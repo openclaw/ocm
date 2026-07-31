@@ -20,7 +20,9 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
@@ -35,6 +37,37 @@ use crate::supervisor::SupervisorService;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INTERNAL_COLOR_MODE_ENV: &str = "OCM_INTERNAL_COLOR_MODE";
+const NON_INTERACTIVE_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+fn run_with_non_interactive_progress<T, F, W>(
+    message: String,
+    interval: Duration,
+    mut write_heartbeat: W,
+    work: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+    W: FnMut(&str) + Send + 'static,
+{
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let heartbeat = thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match stop_rx.recv_timeout(interval) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => write_heartbeat(&format!(
+                    "[ocm] {message} ({}s elapsed; still running)",
+                    started.elapsed().as_secs()
+                )),
+            }
+        }
+    });
+
+    let result = work();
+    let _ = stop_tx.send(());
+    let _ = heartbeat.join();
+    result
+}
 
 #[derive(Default)]
 struct OutputErrors {
@@ -317,8 +350,20 @@ impl Cli {
     where
         F: FnOnce() -> Result<T, String>,
     {
+        let message = message.into();
         if !self.progress_output_enabled() {
-            return work();
+            return run_with_non_interactive_progress(
+                message,
+                NON_INTERACTIVE_PROGRESS_HEARTBEAT_INTERVAL,
+                |line| {
+                    // Only the fixed OCM phase label and elapsed time are emitted here. Child
+                    // output remains on the existing bounded success/error handling path.
+                    let stderr = io::stderr();
+                    let mut handle = stderr.lock();
+                    let _ = writeln!(handle, "{line}");
+                },
+                work,
+            );
         }
 
         let bar = ProgressBar::new_spinner();
@@ -331,7 +376,7 @@ impl Cli {
             .map_err(|error| error.to_string())?
             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
         bar.set_style(style);
-        bar.set_message(message.into());
+        bar.set_message(message);
         bar.enable_steady_tick(Duration::from_millis(90));
         bar.tick();
 
@@ -658,5 +703,75 @@ impl Cli {
                 1
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::run_with_non_interactive_progress;
+
+    #[test]
+    fn non_interactive_progress_stays_quiet_for_fast_work() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&lines);
+
+        let result = run_with_non_interactive_progress(
+            "Fast phase".to_string(),
+            Duration::from_secs(1),
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || Ok::<_, String>("done"),
+        );
+
+        assert_eq!(result.unwrap(), "done");
+        assert!(lines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn non_interactive_progress_reports_bounded_label_for_slow_work() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&lines);
+
+        run_with_non_interactive_progress(
+            "Building runtime demo".to_string(),
+            Duration::from_millis(5),
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || {
+                std::thread::sleep(Duration::from_millis(18));
+                Ok::<_, String>(())
+            },
+        )
+        .unwrap();
+
+        let lines = lines.lock().unwrap();
+        assert!(!lines.is_empty());
+        assert!(lines.iter().all(|line| {
+            line.starts_with("[ocm] Building runtime demo (")
+                && line.ends_with("s elapsed; still running)")
+        }));
+    }
+
+    #[test]
+    fn non_interactive_progress_preserves_work_error_without_echoing_it() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&lines);
+        let secret_shaped_error = "child failed with token=fixture-secret";
+
+        let result = run_with_non_interactive_progress(
+            "Installing runtime demo".to_string(),
+            Duration::from_millis(5),
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || {
+                std::thread::sleep(Duration::from_millis(12));
+                Err::<(), _>(secret_shaped_error.to_string())
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), secret_shaped_error);
+        let lines = lines.lock().unwrap();
+        assert!(!lines.is_empty());
+        assert!(lines.iter().all(|line| !line.contains("fixture-secret")));
     }
 }
