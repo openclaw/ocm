@@ -105,10 +105,16 @@ pub(crate) fn openclaw_env_archive_options(
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<EnvArchiveOptions, String> {
     let workspaces = resolve_env_openclaw_workspaces(paths, env, runtime)?;
+    let included_path_roots = workspaces.archive_relative_roots(&paths.root)?;
+    let mut excluded_path_roots = openclaw_archive_excluded_path_roots(paths)?;
+    excluded_path_roots.extend(openclaw_workspace_archive_excluded_path_roots(
+        paths,
+        &workspaces,
+    )?);
     Ok(EnvArchiveOptions {
         should_skip_path: should_skip_openclaw_env_archive_path,
-        included_path_roots: workspaces.archive_relative_roots(&paths.root)?,
-        excluded_path_roots: openclaw_archive_excluded_path_roots(paths)?,
+        included_path_roots,
+        excluded_path_roots,
         snapshot_sqlite_files: true,
     })
 }
@@ -461,6 +467,26 @@ fn openclaw_archive_excluded_path_roots(paths: &EnvPaths) -> Result<BTreeSet<Pat
         .into_iter()
         .map(|path| Path::new(".openclaw").join(path))
         .collect())
+}
+
+fn openclaw_workspace_archive_excluded_path_roots(
+    paths: &EnvPaths,
+    workspaces: &OpenClawWorkspaceInventory,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let archive_root = clean_path(&paths.root);
+    workspaces
+        .workspace_roots()
+        .map(|workspace_root| {
+            let workspace_root = clean_path(workspace_root);
+            let relative_root = workspace_root.strip_prefix(&archive_root).map_err(|_| {
+                format!(
+                    "configured OpenClaw workspace is outside the environment root: {}",
+                    display_path(&workspace_root)
+                )
+            })?;
+            Ok(relative_root.join(".openclaw/tmp"))
+        })
+        .collect()
 }
 
 fn openclaw_extension_runtime_debris_roots(state_dir: &Path) -> Result<BTreeSet<PathBuf>, String> {
@@ -892,6 +918,84 @@ mod tests {
     }
 
     #[test]
+    fn archive_policy_omits_openclaw_tmp_inside_configured_workspaces() {
+        let temp =
+            std::env::temp_dir().join(format!("ocm-openclaw-workspace-tmp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let archive_path = temp.with_extension("tar");
+        let extract_dir = temp.with_extension("extracted");
+        let _ = fs::remove_file(&archive_path);
+        let _ = fs::remove_dir_all(&extract_dir);
+        let paths = derive_env_paths(&temp);
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        fs::write(
+            &paths.config_path,
+            format!(
+                r#"{{"agents":{{"defaults":{{"workspace":"{}"}}}}}}"#,
+                paths.state_dir.join("team").display()
+            ),
+        )
+        .unwrap();
+
+        for path in [
+            "workspace/notes.txt",
+            "workspace/tmp/keep.txt",
+            "workspace/.openclaw/tmp/cache.bin",
+            "workspace/.openclaw/tmp-keep/data.bin",
+            "team/notes.txt",
+            "team/.openclaw/tmp/cache.bin",
+        ] {
+            let path = paths.state_dir.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "fixture\n").unwrap();
+        }
+
+        let options = openclaw_env_snapshot_archive_options(
+            &paths,
+            &BTreeMap::new(),
+            OpenClawWorkspaceRuntime::default(),
+        )
+        .unwrap();
+        crate::infra::archive::write_env_archive_with_options(
+            &serde_json::json!({ "kind": "test" }),
+            &paths.root,
+            &archive_path,
+            options,
+        )
+        .unwrap();
+        let extracted = crate::infra::archive::extract_env_archive::<serde_json::Value>(
+            &archive_path,
+            &extract_dir,
+        )
+        .unwrap();
+
+        for path in [
+            "workspace/notes.txt",
+            "workspace/tmp/keep.txt",
+            "workspace/.openclaw/tmp-keep/data.bin",
+            "team/notes.txt",
+        ] {
+            assert!(
+                extracted.root_dir.join(".openclaw").join(path).exists(),
+                "{path}"
+            );
+        }
+        for path in [
+            "workspace/.openclaw/tmp/cache.bin",
+            "team/.openclaw/tmp/cache.bin",
+        ] {
+            assert!(
+                !extracted.root_dir.join(".openclaw").join(path).exists(),
+                "{path}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&temp);
+        let _ = fs::remove_file(&archive_path);
+        let _ = fs::remove_dir_all(&extract_dir);
+    }
+
+    #[test]
     fn archive_policy_uses_configured_workspace_roots_without_prefix_guessing() {
         let temp =
             std::env::temp_dir().join(format!("ocm-openclaw-archive-{}", std::process::id()));
@@ -934,7 +1038,18 @@ mod tests {
                 .included_path_roots
                 .contains(Path::new(".openclaw/state"))
         );
-        assert!(options.excluded_path_roots.is_empty());
+        for options in [&export_options, &options] {
+            assert!(
+                options
+                    .excluded_path_roots
+                    .contains(Path::new(".openclaw/team/.openclaw/tmp"))
+            );
+            assert!(
+                options
+                    .excluded_path_roots
+                    .contains(Path::new(".openclaw/workspace/.openclaw/tmp"))
+            );
+        }
         assert!(options.snapshot_sqlite_files);
         assert!(export_options.snapshot_sqlite_files);
         assert!(
