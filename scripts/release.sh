@@ -360,6 +360,10 @@ case "$branch" in
         echo "error: ${version} is on main, but HEAD is not the expected squash-merged release commit" >&2
         exit 1
       fi
+      run_step "Verifying exact-SHA main CI" \
+        "${script_dir}/verify-release-ci.sh" \
+        --repo "$(github_repository)" \
+        --commit "$head_sha"
 
       if git show-ref --verify --quiet "refs/tags/${tag}"; then
         log_step "Using existing local tag ${tag}"
@@ -450,5 +454,6 @@ Release pull request ready: ${pr_url}
 Next:
   1. Squash-merge ${release_branch} into main.
   2. Update local main to the merged commit.
-  3. Rerun: scripts/release.sh ${version} --remote ${remote}
+  3. Wait for the exact main-branch CI run to pass.
+  4. Rerun: scripts/release.sh ${version} --remote ${remote}
 EOF

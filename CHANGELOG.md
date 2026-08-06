@@ -4,6 +4,8 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+- Require successful exact-SHA `main` CI before signed release tags can be created or packaged.
+
 ## 0.2.30 - 2026-07-23
 
 ### Added

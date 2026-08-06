@@ -6,6 +6,7 @@ on:
       - "v*"
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -39,6 +40,9 @@ jobs:
               --repo "$RELEASE_REPO" \
               --tag "$RELEASE_TAG"
           )"
+          ./scripts/verify-release-ci.sh \
+            --repo "$RELEASE_REPO" \
+            --commit "$verified_commit"
           printf 'commit=%s\n' "$verified_commit" >>"$GITHUB_OUTPUT"
 
   build:

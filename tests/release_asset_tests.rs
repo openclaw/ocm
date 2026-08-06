@@ -410,7 +410,9 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
     assert!(ci.contains("cargo install --locked"));
     assert!(release.contains("cargo build --locked --release"));
     assert!(release.contains("scripts/verify-release-tag.sh"));
+    assert!(release.contains("scripts/verify-release-ci.sh"));
     assert!(release.contains("scripts/publish-release.sh"));
+    assert!(release.contains("actions: read"));
     assert!(release.contains("cp ./install.sh ./dist/install.sh"));
     assert!(release.contains("tags:"));
     assert!(release.contains("- \"v*\""));

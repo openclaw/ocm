@@ -106,6 +106,16 @@ impl ReleaseRepo {
         assert!(push.status.success(), "{}", stderr(&push));
         self.git_stdout(&["rev-parse", "HEAD"]).trim().to_string()
     }
+
+    fn record_ci(&self, head_sha: &str, status: &str, conclusion: &str) {
+        fs::write(
+            self.repo.join(".git/test-ci-run"),
+            format!(
+                "12345|{head_sha}|{status}|{conclusion}|https://github.com/example/ocm/actions/runs/12345\n"
+            ),
+        )
+        .unwrap();
+    }
 }
 
 fn stdout(output: &Output) -> String {
@@ -166,6 +176,7 @@ fn init_release_repo(label: &str) -> ReleaseRepo {
         "scripts/release.sh",
         "scripts/update-version.sh",
         "scripts/validate-version.sh",
+        "scripts/verify-release-ci.sh",
     ] {
         copy_script(&repo, script);
     }
@@ -209,6 +220,11 @@ exec "$real_git" "$@"
         r#"#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>.git/test-ghx-commands
+if [[ "${1:-}" == "api" && "${2:-}" == repos/example/ocm/actions/workflows/ci.yml/runs\?* ]]; then
+  [[ -f .git/test-ci-run ]] || exit 0
+  cat .git/test-ci-run
+  exit 0
+fi
 case "${1:-} ${2:-}" in
   "pr view")
     [[ -f .git/test-pr-url ]] || exit 1
@@ -361,6 +377,7 @@ fn release_script_tags_only_after_the_release_pr_is_squash_merged() {
     let repo = init_release_repo("release-pr-tag");
     assert!(repo.run_release("0.2.8").status.success());
     let merged_head = repo.merge_release_pr("0.2.8");
+    repo.record_ci(&merged_head, "completed", "success");
 
     let output = repo.run_release("0.2.8");
     assert!(output.status.success(), "{}", stderr(&output));
@@ -374,6 +391,7 @@ fn release_script_retries_a_previously_created_local_tag() {
     let repo = init_release_repo("release-local-tag-resume");
     assert!(repo.run_release("0.2.8").status.success());
     let merged_head = repo.merge_release_pr("0.2.8");
+    repo.record_ci(&merged_head, "completed", "success");
     let tag = repo.git_output(&[
         "-c",
         "tag.gpgSign=true",
@@ -395,12 +413,51 @@ fn release_script_retries_a_previously_created_local_tag() {
 fn release_script_accepts_an_already_pushed_verified_tag() {
     let repo = init_release_repo("release-tag-idempotent");
     assert!(repo.run_release("0.2.8").status.success());
-    repo.merge_release_pr("0.2.8");
+    let merged_head = repo.merge_release_pr("0.2.8");
+    repo.record_ci(&merged_head, "completed", "success");
     assert!(repo.run_release("0.2.8").status.success());
 
     let output = repo.run_release("0.2.8");
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("already published from verified commit"));
+}
+
+#[test]
+fn release_script_refuses_to_tag_without_exact_sha_ci() {
+    let repo = init_release_repo("release-ci-missing");
+    assert!(repo.run_release("0.2.8").status.success());
+    let merged_head = repo.merge_release_pr("0.2.8");
+
+    let output = repo.run_release("0.2.8");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains(&format!(
+        "no main-branch CI push run exists for exact commit {merged_head}"
+    )));
+    assert!(repo.remote_ref("refs/tags/v0.2.8").is_empty());
+}
+
+#[test]
+fn release_script_refuses_pending_failed_and_wrong_sha_ci() {
+    let repo = init_release_repo("release-ci-invalid");
+    assert!(repo.run_release("0.2.8").status.success());
+    let merged_head = repo.merge_release_pr("0.2.8");
+
+    repo.record_ci(&merged_head, "in_progress", "");
+    let pending = repo.run_release("0.2.8");
+    assert_eq!(pending.status.code(), Some(1));
+    assert!(stderr(&pending).contains("is still in_progress"));
+
+    repo.record_ci(&merged_head, "completed", "failure");
+    let failed = repo.run_release("0.2.8");
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(stderr(&failed).contains("concluded failure"));
+
+    let wrong_sha = repo.git_stdout(&["rev-parse", "HEAD^"]);
+    repo.record_ci(wrong_sha.trim(), "completed", "success");
+    let wrong = repo.run_release("0.2.8");
+    assert_eq!(wrong.status.code(), Some(1));
+    assert!(stderr(&wrong).contains(&format!("not {merged_head}")));
+    assert!(repo.remote_ref("refs/tags/v0.2.8").is_empty());
 }
 
 #[test]
