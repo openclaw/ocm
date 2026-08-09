@@ -1,4 +1,4 @@
-use super::{RuntimeMeta, RuntimeReleaseSelectorKind, RuntimeService};
+use super::{RuntimeCompanionMeta, RuntimeMeta, RuntimeReleaseSelectorKind, RuntimeService};
 use crate::store::{get_runtime, get_runtime_verified, list_runtimes, runtime_integrity_issue};
 use serde::Serialize;
 
@@ -19,6 +19,7 @@ pub struct RuntimeVerifySummary {
     pub release_selector_kind: Option<RuntimeReleaseSelectorKind>,
     pub release_selector_value: Option<String>,
     pub install_root: Option<String>,
+    pub companions: Vec<RuntimeCompanionMeta>,
     pub healthy: bool,
     pub issue: Option<String>,
 }
@@ -85,6 +86,7 @@ fn build_verify_summary(
         release_selector_kind: meta.release_selector_kind,
         release_selector_value: meta.release_selector_value,
         install_root: meta.install_root,
+        companions: meta.companions,
         healthy: issue.is_none(),
         issue,
     }

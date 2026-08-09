@@ -147,6 +147,36 @@ fn source_extension_package_tarball() -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+fn companion_package_tarball(id: &str, package_name: &str, version: &str) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut encoder);
+        append_tar_file(
+            &mut builder,
+            "package/package.json",
+            format!(
+                "{{\"name\":\"{package_name}\",\"version\":\"{version}\",\"type\":\"module\",\"openclaw\":{{\"build\":{{\"openclawVersion\":\"{version}\"}},\"runtimeExtensions\":[\"./dist/index.js\"]}}}}"
+            )
+            .as_bytes(),
+            0o644,
+        );
+        append_tar_file(
+            &mut builder,
+            "package/openclaw.plugin.json",
+            format!("{{\"id\":\"{id}\",\"configSchema\":{{}}}}").as_bytes(),
+            0o644,
+        );
+        append_tar_file(
+            &mut builder,
+            "package/dist/index.js",
+            b"export default { id: 'codex' };\n",
+            0o644,
+        );
+        builder.finish().unwrap();
+    }
+    encoder.finish().unwrap()
+}
+
 fn sha512_integrity(body: &[u8]) -> String {
     let digest = Sha512::digest(body);
     format!(
@@ -295,6 +325,121 @@ fi
         format!("{}:{existing_path}", path_string(&bin_dir))
     };
     env.insert("PATH".to_string(), combined_path);
+    log_path
+}
+
+fn install_fake_companion_build_tools(
+    root: &TestDir,
+    env: &mut BTreeMap<String, String>,
+    root_archive: &Path,
+    companion_archive: &Path,
+) -> PathBuf {
+    let bin_dir = root.child("fake-companion-bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let log_path = root.child("fake-companion-tools.log");
+    write_executable_script(
+        &bin_dir.join("node"),
+        &format!(
+            r#"#!/bin/sh
+printf 'node %s\n' "$*" >> "{}"
+if [ "$1" = "--version" ]; then
+  printf 'v22.22.3\n'
+  exit 0
+fi
+case "$1" in
+  scripts/lib/plugin-npm-runtime-build.mjs|scripts/generate-npm-package-lock.mjs)
+    exit 0
+    ;;
+  scripts/lib/plugin-npm-package-manifest.mjs)
+    destination=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--pack-destination" ]; then
+        shift
+        destination="$1"
+      fi
+      shift
+    done
+    mkdir -p "$destination"
+    cp "{}" "$destination/openclaw-codex-2026.8.1.tgz"
+    exit 0
+    ;;
+esac
+printf 'unexpected fake node invocation: %s\n' "$*" >&2
+exit 1
+"#,
+            path_string(&log_path),
+            path_string(companion_archive),
+        ),
+    );
+    write_executable_script(
+        &bin_dir.join("npm"),
+        &format!(
+            r#"#!/bin/sh
+printf 'npm %s\n' "$*" >> "{}"
+if [ "$1" = "--version" ]; then
+  printf '10.0.0\n'
+  exit 0
+fi
+if [ "$1" = "pack" ]; then
+  destination=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--pack-destination" ]; then
+      shift
+      destination="$1"
+    fi
+    shift
+  done
+  mkdir -p "$destination"
+  cp "{}" "$destination/openclaw-2026.8.1.tgz"
+  printf 'openclaw-2026.8.1.tgz\n'
+  exit 0
+fi
+prefix=""
+archive=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --prefix)
+      shift
+      prefix="$1"
+      ;;
+    install|--omit=dev|--no-save|--package-lock=false)
+      ;;
+    *)
+      archive="$1"
+      ;;
+  esac
+  shift
+done
+if [ -z "$prefix" ] || [ -z "$archive" ]; then
+  echo "fake npm expected --prefix and archive path" >&2
+  exit 1
+fi
+case "$(basename "$archive")" in
+  openclaw-codex-2026.8.1.tgz)
+    mkdir -p "$prefix/node_modules/@openclaw/codex"
+    tar -xzf "$archive" -C "$prefix/node_modules/@openclaw/codex" --strip-components=1 package
+    mkdir -p "$prefix/node_modules/@openai/codex"
+    printf '{{"name":"@openai/codex","version":"0.147.0"}}\n' > "$prefix/node_modules/@openai/codex/package.json"
+    ;;
+  *)
+    mkdir -p "$prefix/node_modules/openclaw"
+    tar -xzf "$archive" -C "$prefix/node_modules/openclaw" --strip-components=1 package
+    ;;
+esac
+"#,
+            path_string(&log_path),
+            path_string(root_archive),
+        ),
+    );
+    let existing_path = env.get("PATH").cloned().unwrap_or_default();
+    env.insert(
+        "PATH".to_string(),
+        if existing_path.is_empty() {
+            path_string(&bin_dir)
+        } else {
+            format!("{}:{existing_path}", path_string(&bin_dir))
+        },
+    );
     log_path
 }
 
@@ -1259,6 +1404,177 @@ fn runtime_build_local_rejects_conflicting_source_plugin_modes() {
         "{}",
         stderr(&build)
     );
+}
+
+#[test]
+fn runtime_build_local_bundles_commit_matched_companion_with_isolated_dependencies() {
+    let root = TestDir::new("runtime-build-local-companion");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    fs::create_dir_all(repo.join("extensions/codex")).unwrap();
+    for relative in [
+        "scripts/lib/plugin-npm-runtime-build.mjs",
+        "scripts/generate-npm-package-lock.mjs",
+        "scripts/lib/plugin-npm-package-manifest.mjs",
+    ] {
+        let path = repo.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "// fake packaging contract\n").unwrap();
+    }
+    fs::write(
+        repo.join("package.json"),
+        br#"{"name":"openclaw","version":"2026.8.1","bin":{"openclaw":"openclaw.mjs"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("extensions/codex/package.json"),
+        br#"{"name":"@openclaw/codex","version":"2026.8.1","openclaw":{"build":{"openclawVersion":"2026.8.1"},"release":{"publishToNpm":true}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("extensions/codex/openclaw.plugin.json"),
+        br#"{"id":"codex","configSchema":{}}"#,
+    )
+    .unwrap();
+
+    let root_archive = root.child("packed-openclaw.tgz");
+    fs::write(
+        &root_archive,
+        openclaw_package_tarball_with_version(
+            "#!/usr/bin/env node\nconsole.log('local companion runtime');\n",
+            "2026.8.1",
+        ),
+    )
+    .unwrap();
+    let companion_archive = root.child("packed-codex.tgz");
+    fs::write(
+        &companion_archive,
+        companion_package_tarball("codex", "@openclaw/codex", "2026.8.1"),
+    )
+    .unwrap();
+
+    let mut env = ocm_env(&root);
+    let tool_log =
+        install_fake_companion_build_tools(&root, &mut env, &root_archive, &companion_archive);
+    let build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "main-with-codex",
+            "--repo",
+            "./openclaw",
+            "--companion",
+            "codex",
+            "--raw",
+        ],
+    );
+    assert!(build.status.success(), "{}", stderr(&build));
+
+    let install_root = runtime_install_root("main-with-codex", &env, &cwd).unwrap();
+    let companion_root = install_root.join("files/node_modules/openclaw/dist/extensions/codex");
+    assert!(companion_root.join("dist/index.js").is_file());
+    assert!(
+        companion_root
+            .join("node_modules/@openai/codex/package.json")
+            .is_file()
+    );
+    assert!(!companion_root.join("node_modules/@openclaw/codex").exists());
+
+    let show = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "show", "main-with-codex", "--json"],
+    );
+    assert!(show.status.success(), "{}", stderr(&show));
+    let value: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert_eq!(value["companions"][0]["id"], "codex");
+    assert_eq!(value["companions"][0]["packageName"], "@openclaw/codex");
+    assert_eq!(value["companions"][0]["version"], "2026.8.1");
+    assert_eq!(
+        value["companions"][0]["artifactSha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(
+        value["companions"][0]["entrypointSha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let verify = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "verify", "main-with-codex", "--json"],
+    );
+    assert!(verify.status.success(), "{}", stderr(&verify));
+    let verification: Value = serde_json::from_str(&stdout(&verify)).unwrap();
+    assert_eq!(verification["healthy"], true);
+
+    fs::write(companion_root.join("dist/index.js"), "tampered\n").unwrap();
+    let verify_tampered = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "verify", "main-with-codex", "--json"],
+    );
+    assert_eq!(verify_tampered.status.code(), Some(1));
+    let tampered: Value = serde_json::from_str(&stdout(&verify_tampered)).unwrap();
+    assert_eq!(tampered["healthy"], false);
+    assert!(
+        tampered["issue"]
+            .as_str()
+            .unwrap()
+            .contains("entrypoint sha256 mismatch")
+    );
+
+    let tool_log = fs::read_to_string(tool_log).unwrap();
+    assert!(tool_log.contains("plugin-npm-runtime-build.mjs extensions/codex"));
+    assert!(tool_log.contains("generate-npm-package-lock.mjs --package-dir extensions/codex"));
+    assert!(tool_log.contains("plugin-npm-package-manifest.mjs --run extensions/codex"));
+}
+
+#[test]
+fn runtime_build_local_rejects_mismatched_companion_before_packing() {
+    let root = TestDir::new("runtime-build-local-companion-mismatch");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    fs::create_dir_all(repo.join("extensions/codex")).unwrap();
+    fs::write(
+        repo.join("package.json"),
+        br#"{"name":"openclaw","version":"2026.8.1"}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("extensions/codex/package.json"),
+        br#"{"name":"@openclaw/codex","version":"2026.7.2","openclaw":{"build":{"openclawVersion":"2026.7.2"},"release":{"publishToNpm":true}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("extensions/codex/openclaw.plugin.json"),
+        br#"{"id":"codex"}"#,
+    )
+    .unwrap();
+    let env = ocm_env(&root);
+    let build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "mismatched",
+            "--repo",
+            "./openclaw",
+            "--companion",
+            "codex",
+        ],
+    );
+    assert!(!build.status.success());
+    assert!(stderr(&build).contains("is not commit-matched"));
 }
 
 #[test]

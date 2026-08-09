@@ -54,6 +54,7 @@ pub struct InstallRuntimeFromOfficialReleaseOptions {
 pub struct BuildLocalRuntimeOptions {
     pub name: String,
     pub repo: String,
+    pub companions: Vec<String>,
     pub description: Option<String>,
     pub force: bool,
     pub include_source_extensions: bool,
@@ -433,6 +434,7 @@ impl<'a> RuntimeService<'a> {
                 StoreBuildLocalRuntimeOptions {
                     name: options.name,
                     repo: options.repo,
+                    companions: options.companions,
                     description: options.description,
                     force: options.force,
                     include_source_extensions: options.include_source_extensions,

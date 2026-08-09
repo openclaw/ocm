@@ -615,6 +615,7 @@ mod tests {
             release_selector_kind: None,
             release_selector_value: None,
             install_root: Some(expected_install_root.to_string_lossy().into_owned()),
+            companions: Vec::new(),
             description: None,
             created_at,
             updated_at: created_at,

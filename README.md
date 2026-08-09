@@ -196,6 +196,13 @@ transitive closure of private `workspace:*` packages. It rewrites nested
 workspace specs only inside scratch archives before installation; the source
 checkout remains unchanged.
 
+For unreleased source builds with separately published, version-bound official
+plugins, repeat `runtime build-local --companion <plugin-id>`. OCM packages each
+selected plugin through OpenClaw's own package-local release contract, requires
+exact host-version parity, stages it as a runtime-owned bundled plugin with
+isolated dependencies, and records artifact and entrypoint hashes for runtime
+verification.
+
 `upgrade simulate` clones the source env, leaves the real env untouched, and
 cleans temporary simulation envs and runtimes when the run finishes. For
 published targets it first validates that the target exists, then runs OpenClaw's own
