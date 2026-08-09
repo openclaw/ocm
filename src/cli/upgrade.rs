@@ -182,7 +182,6 @@ struct UpgradeTransactionPlan {
 struct UpgradeRollbackPlan {
     record: UpgradeHistoryRecord,
     recovery: Option<UpgradeRuntimeRecovery>,
-    service: Option<ServiceSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -545,17 +544,7 @@ impl Cli {
             })?;
         self.verify_rollback_target_version(env_name, &record)?;
         let recovery = self.verify_rollback_source(env_name, &record)?;
-        let service = if current.service_enabled && current.service_running {
-            Some(self.service_service().status(env_name)?)
-        } else {
-            None
-        };
-
-        Ok(UpgradeRollbackPlan {
-            record,
-            recovery,
-            service,
-        })
+        Ok(UpgradeRollbackPlan { record, recovery })
     }
 
     fn verify_rollback_target_version(
@@ -713,7 +702,11 @@ impl Cli {
         env_name: &str,
         plan: UpgradeRollbackPlan,
     ) -> Result<UpgradeRollbackSummary, String> {
-        let runtime_names = rollback_runtime_names(&plan.record);
+        let runtime_names = plan
+            .recovery
+            .as_ref()
+            .map(|recovery| vec![recovery.meta.name.clone()])
+            .unwrap_or_default();
         let mut transaction = self.begin_upgrade_transaction_locked(
             env_name,
             UpgradeTransactionPlan {
@@ -728,25 +721,25 @@ impl Cli {
         let rollback_transaction_id = transaction.id.clone();
         let safety_snapshot_id = transaction.snapshot_id.clone();
 
-        if plan
-            .service
-            .as_ref()
-            .is_some_and(|service| service.installed && service.desired_running)
-            && let Err(error) = self.service_service().stop_locked(env_name)
+        if plan.record.service_after.enabled
+            && plan.record.service_after.running
+            && let Err(error) = self
+                .service_service()
+                .quiesce_for_runtime_mutation_locked(env_name)
         {
             return Ok(self.fail_upgrade_rollback_locked(
                 env_name,
                 &plan,
                 transaction,
-                format!("failed to stop the managed service before rollback: {error}"),
+                format!("failed to quiesce the managed service before rollback: {error}"),
             ));
         }
 
         if let Some(recovery) = plan.recovery.as_ref() {
+            transaction.mark_runtime_mutated(&recovery.meta.name);
             if let Err(error) = self.restore_retained_runtime(recovery) {
                 return Ok(self.fail_upgrade_rollback_locked(env_name, &plan, transaction, error));
             }
-            transaction.mark_runtime_mutated();
         }
 
         if let Err(error) =
@@ -1728,6 +1721,11 @@ impl Cli {
                     ),
                 });
             }
+            let runtime_names = if target.is_named_runtime() {
+                Vec::new()
+            } else {
+                vec![target_runtime_name.clone()]
+            };
             let mut transaction = self.begin_upgrade_transaction_locked(
                 env_name,
                 UpgradeTransactionPlan {
@@ -1742,11 +1740,14 @@ impl Cli {
                         openclaw_version: target_version.clone(),
                     },
                 },
-                &[current.name.clone(), target_runtime_name.clone()],
+                &runtime_names,
                 options.rollback_enabled,
                 "pre-upgrade",
                 None,
             )?;
+            if !target.is_named_runtime() {
+                transaction.mark_runtime_mutated(&target_runtime_name);
+            }
             let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -1763,11 +1764,8 @@ impl Cli {
                     );
                 }
             };
-            if matches!(
-                prepared.action,
-                OfficialRuntimePrepareAction::Installed | OfficialRuntimePrepareAction::Updated
-            ) {
-                transaction.mark_runtime_mutated();
+            if matches!(prepared.action, OfficialRuntimePrepareAction::Reused) {
+                transaction.unmark_runtime_mutated(&prepared.name);
             }
             let binding_changed = prepared.name != current.name;
             let post_update_note = match self.run_post_core_update(env_name, &prepared.name) {
@@ -1974,11 +1972,12 @@ impl Cli {
                         openclaw_version: target_version.clone(),
                     },
                 },
-                &[current.name.clone(), target_runtime_name.clone()],
+                std::slice::from_ref(&target_runtime_name),
                 options.rollback_enabled,
                 "pre-upgrade",
                 None,
             )?;
+            transaction.mark_runtime_mutated(&target_runtime_name);
             let prepared = match self.prepare_isolated_upgrade_target(env_name, &target, resolved) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -1999,8 +1998,8 @@ impl Cli {
                 prepared.action,
                 OfficialRuntimePrepareAction::Installed | OfficialRuntimePrepareAction::Updated
             );
-            if changed {
-                transaction.mark_runtime_mutated();
+            if !changed {
+                transaction.unmark_runtime_mutated(&prepared.name);
             }
             let post_update_note = if changed {
                 match self.run_post_core_update(env_name, &prepared.name) {
@@ -2040,8 +2039,12 @@ impl Cli {
                     format!("failed to publish upgraded runtime: {error}"),
                 );
             }
-            let service_result =
-                self.reconcile_upgraded_service_locked(env_name, service.as_ref(), false, changed);
+            let service_result = self.reconcile_upgraded_service_locked(
+                env_name,
+                service.as_ref(),
+                false,
+                changed || transaction.service_quiesced,
+            );
             let (service_action, service_note) = match service_result {
                 Ok(result) => result,
                 Err(error) => {
@@ -2150,6 +2153,7 @@ impl Cli {
             "pre-upgrade",
             None,
         )?;
+        transaction.mark_runtime_mutated(&current.name);
         let updated = match self.with_progress(format!("Updating runtime {}", current.name), || {
             self.with_isolated_runtime_mutation(env_name, &current.name, || {
                 self.runtime_service()
@@ -2171,7 +2175,6 @@ impl Cli {
                 );
             }
         };
-        transaction.mark_runtime_mutated();
         let post_update_note = match self.run_post_core_update(env_name, &updated.name) {
             Ok(note) => {
                 transaction.mark_post_update_completed(note.as_deref());
@@ -2364,6 +2367,9 @@ impl Cli {
             "pre-upgrade",
             None,
         )?;
+        if !target.is_named_runtime() {
+            transaction.mark_runtime_mutated(&target_runtime_name);
+        }
         let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -2380,11 +2386,8 @@ impl Cli {
                 );
             }
         };
-        if matches!(
-            prepared.action,
-            OfficialRuntimePrepareAction::Installed | OfficialRuntimePrepareAction::Updated
-        ) {
-            transaction.mark_runtime_mutated();
+        if matches!(prepared.action, OfficialRuntimePrepareAction::Reused) {
+            transaction.unmark_runtime_mutated(&prepared.name);
         }
         let post_update_note = match self.run_post_core_update(env_name, &prepared.name) {
             Ok(note) => {
@@ -2998,6 +3001,27 @@ impl Cli {
             }
         }
 
+        let service_quiesced = if runtime_names.is_empty() {
+            false
+        } else {
+            match self
+                .service_service()
+                .quiesce_for_runtime_mutation_locked(env_name)
+            {
+                Ok(quiesced) => quiesced,
+                Err(error) => {
+                    return Err(self.cleanup_failed_transaction_setup(
+                        env_name,
+                        &snapshot.id,
+                        runtime_backups,
+                        format!(
+                            "failed to quiesce managed service before runtime mutation: {error}"
+                        ),
+                    ));
+                }
+            }
+        };
+
         Ok(UpgradeTransaction {
             id,
             snapshot_id: snapshot.id,
@@ -3019,7 +3043,8 @@ impl Cli {
                 status: "not-run".to_string(),
                 note: None,
             },
-            runtime_mutated: false,
+            service_quiesced,
+            mutated_runtime_names: BTreeSet::new(),
             rollback_of,
         })
     }
@@ -3091,20 +3116,24 @@ impl Cli {
         env_name: &str,
         transaction: &mut UpgradeTransaction,
     ) -> Result<(), String> {
-        if !transaction.runtime_mutated
-            || transaction.source.kind != "runtime"
+        if transaction.source.kind != "runtime"
             || transaction.source.name != transaction.target.name
         {
             return Ok(());
         }
         let runtime_name = transaction.source.name.clone();
-        let backup = transaction
+        if !transaction.mutated_runtime_names.contains(&runtime_name) {
+            return Ok(());
+        }
+        let Some(backup) = transaction
             .runtime_backups
             .iter_mut()
             .find(|backup| backup.meta.name == runtime_name)
-            .ok_or_else(|| {
-                format!("runtime backup for in-place upgrade of \"{runtime_name}\" was not created")
-            })?;
+        else {
+            return Err(format!(
+                "runtime backup for in-place upgrade of \"{runtime_name}\" was not created"
+            ));
+        };
         let Some(source_root) = backup.backup_root.take() else {
             return Err(format!(
                 "runtime \"{runtime_name}\" does not have installer-managed bytes to retain"
@@ -3163,6 +3192,11 @@ impl Cli {
         let runtime_recovery = transaction
             .runtime_backups
             .iter()
+            .filter(|backup| {
+                transaction
+                    .mutated_runtime_names
+                    .contains(&backup.meta.name)
+            })
             .map(|backup| UpgradeHistoryRuntimeRecovery {
                 runtime_name: backup.meta.name.clone(),
                 release_version: backup.meta.release_version.clone(),
@@ -3245,6 +3279,18 @@ impl Cli {
     ) -> Result<UpgradeEnvSummary, String> {
         if !transaction.rollback_enabled {
             let snapshot_id = transaction.snapshot_id.clone();
+            let service_restore_warning = if transaction.service_before.enabled
+                && transaction.service_before.running
+            {
+                self.service_service()
+                    .start_locked(env_name)
+                    .err()
+                    .map(|restore_error| {
+                        format!("failed to restore the pre-upgrade service state: {restore_error}")
+                    })
+            } else {
+                None
+            };
             let mut summary = UpgradeEnvSummary {
                 env_name: env_name.to_string(),
                 previous_binding_kind: previous_binding_kind.to_string(),
@@ -3257,7 +3303,10 @@ impl Cli {
                 service_action: None,
                 snapshot_id: Some(snapshot_id),
                 rollback: Some("disabled".to_string()),
-                note: Some(format!("upgrade failed and rollback was disabled: {error}")),
+                note: join_optional_warnings(
+                    Some(format!("upgrade failed and rollback was disabled: {error}")),
+                    service_restore_warning,
+                ),
             };
             if let Err(history_error) = self.record_upgrade_history(&transaction, &summary) {
                 summary.note = join_optional_warnings(
@@ -3320,9 +3369,19 @@ impl Cli {
         env_name: &str,
         transaction: &UpgradeTransaction,
     ) -> Result<(), String> {
-        // Restore runtime bytes and metadata before the snapshot republishes supervisor
-        // state; otherwise rollback can briefly advertise the failed runtime revision.
-        for runtime_backup in &transaction.runtime_backups {
+        let changes_runtime_trees = !transaction.mutated_runtime_names.is_empty();
+        if changes_runtime_trees {
+            self.service_service()
+                .quiesce_for_runtime_mutation_locked(env_name)
+                .map_err(|error| {
+                    format!("failed to quiesce the failed target before runtime rollback: {error}")
+                })?;
+        }
+        for runtime_backup in transaction.runtime_backups.iter().filter(|backup| {
+            transaction
+                .mutated_runtime_names
+                .contains(&backup.meta.name)
+        }) {
             self.restore_runtime_backup(runtime_backup)?;
         }
         self.environment_service()
@@ -3330,8 +3389,25 @@ impl Cli {
                 env_name: env_name.to_string(),
                 snapshot_id: transaction.snapshot_id.clone(),
             })?;
-        for runtime_name in &transaction.created_runtime_names {
+        if changes_runtime_trees {
+            self.service_service().wait_for_binding_convergence_locked(
+                env_name,
+                &transaction.source.kind,
+                &transaction.source.name,
+            )?;
+        }
+        for runtime_name in transaction
+            .created_runtime_names
+            .iter()
+            .filter(|runtime_name| transaction.mutated_runtime_names.contains(*runtime_name))
+        {
             self.remove_runtime_created_during_upgrade(runtime_name)?;
+        }
+        if transaction.service_before.enabled && transaction.service_before.running {
+            self.service_service()
+                .start_locked(env_name)
+                .map(|_| ())
+                .map_err(|error| format!("failed to restart the restored service: {error}"))?;
         }
         Ok(())
     }
@@ -3515,13 +3591,18 @@ struct UpgradeTransaction {
     service_before: UpgradeHistoryServiceState,
     migration: UpgradeHistoryStage,
     finalization: UpgradeHistoryStage,
-    runtime_mutated: bool,
+    service_quiesced: bool,
+    mutated_runtime_names: BTreeSet<String>,
     rollback_of: Option<String>,
 }
 
 impl UpgradeTransaction {
-    fn mark_runtime_mutated(&mut self) {
-        self.runtime_mutated = true;
+    fn mark_runtime_mutated(&mut self, runtime_name: &str) {
+        self.mutated_runtime_names.insert(runtime_name.to_string());
+    }
+
+    fn unmark_runtime_mutated(&mut self, runtime_name: &str) {
+        self.mutated_runtime_names.remove(runtime_name);
     }
 
     fn mark_post_update_completed(&mut self, note: Option<&str>) {
@@ -3634,16 +3715,6 @@ fn has_successful_rollback_child(history: &[UpgradeHistoryRecord], transaction_i
     history.iter().any(|record| {
         record.rollback_of.as_deref() == Some(transaction_id) && record.outcome == "rolled-back"
     })
-}
-
-fn rollback_runtime_names(record: &UpgradeHistoryRecord) -> Vec<String> {
-    let mut names = Vec::new();
-    for binding in [&record.target, &record.source] {
-        if binding.kind == "runtime" && !names.contains(&binding.name) {
-            names.push(binding.name.clone());
-        }
-    }
-    names
 }
 
 fn rollback_service_action_for_dry_run(record: &UpgradeHistoryRecord) -> Option<String> {

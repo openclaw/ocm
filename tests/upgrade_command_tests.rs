@@ -6,12 +6,16 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::{self, sleep};
 use std::time::Duration;
 
 use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
-use ocm::store::{now_utc, supervisor_runtime_path, supervisor_state_path};
+use ocm::store::{env_registry_path, now_utc, supervisor_runtime_path, supervisor_state_path};
 use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
 use serde_json::Value;
 use sha2::{Digest, Sha512};
@@ -109,6 +113,38 @@ fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
         ocm_home: ocm_home.to_string(),
         updated_at: now_utc(),
         services: Vec::new(),
+        children: Vec::new(),
+    };
+    fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+}
+
+fn write_backoff_supervisor_runtime(
+    runtime_path: &Path,
+    ocm_home: &str,
+    binding_name: &str,
+    child_port: u32,
+) {
+    let log_root = runtime_path.parent().unwrap();
+    let runtime = SupervisorRuntimeState {
+        kind: "ocm-supervisor-runtime".to_string(),
+        ocm_home: ocm_home.to_string(),
+        updated_at: now_utc(),
+        services: vec![SupervisorRuntimeService {
+            env_name: "demo".to_string(),
+            binding_kind: "runtime".to_string(),
+            binding_name: binding_name.to_string(),
+            gateway_state: "backoff".to_string(),
+            restart_handoff: Some("none".to_string()),
+            restart_count: 1,
+            child_port,
+            pid: None,
+            stdout_path: path_string(&log_root.join("demo.stdout.log")),
+            stderr_path: path_string(&log_root.join("demo.stderr.log")),
+            last_exit_code: Some(1),
+            last_error: Some("fixture target failed".to_string()),
+            last_event_at: Some(now_utc()),
+            next_retry_at: Some(now_utc()),
+        }],
         children: Vec::new(),
     };
     fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
@@ -223,6 +259,14 @@ case "$1" in
       echo "missing gateway status flags" >&2
       exit 1
     }}
+    if [ -n "${{OCM_TEST_GATEWAY_STATUS_STARTED:-}}" ]; then
+      : > "$OCM_TEST_GATEWAY_STATUS_STARTED"
+    fi
+    if [ -n "${{OCM_TEST_GATEWAY_STATUS_RELEASE:-}}" ]; then
+      while [ ! -e "$OCM_TEST_GATEWAY_STATUS_RELEASE" ]; do
+        sleep 0.01
+      done
+    fi
     if [ "${{OCM_TEST_GATEWAY_AUTH_HANDSHAKE:-}}" = "1" ]; then
       printf '{{"rpc":{{"ok":false,"error":"device identity required"}}}}\n'
       exit "${{OCM_TEST_GATEWAY_STATUS_EXIT_CODE:-0}}"
@@ -794,6 +838,14 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
     );
     assert!(stdout(&prune_snapshot).contains("Pruned 1 snapshot(s)."));
     assert!(!recovery_root.exists());
+
+    let reuse = run_ocm(&cwd, &env, &["upgrade", "demo"]);
+    assert!(reuse.status.success(), "{}", stderr(&reuse));
+    assert!(stdout(&reuse).contains("outcome=up-to-date"));
+    let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["serviceRunning"], true);
 }
 
 #[test]
@@ -870,35 +922,103 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
     let start = run_ocm(&cwd, &env, &["start", "demo", "--port", port.as_str()]);
     assert!(start.status.success(), "{}", stderr(&start));
 
+    let before_runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
+    assert!(
+        before_runtime.status.success(),
+        "{}",
+        stderr(&before_runtime)
+    );
+    let before_runtime: Value = serde_json::from_str(&stdout(&before_runtime)).unwrap();
+    let runtime_entrypoint = PathBuf::from(before_runtime["installRoot"].as_str().unwrap())
+        .join("files/node_modules/openclaw/openclaw.mjs");
+    let runtime_hash_before = Sha512::digest(fs::read(&runtime_entrypoint).unwrap()).to_vec();
+
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     write_running_supervisor_runtime(&runtime_path, &ocm_home, "stable", 4242, health_port);
 
-    let state_path = supervisor_state_path(&env, &cwd).unwrap();
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let gateway_status_started = root.child("gateway-status-started");
+    let gateway_status_release = root.child("gateway-status-release");
+    env.insert(
+        "OCM_TEST_GATEWAY_STATUS_STARTED".to_string(),
+        path_string(&gateway_status_started),
+    );
+    env.insert(
+        "OCM_TEST_GATEWAY_STATUS_RELEASE".to_string(),
+        path_string(&gateway_status_release),
+    );
     let replacement_runtime_path = runtime_path.clone();
     let replacement_ocm_home = ocm_home.clone();
+    let observer_done = Arc::new(AtomicBool::new(false));
+    let missing_while_active = Arc::new(AtomicBool::new(false));
+    let observer_done_thread = Arc::clone(&observer_done);
+    let missing_while_active_thread = Arc::clone(&missing_while_active);
+    let observed_entrypoint = runtime_entrypoint.clone();
     let restart_observer = thread::spawn(move || {
-        for _ in 0..200 {
-            let state = fs::read_to_string(&state_path).unwrap_or_default();
-            if state.contains("restartRequests") && state.contains("\"envName\": \"demo\"") {
-                write_running_supervisor_runtime(
+        let mut last_running = true;
+        let mut runtime_active = true;
+        let mut stop_count = 0;
+        let mut start_count = 0;
+        let mut next_pid = 4243;
+        let mut target_entered_backoff = false;
+        while !observer_done_thread.load(Ordering::Relaxed) {
+            if runtime_active && !observed_entrypoint.exists() {
+                missing_while_active_thread.store(true, Ordering::Relaxed);
+            }
+            let desired_running = fs::read(&registry_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|registry| registry["envs"].as_array().cloned())
+                .and_then(|envs| envs.into_iter().find(|entry| entry["name"] == "demo"))
+                .and_then(|entry| entry["serviceRunning"].as_bool())
+                .unwrap_or(last_running);
+            if desired_running != last_running {
+                if desired_running {
+                    write_running_supervisor_runtime(
+                        &replacement_runtime_path,
+                        &replacement_ocm_home,
+                        "stable",
+                        next_pid,
+                        health_port,
+                    );
+                    next_pid += 1;
+                    start_count += 1;
+                    runtime_active = true;
+                } else {
+                    write_empty_supervisor_runtime(
+                        &replacement_runtime_path,
+                        &replacement_ocm_home,
+                    );
+                    stop_count += 1;
+                    runtime_active = false;
+                }
+                last_running = desired_running;
+            }
+            if desired_running
+                && start_count >= 1
+                && !target_entered_backoff
+                && gateway_status_started.exists()
+            {
+                write_backoff_supervisor_runtime(
                     &replacement_runtime_path,
                     &replacement_ocm_home,
                     "stable",
-                    4243,
                     health_port,
                 );
-                return;
+                fs::write(&gateway_status_release, []).unwrap();
+                target_entered_backoff = true;
             }
-            sleep(Duration::from_millis(25));
+            sleep(Duration::from_millis(1));
         }
-        panic!("upgrade did not request a supervised gateway restart");
+        (stop_count, start_count, target_entered_backoff)
     });
 
     env.insert("OCM_TEST_GATEWAY_UNREADY".to_string(), "1".to_string());
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo"]);
-    restart_observer.join().unwrap();
+    observer_done.store(true, Ordering::Relaxed);
+    let (stop_count, start_count, target_entered_backoff) = restart_observer.join().unwrap();
 
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
     let output = stdout(&upgrade);
@@ -909,11 +1029,23 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
         "{output}"
     );
     assert!(!health_server.requests().is_empty());
+    assert!(target_entered_backoff);
+    assert!(stop_count >= 2, "stop_count={stop_count}");
+    assert!(start_count >= 2, "start_count={start_count}");
+    assert!(
+        !missing_while_active.load(Ordering::Relaxed),
+        "the retrying in-place runtime observed its entrypoint disappear"
+    );
 
     let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
     assert!(runtime.status.success(), "{}", stderr(&runtime));
     let runtime_json: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
     assert_eq!(runtime_json["releaseVersion"], "2026.3.24");
+    assert_eq!(
+        Sha512::digest(fs::read(&runtime_entrypoint).unwrap()).to_vec(),
+        runtime_hash_before,
+        "in-place updated runtime bytes were not restored"
+    );
 
     let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(history.status.success(), "{}", stderr(&history));
@@ -932,6 +1064,279 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
         .join("demo")
         .join(format!("{}.recovery", record["id"].as_str().unwrap()));
     assert!(!recovery_root.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TestDir::new("upgrade-reused-target-backoff-rollback");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let health_server =
+        TestHttpServer::serve_bytes_times("/health", "application/json", br#"{"ok":true}"#, 8);
+    let health_port = health_server
+        .url()
+        .split(':')
+        .nth(2)
+        .and_then(|value| value.split('/').next())
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap();
+
+    let source_version = "2026.8.1";
+    let target_version = "2026.8.2";
+    let source_tarball =
+        openclaw_package_tarball(&recording_openclaw_script(source_version), source_version);
+    let source_integrity = sha512_integrity(&source_tarball);
+    let source_server = TestHttpServer::serve_bytes_times(
+        "/openclaw-2026.8.1.tgz",
+        "application/octet-stream",
+        &source_tarball,
+        4,
+    );
+    let target_tarball =
+        openclaw_package_tarball(&recording_openclaw_script(target_version), target_version);
+    let target_integrity = sha512_integrity(&target_tarball);
+    let target_server = TestHttpServer::serve_bytes_times(
+        "/openclaw-2026.8.2.tgz",
+        "application/octet-stream",
+        &target_tarball,
+        4,
+    );
+    let packument = format!(
+        "{{\"dist-tags\":{{\"latest\":\"{target_version}\"}},\"versions\":{{\"{source_version}\":{{\"version\":\"{source_version}\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{source_integrity}\"}}}},\"{target_version}\":{{\"version\":\"{target_version}\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{target_integrity}\"}}}}}},\"time\":{{\"{source_version}\":\"2026-08-01T00:00:00.000Z\",\"{target_version}\":\"2026-08-02T00:00:00.000Z\"}}}}",
+        source_server.url(),
+        target_server.url(),
+    );
+    let packument_server = TestHttpServer::serve_bytes_times(
+        "/openclaw",
+        "application/json",
+        packument.as_bytes(),
+        12,
+    );
+
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    install_fake_launchctl(&root, &mut env);
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
+        packument_server.url(),
+    );
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+
+    let port = health_port.to_string();
+    let start = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "start",
+            "demo",
+            "--version",
+            source_version,
+            "--port",
+            &port,
+        ],
+    );
+    assert!(start.status.success(), "{}", stderr(&start));
+    let install_target = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "install", "--version", target_version],
+    );
+    assert!(
+        install_target.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&install_target),
+        stderr(&install_target)
+    );
+
+    let target = run_ocm(&cwd, &env, &["runtime", "show", target_version, "--json"]);
+    assert!(target.status.success(), "{}", stderr(&target));
+    let target: Value = serde_json::from_str(&stdout(&target)).unwrap();
+    let target_root = PathBuf::from(target["installRoot"].as_str().unwrap());
+    let target_entrypoint = target_root.join("files/node_modules/openclaw/openclaw.mjs");
+    let target_chunks = target_root.join("files/node_modules/openclaw/dist/chunks");
+    fs::create_dir_all(&target_chunks).unwrap();
+    for index in 0..2_000 {
+        fs::write(
+            target_chunks.join(format!("chunk-{index:04}.js")),
+            format!("export const chunk{index} = {index};\n"),
+        )
+        .unwrap();
+    }
+    let watched_chunk = target_chunks.join("chunk-1000.js");
+    let entrypoint_hash_before = Sha512::digest(fs::read(&target_entrypoint).unwrap()).to_vec();
+    let entrypoint_inode_before = fs::metadata(&target_entrypoint).unwrap().ino();
+    let chunk_inode_before = fs::metadata(&watched_chunk).unwrap().ino();
+
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    write_running_supervisor_runtime(&runtime_path, &ocm_home, source_version, 4242, health_port);
+    let state_path = supervisor_state_path(&env, &cwd).unwrap();
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let gateway_status_started = root.child("gateway-status-started");
+    let gateway_status_release = root.child("gateway-status-release");
+    env.insert(
+        "OCM_TEST_GATEWAY_STATUS_STARTED".to_string(),
+        path_string(&gateway_status_started),
+    );
+    env.insert(
+        "OCM_TEST_GATEWAY_STATUS_RELEASE".to_string(),
+        path_string(&gateway_status_release),
+    );
+    let observer_done = Arc::new(AtomicBool::new(false));
+    let missing_target_file = Arc::new(AtomicBool::new(false));
+    let observer_done_thread = Arc::clone(&observer_done);
+    let missing_target_file_thread = Arc::clone(&missing_target_file);
+    let observed_entrypoint = target_entrypoint.clone();
+    let observed_chunk = watched_chunk.clone();
+    let observer_runtime_path = runtime_path.clone();
+    let observer_ocm_home = ocm_home.clone();
+    let observer = thread::spawn(move || {
+        let mut last_binding = Some(source_version.to_string());
+        let mut target_was_running = false;
+        let mut target_restart_was_acknowledged = false;
+        let mut target_entered_backoff = false;
+        let mut observed_bindings = Vec::new();
+        while !observer_done_thread.load(Ordering::Relaxed) {
+            if !observed_entrypoint.exists() || !observed_chunk.exists() {
+                missing_target_file_thread.store(true, Ordering::Relaxed);
+            }
+            let state = fs::read_to_string(&state_path).unwrap_or_default();
+            let state_json: Value = serde_json::from_str(&state).unwrap_or(Value::Null);
+            let planned_binding = state_json["children"]
+                .as_array()
+                .and_then(|children| children.iter().find(|child| child["envName"] == "demo"))
+                .and_then(|child| child["bindingName"].as_str())
+                .map(str::to_string);
+            let registry = fs::read_to_string(&registry_path).unwrap_or_default();
+            let registry_json: Value = serde_json::from_str(&registry).unwrap_or(Value::Null);
+            let registered = registry_json["envs"]
+                .as_array()
+                .and_then(|envs| envs.iter().find(|entry| entry["name"] == "demo"));
+            let next_binding = match registered {
+                Some(entry) if entry["serviceRunning"] == true => {
+                    entry["defaultRuntime"].as_str().map(str::to_string)
+                }
+                Some(_) => None,
+                None => planned_binding,
+            };
+            if next_binding != last_binding {
+                observed_bindings.push(next_binding.clone());
+                match next_binding.as_deref() {
+                    Some(value) if value == target_version => {
+                        write_running_supervisor_runtime(
+                            &observer_runtime_path,
+                            &observer_ocm_home,
+                            target_version,
+                            4243,
+                            health_port,
+                        );
+                        target_was_running = true;
+                    }
+                    Some(value) if value == source_version => write_running_supervisor_runtime(
+                        &observer_runtime_path,
+                        &observer_ocm_home,
+                        source_version,
+                        4244,
+                        health_port,
+                    ),
+                    None => {
+                        write_empty_supervisor_runtime(&observer_runtime_path, &observer_ocm_home)
+                    }
+                    _ => {}
+                }
+                last_binding = next_binding;
+            }
+            let target_restart_requested =
+                state_json["restartRequests"]
+                    .as_array()
+                    .is_some_and(|requests| {
+                        requests.iter().any(|request| request["envName"] == "demo")
+                    });
+            if target_was_running && !target_restart_was_acknowledged && target_restart_requested {
+                write_running_supervisor_runtime(
+                    &observer_runtime_path,
+                    &observer_ocm_home,
+                    target_version,
+                    4244,
+                    health_port,
+                );
+                target_restart_was_acknowledged = true;
+            }
+            if target_was_running && !target_entered_backoff && gateway_status_started.exists() {
+                write_backoff_supervisor_runtime(
+                    &observer_runtime_path,
+                    &observer_ocm_home,
+                    target_version,
+                    health_port,
+                );
+                fs::write(&gateway_status_release, []).unwrap();
+                target_entered_backoff = true;
+            }
+            sleep(Duration::from_millis(1));
+        }
+        (target_entered_backoff, observed_bindings)
+    });
+
+    env.insert("OCM_TEST_GATEWAY_UNREADY".to_string(), "1".to_string());
+    let upgrade = run_ocm(
+        &cwd,
+        &env,
+        &["upgrade", "demo", "--runtime", target_version],
+    );
+    observer_done.store(true, Ordering::Relaxed);
+    let (target_entered_backoff, observed_bindings) = observer.join().unwrap();
+
+    assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
+    let output = stdout(&upgrade);
+    assert!(output.contains("outcome=rolled-back"), "{output}");
+    assert!(output.contains("rollback=restored"), "{output}");
+    assert!(
+        target_entered_backoff,
+        "target never entered fixture backoff"
+    );
+    let target_observed = observed_bindings
+        .iter()
+        .position(|binding| binding.as_deref() == Some(target_version))
+        .expect("target binding was never observed");
+    let restored_source = observed_bindings
+        .iter()
+        .rposition(|binding| binding.as_deref() == Some(source_version))
+        .expect("restored source binding was never observed");
+    assert!(
+        target_observed < restored_source,
+        "source binding was not restored after the failed target: {observed_bindings:?}"
+    );
+    assert!(
+        !missing_target_file.load(Ordering::Relaxed),
+        "the retrying target observed its entrypoint or a chunk disappear"
+    );
+    assert_eq!(
+        fs::metadata(&target_entrypoint).unwrap().ino(),
+        entrypoint_inode_before,
+        "reused target entrypoint inode changed"
+    );
+    assert_eq!(
+        fs::metadata(&watched_chunk).unwrap().ino(),
+        chunk_inode_before,
+        "reused target chunk inode changed"
+    );
+    assert_eq!(
+        Sha512::digest(fs::read(&target_entrypoint).unwrap()).to_vec(),
+        entrypoint_hash_before,
+        "reused target entrypoint bytes changed"
+    );
+    let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["defaultRuntime"], source_version);
 }
 
 #[test]
@@ -2050,20 +2455,28 @@ fn upgrade_rolls_back_runtime_when_service_restart_fails() {
     assert!(start.status.success(), "{}", stderr(&start));
 
     let launchctl_bin = env.get("OCM_INTERNAL_LAUNCHCTL_BIN").unwrap();
+    let stopped_marker = root.child("service-stopped");
     write_executable_script(
         std::path::Path::new(launchctl_bin),
-        "#!/bin/sh\ncase \"$1\" in\n  managername)\n    exit 0\n    ;;\n  print)\n    printf 'state = waiting\\n'\n    exit 0\n    ;;\n  bootout|unload)\n    exit 0\n    ;;\n  bootstrap)\n    echo 'forced bootstrap failure' >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
+        &format!(
+            "#!/bin/sh\nmarker='{}'\ncase \"$1\" in\n  managername)\n    exit 0\n    ;;\n  print)\n    if [ -e \"$marker\" ]; then\n      printf 'Could not find service \\\"%s\\\" in domain for user gui\\n' \"$2\" >&2\n      exit 1\n    fi\n    printf 'state = waiting\\n'\n    exit 0\n    ;;\n  bootout|unload)\n    : > \"$marker\"\n    exit 0\n    ;;\n  bootstrap)\n    echo 'forced bootstrap failure' >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
+            stopped_marker.display()
+        ),
     );
 
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--version", "2026.3.25"]);
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
     let output = stdout(&upgrade);
     assert!(
-        output.contains("outcome=rolled-back"),
+        output.contains("outcome=rollback-failed"),
         "stdout:\n{output}\nstderr:\n{}",
         stderr(&upgrade)
     );
-    assert!(output.contains("rollback=restored"), "{output}");
+    assert!(output.contains("rollback=failed"), "{output}");
+    assert!(
+        output.contains("failed to restart the restored service"),
+        "{output}"
+    );
     assert!(output.contains("snapshot="), "{output}");
 
     let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
@@ -2668,8 +3081,7 @@ fn upgrade_reuses_the_bound_named_runtime_without_retaining_recovery_bytes() {
     let record = &history_json[0];
     assert_eq!(record["source"]["name"], "local");
     assert_eq!(record["target"]["name"], "local");
-    assert_eq!(record["runtimeRecovery"][0]["runtimeName"], "local");
-    assert!(record["runtimeRecovery"][0]["backupId"].is_null());
+    assert!(record["runtimeRecovery"].as_array().unwrap().is_empty());
 
     let recovery_root = Path::new(env.get("OCM_HOME").unwrap())
         .join("upgrade-history")
