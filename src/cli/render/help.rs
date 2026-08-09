@@ -1887,7 +1887,7 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
             "Build a local OpenClaw package runtime",
             "Run the local OpenClaw package build/pack path and install the produced tarball as an OCM-managed runtime.",
             vec![format!(
-                "{cmd} runtime build-local <name> --repo <openclaw-repo> [--include-source-extensions | --for-env <env>] [--description <text>] [--force] [--raw] [--json]"
+                "{cmd} runtime build-local <name> --repo <openclaw-repo> [--companion <plugin-id>]... [--include-source-extensions | --for-env <env>] [--description <text>] [--force] [--raw] [--json]"
             )],
             &[
                 (
@@ -1901,6 +1901,10 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
                 (
                     "--for-env <env>",
                     "Include the source-plugin closure required by one target environment",
+                ),
+                (
+                    "--companion <plugin-id>",
+                    "Build and bundle a commit-matched official plugin; repeatable",
                 ),
                 ("--description <text>", "Optional human description"),
                 (
@@ -1921,6 +1925,9 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!(
                     "{cmd} runtime build-local primary-test --repo /path/to/openclaw --for-env primary --force"
                 ),
+                format!(
+                    "{cmd} runtime build-local upstream-main --repo /path/to/openclaw --companion codex --force"
+                ),
             ],
             &[
                 "`build-local` uses `npm pack` so OpenClaw's prepack script performs the release-style build, UI build, package inventory, and built entry smoke checks.",
@@ -1928,6 +1935,7 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
                 "`--for-env` resolves the target config before the build, validates its plugin references against the selected checkout and installed-plugin records, and adds only required omitted source plugins plus transitive local plugin dependencies.",
                 "`--for-env` and `--include-source-extensions` are mutually exclusive.",
                 "Source-extension runtimes can take longer to build and use substantially more disk space than the release-shaped default.",
+                "Each `--companion` uses OpenClaw's package-local plugin release build, requires exact host-version parity, installs dependencies in an isolated plugin tree, and records artifact and entrypoint hashes.",
                 "The resulting runtime is installed under OCM's package runtime layout: files/node_modules/openclaw/openclaw.mjs.",
                 "Use this when testing release and upgrade behavior from a local checkout without source/Jiti execution paths.",
                 "A runtime bound to an environment cannot be replaced directly. Clear the binding first or use `ocm upgrade <env>` for published OpenClaw releases.",

@@ -16,6 +16,10 @@ All notable changes to OCM are documented here.
 - Copy repo-backed and symlinked plain-home agent workspaces into an adopted
   environment and rewrite the imported config to keep the fixture isolated.
 
+### Added
+
+- Let `runtime build-local` assemble repeatable, commit-matched official companion plugins through OpenClaw's release packaging contract, stage them as trusted runtime-owned bundled plugins with isolated dependencies, and record artifact and entrypoint hashes for verification.
+
 ### Changed
 
 - Resolve and package the complete transitive closure of private OpenClaw `workspace:*` dependencies during `runtime build-local`, rewriting nested workspace specs only inside scratch archives so current source graphs install without mutating the checkout.

@@ -22,7 +22,8 @@ pub(crate) use npm_proxy::{
 #[doc(hidden)]
 pub use npm_proxy::{is_internal_npm_proxy, run_internal_npm_proxy};
 pub use registry::{
-    AddRuntimeOptions, RuntimeMeta, RuntimeReleaseSelectorKind, RuntimeService, RuntimeSourceKind,
+    AddRuntimeOptions, RuntimeCompanionMeta, RuntimeMeta, RuntimeReleaseSelectorKind,
+    RuntimeService, RuntimeSourceKind,
 };
 pub use releases::{
     OpenClawRelease, OpenClawReleaseCatalogEntry, RuntimeRelease, RuntimeReleaseManifest,

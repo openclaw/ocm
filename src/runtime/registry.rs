@@ -47,6 +47,17 @@ impl RuntimeReleaseSelectorKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RuntimeCompanionMeta {
+    pub id: String,
+    pub package_name: String,
+    pub version: String,
+    pub artifact_sha256: String,
+    pub entrypoint: String,
+    pub entrypoint_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeMeta {
     pub kind: String,
     pub name: String,
@@ -75,6 +86,8 @@ pub struct RuntimeMeta {
     pub release_selector_value: Option<String>,
     #[serde(default)]
     pub install_root: Option<String>,
+    #[serde(default)]
+    pub companions: Vec<RuntimeCompanionMeta>,
     pub description: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,

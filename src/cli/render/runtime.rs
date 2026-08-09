@@ -258,6 +258,23 @@ pub fn runtime_show(
     }
     push_card(&mut lines, "Source details", source_rows, profile.color);
 
+    if !meta.companions.is_empty() {
+        push_card(
+            &mut lines,
+            "Companions",
+            meta.companions
+                .iter()
+                .map(|companion| {
+                    KeyValueRow::accent(
+                        companion.id.clone(),
+                        format!("{}@{}", companion.package_name, companion.version),
+                    )
+                })
+                .collect(),
+            profile.color,
+        );
+    }
+
     push_card(
         &mut lines,
         "Metadata",
@@ -351,6 +368,16 @@ fn runtime_show_raw(meta: &RuntimeMeta) -> Result<Vec<String>, String> {
     }
     if let Some(install_root) = meta.install_root.as_deref() {
         lines.insert("installRoot".to_string(), install_root.to_string());
+    }
+    if !meta.companions.is_empty() {
+        lines.insert(
+            "companions".to_string(),
+            meta.companions
+                .iter()
+                .map(|companion| format!("{}@{}", companion.package_name, companion.version))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
     }
     Ok(format_key_value_lines(lines))
 }
@@ -953,6 +980,12 @@ fn runtime_verify_raw(summary: &RuntimeVerifySummary) -> Vec<String> {
     if let Some(install_root) = summary.install_root.as_deref() {
         lines.push(format!("installRoot: {install_root}"));
     }
+    for companion in &summary.companions {
+        lines.push(format!(
+            "companion: {} {}@{}",
+            companion.id, companion.package_name, companion.version
+        ));
+    }
     if let Some(issue) = summary.issue.as_deref() {
         lines.push(format!("issue: {issue}"));
     }
@@ -1201,6 +1234,7 @@ mod tests {
             release_selector_kind: Some(RuntimeReleaseSelectorKind::Channel),
             release_selector_value: Some("stable".to_string()),
             install_root: Some("/tmp/ocm/runtimes/stable".to_string()),
+            companions: Vec::new(),
             description: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -1225,6 +1259,7 @@ mod tests {
             release_selector_kind: Some(RuntimeReleaseSelectorKind::Channel),
             release_selector_value: Some("stable".to_string()),
             install_root: Some("/tmp/ocm/runtimes/stable".to_string()),
+            companions: Vec::new(),
             healthy: true,
             issue: None,
         }

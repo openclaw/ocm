@@ -102,6 +102,7 @@ If you run `ocm setup` from inside an OpenClaw checkout, local mode can detect t
 
 ```bash
 ocm runtime build-local main-local --repo /path/to/openclaw --force
+ocm runtime build-local main-with-codex --repo /path/to/openclaw --companion codex --force
 ocm start luna --runtime main-local
 ocm upgrade luna --runtime main-local
 ```
@@ -113,10 +114,13 @@ their complete transitive closure. Its build-only npm proxy rewrites nested
 workspace specs to exact local versions only inside scratch archives, leaving
 the selected checkout unchanged.
 
+Repeat `--companion <plugin-id>` when the checkout contains an official plugin that is version-bound to the selected OpenClaw build but published separately. OCM uses OpenClaw's package-local plugin release contract, requires the plugin package version and `openclaw.build.openclawVersion` to match the root package exactly, installs its dependencies in an isolated runtime-owned tree, and stages it under `dist/extensions/<plugin-id>` so OpenClaw discovers it as bundled. The runtime record stores the package version plus artifact and entrypoint hashes, and `runtime verify` checks the installed entrypoint hash. OCM refuses missing, mismatched, non-publishable, duplicate, or already-bundled companion selections before publishing the runtime.
+
 The installed runtime uses the same package layout as published OpenClaw runtimes:
 
 ```text
 files/node_modules/openclaw/openclaw.mjs
+files/node_modules/openclaw/dist/extensions/codex/
 ```
 
 That matters for release and upgrade testing because it avoids source/Jiti execution paths and exercises the built package files that users install.
@@ -244,6 +248,7 @@ Examples:
 ```bash
 ocm release install --channel stable
 ocm runtime build-local main-local --repo /path/to/openclaw --force
+ocm runtime build-local main-with-codex --repo /path/to/openclaw --companion codex --force
 ocm runtime list
 ocm runtime show stable
 ocm runtime verify stable

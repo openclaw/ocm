@@ -301,6 +301,21 @@ impl Cli {
         let Some(repo) = repo else {
             return Err("--repo is required".to_string());
         };
+        let mut args = args;
+        let mut companions = Vec::new();
+        loop {
+            let (remaining, companion) = Self::consume_option(args, "--companion")?;
+            let Some(companion) = companion else {
+                args = remaining;
+                break;
+            };
+            let Some(companion) = Self::require_option_value(Some(companion), "--companion")?
+            else {
+                return Err("--companion is required".to_string());
+            };
+            companions.push(companion);
+            args = remaining;
+        }
         let (args, description) = Self::consume_option(args, "--description")?;
         let Some(name) = args.first() else {
             return Err("runtime name is required".to_string());
@@ -312,6 +327,7 @@ impl Cli {
                 .build_local(BuildLocalRuntimeOptions {
                     name: name.clone(),
                     repo: repo.clone(),
+                    companions,
                     description,
                     force,
                     include_source_extensions,
