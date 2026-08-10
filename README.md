@@ -191,6 +191,11 @@ operations reject that runtime. Use `ocm upgrade <env>` so the environment gets
 the snapshot, OpenClaw migration, rollback, and verification path, or clear the
 binding first when intentionally managing an unused runtime.
 
+For unreleased OpenClaw workspaces, `runtime build-local` follows the complete
+transitive closure of private `workspace:*` packages. It rewrites nested
+workspace specs only inside scratch archives before installation; the source
+checkout remains unchanged.
+
 `upgrade simulate` clones the source env, leaves the real env untouched, and
 cleans temporary simulation envs and runtimes when the run finishes. For
 published targets it first validates that the target exists, then runs OpenClaw's own
