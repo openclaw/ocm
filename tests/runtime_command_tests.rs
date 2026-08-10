@@ -127,7 +127,7 @@ fn source_extension_package_tarball() -> Vec<u8> {
         append_tar_file(
             &mut builder,
             "package/package.json",
-            br#"{"name":"@openclaw/codex","version":"2026.4.25","dependencies":{"codex-runtime":"1.0.0"}}"#,
+            br#"{"name":"@openclaw/codex","version":"2026.4.25","dependencies":{"codex-runtime":"1.0.0"},"peerDependencies":{"openclaw":"*"}}"#,
             0o644,
         );
         append_tar_file(
@@ -1115,6 +1115,36 @@ fn runtime_build_local_derives_source_plugins_from_target_env_before_pack() {
         fs::read_to_string(runtime_root.join("dist/extensions/codex/index.js")).unwrap(),
         "export const build = 'source';\n"
     );
+
+    let host_peer = runtime_root.join("dist/extensions/codex/node_modules/openclaw");
+    let peer_package: Value = serde_json::from_slice(
+        &fs::read(host_peer.join("package.json"))
+            .expect("Codex-like companion must resolve its OpenClaw host peer"),
+    )
+    .unwrap();
+    assert_eq!(peer_package["name"], "openclaw");
+
+    let verify = run_ocm(&cwd, &env, &["runtime", "verify", "primary-test", "--json"]);
+    assert!(verify.status.success(), "{}", stderr(&verify));
+    let verification: Value = serde_json::from_str(&stdout(&verify)).unwrap();
+    assert_eq!(verification["healthy"], true);
+
+    let metadata = fs::symlink_metadata(&host_peer).unwrap();
+    if metadata.file_type().is_symlink() {
+        fs::remove_file(&host_peer).unwrap();
+    } else {
+        fs::remove_dir_all(&host_peer).unwrap();
+    }
+    let verify_missing_peer = run_ocm(&cwd, &env, &["runtime", "verify", "primary-test", "--json"]);
+    assert_eq!(verify_missing_peer.status.code(), Some(1));
+    let missing_peer: Value = serde_json::from_str(&stdout(&verify_missing_peer)).unwrap();
+    assert_eq!(missing_peer["healthy"], false);
+    assert!(
+        missing_peer["issue"]
+            .as_str()
+            .unwrap()
+            .contains("runtime sha256 mismatch")
+    );
 }
 
 #[test]
@@ -1384,7 +1414,10 @@ exec "$OPENCLAW_OCM_REAL_NPM_BIN" "$@"
     let adapter_log = fs::read_to_string(adapter_log).unwrap();
     assert!(adapter_log.contains("args=pack --pack-destination"));
     assert!(adapter_log.contains("args=install --prefix"));
-    assert!(adapter_log.contains("real-npm=npm"));
+    assert!(adapter_log.lines().any(|line| {
+        line.strip_prefix("real-npm=")
+            .is_some_and(|value| value.ends_with("/ocm") || value.ends_with("\\ocm.exe"))
+    }));
     assert!(adapter_log.contains(&format!("adapter={adapter_extension}")));
     assert_eq!(
         adapter_log

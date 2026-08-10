@@ -37,5 +37,9 @@ fn run() -> Result<i32, String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    if ocm::runtime::is_internal_npm_proxy(&env_map) {
+        return ocm::runtime::run_internal_npm_proxy(&args, &env_map, &cwd);
+    }
+
     Ok(Cli { env: env_map, cwd }.run(args))
 }

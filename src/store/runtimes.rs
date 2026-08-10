@@ -21,9 +21,11 @@ use crate::runtime::releases::{
     select_release,
 };
 use crate::runtime::{
-    AddRuntimeOptions, InstallRuntimeFromOfficialReleaseOptions, InstallRuntimeFromReleaseOptions,
-    InstallRuntimeFromUrlOptions, InstallRuntimeOptions, RuntimeMeta, RuntimeReleaseSelectorKind,
-    RuntimeSourceKind, is_official_openclaw_package_runtime, is_openclaw_package_runtime,
+    AddRuntimeOptions, INTERNAL_NPM_PROXY_REAL_BIN_ENV, INTERNAL_NPM_PROXY_WORKSPACE_DIRS_ENV,
+    INTERNAL_NPM_PROXY_WORKSPACE_VERSIONS_ENV, InstallRuntimeFromOfficialReleaseOptions,
+    InstallRuntimeFromReleaseOptions, InstallRuntimeFromUrlOptions, InstallRuntimeOptions,
+    RuntimeMeta, RuntimeReleaseSelectorKind, RuntimeSourceKind,
+    is_official_openclaw_package_runtime, is_openclaw_package_runtime,
 };
 
 use super::common::{
@@ -388,7 +390,22 @@ fn configured_npm_program(env: &BTreeMap<String, String>) -> Option<String> {
 struct LocalBuildNpmAdapter {
     command: CommandSpec,
     real_npm: String,
+    npm_proxy: String,
     workspace_dependency_dirs: Option<OsString>,
+    workspace_dependency_versions: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalWorkspacePackage {
+    dir: PathBuf,
+    version: Option<String>,
+    workspace_dependencies: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalWorkspaceDependencyPlan {
+    dirs: OsString,
+    versions_json: String,
 }
 
 #[derive(Clone, Debug)]
@@ -421,11 +438,22 @@ struct SourcePluginInventory {
 
 impl LocalBuildNpmAdapter {
     fn apply_environment(&self, command: &mut Command) {
-        command.env("OPENCLAW_OCM_REAL_NPM_BIN", &self.real_npm);
+        command.env("OPENCLAW_OCM_REAL_NPM_BIN", &self.npm_proxy);
+        command.env(INTERNAL_NPM_PROXY_REAL_BIN_ENV, &self.real_npm);
         if let Some(workspace_dependency_dirs) = &self.workspace_dependency_dirs {
             command.env(
                 "OPENCLAW_OCM_WORKSPACE_DEPENDENCY_DIRS",
                 workspace_dependency_dirs,
+            );
+            command.env(
+                INTERNAL_NPM_PROXY_WORKSPACE_DIRS_ENV,
+                workspace_dependency_dirs,
+            );
+        }
+        if let Some(workspace_dependency_versions) = &self.workspace_dependency_versions {
+            command.env(
+                INTERNAL_NPM_PROXY_WORKSPACE_VERSIONS_ENV,
+                workspace_dependency_versions,
             );
         }
     }
@@ -756,7 +784,9 @@ fn resolve_target_source_plugin_closure(
     source_plugin_dependency_closure(direct, &inventory)
 }
 
-fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>, String> {
+fn local_workspace_dependency_plan(
+    repo_path: &Path,
+) -> Result<Option<LocalWorkspaceDependencyPlan>, String> {
     let package_json_path = repo_path.join("package.json");
     let raw = fs::read_to_string(&package_json_path).map_err(|error| {
         format!(
@@ -775,12 +805,19 @@ fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>,
     if pending.is_empty() {
         return Ok(None);
     }
-    let mut visited = root_package
+    let root_name = root_package
         .get("name")
         .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+        .unwrap_or("openclaw")
+        .to_string();
+    let root_version = root_package
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "OpenClaw package.json is missing a non-empty version".to_string())?
+        .to_string();
+    let mut visited = BTreeSet::from([root_name.clone()]);
 
     let mut packages = BTreeMap::new();
     for package_dir in local_workspace_package_dirs(repo_path)? {
@@ -799,27 +836,52 @@ fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>,
             .get("name")
             .and_then(serde_json::Value::as_str)
         {
-            packages.insert(name.to_string(), (package_dir, package_value));
+            packages.insert(
+                name.to_string(),
+                LocalWorkspacePackage {
+                    dir: package_dir,
+                    version: package_value
+                        .get("version")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                    workspace_dependencies: workspace_dependency_names(&package_value, true),
+                },
+            );
         }
     }
 
     let mut selected = BTreeMap::new();
+    let mut versions = BTreeMap::from([(root_name, root_version)]);
     while let Some(name) = pending.pop_first() {
         if !visited.insert(name.clone()) {
             continue;
         }
-        let (package_dir, package_value) = packages.get(&name).ok_or_else(|| {
+        let package = packages.get(&name).cloned().ok_or_else(|| {
             format!(
                 "OpenClaw workspace dependency \"{name}\" is not declared by pnpm-workspace.yaml"
             )
         })?;
-        selected.insert(name, package_dir.clone());
-        pending.extend(workspace_dependency_names(package_value, true));
+        let version = package.version.clone().ok_or_else(|| {
+            format!("selected OpenClaw workspace dependency \"{name}\" is missing a version")
+        })?;
+        pending.extend(package.workspace_dependencies.iter().cloned());
+        versions.insert(name.clone(), version);
+        selected.insert(name, package);
     }
 
-    std::env::join_paths(selected.into_values())
-        .map(Some)
-        .map_err(|error| format!("failed to encode OpenClaw workspace dependency paths: {error}"))
+    let dirs =
+        std::env::join_paths(selected.values().map(|package| &package.dir)).map_err(|error| {
+            format!("failed to encode OpenClaw workspace dependency paths: {error}")
+        })?;
+    let versions_json = serde_json::to_string(&versions).map_err(|error| {
+        format!("failed to encode OpenClaw workspace dependency versions: {error}")
+    })?;
+    Ok(Some(LocalWorkspaceDependencyPlan {
+        dirs,
+        versions_json,
+    }))
 }
 
 fn local_build_npm_adapter(
@@ -838,6 +900,9 @@ fn local_build_npm_adapter(
         return Ok(None);
     };
 
+    let workspace_dependencies = local_workspace_dependency_plan(repo_path)?;
+    let npm_proxy = std::env::current_exe()
+        .map_err(|error| format!("failed to resolve OCM npm proxy executable: {error}"))?;
     Ok(Some(LocalBuildNpmAdapter {
         command: CommandSpec {
             program: "node".to_string(),
@@ -845,7 +910,11 @@ fn local_build_npm_adapter(
             path_prepend: None,
         },
         real_npm: "npm".to_string(),
-        workspace_dependency_dirs: local_workspace_dependency_dirs(repo_path)?,
+        npm_proxy: display_path(&npm_proxy),
+        workspace_dependency_dirs: workspace_dependencies
+            .as_ref()
+            .map(|plan| plan.dirs.clone()),
+        workspace_dependency_versions: workspace_dependencies.map(|plan| plan.versions_json),
     }))
 }
 
@@ -1309,6 +1378,70 @@ fn pack_local_source_extensions(
     Ok(archives)
 }
 
+fn remove_path_if_present(path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path).map_err(|error| error.to_string())
+    } else {
+        fs::remove_file(path).map_err(|error| error.to_string())
+    }
+}
+
+fn link_or_copy_openclaw_host(source: &Path, target: &Path) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        ensure_dir(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        let link_target = relative_symlink_target(source, target).unwrap_or_else(|| source.into());
+        if std::os::unix::fs::symlink(link_target, target).is_ok() {
+            return Ok(());
+        }
+    }
+    #[cfg(windows)]
+    {
+        let link_target = relative_symlink_target(source, target).unwrap_or_else(|| source.into());
+        if std::os::windows::fs::symlink_dir(link_target, target).is_ok() {
+            return Ok(());
+        }
+    }
+
+    // The target is nested inside the host package, so stage the fallback outside
+    // that tree before copying to avoid recursively copying the destination.
+    let staged = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let staged_host = staged.path().join("openclaw");
+    copy_dir_recursive(source, &staged_host)?;
+    copy_dir_recursive(&staged_host, target)
+}
+
+fn ensure_local_source_extension_openclaw_peer(
+    host_package: &Path,
+    extension_root: &Path,
+) -> Result<(), String> {
+    let package_json_path = extension_root.join("package.json");
+    let package: serde_json::Value = read_json(&package_json_path).map_err(|error| {
+        format!(
+            "failed to inspect installed source extension package at {}: {error}",
+            display_path(&package_json_path)
+        )
+    })?;
+    if package
+        .pointer("/peerDependencies/openclaw")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let peer_path = extension_root.join("node_modules/openclaw");
+    remove_path_if_present(&peer_path)?;
+    link_or_copy_openclaw_host(host_package, &peer_path)
+}
+
 fn materialize_local_source_extensions(
     install_files: &Path,
     extensions: &[LocalSourceExtensionArchive],
@@ -1343,6 +1476,10 @@ fn materialize_local_source_extensions(
             ));
         }
         copy_dir_recursive(&installed_package, &target)?;
+        ensure_local_source_extension_openclaw_peer(
+            &installed_openclaw_package_root(install_files),
+            &target,
+        )?;
     }
     Ok(())
 }
@@ -1577,6 +1714,7 @@ fn prepare_runtime_from_openclaw_package(
     })()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_runtime_from_openclaw_package_archive(
     target: &RuntimeInstallTarget,
     archive_path: &Path,
@@ -2051,6 +2189,7 @@ pub fn install_runtime_from_release(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install_runtime_from_selected_release(
     name: String,
     force: bool,

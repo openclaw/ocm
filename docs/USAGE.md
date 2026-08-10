@@ -108,6 +108,11 @@ ocm upgrade luna --runtime main-local
 
 Use this when you need to test what users will run after an OpenClaw release, but from a local checkout before publishing. OCM runs `npm pack` in the OpenClaw repo, which triggers OpenClaw's package prepack path instead of registering a source checkout command.
 
+When the root package depends on private `workspace:*` packages, OCM resolves
+their complete transitive closure. Its build-only npm proxy rewrites nested
+workspace specs to exact local versions only inside scratch archives, leaving
+the selected checkout unchanged.
+
 The installed runtime uses the same package layout as published OpenClaw runtimes:
 
 ```text
