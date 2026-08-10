@@ -2,6 +2,7 @@ mod support;
 
 use std::{fs, path::Path};
 
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout, write_text};
@@ -265,6 +266,71 @@ fn env_snapshot_restore_reverts_state_from_the_selected_snapshot() {
         fs::read_to_string(root.child("ocm-home/envs/source/.openclaw/workspace/notes.txt"))
             .unwrap(),
         "before restore"
+    );
+}
+
+#[test]
+fn env_snapshot_restore_preserves_device_pairing_state_while_clearing_foreign_runtime_refs() {
+    let root = TestDir::new("env-snapshot-device-pairing-state");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    for (name, port) in [("foreign", "19780"), ("source", "19781")] {
+        let create = run_ocm(&cwd, &env, &["env", "create", name, "--port", port]);
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
+
+    let source_state = root.child("ocm-home/envs/source/.openclaw");
+    let foreign_workspace = root.child("ocm-home/envs/foreign/.openclaw/workspace");
+    write_text(
+        &source_state.join("agents/main/sessions/main.jsonl"),
+        &format!("{{\"cwd\":\"{}\"}}\n", foreign_workspace.display()),
+    );
+    let database_path = source_state.join("state/openclaw.sqlite");
+    fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+    let database = Connection::open(&database_path).unwrap();
+    database
+        .execute_batch(
+            "CREATE TABLE device_pairing_paired (
+               device_id TEXT PRIMARY KEY,
+               token TEXT NOT NULL
+             );
+             INSERT INTO device_pairing_paired VALUES ('paired-browser', 'must-survive');",
+        )
+        .unwrap();
+    drop(database);
+
+    let snapshot = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "create", "source", "--json"],
+    );
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+    let snapshot_json: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    let snapshot_id = snapshot_json["id"].as_str().unwrap();
+
+    let restore = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "restore", "source", snapshot_id],
+    );
+    assert!(restore.status.success(), "{}", stderr(&restore));
+
+    let restored = Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("snapshot restore must retain OpenClaw's shared state database");
+    let token: String = restored
+        .query_row(
+            "SELECT token FROM device_pairing_paired WHERE device_id = 'paired-browser'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(token, "must-survive");
+    assert!(
+        !source_state
+            .join("agents/main/sessions/main.jsonl")
+            .exists()
     );
 }
 

@@ -187,7 +187,7 @@ pub(crate) fn clear_nonportable_runtime_state(
         let path = entry.path();
         let name = entry.file_name();
         if name == OsStr::new("openclaw.json")
-            || is_managed_plugin_state_root(&name)
+            || is_durable_openclaw_state_root(&name)
             || workspaces.contains(&path)
         {
             continue;
@@ -210,10 +210,10 @@ pub(crate) fn clear_nonportable_runtime_state(
     Ok(changed)
 }
 
-fn is_managed_plugin_state_root(name: &OsStr) -> bool {
+fn is_durable_openclaw_state_root(name: &OsStr) -> bool {
     matches!(
         name.to_str(),
-        Some("plugins") | Some("extensions") | Some("npm") | Some("git")
+        Some("state") | Some("plugins") | Some("extensions") | Some("npm") | Some("git")
     )
 }
 
@@ -780,6 +780,12 @@ mod tests {
             "keep secondary workspace\n",
         )
         .unwrap();
+        fs::create_dir_all(paths.state_dir.join("state")).unwrap();
+        fs::write(
+            paths.state_dir.join("state/openclaw.sqlite"),
+            "paired device state must survive\n",
+        )
+        .unwrap();
 
         let changed = clear_nonportable_runtime_state(
             &paths,
@@ -796,6 +802,7 @@ mod tests {
                 .join("workspace-clawforce/skills/social.md")
                 .exists()
         );
+        assert!(paths.state_dir.join("state/openclaw.sqlite").exists());
         assert!(
             paths
                 .state_dir
