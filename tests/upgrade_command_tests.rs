@@ -23,7 +23,7 @@ use tar::{Builder, Header};
 
 use crate::support::{
     TestDir, TestHttpServer, install_fake_launchctl, install_fake_node_and_npm, ocm_env,
-    path_string, run_ocm, stderr, stdout, write_executable_script,
+    path_string, run_ocm, stderr, stdout, write_executable_script, write_text,
 };
 
 fn append_tar_file(
@@ -181,6 +181,11 @@ case "$1" in
         while [ ! -e "$OCM_TEST_UPDATE_FINALIZE_RELEASE" ]; do
           sleep 0.05
         done
+      fi
+      if [ -n "${{OCM_TEST_REQUIRE_STOP_MARKER_DURING_FINALIZE:-}}" ] &&
+         [ ! -e "$OCM_TEST_REQUIRE_STOP_MARKER_DURING_FINALIZE" ]; then
+        echo "managed service was not stopped before update finalize" >&2
+        exit 24
       fi
       if [ "${{OCM_TEST_FAIL_UPDATE_FINALIZE:-}}" = "1" ]; then
         echo "forced update finalize failure" >&2
@@ -951,6 +956,8 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
     );
     let replacement_runtime_path = runtime_path.clone();
     let replacement_ocm_home = ocm_home.clone();
+    let stop_marker = root.child("service-stopped-before-finalize");
+    let observed_stop_marker = stop_marker.clone();
     let observer_done = Arc::new(AtomicBool::new(false));
     let missing_while_active = Arc::new(AtomicBool::new(false));
     let observer_done_thread = Arc::clone(&observer_done);
@@ -991,6 +998,7 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
                         &replacement_runtime_path,
                         &replacement_ocm_home,
                     );
+                    fs::write(&observed_stop_marker, "stopped").unwrap();
                     stop_count += 1;
                     runtime_active = false;
                 }
@@ -1015,6 +1023,10 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
         (stop_count, start_count, target_entered_backoff)
     });
 
+    env.insert(
+        "OCM_TEST_REQUIRE_STOP_MARKER_DURING_FINALIZE".to_string(),
+        path_string(&stop_marker),
+    );
     env.insert("OCM_TEST_GATEWAY_UNREADY".to_string(), "1".to_string());
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo"]);
     observer_done.store(true, Ordering::Relaxed);
@@ -2454,6 +2466,15 @@ fn upgrade_rolls_back_runtime_when_service_restart_fails() {
     let start = run_ocm(&cwd, &env, &["start", "demo"]);
     assert!(start.status.success(), "{}", stderr(&start));
 
+    let before = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(before.status.success(), "{}", stderr(&before));
+    let before_json: Value = serde_json::from_str(&stdout(&before)).unwrap();
+    let env_root = PathBuf::from(before_json["root"].as_str().unwrap());
+    let dotenv = env_root.join(".openclaw/.env");
+    let future_state = env_root.join("durable-future/rollback-marker.txt");
+    write_text(&dotenv, "OPENCLAW_ROLLBACK_SENTINEL=before\n");
+    write_text(&future_state, "safe pre-upgrade state\n");
+
     let launchctl_bin = env.get("OCM_INTERNAL_LAUNCHCTL_BIN").unwrap();
     let stopped_marker = root.child("service-stopped");
     write_executable_script(
@@ -2494,6 +2515,20 @@ fn upgrade_rolls_back_runtime_when_service_restart_fails() {
         stderr(&target_runtime).contains("runtime \"2026.3.25\" does not exist"),
         "{}",
         stderr(&target_runtime)
+    );
+
+    let restored = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(restored.status.success(), "{}", stderr(&restored));
+    let restored_json: Value = serde_json::from_str(&stdout(&restored)).unwrap();
+    assert_eq!(restored_json["defaultRuntime"], "stable");
+    assert_eq!(restored_json["root"], before_json["root"]);
+    assert_eq!(
+        fs::read_to_string(&dotenv).unwrap(),
+        "OPENCLAW_ROLLBACK_SENTINEL=before\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&future_state).unwrap(),
+        "safe pre-upgrade state\n"
     );
 }
 

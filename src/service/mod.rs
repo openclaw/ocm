@@ -18,6 +18,12 @@ pub struct ServiceService<'a> {
     cwd: &'a Path,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ServiceMaintenanceState {
+    pub(crate) enabled: bool,
+    pub(crate) running: bool,
+}
+
 impl<'a> ServiceService<'a> {
     pub fn new(env: &'a BTreeMap<String, String>, cwd: &'a Path) -> Self {
         Self { env, cwd }
@@ -148,6 +154,57 @@ impl<'a> ServiceService<'a> {
             }
             sleep(Duration::from_millis(25));
         }
+    }
+
+    pub(crate) fn quiesce_for_snapshot_locked(
+        &self,
+        name: &str,
+    ) -> Result<Option<ServiceMaintenanceState>, String> {
+        let status = self.status(name)?;
+        if !status.running {
+            return Ok(None);
+        }
+        let meta = crate::env::EnvironmentService::new(self.env, self.cwd).get(name)?;
+        let state = ServiceMaintenanceState {
+            enabled: meta.service_enabled,
+            running: meta.service_running,
+        };
+        let stopped = self.stop_locked(name)?;
+        if stopped.running {
+            let stop_error = format!(
+                "managed service for {name} remained running after the snapshot safety stop"
+            );
+            return match self.restore_after_snapshot_locked(name, Some(state)) {
+                Ok(()) => Err(stop_error),
+                Err(restore_error) => Err(format!(
+                    "{stop_error}; also failed to restore its pre-snapshot service policy: {restore_error}"
+                )),
+            };
+        }
+        if let Err(error) = self.wait_for_runtime_mutation_quiescence_locked(name) {
+            return match self.restore_after_snapshot_locked(name, Some(state)) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(format!(
+                    "{error}; also failed to restore its pre-snapshot service policy: {restore_error}"
+                )),
+            };
+        }
+        Ok(Some(state))
+    }
+
+    pub(crate) fn restore_after_snapshot_locked(
+        &self,
+        name: &str,
+        state: Option<ServiceMaintenanceState>,
+    ) -> Result<(), String> {
+        if state.is_some_and(|state| state.enabled && state.running) {
+            let meta = crate::env::EnvironmentService::new(self.env, self.cwd).get(name)?;
+            if meta.service_enabled && meta.service_running && self.status(name)?.running {
+                return Ok(());
+            }
+            self.start_locked(name)?;
+        }
+        Ok(())
     }
 
     pub fn restart(&self, name: &str) -> Result<ServiceActionSummary, String> {

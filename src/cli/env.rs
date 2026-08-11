@@ -807,11 +807,33 @@ impl Cli {
         Self::assert_no_extra_args(&args[1..])?;
 
         let snapshot = self.with_progress(format!("Creating snapshot for {name}"), || {
-            self.environment_service()
-                .create_snapshot(CreateEnvSnapshotOptions {
-                    env_name: name.clone(),
-                    label,
-                })
+            let _operation_lock = self.environment_service().lock_operation(name)?;
+            let service_state = self
+                .service_service()
+                .quiesce_for_snapshot_locked(name)?;
+            let snapshot_result = self
+                .environment_service()
+                .create_snapshot_locked_with_service_state(
+                    CreateEnvSnapshotOptions {
+                        env_name: name.clone(),
+                        label,
+                    },
+                    service_state.map(|state| (state.enabled, state.running)),
+                );
+            let service_result = self
+                .service_service()
+                .restore_after_snapshot_locked(name, service_state);
+            match (snapshot_result, service_result) {
+                (Ok(snapshot), Ok(())) => Ok(snapshot),
+                (Ok(snapshot), Err(service_error)) => Err(format!(
+                    "snapshot {} was created, but the managed service could not be restored: {service_error}",
+                    snapshot.id
+                )),
+                (Err(snapshot_error), Ok(())) => Err(snapshot_error),
+                (Err(snapshot_error), Err(service_error)) => Err(format!(
+                    "{snapshot_error}; also failed to restore the managed service after snapshot capture: {service_error}"
+                )),
+            }
         })?;
 
         if json_flag {
@@ -884,11 +906,84 @@ impl Cli {
         let restored = self.with_progress(
             format!("Restoring snapshot {snapshot_id} for {name}"),
             || {
-                self.environment_service()
-                    .restore_snapshot(RestoreEnvSnapshotOptions {
+                let _operation_lock = self.environment_service().lock_operation(name)?;
+                let selected_snapshot = self
+                    .environment_service()
+                    .get_snapshot(name, snapshot_id)?;
+                let service_state = self
+                    .service_service()
+                    .quiesce_for_snapshot_locked(name)?;
+                let restore_result = self.environment_service().prepare_snapshot_restore_locked(
+                    RestoreEnvSnapshotOptions {
                         env_name: name.clone(),
                         snapshot_id: snapshot_id.clone(),
-                    })
+                    },
+                );
+                match restore_result {
+                    Ok(transaction) => {
+                        let restored = transaction.summary.clone();
+                        let restored_service_state =
+                            if selected_snapshot.service_enabled && selected_snapshot.service_running {
+                                Some(crate::service::ServiceMaintenanceState {
+                                    enabled: true,
+                                    running: true,
+                                })
+                            } else {
+                                None
+                            };
+                        let service_acceptance = self
+                            .service_service()
+                            .restore_after_snapshot_locked(name, restored_service_state)
+                            .and_then(|()| {
+                                if restored_service_state.is_none() {
+                                    return Ok(());
+                                }
+                                match self.wait_for_restarted_gateway_health(name, true)? {
+                                    None => Ok(()),
+                                    Some(note) => Err(note),
+                                }
+                            });
+                        match service_acceptance {
+                            Ok(()) => {
+                                self.environment_service()
+                                    .commit_snapshot_restore_locked(transaction)?;
+                                Ok(restored)
+                            }
+                            Err(service_error) => {
+                                let rollback_result = self
+                                    .environment_service()
+                                    .rollback_snapshot_restore_locked(transaction);
+                                let service_restore_result = self
+                                    .service_service()
+                                    .restore_after_snapshot_locked(name, service_state);
+                                let mut error = format!(
+                                    "snapshot {} failed managed-service acceptance: {service_error}",
+                                    restored.snapshot_id
+                                );
+                                if let Err(rollback_error) = rollback_result {
+                                    error.push_str(&format!(
+                                        "; restoring the displaced environment root also failed: {rollback_error}"
+                                    ));
+                                }
+                                if let Err(restore_error) = service_restore_result {
+                                    error.push_str(&format!(
+                                        "; restoring the pre-restore managed service also failed: {restore_error}"
+                                    ));
+                                }
+                                Err(error)
+                            }
+                        }
+                    }
+                    Err(restore_error) => match self
+                        .service_service()
+                        .restore_after_snapshot_locked(name, service_state)
+                    {
+                        Ok(()) => Err(restore_error),
+                        Err(service_error) => Err(format!(
+                            "{restore_error}; also failed to restore the pre-restore managed service state: {service_error}"
+                        )),
+                    },
+                }
             },
         )?;
 

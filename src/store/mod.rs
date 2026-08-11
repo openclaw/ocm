@@ -1,3 +1,4 @@
+mod checkpoints;
 mod common;
 mod envs;
 mod gateway_ports;
@@ -46,8 +47,8 @@ pub use layout::{
     EnvPaths, StorePaths, clean_path, default_env_root, derive_env_paths, display_path,
     env_registry_path, launcher_meta_path, resolve_absolute_path, resolve_ocm_home,
     resolve_store_paths, resolve_user_home, runtime_install_files_dir, runtime_install_root,
-    runtime_meta_path, snapshot_archive_path, snapshot_env_dir, snapshot_meta_path,
-    source_watch_override_path, supervisor_logs_dir, supervisor_runtime_path,
+    runtime_meta_path, snapshot_archive_path, snapshot_checkpoint_path, snapshot_env_dir,
+    snapshot_meta_path, source_watch_override_path, supervisor_logs_dir, supervisor_runtime_path,
     supervisor_state_path, upgrade_history_env_dir, upgrade_history_meta_path,
     upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir, validate_name,
 };
@@ -63,8 +64,7 @@ pub(crate) use openclaw_config::{
 };
 pub(crate) use openclaw_state::{
     OpenClawStateAudit, audit_openclaw_state, clear_nonportable_runtime_state,
-    openclaw_env_archive_options, openclaw_env_snapshot_archive_options,
-    prepare_migrated_runtime_state, repair_openclaw_runtime_state,
+    openclaw_env_archive_options, prepare_migrated_runtime_state, repair_openclaw_runtime_state,
 };
 pub(crate) use openclaw_workspaces::{
     OpenClawWorkspaceRuntime, resolve_env_openclaw_workspaces, resolve_plain_openclaw_workspaces,
@@ -77,6 +77,11 @@ pub use runtimes::{
     add_runtime, get_runtime, get_runtime_verified, install_runtime,
     install_runtime_from_official_openclaw_release, install_runtime_from_release,
     install_runtime_from_url, list_runtimes, remove_runtime, runtime_integrity_issue,
+};
+pub(crate) use snapshots::{
+    EnvSnapshotRestoreTransaction, commit_env_snapshot_restore,
+    create_env_snapshot_with_service_state, prepare_env_snapshot_restore,
+    rollback_env_snapshot_restore,
 };
 pub use snapshots::{
     create_env_snapshot, get_env_snapshot, list_all_env_snapshots, list_env_snapshots,

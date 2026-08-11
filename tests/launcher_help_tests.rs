@@ -604,7 +604,9 @@ fn nested_snapshot_help_is_available() {
     assert!(remove.status.success(), "{}", stderr(&remove));
     let output = stdout(&remove);
     assert!(output.contains("ocm env snapshot remove <name> <snapshot> [--raw] [--json]"));
-    assert!(output.contains("validates the stored environment, snapshot ID, and archive path"));
+    assert!(output.contains(
+        "validates the stored environment, snapshot ID, storage kind, and artifact path"
+    ));
     assert!(output.contains("later cleanup failures are reported as warnings"));
 
     let prune = run_ocm(&cwd, &env, &["help", "env", "snapshot", "prune"]);

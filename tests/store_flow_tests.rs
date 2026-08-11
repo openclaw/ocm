@@ -1096,20 +1096,20 @@ fn environment_snapshot_captures_a_named_point_in_time() {
 
     assert_eq!(snapshot.env_name, "source");
     assert_eq!(snapshot.label.as_deref(), Some("before-upgrade"));
-    assert!(snapshot.archive_path.ends_with(".tar"));
+    assert!(snapshot.archive_path.ends_with(".checkpoint"));
+    assert!(matches!(
+        snapshot.storage_kind.as_str(),
+        "apfs-clone-v1" | "full-copy-v1"
+    ));
 
     let fetched = get_env_snapshot("source", &snapshot.id, &env, &cwd).unwrap();
     assert_eq!(fetched.id, snapshot.id);
 
-    let extract_dir = root.child("snapshot-extracted");
-    let extracted = extract_env_archive::<EnvArchiveMetadata>(
-        std::path::Path::new(&snapshot.archive_path),
-        &extract_dir,
-    )
-    .unwrap();
-    assert_eq!(extracted.metadata.env.name, "source");
     assert_eq!(
-        fs::read_to_string(extracted.root_dir.join(".openclaw/workspace/notes.txt")).unwrap(),
+        fs::read_to_string(
+            std::path::Path::new(&snapshot.archive_path).join(".openclaw/workspace/notes.txt")
+        )
+        .unwrap(),
         "hello snapshot"
     );
 }
@@ -1197,9 +1197,6 @@ fn environment_snapshot_restores_live_global_and_agent_sqlite_state() {
 
     for database in [&global_database, &agent_database] {
         assert!(database.exists());
-        assert!(!database.with_extension("sqlite-wal").exists());
-        assert!(!database.with_extension("sqlite-shm").exists());
-        assert!(!database.with_extension("sqlite-journal").exists());
         let restored = Connection::open_with_flags(
             database,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1222,7 +1219,7 @@ fn environment_snapshot_restores_live_global_and_agent_sqlite_state() {
 
 #[cfg(unix)]
 #[test]
-fn environment_snapshot_preserves_managed_plugin_payloads_and_skips_runtime_debris() {
+fn environment_snapshot_captures_the_complete_root_and_clears_runtime_residue_on_restore() {
     let root = TestDir::new("store-env-snapshot-legacy-plugin-deps");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -1368,36 +1365,23 @@ fn environment_snapshot_preserves_managed_plugin_payloads_and_skips_runtime_debr
     )
     .unwrap();
 
-    let extract_dir = root.child("snapshot-extracted");
-    let extracted = extract_env_archive::<EnvArchiveMetadata>(
-        std::path::Path::new(&snapshot.archive_path),
-        &extract_dir,
-    )
-    .unwrap();
+    let checkpoint_root = std::path::Path::new(&snapshot.archive_path);
     assert_eq!(
-        fs::read_to_string(extracted.root_dir.join(".openclaw/workspace/notes.txt")).unwrap(),
+        fs::read_to_string(checkpoint_root.join(".openclaw/workspace/notes.txt")).unwrap(),
         "hello snapshot"
     );
     assert_eq!(
-        fs::read_to_string(extracted.root_dir.join(".openclaw/openclaw.json")).unwrap(),
+        fs::read_to_string(checkpoint_root.join(".openclaw/openclaw.json")).unwrap(),
         "{\"gateway\":{\"port\":19789}}\n"
     );
     assert_eq!(
-        fs::read_to_string(
-            extracted
-                .root_dir
-                .join(".openclaw/agents/main/agent/auth-profiles.json")
-        )
-        .unwrap(),
+        fs::read_to_string(checkpoint_root.join(".openclaw/agents/main/agent/auth-profiles.json"))
+            .unwrap(),
         "{\"default\":\"ok\"}\n"
     );
     assert_eq!(
-        fs::read_to_string(
-            extracted
-                .root_dir
-                .join(".openclaw/agents/main/sessions/main.jsonl")
-        )
-        .unwrap(),
+        fs::read_to_string(checkpoint_root.join(".openclaw/agents/main/sessions/main.jsonl"))
+            .unwrap(),
         "{\"runtime\":\"session\"}\n"
     );
     for path in [
@@ -1415,63 +1399,48 @@ fn environment_snapshot_preserves_managed_plugin_payloads_and_skips_runtime_debr
         ".openclaw/git/git-demo/repo/.git/HEAD",
         ".openclaw/git/git-demo/repo/openclaw.plugin.json",
     ] {
-        assert!(extracted.root_dir.join(path).exists(), "{path}");
+        assert!(checkpoint_root.join(path).exists(), "{path}");
     }
     assert!(
-        fs::symlink_metadata(extracted.root_dir.join(".openclaw/workspace/missing-link"))
+        fs::symlink_metadata(checkpoint_root.join(".openclaw/workspace/missing-link"))
             .unwrap()
             .file_type()
             .is_symlink()
     );
     assert!(
         fs::symlink_metadata(
-            extracted
-                .root_dir
-                .join(".openclaw/npm/projects/demo/node_modules/demo-link")
+            checkpoint_root.join(".openclaw/npm/projects/demo/node_modules/demo-link")
         )
         .unwrap()
         .file_type()
         .is_symlink()
     );
-    assert!(
-        !extracted
-            .root_dir
-            .join(".openclaw/plugin-runtime-deps")
-            .exists()
-    );
-    assert!(
-        !extracted
-            .root_dir
-            .join(".openclaw/bundled-plugin-runtime-deps")
-            .exists()
-    );
-    assert!(
-        !extracted
-            .root_dir
-            .join(".openclaw/.local/bundled-plugin-runtime-deps")
-            .exists()
-    );
-    assert!(!extracted.root_dir.join(".openclaw/run").exists());
-    assert!(!extracted.root_dir.join(".openclaw/logs").exists());
-    assert!(!extracted.root_dir.join(".openclaw/cache").exists());
-    assert!(
-        !extracted
-            .root_dir
-            .join(".openclaw/extensions/demo/.openclaw-runtime-deps.json")
-            .exists()
-    );
-    assert!(
-        !extracted
-            .root_dir
-            .join(".openclaw/extensions/demo/node_modules")
-            .exists()
-    );
-    assert!(
-        !extracted
-            .root_dir
-            .join(".openclaw/future-runtime-cache")
-            .exists()
-    );
+    for path in [
+        ".openclaw/plugin-runtime-deps",
+        ".openclaw/bundled-plugin-runtime-deps",
+        ".openclaw/.local/bundled-plugin-runtime-deps",
+        ".openclaw/run",
+        ".openclaw/logs",
+        ".openclaw/cache",
+        ".openclaw/extensions/demo/.openclaw-runtime-deps.json",
+        ".openclaw/extensions/demo/node_modules",
+        ".openclaw/future-runtime-cache",
+    ] {
+        assert!(checkpoint_root.join(path).exists(), "{path}");
+    }
+
+    restore_env_snapshot(
+        RestoreEnvSnapshotOptions {
+            env_name: "source".to_string(),
+            snapshot_id: snapshot.id,
+        },
+        &env,
+        &cwd,
+    )
+    .unwrap();
+    assert!(!source_root.join(".openclaw/run").exists());
+    assert!(source_root.join(".openclaw/logs").exists());
+    assert!(source_root.join(".openclaw/future-runtime-cache").exists());
 }
 
 #[test]
@@ -1646,7 +1615,7 @@ fn environment_snapshot_restore_replaces_env_state_from_the_snapshot() {
 }
 
 #[test]
-fn environment_snapshot_restore_clears_broken_foreign_runtime_state_but_keeps_agent_auth() {
+fn environment_snapshot_restore_preserves_captured_agent_state() {
     let root = TestDir::new("store-env-snapshot-restore-runtime-cleanup");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -1729,13 +1698,9 @@ fn environment_snapshot_restore_clears_broken_foreign_runtime_state_but_keeps_ag
             .exists()
     );
     assert!(
-        !source_root
+        source_root
             .join(".openclaw/agents/main/sessions/main.jsonl")
             .exists()
-    );
-    assert!(
-        !source_root.join(".openclaw/logs").exists(),
-        "restore should clear only broken non-portable runtime residue"
     );
 }
 
@@ -1928,7 +1893,7 @@ fn environment_snapshot_reads_reject_mismatched_identity_and_archive_paths() {
         &cwd,
     )
     .unwrap_err();
-    assert!(error.contains("archive path is"), "{error}");
+    assert!(error.contains("artifact path is"), "{error}");
     assert!(foreign_archive.exists());
 
     let error = get_env_snapshot("source", "../outside", &env, &cwd).unwrap_err();

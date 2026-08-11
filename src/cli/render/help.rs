@@ -1600,7 +1600,7 @@ pub fn env_snapshot_command_help(cmd: &str, action: &str) -> Option<String> {
     Some(match action {
         "create" => render_leaf(
             "Create an environment snapshot",
-            "Capture a point-in-time snapshot of an environment.",
+            "Capture a verified whole-root checkpoint while its managed gateway is stopped.",
             vec![format!(
                 "{cmd} env snapshot create <name> [--label <label>] [--raw] [--json]"
             )],
@@ -1615,7 +1615,7 @@ pub fn env_snapshot_command_help(cmd: &str, action: &str) -> Option<String> {
             vec![format!(
                 "{cmd} env snapshot create mira --label before-upgrade"
             )],
-            &[],
+            &["Checkpoints include secret-bearing state and remain on the source filesystem."],
         ),
         "show" => render_leaf(
             "Show one environment snapshot",
@@ -1659,7 +1659,7 @@ pub fn env_snapshot_command_help(cmd: &str, action: &str) -> Option<String> {
         ),
         "restore" => render_leaf(
             "Restore an environment snapshot",
-            "Replace an environment root with the contents of a snapshot.",
+            "Replace an environment root from a checkpoint while its managed gateway is stopped.",
             vec![format!(
                 "{cmd} env snapshot restore <name> <snapshot> [--raw] [--json]"
             )],
@@ -1673,11 +1673,13 @@ pub fn env_snapshot_command_help(cmd: &str, action: &str) -> Option<String> {
             vec![format!(
                 "{cmd} env snapshot restore mira 1742922000-123456789"
             )],
-            &["Snapshot restore keeps existing safety rails around foreign directories."],
+            &[
+                "Restore uses an exclusive same-filesystem namespace and retains the displaced root through service acceptance.",
+            ],
         ),
         "remove" => render_leaf(
             "Remove an environment snapshot",
-            "Delete snapshot metadata and archived content for a snapshot.",
+            "Delete snapshot metadata and checkpoint content for a snapshot.",
             vec![format!(
                 "{cmd} env snapshot remove <name> <snapshot> [--raw] [--json]"
             )],
@@ -1692,8 +1694,8 @@ pub fn env_snapshot_command_help(cmd: &str, action: &str) -> Option<String> {
                 "{cmd} env snapshot remove mira 1742922000-123456789"
             )],
             &[
-                "OCM validates the stored environment, snapshot ID, and archive path before removal.",
-                "Metadata and archive content leave their live paths together; later cleanup failures are reported as warnings.",
+                "OCM validates the stored environment, snapshot ID, storage kind, and artifact path before removal.",
+                "Metadata and checkpoint content leave their live paths together; later cleanup failures are reported as warnings.",
             ],
         ),
         "prune" => render_leaf(

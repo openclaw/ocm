@@ -586,6 +586,7 @@ dependencies = [
  "base64",
  "ctrlc",
  "dialoguer",
+ "filetime",
  "flate2",
  "fs2",
  "indicatif",
@@ -605,6 +606,7 @@ dependencies = [
  "ureq",
  "url",
  "windows-sys 0.61.2",
+ "xattr",
  "zip",
 ]
 

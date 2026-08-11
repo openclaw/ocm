@@ -336,3 +336,12 @@ pub fn snapshot_archive_path(
 ) -> Result<PathBuf, String> {
     Ok(snapshot_env_dir(env_name, env, cwd)?.join(format!("{snapshot_id}.tar")))
 }
+
+pub fn snapshot_checkpoint_path(
+    env_name: &str,
+    snapshot_id: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
+    Ok(snapshot_env_dir(env_name, env, cwd)?.join(format!("{snapshot_id}.checkpoint")))
+}

@@ -148,8 +148,9 @@ Use `upgrade simulate` when you want to test what would happen against a publish
 - simulation envs and temporary runtimes are cleaned up automatically; use `--keep-simulations` only when you need retained debug artifacts
 - missing published targets fail before any simulation env is created
 - `--scenario all` runs built-in current, clean minimum, and Telegram-configured env shapes as separate simulation clones
-- a pre-upgrade snapshot is created before env state changes
-- when an env moves to a new runtime, OCM runs OpenClaw's update finalization path inside that env before service restart
+- a running managed gateway is stopped before its verified pre-upgrade checkpoint and remains stopped through mutation and finalization
+- new checkpoints capture the complete environment root; APFS clone support is used when available and a metadata-preserving full copy is the fallback
+- when an env moves to a new runtime, OCM runs OpenClaw's update finalization path cold before service restart
 - if service reconciliation fails, OCM restores the snapshot and previous runtime unless `--no-rollback` is set
 - pinned runtimes stay pinned unless you pass `--version`, `--channel`, or `--runtime`
 - local-command environments are reported clearly instead of being changed behind your back
@@ -362,6 +363,19 @@ ocm start rowan
 ```
 
 ### Snapshots
+
+Snapshot create and restore stop a running OCM-managed gateway before copying or
+replacing its root, then restore the recorded service policy. New snapshots are
+verified whole-root checkpoints: they include secrets, browser state, SQLite
+sidecars, modes, symlinks, plugin data, and unknown future paths. Restore stages
+an exclusive candidate beside the live root and retains the displaced root
+until service acceptance; failed acceptance restores the displaced root.
+
+APFS checkpoints begin as space-efficient copy-on-write clones. Other
+filesystems require a full metadata-preserving copy. Plan space for checkpoint
+divergence and a temporary restore candidate. These same-disk, secret-bearing
+checkpoints are operational rollback—not off-disk disaster recovery. Legacy tar
+snapshots remain readable.
 
 Create:
 

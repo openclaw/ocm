@@ -119,6 +119,7 @@ pub(crate) fn openclaw_env_archive_options(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn openclaw_env_snapshot_archive_options(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,

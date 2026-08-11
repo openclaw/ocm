@@ -21,6 +21,7 @@ semver = "1.0"
 base64 = "0.22"
 flate2 = "1.1"
 fs2 = "0.4"
+filetime = "0.2"
 tar = "0.4"
 tempfile = "3.27"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
@@ -37,6 +38,7 @@ rusqlite = { version = "0.37", default-features = false, features = ["backup", "
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+xattr = "1.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

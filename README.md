@@ -135,19 +135,28 @@ ocm upgrade simulate mira --to beta --scenario all
 ocm upgrade simulate mira --to ./openclaw
 ```
 
-`upgrade` creates a pre-upgrade snapshot before changing an environment. If a
-running service cannot be restarted or started after the change, OCM restores
-the snapshot and previous runtime by default. When an environment moves to a new
-runtime, OCM runs OpenClaw's update finalization path inside that environment
-before service restart. A running managed service is considered recovered only
+`upgrade` stops a running managed gateway and creates a verified pre-upgrade
+checkpoint before changing an environment. If a running service cannot be
+restarted or started after the change, OCM keeps the restored checkpoint and
+previous runtime as the coherent rollback state. When an environment moves to a
+new runtime, OCM runs OpenClaw's update finalization path while the gateway is
+stopped, before service restart. A running managed service is considered recovered only
 after its HTTP health endpoint responds and OpenClaw's gateway status proves the
 gateway is reachable; otherwise the upgrade follows the normal rollback path.
-Snapshots preserve managed path, npm, and Git plugin payloads together with
-their package metadata and symlinks, while generated plugin dependency caches
-and live runtime residue stay out of the archive.
+New snapshots preserve the complete environment root, including credentials,
+browser profiles, plugin payloads, unknown future directories, modes, symlinks,
+and SQLite sidecars. OCM verifies tree contents and SQLite integrity before
+publishing the checkpoint. APFS uses copy-on-write clones when available;
+other filesystems use a metadata-preserving full copy. Restore discards only
+explicit process residue such as locks, sockets, PIDs, and temporary runtime
+directories. Legacy tar snapshots remain readable.
+
+Checkpoints contain secrets and share the source filesystem. Keep `OCM_HOME`
+private, allow enough space for checkpoint divergence plus a restore candidate,
+and retain an off-disk backup for disaster recovery.
 Snapshot removal validates that the stored environment, snapshot ID, and
-archive path match the named snapshot before deleting anything. It takes the
-live metadata and archive out of service together, then reports warnings if
+artifact path match the named snapshot before deleting anything. It takes the
+live metadata and checkpoint out of service together, then reports warnings if
 linked upgrade recovery or staged artifact cleanup still needs attention.
 When both OpenClaw versions are known, `upgrade` rejects an older target before
 creating a snapshot, downloading the target, or changing runtime metadata.

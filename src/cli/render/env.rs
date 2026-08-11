@@ -1667,7 +1667,7 @@ mod tests {
         assert!(lines[1].contains("[scope:all]"));
         assert!(lines[1].contains("[1 candidate(s)]"));
         assert!(lines.iter().any(|line| line.starts_with('┌')));
-        assert!(lines.iter().any(|line| line.contains("Archive")));
+        assert!(lines.iter().any(|line| line.contains("Checkpoint")));
         assert_eq!(lines.last().unwrap(), "Re-run with --yes to remove them.");
     }
 
@@ -1727,6 +1727,7 @@ mod tests {
             env_name: env_name.to_string(),
             label: Some(label.to_string()),
             archive_path: "/tmp/demo-snapshot.tar".to_string(),
+            storage_kind: "tar-archive-v1".to_string(),
             source_root: "/tmp/demo".to_string(),
             gateway_port: Some(18789),
             service_enabled: true,
@@ -2230,7 +2231,8 @@ pub fn env_snapshot_created(snapshot: &EnvSnapshotSummary, profile: RenderProfil
     let mut rows = vec![
         KeyValueRow::accent("Env", snapshot.env_name.clone()),
         KeyValueRow::accent("Snapshot", snapshot.id.clone()),
-        KeyValueRow::plain("Archive", snapshot.archive_path.clone()),
+        KeyValueRow::plain("Checkpoint", snapshot.archive_path.clone()),
+        KeyValueRow::plain("Storage", snapshot.storage_kind.clone()),
     ];
     if let Some(label) = snapshot.label.as_deref() {
         rows.push(KeyValueRow::plain("Label", label));
@@ -2245,7 +2247,8 @@ fn env_snapshot_created_raw(snapshot: &EnvSnapshotSummary) -> Vec<String> {
             "Created snapshot {} for env {}",
             snapshot.id, snapshot.env_name
         ),
-        format!("  archive: {}", snapshot.archive_path),
+        format!("  checkpoint: {}", snapshot.archive_path),
+        format!("  storage: {}", snapshot.storage_kind),
         format!("  root: {}", snapshot.source_root),
     ];
     if let Some(label) = snapshot.label.as_deref() {
@@ -2284,7 +2287,8 @@ pub fn env_snapshot_show(
         &mut lines,
         "Paths",
         vec![
-            KeyValueRow::plain("Archive", snapshot.archive_path.clone()),
+            KeyValueRow::plain("Checkpoint", snapshot.archive_path.clone()),
+            KeyValueRow::plain("Storage", snapshot.storage_kind.clone()),
             KeyValueRow::plain("Source root", snapshot.source_root.clone()),
         ],
         profile.color,
@@ -2312,6 +2316,7 @@ fn env_snapshot_show_raw(snapshot: &EnvSnapshotSummary) -> Result<Vec<String>, S
         format!("snapshotId: {}", snapshot.id),
         format!("envName: {}", snapshot.env_name),
         format!("archivePath: {}", snapshot.archive_path),
+        format!("storageKind: {}", snapshot.storage_kind),
         format!("sourceRoot: {}", snapshot.source_root),
     ];
     if let Some(label) = snapshot.label.as_deref() {
@@ -2402,7 +2407,8 @@ pub fn env_snapshot_restored(
         KeyValueRow::accent("Env", restored.env_name.clone()),
         KeyValueRow::accent("Snapshot", restored.snapshot_id.clone()),
         KeyValueRow::plain("Root", restored.root.clone()),
-        KeyValueRow::plain("Archive", restored.archive_path.clone()),
+        KeyValueRow::plain("Checkpoint", restored.archive_path.clone()),
+        KeyValueRow::plain("Storage", restored.storage_kind.clone()),
         action_export_binding_row(
             restored.default_runtime.clone(),
             restored.default_launcher.clone(),
@@ -2425,7 +2431,8 @@ fn env_snapshot_restored_raw(restored: &EnvSnapshotRestoreSummary) -> Vec<String
             restored.env_name, restored.snapshot_id
         ),
         format!("  root: {}", restored.root),
-        format!("  archive: {}", restored.archive_path),
+        format!("  checkpoint: {}", restored.archive_path),
+        format!("  storage: {}", restored.storage_kind),
     ];
     if let Some(label) = restored.label.as_deref() {
         lines.push(format!("  label: {label}"));
@@ -2454,7 +2461,8 @@ pub fn env_snapshot_removed(
     let mut rows = vec![
         KeyValueRow::accent("Env", removed.env_name.clone()),
         KeyValueRow::accent("Snapshot", removed.snapshot_id.clone()),
-        KeyValueRow::plain("Archive", removed.archive_path.clone()),
+        KeyValueRow::plain("Checkpoint", removed.archive_path.clone()),
+        KeyValueRow::plain("Storage", removed.storage_kind.clone()),
     ];
     if let Some(label) = removed.label.as_deref() {
         rows.push(KeyValueRow::plain("Label", label));
@@ -2477,7 +2485,8 @@ fn env_snapshot_removed_raw(removed: &EnvSnapshotRemoveSummary) -> Vec<String> {
             "Removed snapshot {} for env {}",
             removed.snapshot_id, removed.env_name
         ),
-        format!("  archive: {}", removed.archive_path),
+        format!("  checkpoint: {}", removed.archive_path),
+        format!("  storage: {}", removed.storage_kind),
     ];
     if let Some(label) = removed.label.as_deref() {
         lines.push(format!("  label: {label}"));
@@ -2533,7 +2542,7 @@ pub fn env_snapshot_prune_preview(
         })
         .collect::<Result<Vec<_>, String>>()?;
     lines.extend(render_table(
-        &["Snapshot", "Env", "Label", "Created", "Archive"],
+        &["Snapshot", "Env", "Label", "Created", "Checkpoint"],
         &rows,
         profile.color,
     ));
@@ -2599,7 +2608,7 @@ pub fn env_snapshot_pruned(
         })
         .collect::<Vec<_>>();
     lines.extend(render_table(
-        &["Snapshot", "Env", "Label", "Archive"],
+        &["Snapshot", "Env", "Label", "Checkpoint"],
         &rows,
         profile.color,
     ));

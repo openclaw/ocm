@@ -70,6 +70,10 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
     Ok(())
 }
 
+pub(crate) fn copy_path_recursive(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_path(source, destination)
+}
+
 pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     let file_type = metadata.file_type();

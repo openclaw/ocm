@@ -5,8 +5,10 @@ use time::{Duration, OffsetDateTime};
 
 use super::EnvironmentService;
 use crate::store::{
-    create_env_snapshot, get_env_snapshot, list_all_env_snapshots, list_env_snapshots, now_utc,
-    remove_env_snapshot, restore_env_snapshot, summarize_snapshot,
+    EnvSnapshotRestoreTransaction, commit_env_snapshot_restore, create_env_snapshot,
+    create_env_snapshot_with_service_state, get_env_snapshot, list_all_env_snapshots,
+    list_env_snapshots, now_utc, prepare_env_snapshot_restore, remove_env_snapshot,
+    restore_env_snapshot, rollback_env_snapshot_restore, summarize_snapshot,
 };
 use crate::supervisor::sync_supervisor_if_present;
 
@@ -23,6 +25,7 @@ pub struct EnvSnapshotSummary {
     pub env_name: String,
     pub label: Option<String>,
     pub archive_path: String,
+    pub storage_kind: String,
     pub source_root: String,
     pub gateway_port: Option<u32>,
     pub service_enabled: bool,
@@ -42,6 +45,7 @@ pub struct EnvSnapshotRestoreSummary {
     pub label: Option<String>,
     pub root: String,
     pub archive_path: String,
+    pub storage_kind: String,
     pub default_runtime: Option<String>,
     pub default_launcher: Option<String>,
     pub protected: bool,
@@ -54,6 +58,7 @@ pub struct EnvSnapshotRemoveSummary {
     pub snapshot_id: String,
     pub label: Option<String>,
     pub archive_path: String,
+    pub storage_kind: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -133,6 +138,16 @@ impl<'a> EnvironmentService<'a> {
         Ok(summarize_snapshot(&meta))
     }
 
+    pub(crate) fn create_snapshot_locked_with_service_state(
+        &self,
+        options: CreateEnvSnapshotOptions,
+        service_state: Option<(bool, bool)>,
+    ) -> Result<EnvSnapshotSummary, String> {
+        let meta =
+            create_env_snapshot_with_service_state(options, service_state, self.env, self.cwd)?;
+        Ok(summarize_snapshot(&meta))
+    }
+
     pub fn list_snapshots(
         &self,
         env_name: Option<&str>,
@@ -168,6 +183,38 @@ impl<'a> EnvironmentService<'a> {
         let summary = restore_env_snapshot(options, self.env, self.cwd)?;
         sync_supervisor_if_present(self.env, self.cwd)?;
         Ok(summary)
+    }
+
+    pub(crate) fn prepare_snapshot_restore_locked(
+        &self,
+        options: RestoreEnvSnapshotOptions,
+    ) -> Result<EnvSnapshotRestoreTransaction, String> {
+        let transaction = prepare_env_snapshot_restore(options, self.env, self.cwd)?;
+        sync_supervisor_if_present(self.env, self.cwd)?;
+        Ok(transaction)
+    }
+
+    pub(crate) fn commit_snapshot_restore_locked(
+        &self,
+        transaction: EnvSnapshotRestoreTransaction,
+    ) -> Result<(), String> {
+        commit_env_snapshot_restore(transaction)
+    }
+
+    pub(crate) fn rollback_snapshot_restore_locked(
+        &self,
+        transaction: EnvSnapshotRestoreTransaction,
+    ) -> Result<(), String> {
+        let cleanup_warning = rollback_env_snapshot_restore(transaction, self.env, self.cwd)?;
+        let sync_result = sync_supervisor_if_present(self.env, self.cwd).map(|_| ());
+        match (cleanup_warning, sync_result) {
+            (None, Ok(())) => Ok(()),
+            (Some(cleanup_warning), Ok(())) => Err(cleanup_warning),
+            (None, Err(sync_error)) => Err(sync_error),
+            (Some(cleanup_warning), Err(sync_error)) => Err(format!(
+                "{cleanup_warning}; supervisor resync also failed: {sync_error}"
+            )),
+        }
     }
 
     pub fn remove_snapshot(
@@ -272,6 +319,7 @@ mod tests {
             env_name: env_name.to_string(),
             label: None,
             archive_path: format!("/tmp/{id}.tar"),
+            storage_kind: "tar-archive-v1".to_string(),
             source_root: format!("/tmp/{env_name}"),
             gateway_port: None,
             service_enabled: false,
