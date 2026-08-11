@@ -708,7 +708,7 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
     use super::run_with_non_interactive_progress;
@@ -733,13 +733,19 @@ mod tests {
     fn non_interactive_progress_reports_bounded_label_for_slow_work() {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&lines);
+        let (heartbeat_tx, heartbeat_rx) = mpsc::channel();
 
         run_with_non_interactive_progress(
             "Building runtime demo".to_string(),
             Duration::from_millis(5),
-            move |line| captured.lock().unwrap().push(line.to_string()),
+            move |line| {
+                captured.lock().unwrap().push(line.to_string());
+                let _ = heartbeat_tx.send(());
+            },
             || {
-                std::thread::sleep(Duration::from_millis(18));
+                heartbeat_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("progress heartbeat was not emitted");
                 Ok::<_, String>(())
             },
         )
@@ -758,13 +764,19 @@ mod tests {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&lines);
         let secret_shaped_error = "child failed with token=fixture-secret";
+        let (heartbeat_tx, heartbeat_rx) = mpsc::channel();
 
         let result = run_with_non_interactive_progress(
             "Installing runtime demo".to_string(),
             Duration::from_millis(5),
-            move |line| captured.lock().unwrap().push(line.to_string()),
+            move |line| {
+                captured.lock().unwrap().push(line.to_string());
+                let _ = heartbeat_tx.send(());
+            },
             || {
-                std::thread::sleep(Duration::from_millis(12));
+                heartbeat_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("progress heartbeat was not emitted");
                 Err::<(), _>(secret_shaped_error.to_string())
             },
         );
