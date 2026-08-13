@@ -938,10 +938,7 @@ impl Cli {
                                 if restored_service_state.is_none() {
                                     return Ok(());
                                 }
-                                match self.wait_for_restarted_gateway_health(name, true)? {
-                                    None => Ok(()),
-                                    Some(note) => Err(note),
-                                }
+                                self.wait_for_restarted_gateway_health(name, true)
                             });
                         match service_acceptance {
                             Ok(()) => {

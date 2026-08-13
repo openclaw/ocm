@@ -161,25 +161,16 @@ impl<'a> ServiceService<'a> {
         name: &str,
     ) -> Result<Option<ServiceMaintenanceState>, String> {
         let status = self.status(name)?;
-        if !status.running {
-            return Ok(None);
-        }
         let meta = crate::env::EnvironmentService::new(self.env, self.cwd).get(name)?;
         let state = ServiceMaintenanceState {
             enabled: meta.service_enabled,
             running: meta.service_running,
         };
-        let stopped = self.stop_locked(name)?;
-        if stopped.running {
-            let stop_error = format!(
-                "managed service for {name} remained running after the snapshot safety stop"
-            );
-            return match self.restore_after_snapshot_locked(name, Some(state)) {
-                Ok(()) => Err(stop_error),
-                Err(restore_error) => Err(format!(
-                    "{stop_error}; also failed to restore its pre-snapshot service policy: {restore_error}"
-                )),
-            };
+        if !state.running && !status.running {
+            return Ok(None);
+        }
+        if state.running {
+            self.stop_locked(name)?;
         }
         if let Err(error) = self.wait_for_runtime_mutation_quiescence_locked(name) {
             return match self.restore_after_snapshot_locked(name, Some(state)) {

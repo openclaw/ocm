@@ -3,7 +3,7 @@ mod support;
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -749,6 +749,335 @@ fn env_snapshot_create_and_restore_quiesce_a_running_managed_gateway() {
     assert_eq!(shown_json["serviceRunning"], true);
     observer_done.store(true, Ordering::Relaxed);
     observer.join().unwrap();
+}
+
+#[test]
+fn env_snapshot_create_waits_for_delayed_supervisor_stop_acknowledgement() {
+    let root = TestDir::new("env-snapshot-delayed-stop-ack");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let health = TestHttpServer::serve_bytes_times("/health", "text/plain", b"ok", 20);
+    let health_port = url::Url::parse(&health.url()).unwrap().port().unwrap() as u32;
+
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--port",
+            &health_port.to_string(),
+            "--launcher",
+            "stable",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let started = run_ocm(&cwd, &env, &["service", "start", "source"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    write_running_snapshot_service(&root, &cwd, &env, health_port);
+
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let running_runtime = fs::read(&runtime_path).unwrap();
+    let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    let observer_runtime_path = runtime_path.clone();
+    let observer_done = Arc::new(AtomicBool::new(false));
+    let observer_done_thread = Arc::clone(&observer_done);
+    let observer = thread::spawn(move || {
+        let mut last_running = true;
+        let mut delayed_stop = false;
+        while !observer_done_thread.load(Ordering::Relaxed) {
+            let desired_running = fs::read(&registry_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|registry| registry["envs"].as_array().cloned())
+                .and_then(|envs| envs.into_iter().find(|entry| entry["name"] == "source"))
+                .and_then(|entry| entry["serviceRunning"].as_bool())
+                .unwrap_or(last_running);
+            if desired_running != last_running {
+                if desired_running {
+                    fs::write(&observer_runtime_path, &running_runtime).unwrap();
+                } else {
+                    delayed_stop = true;
+                    thread::sleep(Duration::from_millis(3_200));
+                    write_empty_snapshot_service(&observer_runtime_path, &ocm_home);
+                }
+                last_running = desired_running;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        delayed_stop
+    });
+
+    let snapshot = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "snapshot",
+            "create",
+            "source",
+            "--label",
+            "delayed-stop",
+        ],
+    );
+
+    for _ in 0..200 {
+        let running = fs::read(&runtime_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|runtime| runtime["children"].as_array().cloned())
+            .is_some_and(|children| !children.is_empty());
+        if running {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    observer_done.store(true, Ordering::Relaxed);
+    assert!(
+        observer.join().unwrap(),
+        "fixture never delayed the stop acknowledgement"
+    );
+    assert!(
+        snapshot.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&snapshot),
+        stderr(&snapshot)
+    );
+
+    let shown = run_ocm(&cwd, &env, &["env", "show", "source", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["serviceEnabled"], true);
+    assert_eq!(shown["serviceRunning"], true);
+}
+
+#[test]
+fn env_snapshot_create_quiesces_desired_service_before_child_is_observable() {
+    let root = TestDir::new("env-snapshot-starting-service");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--port",
+            "19845",
+            "--launcher",
+            "stable",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let started = run_ocm(&cwd, &env, &["service", "start", "source"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+
+    write_running_snapshot_service(&root, &cwd, &env, 19845);
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    let running_runtime = fs::read(&runtime_path).unwrap();
+    let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    write_empty_snapshot_service(&runtime_path, &ocm_home);
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let observer_done = Arc::new(AtomicBool::new(false));
+    let stop_count = Arc::new(AtomicUsize::new(0));
+    let start_count = Arc::new(AtomicUsize::new(0));
+    let observer_done_thread = Arc::clone(&observer_done);
+    let observer_stop_count = Arc::clone(&stop_count);
+    let observer_start_count = Arc::clone(&start_count);
+    let observer_runtime_path = runtime_path.clone();
+    let observer = thread::spawn(move || {
+        let mut last_running = true;
+        while !observer_done_thread.load(Ordering::Relaxed) {
+            let desired_running = fs::read(&registry_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|registry| registry["envs"].as_array().cloned())
+                .and_then(|envs| envs.into_iter().find(|entry| entry["name"] == "source"))
+                .and_then(|entry| entry["serviceRunning"].as_bool())
+                .unwrap_or(last_running);
+            if desired_running != last_running {
+                if desired_running {
+                    fs::write(&observer_runtime_path, &running_runtime).unwrap();
+                    observer_start_count.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    write_empty_snapshot_service(&observer_runtime_path, &ocm_home);
+                    observer_stop_count.fetch_add(1, Ordering::Relaxed);
+                }
+                last_running = desired_running;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+
+    let snapshot = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "create", "source", "--label", "starting"],
+    );
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while start_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    observer_done.store(true, Ordering::Relaxed);
+    observer.join().unwrap();
+    assert_eq!(stop_count.load(Ordering::Relaxed), 1);
+    assert_eq!(start_count.load(Ordering::Relaxed), 1);
+
+    let shown = run_ocm(&cwd, &env, &["env", "show", "source", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["serviceEnabled"], true);
+    assert_eq!(shown["serviceRunning"], true);
+}
+
+#[test]
+fn env_snapshot_create_preserves_disabled_policy_while_stale_child_quiesces() {
+    let root = TestDir::new("env-snapshot-disabled-stale-child");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--port",
+            "19846",
+            "--launcher",
+            "stable",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let started = run_ocm(&cwd, &env, &["service", "start", "source"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    write_running_snapshot_service(&root, &cwd, &env, 19846);
+
+    let disabled = run_ocm(&cwd, &env, &["service", "uninstall", "source"]);
+    assert!(disabled.status.success(), "{}", stderr(&disabled));
+    let before = run_ocm(&cwd, &env, &["env", "show", "source", "--json"]);
+    assert!(before.status.success(), "{}", stderr(&before));
+    let before: Value = serde_json::from_str(&stdout(&before)).unwrap();
+    assert_eq!(before["serviceEnabled"], false);
+    assert_eq!(before["serviceRunning"], false);
+
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    let observer_runtime_path = runtime_path.clone();
+    let observer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        write_empty_snapshot_service(&observer_runtime_path, &ocm_home);
+    });
+    let snapshot = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "create", "source", "--label", "disabled"],
+    );
+    observer.join().unwrap();
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+
+    let shown = run_ocm(&cwd, &env, &["env", "show", "source", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["serviceEnabled"], false);
+    assert_eq!(shown["serviceRunning"], false);
+    let list = run_ocm(&cwd, &env, &["env", "snapshot", "list", "source", "--json"]);
+    assert!(list.status.success(), "{}", stderr(&list));
+    let list: Value = serde_json::from_str(&stdout(&list)).unwrap();
+    assert_eq!(list[0]["serviceEnabled"], false);
+    assert_eq!(list[0]["serviceRunning"], false);
+}
+
+#[test]
+fn env_snapshot_create_preserves_already_stopped_enabled_policy() {
+    let root = TestDir::new("env-snapshot-already-stopped");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--port",
+            "19847",
+            "--launcher",
+            "stable",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let installed = run_ocm(&cwd, &env, &["service", "install", "source"]);
+    assert!(installed.status.success(), "{}", stderr(&installed));
+
+    fs::write(root.child("launchctl.log"), "").unwrap();
+    let snapshot = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "create", "source", "--label", "stopped"],
+    );
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+    let lifecycle = fs::read_to_string(root.child("launchctl.log")).unwrap();
+    assert!(!lifecycle.contains("bootout "), "{lifecycle}");
+    assert!(!lifecycle.contains("bootstrap "), "{lifecycle}");
+
+    let shown = run_ocm(&cwd, &env, &["env", "show", "source", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["serviceEnabled"], true);
+    assert_eq!(shown["serviceRunning"], false);
 }
 
 #[test]

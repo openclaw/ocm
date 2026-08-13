@@ -861,10 +861,7 @@ impl Cli {
             .with_progress(format!("Starting restored service for {env_name}"), || {
                 self.service_service().start_locked(env_name)
             })?;
-        let note = self.wait_for_restarted_gateway_health(env_name, started.running)?;
-        if let Some(note) = note {
-            return Err(note);
-        }
+        self.wait_for_restarted_gateway_health(env_name, started.desired_running)?;
         Ok(Some("started".to_string()))
     }
 
@@ -2684,10 +2681,8 @@ impl Cli {
                 .with_progress(format!("Restarting service for {env_name}"), || {
                     self.service_service().restart_locked(env_name)
                 })?;
-            let note = join_optional_warnings(
-                join_warnings(&restart.warnings),
-                self.wait_for_restarted_gateway_health(env_name, restart.running)?,
-            );
+            self.wait_for_restarted_gateway_health(env_name, restart.desired_running)?;
+            let note = join_warnings(&restart.warnings);
             return Ok((Some("restarted".to_string()), note));
         }
 
@@ -2695,10 +2690,8 @@ impl Cli {
             let start = self.with_progress(format!("Starting service for {env_name}"), || {
                 self.service_service().start_locked(env_name)
             })?;
-            let note = join_optional_warnings(
-                join_warnings(&start.warnings),
-                self.wait_for_restarted_gateway_health(env_name, start.running)?,
-            );
+            self.wait_for_restarted_gateway_health(env_name, start.desired_running)?;
+            let note = join_warnings(&start.warnings);
             return Ok((Some("started".to_string()), note));
         }
 
@@ -2708,10 +2701,10 @@ impl Cli {
     pub(super) fn wait_for_restarted_gateway_health(
         &self,
         env_name: &str,
-        action_reported_running: bool,
-    ) -> Result<Option<String>, String> {
-        if !action_reported_running {
-            return Ok(None);
+        action_desired_running: bool,
+    ) -> Result<(), String> {
+        if !action_desired_running {
+            return Ok(());
         }
 
         let deadline = Instant::now() + Duration::from_secs(90);
@@ -2722,7 +2715,7 @@ impl Cli {
             latest_issue = status.issue.clone();
             if status.running && gateway_health_ok(status.child_port.unwrap_or(status.gateway_port))
             {
-                return Ok(None);
+                return Ok(());
             }
             if status.gateway_state == "backoff" && status.last_exit_code != Some(0) {
                 if should_wait_for_scheduled_gateway_retry(
@@ -2743,10 +2736,10 @@ impl Cli {
             sleep(Duration::from_millis(500));
         }
 
-        Ok(Some(format!(
+        Err(format!(
             "service restart returned before the gateway health endpoint became ready; latest status: {}",
             latest_issue.unwrap_or_else(|| "starting".to_string())
-        )))
+        ))
     }
 
     fn verify_upgraded_openclaw(

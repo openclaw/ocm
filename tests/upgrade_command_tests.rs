@@ -330,7 +330,10 @@ case "$1" in
         sleep 0.01
       done
     fi
-    if [ "${{OCM_TEST_GATEWAY_AUTH_HANDSHAKE:-}}" = "1" ]; then
+    if [ -n "${{OCM_TEST_GATEWAY_READY_MARKER:-}}" ] &&
+       [ ! -e "$OCM_TEST_GATEWAY_READY_MARKER" ]; then
+      printf '{{"rpc":{{"ok":false,"error":"connect ECONNREFUSED 127.0.0.1"}}}}\n'
+    elif [ "${{OCM_TEST_GATEWAY_AUTH_HANDSHAKE:-}}" = "1" ]; then
       printf '{{"rpc":{{"ok":false,"error":"device identity required"}}}}\n'
       exit "${{OCM_TEST_GATEWAY_STATUS_EXIT_CODE:-0}}"
     elif [ "${{OCM_TEST_GATEWAY_UNREADY:-}}" = "1" ]; then
@@ -722,6 +725,8 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
     let root = TestDir::new("upgrade-tracked-runtime");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
+    let (health_port, health_requests, health_stop, health_handle) =
+        spawn_converging_health_server();
 
     let old_tarball =
         openclaw_package_tarball(&recording_openclaw_script("2026.3.24"), "2026.3.24");
@@ -781,7 +786,11 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
     );
     install_fake_launchctl(&root, &mut env);
 
-    let start = run_ocm(&cwd, &env, &["start", "demo"]);
+    let start = run_ocm(
+        &cwd,
+        &env,
+        &["start", "demo", "--port", &health_port.to_string()],
+    );
     assert!(start.status.success(), "{}", stderr(&start));
 
     env.insert(
@@ -792,7 +801,53 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
         "OCM_TEST_GATEWAY_STATUS_EXIT_CODE".to_string(),
         "1".to_string(),
     );
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let observer_done = Arc::new(AtomicBool::new(false));
+    let observer_done_thread = Arc::clone(&observer_done);
+    let observer_runtime_path = runtime_path.clone();
+    let observer = thread::spawn(move || {
+        let mut last_desired_running = true;
+        let mut next_pid = 4242;
+        let mut saw_stop = false;
+        let mut saw_start = false;
+        while !observer_done_thread.load(Ordering::Relaxed) {
+            let desired_running = fs::read(&registry_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|registry| registry["envs"].as_array().cloned())
+                .and_then(|envs| envs.into_iter().find(|entry| entry["name"] == "demo"))
+                .and_then(|entry| entry["serviceRunning"].as_bool())
+                .unwrap_or(last_desired_running);
+            if desired_running != last_desired_running {
+                if desired_running {
+                    write_running_supervisor_runtime(
+                        &observer_runtime_path,
+                        &ocm_home,
+                        "stable",
+                        next_pid,
+                        health_port,
+                    );
+                    next_pid += 1;
+                    saw_start = true;
+                } else {
+                    write_empty_supervisor_runtime(&observer_runtime_path, &ocm_home);
+                    saw_stop = true;
+                }
+                last_desired_running = desired_running;
+            }
+            sleep(Duration::from_millis(5));
+        }
+        (saw_stop, saw_start)
+    });
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo"]);
+    observer_done.store(true, Ordering::Relaxed);
+    let (saw_stop, saw_start) = observer.join().unwrap();
+    assert!(saw_stop, "upgrade did not stop the source service");
+    assert!(saw_start, "upgrade did not start the updated service");
+    assert!(health_requests.load(Ordering::SeqCst) >= 2);
     assert!(upgrade.status.success(), "{}", stderr(&upgrade));
     let output = stdout(&upgrade);
     assert!(output.contains("outcome=updated"), "{output}");
@@ -871,6 +926,38 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
         snapshot_json[0]["id"].as_str().unwrap()
     );
 
+    let snapshot_registry_path = env_registry_path(&env, &cwd).unwrap();
+    let snapshot_ocm_home = env.get("OCM_HOME").unwrap().clone();
+    let snapshot_runtime_path = runtime_path.clone();
+    let snapshot_observer_done = Arc::new(AtomicBool::new(false));
+    let snapshot_observer_done_thread = Arc::clone(&snapshot_observer_done);
+    let snapshot_observer = thread::spawn(move || {
+        let mut last_desired_running = true;
+        while !snapshot_observer_done_thread.load(Ordering::Relaxed) {
+            let desired_running = fs::read(&snapshot_registry_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|registry| registry["envs"].as_array().cloned())
+                .and_then(|envs| envs.into_iter().find(|entry| entry["name"] == "demo"))
+                .and_then(|entry| entry["serviceRunning"].as_bool())
+                .unwrap_or(last_desired_running);
+            if desired_running != last_desired_running {
+                if desired_running {
+                    write_running_supervisor_runtime(
+                        &snapshot_runtime_path,
+                        &snapshot_ocm_home,
+                        "stable",
+                        4244,
+                        health_port,
+                    );
+                } else {
+                    write_empty_supervisor_runtime(&snapshot_runtime_path, &snapshot_ocm_home);
+                }
+                last_desired_running = desired_running;
+            }
+            sleep(Duration::from_millis(5));
+        }
+    });
     let create_newer_snapshot = run_ocm(
         &cwd,
         &env,
@@ -903,6 +990,9 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
     assert!(!recovery_root.exists());
 
     let reuse = run_ocm(&cwd, &env, &["upgrade", "demo"]);
+    snapshot_observer_done.store(true, Ordering::Relaxed);
+    snapshot_observer.join().unwrap();
+    stop_converging_health_server(health_port, &health_stop, health_handle);
     assert!(reuse.status.success(), "{}", stderr(&reuse));
     assert!(stdout(&reuse).contains("outcome=up-to-date"));
     let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
@@ -1311,6 +1401,147 @@ fn upgrade_waits_for_one_supervisor_convergence_retry() {
     );
     assert!(recovered_target, "fixture retry never became healthy");
     assert!(health_requests.load(Ordering::SeqCst) >= 2);
+    let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["defaultRuntime"], "new");
+}
+
+#[test]
+fn upgrade_waits_for_delayed_supervisor_start_before_gateway_verification() {
+    let root = TestDir::new("upgrade-delayed-supervisor-start");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let health_server =
+        TestHttpServer::serve_bytes_times("/health", "application/json", br#"{"ok":true}"#, 20);
+    let health_port = url::Url::parse(&health_server.url())
+        .unwrap()
+        .port()
+        .unwrap() as u32;
+
+    let old_runtime = root.child("old-openclaw");
+    let new_runtime = root.child("new-openclaw");
+    write_executable_script(&old_runtime, &recording_openclaw_script("2026.8.1"));
+    write_executable_script(&new_runtime, &recording_openclaw_script("2026.8.2"));
+
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    for (name, runtime) in [("old", &old_runtime), ("new", &new_runtime)] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", name, "--path", &path_string(runtime)],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+
+    let start = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "start",
+            "demo",
+            "--runtime",
+            "old",
+            "--port",
+            &health_port.to_string(),
+        ],
+    );
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    write_running_supervisor_runtime(&runtime_path, &ocm_home, "old", 4242, health_port);
+
+    let gateway_ready = root.child("gateway-ready");
+    env.insert(
+        "OCM_TEST_GATEWAY_READY_MARKER".to_string(),
+        path_string(&gateway_ready),
+    );
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let observer_done = Arc::new(AtomicBool::new(false));
+    let observer_done_thread = Arc::clone(&observer_done);
+    let observer_runtime_path = runtime_path.clone();
+    let observer_ocm_home = ocm_home.clone();
+    let observer_gateway_ready = gateway_ready.clone();
+    let observer = thread::spawn(move || {
+        let mut last_binding = "old".to_string();
+        let mut last_desired_running = true;
+        let mut pending_start: Option<(String, Instant)> = None;
+        let mut next_pid = 4243;
+        let mut saw_delayed_target_start = false;
+        while !observer_done_thread.load(Ordering::Relaxed) {
+            let registry = fs::read(&registry_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .unwrap_or(Value::Null);
+            let env_meta = registry["envs"]
+                .as_array()
+                .and_then(|envs| envs.iter().find(|entry| entry["name"] == "demo"));
+            let binding = env_meta
+                .and_then(|entry| entry["defaultRuntime"].as_str())
+                .unwrap_or(&last_binding)
+                .to_string();
+            let desired_running = env_meta
+                .and_then(|entry| entry["serviceRunning"].as_bool())
+                .unwrap_or(last_desired_running);
+
+            if desired_running != last_desired_running {
+                if desired_running {
+                    write_empty_supervisor_runtime(&observer_runtime_path, &observer_ocm_home);
+                    pending_start = Some((binding.clone(), Instant::now()));
+                    if binding == "new" {
+                        saw_delayed_target_start = true;
+                    }
+                } else {
+                    write_empty_supervisor_runtime(&observer_runtime_path, &observer_ocm_home);
+                    let _ = fs::remove_file(&observer_gateway_ready);
+                    pending_start = None;
+                }
+                last_desired_running = desired_running;
+            }
+            last_binding = binding.clone();
+
+            if let Some((pending_binding, started_at)) = pending_start.as_ref()
+                && desired_running
+                && binding == *pending_binding
+                && started_at.elapsed() >= Duration::from_millis(250)
+            {
+                write_running_supervisor_runtime(
+                    &observer_runtime_path,
+                    &observer_ocm_home,
+                    pending_binding,
+                    next_pid,
+                    health_port,
+                );
+                next_pid += 1;
+                fs::write(&observer_gateway_ready, "ready").unwrap();
+                pending_start = None;
+            }
+            sleep(Duration::from_millis(1));
+        }
+        saw_delayed_target_start
+    });
+
+    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new"]);
+    observer_done.store(true, Ordering::Relaxed);
+    assert!(
+        observer.join().unwrap(),
+        "fixture never exposed desiredRunning=true while running=false for the target"
+    );
+    assert!(
+        upgrade.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&upgrade),
+        stderr(&upgrade)
+    );
+    assert!(!health_server.requests().is_empty());
+
     let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(shown.status.success(), "{}", stderr(&shown));
     let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
@@ -4082,15 +4313,8 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
     let root = TestDir::new("upgrade-explicit-rollback-service");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let health_server =
-        TestHttpServer::serve_bytes_times("/health", "application/json", br#"{"ok":true}"#, 20);
-    let health_port = health_server
-        .url()
-        .split(':')
-        .nth(2)
-        .and_then(|value| value.split('/').next())
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap();
+    let (health_port, health_requests, health_stop, health_handle) =
+        spawn_converging_health_server();
 
     let old_runtime = root.child("old-openclaw");
     let new_runtime = root.child("new-openclaw");
@@ -4143,8 +4367,64 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
     assert!(snapshot.status.success(), "{}", stderr(&snapshot));
     let snapshot_json: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
     let snapshot_id = snapshot_json["id"].as_str().unwrap();
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    write_running_supervisor_runtime(&runtime_path, &ocm_home, "old", 4242, health_port);
+    let state_path = supervisor_state_path(&env, &cwd).unwrap();
+    let bind_observer_done = Arc::new(AtomicBool::new(false));
+    let bind_observer_done_thread = Arc::clone(&bind_observer_done);
+    let bind_runtime_path = runtime_path.clone();
+    let bind_ocm_home = ocm_home.clone();
+    let bind_state_path = state_path.clone();
+    let bind_observer = thread::spawn(move || {
+        let mut observed_binding = Some("old".to_string());
+        let mut next_pid = 4243;
+        let mut saw_stop = false;
+        let mut saw_target_start = false;
+        while !bind_observer_done_thread.load(Ordering::Relaxed) {
+            let state = fs::read_to_string(&bind_state_path).unwrap_or_default();
+            let parsed: Value = serde_json::from_str(&state).unwrap_or(Value::Null);
+            let desired_binding = parsed["children"]
+                .as_array()
+                .and_then(|children| children.iter().find(|child| child["envName"] == "demo"))
+                .and_then(|child| child["bindingName"].as_str())
+                .map(str::to_string);
+            if desired_binding != observed_binding {
+                if let Some(binding) = desired_binding.as_deref() {
+                    write_running_supervisor_runtime(
+                        &bind_runtime_path,
+                        &bind_ocm_home,
+                        binding,
+                        next_pid,
+                        health_port,
+                    );
+                    next_pid += 1;
+                    if binding == "new" {
+                        saw_target_start = true;
+                    }
+                } else {
+                    write_empty_supervisor_runtime(&bind_runtime_path, &bind_ocm_home);
+                    saw_stop = true;
+                }
+                observed_binding = desired_binding;
+            }
+            sleep(Duration::from_millis(25));
+        }
+        (saw_stop, saw_target_start)
+    });
     let bind = run_ocm(&cwd, &env, &["env", "set-runtime", "demo", "new"]);
+    bind_observer_done.store(true, Ordering::Relaxed);
+    let (bind_saw_stop, bind_saw_target_start) = bind_observer.join().unwrap();
     assert!(bind.status.success(), "{}", stderr(&bind));
+    assert!(
+        bind_saw_stop,
+        "runtime switch did not stop the source service"
+    );
+    assert!(
+        bind_saw_target_start,
+        "runtime switch did not start the target service"
+    );
     fs::write(&marker, "after-upgrade").unwrap();
 
     let transaction_id = "1782864000-000000001";
@@ -4181,11 +4461,6 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
     )
     .unwrap();
 
-    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
-    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
-    let ocm_home = env.get("OCM_HOME").unwrap().clone();
-    write_running_supervisor_runtime(&runtime_path, &ocm_home, "new", 4242, health_port);
-    let state_path = supervisor_state_path(&env, &cwd).unwrap();
     let observed_runtime_path = runtime_path.clone();
     let observed_ocm_home = ocm_home.clone();
     let service_observer = thread::spawn(move || {
@@ -4218,13 +4493,19 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
 
     let rollback = run_ocm(&cwd, &env, &["upgrade", "rollback", "demo", "--raw"]);
     service_observer.join().unwrap();
-    assert!(rollback.status.success(), "{}", stderr(&rollback));
+    stop_converging_health_server(health_port, &health_stop, health_handle);
+    assert!(
+        rollback.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&rollback),
+        stderr(&rollback)
+    );
     let output = stdout(&rollback);
     assert!(output.contains("outcome=rolled-back"), "{output}");
     assert!(output.contains("service=started"), "{output}");
     assert!(output.contains("to=runtime:old"), "{output}");
     assert_eq!(fs::read_to_string(&marker).unwrap(), "before-upgrade");
-    assert!(!health_server.requests().is_empty());
+    assert!(health_requests.load(Ordering::SeqCst) >= 2);
 
     let service = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
     assert!(service.status.success(), "{}", stderr(&service));
