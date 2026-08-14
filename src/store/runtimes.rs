@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::host::verify_official_openclaw_runtime_host;
@@ -317,6 +317,7 @@ pub struct BuildLocalRuntimeOptions {
     pub repo: String,
     pub description: Option<String>,
     pub force: bool,
+    pub include_source_extensions: bool,
 }
 
 fn summarize_command_output(stdout: &[u8], stderr: &[u8]) -> Option<String> {
@@ -362,6 +363,19 @@ struct LocalBuildNpmAdapter {
     command: CommandSpec,
     real_npm: String,
     workspace_dependency_dirs: Option<OsString>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalSourceExtension {
+    id: String,
+    package_name: String,
+    source_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct LocalSourceExtensionArchive {
+    extension: LocalSourceExtension,
+    archive_path: PathBuf,
 }
 
 impl LocalBuildNpmAdapter {
@@ -553,6 +567,7 @@ fn local_build_npm_adapter(
 
 fn install_openclaw_package_with_npm(
     archive_path: &Path,
+    additional_archives: &[PathBuf],
     install_files: &Path,
     cwd: &Path,
     env: &BTreeMap<String, String>,
@@ -580,6 +595,7 @@ fn install_openclaw_package_with_npm(
         .arg("--omit=dev")
         .arg("--no-save")
         .arg("--package-lock=false")
+        .args(additional_archives)
         .arg(archive_path)
         .env("npm_config_fund", "false")
         .env("npm_config_audit", "false")
@@ -754,6 +770,269 @@ fn pack_local_openclaw_repo(
             display_path(pack_dir)
         )),
     }
+}
+
+fn packaged_openclaw_extension_ids(archive_path: &Path) -> Result<BTreeSet<String>, String> {
+    let file = fs::File::open(archive_path).map_err(|error| {
+        format!(
+            "failed to inspect local OpenClaw package at {}: {error}",
+            display_path(archive_path)
+        )
+    })?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut ids = BTreeSet::new();
+    for entry in archive.entries().map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path().map_err(|error| error.to_string())?;
+        let mut components = path.components();
+        if !matches!(components.next(), Some(Component::Normal(value)) if value == "package")
+            || !matches!(components.next(), Some(Component::Normal(value)) if value == "dist")
+            || !matches!(components.next(), Some(Component::Normal(value)) if value == "extensions")
+        {
+            continue;
+        }
+        if let Some(Component::Normal(value)) = components.next()
+            && value != "node_modules"
+        {
+            ids.insert(value.to_string_lossy().to_string());
+        }
+    }
+    Ok(ids)
+}
+
+fn npm_package_relative_path(package_name: &str) -> Option<PathBuf> {
+    let valid_component = |value: &str| {
+        !value.is_empty()
+            && value != "."
+            && value != ".."
+            && !value.contains(['/', '\\'])
+            && Path::new(value).file_name() == Some(OsStr::new(value))
+    };
+    if let Some(scoped) = package_name.strip_prefix('@') {
+        let (scope, name) = scoped.split_once('/')?;
+        if !valid_component(scope) || !valid_component(name) || name.contains('/') {
+            return None;
+        }
+        return Some(PathBuf::from(format!("@{scope}")).join(name));
+    }
+    valid_component(package_name).then(|| PathBuf::from(package_name))
+}
+
+fn local_source_extensions_omitted_from_package(
+    repo_path: &Path,
+    archive_path: &Path,
+) -> Result<Vec<LocalSourceExtension>, String> {
+    let packaged_ids = packaged_openclaw_extension_ids(archive_path)?;
+    let extensions_dir = repo_path.join("dist/extensions");
+    let entries = fs::read_dir(&extensions_dir).map_err(|error| {
+        format!(
+            "failed to read built OpenClaw extensions at {}: {error}",
+            display_path(&extensions_dir)
+        )
+    })?;
+    let mut extensions = Vec::new();
+    let mut package_names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let source_dir = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().to_string();
+        if id == "node_modules" || packaged_ids.contains(&id) {
+            continue;
+        }
+        let package_json_path = source_dir.join("package.json");
+        let manifest_path = source_dir.join("openclaw.plugin.json");
+        if !package_json_path.exists() && !manifest_path.exists() {
+            continue;
+        }
+        let raw = fs::read_to_string(&package_json_path).map_err(|error| {
+            format!(
+                "source extension \"{id}\" cannot be packaged because {} is unavailable: {error}",
+                display_path(&package_json_path)
+            )
+        })?;
+        let package_json: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+            format!(
+                "failed to parse source extension package.json at {}: {error}",
+                display_path(&package_json_path)
+            )
+        })?;
+        let package_name = package_json
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| npm_package_relative_path(value).is_some())
+            .ok_or_else(|| {
+                format!(
+                    "source extension \"{id}\" has no valid npm package name in {}",
+                    display_path(&package_json_path)
+                )
+            })?
+            .to_string();
+        if !package_names.insert(package_name.clone()) {
+            return Err(format!(
+                "multiple source extensions use npm package name \"{package_name}\""
+            ));
+        }
+        extensions.push(LocalSourceExtension {
+            id,
+            package_name,
+            source_dir,
+        });
+    }
+    extensions.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(extensions)
+}
+
+fn pack_local_source_extensions(
+    extensions: Vec<LocalSourceExtension>,
+    pack_dir: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<Vec<LocalSourceExtensionArchive>, String> {
+    if extensions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let npm = CommandSpec {
+        program: npm_program(env),
+        args: Vec::new(),
+        path_prepend: None,
+    };
+    let mut command = Command::new(&npm.program);
+    command
+        .args(&npm.args)
+        .arg("pack")
+        .arg("--json")
+        .arg("--ignore-scripts")
+        .arg("--pack-destination")
+        .arg(pack_dir)
+        .args(extensions.iter().map(|extension| &extension.source_dir))
+        .env("npm_config_fund", "false")
+        .env("npm_config_audit", "false")
+        .env("npm_config_update_notifier", "false")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    npm.apply_environment(&mut command, env)?;
+    let output = command.output().map_err(|error| {
+        format!("failed to run npm pack for local OpenClaw source extensions: {error}")
+    })?;
+    if !output.status.success() {
+        let detail =
+            summarize_command_output(&output.stdout, &output.stderr).unwrap_or_else(|| {
+                format!(
+                    "npm pack exited with code {}",
+                    output.status.code().unwrap_or(1)
+                )
+            });
+        return Err(format!(
+            "failed to pack local OpenClaw source extensions: {detail}"
+        ));
+    }
+
+    let values: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("failed to parse npm pack source extension output: {error}"))?;
+    let values = values
+        .as_array()
+        .ok_or_else(|| "npm pack source extension output was not a JSON array".to_string())?;
+    let mut archives_by_name = BTreeMap::new();
+    for value in values {
+        let package_name = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                "npm pack source extension output is missing a package name".to_string()
+            })?;
+        let filename = value
+            .get("filename")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "npm pack source extension output is missing a filename".to_string())?;
+        if Path::new(filename).file_name() != Some(OsStr::new(filename)) {
+            return Err(format!(
+                "npm pack returned an invalid source extension filename: {filename}"
+            ));
+        }
+        let archive_path = pack_dir.join(filename);
+        if !path_exists(&archive_path) {
+            return Err(format!(
+                "npm pack did not create source extension archive {}",
+                display_path(&archive_path)
+            ));
+        }
+        if archives_by_name
+            .insert(package_name.to_string(), archive_path)
+            .is_some()
+        {
+            return Err(format!(
+                "npm pack returned duplicate source extension package \"{package_name}\""
+            ));
+        }
+    }
+
+    let archives = extensions
+        .into_iter()
+        .map(|extension| {
+            let archive_path = archives_by_name
+                .remove(&extension.package_name)
+                .ok_or_else(|| {
+                    format!(
+                        "npm pack did not return source extension package \"{}\"",
+                        extension.package_name
+                    )
+                })?;
+            Ok(LocalSourceExtensionArchive {
+                extension,
+                archive_path,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if let Some(package_name) = archives_by_name.keys().next() {
+        return Err(format!(
+            "npm pack returned unexpected source extension package \"{package_name}\""
+        ));
+    }
+    Ok(archives)
+}
+
+fn materialize_local_source_extensions(
+    install_files: &Path,
+    extensions: &[LocalSourceExtensionArchive],
+) -> Result<(), String> {
+    let target_root = installed_openclaw_package_root(install_files).join("dist/extensions");
+    for extension in extensions {
+        let package_relative_path = npm_package_relative_path(&extension.extension.package_name)
+            .ok_or_else(|| {
+                format!(
+                    "source extension \"{}\" has an invalid npm package name",
+                    extension.extension.id
+                )
+            })?;
+        let installed_package = install_files
+            .join("node_modules")
+            .join(package_relative_path);
+        if !installed_package.join("package.json").exists() {
+            return Err(format!(
+                "installed source extension \"{}\" is missing {}",
+                extension.extension.id,
+                display_path(&installed_package.join("package.json"))
+            ));
+        }
+        let target = target_root.join(&extension.extension.id);
+        if path_exists(&target) {
+            return Err(format!(
+                "source extension target already exists after package installation: {}",
+                display_path(&target)
+            ));
+        }
+        copy_dir_recursive(&installed_package, &target)?;
+    }
+    Ok(())
 }
 
 fn build_installed_runtime_meta(
@@ -963,6 +1242,7 @@ fn install_runtime_from_openclaw_package(
             description,
             context,
             None,
+            &[],
         );
         let _ = fs::remove_file(&archive_path);
         publish_runtime(target, meta?)
@@ -977,14 +1257,21 @@ fn stage_runtime_from_openclaw_package_archive(
     description: Option<String>,
     context: InstallContext<'_>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
+    source_extensions: &[LocalSourceExtensionArchive],
 ) -> Result<RuntimeMeta, String> {
+    let additional_archives = source_extensions
+        .iter()
+        .map(|extension| extension.archive_path.clone())
+        .collect::<Vec<_>>();
     install_openclaw_package_with_npm(
         archive_path,
+        &additional_archives,
         &target.install_files,
         context.cwd,
         context.env,
         local_adapter,
     )?;
+    materialize_local_source_extensions(&target.install_files, source_extensions)?;
     expose_openclaw_package_runtime_dependencies(&target.install_files)?;
 
     let binary_path = installed_openclaw_binary_path(&target.install_files);
@@ -1315,6 +1602,13 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
         let local_adapter = local_build_npm_adapter(&repo_path, context.env)?;
         let archive_path =
             pack_local_openclaw_repo(&repo_path, &pack_dir, context.env, local_adapter.as_ref())?;
+        let source_extensions = if options.include_source_extensions {
+            let extensions =
+                local_source_extensions_omitted_from_package(&repo_path, &archive_path)?;
+            pack_local_source_extensions(extensions, &pack_dir, context.env)?
+        } else {
+            Vec::new()
+        };
         let target = prepare_runtime_install_target(name, options.force, context.env, context.cwd)?;
         if path_exists(&target.install_root) {
             return Err(format!(
@@ -1339,6 +1633,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
             description,
             context,
             local_adapter.as_ref(),
+            &source_extensions,
         )?;
         publish_runtime(target, meta)
     })();

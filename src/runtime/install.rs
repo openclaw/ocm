@@ -55,6 +55,7 @@ pub struct BuildLocalRuntimeOptions {
     pub repo: String,
     pub description: Option<String>,
     pub force: bool,
+    pub include_source_extensions: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -391,6 +392,7 @@ impl<'a> RuntimeService<'a> {
                     repo: options.repo,
                     description: options.description,
                     force: options.force,
+                    include_source_extensions: options.include_source_extensions,
                 },
                 InstallContext {
                     env: self.env,

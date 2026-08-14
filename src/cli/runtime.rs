@@ -286,6 +286,8 @@ impl Cli {
         let (args, json_flag, profile) =
             self.consume_human_output_flags(args, "runtime build-local")?;
         let (args, force) = Self::consume_flag(args, "--force");
+        let (args, include_source_extensions) =
+            Self::consume_flag(args, "--include-source-extensions");
         let (args, repo) = Self::consume_option(args, "--repo")?;
         let repo = Self::require_option_value(repo, "--repo")?;
         let Some(repo) = repo else {
@@ -304,6 +306,7 @@ impl Cli {
                     repo: repo.clone(),
                     description,
                     force,
+                    include_source_extensions,
                 })
         })?;
 

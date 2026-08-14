@@ -116,6 +116,26 @@ files/node_modules/openclaw/openclaw.mjs
 
 That matters for release and upgrade testing because it avoids source/Jiti execution paths and exercises the built package files that users install.
 
+When an environment should run an immutable build of a local checkout while
+retaining extensions that are available to the source launcher but intentionally
+omitted from the release-shaped core package, opt in explicitly:
+
+```bash
+ocm runtime build-local upstream-main \
+  --repo /path/to/openclaw \
+  --include-source-extensions \
+  --force
+```
+
+OCM packages only built extensions under that checkout's `dist/extensions`
+that are absent from the core tarball, installs their runtime dependencies, and
+places them in the managed runtime's bundled-extension root. Extensions from
+global, state, workspace, or other external paths are not included or promoted.
+Without the flag, `build-local` remains release-shaped.
+Because the opt-in installs every omitted extension and its dependency closure,
+the resulting runtime can take longer to build and use substantially more disk
+space than the release-shaped default.
+
 ### 6. Keep an environment running in the background
 
 ```bash
@@ -231,7 +251,9 @@ Use a launcher when you want:
 
 - published OpenClaw release: use `release` and `runtime`
 - local checkout as source command: use `launcher`
-- local checkout as built package: use `runtime build-local`
+- local checkout as built package: use `runtime build-local`; add
+  `--include-source-extensions` only when the managed artifact should retain
+  source-checkout extensions omitted from the release package
 - day-to-day work: use `env`
 
 ## Running commands inside environments

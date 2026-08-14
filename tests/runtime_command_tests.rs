@@ -78,6 +78,75 @@ fn openclaw_package_tarball_with_dependencies(script_body: &str, version: &str) 
     encoder.finish().unwrap()
 }
 
+fn openclaw_package_tarball_with_bundled_extension(script_body: &str, version: &str) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut encoder);
+        append_tar_file(
+            &mut builder,
+            "package/openclaw.mjs",
+            script_body.as_bytes(),
+            0o755,
+        );
+        append_tar_file(
+            &mut builder,
+            "package/package.json",
+            format!(
+                "{{\"name\":\"openclaw\",\"version\":\"{version}\",\"bin\":{{\"openclaw\":\"openclaw.mjs\"}}}}"
+            )
+            .as_bytes(),
+            0o644,
+        );
+        append_tar_file(
+            &mut builder,
+            "package/dist/extensions/memory-core/package.json",
+            br#"{"name":"@openclaw/memory-core","version":"2026.4.25"}"#,
+            0o644,
+        );
+        append_tar_file(
+            &mut builder,
+            "package/dist/extensions/memory-core/openclaw.plugin.json",
+            br#"{"id":"memory-core","configSchema":{"type":"object"}}"#,
+            0o644,
+        );
+        append_tar_file(
+            &mut builder,
+            "package/dist/extensions/memory-core/index.js",
+            b"export const build = 'packaged';\n",
+            0o644,
+        );
+        builder.finish().unwrap();
+    }
+    encoder.finish().unwrap()
+}
+
+fn source_extension_package_tarball() -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut encoder);
+        append_tar_file(
+            &mut builder,
+            "package/package.json",
+            br#"{"name":"@openclaw/codex","version":"2026.4.25","dependencies":{"codex-runtime":"1.0.0"}}"#,
+            0o644,
+        );
+        append_tar_file(
+            &mut builder,
+            "package/openclaw.plugin.json",
+            br#"{"id":"codex","configSchema":{"type":"object"}}"#,
+            0o644,
+        );
+        append_tar_file(
+            &mut builder,
+            "package/index.js",
+            b"export const build = 'source';\n",
+            0o644,
+        );
+        builder.finish().unwrap();
+    }
+    encoder.finish().unwrap()
+}
+
 fn sha512_integrity(body: &[u8]) -> String {
     let digest = Sha512::digest(body);
     format!(
@@ -111,6 +180,36 @@ if [ "$1" = "--version" ]; then
 fi
 
 if [ "$1" = "pack" ]; then
+  case " $* " in
+    *" --json "*)
+      shift
+      destination=""
+      source_dir=""
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --pack-destination)
+            shift
+            destination="$1"
+            ;;
+          --json|--ignore-scripts)
+            ;;
+          *)
+            source_dir="$1"
+            ;;
+        esac
+        shift
+      done
+      if [ -z "$destination" ] || [ -z "$source_dir" ] || [ -z "$FAKE_SOURCE_EXTENSION_ARCHIVE" ]; then
+        echo "fake npm source extension pack is not configured" >&2
+        exit 1
+      fi
+      mkdir -p "$destination"
+      cp "$FAKE_SOURCE_EXTENSION_ARCHIVE" "$destination/$FAKE_SOURCE_EXTENSION_FILENAME"
+      printf '[{{"name":"%s","version":"2026.4.25","filename":"%s"}}]\n' \
+        "$FAKE_SOURCE_EXTENSION_NAME" "$FAKE_SOURCE_EXTENSION_FILENAME"
+      exit 0
+      ;;
+  esac
   printf 'verify-deps-before-run=%s\n' "$PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN" >> "{}"
   printf 'allow-unreleased-changelog=%s\n' "$OPENCLAW_PREPACK_ALLOW_UNRELEASED_CHANGELOG" >> "{}"
   printf 'ignore-scripts-lower=%s\n' "${{npm_config_ignore_scripts-unset}}" >> "{}"
@@ -138,6 +237,7 @@ fi
 
 prefix=""
 archive=""
+source_extension_archive=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --prefix)
@@ -147,6 +247,7 @@ while [ "$#" -gt 0 ]; do
     install|--omit=dev|--no-save|--package-lock=false)
       ;;
     *)
+      source_extension_archive="$archive"
       archive="$1"
       ;;
   esac
@@ -160,6 +261,13 @@ fi
 
 mkdir -p "$prefix/node_modules/openclaw"
 tar -xzf "$archive" -C "$prefix/node_modules/openclaw" --strip-components=1 package
+if [ -n "$source_extension_archive" ]; then
+  source_extension_root="$prefix/node_modules/$FAKE_SOURCE_EXTENSION_INSTALL_PATH"
+  mkdir -p "$source_extension_root"
+  tar -xzf "$source_extension_archive" -C "$source_extension_root" --strip-components=1 package
+  mkdir -p "$prefix/node_modules/codex-runtime"
+  printf '{{"name":"codex-runtime","version":"1.0.0"}}\n' > "$prefix/node_modules/codex-runtime/package.json"
+fi
 if grep -q '"chokidar"' "$prefix/node_modules/openclaw/package.json"; then
   mkdir -p "$prefix/node_modules/chokidar"
   mkdir -p "$prefix/node_modules/readdirp"
@@ -522,6 +630,171 @@ fn runtime_build_local_packs_and_installs_release_shaped_package() {
 
     let verify = run_ocm(&cwd, &env, &["runtime", "verify", "main-local", "--raw"]);
     assert!(verify.status.success(), "{}", stderr(&verify));
+}
+
+#[test]
+fn runtime_build_local_can_include_source_extensions_without_widening_default_trust() {
+    let root = TestDir::new("runtime-build-local-source-extensions");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    let codex_dir = repo.join("dist/extensions/codex");
+    let memory_core_dir = repo.join("dist/extensions/memory-core");
+    let dependency_only_dir = repo.join("dist/extensions/node_modules/external-helper");
+    let external_plugin_dir = cwd.join("external-plugins/external-demo");
+    for dir in [
+        &codex_dir,
+        &memory_core_dir,
+        &dependency_only_dir,
+        &external_plugin_dir,
+    ] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(
+        repo.join("package.json"),
+        br#"{"name":"openclaw","version":"2026.4.25","bin":{"openclaw":"openclaw.mjs"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        codex_dir.join("package.json"),
+        br#"{"name":"@openclaw/codex","version":"2026.4.25","dependencies":{"codex-runtime":"1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        codex_dir.join("openclaw.plugin.json"),
+        br#"{"id":"codex","configSchema":{"type":"object"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        codex_dir.join("index.js"),
+        "export const build = 'source';\n",
+    )
+    .unwrap();
+    fs::write(
+        memory_core_dir.join("package.json"),
+        br#"{"name":"@openclaw/memory-core","version":"2026.4.25"}"#,
+    )
+    .unwrap();
+    fs::write(
+        memory_core_dir.join("openclaw.plugin.json"),
+        br#"{"id":"memory-core","configSchema":{"type":"object"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        memory_core_dir.join("index.js"),
+        "export const build = 'source';\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency_only_dir.join("package.json"),
+        br#"{"name":"external-helper","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        external_plugin_dir.join("package.json"),
+        br#"{"name":"external-demo","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        &external_plugin_dir,
+        repo.join("dist/extensions/linked-external-demo"),
+    )
+    .unwrap();
+
+    let archive_path = root.child("packed-openclaw.tgz");
+    fs::write(
+        &archive_path,
+        openclaw_package_tarball_with_bundled_extension(
+            "#!/usr/bin/env node\nconsole.log('source extension runtime');\n",
+            "2026.4.25",
+        ),
+    )
+    .unwrap();
+    let source_extension_archive = root.child("openclaw-codex-2026.4.25.tgz");
+    fs::write(
+        &source_extension_archive,
+        source_extension_package_tarball(),
+    )
+    .unwrap();
+
+    let mut env = ocm_env(&root);
+    env.insert(
+        "FAKE_SOURCE_EXTENSION_ARCHIVE".to_string(),
+        path_string(&source_extension_archive),
+    );
+    env.insert(
+        "FAKE_SOURCE_EXTENSION_NAME".to_string(),
+        "@openclaw/codex".to_string(),
+    );
+    env.insert(
+        "FAKE_SOURCE_EXTENSION_FILENAME".to_string(),
+        "openclaw-codex-2026.4.25.tgz".to_string(),
+    );
+    env.insert(
+        "FAKE_SOURCE_EXTENSION_INSTALL_PATH".to_string(),
+        "@openclaw/codex".to_string(),
+    );
+    install_fake_node_and_packing_npm(&root, &mut env, &archive_path);
+
+    let release_build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "release-shaped",
+            "--repo",
+            "./openclaw",
+            "--raw",
+        ],
+    );
+    assert!(release_build.status.success(), "{}", stderr(&release_build));
+    let release_root = runtime_install_root("release-shaped", &env, &cwd)
+        .unwrap()
+        .join("files/node_modules/openclaw");
+    assert!(!release_root.join("dist/extensions/codex").exists());
+    assert_eq!(
+        fs::read_to_string(release_root.join("dist/extensions/memory-core/index.js")).unwrap(),
+        "export const build = 'packaged';\n"
+    );
+
+    let source_build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "source-extensions",
+            "--repo",
+            "./openclaw",
+            "--include-source-extensions",
+            "--raw",
+        ],
+    );
+    assert!(source_build.status.success(), "{}", stderr(&source_build));
+    let source_root = runtime_install_root("source-extensions", &env, &cwd)
+        .unwrap()
+        .join("files/node_modules/openclaw");
+    assert_eq!(
+        fs::read_to_string(source_root.join("dist/extensions/codex/index.js")).unwrap(),
+        "export const build = 'source';\n"
+    );
+    assert_eq!(
+        fs::read_to_string(source_root.join("dist/extensions/memory-core/index.js")).unwrap(),
+        "export const build = 'packaged';\n"
+    );
+    assert!(
+        source_root
+            .join("node_modules/codex-runtime/package.json")
+            .exists()
+    );
+    assert!(!source_root.join("dist/extensions/external-helper").exists());
+    assert!(!source_root.join("dist/extensions/external-demo").exists());
+    assert!(
+        !source_root
+            .join("dist/extensions/linked-external-demo")
+            .exists()
+    );
 }
 
 #[test]
