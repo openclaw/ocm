@@ -4,6 +4,7 @@ mod registry;
 pub mod releases;
 mod verify;
 
+pub(crate) use install::StagedRuntimeInstall;
 pub use install::{
     BuildLocalRuntimeOptions, InstallRuntimeFromOfficialReleaseOptions,
     InstallRuntimeFromReleaseOptions, InstallRuntimeFromUrlOptions, InstallRuntimeOptions,

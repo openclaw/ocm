@@ -208,6 +208,16 @@ fn stop_converging_health_server(port: u32, stop: &AtomicBool, handle: thread::J
     handle.join().unwrap();
 }
 
+fn health_status(port: u32) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response.lines().next().unwrap_or_default().to_string()
+}
+
 fn recording_openclaw_script(version: &str) -> String {
     format!(
         r#"#!/bin/sh
@@ -3103,10 +3113,12 @@ fn upgrade_rolls_back_runtime_when_service_restart_fails() {
 }
 
 #[test]
-fn upgrade_restores_runtime_when_runtime_preparation_fails() {
+fn upgrade_fails_runtime_preparation_before_cutover() {
     let root = TestDir::new("upgrade-runtime-prepare-rollback");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
+    let (health_port, health_requests, health_stop, health_handle) =
+        spawn_converging_health_server();
 
     let old_tarball = openclaw_package_tarball("console.log('2026.3.24');\n", "2026.3.24");
     let old_integrity = sha512_integrity(&old_tarball);
@@ -3152,11 +3164,54 @@ fn upgrade_restores_runtime_when_runtime_preparation_fails() {
         "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
         packument_server.url(),
     );
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
 
-    let start = run_ocm(&cwd, &env, &["start", "demo", "--no-service"]);
+    let start = run_ocm(
+        &cwd,
+        &env,
+        &["start", "demo", "--port", &health_port.to_string()],
+    );
     assert!(start.status.success(), "{}", stderr(&start));
+    assert_eq!(
+        health_status(health_port),
+        "HTTP/1.1 503 Service Unavailable"
+    );
+    assert_eq!(health_status(health_port), "HTTP/1.1 200 OK");
+
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    write_running_supervisor_runtime(&runtime_path, &ocm_home, "stable", 4242, health_port);
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let observer_done = Arc::new(AtomicBool::new(false));
+    let observer_done_thread = Arc::clone(&observer_done);
+    let source_was_stopped = Arc::new(AtomicBool::new(false));
+    let source_was_stopped_thread = Arc::clone(&source_was_stopped);
+    let observer = thread::spawn(move || {
+        while !observer_done_thread.load(Ordering::Relaxed) {
+            let desired_running = fs::read(&registry_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|registry| registry["envs"].as_array().cloned())
+                .and_then(|envs| envs.into_iter().find(|entry| entry["name"] == "demo"))
+                .and_then(|entry| entry["serviceRunning"].as_bool())
+                .unwrap_or(true);
+            if !desired_running {
+                source_was_stopped_thread.store(true, Ordering::SeqCst);
+            }
+            sleep(Duration::from_millis(1));
+        }
+    });
 
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo"]);
+    observer_done.store(true, Ordering::Relaxed);
+    observer.join().unwrap();
+    assert_eq!(health_status(health_port), "HTTP/1.1 200 OK");
+    stop_converging_health_server(health_port, &health_stop, health_handle);
     assert!(
         !upgrade.status.success(),
         "stdout:\n{}\nstderr:\n{}",
@@ -3164,21 +3219,42 @@ fn upgrade_restores_runtime_when_runtime_preparation_fails() {
         stderr(&upgrade)
     );
     let output = stdout(&upgrade);
-    assert!(
-        output.contains("outcome=rolled-back"),
-        "stdout:\n{output}\nstderr:\n{}",
-        stderr(&upgrade)
-    );
-    assert!(output.contains("rollback=restored"), "{output}");
+    assert!(output.contains("outcome=failed"), "{output}");
+    assert!(!output.contains("snapshot="), "{output}");
+    assert!(!output.contains("rollback="), "{output}");
     assert!(
         output.contains("runtime artifact integrity is invalid"),
         "{output}"
     );
+    assert!(
+        !source_was_stopped.load(Ordering::SeqCst),
+        "source service policy changed during pre-cutover failure"
+    );
+    assert!(health_requests.load(Ordering::SeqCst) >= 3);
 
     let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
     assert!(runtime.status.success(), "{}", stderr(&runtime));
     let runtime_json: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
     assert_eq!(runtime_json["releaseVersion"], "2026.3.24");
+    let staged_runtime_paths = fs::read_dir(Path::new(&ocm_home).join("runtimes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".stable.stage-"))
+        .collect::<Vec<_>>();
+    assert!(staged_runtime_paths.is_empty(), "{staged_runtime_paths:?}");
+    let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "demo", "--json"]);
+    assert!(snapshots.status.success(), "{}", stderr(&snapshots));
+    let snapshots: Value = serde_json::from_str(&stdout(&snapshots)).unwrap();
+    assert!(snapshots.as_array().unwrap().is_empty());
+    let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+    assert!(history.status.success(), "{}", stderr(&history));
+    let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
+    assert!(history.as_array().unwrap().is_empty());
+    let service = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+    assert!(service.status.success(), "{}", stderr(&service));
+    let service: Value = serde_json::from_str(&stdout(&service)).unwrap();
+    assert_eq!(service["desiredRunning"], true);
+    assert_eq!(service["running"], true);
 }
 
 #[test]
@@ -3471,7 +3547,7 @@ fn upgrade_rollback_refuses_a_broken_source_launcher_before_mutation() {
 }
 
 #[test]
-fn upgrade_can_switch_env_to_an_installed_runtime() {
+fn upgrade_keeps_a_disabled_service_disabled_when_switching_runtime() {
     let root = TestDir::new("upgrade-installed-runtime");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -3517,6 +3593,11 @@ fn upgrade_can_switch_env_to_an_installed_runtime() {
         &["env", "create", "demo", "--runtime", "old-local"],
     );
     assert!(create.status.success(), "{}", stderr(&create));
+    let before = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(before.status.success(), "{}", stderr(&before));
+    let before: Value = serde_json::from_str(&stdout(&before)).unwrap();
+    assert_eq!(before["serviceEnabled"], false);
+    assert_eq!(before["serviceRunning"], false);
 
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new-local"]);
     assert!(upgrade.status.success(), "{}", stderr(&upgrade));
@@ -3524,11 +3605,14 @@ fn upgrade_can_switch_env_to_an_installed_runtime() {
     assert!(output.contains("from=runtime:old-local"), "{output}");
     assert!(output.contains("to=runtime:new-local"), "{output}");
     assert!(output.contains("outcome=switched"), "{output}");
+    assert!(!output.contains("service="), "{output}");
 
     let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(show.status.success(), "{}", stderr(&show));
     let env_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
     assert_eq!(env_json["defaultRuntime"], "new-local");
+    assert_eq!(env_json["serviceEnabled"], false);
+    assert_eq!(env_json["serviceRunning"], false);
     let env_root = Path::new(env_json["root"].as_str().unwrap());
     let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
     assert!(

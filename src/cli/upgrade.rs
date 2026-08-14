@@ -22,7 +22,7 @@ use crate::runtime::releases::{
 };
 use crate::runtime::{
     InstallRuntimeFromOfficialReleaseOptions, OfficialRuntimePrepareAction, RuntimeMeta,
-    RuntimeReleaseSelectorKind, RuntimeService,
+    RuntimeReleaseSelectorKind, RuntimeService, StagedRuntimeInstall,
 };
 use crate::service::ServiceSummary;
 use crate::store::{
@@ -1723,6 +1723,22 @@ impl Cli {
             } else {
                 vec![target_runtime_name.clone()]
             };
+            let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return self.fail_upgrade_before_cutover(
+                        env_name,
+                        "runtime",
+                        previous_binding_name,
+                        "runtime",
+                        target_runtime_name,
+                        target_version.clone(),
+                        target.release_channel_hint(),
+                        error,
+                    );
+                }
+            };
+            let target_changed = !matches!(prepared.action, OfficialRuntimePrepareAction::Reused);
             let mut transaction = self.begin_upgrade_transaction_locked(
                 env_name,
                 UpgradeTransactionPlan {
@@ -1742,10 +1758,10 @@ impl Cli {
                 "pre-upgrade",
                 None,
             )?;
-            if !target.is_named_runtime() {
-                transaction.mark_runtime_mutated(&target_runtime_name);
+            if target_changed {
+                transaction.mark_runtime_mutated(&prepared.name);
             }
-            let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
+            let prepared = match prepared.commit() {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return self.rollback_failed_upgrade(
@@ -1761,9 +1777,6 @@ impl Cli {
                     );
                 }
             };
-            if matches!(prepared.action, OfficialRuntimePrepareAction::Reused) {
-                transaction.unmark_runtime_mutated(&prepared.name);
-            }
             let binding_changed = prepared.name != current.name;
             let post_update_note = match self.run_post_core_update(env_name, &prepared.name) {
                 Ok(note) => {
@@ -1955,6 +1968,25 @@ impl Cli {
                     ),
                 });
             }
+            let prepared = match self.prepare_isolated_upgrade_target(env_name, &target, resolved) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return self.fail_upgrade_before_cutover(
+                        env_name,
+                        "runtime",
+                        previous_binding_name,
+                        "runtime",
+                        target_runtime_name,
+                        target_version.clone(),
+                        target.release_channel_hint(),
+                        error,
+                    );
+                }
+            };
+            let changed = matches!(
+                prepared.action,
+                OfficialRuntimePrepareAction::Installed | OfficialRuntimePrepareAction::Updated
+            );
             let mut transaction = self.begin_upgrade_transaction_locked(
                 env_name,
                 UpgradeTransactionPlan {
@@ -1974,8 +2006,10 @@ impl Cli {
                 "pre-upgrade",
                 None,
             )?;
-            transaction.mark_runtime_mutated(&target_runtime_name);
-            let prepared = match self.prepare_isolated_upgrade_target(env_name, &target, resolved) {
+            if changed {
+                transaction.mark_runtime_mutated(&prepared.name);
+            }
+            let prepared = match prepared.commit() {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return self.rollback_failed_upgrade(
@@ -1991,13 +2025,6 @@ impl Cli {
                     );
                 }
             };
-            let changed = matches!(
-                prepared.action,
-                OfficialRuntimePrepareAction::Installed | OfficialRuntimePrepareAction::Updated
-            );
-            if !changed {
-                transaction.unmark_runtime_mutated(&prepared.name);
-            }
             let post_update_note = if changed {
                 match self.run_post_core_update(env_name, &prepared.name) {
                     Ok(note) => {
@@ -2131,6 +2158,27 @@ impl Cli {
                 note: Some("dry run: no runtime, env, service, or snapshot changed".to_string()),
             });
         }
+        let prepared =
+            match self.with_progress(format!("Updating runtime {}", current.name), || {
+                self.with_isolated_runtime_mutation(env_name, &current.name, || {
+                    self.runtime_service()
+                        .prepare_resolved_update(resolved_update)
+                })
+            }) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return self.fail_upgrade_before_cutover(
+                        env_name,
+                        "runtime",
+                        previous_binding_name,
+                        "runtime",
+                        current.name,
+                        current.release_version,
+                        current.release_channel,
+                        error,
+                    );
+                }
+            };
         let mut transaction = self.begin_upgrade_transaction_locked(
             env_name,
             UpgradeTransactionPlan {
@@ -2151,12 +2199,7 @@ impl Cli {
             None,
         )?;
         transaction.mark_runtime_mutated(&current.name);
-        let updated = match self.with_progress(format!("Updating runtime {}", current.name), || {
-            self.with_isolated_runtime_mutation(env_name, &current.name, || {
-                self.runtime_service()
-                    .apply_resolved_update(resolved_update, false)
-            })
-        }) {
+        let updated = match prepared.commit() {
             Ok(updated) => updated,
             Err(error) => {
                 return self.rollback_failed_upgrade(
@@ -2345,6 +2388,22 @@ impl Cli {
             });
         }
 
+        let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return self.fail_upgrade_before_cutover(
+                    env_name,
+                    "launcher",
+                    launcher_name.to_string(),
+                    "runtime",
+                    target_runtime_name,
+                    target_version.clone(),
+                    target.release_channel_hint(),
+                    error,
+                );
+            }
+        };
+        let target_changed = !matches!(prepared.action, OfficialRuntimePrepareAction::Reused);
         let mut transaction = self.begin_upgrade_transaction_locked(
             env_name,
             UpgradeTransactionPlan {
@@ -2364,10 +2423,10 @@ impl Cli {
             "pre-upgrade",
             None,
         )?;
-        if !target.is_named_runtime() {
-            transaction.mark_runtime_mutated(&target_runtime_name);
+        if target_changed {
+            transaction.mark_runtime_mutated(&prepared.name);
         }
-        let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
+        let prepared = match prepared.commit() {
             Ok(prepared) => prepared,
             Err(error) => {
                 return self.rollback_failed_upgrade(
@@ -2383,9 +2442,6 @@ impl Cli {
                 );
             }
         };
-        if matches!(prepared.action, OfficialRuntimePrepareAction::Reused) {
-            transaction.unmark_runtime_mutated(&prepared.name);
-        }
         let post_update_note = match self.run_post_core_update(env_name, &prepared.name) {
             Ok(note) => {
                 transaction.mark_post_update_completed(note.as_deref());
@@ -2606,9 +2662,10 @@ impl Cli {
                 name: resolved.name,
                 meta,
                 action: OfficialRuntimePrepareAction::Reused,
+                staged: None,
             }),
             ResolvedUpgradeTargetKind::Official(release) => {
-                let (meta, action) = self.with_progress(
+                let staged = self.with_progress(
                     format!("Preparing OpenClaw runtime for {env_name}"),
                     || {
                         self.runtime_service()
@@ -2624,10 +2681,13 @@ impl Cli {
                             )
                     },
                 )?;
+                let meta = staged.meta().clone();
+                let action = staged.action();
                 Ok(PreparedUpgradeTarget {
                     name: resolved.name,
                     meta,
                     action,
+                    staged: Some(staged),
                 })
             }
         }
@@ -2943,9 +3003,56 @@ impl Cli {
         let prepared = self
             .environment_service()
             .prepare_snapshot_capture_locked(env_name)?;
-        let service_state = self
-            .service_service()
-            .quiesce_for_snapshot_locked(env_name)?;
+        let mut seen = BTreeSet::new();
+        let mut runtime_backups: Vec<RuntimeRollbackBackup> = Vec::new();
+        let mut created_runtime_names = Vec::new();
+
+        for runtime_name in runtime_names {
+            if !seen.insert(runtime_name.clone()) {
+                continue;
+            }
+            let meta_path = match runtime_meta_path(runtime_name, &self.env, &self.cwd) {
+                Ok(meta_path) => meta_path,
+                Err(error) => {
+                    for backup in runtime_backups {
+                        backup.cleanup();
+                    }
+                    return Err(error);
+                }
+            };
+            if meta_path.exists() {
+                let runtime = match get_runtime(runtime_name, &self.env, &self.cwd) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        for backup in runtime_backups {
+                            backup.cleanup();
+                        }
+                        return Err(error);
+                    }
+                };
+                match self.backup_runtime_for_upgrade(&runtime) {
+                    Ok(backup) => runtime_backups.push(backup),
+                    Err(error) => {
+                        for backup in runtime_backups {
+                            backup.cleanup();
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                created_runtime_names.push(runtime_name.clone());
+            }
+        }
+
+        let service_state = match self.service_service().quiesce_for_snapshot_locked(env_name) {
+            Ok(service_state) => service_state,
+            Err(error) => {
+                for backup in runtime_backups {
+                    backup.cleanup();
+                }
+                return Err(error);
+            }
+        };
         let started_at = time::OffsetDateTime::now_utc();
         let id = format!(
             "{}-{:09}",
@@ -2965,6 +3072,9 @@ impl Cli {
         let snapshot = match snapshot_result {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                for backup in runtime_backups {
+                    backup.cleanup();
+                }
                 let snapshot_error = format!(
                     "failed to create {snapshot_label} snapshot for env \"{env_name}\": {error}"
                 );
@@ -2979,55 +3089,6 @@ impl Cli {
                 };
             }
         };
-        let mut seen = BTreeSet::new();
-        let mut runtime_backups = Vec::new();
-        let mut created_runtime_names = Vec::new();
-
-        for runtime_name in runtime_names {
-            if !seen.insert(runtime_name.clone()) {
-                continue;
-            }
-            let meta_path = match runtime_meta_path(runtime_name, &self.env, &self.cwd) {
-                Ok(meta_path) => meta_path,
-                Err(error) => {
-                    return Err(self.cleanup_failed_transaction_setup(
-                        env_name,
-                        &snapshot.id,
-                        runtime_backups,
-                        service_state,
-                        error,
-                    ));
-                }
-            };
-            if meta_path.exists() {
-                let runtime = match get_runtime(runtime_name, &self.env, &self.cwd) {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        return Err(self.cleanup_failed_transaction_setup(
-                            env_name,
-                            &snapshot.id,
-                            runtime_backups,
-                            service_state,
-                            error,
-                        ));
-                    }
-                };
-                match self.backup_runtime_for_upgrade(&runtime) {
-                    Ok(backup) => runtime_backups.push(backup),
-                    Err(error) => {
-                        return Err(self.cleanup_failed_transaction_setup(
-                            env_name,
-                            &snapshot.id,
-                            runtime_backups,
-                            service_state,
-                            error,
-                        ));
-                    }
-                }
-            } else {
-                created_runtime_names.push(runtime_name.clone());
-            }
-        }
 
         let service_quiesced = service_state.is_some();
 
@@ -3056,40 +3117,6 @@ impl Cli {
             mutated_runtime_names: BTreeSet::new(),
             rollback_of,
         })
-    }
-
-    fn cleanup_failed_transaction_setup(
-        &self,
-        env_name: &str,
-        snapshot_id: &str,
-        runtime_backups: Vec<RuntimeRollbackBackup>,
-        service_state: Option<crate::service::ServiceMaintenanceState>,
-        error: String,
-    ) -> String {
-        for backup in runtime_backups {
-            backup.cleanup();
-        }
-        let cleanup_result = self.environment_service().remove_snapshot_locked(
-            crate::env::RemoveEnvSnapshotOptions {
-                env_name: env_name.to_string(),
-                snapshot_id: snapshot_id.to_string(),
-            },
-        );
-        let service_result = self
-            .service_service()
-            .restore_after_snapshot_locked(env_name, service_state);
-        let mut result = error;
-        if let Err(cleanup_error) = cleanup_result {
-            result = format!(
-                "{result}; also failed to remove the incomplete transaction snapshot: {cleanup_error}"
-            );
-        }
-        if let Err(service_error) = service_result {
-            result = format!(
-                "{result}; also failed to restore the managed service after snapshot capture: {service_error}"
-            );
-        }
-        result
     }
 
     fn finish_successful_upgrade(
@@ -3283,6 +3310,36 @@ impl Cli {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn fail_upgrade_before_cutover(
+        &self,
+        env_name: &str,
+        previous_binding_kind: &str,
+        previous_binding_name: String,
+        binding_kind: &str,
+        binding_name: String,
+        runtime_release_version: Option<String>,
+        runtime_release_channel: Option<String>,
+        error: String,
+    ) -> Result<UpgradeEnvSummary, String> {
+        Ok(UpgradeEnvSummary {
+            env_name: env_name.to_string(),
+            previous_binding_kind: previous_binding_kind.to_string(),
+            previous_binding_name,
+            binding_kind: binding_kind.to_string(),
+            binding_name,
+            outcome: "failed".to_string(),
+            runtime_release_version,
+            runtime_release_channel,
+            service_action: None,
+            snapshot_id: None,
+            rollback: None,
+            note: Some(format!(
+                "upgrade preparation failed before cutover; the source environment and service were left unchanged: {error}"
+            )),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn rollback_failed_upgrade(
         &self,
         env_name: &str,
@@ -3458,11 +3515,20 @@ impl Cli {
     }
 }
 
-#[derive(Clone, Debug)]
 struct PreparedUpgradeTarget {
     name: String,
     meta: RuntimeMeta,
     action: OfficialRuntimePrepareAction,
+    staged: Option<StagedRuntimeInstall>,
+}
+
+impl PreparedUpgradeTarget {
+    fn commit(mut self) -> Result<Self, String> {
+        if let Some(staged) = self.staged.take() {
+            self.meta = staged.commit()?;
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug)]
@@ -3619,10 +3685,6 @@ struct UpgradeTransaction {
 impl UpgradeTransaction {
     fn mark_runtime_mutated(&mut self, runtime_name: &str) {
         self.mutated_runtime_names.insert(runtime_name.to_string());
-    }
-
-    fn unmark_runtime_mutated(&mut self, runtime_name: &str) {
-        self.mutated_runtime_names.remove(runtime_name);
     }
 
     fn mark_post_update_completed(&mut self, note: Option<&str>) {

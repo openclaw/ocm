@@ -7,10 +7,11 @@ use crate::runtime::releases::{
 };
 use crate::store::{
     BuildLocalRuntimeOptions as StoreBuildLocalRuntimeOptions, InstallContext,
-    RuntimeReleaseDetails, get_runtime, install_runtime, install_runtime_from_local_openclaw_build,
-    install_runtime_from_official_openclaw_release, install_runtime_from_release,
-    install_runtime_from_selected_official_openclaw_release, install_runtime_from_selected_release,
-    install_runtime_from_url, list_runtimes, runtime_integrity_issue,
+    PreparedRuntimeInstall, RuntimeReleaseDetails, get_runtime, install_runtime,
+    install_runtime_from_local_openclaw_build, install_runtime_from_official_openclaw_release,
+    install_runtime_from_release, install_runtime_from_url, list_runtimes,
+    prepare_runtime_from_selected_official_openclaw_release, prepare_runtime_from_selected_release,
+    runtime_integrity_issue,
 };
 use serde::Serialize;
 
@@ -118,6 +119,25 @@ pub enum OfficialRuntimePrepareAction {
     Updated,
 }
 
+pub(crate) struct StagedRuntimeInstall {
+    prepared: PreparedRuntimeInstall,
+    action: OfficialRuntimePrepareAction,
+}
+
+impl StagedRuntimeInstall {
+    pub(crate) fn meta(&self) -> &RuntimeMeta {
+        self.prepared.meta()
+    }
+
+    pub(crate) fn action(&self) -> OfficialRuntimePrepareAction {
+        self.action
+    }
+
+    pub(crate) fn commit(self) -> Result<RuntimeMeta, String> {
+        self.prepared.commit()
+    }
+}
+
 impl<'a> RuntimeService<'a> {
     pub fn canonical_official_openclaw_runtime_name(
         version: Option<&str>,
@@ -176,13 +196,8 @@ impl<'a> RuntimeService<'a> {
         &self,
         options: InstallRuntimeFromOfficialReleaseOptions,
         selected_release: OpenClawRelease,
-    ) -> Result<(RuntimeMeta, OfficialRuntimePrepareAction), String> {
-        self.prepare_official_openclaw_runtime_with_refresh(
-            options,
-            false,
-            false,
-            Some(selected_release),
-        )
+    ) -> Result<StagedRuntimeInstall, String> {
+        self.prepare_official_openclaw_runtime_staged(options, false, Some(selected_release))
     }
 
     fn prepare_official_openclaw_runtime_with_refresh(
@@ -192,6 +207,25 @@ impl<'a> RuntimeService<'a> {
         require_unbound: bool,
         selected_release: Option<OpenClawRelease>,
     ) -> Result<(RuntimeMeta, OfficialRuntimePrepareAction), String> {
+        let prepared = self.prepare_official_openclaw_runtime_staged(
+            options,
+            require_unbound,
+            selected_release,
+        )?;
+        let action = prepared.action();
+        let meta = prepared.commit()?;
+        if refresh_supervisor {
+            self.refresh_supervisor_if_present()?;
+        }
+        Ok((meta, action))
+    }
+
+    fn prepare_official_openclaw_runtime_staged(
+        &self,
+        options: InstallRuntimeFromOfficialReleaseOptions,
+        require_unbound: bool,
+        selected_release: Option<OpenClawRelease>,
+    ) -> Result<StagedRuntimeInstall, String> {
         let version = options
             .version
             .map(|value| value.trim().to_string())
@@ -285,7 +319,10 @@ impl<'a> RuntimeService<'a> {
             };
 
             if !options.force && healthy && same_release && matches_requested_selector {
-                return Ok((existing, OfficialRuntimePrepareAction::Reused));
+                return Ok(StagedRuntimeInstall {
+                    prepared: PreparedRuntimeInstall::reuse(existing),
+                    action: OfficialRuntimePrepareAction::Reused,
+                });
             }
 
             existing_meta = Some(existing);
@@ -297,7 +334,7 @@ impl<'a> RuntimeService<'a> {
                 .and_then(|meta| meta.description.clone())
         });
         let install = || {
-            install_runtime_from_selected_official_openclaw_release(
+            prepare_runtime_from_selected_official_openclaw_release(
                 runtime_name.clone(),
                 options.force || existing_meta.is_some(),
                 releases_url,
@@ -326,17 +363,17 @@ impl<'a> RuntimeService<'a> {
         } else {
             install()?
         };
-        let action = if install.reused {
+        let action = if install.reused() {
             OfficialRuntimePrepareAction::Reused
         } else if existing_meta.is_some() {
             OfficialRuntimePrepareAction::Updated
         } else {
             OfficialRuntimePrepareAction::Installed
         };
-        if refresh_supervisor {
-            self.refresh_supervisor_if_present()?;
-        }
-        Ok((install.meta, action))
+        Ok(StagedRuntimeInstall {
+            prepared: install,
+            action,
+        })
     }
 
     pub fn install(&self, options: InstallRuntimeOptions) -> Result<RuntimeMeta, String> {
@@ -484,11 +521,23 @@ impl<'a> RuntimeService<'a> {
         resolved: ResolvedRuntimeUpdate,
         refresh_supervisor: bool,
     ) -> Result<RuntimeMeta, String> {
+        let prepared = self.prepare_resolved_update(resolved)?;
+        let meta = prepared.commit()?;
+        if refresh_supervisor {
+            self.refresh_supervisor_if_present()?;
+        }
+        Ok(meta)
+    }
+
+    pub(crate) fn prepare_resolved_update(
+        &self,
+        resolved: ResolvedRuntimeUpdate,
+    ) -> Result<StagedRuntimeInstall, String> {
         let selector_kind = Some(resolved.selector_kind);
         let selector_value = Some(resolved.selector_value);
-        let meta = match resolved.release {
+        let prepared = match resolved.release {
             ResolvedRuntimeUpdateRelease::Official(release) => {
-                install_runtime_from_selected_official_openclaw_release(
+                prepare_runtime_from_selected_official_openclaw_release(
                     resolved.existing.name,
                     true,
                     resolved.manifest_url,
@@ -500,10 +549,9 @@ impl<'a> RuntimeService<'a> {
                         cwd: self.cwd,
                     },
                 )?
-                .meta
             }
             ResolvedRuntimeUpdateRelease::Manifest(release) => {
-                install_runtime_from_selected_release(
+                prepare_runtime_from_selected_release(
                     resolved.existing.name,
                     true,
                     resolved.manifest_url,
@@ -516,10 +564,10 @@ impl<'a> RuntimeService<'a> {
                 )?
             }
         };
-        if refresh_supervisor {
-            self.refresh_supervisor_if_present()?;
-        }
-        Ok(meta)
+        Ok(StagedRuntimeInstall {
+            prepared,
+            action: OfficialRuntimePrepareAction::Updated,
+        })
     }
 
     pub fn update_all_from_release(

@@ -135,12 +135,14 @@ ocm upgrade simulate mira --to beta --scenario all
 ocm upgrade simulate mira --to ./openclaw
 ```
 
-`upgrade` stops a running managed gateway and creates a verified pre-upgrade
-checkpoint before changing an environment. If a running service cannot be
-restarted or started after the change, OCM keeps the restored checkpoint and
-previous runtime as the coherent rollback state. When an environment moves to a
-new runtime, OCM runs OpenClaw's update finalization path while the gateway is
-stopped, before service restart. A running managed service is considered recovered only
+`upgrade` stages the target runtime, validates the checkpoint source, and
+prepares runtime recovery while the current managed gateway remains available.
+Preparation failures leave the source environment and service unchanged. OCM
+stops a running gateway only for checkpoint capture, runtime publication,
+environment mutation, and OpenClaw update finalization. If a running service
+cannot be restarted or started after the change, OCM keeps the restored
+checkpoint and previous runtime as the coherent rollback state. A running
+managed service is considered recovered only
 after its HTTP health endpoint responds and OpenClaw's gateway status proves the
 gateway is reachable; otherwise the upgrade follows the normal rollback path.
 New snapshots preserve the complete environment root, including credentials,

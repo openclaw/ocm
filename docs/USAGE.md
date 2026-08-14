@@ -168,7 +168,8 @@ Use `upgrade simulate` when you want to test what would happen against a publish
 - simulation envs and temporary runtimes are cleaned up automatically; use `--keep-simulations` only when you need retained debug artifacts
 - missing published targets fail before any simulation env is created
 - `--scenario all` runs built-in current, clean minimum, and Telegram-configured env shapes as separate simulation clones
-- a running managed gateway is stopped before its verified pre-upgrade checkpoint and remains stopped through mutation and finalization
+- target runtime installation, checkpoint preflight, and runtime recovery preparation run while the current managed gateway remains available; preparation failure leaves it unchanged
+- a running managed gateway is stopped only for checkpoint capture, runtime publication, environment mutation, and finalization
 - new checkpoints capture the complete environment root; APFS clone support is used when available and a metadata-preserving full copy is the fallback
 - when an env moves to a new runtime, OCM runs OpenClaw's update finalization path cold before service restart
 - if service reconciliation fails, OCM restores the snapshot and previous runtime unless `--no-rollback` is set
