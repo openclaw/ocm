@@ -312,6 +312,13 @@ impl PreparedRuntimeInstall {
         self.reused
     }
 
+    pub(crate) fn prepared_binary_path(&self) -> PathBuf {
+        self.target
+            .as_ref()
+            .map(|target| installed_openclaw_binary_path(&target.install_files))
+            .unwrap_or_else(|| PathBuf::from(&self.meta.binary_path))
+    }
+
     pub(crate) fn commit(mut self) -> Result<RuntimeMeta, String> {
         let meta = self.meta.clone();
         match self.target.take() {

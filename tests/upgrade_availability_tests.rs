@@ -286,6 +286,10 @@ case "$1" in
     printf 'Config valid\n'
     exit 0
     ;;
+  doctor)
+    printf '%s\n' '{{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{{"checkId":"core/doctor/lint-selection","severity":"error","message":"Unknown health check id selected by --only: codex/managed-app-server.","path":"codex/managed-app-server"}}]}}'
+    exit 1
+    ;;
   update)
     if [ "$2" = "finalize" ]; then
       : > "$OCM_TEST_UPDATE_FINALIZE_STARTED"

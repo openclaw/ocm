@@ -133,6 +133,10 @@ impl StagedRuntimeInstall {
         self.action
     }
 
+    pub(crate) fn prepared_binary_path(&self) -> std::path::PathBuf {
+        self.prepared.prepared_binary_path()
+    }
+
     pub(crate) fn commit(self) -> Result<RuntimeMeta, String> {
         self.prepared.commit()
     }

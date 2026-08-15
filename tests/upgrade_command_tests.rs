@@ -291,6 +291,26 @@ case "$1" in
     exit 0
     ;;
   doctor)
+    if [ "$2" = "--lint" ]; then
+      has_arg "--only" "$@" && has_arg "codex/managed-app-server" "$@" && has_arg "--json" "$@" || {{
+        echo "missing managed Codex candidate flags" >&2
+        exit 1
+      }}
+      case "${{OCM_TEST_CODEX_PREFLIGHT:-unsupported}}" in
+        pass)
+          printf '{{"ok":true,"checksRun":1,"checksSkipped":0,"findings":[]}}\n'
+          exit 0
+          ;;
+        fail)
+          printf '{{"ok":false,"checksRun":1,"checksSkipped":0,"findings":[{{"checkId":"codex/managed-app-server","severity":"error","message":"Managed Codex app-server version mismatch: expected 0.147.0, detected 0.146.0.","path":"/candidate/codex"}}]}}\n'
+          exit 1
+          ;;
+        unsupported)
+          printf '{{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{{"checkId":"core/doctor/lint-selection","severity":"error","message":"Unknown health check id selected by --only: codex/managed-app-server.","path":"codex/managed-app-server"}}]}}\n'
+          exit 1
+          ;;
+      esac
+    fi
     has_arg "--non-interactive" "$@" && has_arg "--fix" "$@" || {{
       echo "missing doctor update flags" >&2
       exit 1
@@ -519,6 +539,12 @@ case "$1" in
       exit 0
     fi
     ;;
+  doctor)
+    if [ "$2" = "--lint" ]; then
+      printf '{{"ok":false,"findings":[{{"checkId":"core/doctor/lint-selection","message":"Unknown health check id selected by --only: codex/managed-app-server.","path":"codex/managed-app-server"}}]}}\n'
+      exit 1
+    fi
+    ;;
 esac
 echo "unexpected args: $*" >&2
 exit 1
@@ -545,6 +571,12 @@ case "$1" in
       fi
       printf '{{"status":"ok"}}\n'
       exit 0
+    fi
+    ;;
+  doctor)
+    if [ "$2" = "--lint" ]; then
+      printf '{{"ok":false,"findings":[{{"checkId":"core/doctor/lint-selection","message":"Unknown health check id selected by --only: codex/managed-app-server.","path":"codex/managed-app-server"}}]}}\n'
+      exit 1
     fi
     ;;
 esac
@@ -875,6 +907,13 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
     let env_json: Value = serde_json::from_str(&stdout(&env_show)).unwrap();
     let env_root = Path::new(env_json["root"].as_str().unwrap());
     let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
+    let candidate_preflight = command_log
+        .find("doctor --lint --only codex/managed-app-server --json")
+        .expect("staged official runtime must run the candidate preflight");
+    let finalization = command_log
+        .find("update finalize --json --yes --no-restart")
+        .expect("updated runtime must finalize");
+    assert!(candidate_preflight < finalization, "{command_log}");
     assert!(
         command_log.contains("update finalize --json --yes --no-restart"),
         "{command_log}"
@@ -5212,4 +5251,101 @@ fn upgrade_all_json_exits_failed_when_any_env_fails() {
             .unwrap()
             .contains("runtime \"missing-soon\" does not exist")
     );
+}
+
+fn setup_named_runtime_candidate_fixture(
+    root: &TestDir,
+) -> (PathBuf, BTreeMap<String, String>, PathBuf) {
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let old_runtime = root.child("old-openclaw");
+    let new_runtime = root.child("new-openclaw");
+    write_executable_script(&old_runtime, &recording_openclaw_script("old-openclaw"));
+    write_executable_script(&new_runtime, &recording_openclaw_script("new-openclaw"));
+
+    let env = ocm_env(root);
+    for (name, runtime) in [("old-local", &old_runtime), ("new-local", &new_runtime)] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                name,
+                "--path",
+                &runtime.display().to_string(),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--runtime", "old-local"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let env_root = root.child("ocm-home/envs/demo");
+    fs::write(env_root.join(".openclaw/openclaw.json"), "{}\n").unwrap();
+    (cwd, env, env_root)
+}
+
+#[test]
+fn upgrade_validates_managed_codex_candidate_before_transactional_cutover() {
+    let root = TestDir::new("upgrade-codex-candidate-preflight");
+    let (cwd, mut env, env_root) = setup_named_runtime_candidate_fixture(&root);
+    env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "pass".to_string());
+
+    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new-local"]);
+    assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+
+    let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
+    let candidate = command_log
+        .find("doctor --lint --only codex/managed-app-server --json")
+        .expect("candidate managed Codex check must run");
+    let finalize = command_log
+        .find("update finalize --json --yes --no-restart")
+        .expect("target finalization must run");
+    assert!(candidate < finalize, "{command_log}");
+}
+
+#[test]
+fn managed_codex_candidate_failure_stops_before_upgrade_mutation() {
+    let root = TestDir::new("upgrade-codex-candidate-preflight-failure");
+    let (cwd, mut env, env_root) = setup_named_runtime_candidate_fixture(&root);
+    env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "fail".to_string());
+    let config_path = env_root.join(".openclaw/openclaw.json");
+    let config_before = fs::read(&config_path).unwrap();
+
+    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new-local"]);
+    assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
+    let output = stdout(&upgrade);
+    assert!(output.contains("outcome=failed"), "{output}");
+    assert!(
+        output.contains("source environment and service were left unchanged"),
+        "{output}"
+    );
+    assert!(
+        output.contains("expected 0.147.0, detected 0.146.0"),
+        "{output}"
+    );
+
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let env_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert_eq!(env_json["defaultRuntime"], "old-local");
+    assert_eq!(fs::read(&config_path).unwrap(), config_before);
+
+    let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "demo", "--json"]);
+    assert!(snapshots.status.success(), "{}", stderr(&snapshots));
+    let snapshots_json: Value = serde_json::from_str(&stdout(&snapshots)).unwrap();
+    assert!(snapshots_json.as_array().unwrap().is_empty());
+    assert!(!root.child("ocm-home/upgrade-history/demo").exists());
+
+    let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
+    assert!(
+        command_log.contains("doctor --lint --only codex/managed-app-server --json"),
+        "{command_log}"
+    );
+    assert!(!command_log.contains("config validate"), "{command_log}");
+    assert!(!command_log.contains("update finalize"), "{command_log}");
 }

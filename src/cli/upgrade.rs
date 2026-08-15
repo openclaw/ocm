@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use super::{Cli, render};
 use crate::env::{
     CloneEnvironmentOptions, CreateEnvSnapshotOptions, EnvDevMeta, RestoreEnvSnapshotOptions,
+    resolve_runtime_run_dir,
 };
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::openclaw_repo::{detect_openclaw_checkout, ensure_openclaw_worktree};
@@ -22,7 +23,7 @@ use crate::runtime::releases::{
 };
 use crate::runtime::{
     InstallRuntimeFromOfficialReleaseOptions, OfficialRuntimePrepareAction, RuntimeMeta,
-    RuntimeReleaseSelectorKind, RuntimeService, StagedRuntimeInstall,
+    RuntimeReleaseSelectorKind, RuntimeService, StagedRuntimeInstall, resolve_runtime_launch,
 };
 use crate::service::ServiceSummary;
 use crate::store::{
@@ -2660,6 +2661,7 @@ impl Cli {
         match resolved.kind {
             ResolvedUpgradeTargetKind::Named(meta) => Ok(PreparedUpgradeTarget {
                 name: resolved.name,
+                prepared_binary_path: PathBuf::from(&meta.binary_path),
                 meta,
                 action: OfficialRuntimePrepareAction::Reused,
                 staged: None,
@@ -2681,10 +2683,12 @@ impl Cli {
                             )
                     },
                 )?;
+                let prepared_binary_path = staged.prepared_binary_path();
                 let meta = staged.meta().clone();
                 let action = staged.action();
                 Ok(PreparedUpgradeTarget {
                     name: resolved.name,
+                    prepared_binary_path,
                     meta,
                     action,
                     staged: Some(staged),
@@ -2699,13 +2703,73 @@ impl Cli {
         target: &UpgradeTarget,
         resolved: ResolvedUpgradeTarget,
     ) -> Result<PreparedUpgradeTarget, String> {
-        if target.is_named_runtime() {
-            return self.prepare_resolved_upgrade_target(env_name, target, resolved);
+        let prepared = if target.is_named_runtime() {
+            self.prepare_resolved_upgrade_target(env_name, target, resolved)?
+        } else {
+            let runtime_name = resolved.name.clone();
+            self.with_isolated_runtime_mutation(env_name, &runtime_name, || {
+                self.prepare_resolved_upgrade_target(env_name, target, resolved)
+            })?
+        };
+        self.validate_prepared_upgrade_target(env_name, &prepared)?;
+        Ok(prepared)
+    }
+
+    fn validate_prepared_upgrade_target(
+        &self,
+        env_name: &str,
+        prepared: &PreparedUpgradeTarget,
+    ) -> Result<(), String> {
+        const CHECK_ID: &str = "codex/managed-app-server";
+        let args = [
+            "doctor".to_string(),
+            "--lint".to_string(),
+            "--only".to_string(),
+            CHECK_ID.to_string(),
+            "--json".to_string(),
+        ];
+        let mut meta = prepared.meta.clone();
+        meta.binary_path = display_path(&prepared.prepared_binary_path);
+        let launch = resolve_runtime_launch(&meta, &args, &self.env, &self.cwd, true)
+            .map_err(|error| format!("candidate managed Codex preflight failed: {error}"))?;
+        let env_meta = self
+            .environment_service()
+            .get(env_name)
+            .map_err(|error| format!("candidate managed Codex preflight failed: {error}"))?;
+        let mut process_env = build_openclaw_env(&env_meta, &self.env);
+        crate::managed_node::apply_path_prepend_to_environment(
+            &mut process_env,
+            launch.path_prepend.as_deref(),
+        )
+        .map_err(|error| format!("candidate managed Codex preflight failed: {error}"))?;
+        process_env.insert("OPENCLAW_UPDATE_IN_PROGRESS".to_string(), "1".to_string());
+
+        let output = Command::new(&launch.program)
+            .args(&launch.args)
+            .current_dir(resolve_runtime_run_dir(&self.cwd))
+            .env_clear()
+            .envs(process_env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| {
+                format!(
+                    "candidate managed Codex preflight failed to start {}: {error}",
+                    display_path(Path::new(&launch.program))
+                )
+            })?;
+        let output = SimulationCommandOutput::from_output(output);
+        if output.status.success() {
+            return Ok(());
         }
-        let runtime_name = resolved.name.clone();
-        self.with_isolated_runtime_mutation(env_name, &runtime_name, || {
-            self.prepare_resolved_upgrade_target(env_name, target, resolved)
-        })
+        if candidate_codex_preflight_is_unsupported(&output.stdout, &output.stderr) {
+            return Ok(());
+        }
+        Err(format!(
+            "candidate managed Codex preflight failed: {}. Repair or reinstall the staged OpenClaw runtime, then rerun the upgrade; the source environment was not changed",
+            output.failure_summary()
+        ))
     }
 
     fn with_isolated_runtime_mutation<T>(
@@ -3517,6 +3581,7 @@ impl Cli {
 
 struct PreparedUpgradeTarget {
     name: String,
+    prepared_binary_path: PathBuf,
     meta: RuntimeMeta,
     action: OfficialRuntimePrepareAction,
     staged: Option<StagedRuntimeInstall>,
@@ -3993,6 +4058,44 @@ fn command_output_reports_unsupported_command(stdout: &str, stderr: &str) -> boo
     })
 }
 
+fn candidate_codex_preflight_is_unsupported(stdout: &str, stderr: &str) -> bool {
+    const CHECK_ID: &str = "codex/managed-app-server";
+    if let Ok(value) = serde_json::from_str::<Value>(stdout)
+        && value
+            .get("findings")
+            .and_then(Value::as_array)
+            .is_some_and(|findings| {
+                findings.iter().any(|finding| {
+                    finding.get("checkId").and_then(Value::as_str)
+                        == Some("core/doctor/lint-selection")
+                        && finding.get("path").and_then(Value::as_str) == Some(CHECK_ID)
+                        && finding
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .is_some_and(|message| {
+                                message.contains("Unknown health check id selected by --only")
+                            })
+                })
+            })
+    {
+        return true;
+    }
+
+    let normalized = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    [
+        "unknown command 'doctor'",
+        "unknown command \"doctor\"",
+        "unrecognized command 'doctor'",
+        "unrecognized command \"doctor\"",
+        "unknown option '--lint'",
+        "unknown option \"--lint\"",
+        "unrecognized option '--lint'",
+        "unrecognized option \"--lint\"",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
 fn shell_command(command: &str) -> Command {
     if cfg!(windows) {
         let mut process = Command::new("cmd");
@@ -4224,9 +4327,9 @@ fn gateway_auth_failure_proves_reachable(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_output_reports_unsupported_command, release_version_from_output,
-        should_wait_for_scheduled_gateway_retry, verify_gateway_status_readiness,
-        version_output_matches_expected,
+        candidate_codex_preflight_is_unsupported, command_output_reports_unsupported_command,
+        release_version_from_output, should_wait_for_scheduled_gateway_retry,
+        verify_gateway_status_readiness, version_output_matches_expected,
     };
 
     #[test]
@@ -4442,6 +4545,26 @@ mod tests {
         assert!(!command_output_reports_unsupported_command(
             "",
             "OpenClaw config is invalid\nProblem: meta: Unrecognized key: lastTouchedAt"
+        ));
+    }
+
+    #[test]
+    fn codex_candidate_probe_only_skips_explicit_unsupported_results() {
+        assert!(candidate_codex_preflight_is_unsupported(
+            r#"{"findings":[{"checkId":"core/doctor/lint-selection","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
+            ""
+        ));
+        assert!(candidate_codex_preflight_is_unsupported(
+            "",
+            "error: unknown option '--lint'"
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"findings":[{"checkId":"codex/managed-app-server","path":"/candidate/codex","message":"version mismatch"}]}"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            "",
+            "managed Codex binary command not found"
         ));
     }
 }
