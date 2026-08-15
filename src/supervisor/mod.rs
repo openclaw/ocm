@@ -1090,8 +1090,9 @@ fn reconcile_running_children(
                 }
             }
             None => {
-                pending.remove(&env_name);
-                inactive.remove(&env_name);
+                let removed_pending = pending.remove(&env_name).is_some();
+                let removed_inactive = inactive.remove(&env_name).is_some();
+                runtime_dirty |= removed_pending || removed_inactive;
             }
         }
     }
@@ -2751,6 +2752,60 @@ mod tests {
         assert_eq!(pending.get("rescue").unwrap().spec, next_rescue);
         assert_eq!(pending.get("main").unwrap().spec, main);
         assert_eq!(pending.get("main").unwrap().restart_count, 7);
+    }
+
+    #[test]
+    fn removing_crash_looping_child_marks_runtime_state_dirty() {
+        let target = child_spec("rosita", 18790);
+        let control = child_spec("control", 19123);
+        let desired = SupervisorState {
+            kind: SUPERVISOR_STATE_KIND.to_string(),
+            ocm_home: "/tmp/ocm".to_string(),
+            generated_at: OffsetDateTime::UNIX_EPOCH,
+            children: vec![control.clone()],
+            skipped_envs: Vec::new(),
+            restart_requests: Vec::new(),
+        };
+        let mut running = BTreeMap::new();
+        let mut pending = BTreeMap::from([
+            (
+                target.env_name.clone(),
+                pending_supervisor_child(
+                    target.clone(),
+                    None,
+                    4,
+                    0,
+                    30_000,
+                    Some(1),
+                    Some("schema 8 is newer than supported schema 7".to_string()),
+                ),
+            ),
+            (
+                control.env_name.clone(),
+                pending_supervisor_child(
+                    control.clone(),
+                    None,
+                    2,
+                    0,
+                    30_000,
+                    Some(1),
+                    Some("control backoff".to_string()),
+                ),
+            ),
+        ]);
+        let mut inactive = pending
+            .iter()
+            .map(|(name, child)| (name.clone(), inactive_from_pending(child, "backoff")))
+            .collect::<BTreeMap<_, _>>();
+
+        let runtime_dirty =
+            reconcile_running_children(&mut running, &mut pending, &mut inactive, &desired);
+
+        assert!(runtime_dirty, "published runtime state must drop rosita");
+        assert!(!pending.contains_key("rosita"));
+        assert!(!inactive.contains_key("rosita"));
+        assert_eq!(pending.get("control").unwrap().spec, control);
+        assert!(inactive.contains_key("control"));
     }
 
     #[test]
