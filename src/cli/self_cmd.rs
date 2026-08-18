@@ -11,7 +11,7 @@ use crate::infra::download::{download_to_file, verify_file_sha256};
 
 use super::{Cli, render};
 
-const RELEASE_REPO: &str = "shakkernerd/ocm";
+const RELEASE_REPO: &str = "openclaw/ocm";
 const INTERNAL_SELF_UPDATE_RELEASE_URL_ENV: &str = "OCM_INTERNAL_SELF_UPDATE_RELEASE_URL";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="shakkernerd/ocm"
+REPO="openclaw/ocm"
 DEFAULT_PREFIX="${HOME}/.local"
 
 usage() {

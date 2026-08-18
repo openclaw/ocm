@@ -424,3 +424,25 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
     assert!(release.contains("os: macos-15-intel"));
     assert!(!release.contains("os: macos-13"));
 }
+
+#[test]
+fn repository_surfaces_use_the_canonical_openclaw_owner() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let surfaces = [
+        fs::read_to_string(root.join("README.md")).unwrap(),
+        fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+        fs::read_to_string(root.join("install.sh")).unwrap(),
+        fs::read_to_string(root.join("src/cli/self_cmd.rs")).unwrap(),
+    ];
+
+    assert!(
+        surfaces
+            .iter()
+            .all(|surface| !surface.contains("shakkernerd/ocm"))
+    );
+    assert!(
+        surfaces
+            .iter()
+            .all(|surface| surface.contains("openclaw/ocm"))
+    );
+}
