@@ -47,9 +47,7 @@ fn wait_for_gateway_readiness_with_timeout(
             });
         }
 
-        if status.last_exit_code.is_some_and(|code| code != 0)
-            && matches!(status.gateway_state.as_str(), "backoff" | "stopped")
-        {
+        if matches!(status.gateway_state.as_str(), "backoff" | "stopped") {
             if status.gateway_state == "backoff"
                 && should_wait_for_scheduled_gateway_retry(
                     &mut permitted_retry_count,
