@@ -44,8 +44,15 @@ pub(crate) fn discover_openclaw_checkout(cwd: &Path) -> Option<PathBuf> {
 /// Rejects checkout dependencies that resolve through another checkout.
 pub(crate) fn ensure_checkout_owned_dependencies(repo_root: &Path) -> Result<(), String> {
     let node_modules = repo_root.join("node_modules");
-    if !node_modules.exists() {
-        return Ok(());
+    match fs::symlink_metadata(&node_modules) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect OpenClaw dependencies at {}: {error}",
+                display_path(&node_modules)
+            ));
+        }
     }
 
     // Compare resolved directories so relative links from linked worktrees cannot
