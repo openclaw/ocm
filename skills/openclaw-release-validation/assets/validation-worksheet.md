@@ -14,111 +14,101 @@
 - Shared issue:
 - Upgrade result: pending
 
-## Test first
+## Upgrade findings
 
-[Release notes]({{RELEASE_NOTES_URL}})
-
-Themes summarize the complete release notes; linked issues are representative
-examples.
-
-{{RELEASE_PRIORITIES}}
-
-## How to use this worksheet
-
-Start with the priorities above or choose any subsystem you know well. Add notes
-directly beneath that subsystem's heading; an empty or comment-only section
-means you did not test it. Record failures, regressions, confusing behavior,
-and meaningful latency under **Release findings** as well.
-
-## Release findings
-
-Record candidate OpenClaw problems found during upgrade or testing. For each
-finding, note what you expected, what happened, and the affected subsystem.
-
-- None yet.
-
-## Private operator notes
-
-Record OCM, copying, setup, local tooling, and cleanup problems here. This
-section is never published to GitHub.
+Record candidate OpenClaw problems observed while upgrading or starting the
+copied gateway. For each finding, note what you expected, what happened, and
+the affected subsystem.
 
 - None yet.
 
 ## Subsystem notes
 
-#### Pairing
+> **Operator notes**
+> Add notes under **Notes** for each subsystem you tested. Leave untested note
+> sections empty. Start with **Priority for this release** when possible.
+
+[Release notes]({{RELEASE_NOTES_URL}})
+
+## Priority for this release
+
+<!-- Campaign creator: move 3-5 selected subsystem sections here; add What changed, optional Recommended testing, and Notes to all 19 sections; then remove this comment. -->
+
+## Other subsystems
+
+### Pairing
 
 <!-- Pair a client or sender and confirm it can act. Add notes below. -->
 
-#### Channels
+### Channels
 
 <!-- Use the channel you know best and confirm one reply per message. Add notes below. -->
 
-#### Control UI
+### Control UI
 
 <!-- Hold a real conversation with tools, reload, and continue. Add notes below. -->
 
-#### TUI
+### TUI
 
 <!-- Drive history, streaming, shortcuts, and reconnect yourself. Add notes below. -->
 
-#### Onboarding
+### Onboarding
 
 <!-- Complete setup and reach a working conversation. Add notes below. -->
 
-#### Slash commands
+### Slash commands
 
 <!-- Try familiar commands and check their results. Add notes below. -->
 
-#### Memory
+### Memory
 
 <!-- Retrieve old memory, add new memory, and retrieve it later. Add notes below. -->
 
-#### Subagents
+### Subagents
 
 <!-- Spawn a child, receive its result, and confirm it exits. Add notes below. -->
 
-#### Agents
+### Agents
 
 <!-- Create or switch agents and confirm their state stays separate. Add notes below. -->
 
-#### Cron
+### Cron
 
 <!-- Create, run, inspect, and remove one disposable job. Add notes below. -->
 
-#### Sessions
+### Sessions
 
 <!-- Restart or reconnect and confirm conversation continuity. Add notes below. -->
 
-#### Context Engine
+### Context Engine
 
 <!-- Confirm relevant context appears without obvious excess. Add notes below. -->
 
-#### Skill Workshop
+### Skill Workshop
 
 <!-- Invoke a skill, revise it, and invoke the revision. Add notes below. -->
 
-#### MCP
+### MCP
 
 <!-- Discover a familiar server and complete one real call. Add notes below. -->
 
-#### Models
+### Models
 
 <!-- List, select, use, and persist a model. Add notes below. -->
 
-#### Approvals
+### Approvals
 
 <!-- Deny once and approve once; confirm each action happens once. Add notes below. -->
 
-#### Compaction
+### Compaction
 
 <!-- Compact a real conversation and confirm continuity. Add notes below. -->
 
-#### Codex harness
+### Codex harness
 
 <!-- Complete useful tool work and inspect its artifacts. Add notes below. -->
 
-#### OpenClaw harness
+### OpenClaw harness
 
 <!-- Complete a real task and inspect its artifacts. Add notes below. -->
 

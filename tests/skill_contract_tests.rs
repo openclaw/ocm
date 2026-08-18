@@ -11,6 +11,28 @@ fn normalize(text: &str) -> String {
         .to_lowercase()
 }
 
+const RELEASE_VALIDATION_SUBSYSTEMS: [&str; 19] = [
+    "Pairing",
+    "Channels",
+    "Control UI",
+    "TUI",
+    "Onboarding",
+    "Slash commands",
+    "Memory",
+    "Subagents",
+    "Agents",
+    "Cron",
+    "Sessions",
+    "Context Engine",
+    "Skill Workshop",
+    "MCP",
+    "Models",
+    "Approvals",
+    "Compaction",
+    "Codex harness",
+    "OpenClaw harness",
+];
+
 #[test]
 fn release_validation_is_manual_and_worksheet_driven() {
     let skill = read("skills/openclaw-release-validation/SKILL.md");
@@ -22,13 +44,21 @@ fn release_validation_is_manual_and_worksheet_driven() {
         "one editable markdown worksheet",
         "finish validation",
         "three to five subsystems",
-        "subsystem | what changed | try",
         "group every user-visible or upgrade-sensitive item",
+        "priority for this release",
+        "other subsystems",
+        "`#### what changed`",
+        "`#### recommended testing`",
+        "`#### notes`",
+        "every priority subsystem must include it",
+        "no notable changes in this release.",
+        "omit **recommended testing**",
         "dominant themes across the subsystem's complete group",
-        "optional supporting examples",
-        "one or two representative links",
-        "never use them as the organizing content",
-        "ignore html guidance comments",
+        "do not include issue, pr, commit, or workflow examples",
+        "a handful of links misrepresents the full release surface",
+        "counts as tested only when tester-authored text appears beneath its `#### notes`",
+        "what changed** and **recommended testing** never count as test evidence",
+        "empty or comment-only note area means untouched",
         "one github issue comment",
     ] {
         assert!(
@@ -38,18 +68,24 @@ fn release_validation_is_manual_and_worksheet_driven() {
     }
 
     assert!(worksheet.contains("{{RELEASE_NOTES_URL}}"));
-    assert!(worksheet.contains("{{RELEASE_PRIORITIES}}"));
-    assert!(worksheet.contains(
-        "Themes summarize the complete release notes; linked issues are representative\nexamples."
-    ));
+    assert!(!worksheet.contains("{{RELEASE_PRIORITIES}}"));
+    assert!(worksheet.contains("## Upgrade findings"));
+    assert!(worksheet.contains("## Priority for this release"));
+    assert!(worksheet.contains("## Other subsystems"));
+    assert!(worksheet.contains("> **Operator notes**"));
+    assert!(worksheet.contains("<!-- Campaign creator: move 3-5 selected subsystem sections"));
+    assert!(!worksheet.contains("## Private operator notes"));
+    assert!(!worksheet.contains("## Release findings"));
+
+    let subsystem_headings = worksheet
+        .lines()
+        .filter_map(|line| line.strip_prefix("### "))
+        .collect::<Vec<_>>();
     assert_eq!(
-        worksheet
-            .lines()
-            .filter(|line| line.starts_with("#### "))
-            .count(),
-        19,
-        "worksheet must retain all 19 subsystem note sections"
+        subsystem_headings, RELEASE_VALIDATION_SUBSYSTEMS,
+        "worksheet must retain all 19 canonical subsystem skeletons"
     );
+    assert_eq!(worksheet.matches("\n#### ").count(), 0);
 }
 
 #[test]
@@ -66,8 +102,8 @@ fn release_validation_preserves_state_and_private_boundaries() {
         "sessions and other real user state are preserved",
         "keep the source unchanged",
         "stop the current credential owner",
-        "private operator note",
-        "never enters the github comment",
+        "keep ocm, copying, local tooling, setup, and cleanup problems in the conversation only",
+        "never enter the worksheet or github comment",
         "remove local paths",
     ] {
         assert!(

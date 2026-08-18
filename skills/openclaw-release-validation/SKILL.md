@@ -39,18 +39,24 @@ When the issue does not exist, become the campaign creator:
    `assets/validation-worksheet.md`; one item may support multiple subsystems.
    Select the three to five subsystems with the broadest changed surface or
    highest regression risk.
-3. Build a compact `Subsystem | What changed | Try` table. In **What changed**,
-   synthesize the dominant themes across the subsystem's complete group instead
-   of listing a few fixes. Use one concise theme statement per cell. Issue or PR
-   links are optional supporting examples: label them `Examples`, limit them to
-   one or two representative links, and never use them as the organizing
-   content. Hyperlink every reference, using only items cited by the release
-   notes or verified live. When a row has no example link, link its subsystem
-   name to the release notes. Put `[Release notes](<release-url>)` immediately
-   above the table.
+3. Move each selected subsystem from **Other subsystems** into **Priority for
+   this release**, leaving all others under **Other subsystems**. Replace every
+   subsystem's hidden guidance comment with `#### What changed` and `####
+Notes`. Add `#### Recommended testing` between them whenever release changes
+   justify a targeted exercise; every priority subsystem must include it. When
+   no release item is relevant, write `No notable changes in this release.`
+   under **What changed** and omit **Recommended testing**.
+
+   For each **What changed**, synthesize the dominant themes across the
+   subsystem's complete group instead of listing a few fixes. Do not include
+   issue, PR, commit, or workflow examples; a handful of links misrepresents the
+   full release surface. Each **Recommended testing** is one concise human-driven
+   exercise.
+
 4. Make a working copy of the worksheet asset and fill it with the exact
-   candidate identity, release-notes URL, and priority table. Ensure no
-   template placeholder remains.
+   candidate identity, release-notes URL, and priority subsystem sections.
+   Remove the campaign-creator comment and ensure no template placeholder
+   remains.
 5. Create the issue with the stable marker, a short participation note, and the
    completed worksheet verbatim between the worksheet markers. Re-query open
    issues for the marker after creation and fail on duplicates.
@@ -111,12 +117,10 @@ Verify `ocm service status <test-env>`, `ocm @<test-env> -- --version`, and
 requires HTTP health and gateway reachability.
 
 Report every error to the tester immediately, including errors recovered by a
-retry. Classify it in the worksheet:
-
-- **Release finding:** candidate OpenClaw behavior caused by the upgrade. This
-  is eligible for the GitHub comment.
-- **Private operator note:** OCM, copying, local tooling, setup, or cleanup.
-  This never enters the GitHub comment.
+retry. Record candidate OpenClaw behavior caused by the upgrade under **Upgrade
+findings**; it is eligible for the GitHub comment. Keep OCM, copying, local
+tooling, setup, and cleanup problems in the conversation only; they never enter
+the worksheet or GitHub comment.
 
 Update the worksheet's upgrade result. Do not continue to testing while the
 upgrade or gateway readiness is unresolved.
@@ -125,7 +129,7 @@ upgrade or gateway readiness is unresolved.
 
 Ask: **What do you want to test first?** Recommend starting with a release
 priority, but let the tester choose one subsystem at a time in any order. After
-each item, add their notes beneath that subsystem's `####` heading, then ask what
+each item, add their notes under that subsystem's `#### Notes`, then ask what
 they want to test next.
 
 The tester drives interactive surfaces such as the TUI, Control UI, onboarding,
@@ -134,10 +138,9 @@ to look for, then wait for their result. Take control only when explicitly
 asked. Do not turn the checklist into an automated scenario runner.
 
 A subsystem counts as tested only when tester-authored text appears beneath its
-heading. Ignore HTML guidance comments when deciding whether a section was
-tested; an empty or comment-only section means untouched. Add concise detail
-under **Release findings** when something feels broken, slow, confusing, or
-regressed.
+`#### Notes`. **What changed** and **Recommended testing** never count as test
+evidence. An empty or comment-only note area means untouched. Add candidate
+problems found during subsystem testing to that subsystem's notes.
 
 ## 6. Finish and publish
 
@@ -148,7 +151,7 @@ When the tester says `finish validation`:
 2. Stop the copied gateway and restore any source gateway stopped for channel
    ownership. Ask before destroying the disposable environment.
 3. Build one GitHub issue comment containing only candidate identity, source
-   version/commit, subsystem names with non-empty note sections, release
+   version/commit, subsystem names with non-empty note sections, upgrade
    findings, tester feedback, and the yes/no promotion vote.
 4. Remove local paths, gateway names, secrets, user identifiers, raw logs, OCM
    notes, setup details, and cleanup details from the comment.
