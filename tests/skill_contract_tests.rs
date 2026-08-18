@@ -32,20 +32,30 @@ fn release_validation_is_manual_and_worksheet_driven() {
         "group every user-visible or upgrade-sensitive item",
         "priority for this release",
         "other surfaces",
-        "`### [<surface>](<taxonomy-url>) — <maturity-label>`",
-        "`#### what changed`",
-        "`#### recommended testing`",
+        "`### [<surface>](<taxonomy-url>)`",
+        "| **maturity score** | <maturity-label> |",
+        "| **what changed** | <release-theme> |",
+        "| **recommended testing** | <exercise-or-em-dash> |",
         "`#### notes`",
-        "every priority surface must include it",
+        "notes` truly empty",
+        "no placeholder text or hidden comment",
+        "every priority surface must have a real recommended exercise",
+        "bounded operator workflow",
+        "exact action, the observable pass condition",
+        "runnable ocm-scoped command",
+        "`ocm @<test-env> -- onboard`",
+        "`ocm @<test-env> -- tui`",
+        "`ocm @<test-env> -- channels status --probe`",
         "no notable changes in this release.",
-        "omit **recommended testing**",
         "dominant themes across the surface's complete group",
         "do not include issue, pr, commit, or workflow examples",
         "a handful of links misrepresents the full release surface",
         "counts as tested only when tester-authored text appears beneath its `#### notes`",
-        "what changed** and **recommended testing** never count as test evidence",
-        "empty or comment-only note area means untouched",
-        "one github issue comment",
+        "table rows are campaign guidance, never test evidence",
+        "empty notes section means untouched",
+        "one final release-analysis comment",
+        "only the surfaces with non-empty notes sections",
+        "do not report the guidance table as evidence",
     ] {
         assert!(
             normalized.contains(required),
@@ -63,8 +73,9 @@ fn release_validation_is_manual_and_worksheet_driven() {
     assert!(worksheet.contains("> [!NOTE]"));
     assert!(worksheet.contains("derived from the live"));
     assert!(worksheet.contains("**Score bands:** Experimental 0–50%"));
-    assert!(worksheet.contains("generate exactly five priority surface sections"));
-    assert!(worksheet.contains("generate every remaining live scorecard surface"));
+    assert!(worksheet.contains("table-and-empty-Notes format"));
+    assert!(worksheet.contains("source for the final"));
+    assert!(!worksheet.contains("<!-- Add notes below. -->"));
     assert!(!worksheet.contains("## Private operator notes"));
     assert!(!worksheet.contains("## Release findings"));
     assert_eq!(worksheet.matches("\n### ").count(), 0);
