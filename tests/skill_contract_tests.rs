@@ -24,6 +24,7 @@ fn release_validation_is_manual_and_worksheet_driven() {
         "https://docs.openclaw.ai/maturity/scorecard.md",
         "complete catalog",
         "do not use a cached or hardcoded surface list",
+        "resolve relative taxonomy links",
         "rank exactly five priority surfaces",
         "change count and breadth",
         "change size and complexity",
