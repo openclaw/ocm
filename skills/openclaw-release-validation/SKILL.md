@@ -1,128 +1,157 @@
 ---
 name: openclaw-release-validation
-description: Validate OpenClaw release candidates through OCM using the built OpenClaw artifact, a broad reusable scenario matrix, copied existing-user state, clean new-user state, concise pass/fail reporting, and focused failure notes. Use when asked to test OpenClaw origin/main, release readiness, upgrade behavior, plugins, services, channels, doctor recovery, packaging, or broad release risk.
+description: Safely copy an existing gateway, upgrade it to an OpenClaw beta, and guide human release testing with one Markdown worksheet.
+user-invocable: true
+disable-model-invocation: true
 ---
 
 # OpenClaw Release Validation
 
-## Overview
+Help a human validate one beta against a copy of a real gateway. Automate only
+fixture setup and reporting. Let the human drive OpenClaw and judge quality.
 
-Run deep release validation for OpenClaw through OCM. Use the repo scenario
-matrix as the source of truth, test built software instead of dev wrappers, and
-produce a quiet report: quick pass/fail per scenario, with detail only for
-failures, blocked cases, or release-risk notes.
+Use one editable Markdown worksheet as the entire run record. Do not create
+`run.json`, mission state, receipts, or other tracking files.
 
-## Required Reading
+Tell the tester: **Edit the worksheet directly or tell me what to record. Reply
+exactly `finish validation` when you are done.**
 
-Before running tests, read:
+## 1. Candidate and shared issue
 
-- `../../README.md`
-- `../../docs/USAGE.md`
-- `references/release-validation-paths.md`
-- `../../docs/OPENCLAW_RELEASE_SCENARIO_MATRIX.md`
-- the current validation report if one exists under
-  `/path/to/release-validation/`
+Use an explicit beta when supplied; otherwise resolve the newest published tag
+matching `vYYYY.M.D-beta.N`. Record its version and commit.
 
-If repo-level AGENTS instructions are present, read and follow them first.
+Use `gh` to find the open issue identified by
+`<!-- openclaw-release-validation:<tag> -->`. Ignore closed campaign issues and
+fail clearly if more than one open issue has the marker.
 
-## Workflow
+When the issue exists, read its body and use the worksheet between
+`<!-- validation-worksheet:start -->` and
+`<!-- validation-worksheet:end -->`. Keep its release priorities and template
+unchanged.
 
-1. Confirm paths, permissions, OpenClaw source repo, and report root. Set
-   `OCM_BIN=<ocm-repo>/target/debug/ocm`, verify it is executable, and invoke
-   that absolute binary for every OCM command in the run.
-2. Create a unique run id. Derive the worktree, runtime, env, report, and
-   cleanup names from that id so concurrent validations cannot share mutable
-   resources.
-3. Read the OpenClaw source repo's `origin` URL without fetching or changing
-   that shared checkout. Create per-run Git metadata from that remote, using
-   the source repo only as a clone-time read-only object cache and
-   dissociating the clone from it. Then resolve `origin/main` to an immutable
-   commit and create a clean detached worktree for it. Record the commit
-   before building.
-4. In the detached worktree, run `pnpm install --frozen-lockfile`,
-   `pnpm check`, and `pnpm build`, then require `git status --porcelain` to
-   remain empty. Build the primary validation target with
-   `"$OCM_BIN" runtime build-local <run-runtime> --repo <run-worktree>
-   --force`, then run
-   `"$OCM_BIN" runtime verify <run-runtime>` and recheck worktree cleanliness.
-   This package-shaped runtime is the target for the matrix. Direct
-   `<run-worktree>/openclaw.mjs` execution is limited to the S02
-   source-artifact boot smoke check.
-5. Review OCM command usage for the touched scenario using `README.md`,
-   `docs/USAGE.md`, and targeted help from the same `"$OCM_BIN"`:
-   `help start`, `help service`, `help logs`, `help upgrade`, and `help env`.
-6. Review changelogs and commits since the last release to identify changed
-   surfaces and extra tests.
-7. Prepare existing-user fixtures before mutation:
-   - use `"$OCM_BIN" env clone` only when clearing sessions, logs, and backups
-     is intended;
-   - for S20, copy the source env's `.openclaw` directory into the run root,
-     import that copy with `"$OCM_BIN" adopt import`, and assert the expected
-     session fixture exists before the upgrade.
-8. Treat every copied or cloned user fixture as secret-bearing. Keep its
-   service stopped and make no provider, channel, webhook, browser, or other
-   external connection by default. Use a credential-free fresh env, mocks, or
-   dedicated test accounts for networked checks. Real external access requires
-   explicit authorization for the run.
-9. Run the broad scenario matrix from
-   `docs/OPENCLAW_RELEASE_SCENARIO_MATRIX.md`.
-10. For each scenario, test both clean new-user state and copied existing-user
-   state when applicable.
-11. Run OpenClaw commands through `"$OCM_BIN" @<env> -- ...` unless the
-    scenario explicitly requires direct execution. Verify OCM env runs expose
-   `OPENCLAW_SERVICE_REPAIR_POLICY=external` as part of normal env execution;
-   do not run broad LaunchAgent/service mutation tests unless the release
-   changed service behavior.
-12. Add extra checks for changed release surfaces, but keep them attached to the
-   closest scenario.
-13. Record a concise scenario table while testing; add detailed notes only for
-   failures, blocked scenarios, or explicit gaps.
-14. Before reporting, verify the detached worktree still points at the recorded
-    commit and the runtime identity matches the run. Redact credentials,
-    private endpoints, user identifiers, and secret-bearing command output.
-15. Destroy run-owned envs, then run
-    `"$OCM_BIN" runtime remove <run-runtime>`. Clean up only resources carrying
-    the current run id. Inspect worktree status before removal and do not
-    force-remove an unclean or unowned worktree.
+When the issue does not exist, become the campaign creator:
 
-## Non-Negotiables
+1. Read the GitHub release notes for the exact tag. If they are empty or
+   incomplete, also read that tag's section of `CHANGELOG.md`.
+2. Read the complete release notes and group every user-visible or
+   upgrade-sensitive item under the subsystem headings in
+   `assets/validation-worksheet.md`; one item may support multiple subsystems.
+   Select the three to five subsystems with the broadest changed surface or
+   highest regression risk.
+3. Build a compact `Subsystem | What changed | Try` table. In **What changed**,
+   synthesize the dominant themes across the subsystem's complete group instead
+   of listing a few fixes. Use one concise theme statement per cell. Issue or PR
+   links are optional supporting examples: label them `Examples`, limit them to
+   one or two representative links, and never use them as the organizing
+   content. Hyperlink every reference, using only items cited by the release
+   notes or verified live. When a row has no example link, link its subsystem
+   name to the release notes. Put `[Release notes](<release-url>)` immediately
+   above the table.
+4. Make a working copy of the worksheet asset and fill it with the exact
+   candidate identity, release-notes URL, and priority table. Ensure no
+   template placeholder remains.
+5. Create the issue with the stable marker, a short participation note, and the
+   completed worksheet verbatim between the worksheet markers. Re-query open
+   issues for the marker after creation and fail on duplicates.
 
-- Do not use the active `../openclaw` repo.
-- Do not substitute `pnpm openclaw` or the source-tree executable for
-  validation of the package-shaped runtime.
-- Do not mutate the real existing-user env; copy it into the run root first.
-- Do not assume `"$OCM_BIN" env clone` preserves sessions, logs, or backups.
-- Do not start a copied user's gateway or make external requests with retained
-  credentials unless the run explicitly authorizes the destination and
-  account.
-- Do not include credentials or raw secret-bearing config in the report.
-- Do not leave temporary services or LaunchAgents running.
-- Do not leave the per-run package runtime installed after its envs are
-  destroyed.
-- Do not clean up resources that are not owned by the current run id.
-- Do not mark a scenario passed unless postconditions were checked.
-- Do not rely on reasoning alone for release readiness; run real command flows.
+Only the campaign creator performs release-note analysis or generates the
+canonical template. Later runs consume the issue body without rewriting it.
 
-## Reporting
+## 2. Choose and copy a real gateway
 
-Use these statuses:
+Discover once with `ocm env list --json`, then add plain `~/.openclaw` when it
+is not already represented. Keep this overview shallow: show each gateway's
+name, known version, and running state without inspecting every gateway's
+plugins or paths. Ask which one the tester wants to copy. Never silently select
+or modify the personal gateway.
 
-- `pass`: command path completed and postconditions were checked
-- `fail`: reproducible breakage with exact command and output recorded
-- `blocked`: could not run, with blocker and next action recorded
-- `needs coverage`: important case not yet exercised in this run
-- `n/a`: scenario does not apply to that user type
+After selection, inspect only that gateway and record its version and commit.
+Import its `.openclaw` state with OCM so sessions and other real user state are
+preserved in the fixture:
 
-Report shape:
+```sh
+ocm adopt import --name <test-env> <selected-state-dir> --json
+```
 
-- Start with OCM/OpenClaw commits, package runtime identity, baseline reviewed,
-  run id, temp paths, and fixture modes used.
-- Include one summary row per scenario with New User, Existing User, Result, and
-  Notes.
-- For each failure, include impact, repro commands, expected, actual, and a
-  short "Paste to fixer" summary.
-- Avoid noisy successful command logs; keep command evidence in the report only
-  where it proves a result or explains a failure.
+Use the `stateDir` returned by `ocm env list --json` for an OCM environment and
+`~/.openclaw` for the plain gateway. Let OCM create the stopped, disposable
+environment and assign a non-conflicting port; do not make an additional staged
+copy. Keep the source unchanged. Before activating copied channel credentials,
+stop the current credential owner and restore it when validation ends.
 
-When a user asks for release validation, run the matrix and update the report;
-do not stop at a plan unless they explicitly ask for planning only.
+## 3. Create the worksheet
+
+Copy the canonical worksheet between the shared issue's markers to
+`.artifacts/openclaw-release-validation/<tag>-<timestamp>.md`. Fill in the
+source, shared issue URL, and local upgrade result without changing the campaign
+priorities. Give the tester a clickable link and briefly point out the three to
+five priority subsystems.
+
+This worksheet is the only checklist and note store. The tester may edit it in
+their editor or tell the agent what to record.
+
+## 4. Upgrade and report errors
+
+Install the exact candidate runtime and use the runtime name returned by OCM:
+
+```sh
+ocm runtime install --version <tag-without-v> --json
+ocm runtime verify <runtime-name> --json
+ocm upgrade <test-env> --runtime <runtime-name> --dry-run --json
+ocm upgrade <test-env> --runtime <runtime-name> --json
+ocm start <test-env> --runtime <runtime-name> --json
+```
+
+Stop any current owner of copied channel credentials immediately before the
+`ocm start` command.
+
+Verify `ocm service status <test-env>`, `ocm @<test-env> -- --version`, and
+`ocm logs <test-env> --tail 100`. OCM's successful managed upgrade already
+requires HTTP health and gateway reachability.
+
+Report every error to the tester immediately, including errors recovered by a
+retry. Classify it in the worksheet:
+
+- **Release finding:** candidate OpenClaw behavior caused by the upgrade. This
+  is eligible for the GitHub comment.
+- **Private operator note:** OCM, copying, local tooling, setup, or cleanup.
+  This never enters the GitHub comment.
+
+Update the worksheet's upgrade result. Do not continue to testing while the
+upgrade or gateway readiness is unresolved.
+
+## 5. Human-driven testing
+
+Ask: **What do you want to test first?** Recommend starting with a release
+priority, but let the tester choose one subsystem at a time in any order. After
+each item, add their notes beneath that subsystem's `####` heading, then ask what
+they want to test next.
+
+The tester drives interactive surfaces such as the TUI, Control UI, onboarding,
+channels, pairing, and approvals. Provide the command or URL and explain what
+to look for, then wait for their result. Take control only when explicitly
+asked. Do not turn the checklist into an automated scenario runner.
+
+A subsystem counts as tested only when tester-authored text appears beneath its
+heading. Ignore HTML guidance comments when deciding whether a section was
+tested; an empty or comment-only section means untouched. Add concise detail
+under **Release findings** when something feels broken, slow, confusing, or
+regressed.
+
+## 6. Finish and publish
+
+When the tester says `finish validation`:
+
+1. Read the worksheet and ask only for a missing promotion vote or final
+   feedback.
+2. Stop the copied gateway and restore any source gateway stopped for channel
+   ownership. Ask before destroying the disposable environment.
+3. Build one GitHub issue comment containing only candidate identity, source
+   version/commit, subsystem names with non-empty note sections, release
+   findings, tester feedback, and the yes/no promotion vote.
+4. Remove local paths, gateway names, secrets, user identifiers, raw logs, OCM
+   notes, setup details, and cleanup details from the comment.
+5. Post the comment once with `gh` and show the tester its URL.
+
+The skill collects release feedback; it does not make the go/no-go decision.
