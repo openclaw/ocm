@@ -20,7 +20,7 @@ use tar::{Builder, Header};
 
 use crate::support::{
     TestDir, TestHttpServer, install_fake_launchctl, install_fake_node_and_npm, ocm_env,
-    path_string, run_ocm, stderr,
+    path_string, run_ocm, stderr, write_json_replacing_path,
 };
 
 const PREPARE_DELAY: Duration = Duration::from_millis(1_500);
@@ -261,7 +261,7 @@ fn write_running_supervisor_runtime(
             stderr_path,
         }],
     };
-    fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    write_json_replacing_path(runtime_path, &runtime);
 }
 
 fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
@@ -273,7 +273,7 @@ fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
         services: Vec::new(),
         children: Vec::new(),
     };
-    fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    write_json_replacing_path(runtime_path, &runtime);
 }
 
 fn fixture_openclaw_script(version: &str) -> String {
