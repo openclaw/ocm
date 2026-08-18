@@ -41,6 +41,40 @@ pub(crate) fn discover_openclaw_checkout(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Rejects checkout dependencies that resolve through another checkout.
+pub(crate) fn ensure_checkout_owned_dependencies(repo_root: &Path) -> Result<(), String> {
+    let node_modules = repo_root.join("node_modules");
+    if !node_modules.exists() {
+        return Ok(());
+    }
+
+    // Compare resolved directories so relative links from linked worktrees cannot
+    // make another checkout's dependency tree appear local.
+    let resolved_repo = fs::canonicalize(repo_root).map_err(|error| {
+        format!(
+            "failed to resolve selected OpenClaw checkout at {}: {error}",
+            display_path(repo_root)
+        )
+    })?;
+    let resolved_dependencies = fs::canonicalize(&node_modules).map_err(|error| {
+        format!(
+            "failed to resolve OpenClaw dependencies at {}: {error}",
+            display_path(&node_modules)
+        )
+    })?;
+    if resolved_dependencies.starts_with(&resolved_repo) {
+        return Ok(());
+    }
+
+    // OCM leaves the selected checkout untouched. A standalone checkout gives
+    // package managers an isolated dependency tree without rewriting the worktree.
+    Err(format!(
+        "OpenClaw dependencies resolve outside the selected checkout: {} -> {}. OCM will not build or run source against dependencies from another checkout. Use a standalone checkout at the selected commit, run `pnpm install --frozen-lockfile` there, and pass that checkout with `--repo`.",
+        display_path(&node_modules),
+        display_path(&resolved_dependencies)
+    ))
+}
+
 pub(crate) fn default_worktree_root(repo_root: &Path, env_name: &str) -> PathBuf {
     clean_path(&repo_root.join(".worktrees").join(env_name))
 }

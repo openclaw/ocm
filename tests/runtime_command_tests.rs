@@ -632,6 +632,64 @@ fn runtime_build_local_packs_and_installs_release_shaped_package() {
     assert!(verify.status.success(), "{}", stderr(&verify));
 }
 
+#[cfg(unix)]
+#[test]
+fn runtime_build_local_rejects_dependencies_from_another_checkout_before_pack() {
+    let root = TestDir::new("runtime-build-local-external-dependencies");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    let shared_dependencies = root.child("other-checkout/node_modules");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&shared_dependencies).unwrap();
+    fs::write(
+        repo.join("package.json"),
+        br#"{"name":"openclaw","version":"2026.4.25","bin":{"openclaw":"openclaw.mjs"}}"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&shared_dependencies, repo.join("node_modules")).unwrap();
+
+    let archive_path = root.child("packed-openclaw.tgz");
+    fs::write(
+        &archive_path,
+        openclaw_package_tarball_with_version(
+            "#!/usr/bin/env node\nconsole.log('wrong dependency tree');\n",
+            "2026.4.25",
+        ),
+    )
+    .unwrap();
+    let mut env = ocm_env(&root);
+    let npm_log = install_fake_node_and_packing_npm(&root, &mut env, &archive_path);
+
+    let build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "main-local",
+            "--repo",
+            &path_string(&repo),
+            "--raw",
+        ],
+    );
+
+    assert!(!build.status.success());
+    let error = stderr(&build);
+    assert!(
+        error.contains("dependencies resolve outside the selected checkout"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&path_string(&shared_dependencies)),
+        "{error}"
+    );
+    assert!(error.contains("standalone checkout"), "{error}");
+    assert!(
+        !npm_log.exists(),
+        "npm pack ran before dependency validation"
+    );
+}
+
 #[test]
 fn runtime_build_local_can_include_source_extensions_without_widening_default_trust() {
     let root = TestDir::new("runtime-build-local-source-extensions");
