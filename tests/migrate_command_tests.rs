@@ -4,6 +4,8 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use rusqlite::{Connection, params};
+
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout};
 
 fn install_fake_openclaw_on_path(
@@ -411,6 +413,41 @@ fn seed_plain_openclaw_home(source_home: &std::path::Path) {
     .unwrap();
     fs::write(source_home.join("gateway.pid"), "4242\n").unwrap();
     fs::write(source_home.join("run/live.sock"), "sock\n").unwrap();
+}
+
+fn seed_installed_plugin_index(source_home: &std::path::Path, records: serde_json::Value) {
+    let database_path = source_home.join("state/openclaw.sqlite");
+    fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+    let database = Connection::open(database_path).unwrap();
+    database
+        .execute_batch(
+            "CREATE TABLE installed_plugin_index (\
+                index_key TEXT NOT NULL PRIMARY KEY, \
+                install_records_json TEXT NOT NULL\
+            );",
+        )
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO installed_plugin_index (index_key, install_records_json) VALUES (?1, ?2)",
+            params!["installed-plugin-index", records.to_string()],
+        )
+        .unwrap();
+}
+
+fn read_imported_plugin_install_records(root: &TestDir, env_name: &str) -> serde_json::Value {
+    let database = Connection::open(root.child(format!(
+        "ocm-home/envs/{env_name}/.openclaw/state/openclaw.sqlite"
+    )))
+    .unwrap();
+    let records: String = database
+        .query_row(
+            "SELECT install_records_json FROM installed_plugin_index WHERE index_key = ?1",
+            ["installed-plugin-index"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&records).unwrap()
 }
 
 fn assert_imported_plain_openclaw_home(
@@ -1078,6 +1115,207 @@ fn adopt_import_preserves_history_and_logs_from_plain_openclaw_home() {
 
     let imported_state = root.child("ocm-home/envs/mira/.openclaw");
     assert_imported_plain_openclaw_home(&imported_state, &source_home);
+}
+
+#[test]
+fn adopt_import_relocates_managed_plugin_install_records_into_the_imported_state() {
+    let root = TestDir::new("adopt-import-plugin-records");
+    let cwd = root.child("workspace");
+    let source_home = root.child("legacy-home/.openclaw");
+    fs::create_dir_all(&cwd).unwrap();
+    seed_plain_openclaw_home(&source_home);
+
+    let managed_hub = source_home.join("extensions/managed-hub");
+    let managed_npm = source_home.join("npm/node_modules/example-managed-npm");
+    for plugin_dir in [&managed_hub, &managed_npm] {
+        fs::create_dir_all(plugin_dir).unwrap();
+        fs::write(plugin_dir.join("openclaw.plugin.json"), "{}\n").unwrap();
+    }
+
+    seed_installed_plugin_index(
+        &source_home,
+        serde_json::json!({
+            "managed-hub": {
+                "source": "clawhub",
+                "installPath": managed_hub.display().to_string()
+            },
+            "managed-npm": {
+                "source": "npm",
+                "installPath": managed_npm.display().to_string()
+            }
+        }),
+    );
+
+    let env = ocm_env(&root);
+    let output = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "adopt",
+            "import",
+            "--name",
+            "mira",
+            source_home.to_string_lossy().as_ref(),
+            "--json",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let imported_records = read_imported_plugin_install_records(&root, "mira");
+
+    assert_eq!(
+        imported_records["managed-hub"]["installPath"].as_str(),
+        Some(
+            root.child("ocm-home/envs/mira/.openclaw/extensions/managed-hub")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert_eq!(
+        imported_records["managed-npm"]["installPath"].as_str(),
+        Some(
+            root.child("ocm-home/envs/mira/.openclaw/npm/node_modules/example-managed-npm")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert!(
+        !imported_records
+            .to_string()
+            .contains(&source_home.display().to_string())
+    );
+}
+
+#[test]
+fn adopt_import_preserves_external_plugin_checkouts_with_an_isolation_warning() {
+    let root = TestDir::new("adopt-import-external-plugin");
+    let cwd = root.child("workspace");
+    let source_home = root.child("legacy-home/.openclaw");
+    let external_plugin = root.child("external-checkout/example-dev-plugin");
+    fs::create_dir_all(&cwd).unwrap();
+    seed_plain_openclaw_home(&source_home);
+    fs::create_dir_all(&external_plugin).unwrap();
+    fs::write(external_plugin.join("marker.txt"), "external checkout\n").unwrap();
+
+    seed_installed_plugin_index(
+        &source_home,
+        serde_json::json!({
+            "external-dev": {
+                "source": "path",
+                "sourcePath": external_plugin.display().to_string(),
+                "installPath": external_plugin.display().to_string()
+            }
+        }),
+    );
+
+    let env = ocm_env(&root);
+    let output = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "adopt",
+            "import",
+            "--name",
+            "mira",
+            source_home.to_string_lossy().as_ref(),
+            "--json",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "warning: imported plugin external-dev could not be isolated inside the env state; OCM preserved but did not copy or modify its external location"
+        ),
+        "{}",
+        stderr(&output)
+    );
+
+    let imported_records = read_imported_plugin_install_records(&root, "mira");
+    assert_eq!(
+        imported_records["external-dev"]["installPath"].as_str(),
+        Some(external_plugin.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        fs::read_to_string(external_plugin.join("marker.txt")).unwrap(),
+        "external checkout\n"
+    );
+    assert!(
+        !root
+            .child("ocm-home/envs/mira/.openclaw/external-checkout")
+            .exists()
+    );
+}
+
+#[test]
+fn adopt_import_relocates_managed_plugin_records_from_a_copied_gateway_fixture() {
+    let root = TestDir::new("adopt-import-copied-plugin-records");
+    let cwd = root.child("workspace");
+    let original_home = root.child("personal/.openclaw");
+    let copied_home = root.child("copied-state");
+    fs::create_dir_all(&cwd).unwrap();
+    seed_plain_openclaw_home(&copied_home);
+
+    let copied_hub = copied_home.join("extensions/copied-hub");
+    let copied_npm = copied_home.join("npm/node_modules/example-copied-npm");
+    for plugin_dir in [&copied_hub, &copied_npm] {
+        fs::create_dir_all(plugin_dir).unwrap();
+        fs::write(plugin_dir.join("openclaw.plugin.json"), "{}\n").unwrap();
+    }
+
+    seed_installed_plugin_index(
+        &copied_home,
+        serde_json::json!({
+            "copied-hub": {
+                "source": "clawhub",
+                "installPath": original_home.join("extensions/copied-hub").display().to_string()
+            },
+            "copied-npm": {
+                "source": "npm",
+                "installPath": original_home
+                    .join("npm/node_modules/example-copied-npm")
+                    .display()
+                    .to_string()
+            }
+        }),
+    );
+
+    let env = ocm_env(&root);
+    let output = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "adopt",
+            "import",
+            "--name",
+            "mira",
+            copied_home.to_string_lossy().as_ref(),
+            "--json",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let imported_records = read_imported_plugin_install_records(&root, "mira");
+    assert_eq!(
+        imported_records["copied-hub"]["installPath"].as_str(),
+        Some(
+            root.child("ocm-home/envs/mira/.openclaw/extensions/copied-hub")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert_eq!(
+        imported_records["copied-npm"]["installPath"].as_str(),
+        Some(
+            root.child("ocm-home/envs/mira/.openclaw/npm/node_modules/example-copied-npm")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert!(
+        !imported_records
+            .to_string()
+            .contains(&original_home.display().to_string())
+    );
 }
 
 #[test]

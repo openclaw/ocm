@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+
+use rusqlite::{Connection, OptionalExtension};
+use serde_json::Value;
 
 use crate::env::EnvMeta;
 use crate::infra::archive::{EnvArchiveEntryKind, EnvArchiveOptions};
@@ -16,6 +20,12 @@ use super::openclaw_workspaces::{
 pub(crate) struct OpenClawStateAudit {
     pub issues: Vec<String>,
     pub repair_runtime_state: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MigratedRuntimeStateResult {
+    pub changed: bool,
+    pub external_plugin_ids: Vec<String>,
 }
 
 pub(crate) fn audit_openclaw_state(
@@ -149,9 +159,9 @@ pub(crate) fn prepare_migrated_runtime_state(
     source_state_root: &Path,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
-) -> Result<bool, String> {
+) -> Result<MigratedRuntimeStateResult, String> {
     if !path_exists(&paths.state_dir) {
-        return Ok(false);
+        return Ok(MigratedRuntimeStateResult::default());
     }
     let workspaces = resolve_archivable_workspaces(paths, env, runtime)?;
 
@@ -163,8 +173,17 @@ pub(crate) fn prepare_migrated_runtime_state(
         source_state_root,
         &paths.state_dir,
     )?;
+    let plugin_paths = relocate_installed_plugin_index_paths(
+        &paths.state_dir.join("state/openclaw.sqlite"),
+        source_state_root,
+        &paths.state_dir,
+    )?;
+    changed |= plugin_paths.changed;
     changed |= clear_volatile_runtime_state(&paths.state_dir, &paths.config_path, &workspaces)?;
-    Ok(changed)
+    Ok(MigratedRuntimeStateResult {
+        changed,
+        external_plugin_ids: plugin_paths.external_plugin_ids,
+    })
 }
 
 pub(crate) fn clear_nonportable_runtime_state(
@@ -287,6 +306,168 @@ fn rewrite_runtime_state_root_refs_inner(
     }
 
     Ok(())
+}
+
+fn relocate_installed_plugin_index_paths(
+    database_path: &Path,
+    source_state_root: &Path,
+    target_state_root: &Path,
+) -> Result<MigratedRuntimeStateResult, String> {
+    if !is_sqlite_database(database_path)? {
+        return Ok(MigratedRuntimeStateResult::default());
+    }
+
+    let connection = Connection::open(database_path).map_err(|error| {
+        format!(
+            "failed to open imported OpenClaw state database {}: {error}",
+            display_path(database_path)
+        )
+    })?;
+    let table_exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'installed_plugin_index'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| {
+            format!(
+                "failed to inspect imported OpenClaw plugin index {}: {error}",
+                display_path(database_path)
+            )
+        })?
+        .is_some();
+    if !table_exists {
+        return Ok(MigratedRuntimeStateResult::default());
+    }
+
+    let Some(raw_records) = connection
+        .query_row(
+            "SELECT install_records_json FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            format!(
+                "failed to read imported OpenClaw plugin install records {}: {error}",
+                display_path(database_path)
+            )
+        })?
+    else {
+        return Ok(MigratedRuntimeStateResult::default());
+    };
+
+    let mut records: Value = serde_json::from_str(&raw_records).map_err(|error| {
+        format!(
+            "failed to parse imported OpenClaw plugin install records {}: {error}",
+            display_path(database_path)
+        )
+    })?;
+    let Some(records) = records.as_object_mut() else {
+        return Err(format!(
+            "imported OpenClaw plugin install records are not an object: {}",
+            display_path(database_path)
+        ));
+    };
+
+    let mut changed = false;
+    let mut external_plugin_ids = BTreeSet::new();
+    for (plugin_id, record) in records.iter_mut() {
+        let Some(record) = record.as_object_mut() else {
+            continue;
+        };
+        let is_path_plugin = record.get("source").and_then(Value::as_str) == Some("path");
+        let mut has_external_path = false;
+        for field in ["installPath", "sourcePath"] {
+            let Some(path) = record.get(field).and_then(Value::as_str) else {
+                continue;
+            };
+            let path = Path::new(path);
+            let Some(relative) = relocatable_plugin_path(path, source_state_root, !is_path_plugin)
+            else {
+                has_external_path |= path.is_absolute() && !path.starts_with(target_state_root);
+                continue;
+            };
+            record.insert(
+                field.to_string(),
+                Value::String(display_path(&target_state_root.join(&relative))),
+            );
+            changed = true;
+        }
+        if has_external_path {
+            external_plugin_ids.insert(plugin_id.clone());
+        }
+    }
+    if !changed {
+        return Ok(MigratedRuntimeStateResult {
+            changed: false,
+            external_plugin_ids: external_plugin_ids.into_iter().collect(),
+        });
+    }
+
+    connection
+        .execute(
+            "UPDATE installed_plugin_index SET install_records_json = ?1 WHERE index_key = 'installed-plugin-index'",
+            [Value::Object(records.clone()).to_string()],
+        )
+        .map_err(|error| {
+            format!(
+                "failed to relocate imported OpenClaw plugin install records {}: {error}",
+                display_path(database_path)
+            )
+        })?;
+    Ok(MigratedRuntimeStateResult {
+        changed: true,
+        external_plugin_ids: external_plugin_ids.into_iter().collect(),
+    })
+}
+
+fn relocatable_plugin_path(
+    path: &Path,
+    source_state_root: &Path,
+    allow_copied_gateway_path: bool,
+) -> Option<PathBuf> {
+    let relative = match path.strip_prefix(source_state_root) {
+        Ok(relative) => relative,
+        Err(_) if allow_copied_gateway_path => {
+            let original_state_root = path
+                .ancestors()
+                .find(|ancestor| ancestor.file_name() == Some(OsStr::new(".openclaw")))?;
+            let relative = path.strip_prefix(original_state_root).ok()?;
+            let managed_root = relative.components().next()?.as_os_str();
+            if !matches!(
+                managed_root.to_str(),
+                Some("extensions") | Some("plugins") | Some("npm") | Some("git")
+            ) {
+                return None;
+            }
+            relative
+        }
+        Err(_) => return None,
+    };
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::CurDir | Component::Normal(_)))
+    {
+        return None;
+    }
+
+    let canonical_source = fs::canonicalize(source_state_root).ok()?;
+    let canonical_payload = fs::canonicalize(source_state_root.join(relative)).ok()?;
+    canonical_payload
+        .starts_with(canonical_source)
+        .then(|| relative.to_path_buf())
+}
+
+fn is_sqlite_database(path: &Path) -> Result<bool, String> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut magic = [0_u8; 16];
+    Ok(file.read_exact(&mut magic).is_ok() && &magic == b"SQLite format 3\0")
 }
 
 fn clear_volatile_runtime_state(
@@ -891,7 +1072,7 @@ mod tests {
             OpenClawWorkspaceRuntime::default(),
         )
         .unwrap();
-        assert!(changed);
+        assert!(changed.changed);
         assert!(paths.workspace_dir.join("notes/todo.txt").exists());
         assert!(
             paths

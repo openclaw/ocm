@@ -168,6 +168,7 @@ impl Cli {
             result.cleared_sandbox_origin,
             result.sandbox_port,
         );
+        self.warn_external_migration_plugins(&result.external_plugin_ids);
         let summary = result.summary;
 
         if json_flag {
@@ -209,6 +210,7 @@ impl Cli {
             result.cleared_sandbox_origin,
             result.sandbox_port,
         );
+        self.warn_external_migration_plugins(&result.external_plugin_ids);
         let summary = result.summary;
 
         if json_flag {
@@ -231,6 +233,14 @@ impl Cli {
         sandbox_port: Option<u32>,
     ) {
         self.warn_cleared_sandbox_origin(&summary.name, cleared_sandbox_origin, sandbox_port);
+    }
+
+    fn warn_external_migration_plugins(&self, plugin_ids: &[String]) {
+        for plugin_id in plugin_ids {
+            self.stderr_line(format!(
+                "warning: imported plugin {plugin_id} could not be isolated inside the env state; OCM preserved but did not copy or modify its external location"
+            ));
+        }
     }
 
     fn handle_adopt_inspect(&self, args: Vec<String>) -> Result<i32, String> {
