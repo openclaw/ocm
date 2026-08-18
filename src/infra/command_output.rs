@@ -213,6 +213,21 @@ mod tests {
     }
 
     #[test]
+    fn summary_redacts_url_userinfo_with_uppercase_scheme() {
+        let summary = bounded_summary(
+            ["download failed: HTTPS://user:password@example.test/package.tgz"].into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary,
+            "download failed: HTTPS://<redacted>@example.test/package.tgz"
+        );
+        assert!(!summary.contains("user"));
+        assert!(!summary.contains("password"));
+    }
+
+    #[test]
     fn character_limit_preserves_head_and_tail() {
         let oversized_head = format!("root cause: {}", "x".repeat(MAX_SUMMARY_CHARS));
         let summary =
