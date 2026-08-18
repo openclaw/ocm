@@ -674,6 +674,11 @@ fn runtime_mutation_help_directs_bound_environments_to_upgrade() {
         assert!(stdout(&help).contains("ocm upgrade <env>"));
     }
 
+    let build_local = run_ocm(&cwd, &env, &["help", "runtime", "build-local"]);
+    let output = stdout(&build_local);
+    assert!(output.contains("--for-env <env>"));
+    assert!(output.contains("mutually exclusive"));
+
     let remove = run_ocm(&cwd, &env, &["help", "runtime", "remove"]);
     assert!(remove.status.success(), "{}", stderr(&remove));
     assert!(stdout(&remove).contains("Clear every environment binding"));
