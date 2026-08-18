@@ -9,7 +9,7 @@ use std::time::Duration;
 use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
 use ocm::infra::download::file_sha256;
-use ocm::store::runtime_install_root;
+use ocm::store::{runtime_install_root, runtime_meta_path};
 use serde_json::Value;
 use sha2::{Digest, Sha512};
 use tar::{Builder, Header};
@@ -627,9 +627,81 @@ fn runtime_build_local_packs_and_installs_release_shaped_package() {
         path_string(&fs::canonicalize(&repo).unwrap())
     );
     assert!(value["sourceSha256"].as_str().is_some());
+    assert!(value["runtimeSha256"].as_str().is_some());
 
     let verify = run_ocm(&cwd, &env, &["runtime", "verify", "main-local", "--raw"]);
     assert!(verify.status.success(), "{}", stderr(&verify));
+}
+
+#[test]
+fn runtime_verify_reports_package_tree_drift() {
+    let root = TestDir::new("runtime-verify-package-tree-drift");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        repo.join("package.json"),
+        br#"{"name":"openclaw","version":"2026.4.25","bin":{"openclaw":"openclaw.mjs"}}"#,
+    )
+    .unwrap();
+    let archive_path = root.child("packed-openclaw.tgz");
+    fs::write(
+        &archive_path,
+        openclaw_package_tarball_with_version(
+            "#!/usr/bin/env node\nconsole.log('local package runtime');\n",
+            "2026.4.25",
+        ),
+    )
+    .unwrap();
+
+    let mut env = ocm_env(&root);
+    let _npm_log = install_fake_node_and_packing_npm(&root, &mut env, &archive_path);
+    let build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "main-local",
+            "--repo",
+            "./openclaw",
+        ],
+    );
+    assert!(build.status.success(), "{}", stderr(&build));
+
+    let install_root = runtime_install_root("main-local", &env, &cwd).unwrap();
+    fs::write(
+        install_root.join("files/node_modules/openclaw/package.json"),
+        br#"{"name":"openclaw","version":"tampered"}"#,
+    )
+    .unwrap();
+
+    let verify = run_ocm(&cwd, &env, &["runtime", "verify", "main-local", "--json"]);
+    assert_eq!(verify.status.code(), Some(1));
+    let value: Value = serde_json::from_str(&stdout(&verify)).unwrap();
+    assert_eq!(value["healthy"], false);
+    assert!(
+        value["issue"]
+            .as_str()
+            .unwrap()
+            .contains("runtime sha256 mismatch:")
+    );
+
+    let meta_path = runtime_meta_path("main-local", &env, &cwd).unwrap();
+    let mut legacy_meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    legacy_meta.as_object_mut().unwrap().remove("runtimeSha256");
+    fs::write(&meta_path, serde_json::to_vec_pretty(&legacy_meta).unwrap()).unwrap();
+    let legacy_verify = run_ocm(&cwd, &env, &["runtime", "verify", "main-local", "--json"]);
+    assert!(legacy_verify.status.success(), "{}", stderr(&legacy_verify));
+
+    fs::write(
+        install_root.join("files/node_modules/openclaw/openclaw.mjs"),
+        "tampered launcher\n",
+    )
+    .unwrap();
+    let launcher_verify = run_ocm(&cwd, &env, &["runtime", "verify", "main-local", "--json"]);
+    assert_eq!(launcher_verify.status.code(), Some(1));
+    assert!(stdout(&launcher_verify).contains("sha256 mismatch:"));
 }
 
 #[test]

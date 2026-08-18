@@ -243,10 +243,18 @@ pub fn runtime_show(
         source_rows.push(KeyValueRow::plain("Manifest URL", source_manifest_url));
     }
     if let Some(source_sha256) = meta.source_sha256.as_deref() {
-        source_rows.push(KeyValueRow::plain("SHA-256", source_sha256));
+        let label = if meta.runtime_sha256.is_some() {
+            "Launcher SHA-256"
+        } else {
+            "SHA-256"
+        };
+        source_rows.push(KeyValueRow::plain(label, source_sha256));
     }
     if let Some(source_integrity) = meta.source_integrity.as_deref() {
         source_rows.push(KeyValueRow::plain("Integrity", source_integrity));
+    }
+    if let Some(runtime_sha256) = meta.runtime_sha256.as_deref() {
+        source_rows.push(KeyValueRow::plain("Runtime SHA-256", runtime_sha256));
     }
     push_card(&mut lines, "Source details", source_rows, profile.color);
 
@@ -319,6 +327,9 @@ fn runtime_show_raw(meta: &RuntimeMeta) -> Result<Vec<String>, String> {
     }
     if let Some(source_integrity) = meta.source_integrity.as_deref() {
         lines.insert("sourceIntegrity".to_string(), source_integrity.to_string());
+    }
+    if let Some(runtime_sha256) = meta.runtime_sha256.as_deref() {
+        lines.insert("runtimeSha256".to_string(), runtime_sha256.to_string());
     }
     if let Some(release_version) = meta.release_version.as_deref() {
         lines.insert("releaseVersion".to_string(), release_version.to_string());
@@ -844,7 +855,15 @@ pub fn runtime_verify(
         source_rows.push(KeyValueRow::plain("Manifest URL", source_manifest_url));
     }
     if let Some(source_sha256) = summary.source_sha256.as_deref() {
-        source_rows.push(KeyValueRow::plain("SHA-256", source_sha256));
+        let label = if summary.runtime_sha256.is_some() {
+            "Launcher SHA-256"
+        } else {
+            "SHA-256"
+        };
+        source_rows.push(KeyValueRow::plain(label, source_sha256));
+    }
+    if let Some(runtime_sha256) = summary.runtime_sha256.as_deref() {
+        source_rows.push(KeyValueRow::plain("Runtime SHA-256", runtime_sha256));
     }
     push_card(&mut lines, "Source details", source_rows, profile.color);
 
@@ -912,6 +931,9 @@ fn runtime_verify_raw(summary: &RuntimeVerifySummary) -> Vec<String> {
     }
     if let Some(source_sha256) = summary.source_sha256.as_deref() {
         lines.push(format!("sourceSha256: {source_sha256}"));
+    }
+    if let Some(runtime_sha256) = summary.runtime_sha256.as_deref() {
+        lines.push(format!("runtimeSha256: {runtime_sha256}"));
     }
     if let Some(release_version) = summary.release_version.as_deref() {
         lines.push(format!("releaseVersion: {release_version}"));
@@ -1093,6 +1115,8 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("Health")));
         assert!(lines.iter().any(|line| line.contains("Tracks")));
         assert!(lines.iter().any(|line| line.contains("Source details")));
+        assert!(lines.iter().any(|line| line.contains("Launcher SHA-256")));
+        assert!(lines.iter().any(|line| line.contains("Runtime SHA-256")));
     }
 
     #[test]
@@ -1110,6 +1134,7 @@ mod tests {
 
         assert!(lines.iter().any(|line| line == "name: stable"));
         assert!(lines.iter().any(|line| line == "healthy: true"));
+        assert!(lines.iter().any(|line| line == "runtimeSha256: def456"));
         assert!(
             lines
                 .iter()
@@ -1170,6 +1195,7 @@ mod tests {
             source_manifest_url: None,
             source_sha256: None,
             source_integrity: None,
+            runtime_sha256: None,
             release_version: Some("2026.3.24".to_string()),
             release_channel: Some("stable".to_string()),
             release_selector_kind: Some(RuntimeReleaseSelectorKind::Channel),
@@ -1193,6 +1219,7 @@ mod tests {
             source_manifest_url: Some("https://registry.npmjs.org/openclaw".to_string()),
             source_sha256: Some("abc123".to_string()),
             source_integrity: Some("sha512-abc123".to_string()),
+            runtime_sha256: Some("def456".to_string()),
             release_version: Some("2026.3.24".to_string()),
             release_channel: Some("stable".to_string()),
             release_selector_kind: Some(RuntimeReleaseSelectorKind::Channel),

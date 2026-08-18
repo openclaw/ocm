@@ -541,6 +541,7 @@ mod tests {
             source_manifest_url: Some("https://example.invalid/openclaw".to_string()),
             source_sha256: None,
             source_integrity: None,
+            runtime_sha256: None,
             release_version: Some("2026.6.11".to_string()),
             release_channel: Some("stable".to_string()),
             release_selector_kind: None,

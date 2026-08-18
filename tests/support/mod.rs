@@ -458,6 +458,20 @@ fi
 
 mkdir -p "$prefix/node_modules/openclaw"
 tar -xzf "$archive" -C "$prefix/node_modules/openclaw" --strip-components=1 package
+if [ -n "${OCM_TEST_NPM_BROKEN_BIN_INDEX:-}" ]; then
+  broken_bin="$prefix/node_modules/openclaw/dist/extensions/demo-${OCM_TEST_NPM_BROKEN_BIN_INDEX}/node_modules/.bin"
+  mkdir -p "$broken_bin"
+  ln -s ../missing-package/bin/missing-tool "$broken_bin/missing-tool"
+fi
+if [ -n "${OCM_TEST_NPM_CHUNK_COUNT:-}" ]; then
+  chunks="$prefix/node_modules/openclaw/dist/chunks"
+  mkdir -p "$chunks"
+  index=0
+  while [ "$index" -lt "$OCM_TEST_NPM_CHUNK_COUNT" ]; do
+    printf 'export const chunk%s = %s;\n' "$index" "$index" > "$chunks/chunk-$(printf '%04d' "$index").js"
+    index=$((index + 1))
+  done
+fi
 if grep -q '"chokidar"' "$prefix/node_modules/openclaw/package.json"; then
   mkdir -p "$prefix/node_modules/chokidar"
   mkdir -p "$prefix/node_modules/readdirp"

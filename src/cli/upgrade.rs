@@ -127,7 +127,7 @@ struct UpgradeTarget {
 
 #[derive(Clone, Debug)]
 enum ResolvedUpgradeTargetKind {
-    Named(RuntimeMeta),
+    Named(Box<RuntimeMeta>),
     Official(OpenClawRelease),
 }
 
@@ -2638,7 +2638,7 @@ impl Cli {
                 name: runtime_name,
                 release_version: meta.release_version.clone(),
                 release_channel: meta.release_channel.clone(),
-                kind: ResolvedUpgradeTargetKind::Named(meta),
+                kind: ResolvedUpgradeTargetKind::Named(Box::new(meta)),
             });
         }
 
@@ -2666,7 +2666,7 @@ impl Cli {
             ResolvedUpgradeTargetKind::Named(meta) => Ok(PreparedUpgradeTarget {
                 name: resolved.name,
                 prepared_binary_path: PathBuf::from(&meta.binary_path),
-                meta,
+                meta: *meta,
                 action: OfficialRuntimePrepareAction::Reused,
                 staged: None,
             }),

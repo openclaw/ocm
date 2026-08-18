@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -10,12 +9,12 @@ use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "macos"))]
 use filetime::{FileTime, set_file_times, set_symlink_file_times};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
-use sha2::{Digest, Sha256};
 #[cfg(not(target_os = "macos"))]
 use std::io::Write;
 
 use super::common::{ensure_dir, path_exists};
 use super::layout::display_path;
+use crate::infra::tree_digest::inventory_tree;
 
 pub(crate) const STORAGE_APFS_CLONE: &str = "apfs-clone-v1";
 pub(crate) const STORAGE_FULL_COPY: &str = "full-copy-v1";
@@ -152,80 +151,6 @@ pub(crate) fn verify_tree_checkpoint(source: &Path, destination: &Path) -> Resul
         ));
     }
     Ok(())
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct InventoryEntry {
-    kind: &'static str,
-    len: Option<u64>,
-    mode: u32,
-    link_target: Option<PathBuf>,
-    sha256: Option<[u8; 32]>,
-}
-
-fn inventory_tree(root: &Path) -> Result<BTreeMap<PathBuf, InventoryEntry>, String> {
-    let mut out = BTreeMap::new();
-    inventory_path(root, root, &mut out)?;
-    Ok(out)
-}
-
-fn inventory_path(
-    root: &Path,
-    path: &Path,
-    out: &mut BTreeMap<PathBuf, InventoryEntry>,
-) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("failed to inspect {}: {error}", display_path(path)))?;
-    let relative = path.strip_prefix(root).unwrap_or(path).to_path_buf();
-    let file_type = metadata.file_type();
-    let (kind, link_target, sha256) = if file_type.is_symlink() {
-        (
-            "symlink",
-            Some(fs::read_link(path).map_err(|error| error.to_string())?),
-            None,
-        )
-    } else if file_type.is_dir() {
-        ("directory", None, None)
-    } else if file_type.is_file() {
-        ("file", None, Some(hash_file(path)?))
-    } else {
-        ("special", None, None)
-    };
-    out.insert(
-        relative,
-        InventoryEntry {
-            kind,
-            len: file_type.is_file().then_some(metadata.len()),
-            mode: metadata_mode(&metadata),
-            link_target,
-            sha256,
-        },
-    );
-    if file_type.is_dir() {
-        let mut entries = fs::read_dir(path)
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            inventory_path(root, &entry.path(), out)?;
-        }
-    }
-    Ok(())
-}
-
-fn hash_file(path: &Path) -> Result<[u8; 32], String> {
-    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher.finalize().into())
 }
 
 fn verify_sqlite_databases(root: &Path) -> Result<(), String> {
@@ -828,28 +753,17 @@ fn preserve_metadata(
     Ok(())
 }
 
-#[cfg(unix)]
-fn metadata_mode(metadata: &fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.mode()
-}
-
-#[cfg(not(unix))]
-fn metadata_mode(metadata: &fs::Metadata) -> u32 {
-    u32::from(metadata.permissions().readonly())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::inventory_tree;
     #[cfg(target_os = "macos")]
     use super::{
         STORAGE_APFS_CLONE, copyfile_tree, create_tree_checkpoint_from_preparation,
         prepare_tree_checkpoint, sqlite_primary_for_sidecar, verify_tree_checkpoint,
     };
+    use crate::infra::tree_digest::inventory_tree;
 
     #[test]
     fn checkpoint_inventory_ignores_directory_allocation_lengths() {
