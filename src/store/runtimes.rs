@@ -359,30 +359,9 @@ pub struct BuildLocalRuntimeOptions {
 }
 
 fn summarize_command_output(stdout: &[u8], stderr: &[u8]) -> Option<String> {
-    let mut fallback = Vec::new();
-    for bytes in [stderr, stdout] {
-        let text = String::from_utf8_lossy(bytes);
-        let meaningful = text
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .filter(|line| !line.starts_with("npm notice"))
-            .filter(|line| !line.starts_with("npm warn"))
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        if !meaningful.is_empty() {
-            let start = meaningful.len().saturating_sub(12);
-            return Some(meaningful[start..].join("\n"));
-        }
-        fallback.extend(
-            text.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .take(3)
-                .map(ToOwned::to_owned),
-        );
-    }
-    (!fallback.is_empty()).then(|| fallback.join("\n"))
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = String::from_utf8_lossy(stdout);
+    crate::infra::command_output::summarize_command_failure(&stderr, &stdout)
 }
 
 fn npm_program(env: &BTreeMap<String, String>) -> String {
@@ -2012,7 +1991,7 @@ npm warn deprecated node-domexception@1.0.0: Use your platform's native DOMExcep
     }
 
     #[test]
-    fn command_summary_keeps_the_failure_tail() {
+    fn command_summary_keeps_the_failure_head_and_tail() {
         let stderr = br#"
 phase 01
 phase 02
@@ -2032,8 +2011,43 @@ Error: CHANGELOG.md does not contain a release section
 
         let summary = summarize_command_output(b"", stderr).unwrap();
 
-        assert!(!summary.contains("phase 01"));
-        assert!(summary.contains("phase 03"));
+        assert!(summary.contains("phase 01"));
+        assert!(summary.contains("lines omitted"));
         assert!(summary.contains("Error: CHANGELOG.md does not contain a release section"));
+        assert!(summary.lines().count() <= 12);
+    }
+
+    #[test]
+    fn command_summary_keeps_the_root_cause_and_redacts_secrets() {
+        let stderr = br#"
+npm error Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@openclaw/ai'
+phase 01
+phase 02
+phase 03
+phase 04
+phase 05
+phase 06
+phase 07
+phase 08
+phase 09
+phase 10
+phase 11
+phase 12
+phase 13
+phase 14
+npm error token=fixture-secret
+npm error password: colon-secret
+npm error Authorization: Basic basic-secret
+npm error command failed
+"#;
+
+        let summary = summarize_command_output(b"", stderr).unwrap();
+
+        assert!(summary.contains("ERR_MODULE_NOT_FOUND"), "{summary}");
+        assert!(summary.contains("command failed"), "{summary}");
+        assert!(!summary.contains("fixture-secret"), "{summary}");
+        assert!(!summary.contains("colon-secret"), "{summary}");
+        assert!(!summary.contains("basic-secret"), "{summary}");
+        assert!(summary.lines().count() <= 12, "{summary}");
     }
 }

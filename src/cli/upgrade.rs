@@ -3599,7 +3599,7 @@ impl SimulationCommandOutput {
     }
 
     fn failure_summary(&self) -> String {
-        let detail = summarize_command_text(&self.stderr, &self.stdout)
+        let detail = summarize_command_failure_text(&self.stderr, &self.stdout)
             .unwrap_or_else(|| "no output".to_string());
         format!(
             "exited with code {}: {detail}",
@@ -4020,10 +4020,14 @@ fn summarize_command_text(primary: &str, secondary: &str) -> Option<String> {
     None
 }
 
+fn summarize_command_failure_text(primary: &str, secondary: &str) -> Option<String> {
+    crate::infra::command_output::summarize_command_failure(primary, secondary)
+}
+
 fn summarize_command_output(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
-    summarize_command_text(&stderr, &stdout).unwrap_or_else(|| "no output".to_string())
+    summarize_command_failure_text(&stderr, &stdout).unwrap_or_else(|| "no output".to_string())
 }
 
 fn command_output_reports_unsupported_command(stdout: &str, stderr: &str) -> bool {
@@ -4259,9 +4263,22 @@ fn gateway_auth_failure_proves_reachable(error: &str) -> bool {
 mod tests {
     use super::{
         candidate_codex_preflight_is_unsupported, command_output_reports_unsupported_command,
-        release_version_from_output, verify_gateway_status_readiness,
-        version_output_matches_expected,
+        release_version_from_output, summarize_command_failure_text,
+        verify_gateway_status_readiness, version_output_matches_expected,
     };
+
+    #[test]
+    fn command_summary_prefers_structured_cli_error_message() {
+        let stderr = "[openclaw] Could not start the CLI.\n[openclaw] Try: openclaw doctor\n";
+        let stdout = r#"{"ok":false,"error":{"type":"cli_error","message":"Cannot find package '@openclaw/plugin-api'; token=fixture-secret Authorization: Bearer bearer-secret"}}"#;
+
+        let summary = summarize_command_failure_text(stderr, stdout).unwrap();
+
+        assert!(summary.contains("Cannot find package '@openclaw/plugin-api'"));
+        assert!(!summary.contains("Could not start the CLI"));
+        assert!(!summary.contains("fixture-secret"));
+        assert!(!summary.contains("bearer-secret"));
+    }
 
     #[test]
     fn version_output_accepts_exact_version() {
