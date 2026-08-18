@@ -1,6 +1,7 @@
 pub(crate) mod inspect;
 mod manage;
 pub(crate) mod platform;
+mod readiness;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -12,6 +13,7 @@ pub use manage::{ServiceActionSummary, ServiceInstallSummary};
 pub(crate) use platform::{
     ServiceManagerKind, service_backend_support_error, service_manager_kind,
 };
+pub(crate) use readiness::wait_for_gateway_readiness;
 
 pub struct ServiceService<'a> {
     env: &'a BTreeMap<String, String>,
@@ -43,8 +45,16 @@ impl<'a> ServiceService<'a> {
     }
 
     pub fn start(&self, name: &str) -> Result<ServiceActionSummary, String> {
+        let summary = self.start_action(name)?;
+        summary.ensure_gateway_ready()?;
+        Ok(summary)
+    }
+
+    pub(crate) fn start_action(&self, name: &str) -> Result<ServiceActionSummary, String> {
         let _lock = crate::env::EnvironmentService::new(self.env, self.cwd).lock_operation(name)?;
-        self.start_locked(name)
+        let mut summary = self.start_locked(name)?;
+        self.apply_gateway_readiness(name, &mut summary)?;
+        Ok(summary)
     }
 
     pub(crate) fn start_locked(&self, name: &str) -> Result<ServiceActionSummary, String> {
@@ -199,12 +209,37 @@ impl<'a> ServiceService<'a> {
     }
 
     pub fn restart(&self, name: &str) -> Result<ServiceActionSummary, String> {
+        let summary = self.restart_action(name)?;
+        summary.ensure_gateway_ready()?;
+        Ok(summary)
+    }
+
+    pub(crate) fn restart_action(&self, name: &str) -> Result<ServiceActionSummary, String> {
         let _lock = crate::env::EnvironmentService::new(self.env, self.cwd).lock_operation(name)?;
-        self.restart_locked(name)
+        let mut summary = self.restart_locked(name)?;
+        self.apply_gateway_readiness(name, &mut summary)?;
+        Ok(summary)
     }
 
     pub(crate) fn restart_locked(&self, name: &str) -> Result<ServiceActionSummary, String> {
         manage::restart_service(name, self.env, self.cwd)
+    }
+
+    fn apply_gateway_readiness(
+        &self,
+        name: &str,
+        summary: &mut ServiceActionSummary,
+    ) -> Result<(), String> {
+        if self
+            .env
+            .get("OCM_INTERNAL_SKIP_SERVICE_READINESS")
+            .is_some_and(|value| value == "1")
+        {
+            return Ok(());
+        }
+        let readiness = wait_for_gateway_readiness(name, self.env, self.cwd)?;
+        summary.apply_gateway_readiness(readiness);
+        Ok(())
     }
 
     pub fn uninstall(&self, name: &str) -> Result<ServiceActionSummary, String> {

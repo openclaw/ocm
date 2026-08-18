@@ -187,6 +187,76 @@ fn write_legacy_openclaw_script(path: &Path, contents: &str) {
     );
 }
 
+fn write_health_gateway_script(path: &Path, mode: &str, delay_ms: u64) {
+    let behavior = match mode {
+        "healthy" => format!("setTimeout(() => server.listen(port, '127.0.0.1'), {delay_ms});"),
+        "timeout" => "setInterval(() => {}, 1000);".to_string(),
+        "exit-23" => format!("setTimeout(() => process.exit(23), {delay_ms});"),
+        _ => panic!("unknown gateway test mode: {mode}"),
+    };
+    write_executable_script(
+        path,
+        &format!(
+            r#"#!/usr/bin/env node
+import http from 'node:http';
+
+const args = process.argv.slice(2);
+if (args[0] === 'gateway' && args[1] === 'restart-handoff') {{
+  process.exit(64);
+}}
+const portIndex = args.indexOf('--port');
+const port = Number(args[portIndex + 1]);
+const server = http.createServer((request, response) => {{
+  response.writeHead(request.url === '/health' ? 200 : 404);
+  response.end(request.url === '/health' ? 'ok' : 'not found');
+}});
+{behavior}
+"#
+        ),
+    );
+}
+
+fn setup_gateway_readiness_fixture(
+    root: &TestDir,
+    mode: &str,
+    delay_ms: u64,
+    timeout_ms: u64,
+) -> (std::path::PathBuf, BTreeMap<String, String>) {
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(root);
+    env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
+    env.insert(
+        "OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS".to_string(),
+        timeout_ms.to_string(),
+    );
+    install_fake_systemd_tools(root, &mut env);
+
+    let script = root.child("bin/readiness-openclaw.mjs");
+    write_health_gateway_script(&script, mode, delay_ms);
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "readiness",
+            "--command",
+            &path_string(&script),
+        ],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--launcher", "readiness"],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let installed = run_ocm(&cwd, &env, &["service", "install", "demo"]);
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    (cwd, env)
+}
+
 fn read_persisted_service_state(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
@@ -917,6 +987,87 @@ fn service_restart_requeues_a_stopped_desired_child() {
 
     assert!(runtime_child_pid(&runtime, "demo").is_some());
     assert!(wait_for_file(&started, Duration::from_secs(5)));
+
+    stop_process(&mut daemon);
+}
+
+#[test]
+fn service_start_and_restart_wait_for_gateway_health() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-readiness-healthy");
+    let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    let started_body: Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(started_body["gatewayReady"], true);
+    assert_eq!(started_body["gatewayState"], "running");
+    assert_eq!(started_body["issue"], Value::Null);
+
+    let restarted = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+    assert!(restarted.status.success(), "{}", stderr(&restarted));
+    let restarted_body: Value = serde_json::from_slice(&restarted.stdout).unwrap();
+    assert_eq!(restarted_body["gatewayReady"], true);
+    assert_eq!(restarted_body["gatewayState"], "running");
+
+    stop_process(&mut daemon);
+}
+
+#[test]
+fn service_start_waits_for_slow_gateway_health() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-readiness-slow");
+    let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 700, 5_000);
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+
+    let started_at = Instant::now();
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    assert!(started_at.elapsed() >= Duration::from_millis(500));
+    let body: Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(body["gatewayReady"], true);
+
+    stop_process(&mut daemon);
+}
+
+#[test]
+fn service_start_reports_failed_backoff_with_the_child_error() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-readiness-backoff");
+    let (cwd, env) = setup_gateway_readiness_fixture(&root, "exit-23", 50, 5_000);
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+    assert!(!started.status.success());
+    let body: Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(body["gatewayReady"], false);
+    assert!(matches!(
+        body["gatewayState"].as_str(),
+        Some("backoff" | "stopped")
+    ));
+    assert!(body["issue"].as_str().unwrap().contains("23"));
+
+    stop_process(&mut daemon);
+}
+
+#[test]
+fn service_start_reports_an_explicit_readiness_timeout() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-readiness-timeout");
+    let (cwd, env) = setup_gateway_readiness_fixture(&root, "timeout", 0, 700);
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+    assert!(!started.status.success());
+    let body: Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(body["gatewayReady"], false);
+    assert!(
+        body["issue"]
+            .as_str()
+            .unwrap()
+            .contains("did not become ready within")
+    );
 
     stop_process(&mut daemon);
 }

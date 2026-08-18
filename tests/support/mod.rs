@@ -229,6 +229,10 @@ pub fn ocm_env(root: &TestDir) -> BTreeMap<String, String> {
 
     let mut env = base_env(&home);
     env.insert("OCM_HOME".to_string(), path_string(&ocm_home));
+    env.insert(
+        "OCM_INTERNAL_SKIP_SERVICE_READINESS".to_string(),
+        "1".to_string(),
+    );
     env
 }
 

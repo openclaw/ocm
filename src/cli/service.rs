@@ -67,10 +67,15 @@ impl Cli {
         };
         Self::assert_no_extra_args(&args[1..])?;
 
-        let summary = self.service_service().start(name)?;
+        let summary = self.service_service().start_action(name)?;
+        let code = if summary.gateway_ready == Some(false) {
+            1
+        } else {
+            0
+        };
         if json_flag {
             self.print_json(&summary)?;
-            return Ok(0);
+            return Ok(code);
         }
 
         self.stdout_lines(render::service::service_action(
@@ -78,7 +83,7 @@ impl Cli {
             profile,
             &self.command_example(),
         ));
-        Ok(0)
+        Ok(code)
     }
 
     pub(super) fn handle_service_stop(&self, args: Vec<String>) -> Result<i32, String> {
@@ -110,10 +115,15 @@ impl Cli {
         };
         Self::assert_no_extra_args(&args[1..])?;
 
-        let summary = self.service_service().restart(name)?;
+        let summary = self.service_service().restart_action(name)?;
+        let code = if summary.gateway_ready == Some(false) {
+            1
+        } else {
+            0
+        };
         if json_flag {
             self.print_json(&summary)?;
-            return Ok(0);
+            return Ok(code);
         }
 
         self.stdout_lines(render::service::service_action(
@@ -121,7 +131,7 @@ impl Cli {
             profile,
             &self.command_example(),
         ));
-        Ok(0)
+        Ok(code)
     }
 
     pub(super) fn handle_service_uninstall(&self, args: Vec<String>) -> Result<i32, String> {

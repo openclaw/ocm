@@ -339,34 +339,37 @@ pub fn service_action(
         return service_action_raw(summary, command_example);
     }
 
-    let state = if summary.running {
-        "running"
-    } else if summary.desired_running {
-        "pending"
-    } else if summary.installed {
-        "stopped"
-    } else {
-        "disabled"
-    };
+    let state = summary.gateway_state.as_str();
 
     let mut lines = vec![paint(&action_title(summary), Tone::Strong, profile.color)];
-    lines.extend(render_key_value_card(
-        "Result",
-        &[
-            KeyValueRow::plain("Action", summary.action.clone()),
-            KeyValueRow::new("Gateway", state, state_tone(state)),
-            KeyValueRow::accent("Port", summary.gateway_port.to_string()),
-            optional_value_row(
-                "Binding",
-                summary
-                    .binding_kind
-                    .as_ref()
-                    .zip(summary.binding_name.as_ref())
-                    .map(|(kind, name)| format!("{kind}:{name}")),
-            ),
-        ],
-        profile.color,
-    ));
+    let mut result_rows = vec![
+        KeyValueRow::plain("Action", summary.action.clone()),
+        KeyValueRow::new("Gateway", state, state_tone(state)),
+        KeyValueRow::accent("Port", summary.gateway_port.to_string()),
+        optional_value_row(
+            "Binding",
+            summary
+                .binding_kind
+                .as_ref()
+                .zip(summary.binding_name.as_ref())
+                .map(|(kind, name)| format!("{kind}:{name}")),
+        ),
+    ];
+    if let Some(ready) = summary.gateway_ready {
+        result_rows.push(KeyValueRow::new(
+            "Ready",
+            if ready { "yes" } else { "no" },
+            if ready { Tone::Success } else { Tone::Danger },
+        ));
+    }
+    lines.extend(render_key_value_card("Result", &result_rows, profile.color));
+    if let Some(issue) = summary.issue.as_ref() {
+        lines.extend(render_key_value_card(
+            "Attention",
+            &[KeyValueRow::warning("Issue", issue.clone())],
+            profile.color,
+        ));
+    }
     if !summary.warnings.is_empty() {
         let rows = summary
             .warnings
@@ -485,6 +488,18 @@ fn service_action_raw(summary: &ServiceActionSummary, _command_example: &str) ->
         format!("desiredRunning: {}", summary.desired_running),
         format!("running: {}", summary.running),
         format!("gatewayPort: {}", summary.gateway_port),
+        format!("gatewayState: {}", summary.gateway_state),
+        format!(
+            "gatewayReady: {}",
+            summary
+                .gateway_ready
+                .map(|ready| ready.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        format!(
+            "issue: {}",
+            summary.issue.clone().unwrap_or_else(|| "none".to_string())
+        ),
         format!(
             "stdoutPath: {}",
             summary
@@ -510,6 +525,9 @@ fn service_action_raw(summary: &ServiceActionSummary, _command_example: &str) ->
 }
 
 fn action_title(summary: &ServiceActionSummary) -> String {
+    if summary.gateway_ready == Some(false) {
+        return format!("Gateway for {} is not ready", summary.env_name);
+    }
     match summary.action.as_str() {
         "install" => format!("Enabled {} in the OCM background service", summary.env_name),
         "start" => format!(
@@ -635,6 +653,9 @@ mod tests {
                 desired_running: true,
                 running: true,
                 gateway_port: 18789,
+                gateway_state: "running".to_string(),
+                gateway_ready: Some(true),
+                issue: None,
                 binding_kind: Some("runtime".to_string()),
                 binding_name: Some("stable".to_string()),
                 stdout_path: Some("/tmp/stdout.log".to_string()),
@@ -664,6 +685,9 @@ mod tests {
             desired_running: false,
             running: true,
             gateway_port: 18789,
+            gateway_state: "stopping".to_string(),
+            gateway_ready: None,
+            issue: None,
             binding_kind: Some("runtime".to_string()),
             binding_name: Some("stable".to_string()),
             stdout_path: None,

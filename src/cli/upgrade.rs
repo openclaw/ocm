@@ -1,11 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -25,7 +21,7 @@ use crate::runtime::{
     InstallRuntimeFromOfficialReleaseOptions, OfficialRuntimePrepareAction, RuntimeMeta,
     RuntimeReleaseSelectorKind, RuntimeService, StagedRuntimeInstall, resolve_runtime_launch,
 };
-use crate::service::ServiceSummary;
+use crate::service::{ServiceSummary, wait_for_gateway_readiness};
 use crate::store::{
     InstallContext, RuntimeReleaseDetails, UpgradeHistoryBinding, UpgradeHistoryRecord,
     UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState, UpgradeHistoryStage,
@@ -2831,39 +2827,17 @@ impl Cli {
             return Ok(());
         }
 
-        let deadline = Instant::now() + Duration::from_secs(90);
-        let mut latest_issue = None;
-        let mut permitted_retry_count = None;
-        while Instant::now() < deadline {
-            let status = self.service_service().status(env_name)?;
-            latest_issue = status.issue.clone();
-            if status.running && gateway_health_ok(status.child_port.unwrap_or(status.gateway_port))
-            {
-                return Ok(());
-            }
-            if status.gateway_state == "backoff" && status.last_exit_code != Some(0) {
-                if should_wait_for_scheduled_gateway_retry(
-                    &mut permitted_retry_count,
-                    status.child_restart_count,
-                    status.next_retry_at.as_deref(),
-                    time::OffsetDateTime::now_utc(),
-                ) {
-                    sleep(Duration::from_millis(500));
-                    continue;
-                }
-                let issue = status
+        let readiness = wait_for_gateway_readiness(env_name, &self.env, &self.cwd)?;
+        if readiness.ready {
+            Ok(())
+        } else {
+            Err(format!(
+                "service restart did not recover: {}",
+                readiness
                     .issue
-                    .or(status.last_error)
-                    .unwrap_or_else(|| "gateway entered failed backoff after restart".to_string());
-                return Err(format!("service restart did not recover: {issue}"));
-            }
-            sleep(Duration::from_millis(500));
+                    .unwrap_or_else(|| "gateway did not become ready".to_string())
+            ))
         }
-
-        Err(format!(
-            "service restart returned before the gateway health endpoint became ready; latest status: {}",
-            latest_issue.unwrap_or_else(|| "starting".to_string())
-        ))
     }
 
     fn verify_upgraded_openclaw(
@@ -4171,57 +4145,6 @@ fn join_optional_warnings(left: Option<String>, right: Option<String>) -> Option
     }
 }
 
-fn gateway_health_ok(port: u32) -> bool {
-    if port == 0 || port > u16::MAX as u32 {
-        return false;
-    }
-    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port as u16);
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr.into(), Duration::from_millis(500))
-    else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
-    let request =
-        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
-    }
-    let mut response = [0_u8; 256];
-    let Ok(read) = stream.read(&mut response) else {
-        return false;
-    };
-    let text = String::from_utf8_lossy(&response[..read]);
-    text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200")
-}
-
-fn should_wait_for_scheduled_gateway_retry(
-    permitted_retry_count: &mut Option<usize>,
-    restart_count: Option<usize>,
-    next_retry_at: Option<&str>,
-    now: time::OffsetDateTime,
-) -> bool {
-    let (Some(restart_count), Some(next_retry_at)) = (restart_count, next_retry_at) else {
-        return false;
-    };
-    let Ok(next_retry_at) = time::OffsetDateTime::parse(
-        next_retry_at,
-        &time::format_description::well_known::Rfc3339,
-    ) else {
-        return false;
-    };
-    if now > next_retry_at + time::Duration::seconds(3) {
-        return false;
-    }
-    match permitted_retry_count {
-        Some(permitted) => restart_count == *permitted,
-        None => {
-            *permitted_retry_count = Some(restart_count);
-            true
-        }
-    }
-}
-
 fn verify_gateway_status_readiness(stdout: &str) -> Result<(), String> {
     let status: Value = serde_json::from_str(stdout.trim()).map_err(|error| {
         format!("post-upgrade gateway readiness failed: invalid status JSON ({error})")
@@ -4328,8 +4251,8 @@ fn gateway_auth_failure_proves_reachable(error: &str) -> bool {
 mod tests {
     use super::{
         candidate_codex_preflight_is_unsupported, command_output_reports_unsupported_command,
-        release_version_from_output, should_wait_for_scheduled_gateway_retry,
-        verify_gateway_status_readiness, version_output_matches_expected,
+        release_version_from_output, verify_gateway_status_readiness,
+        version_output_matches_expected,
     };
 
     #[test]
@@ -4471,61 +4394,6 @@ mod tests {
             unknown.contains("did not report RPC reachability"),
             "{unknown}"
         );
-    }
-
-    #[test]
-    fn scheduled_gateway_retry_allows_only_the_observed_next_attempt() {
-        let now = time::OffsetDateTime::now_utc();
-        let next_retry_at = (now + time::Duration::seconds(1))
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
-        let mut permitted_retry_count = None;
-
-        assert!(should_wait_for_scheduled_gateway_retry(
-            &mut permitted_retry_count,
-            Some(2),
-            Some(&next_retry_at),
-            now,
-        ));
-        assert!(should_wait_for_scheduled_gateway_retry(
-            &mut permitted_retry_count,
-            Some(2),
-            Some(&next_retry_at),
-            now,
-        ));
-        assert!(!should_wait_for_scheduled_gateway_retry(
-            &mut permitted_retry_count,
-            Some(3),
-            Some(&next_retry_at),
-            now,
-        ));
-    }
-
-    #[test]
-    fn scheduled_gateway_retry_rejects_missing_or_stale_retry_state() {
-        let now = time::OffsetDateTime::now_utc();
-        let stale_retry_at = (now - time::Duration::seconds(4))
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
-
-        assert!(!should_wait_for_scheduled_gateway_retry(
-            &mut None,
-            Some(1),
-            None,
-            now,
-        ));
-        assert!(!should_wait_for_scheduled_gateway_retry(
-            &mut None,
-            Some(1),
-            Some(&stale_retry_at),
-            now,
-        ));
-        assert!(!should_wait_for_scheduled_gateway_retry(
-            &mut None,
-            Some(1),
-            Some("not-a-timestamp"),
-            now,
-        ));
     }
 
     #[test]

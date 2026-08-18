@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use super::inspect::ServiceSummary;
+use super::readiness::GatewayReadiness;
 use super::service_backend_support_error;
 use crate::env::EnvironmentService;
 use crate::store::{restore_environment_service_policy, set_environment_service_policy};
@@ -22,6 +23,9 @@ pub struct ServiceActionSummary {
     pub running: bool,
     pub desired_running: bool,
     pub gateway_port: u32,
+    pub gateway_state: String,
+    pub gateway_ready: Option<bool>,
+    pub issue: Option<String>,
     pub binding_kind: Option<String>,
     pub binding_name: Option<String>,
     pub stdout_path: Option<String>,
@@ -30,6 +34,31 @@ pub struct ServiceActionSummary {
 }
 
 pub type ServiceInstallSummary = ServiceActionSummary;
+
+impl ServiceActionSummary {
+    pub(crate) fn apply_gateway_readiness(&mut self, readiness: GatewayReadiness) {
+        self.loaded = readiness.status.loaded;
+        self.running = readiness.status.running;
+        self.desired_running = readiness.status.desired_running;
+        self.gateway_port = readiness.status.gateway_port;
+        self.gateway_state = readiness.status.gateway_state;
+        self.gateway_ready = Some(readiness.ready);
+        self.issue = readiness.issue;
+        self.stdout_path = readiness.status.stdout_path;
+        self.stderr_path = readiness.status.stderr_path;
+    }
+
+    pub(crate) fn ensure_gateway_ready(&self) -> Result<(), String> {
+        if self.gateway_ready == Some(false) {
+            Err(self
+                .issue
+                .clone()
+                .unwrap_or_else(|| "gateway did not become ready".to_string()))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ServiceSupervisorPolicy {
@@ -422,6 +451,9 @@ fn service_action_summary(
         running: summary.running,
         desired_running: summary.desired_running,
         gateway_port: summary.gateway_port,
+        gateway_state: summary.gateway_state,
+        gateway_ready: None,
+        issue: summary.issue,
         binding_kind: summary.binding_kind,
         binding_name: summary.binding_name,
         stdout_path: summary.stdout_path,
