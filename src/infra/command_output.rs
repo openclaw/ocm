@@ -92,16 +92,31 @@ fn bounded_summary<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
     if summary.chars().count() <= MAX_SUMMARY_CHARS {
         return Some(summary);
     }
+
+    // Split the character budget so an oversized first line cannot discard
+    // the command's final error context.
+    let content_budget = MAX_SUMMARY_CHARS - 3;
+    let head_budget = content_budget / 2;
+    let tail_budget = content_budget - head_budget;
+    let tail = summary
+        .chars()
+        .rev()
+        .take(tail_budget)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev();
     Some(
         summary
             .chars()
-            .take(MAX_SUMMARY_CHARS - 3)
+            .take(head_budget)
             .chain("...".chars())
+            .chain(tail)
             .collect(),
     )
 }
 
 fn redact_obvious_secrets(line: &str) -> String {
+    let line = redact_url_userinfo(line);
     let lower_line = line.to_ascii_lowercase();
     if let Some((marker, start)) = ["authorization:", "authorization="]
         .into_iter()
@@ -114,7 +129,35 @@ fn redact_obvious_secrets(line: &str) -> String {
         return format!("{prefix}{separator}{marker}<redacted>");
     }
 
-    redact_assignments(line)
+    redact_assignments(&line)
+}
+
+// Replace URL userinfo as a unit so usernames, passwords, and percent-encoded
+// credentials cannot reach operator-facing diagnostics.
+fn redact_url_userinfo(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut cursor = 0;
+    while let Some(separator) = line[cursor..].find("://") {
+        let authority_start = cursor + separator + 3;
+        let authority_end = line[authority_start..]
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, '/' | '?' | '#')
+            })
+            .map(|offset| authority_start + offset)
+            .unwrap_or(line.len());
+        let authority = &line[authority_start..authority_end];
+        let Some(userinfo_end) = authority.rfind('@') else {
+            output.push_str(&line[cursor..authority_start]);
+            cursor = authority_start;
+            continue;
+        };
+        output.push_str(&line[cursor..authority_start]);
+        output.push_str("<redacted>@");
+        output.push_str(&authority[userinfo_end + 1..]);
+        cursor = authority_end;
+    }
+    output.push_str(&line[cursor..]);
+    output
 }
 
 fn redact_assignments(line: &str) -> String {
@@ -148,4 +191,36 @@ fn redact_assignments(line: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_SUMMARY_CHARS, bounded_summary};
+
+    #[test]
+    fn summary_redacts_url_userinfo() {
+        let summary = bounded_summary(
+            ["download failed: https://user:password@example.test/package.tgz"].into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary,
+            "download failed: https://<redacted>@example.test/package.tgz"
+        );
+        assert!(!summary.contains("user"));
+        assert!(!summary.contains("password"));
+    }
+
+    #[test]
+    fn character_limit_preserves_head_and_tail() {
+        let oversized_head = format!("root cause: {}", "x".repeat(MAX_SUMMARY_CHARS));
+        let summary =
+            bounded_summary([oversized_head.as_str(), "final actionable error"].into_iter())
+                .unwrap();
+
+        assert!(summary.starts_with("root cause:"));
+        assert!(summary.ends_with("final actionable error"));
+        assert_eq!(summary.chars().count(), MAX_SUMMARY_CHARS);
+    }
 }
