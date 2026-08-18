@@ -11,28 +11,6 @@ fn normalize(text: &str) -> String {
         .to_lowercase()
 }
 
-const RELEASE_VALIDATION_SUBSYSTEMS: [&str; 19] = [
-    "Pairing",
-    "Channels",
-    "Control UI",
-    "TUI",
-    "Onboarding",
-    "Slash commands",
-    "Memory",
-    "Subagents",
-    "Agents",
-    "Cron",
-    "Sessions",
-    "Context Engine",
-    "Skill Workshop",
-    "MCP",
-    "Models",
-    "Approvals",
-    "Compaction",
-    "Codex harness",
-    "OpenClaw harness",
-];
-
 #[test]
 fn release_validation_is_manual_and_worksheet_driven() {
     let skill = read("skills/openclaw-release-validation/SKILL.md");
@@ -43,17 +21,24 @@ fn release_validation_is_manual_and_worksheet_driven() {
         "disable-model-invocation: true",
         "one editable markdown worksheet",
         "finish validation",
-        "three to five subsystems",
+        "https://docs.openclaw.ai/maturity/scorecard.md",
+        "complete catalog",
+        "do not use a cached or hardcoded surface list",
+        "rank exactly five priority surfaces",
+        "change count and breadth",
+        "change size and complexity",
+        "maturity expectations",
         "group every user-visible or upgrade-sensitive item",
         "priority for this release",
-        "other subsystems",
+        "other surfaces",
+        "`### [<surface>](<taxonomy-url>) — <maturity-label>`",
         "`#### what changed`",
         "`#### recommended testing`",
         "`#### notes`",
-        "every priority subsystem must include it",
+        "every priority surface must include it",
         "no notable changes in this release.",
         "omit **recommended testing**",
-        "dominant themes across the subsystem's complete group",
+        "dominant themes across the surface's complete group",
         "do not include issue, pr, commit, or workflow examples",
         "a handful of links misrepresents the full release surface",
         "counts as tested only when tester-authored text appears beneath its `#### notes`",
@@ -68,23 +53,20 @@ fn release_validation_is_manual_and_worksheet_driven() {
     }
 
     assert!(worksheet.contains("{{RELEASE_NOTES_URL}}"));
+    assert!(worksheet.contains("{{SCORECARD_URL}}"));
+    assert!(worksheet.contains("{{TAXONOMY_URL}}"));
     assert!(!worksheet.contains("{{RELEASE_PRIORITIES}}"));
     assert!(worksheet.contains("## Upgrade findings"));
     assert!(worksheet.contains("## Priority for this release"));
-    assert!(worksheet.contains("## Other subsystems"));
-    assert!(worksheet.contains("> **Operator notes**"));
-    assert!(worksheet.contains("<!-- Campaign creator: move 3-5 selected subsystem sections"));
+    assert!(worksheet.contains("## Other surfaces"));
+    assert!(worksheet.contains("> [!NOTE]"));
+    assert!(worksheet.contains("derived from the live"));
+    assert!(worksheet.contains("**Score bands:** Experimental 0–50%"));
+    assert!(worksheet.contains("generate exactly five priority surface sections"));
+    assert!(worksheet.contains("generate every remaining live scorecard surface"));
     assert!(!worksheet.contains("## Private operator notes"));
     assert!(!worksheet.contains("## Release findings"));
-
-    let subsystem_headings = worksheet
-        .lines()
-        .filter_map(|line| line.strip_prefix("### "))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        subsystem_headings, RELEASE_VALIDATION_SUBSYSTEMS,
-        "worksheet must retain all 19 canonical subsystem skeletons"
-    );
+    assert_eq!(worksheet.matches("\n### ").count(), 0);
     assert_eq!(worksheet.matches("\n#### ").count(), 0);
 }
 
