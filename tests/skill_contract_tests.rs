@@ -30,14 +30,15 @@ fn release_validation_is_manual_and_worksheet_driven() {
         "change size and complexity",
         "maturity expectations",
         "group every user-visible or upgrade-sensitive item",
-        "priority for this release",
-        "other surfaces",
+        "your changes in this release",
+        "priority surfaces to test",
+        "other surfaces to test",
         "`### [surface](taxonomy-url)`",
         "| **maturity score** | <maturity-label> |",
         "| **what changed** | <release-theme> |",
         "| **recommended testing** | <exercise-or-em-dash> |",
-        "`#### notes`",
-        "notes` truly empty",
+        "| **testing notes** | |",
+        "testing notes** value cell truly empty",
         "no placeholder text or hidden comment",
         "every priority surface must have a real recommended exercise",
         "bounded operator workflow",
@@ -50,12 +51,16 @@ fn release_validation_is_manual_and_worksheet_driven() {
         "dominant themes across the surface's complete group",
         "do not include issue, pr, commit, or workflow examples",
         "a handful of links misrepresents the full release surface",
-        "counts as tested only when tester-authored text appears beneath its `#### notes`",
-        "table rows are campaign guidance, never test evidence",
-        "empty notes section means untouched",
+        "`gh api user`",
+        "enumerate every pr authored by that login",
+        "complete linked list",
+        "current tester's complete authored-pr list",
+        "counts as tested only when tester-authored text appears in its **testing notes** row",
+        "rows are campaign guidance, never test evidence",
+        "empty testing notes value means untouched",
         "one final release-analysis comment",
-        "only the surfaces with non-empty notes sections",
-        "do not report the guidance table as evidence",
+        "only the surfaces with non-empty testing notes cells",
+        "do not report the other table rows as evidence",
     ] {
         assert!(
             normalized.contains(required),
@@ -68,18 +73,27 @@ fn release_validation_is_manual_and_worksheet_driven() {
     assert!(worksheet.contains("{{TAXONOMY_URL}}"));
     assert!(!worksheet.contains("{{RELEASE_PRIORITIES}}"));
     assert!(worksheet.contains("## Upgrade findings"));
-    assert!(worksheet.contains("## Priority for this release"));
-    assert!(worksheet.contains("## Other surfaces"));
+    assert!(worksheet.contains("## Your changes in this release"));
+    assert!(worksheet.contains("## Priority surfaces to test"));
+    assert!(worksheet.contains("## Other surfaces to test"));
     assert!(worksheet.contains("> [!NOTE]"));
     assert!(worksheet.contains("derived from the live"));
     assert!(worksheet.contains("**Score bands:** Experimental 0–50%"));
-    assert!(worksheet.contains("table-and-empty-Notes format"));
+    assert!(worksheet.contains("empty Testing notes cell"));
     assert!(worksheet.contains("source for the final"));
     assert!(!worksheet.contains("<!-- Add notes below. -->"));
+    assert!(!worksheet.contains("## Surface notes"));
     assert!(!worksheet.contains("## Private operator notes"));
     assert!(!worksheet.contains("## Release findings"));
+    assert!(!worksheet.contains("| | |"));
     assert_eq!(worksheet.matches("\n### ").count(), 0);
     assert_eq!(worksheet.matches("\n#### ").count(), 0);
+
+    let changes = worksheet.find("## Your changes in this release").unwrap();
+    let priority = worksheet.find("## Priority surfaces to test").unwrap();
+    let callout = worksheet.find("> [!NOTE]").unwrap();
+    let other = worksheet.find("## Other surfaces to test").unwrap();
+    assert!(changes < priority && priority < callout && callout < other);
 }
 
 #[test]
