@@ -32,7 +32,7 @@ fn release_validation_is_manual_and_worksheet_driven() {
         "group every user-visible or upgrade-sensitive item",
         "priority for this release",
         "other surfaces",
-        "`### [<surface>](<taxonomy-url>)`",
+        "`### [surface](taxonomy-url)`",
         "| **maturity score** | <maturity-label> |",
         "| **what changed** | <release-theme> |",
         "| **recommended testing** | <exercise-or-em-dash> |",

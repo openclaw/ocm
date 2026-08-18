@@ -57,12 +57,12 @@ When the issue does not exist, become the campaign creator:
    **Other surfaces**. Format every section exactly like this:
 
    ```md
-   ### [<surface>](<taxonomy-url>)
+   ### [surface](taxonomy-url)
 
-   | | |
-   | --- | --- |
-   | **Maturity score** | <maturity-label> |
-   | **What changed** | <release-theme> |
+   |                         |                       |
+   | ----------------------- | --------------------- |
+   | **Maturity score**      | <maturity-label>      |
+   | **What changed**        | <release-theme>       |
    | **Recommended testing** | <exercise-or-em-dash> |
 
    #### Notes
