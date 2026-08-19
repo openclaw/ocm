@@ -11,9 +11,9 @@ use std::thread::{self, sleep};
 use std::time::Duration;
 
 use ocm::env::EnvironmentService;
-use ocm::store::{now_utc, supervisor_runtime_path};
+use ocm::store::{now_utc, supervisor_runtime_path, supervisor_state_path};
 use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::support::{
     TestDir, install_fake_launchctl, install_fake_systemd_tools, managed_service_definition_path,
@@ -782,6 +782,154 @@ fn service_status_all_reports_env_and_ocm_service_state_in_json() {
 }
 
 #[test]
+fn service_status_version_contract_is_read_only_for_mismatch_unknown_and_current() {
+    let root = TestDir::new("service-status-version-mismatch");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = launchd_env(&root);
+    setup_launcher_env(&cwd, &env);
+
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let runtime = json!({
+        "kind": "ocm-supervisor-runtime",
+        "ocmHome": path_string(&root.child("ocm-home")),
+        "daemonVersion": "0.1.0",
+        "updatedAt": "2026-08-17T00:00:00Z",
+        "services": [{
+            "envName": "demo",
+            "bindingKind": "launcher",
+            "bindingName": "stable",
+            "gatewayState": "running",
+            "restartHandoff": "protocol-v1",
+            "restartCount": 0,
+            "childPort": 18789,
+            "pid": 4242,
+            "stdoutPath": path_string(&root.child("demo.stdout.log")),
+            "stderrPath": path_string(&root.child("demo.stderr.log")),
+            "lastExitCode": null,
+            "lastError": null,
+            "lastEventAt": null,
+            "nextRetryAt": null
+        }],
+        "children": [{
+            "envName": "demo",
+            "bindingKind": "launcher",
+            "bindingName": "stable",
+            "pid": 4242,
+            "restartCount": 0,
+            "childPort": 18789,
+            "stdoutPath": path_string(&root.child("demo.stdout.log")),
+            "stderrPath": path_string(&root.child("demo.stderr.log"))
+        }]
+    });
+    let runtime_before = serde_json::to_vec(&runtime).unwrap();
+    fs::write(&runtime_path, &runtime_before).unwrap();
+
+    let output = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let body = json_output(&output);
+
+    assert_eq!(body["ocmCliVersion"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["ocmServiceVersion"], "0.1.0");
+    assert_eq!(body["ocmServiceVersionStatus"], "mismatch");
+    assert!(
+        body["ocmServiceVersionNote"]
+            .as_str()
+            .unwrap()
+            .contains("service refresh-daemon --acknowledge-gateway-restarts")
+    );
+    assert_eq!(body["childPid"], 4242);
+    assert_eq!(fs::read(&runtime_path).unwrap(), runtime_before);
+
+    let mut unknown_runtime = runtime.clone();
+    unknown_runtime
+        .as_object_mut()
+        .unwrap()
+        .remove("daemonVersion");
+    let unknown_before = serde_json::to_vec(&unknown_runtime).unwrap();
+    fs::write(&runtime_path, &unknown_before).unwrap();
+    let unknown = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+    assert!(unknown.status.success(), "{}", stderr(&unknown));
+    let unknown_body = json_output(&unknown);
+    assert_eq!(unknown_body["ocmServiceVersion"], Value::Null);
+    assert_eq!(unknown_body["ocmServiceVersionStatus"], "unknown");
+    assert!(
+        unknown_body["ocmServiceVersionNote"]
+            .as_str()
+            .unwrap()
+            .contains("does not report its version")
+    );
+    assert_eq!(unknown_body["childPid"], 4242);
+    assert_eq!(fs::read(&runtime_path).unwrap(), unknown_before);
+
+    let mut current_runtime = runtime;
+    current_runtime["daemonVersion"] = Value::String(env!("CARGO_PKG_VERSION").to_string());
+    let current_before = serde_json::to_vec(&current_runtime).unwrap();
+    fs::write(&runtime_path, &current_before).unwrap();
+    let current = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+    assert!(current.status.success(), "{}", stderr(&current));
+    let current_body = json_output(&current);
+    assert_eq!(current_body["ocmServiceVersionStatus"], "current");
+    assert_eq!(current_body["ocmServiceVersionNote"], Value::Null);
+    assert_eq!(current_body["childPid"], 4242);
+    assert_eq!(fs::read(&runtime_path).unwrap(), current_before);
+}
+
+#[test]
+fn service_refresh_daemon_requires_interruption_ack_and_preserves_desired_state() {
+    let root = TestDir::new("service-refresh-daemon-ack");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = launchd_env(&root);
+    setup_launcher_env(&cwd, &env);
+
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    let state_path = supervisor_state_path(&env, &cwd).unwrap();
+    let state_before = fs::read(&state_path).unwrap();
+    let launchctl_log = root.child("launchctl.log");
+    fs::write(&launchctl_log, "").unwrap();
+
+    let refused = run_ocm(&cwd, &env, &["service", "refresh-daemon", "--json"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("--acknowledge-gateway-restarts"),
+        "{}",
+        stderr(&refused)
+    );
+    let refused_calls = fs::read_to_string(&launchctl_log).unwrap();
+    assert!(!refused_calls.contains("bootout"));
+    assert!(!refused_calls.contains("bootstrap"));
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+
+    fs::write(&launchctl_log, "").unwrap();
+    let refreshed = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "service",
+            "refresh-daemon",
+            "--acknowledge-gateway-restarts",
+            "--json",
+        ],
+    );
+    assert!(refreshed.status.success(), "{}", stderr(&refreshed));
+    let body = json_output(&refreshed);
+    assert_eq!(body["action"], "refresh");
+    assert_eq!(body["gatewayInterruptionExpected"], true);
+    assert_eq!(body["gatewayInterruptionAcknowledged"], true);
+    assert!(body["note"].as_str().unwrap().contains("interrupted"));
+    let refreshed_calls = fs::read_to_string(&launchctl_log).unwrap();
+    assert!(refreshed_calls.contains("bootout"));
+    assert!(refreshed_calls.contains("bootstrap"));
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+}
+
+#[test]
 fn systemd_service_install_writes_the_ocm_unit() {
     let root = TestDir::new("service-systemd-install");
     let cwd = root.child("workspace");
@@ -933,6 +1081,7 @@ fn service_status_ignores_stale_runtime_children_when_the_daemon_is_down() {
     let stale_runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: Vec::new(),
         children: vec![SupervisorRuntimeChild {
@@ -979,6 +1128,7 @@ fn service_status_reports_clean_backoff_as_restarting_without_issue() {
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -1026,6 +1176,7 @@ fn service_status_keeps_failed_backoff_as_issue() {
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),

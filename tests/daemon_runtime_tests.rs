@@ -526,9 +526,11 @@ fn daemon_run_persists_live_runtime_children() {
     let runtime = wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(5))
         .expect("daemon runtime state did not report running children");
     assert_eq!(runtime["kind"], "ocm-supervisor-runtime");
+    assert_eq!(runtime["daemonVersion"], env!("CARGO_PKG_VERSION"));
 
     let runtime_body = to_value(service.runtime().unwrap()).unwrap();
     assert_eq!(runtime_body["present"], true);
+    assert_eq!(runtime_body["daemonVersion"], env!("CARGO_PKG_VERSION"));
     assert_eq!(runtime_body["runtimePath"], path_string(&runtime_path));
     assert_eq!(runtime_body["children"].as_array().unwrap().len(), 2);
 

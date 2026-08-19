@@ -13,6 +13,7 @@ use crate::infra::download::{
 };
 use crate::infra::tree_digest::tree_sha256;
 use crate::managed_node::{CommandSpec, managed_runtime_install_command};
+use crate::openclaw_repo::ensure_checkout_owned_dependencies;
 use crate::runtime::releases::{
     OpenClawRelease, RuntimeRelease, load_official_openclaw_release_selection,
     load_release_manifest, normalize_openclaw_channel_selector, official_openclaw_releases_url,
@@ -29,11 +30,13 @@ use super::common::{
     ExclusiveFileLock, copy_dir_recursive, ensure_dir, load_json_files, lock_file, path_exists,
     read_json, write_json,
 };
+use super::envs::get_environment;
 use super::layout::{
-    clean_path, display_path, resolve_absolute_path, runtime_install_root, runtime_meta_path,
-    validate_name,
+    clean_path, derive_env_paths, display_path, resolve_absolute_path, runtime_install_root,
+    runtime_meta_path, validate_name,
 };
 use super::now_utc;
+use super::openclaw_workspaces::load_effective_openclaw_config;
 
 fn trim_description(description: Option<String>) -> Option<String> {
     description
@@ -357,33 +360,14 @@ pub struct BuildLocalRuntimeOptions {
     pub description: Option<String>,
     pub force: bool,
     pub include_source_extensions: bool,
+    /// Existing environment whose configured source-plugin closure must be packaged.
+    pub target_env: Option<String>,
 }
 
 fn summarize_command_output(stdout: &[u8], stderr: &[u8]) -> Option<String> {
-    let mut fallback = Vec::new();
-    for bytes in [stderr, stdout] {
-        let text = String::from_utf8_lossy(bytes);
-        let meaningful = text
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .filter(|line| !line.starts_with("npm notice"))
-            .filter(|line| !line.starts_with("npm warn"))
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        if !meaningful.is_empty() {
-            let start = meaningful.len().saturating_sub(12);
-            return Some(meaningful[start..].join("\n"));
-        }
-        fallback.extend(
-            text.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .take(3)
-                .map(ToOwned::to_owned),
-        );
-    }
-    (!fallback.is_empty()).then(|| fallback.join("\n"))
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = String::from_utf8_lossy(stdout);
+    crate::infra::command_output::summarize_command_failure(&stderr, &stdout)
 }
 
 fn npm_program(env: &BTreeMap<String, String>) -> String {
@@ -407,14 +391,29 @@ struct LocalBuildNpmAdapter {
 #[derive(Clone, Debug)]
 struct LocalSourceExtension {
     id: String,
+    directory_name: String,
     package_name: String,
     source_dir: PathBuf,
+    materialize: bool,
 }
 
 #[derive(Clone, Debug)]
 struct LocalSourceExtensionArchive {
     extension: LocalSourceExtension,
     archive_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct SourcePluginDefinition {
+    directory_name: String,
+    package_name: Option<String>,
+    dependency_names: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourcePluginInventory {
+    by_id: BTreeMap<String, SourcePluginDefinition>,
+    id_by_package_name: BTreeMap<String, String>,
 }
 
 impl LocalBuildNpmAdapter {
@@ -488,14 +487,18 @@ fn local_workspace_package_dirs(repo_path: &Path) -> Result<Vec<PathBuf>, String
     Ok(dirs)
 }
 
-fn workspace_dependency_names(value: &serde_json::Value) -> BTreeSet<String> {
+fn workspace_dependency_names(
+    value: &serde_json::Value,
+    include_dev_dependencies: bool,
+) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    for section in [
-        "dependencies",
-        "optionalDependencies",
-        "peerDependencies",
-        "devDependencies",
-    ] {
+    let sections = [
+        Some("dependencies"),
+        Some("optionalDependencies"),
+        Some("peerDependencies"),
+        include_dev_dependencies.then_some("devDependencies"),
+    ];
+    for section in sections.into_iter().flatten() {
         let Some(dependencies) = value.get(section).and_then(serde_json::Value::as_object) else {
             continue;
         };
@@ -509,6 +512,245 @@ fn workspace_dependency_names(value: &serde_json::Value) -> BTreeSet<String> {
         }
     }
     names
+}
+
+fn source_plugin_inventory(repo_path: &Path) -> Result<SourcePluginInventory, String> {
+    let extensions_dir = repo_path.join("extensions");
+    let entries = fs::read_dir(&extensions_dir).map_err(|error| error.to_string())?;
+    let mut inventory = SourcePluginInventory::default();
+
+    // The manifest id is the runtime identity. Directory names are retained separately because
+    // OpenClaw permits a source directory such as kimi-coding to expose plugin id "kimi".
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            continue;
+        }
+        let source_dir = entry.path();
+        let manifest_path = source_dir.join("openclaw.plugin.json");
+        if !manifest_path.exists() {
+            continue;
+        }
+        let manifest: serde_json::Value = read_json(&manifest_path)
+            .map_err(|error| format!("invalid source plugin manifest: {error}"))?;
+        let id = manifest
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "source plugin manifest has no id: {}",
+                    display_path(&manifest_path)
+                )
+            })?
+            .to_string();
+        let directory_name = entry.file_name().to_string_lossy().to_string();
+        if let Some(previous) = inventory.by_id.get(&id) {
+            return Err(format!(
+                "source plugin id \"{id}\" is ambiguous between extensions/{} and extensions/{directory_name}",
+                previous.directory_name
+            ));
+        }
+
+        let package_path = source_dir.join("package.json");
+        let (package_name, dependency_names) = if package_path.exists() {
+            let package: serde_json::Value = read_json(&package_path)
+                .map_err(|error| format!("invalid source plugin package: {error}"))?;
+            let package_name = package
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| npm_package_relative_path(value).is_some())
+                .ok_or_else(|| format!("source plugin \"{id}\" has no valid npm package name"))?
+                .to_string();
+            (
+                Some(package_name),
+                workspace_dependency_names(&package, false),
+            )
+        } else {
+            // Source-only plugin directories without package.json are built into the core archive
+            // and cannot be selected as separately packed source plugins.
+            (None, BTreeSet::new())
+        };
+
+        if let Some(package_name) = package_name.as_deref()
+            && let Some(previous_id) = inventory
+                .id_by_package_name
+                .insert(package_name.to_string(), id.clone())
+        {
+            return Err(format!(
+                "source plugin npm package \"{package_name}\" is ambiguous between plugin ids \"{previous_id}\" and \"{id}\""
+            ));
+        }
+        inventory.by_id.insert(
+            id,
+            SourcePluginDefinition {
+                directory_name,
+                package_name,
+                dependency_names,
+            },
+        );
+    }
+    Ok(inventory)
+}
+
+fn source_plugin_dependency_closure(
+    direct: BTreeSet<String>,
+    inventory: &SourcePluginInventory,
+) -> Result<BTreeSet<String>, String> {
+    let mut ids = BTreeSet::new();
+    let mut pending = direct.into_iter().collect::<Vec<_>>();
+    while let Some(id) = pending.pop() {
+        if !ids.insert(id.clone()) {
+            continue;
+        }
+        let plugin = inventory.by_id.get(&id).ok_or_else(|| {
+            format!("source plugin \"{id}\" disappeared during closure resolution")
+        })?;
+        for dependency_name in &plugin.dependency_names {
+            if let Some(dependency_id) = inventory.id_by_package_name.get(dependency_name)
+                && !ids.contains(dependency_id)
+            {
+                pending.push(dependency_id.clone());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn collect_plugin_ids_from_records(value: &serde_json::Value, ids: &mut BTreeSet<String>) {
+    for pointer in ["/plugins/installs", "/installRecords"] {
+        if let Some(records) = value
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_object)
+        {
+            ids.extend(records.keys().filter_map(|id| normalized_plugin_id(id)));
+        }
+    }
+    if let Some(records) = value.get("plugins").and_then(serde_json::Value::as_array) {
+        ids.extend(
+            records
+                .iter()
+                .filter_map(|record| record.get("pluginId")?.as_str())
+                .filter_map(normalized_plugin_id),
+        );
+    }
+}
+
+fn normalized_plugin_id(id: &str) -> Option<String> {
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    let Some(plugins) = config.get("plugins").and_then(serde_json::Value::as_object) else {
+        return ids;
+    };
+    if let Some(entries) = plugins
+        .get("entries")
+        .and_then(serde_json::Value::as_object)
+    {
+        ids.extend(
+            entries
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.get("enabled").and_then(serde_json::Value::as_bool) != Some(false)
+                })
+                .filter_map(|(id, _)| normalized_plugin_id(id)),
+        );
+    }
+    if let Some(values) = plugins.get("allow").and_then(serde_json::Value::as_array) {
+        ids.extend(
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(normalized_plugin_id),
+        );
+    }
+    if let Some(slots) = plugins.get("slots").and_then(serde_json::Value::as_object) {
+        ids.extend(
+            slots
+                .values()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|id| id.trim() != "none")
+                .filter_map(normalized_plugin_id),
+        );
+    }
+    if let Some(deny) = plugins.get("deny").and_then(serde_json::Value::as_array) {
+        for id in deny.iter().filter_map(serde_json::Value::as_str) {
+            ids.remove(id.trim());
+        }
+    }
+    ids
+}
+
+fn installed_target_plugin_ids(
+    paths: &super::layout::EnvPaths,
+    config: &serde_json::Value,
+) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    collect_plugin_ids_from_records(config, &mut ids);
+    let installs_path = paths.state_dir.join("plugins/installs.json");
+    if let Ok(value) = read_json::<serde_json::Value>(&installs_path) {
+        collect_plugin_ids_from_records(&value, &mut ids);
+    }
+    ids
+}
+
+fn resolve_target_source_plugin_closure(
+    target_env: &str,
+    repo_path: &Path,
+    context: InstallContext<'_>,
+) -> Result<BTreeSet<String>, String> {
+    let target_env = validate_name(target_env, "Environment name")?;
+    let target = get_environment(&target_env, context.env, context.cwd)?;
+    let paths = derive_env_paths(Path::new(&target.root));
+    let config = load_effective_openclaw_config(&paths.config_path)?
+        .map(|resolved| resolved.value)
+        .unwrap_or_else(|| serde_json::json!({}));
+    if config
+        .pointer("/plugins/enabled")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        return Ok(BTreeSet::new());
+    }
+
+    // Only OpenClaw's explicit plugin policy fields are part of this contract. Inferring plugin
+    // ids from arbitrary provider, agent, or plugin-owned config would create false dependencies.
+    let inventory = source_plugin_inventory(repo_path)?;
+    let source_ids = inventory.by_id.keys().cloned().collect::<BTreeSet<_>>();
+    let explicit = collect_explicit_plugin_references(&config);
+    let installed = installed_target_plugin_ids(&paths, &config);
+    let missing = explicit
+        .iter()
+        .filter(|id| !source_ids.contains(*id) && !installed.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "target environment \"{target_env}\" references plugins unavailable from the selected checkout or its installed plugin records: {}. Repair the target plugin config or install the missing plugins before building",
+            missing.join(", ")
+        ));
+    }
+
+    let mut direct = explicit;
+    direct.retain(|id| {
+        inventory
+            .by_id
+            .get(id)
+            .is_some_and(|plugin| plugin.package_name.is_some())
+    });
+
+    // Follow local workspace dependencies by npm package name so a selected plugin is installed
+    // with every separately packed source plugin it imports at runtime.
+    source_plugin_dependency_closure(direct, &inventory)
 }
 
 fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>, String> {
@@ -526,7 +768,7 @@ fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>,
         )
     })?;
 
-    let mut pending = workspace_dependency_names(&root_package);
+    let mut pending = workspace_dependency_names(&root_package, true);
     if pending.is_empty() {
         return Ok(None);
     }
@@ -569,7 +811,7 @@ fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>,
             )
         })?;
         selected.insert(name, package_dir.clone());
-        pending.extend(workspace_dependency_names(package_value));
+        pending.extend(workspace_dependency_names(package_value, true));
     }
 
     std::env::join_paths(selected.into_values())
@@ -858,11 +1100,12 @@ fn npm_package_relative_path(package_name: &str) -> Option<PathBuf> {
     valid_component(package_name).then(|| PathBuf::from(package_name))
 }
 
-fn local_source_extensions_omitted_from_package(
+fn local_source_extensions_from_build(
     repo_path: &Path,
-    archive_path: &Path,
+    packaged_ids: &BTreeSet<String>,
+    include_packaged: bool,
+    target_ids: Option<&BTreeSet<String>>,
 ) -> Result<Vec<LocalSourceExtension>, String> {
-    let packaged_ids = packaged_openclaw_extension_ids(archive_path)?;
     let extensions_dir = repo_path.join("dist/extensions");
     let entries = fs::read_dir(&extensions_dir).map_err(|error| {
         format!(
@@ -882,8 +1125,10 @@ fn local_source_extensions_omitted_from_package(
         {
             continue;
         }
-        let id = entry.file_name().to_string_lossy().to_string();
-        if id == "node_modules" || packaged_ids.contains(&id) {
+        let directory_name = entry.file_name().to_string_lossy().to_string();
+        if directory_name == "node_modules"
+            || (!include_packaged && packaged_ids.contains(&directory_name))
+        {
             continue;
         }
         let package_json_path = source_dir.join("package.json");
@@ -891,9 +1136,24 @@ fn local_source_extensions_omitted_from_package(
         if !package_json_path.exists() && !manifest_path.exists() {
             continue;
         }
+        let id = fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|manifest| {
+                manifest
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| directory_name.clone());
+        if target_ids.is_some_and(|target_ids| !target_ids.contains(&id)) {
+            continue;
+        }
         let raw = fs::read_to_string(&package_json_path).map_err(|error| {
             format!(
-                "source extension \"{id}\" cannot be packaged because {} is unavailable: {error}",
+                "source extension \"{directory_name}\" cannot be packaged because {} is unavailable: {error}",
                 display_path(&package_json_path)
             )
         })?;
@@ -920,10 +1180,13 @@ fn local_source_extensions_omitted_from_package(
                 "multiple source extensions use npm package name \"{package_name}\""
             ));
         }
+        let materialize = !packaged_ids.contains(&directory_name);
         extensions.push(LocalSourceExtension {
             id,
+            directory_name,
             package_name,
             source_dir,
+            materialize,
         });
     }
     extensions.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1045,6 +1308,9 @@ fn materialize_local_source_extensions(
 ) -> Result<(), String> {
     let target_root = installed_openclaw_package_root(install_files).join("dist/extensions");
     for extension in extensions {
+        if !extension.extension.materialize {
+            continue;
+        }
         let package_relative_path = npm_package_relative_path(&extension.extension.package_name)
             .ok_or_else(|| {
                 format!(
@@ -1062,7 +1328,7 @@ fn materialize_local_source_extensions(
                 display_path(&installed_package.join("package.json"))
             ));
         }
-        let target = target_root.join(&extension.extension.id);
+        let target = target_root.join(&extension.extension.directory_name);
         if path_exists(&target) {
             return Err(format!(
                 "source extension target already exists after package installation: {}",
@@ -1648,8 +1914,14 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
     }
 
     let repo_path = fs::canonicalize(&repo_path).map_err(|error| error.to_string())?;
+    ensure_checkout_owned_dependencies(&repo_path)?;
     let version = load_openclaw_repo_version(&repo_path)?;
     let commit = git_short_commit(&repo_path);
+    let target_source_plugins = options
+        .target_env
+        .as_deref()
+        .map(|target_env| resolve_target_source_plugin_closure(target_env, &repo_path, context))
+        .transpose()?;
     let stores = super::ensure_store(context.env, context.cwd)?;
     let pack_dir = stores.runtimes_dir.join(format!(
         ".{name}.pack-{}-{}",
@@ -1662,9 +1934,43 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
         let local_adapter = local_build_npm_adapter(&repo_path, context.env)?;
         let archive_path =
             pack_local_openclaw_repo(&repo_path, &pack_dir, context.env, local_adapter.as_ref())?;
+        let needs_source_extensions = options.include_source_extensions
+            || target_source_plugins
+                .as_ref()
+                .is_some_and(|plugins| !plugins.is_empty());
+        let packaged_ids = needs_source_extensions
+            .then(|| packaged_openclaw_extension_ids(&archive_path))
+            .transpose()?
+            .unwrap_or_default();
         let source_extensions = if options.include_source_extensions {
             let extensions =
-                local_source_extensions_omitted_from_package(&repo_path, &archive_path)?;
+                local_source_extensions_from_build(&repo_path, &packaged_ids, false, None)?;
+            pack_local_source_extensions(extensions, &pack_dir, context.env)?
+        } else if let Some(target_source_plugins) = target_source_plugins
+            .as_ref()
+            .filter(|plugins| !plugins.is_empty())
+        {
+            let extensions = local_source_extensions_from_build(
+                &repo_path,
+                &packaged_ids,
+                true,
+                Some(target_source_plugins),
+            )?;
+            let available_ids = extensions
+                .iter()
+                .map(|extension| extension.id.clone())
+                .collect::<BTreeSet<_>>();
+            let missing = target_source_plugins
+                .difference(&available_ids)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "the local OpenClaw build did not produce required source plugins for target environment {}: {}",
+                    options.target_env.as_deref().unwrap_or_default(),
+                    missing.join(", ")
+                ));
+            }
             pack_local_source_extensions(extensions, &pack_dir, context.env)?
         } else {
             Vec::new()
@@ -2024,7 +2330,93 @@ pub fn verify_runtime_binary(
 
 #[cfg(test)]
 mod tests {
-    use super::summarize_command_output;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{
+        SourcePluginDefinition, SourcePluginInventory, collect_explicit_plugin_references,
+        source_plugin_dependency_closure, source_plugin_inventory, summarize_command_output,
+    };
+
+    #[test]
+    fn target_plugin_references_ignore_arbitrary_matching_config_values() {
+        let config = serde_json::json!({
+            "agents": { "list": [{ "id": "codex" }] },
+            "plugins": {
+                "entries": {
+                    "workboard": { "enabled": true },
+                    "disabled": { "enabled": false }
+                },
+                "deny": ["blocked"],
+                "allow": ["blocked", "allowed"],
+                "slots": { "memory": "memory-core" }
+            }
+        });
+
+        assert_eq!(
+            collect_explicit_plugin_references(&config),
+            BTreeSet::from([
+                "allowed".to_string(),
+                "memory-core".to_string(),
+                "workboard".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn source_plugin_inventory_rejects_ambiguous_manifest_ids() {
+        let repo = tempfile::tempdir().unwrap();
+        for directory in ["first", "second"] {
+            let plugin = repo.path().join("extensions").join(directory);
+            std::fs::create_dir_all(&plugin).unwrap();
+            std::fs::write(plugin.join("openclaw.plugin.json"), r#"{"id":"duplicate"}"#).unwrap();
+            std::fs::write(
+                plugin.join("package.json"),
+                format!(r#"{{"name":"@openclaw/{directory}"}}"#),
+            )
+            .unwrap();
+        }
+
+        let error = source_plugin_inventory(repo.path()).unwrap_err();
+
+        assert!(error.contains("source plugin id \"duplicate\" is ambiguous"));
+    }
+
+    #[test]
+    fn target_source_plugin_closure_includes_transitive_workspace_plugins() {
+        let inventory = SourcePluginInventory {
+            by_id: BTreeMap::from([
+                (
+                    "codex".to_string(),
+                    SourcePluginDefinition {
+                        directory_name: "codex".to_string(),
+                        package_name: Some("@openclaw/codex".to_string()),
+                        dependency_names: BTreeSet::from(["@openclaw/shared-ui".to_string()]),
+                    },
+                ),
+                (
+                    "shared-ui".to_string(),
+                    SourcePluginDefinition {
+                        directory_name: "shared-ui".to_string(),
+                        package_name: Some("@openclaw/shared-ui".to_string()),
+                        dependency_names: BTreeSet::new(),
+                    },
+                ),
+            ]),
+            id_by_package_name: BTreeMap::from([
+                ("@openclaw/codex".to_string(), "codex".to_string()),
+                ("@openclaw/shared-ui".to_string(), "shared-ui".to_string()),
+            ]),
+        };
+
+        let closure =
+            source_plugin_dependency_closure(BTreeSet::from(["codex".to_string()]), &inventory)
+                .unwrap();
+
+        assert_eq!(
+            closure,
+            BTreeSet::from(["codex".to_string(), "shared-ui".to_string()])
+        );
+    }
 
     #[test]
     fn command_summary_prefers_errors_over_npm_warnings() {
@@ -2054,7 +2446,7 @@ npm warn deprecated node-domexception@1.0.0: Use your platform's native DOMExcep
     }
 
     #[test]
-    fn command_summary_keeps_the_failure_tail() {
+    fn command_summary_keeps_the_failure_head_and_tail() {
         let stderr = br#"
 phase 01
 phase 02
@@ -2074,8 +2466,43 @@ Error: CHANGELOG.md does not contain a release section
 
         let summary = summarize_command_output(b"", stderr).unwrap();
 
-        assert!(!summary.contains("phase 01"));
-        assert!(summary.contains("phase 03"));
+        assert!(summary.contains("phase 01"));
+        assert!(summary.contains("lines omitted"));
         assert!(summary.contains("Error: CHANGELOG.md does not contain a release section"));
+        assert!(summary.lines().count() <= 12);
+    }
+
+    #[test]
+    fn command_summary_keeps_the_root_cause_and_redacts_secrets() {
+        let stderr = br#"
+npm error Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@openclaw/ai'
+phase 01
+phase 02
+phase 03
+phase 04
+phase 05
+phase 06
+phase 07
+phase 08
+phase 09
+phase 10
+phase 11
+phase 12
+phase 13
+phase 14
+npm error token=fixture-secret
+npm error password: colon-secret
+npm error Authorization: Basic basic-secret
+npm error command failed
+"#;
+
+        let summary = summarize_command_output(b"", stderr).unwrap();
+
+        assert!(summary.contains("ERR_MODULE_NOT_FOUND"), "{summary}");
+        assert!(summary.contains("command failed"), "{summary}");
+        assert!(!summary.contains("fixture-secret"), "{summary}");
+        assert!(!summary.contains("colon-secret"), "{summary}");
+        assert!(!summary.contains("basic-secret"), "{summary}");
+        assert!(summary.lines().count() <= 12, "{summary}");
     }
 }

@@ -633,6 +633,116 @@ fn runtime_build_local_packs_and_installs_release_shaped_package() {
     assert!(verify.status.success(), "{}", stderr(&verify));
 }
 
+#[cfg(unix)]
+#[test]
+fn runtime_build_local_rejects_dependencies_from_another_checkout_before_pack() {
+    let root = TestDir::new("runtime-build-local-external-dependencies");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    let shared_dependencies = root.child("other-checkout/node_modules");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&shared_dependencies).unwrap();
+    fs::write(
+        repo.join("package.json"),
+        br#"{"name":"openclaw","version":"2026.4.25","bin":{"openclaw":"openclaw.mjs"}}"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&shared_dependencies, repo.join("node_modules")).unwrap();
+
+    let archive_path = root.child("packed-openclaw.tgz");
+    fs::write(
+        &archive_path,
+        openclaw_package_tarball_with_version(
+            "#!/usr/bin/env node\nconsole.log('wrong dependency tree');\n",
+            "2026.4.25",
+        ),
+    )
+    .unwrap();
+    let mut env = ocm_env(&root);
+    let npm_log = install_fake_node_and_packing_npm(&root, &mut env, &archive_path);
+
+    let build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "main-local",
+            "--repo",
+            &path_string(&repo),
+            "--raw",
+        ],
+    );
+
+    assert!(!build.status.success());
+    let error = stderr(&build);
+    assert!(
+        error.contains("dependencies resolve outside the selected checkout"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&path_string(&shared_dependencies)),
+        "{error}"
+    );
+    assert!(error.contains("standalone checkout"), "{error}");
+    assert!(
+        !npm_log.exists(),
+        "npm pack ran before dependency validation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_build_local_rejects_dangling_dependency_link_before_pack() {
+    let root = TestDir::new("runtime-build-local-dangling-dependencies");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    let missing_dependencies = root.child("missing-checkout/node_modules");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        repo.join("package.json"),
+        br#"{"name":"openclaw","version":"2026.4.25","bin":{"openclaw":"openclaw.mjs"}}"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&missing_dependencies, repo.join("node_modules")).unwrap();
+
+    let archive_path = root.child("packed-openclaw.tgz");
+    fs::write(
+        &archive_path,
+        openclaw_package_tarball_with_version(
+            "#!/usr/bin/env node\nconsole.log('wrong dependency tree');\n",
+            "2026.4.25",
+        ),
+    )
+    .unwrap();
+    let mut env = ocm_env(&root);
+    let npm_log = install_fake_node_and_packing_npm(&root, &mut env, &archive_path);
+
+    let build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "main-local",
+            "--repo",
+            &path_string(&repo),
+            "--raw",
+        ],
+    );
+
+    assert!(!build.status.success());
+    assert!(
+        stderr(&build).contains("failed to resolve OpenClaw dependencies"),
+        "{}",
+        stderr(&build)
+    );
+    assert!(
+        !npm_log.exists(),
+        "npm pack ran before dependency validation"
+    );
+}
+
 #[test]
 fn runtime_verify_reports_package_tree_drift() {
     let root = TestDir::new("runtime-verify-package-tree-drift");
@@ -877,6 +987,243 @@ fn runtime_build_local_can_include_source_extensions_without_widening_default_tr
         !source_root
             .join("dist/extensions/linked-external-demo")
             .exists()
+    );
+}
+
+#[test]
+fn runtime_build_local_derives_source_plugins_from_target_env_before_pack() {
+    let root = TestDir::new("runtime-build-local-target-source-plugins");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    let source_codex_dir = repo.join("extensions/codex");
+    let built_codex_dir = repo.join("dist/extensions/codex");
+    for dir in [&source_codex_dir, &built_codex_dir] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            br#"{"name":"@openclaw/codex","version":"2026.4.25","dependencies":{"codex-runtime":"1.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("openclaw.plugin.json"),
+            br#"{"id":"codex","configSchema":{"type":"object"}}"#,
+        )
+        .unwrap();
+    }
+    fs::write(
+        built_codex_dir.join("index.js"),
+        "export const build = 'source';\n",
+    )
+    .unwrap();
+    let unrelated_dir = repo.join("dist/extensions/unrelated");
+    fs::create_dir_all(&unrelated_dir).unwrap();
+    fs::write(
+        unrelated_dir.join("openclaw.plugin.json"),
+        br#"{"id":"unrelated"}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("package.json"),
+        br#"{"name":"openclaw","version":"2026.4.25","bin":{"openclaw":"openclaw.mjs"}}"#,
+    )
+    .unwrap();
+
+    let archive_path = root.child("packed-openclaw.tgz");
+    fs::write(
+        &archive_path,
+        openclaw_package_tarball_with_bundled_extension(
+            "#!/usr/bin/env node\nconsole.log('target runtime');\n",
+            "2026.4.25",
+        ),
+    )
+    .unwrap();
+    let source_extension_archive = root.child("openclaw-codex-2026.4.25.tgz");
+    fs::write(
+        &source_extension_archive,
+        source_extension_package_tarball(),
+    )
+    .unwrap();
+
+    let mut env = ocm_env(&root);
+    env.insert(
+        "FAKE_SOURCE_EXTENSION_ARCHIVE".to_string(),
+        path_string(&source_extension_archive),
+    );
+    env.insert(
+        "FAKE_SOURCE_EXTENSION_NAME".to_string(),
+        "@openclaw/codex".to_string(),
+    );
+    env.insert(
+        "FAKE_SOURCE_EXTENSION_FILENAME".to_string(),
+        "openclaw-codex-2026.4.25.tgz".to_string(),
+    );
+    env.insert(
+        "FAKE_SOURCE_EXTENSION_INSTALL_PATH".to_string(),
+        "@openclaw/codex".to_string(),
+    );
+    install_fake_node_and_packing_npm(&root, &mut env, &archive_path);
+
+    let old_runtime = cwd.join("old-openclaw");
+    write_executable_script(&old_runtime, "#!/bin/sh\nexit 0\n");
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "add",
+            "old-local",
+            "--path",
+            old_runtime.to_str().unwrap(),
+        ],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "primary", "--runtime", "old-local"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    fs::write(
+        root.child("ocm-home/envs/primary/.openclaw/openclaw.json"),
+        br#"{"plugins":{"entries":{"codex":{"enabled":true}}}}"#,
+    )
+    .unwrap();
+
+    let build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "primary-test",
+            "--repo",
+            "./openclaw",
+            "--for-env",
+            "primary",
+            "--raw",
+        ],
+    );
+    assert!(build.status.success(), "{}", stderr(&build));
+    let runtime_root = runtime_install_root("primary-test", &env, &cwd)
+        .unwrap()
+        .join("files/node_modules/openclaw");
+    assert_eq!(
+        fs::read_to_string(runtime_root.join("dist/extensions/codex/index.js")).unwrap(),
+        "export const build = 'source';\n"
+    );
+}
+
+#[test]
+fn runtime_build_local_rejects_missing_target_plugin_before_pack() {
+    let root = TestDir::new("runtime-build-local-missing-target-plugin");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    fs::create_dir_all(repo.join("extensions/codex")).unwrap();
+    fs::write(
+        repo.join("extensions/codex/openclaw.plugin.json"),
+        br#"{"id":"codex"}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("extensions/codex/package.json"),
+        br#"{"name":"@openclaw/codex","version":"2026.4.25"}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("package.json"),
+        br#"{"name":"openclaw","version":"2026.4.25","bin":{"openclaw":"openclaw.mjs"}}"#,
+    )
+    .unwrap();
+
+    let archive_path = root.child("packed-openclaw.tgz");
+    fs::write(
+        &archive_path,
+        openclaw_package_tarball("#!/usr/bin/env node\n"),
+    )
+    .unwrap();
+    let mut env = ocm_env(&root);
+    let npm_log = install_fake_node_and_packing_npm(&root, &mut env, &archive_path);
+    let old_runtime = cwd.join("old-openclaw");
+    write_executable_script(&old_runtime, "#!/bin/sh\nexit 0\n");
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "add",
+            "old-local",
+            "--path",
+            old_runtime.to_str().unwrap(),
+        ],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "primary", "--runtime", "old-local"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    fs::write(
+        root.child("ocm-home/envs/primary/.openclaw/openclaw.json"),
+        br#"{"plugins":{"entries":{"missing-plugin":{"enabled":true}}}}"#,
+    )
+    .unwrap();
+
+    let build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "primary-test",
+            "--repo",
+            "./openclaw",
+            "--for-env",
+            "primary",
+            "--raw",
+        ],
+    );
+    assert!(!build.status.success(), "{}", stdout(&build));
+    assert!(
+        stderr(&build).contains("missing-plugin"),
+        "{}",
+        stderr(&build)
+    );
+    assert!(
+        !npm_log.exists(),
+        "npm pack must not run after preflight failure"
+    );
+}
+
+#[test]
+fn runtime_build_local_rejects_conflicting_source_plugin_modes() {
+    let root = TestDir::new("runtime-build-local-conflicting-source-plugin-modes");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    let build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "primary-test",
+            "--repo",
+            "./openclaw",
+            "--for-env",
+            "primary",
+            "--include-source-extensions",
+        ],
+    );
+
+    assert!(!build.status.success(), "{}", stdout(&build));
+    assert!(
+        stderr(&build).contains(
+            "runtime build-local accepts only one of --include-source-extensions or --for-env"
+        ),
+        "{}",
+        stderr(&build)
     );
 }
 

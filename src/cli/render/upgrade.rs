@@ -587,6 +587,25 @@ fn upgrade_history_raw_line(record: &UpgradeHistoryRecord) -> Result<String, Str
     if let Some(rollback_of) = record.rollback_of.as_deref() {
         bits.push(format!("rollbackOf={rollback_of}"));
     }
+    if !record.phases.is_empty() {
+        bits.push(format!(
+            "phases={}",
+            record
+                .phases
+                .iter()
+                .map(|phase| format!(
+                    "{}:{}:{}:{}+{}:{}",
+                    phase.owner,
+                    phase.phase,
+                    phase.window,
+                    phase.started_offset_ms,
+                    phase.duration_ms,
+                    phase.outcome
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     Ok(bits.join("  "))
 }
 

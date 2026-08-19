@@ -16,9 +16,11 @@ use std::time::Duration;
 
 use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
+use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha512;
 use tar::{Builder, Header};
+use tempfile::NamedTempFile;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -271,6 +273,16 @@ pub fn write_text(path: &Path, contents: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, contents).unwrap();
+}
+
+/// Writes a complete JSON document by atomically replacing the destination path.
+pub fn write_json_replacing_path<T: Serialize>(path: &Path, value: &T) {
+    let parent = path.parent().unwrap();
+    fs::create_dir_all(parent).unwrap();
+    let mut temp = NamedTempFile::new_in(parent).unwrap();
+    serde_json::to_writer(&mut temp, value).unwrap();
+    temp.write_all(b"\n").unwrap();
+    temp.persist(path).unwrap();
 }
 
 pub fn write_executable_script(path: &Path, contents: &str) {

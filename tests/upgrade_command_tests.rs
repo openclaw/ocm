@@ -25,7 +25,8 @@ use tar::{Builder, Header};
 
 use crate::support::{
     TestDir, TestHttpServer, install_fake_launchctl, install_fake_node_and_npm, ocm_env,
-    path_string, run_ocm, stderr, stdout, write_executable_script, write_text,
+    path_string, run_ocm, stderr, stdout, write_executable_script, write_json_replacing_path,
+    write_text,
 };
 
 fn append_tar_file(
@@ -78,6 +79,7 @@ fn write_running_supervisor_runtime(
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -106,18 +108,19 @@ fn write_running_supervisor_runtime(
             stderr_path,
         }],
     };
-    fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    write_json_replacing_path(runtime_path, &runtime);
 }
 
 fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: Vec::new(),
         children: Vec::new(),
     };
-    fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    write_json_replacing_path(runtime_path, &runtime);
 }
 
 fn write_backoff_supervisor_runtime(
@@ -130,6 +133,7 @@ fn write_backoff_supervisor_runtime(
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -149,7 +153,26 @@ fn write_backoff_supervisor_runtime(
         }],
         children: Vec::new(),
     };
-    fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    write_json_replacing_path(runtime_path, &runtime);
+}
+
+#[test]
+fn supervisor_runtime_fixture_writes_replace_complete_documents() {
+    let root = TestDir::new("supervisor-runtime-fixture-replacement");
+    let runtime_path = root.child("runtime.json");
+    let ocm_home = path_string(&root.child("ocm-home"));
+
+    write_running_supervisor_runtime(&runtime_path, &ocm_home, "stable", 4242, 18789);
+    // A reader that opened the previous snapshot must retain that complete document
+    // while the runtime path moves to the next snapshot.
+    let prior_runtime = fs::File::open(&runtime_path).unwrap();
+    write_empty_supervisor_runtime(&runtime_path, &ocm_home);
+
+    let prior_json: Value = serde_json::from_reader(prior_runtime).unwrap();
+    assert_eq!(prior_json["services"].as_array().unwrap().len(), 1);
+
+    let current_json: Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+    assert!(current_json["services"].as_array().unwrap().is_empty());
 }
 
 fn spawn_converging_health_server() -> (
@@ -926,6 +949,10 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
     assert!(
         !command_log.contains("plugins update --all\n"),
         "{command_log}"
+    );
+    assert!(
+        !command_log.contains("completion --write-state"),
+        "a finalizer without the structured defer receipt must not trigger duplicate completion work: {command_log}"
     );
 
     let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "demo", "--json"]);

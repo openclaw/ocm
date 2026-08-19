@@ -11,7 +11,8 @@ use ocm::infra::download::file_sha256;
 use tar::{Builder, EntryType};
 
 use crate::support::{
-    TestDir, TestHttpServer, ocm_env, path_string, run_ocm, run_ocm_binary, stderr, stdout,
+    TestDir, TestHttpServer, install_fake_launchctl, ocm_env, path_string, run_ocm, run_ocm_binary,
+    stderr, stdout,
 };
 
 fn current_release_asset_name() -> String {
@@ -212,6 +213,73 @@ fn self_update_replaces_a_copied_binary_in_place() {
         .unwrap();
     assert!(updated.status.success());
     assert_eq!(String::from_utf8(updated.stdout).unwrap(), "9.9.9\n");
+}
+
+#[test]
+fn self_update_reports_running_daemon_skew_without_restarting_it() {
+    let root = TestDir::new("self-update-running-daemon-skew");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let copied_binary = copied_ocm(&root);
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+
+    for args in [
+        vec!["launcher", "add", "stable", "--command", "openclaw"],
+        vec!["env", "create", "demo", "--launcher", "stable"],
+        vec!["service", "start", "demo"],
+    ] {
+        let output = run_ocm_binary(&copied_binary, &cwd, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+
+    let target_version = "9.9.9";
+    let asset_name = current_release_asset_name();
+    let archive_path = root.child(&asset_name);
+    write_release_archive(
+        &archive_path,
+        &format!(
+            "#!/usr/bin/env bash\nif [[ \"$1\" == \"--version\" ]]; then\n  printf '{target_version}\\n'\nelse\n  printf 'updated ocm\\n'\nfi\n"
+        ),
+    );
+    let asset = TestHttpServer::serve_bytes(
+        "/download.tar.gz",
+        "application/gzip",
+        &fs::read(&archive_path).unwrap(),
+    );
+    let digest = file_sha256(&archive_path).unwrap();
+    let metadata = format!(
+        "{{\"tag_name\":\"v{target_version}\",\"assets\":[{{\"name\":\"{asset_name}\",\"browser_download_url\":\"{}\",\"digest\":\"sha256:{digest}\"}}]}}",
+        asset.url()
+    );
+    let release =
+        TestHttpServer::serve_bytes("/release.json", "application/json", metadata.as_bytes());
+    env.insert(
+        "OCM_INTERNAL_SELF_UPDATE_RELEASE_URL".to_string(),
+        release.url(),
+    );
+    let launchctl_log = root.child("launchctl.log");
+    fs::write(&launchctl_log, "").unwrap();
+
+    let output = run_ocm_binary(
+        &copied_binary,
+        &cwd,
+        &env,
+        &["self", "update", "--version", target_version, "--raw"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("daemonRefreshRequired: true"));
+    assert!(text.contains("service refresh-daemon --acknowledge-gateway-restarts"));
+
+    let calls = fs::read_to_string(&launchctl_log).unwrap();
+    assert!(calls.contains("print"));
+    assert!(!calls.contains("bootout"));
+    assert!(!calls.contains("bootstrap"));
 }
 
 #[test]

@@ -48,6 +48,17 @@ pub struct UpgradeHistoryRuntimeRecovery {
     pub backup_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeHistoryPhaseTiming {
+    pub owner: String,
+    pub phase: String,
+    pub window: String,
+    pub started_offset_ms: u64,
+    pub duration_ms: u64,
+    pub outcome: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeHistoryRecord {
@@ -67,6 +78,8 @@ pub struct UpgradeHistoryRecord {
     pub outcome: String,
     pub migration: UpgradeHistoryStage,
     pub finalization: UpgradeHistoryStage,
+    #[serde(default)]
+    pub phases: Vec<UpgradeHistoryPhaseTiming>,
     pub service_before: UpgradeHistoryServiceState,
     pub service_after: UpgradeHistoryServiceState,
     #[serde(default)]
@@ -302,6 +315,37 @@ fn validate_upgrade_history_record(record: &UpgradeHistoryRecord) -> Result<(), 
             record.format_version
         ));
     }
+    for phase in &record.phases {
+        if !matches!(phase.owner.as_str(), "ocm" | "openclaw") {
+            return Err(format!("unsupported upgrade timing owner: {}", phase.owner));
+        }
+        if !matches!(
+            phase.window.as_str(),
+            "preparation" | "stopped" | "post-ready"
+        ) {
+            return Err(format!(
+                "unsupported upgrade timing window: {}",
+                phase.window
+            ));
+        }
+        if !matches!(
+            phase.outcome.as_str(),
+            "completed" | "failed" | "warning" | "skipped" | "deferred" | "already-observed"
+        ) {
+            return Err(format!(
+                "unsupported upgrade timing outcome: {}",
+                phase.outcome
+            ));
+        }
+        if phase.phase.is_empty()
+            || !phase
+                .phase
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err("upgrade timing phase must be a non-empty identifier".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -336,10 +380,11 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        RuntimeMeta, RuntimeSourceKind, UpgradeHistoryBinding, UpgradeHistoryRecord,
-        UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState, UpgradeHistoryStage,
-        get_upgrade_history_record, get_upgrade_runtime_recovery, list_upgrade_history,
-        lock_upgrade_transaction, runtime_install_root, save_upgrade_history_record, write_json,
+        RuntimeMeta, RuntimeSourceKind, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming,
+        UpgradeHistoryRecord, UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState,
+        UpgradeHistoryStage, get_upgrade_history_record, get_upgrade_runtime_recovery,
+        list_upgrade_history, lock_upgrade_transaction, runtime_install_root,
+        save_upgrade_history_record, write_json,
     };
     use crate::store::layout::upgrade_history_runtime_recovery_dir;
 
@@ -389,6 +434,14 @@ mod tests {
                 status: "completed".to_string(),
                 note: None,
             },
+            phases: vec![UpgradeHistoryPhaseTiming {
+                owner: "ocm".to_string(),
+                phase: "preparation".to_string(),
+                window: "preparation".to_string(),
+                started_offset_ms: 0,
+                duration_ms: 10,
+                outcome: "completed".to_string(),
+            }],
             service_before: UpgradeHistoryServiceState {
                 enabled: true,
                 running: true,
@@ -424,6 +477,7 @@ mod tests {
         let loaded = get_upgrade_history_record("demo", "1700000000-000000001", &env, cwd).unwrap();
         assert_eq!(loaded.source.openclaw_version.as_deref(), Some("2026.6.11"));
         assert_eq!(loaded.target.openclaw_version.as_deref(), Some("2026.6.33"));
+        assert_eq!(loaded.phases, record("ignored", older).phases);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -464,6 +518,20 @@ mod tests {
 
         let loaded = get_upgrade_history_record("demo", "1700000000-000000001", &env, cwd).unwrap();
         assert!(loaded.rollback_of.is_none());
+        assert!(loaded.phases.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upgrade_history_rejects_unstructured_phase_labels() {
+        let (root, env) = test_env("phase-label");
+        let started_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut record = record("1700000000-000000001", started_at);
+        record.phases[0].phase = "config=/private/token".to_string();
+
+        let error = save_upgrade_history_record(&record, &env, root.as_path()).unwrap_err();
+        assert_eq!(error, "upgrade timing phase must be a non-empty identifier");
 
         let _ = std::fs::remove_dir_all(root);
     }
