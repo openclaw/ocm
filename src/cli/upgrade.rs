@@ -2,8 +2,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{Cli, render};
@@ -23,14 +24,15 @@ use crate::runtime::{
 };
 use crate::service::{ServiceSummary, wait_for_gateway_readiness};
 use crate::store::{
-    InstallContext, RuntimeReleaseDetails, UpgradeHistoryBinding, UpgradeHistoryRecord,
-    UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState, UpgradeHistoryStage,
-    UpgradeRuntimeRecovery, clean_path, copy_dir_recursive, derive_env_paths, display_path,
-    ensure_minimum_local_openclaw_config, ensure_store, get_runtime, get_upgrade_history_record,
-    get_upgrade_runtime_recovery, install_runtime_from_selected_official_openclaw_release,
-    list_upgrade_history, lock_env_registry, lock_upgrade_transaction, remove_runtime,
-    remove_upgrade_recovery, resolve_absolute_path, runtime_install_root, runtime_integrity_issue,
-    runtime_meta_path, save_environment, save_upgrade_history_record, upgrade_history_recovery_dir,
+    InstallContext, RuntimeReleaseDetails, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming,
+    UpgradeHistoryRecord, UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState,
+    UpgradeHistoryStage, UpgradeRuntimeRecovery, clean_path, copy_dir_recursive, derive_env_paths,
+    display_path, ensure_minimum_local_openclaw_config, ensure_store, get_runtime,
+    get_upgrade_history_record, get_upgrade_runtime_recovery,
+    install_runtime_from_selected_official_openclaw_release, list_upgrade_history,
+    lock_env_registry, lock_upgrade_transaction, remove_runtime, remove_upgrade_recovery,
+    resolve_absolute_path, runtime_install_root, runtime_integrity_issue, runtime_meta_path,
+    save_environment, save_upgrade_history_record, upgrade_history_recovery_dir,
     upgrade_history_runtime_recovery_dir, write_json,
 };
 
@@ -173,6 +175,97 @@ struct UpgradeSimulationOptions {
 struct UpgradeTransactionPlan {
     source: UpgradeHistoryBinding,
     target: UpgradeHistoryBinding,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UpgradePhaseStart {
+    at: Instant,
+    started_offset_ms: u64,
+}
+
+#[derive(Debug)]
+struct UpgradeTimingRecorder {
+    started_at: time::OffsetDateTime,
+    origin: Instant,
+    phases: Vec<UpgradeHistoryPhaseTiming>,
+}
+
+impl UpgradeTimingRecorder {
+    fn new() -> Self {
+        Self {
+            started_at: time::OffsetDateTime::now_utc(),
+            origin: Instant::now(),
+            phases: Vec::new(),
+        }
+    }
+
+    fn start(&self) -> UpgradePhaseStart {
+        let at = Instant::now();
+        UpgradePhaseStart {
+            at,
+            started_offset_ms: duration_ms(at.duration_since(self.origin)),
+        }
+    }
+
+    fn finish(
+        &mut self,
+        owner: &str,
+        phase: &str,
+        window: &str,
+        started: UpgradePhaseStart,
+        outcome: &str,
+    ) {
+        self.phases.push(UpgradeHistoryPhaseTiming {
+            owner: owner.to_string(),
+            phase: phase.to_string(),
+            window: window.to_string(),
+            started_offset_ms: started.started_offset_ms,
+            duration_ms: duration_ms(started.at.elapsed()),
+            outcome: outcome.to_string(),
+        });
+    }
+
+    fn record(
+        &mut self,
+        owner: &str,
+        phase: &str,
+        window: &str,
+        started_offset_ms: u64,
+        duration_ms: u64,
+        outcome: &str,
+    ) {
+        self.phases.push(UpgradeHistoryPhaseTiming {
+            owner: owner.to_string(),
+            phase: phase.to_string(),
+            window: window.to_string(),
+            started_offset_ms,
+            duration_ms,
+            outcome: outcome.to_string(),
+        });
+    }
+
+    fn append_openclaw_phases(
+        &mut self,
+        command_started: UpgradePhaseStart,
+        phases: &[OpenClawFinalizePhaseTiming],
+    ) {
+        for phase in phases {
+            self.phases.push(UpgradeHistoryPhaseTiming {
+                owner: "openclaw".to_string(),
+                phase: phase.phase.clone(),
+                window: "stopped".to_string(),
+                started_offset_ms: command_started
+                    .started_offset_ms
+                    .saturating_add(phase.started_offset_ms),
+                duration_ms: phase.duration_ms,
+                outcome: phase.outcome.clone(),
+            });
+        }
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Debug)]
@@ -714,6 +807,7 @@ impl Cli {
             true,
             "pre-rollback",
             Some(plan.record.id.clone()),
+            UpgradeTimingRecorder::new(),
         )?;
         let rollback_transaction_id = transaction.id.clone();
         let safety_snapshot_id = transaction.snapshot_id.clone();
@@ -1720,6 +1814,8 @@ impl Cli {
             } else {
                 vec![target_runtime_name.clone()]
             };
+            let mut timings = UpgradeTimingRecorder::new();
+            let preparation_started = timings.start();
             let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -1735,6 +1831,13 @@ impl Cli {
                     );
                 }
             };
+            timings.finish(
+                "ocm",
+                "preparation",
+                "preparation",
+                preparation_started,
+                "completed",
+            );
             let target_changed = !matches!(prepared.action, OfficialRuntimePrepareAction::Reused);
             let mut transaction = self.begin_upgrade_transaction_locked(
                 env_name,
@@ -1754,6 +1857,7 @@ impl Cli {
                 options.rollback_enabled,
                 "pre-upgrade",
                 None,
+                timings,
             )?;
             if target_changed {
                 transaction.mark_runtime_mutated(&prepared.name);
@@ -1775,26 +1879,31 @@ impl Cli {
                 }
             };
             let binding_changed = prepared.name != current.name;
-            let post_update_note = match self.run_post_core_update(env_name, &prepared.name) {
-                Ok(note) => {
-                    transaction.mark_post_update_completed(note.as_deref());
-                    note
-                }
-                Err(error) => {
-                    transaction.mark_post_update_failed(&error);
-                    return self.rollback_failed_upgrade(
-                        env_name,
-                        "runtime",
-                        previous_binding_name,
-                        "runtime",
-                        prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
-                        transaction,
-                        error,
-                    );
-                }
-            };
+            let post_update =
+                match self.run_post_core_update(env_name, &prepared.name, &mut transaction.timings)
+                {
+                    Ok(result) => {
+                        transaction.mark_post_update_completed(result.note.as_deref());
+                        result
+                    }
+                    Err(error) => {
+                        transaction.mark_post_update_failed(&error);
+                        return self.rollback_failed_upgrade(
+                            env_name,
+                            "runtime",
+                            previous_binding_name,
+                            "runtime",
+                            prepared.name,
+                            prepared.meta.release_version,
+                            prepared.meta.release_channel,
+                            transaction,
+                            error,
+                        );
+                    }
+                };
+            let post_update_note = post_update.note;
+            let completion_deferred = post_update.completion_deferred;
+            let publish_started = transaction.timings.start();
             let publish_result = if binding_changed {
                 self.environment_service()
                     .set_runtime_locked(env_name, prepared.name.as_str())
@@ -1803,6 +1912,17 @@ impl Cli {
                 self.runtime_service()
                     .refresh_supervisor_if_present(&prepared.name)
             };
+            transaction.timings.finish(
+                "ocm",
+                "bindingPublish",
+                "stopped",
+                publish_started,
+                if publish_result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            );
             if let Err(error) = publish_result {
                 return self.rollback_failed_upgrade(
                     env_name,
@@ -1821,6 +1941,7 @@ impl Cli {
                 service.as_ref(),
                 binding_changed,
                 true,
+                &mut transaction.timings,
             );
             let (service_action, service_note) = match service_result {
                 Ok(result) => result,
@@ -1845,13 +1966,36 @@ impl Cli {
                     note_for_official_prepare_action(&prepared.action)
                 }
             });
+            let completion_note = self.refresh_deferred_completion_cache(
+                env_name,
+                &prepared.name,
+                completion_deferred,
+                &mut transaction.timings,
+            );
+            let verification_started = transaction.timings.start();
             let verification_note = match self.verify_upgraded_openclaw(
                 env_name,
                 prepared.meta.release_version.as_deref(),
                 service_action.is_some(),
             ) {
-                Ok(note) => note,
+                Ok(note) => {
+                    transaction.timings.finish(
+                        "ocm",
+                        "deepVerification",
+                        "post-ready",
+                        verification_started,
+                        "completed",
+                    );
+                    note
+                }
                 Err(error) => {
+                    transaction.timings.finish(
+                        "ocm",
+                        "deepVerification",
+                        "post-ready",
+                        verification_started,
+                        "failed",
+                    );
                     return self.rollback_failed_upgrade(
                         env_name,
                         "runtime",
@@ -1866,7 +2010,10 @@ impl Cli {
                 }
             };
             let note = join_optional_warnings(
-                join_optional_warnings(post_update_note, runtime_note),
+                join_optional_warnings(
+                    join_optional_warnings(post_update_note, runtime_note),
+                    completion_note,
+                ),
                 verification_note,
             );
 
@@ -1966,6 +2113,8 @@ impl Cli {
                     ),
                 });
             }
+            let mut timings = UpgradeTimingRecorder::new();
+            let preparation_started = timings.start();
             let prepared = match self.prepare_isolated_upgrade_target(env_name, &target, resolved) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -1981,6 +2130,13 @@ impl Cli {
                     );
                 }
             };
+            timings.finish(
+                "ocm",
+                "preparation",
+                "preparation",
+                preparation_started,
+                "completed",
+            );
             let changed = matches!(
                 prepared.action,
                 OfficialRuntimePrepareAction::Installed | OfficialRuntimePrepareAction::Updated
@@ -2003,6 +2159,7 @@ impl Cli {
                 options.rollback_enabled,
                 "pre-upgrade",
                 None,
+                timings,
             )?;
             if changed {
                 transaction.mark_runtime_mutated(&prepared.name);
@@ -2023,11 +2180,12 @@ impl Cli {
                     );
                 }
             };
-            let post_update_note = if changed {
-                match self.run_post_core_update(env_name, &prepared.name) {
-                    Ok(note) => {
-                        transaction.mark_post_update_completed(note.as_deref());
-                        note
+            let (post_update_note, completion_deferred) = if changed {
+                match self.run_post_core_update(env_name, &prepared.name, &mut transaction.timings)
+                {
+                    Ok(result) => {
+                        transaction.mark_post_update_completed(result.note.as_deref());
+                        (result.note, result.completion_deferred)
                     }
                     Err(error) => {
                         transaction.mark_post_update_failed(&error);
@@ -2046,13 +2204,27 @@ impl Cli {
                 }
             } else {
                 transaction.mark_post_update_not_needed();
-                None
+                (None, false)
             };
-            if changed
-                && let Err(error) = self
-                    .runtime_service()
+            let publish_started = transaction.timings.start();
+            let publish_result = if changed {
+                self.runtime_service()
                     .refresh_supervisor_if_present(&prepared.name)
-            {
+            } else {
+                Ok(())
+            };
+            transaction.timings.finish(
+                "ocm",
+                "bindingPublish",
+                "stopped",
+                publish_started,
+                if publish_result.is_ok() {
+                    if changed { "completed" } else { "skipped" }
+                } else {
+                    "failed"
+                },
+            );
+            if let Err(error) = publish_result {
                 return self.rollback_failed_upgrade(
                     env_name,
                     "runtime",
@@ -2070,6 +2242,7 @@ impl Cli {
                 service.as_ref(),
                 false,
                 changed || transaction.service_quiesced,
+                &mut transaction.timings,
             );
             let (service_action, service_note) = match service_result {
                 Ok(result) => result,
@@ -2087,13 +2260,36 @@ impl Cli {
                     );
                 }
             };
+            let completion_note = self.refresh_deferred_completion_cache(
+                env_name,
+                &prepared.name,
+                completion_deferred,
+                &mut transaction.timings,
+            );
+            let verification_started = transaction.timings.start();
             let verification_note = match self.verify_upgraded_openclaw(
                 env_name,
                 prepared.meta.release_version.as_deref(),
                 service_action.is_some(),
             ) {
-                Ok(note) => note,
+                Ok(note) => {
+                    transaction.timings.finish(
+                        "ocm",
+                        "deepVerification",
+                        "post-ready",
+                        verification_started,
+                        "completed",
+                    );
+                    note
+                }
                 Err(error) => {
+                    transaction.timings.finish(
+                        "ocm",
+                        "deepVerification",
+                        "post-ready",
+                        verification_started,
+                        "failed",
+                    );
                     return self.rollback_failed_upgrade(
                         env_name,
                         "runtime",
@@ -2121,7 +2317,7 @@ impl Cli {
                 rollback: None,
                 note: join_optional_warnings(
                     join_optional_warnings(
-                        post_update_note,
+                        join_optional_warnings(post_update_note, completion_note),
                         service_note.or_else(|| note_for_official_prepare_action(&prepared.action)),
                     ),
                     verification_note,
@@ -2160,6 +2356,8 @@ impl Cli {
                 note: Some("dry run: no runtime, env, service, or snapshot changed".to_string()),
             });
         }
+        let mut timings = UpgradeTimingRecorder::new();
+        let preparation_started = timings.start();
         let prepared =
             match self.with_progress(format!("Updating runtime {}", current.name), || {
                 self.with_isolated_runtime_mutation(env_name, &current.name, || {
@@ -2181,6 +2379,13 @@ impl Cli {
                     );
                 }
             };
+        timings.finish(
+            "ocm",
+            "preparation",
+            "preparation",
+            preparation_started,
+            "completed",
+        );
         let mut transaction = self.begin_upgrade_transaction_locked(
             env_name,
             UpgradeTransactionPlan {
@@ -2199,6 +2404,7 @@ impl Cli {
             options.rollback_enabled,
             "pre-upgrade",
             None,
+            timings,
         )?;
         transaction.mark_runtime_mutated(&current.name);
         let updated = match prepared.commit() {
@@ -2217,30 +2423,45 @@ impl Cli {
                 );
             }
         };
-        let post_update_note = match self.run_post_core_update(env_name, &updated.name) {
-            Ok(note) => {
-                transaction.mark_post_update_completed(note.as_deref());
-                note
-            }
-            Err(error) => {
-                transaction.mark_post_update_failed(&error);
-                return self.rollback_failed_upgrade(
-                    env_name,
-                    "runtime",
-                    previous_binding_name,
-                    "runtime",
-                    updated.name,
-                    updated.release_version,
-                    updated.release_channel,
-                    transaction,
-                    error,
-                );
-            }
-        };
-        if let Err(error) = self
+        let post_update =
+            match self.run_post_core_update(env_name, &updated.name, &mut transaction.timings) {
+                Ok(result) => {
+                    transaction.mark_post_update_completed(result.note.as_deref());
+                    result
+                }
+                Err(error) => {
+                    transaction.mark_post_update_failed(&error);
+                    return self.rollback_failed_upgrade(
+                        env_name,
+                        "runtime",
+                        previous_binding_name,
+                        "runtime",
+                        updated.name,
+                        updated.release_version,
+                        updated.release_channel,
+                        transaction,
+                        error,
+                    );
+                }
+            };
+        let post_update_note = post_update.note;
+        let completion_deferred = post_update.completion_deferred;
+        let publish_started = transaction.timings.start();
+        let publish_result = self
             .runtime_service()
-            .refresh_supervisor_if_present(&updated.name)
-        {
+            .refresh_supervisor_if_present(&updated.name);
+        transaction.timings.finish(
+            "ocm",
+            "bindingPublish",
+            "stopped",
+            publish_started,
+            if publish_result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        if let Err(error) = publish_result {
             return self.rollback_failed_upgrade(
                 env_name,
                 "runtime",
@@ -2253,8 +2474,13 @@ impl Cli {
                 format!("failed to publish upgraded runtime: {error}"),
             );
         }
-        let service_result =
-            self.reconcile_upgraded_service_locked(env_name, service.as_ref(), false, true);
+        let service_result = self.reconcile_upgraded_service_locked(
+            env_name,
+            service.as_ref(),
+            false,
+            true,
+            &mut transaction.timings,
+        );
         let (service_action, service_note) = match service_result {
             Ok(result) => result,
             Err(error) => {
@@ -2271,13 +2497,36 @@ impl Cli {
                 );
             }
         };
+        let completion_note = self.refresh_deferred_completion_cache(
+            env_name,
+            &updated.name,
+            completion_deferred,
+            &mut transaction.timings,
+        );
+        let verification_started = transaction.timings.start();
         let verification_note = match self.verify_upgraded_openclaw(
             env_name,
             updated.release_version.as_deref(),
             service_action.is_some(),
         ) {
-            Ok(note) => note,
+            Ok(note) => {
+                transaction.timings.finish(
+                    "ocm",
+                    "deepVerification",
+                    "post-ready",
+                    verification_started,
+                    "completed",
+                );
+                note
+            }
             Err(error) => {
+                transaction.timings.finish(
+                    "ocm",
+                    "deepVerification",
+                    "post-ready",
+                    verification_started,
+                    "failed",
+                );
                 return self.rollback_failed_upgrade(
                     env_name,
                     "runtime",
@@ -2304,7 +2553,10 @@ impl Cli {
             snapshot_id: Some(transaction.snapshot_id.clone()),
             rollback: None,
             note: join_optional_warnings(
-                join_optional_warnings(post_update_note, service_note),
+                join_optional_warnings(
+                    join_optional_warnings(post_update_note, completion_note),
+                    service_note,
+                ),
                 verification_note,
             ),
         };
@@ -2393,6 +2645,8 @@ impl Cli {
             });
         }
 
+        let mut timings = UpgradeTimingRecorder::new();
+        let preparation_started = timings.start();
         let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -2408,6 +2662,13 @@ impl Cli {
                 );
             }
         };
+        timings.finish(
+            "ocm",
+            "preparation",
+            "preparation",
+            preparation_started,
+            "completed",
+        );
         let target_changed = !matches!(prepared.action, OfficialRuntimePrepareAction::Reused);
         let mut transaction = self.begin_upgrade_transaction_locked(
             env_name,
@@ -2427,6 +2688,7 @@ impl Cli {
             options.rollback_enabled,
             "pre-upgrade",
             None,
+            timings,
         )?;
         if target_changed {
             transaction.mark_runtime_mutated(&prepared.name);
@@ -2447,30 +2709,45 @@ impl Cli {
                 );
             }
         };
-        let post_update_note = match self.run_post_core_update(env_name, &prepared.name) {
-            Ok(note) => {
-                transaction.mark_post_update_completed(note.as_deref());
-                note
-            }
-            Err(error) => {
-                transaction.mark_post_update_failed(&error);
-                return self.rollback_failed_upgrade(
-                    env_name,
-                    "launcher",
-                    launcher_name.to_string(),
-                    "runtime",
-                    prepared.name,
-                    prepared.meta.release_version,
-                    prepared.meta.release_channel,
-                    transaction,
-                    error,
-                );
-            }
-        };
-        if let Err(error) = self
+        let post_update =
+            match self.run_post_core_update(env_name, &prepared.name, &mut transaction.timings) {
+                Ok(result) => {
+                    transaction.mark_post_update_completed(result.note.as_deref());
+                    result
+                }
+                Err(error) => {
+                    transaction.mark_post_update_failed(&error);
+                    return self.rollback_failed_upgrade(
+                        env_name,
+                        "launcher",
+                        launcher_name.to_string(),
+                        "runtime",
+                        prepared.name,
+                        prepared.meta.release_version,
+                        prepared.meta.release_channel,
+                        transaction,
+                        error,
+                    );
+                }
+            };
+        let post_update_note = post_update.note;
+        let completion_deferred = post_update.completion_deferred;
+        let publish_started = transaction.timings.start();
+        let publish_result = self
             .environment_service()
-            .set_runtime_locked(env_name, prepared.name.as_str())
-        {
+            .set_runtime_locked(env_name, prepared.name.as_str());
+        transaction.timings.finish(
+            "ocm",
+            "bindingPublish",
+            "stopped",
+            publish_started,
+            if publish_result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        if let Err(error) = publish_result {
             return self.rollback_failed_upgrade(
                 env_name,
                 "launcher",
@@ -2483,8 +2760,13 @@ impl Cli {
                 format!("failed to publish upgraded runtime: {error}"),
             );
         }
-        let service_result =
-            self.reconcile_upgraded_service_locked(env_name, service.as_ref(), true, true);
+        let service_result = self.reconcile_upgraded_service_locked(
+            env_name,
+            service.as_ref(),
+            true,
+            true,
+            &mut transaction.timings,
+        );
         let (service_action, service_note) = match service_result {
             Ok(result) => result,
             Err(error) => {
@@ -2501,13 +2783,36 @@ impl Cli {
                 );
             }
         };
+        let completion_note = self.refresh_deferred_completion_cache(
+            env_name,
+            &prepared.name,
+            completion_deferred,
+            &mut transaction.timings,
+        );
+        let verification_started = transaction.timings.start();
         let verification_note = match self.verify_upgraded_openclaw(
             env_name,
             prepared.meta.release_version.as_deref(),
             service_action.is_some(),
         ) {
-            Ok(note) => note,
+            Ok(note) => {
+                transaction.timings.finish(
+                    "ocm",
+                    "deepVerification",
+                    "post-ready",
+                    verification_started,
+                    "completed",
+                );
+                note
+            }
             Err(error) => {
+                transaction.timings.finish(
+                    "ocm",
+                    "deepVerification",
+                    "post-ready",
+                    verification_started,
+                    "failed",
+                );
                 return self.rollback_failed_upgrade(
                     env_name,
                     "launcher",
@@ -2535,7 +2840,7 @@ impl Cli {
             rollback: None,
             note: join_optional_warnings(
                 join_optional_warnings(
-                    post_update_note,
+                    join_optional_warnings(post_update_note, completion_note),
                     service_note
                         .or_else(|| Some(format!("env now uses runtime {}", prepared.name))),
                 ),
@@ -2793,6 +3098,7 @@ impl Cli {
         service: Option<&ServiceSummary>,
         binding_changed: bool,
         runtime_changed: bool,
+        timings: &mut UpgradeTimingRecorder,
     ) -> Result<(Option<String>, Option<String>), String> {
         let Some(service) = service else {
             return Ok((None, None));
@@ -2805,20 +3111,51 @@ impl Cli {
         }
 
         if service.running {
-            let restart = self
+            let convergence_started = timings.start();
+            let restart_result = self
                 .with_progress(format!("Restarting service for {env_name}"), || {
                     self.service_service().restart_locked(env_name)
-                })?;
-            self.wait_for_restarted_gateway_health(env_name, restart.desired_running)?;
+                });
+            timings.finish(
+                "ocm",
+                "supervisorConvergence",
+                "stopped",
+                convergence_started,
+                if restart_result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            );
+            let restart = restart_result?;
+            self.wait_for_restarted_gateway_health_timed(
+                env_name,
+                restart.desired_running,
+                timings,
+            )?;
             let note = join_warnings(&restart.warnings);
             return Ok((Some("restarted".to_string()), note));
         }
 
         if binding_changed || runtime_changed {
-            let start = self.with_progress(format!("Starting service for {env_name}"), || {
-                self.service_service().start_locked(env_name)
-            })?;
-            self.wait_for_restarted_gateway_health(env_name, start.desired_running)?;
+            let convergence_started = timings.start();
+            let start_result = self
+                .with_progress(format!("Starting service for {env_name}"), || {
+                    self.service_service().start_locked(env_name)
+                });
+            timings.finish(
+                "ocm",
+                "supervisorConvergence",
+                "stopped",
+                convergence_started,
+                if start_result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            );
+            let start = start_result?;
+            self.wait_for_restarted_gateway_health_timed(env_name, start.desired_running, timings)?;
             let note = join_warnings(&start.warnings);
             return Ok((Some("started".to_string()), note));
         }
@@ -2836,6 +3173,71 @@ impl Cli {
         }
 
         let readiness = wait_for_gateway_readiness(env_name, &self.env, &self.cwd)?;
+        if readiness.ready {
+            Ok(())
+        } else {
+            Err(format!(
+                "service restart did not recover: {}",
+                readiness
+                    .issue
+                    .unwrap_or_else(|| "gateway did not become ready".to_string())
+            ))
+        }
+    }
+
+    fn wait_for_restarted_gateway_health_timed(
+        &self,
+        env_name: &str,
+        action_desired_running: bool,
+        timings: &mut UpgradeTimingRecorder,
+    ) -> Result<(), String> {
+        if !action_desired_running {
+            return Ok(());
+        }
+
+        let started = timings.start();
+        let readiness = wait_for_gateway_readiness(env_name, &self.env, &self.cwd)?;
+        let elapsed_ms = duration_ms(started.at.elapsed());
+        let process_ms = readiness.process_observed_after_ms;
+        if let Some(process_ms) = process_ms {
+            timings.record(
+                "ocm",
+                "processSpawn",
+                "stopped",
+                started.started_offset_ms,
+                process_ms,
+                if process_ms == 0 {
+                    "already-observed"
+                } else {
+                    "completed"
+                },
+            );
+            timings.record(
+                "ocm",
+                "httpReady",
+                "stopped",
+                started.started_offset_ms.saturating_add(process_ms),
+                readiness
+                    .ready_after_ms
+                    .unwrap_or(elapsed_ms)
+                    .saturating_sub(process_ms),
+                if readiness.ready {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            );
+        } else {
+            timings.record(
+                "ocm",
+                "processSpawn",
+                "stopped",
+                started.started_offset_ms,
+                elapsed_ms,
+                "failed",
+            );
+        }
+
         if readiness.ready {
             Ok(())
         } else {
@@ -2919,62 +3321,210 @@ impl Cli {
         &self,
         env_name: &str,
         runtime_name: &str,
-    ) -> Result<Option<String>, String> {
+        timings: &mut UpgradeTimingRecorder,
+    ) -> Result<PostCoreUpdateResult, String> {
         // Resolve the replacement explicitly while the previous binding remains published.
         // A failed finalizer can then roll back without ever activating the replacement.
-        let config_repaired = self.repair_target_openclaw_config(env_name, runtime_name)?;
-        self.run_update_mode_openclaw_command(
+        let config_repaired =
+            self.repair_target_openclaw_config(env_name, runtime_name, timings)?;
+        let finalize_started = timings.start();
+        let output = match self.run_update_mode_openclaw_command_output_with_env(
             env_name,
             runtime_name,
             "openclaw update finalize",
             &["update", "finalize", "--json", "--yes", "--no-restart"],
-        )?;
-        Ok(Some(if config_repaired {
-            "OpenClaw config repair and update finalization completed".to_string()
+            &[("OPENCLAW_UPDATE_POST_CORE", "1")],
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                timings.finish(
+                    "ocm",
+                    "openclawFinalize",
+                    "stopped",
+                    finalize_started,
+                    "failed",
+                );
+                return Err(error);
+            }
+        };
+        let child_phases = parse_openclaw_finalize_phases(&output.stdout);
+        if !output.status.success() {
+            if child_phases.is_empty() {
+                timings.finish(
+                    "ocm",
+                    "openclawFinalize",
+                    "stopped",
+                    finalize_started,
+                    "failed",
+                );
+            } else {
+                timings.append_openclaw_phases(finalize_started, &child_phases);
+            }
+            return Err(format!(
+                "openclaw update finalize failed: {}",
+                output.failure_summary()
+            ));
+        }
+        let completion_deferred = child_phases
+            .iter()
+            .any(|phase| phase.phase == "completionCache" && phase.outcome == "deferred");
+        if child_phases.is_empty() {
+            timings.finish(
+                "ocm",
+                "openclawFinalize",
+                "stopped",
+                finalize_started,
+                "completed",
+            );
         } else {
-            "OpenClaw update finalization completed".to_string()
-        }))
+            timings.append_openclaw_phases(finalize_started, &child_phases);
+        }
+        Ok(PostCoreUpdateResult {
+            note: Some(if config_repaired {
+                "OpenClaw config repair and update finalization completed".to_string()
+            } else {
+                "OpenClaw update finalization completed".to_string()
+            }),
+            completion_deferred,
+        })
+    }
+
+    fn refresh_deferred_completion_cache(
+        &self,
+        env_name: &str,
+        runtime_name: &str,
+        deferred: bool,
+        timings: &mut UpgradeTimingRecorder,
+    ) -> Option<String> {
+        if !deferred {
+            return None;
+        }
+        let started = timings.start();
+        let result = self.run_update_mode_openclaw_command(
+            env_name,
+            runtime_name,
+            "openclaw completion cache refresh",
+            &["completion", "--write-state"],
+        );
+        timings.finish(
+            "ocm",
+            "completionCache",
+            "post-ready",
+            started,
+            if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        result.err().map(|error| {
+            format!(
+                "OpenClaw completion cache refresh failed after readiness and can be retried manually: {error}"
+            )
+        })
     }
 
     fn repair_target_openclaw_config(
         &self,
         env_name: &str,
         runtime_name: &str,
+        timings: &mut UpgradeTimingRecorder,
     ) -> Result<bool, String> {
+        let validation_started = timings.start();
         let env = self
             .environment_service()
             .get(env_name)
             .map_err(|error| format!("failed to inspect OpenClaw config: {error}"))?;
         let config_path = derive_env_paths(Path::new(&env.root)).config_path;
         if !config_path.exists() {
+            timings.finish(
+                "ocm",
+                "targetConfigValidation",
+                "stopped",
+                validation_started,
+                "skipped",
+            );
             return Ok(false);
         }
 
-        let validation = self.run_update_mode_openclaw_command_output(
+        let validation = match self.run_update_mode_openclaw_command_output(
             env_name,
             runtime_name,
             "openclaw config validate",
             &["config", "validate"],
-        )?;
+        ) {
+            Ok(validation) => validation,
+            Err(error) => {
+                timings.finish(
+                    "ocm",
+                    "targetConfigValidation",
+                    "stopped",
+                    validation_started,
+                    "failed",
+                );
+                return Err(error);
+            }
+        };
+        let validation_unsupported = !validation.status.success()
+            && command_output_reports_unsupported_command(&validation.stdout, &validation.stderr);
+        timings.finish(
+            "ocm",
+            "targetConfigValidation",
+            "stopped",
+            validation_started,
+            if validation.status.success() {
+                "completed"
+            } else if validation_unsupported {
+                "skipped"
+            } else {
+                "failed"
+            },
+        );
         if validation.status.success() {
             return Ok(false);
         }
-        if command_output_reports_unsupported_command(&validation.stdout, &validation.stderr) {
+        if validation_unsupported {
             return Ok(false);
         }
 
-        self.run_update_mode_openclaw_command(
+        let doctor_started = timings.start();
+        let doctor_result = self.run_update_mode_openclaw_command(
             env_name,
             runtime_name,
             "openclaw doctor",
             &["doctor", "--non-interactive", "--fix"],
-        )?;
-        self.run_update_mode_openclaw_command(
+        );
+        timings.finish(
+            "ocm",
+            "doctor",
+            "stopped",
+            doctor_started,
+            if doctor_result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        doctor_result?;
+        let revalidation_started = timings.start();
+        let revalidation_result = self.run_update_mode_openclaw_command(
             env_name,
             runtime_name,
             "openclaw config validate after doctor",
             &["config", "validate"],
-        )?;
+        );
+        timings.finish(
+            "ocm",
+            "targetConfigRevalidation",
+            "stopped",
+            revalidation_started,
+            if revalidation_result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        revalidation_result?;
         Ok(true)
     }
 
@@ -3001,22 +3551,38 @@ impl Cli {
         name: &str,
         args: &[&str],
     ) -> Result<SimulationCommandOutput, String> {
+        self.run_update_mode_openclaw_command_output_with_env(
+            env_name,
+            runtime_name,
+            name,
+            args,
+            &[],
+        )
+    }
+
+    fn run_update_mode_openclaw_command_output_with_env(
+        &self,
+        env_name: &str,
+        runtime_name: &str,
+        name: &str,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<SimulationCommandOutput, String> {
         let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
         let resolved = self
             .environment_service()
             .resolve(env_name, Some(runtime_name.to_string()), None, &args)
             .map_err(|error| format!("{name} failed: {error}"))?;
-        self.run_resolved_for_simulation(
-            resolved,
-            &[
-                ("OPENCLAW_UPDATE_IN_PROGRESS", "1"),
-                ("OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE", "1"),
-                ("OPENCLAW_UPDATE_PARENT_SUPPORTS_GATEWAY_RESTART", "1"),
-                ("OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR", "0"),
-                ("OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION", "0"),
-            ],
-        )
-        .map_err(|error| format!("{name} failed: {error}"))
+        let mut command_env = vec![
+            ("OPENCLAW_UPDATE_IN_PROGRESS", "1"),
+            ("OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE", "1"),
+            ("OPENCLAW_UPDATE_PARENT_SUPPORTS_GATEWAY_RESTART", "1"),
+            ("OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR", "0"),
+            ("OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION", "0"),
+        ];
+        command_env.extend_from_slice(extra_env);
+        self.run_resolved_for_simulation(resolved, &command_env)
+            .map_err(|error| format!("{name} failed: {error}"))
     }
 
     fn run_launcher_mode_openclaw_command_output(
@@ -3044,7 +3610,9 @@ impl Cli {
         rollback_enabled: bool,
         snapshot_label: &str,
         rollback_of: Option<String>,
+        mut timings: UpgradeTimingRecorder,
     ) -> Result<UpgradeTransaction, String> {
+        let snapshot_preparation_started = timings.start();
         let env_meta = self.environment_service().get(env_name)?;
         let prepared = self
             .environment_service()
@@ -3090,6 +3658,14 @@ impl Cli {
             }
         }
 
+        timings.finish(
+            "ocm",
+            "snapshotPreparation",
+            "preparation",
+            snapshot_preparation_started,
+            "completed",
+        );
+        let quiescence_started = timings.start();
         let service_state = match self.service_service().quiesce_for_snapshot_locked(env_name) {
             Ok(service_state) => service_state,
             Err(error) => {
@@ -3099,7 +3675,7 @@ impl Cli {
                 return Err(error);
             }
         };
-        let started_at = time::OffsetDateTime::now_utc();
+        let started_at = timings.started_at;
         let id = format!(
             "{}-{:09}",
             started_at.unix_timestamp(),
@@ -3137,6 +3713,13 @@ impl Cli {
         };
 
         let service_quiesced = service_state.is_some();
+        timings.finish(
+            "ocm",
+            "quiescenceSnapshot",
+            "stopped",
+            quiescence_started,
+            "completed",
+        );
 
         Ok(UpgradeTransaction {
             id,
@@ -3145,6 +3728,7 @@ impl Cli {
             created_runtime_names,
             rollback_enabled,
             started_at,
+            timings,
             source: plan.source,
             target: plan.target,
             service_before: UpgradeHistoryServiceState {
@@ -3306,6 +3890,7 @@ impl Cli {
             started_at: transaction.started_at,
             completed_at: time::OffsetDateTime::now_utc(),
             outcome: summary.outcome.clone(),
+            phases: transaction.timings.phases.clone(),
             migration: transaction.migration.clone(),
             finalization: transaction.finalization.clone(),
             service_before: transaction.service_before.clone(),
@@ -3569,6 +4154,52 @@ struct PreparedUpgradeTarget {
     staged: Option<StagedRuntimeInstall>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenClawFinalizeReceipt {
+    #[serde(default)]
+    phase_timings: Vec<OpenClawFinalizePhaseTiming>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenClawFinalizePhaseTiming {
+    phase: String,
+    started_offset_ms: u64,
+    duration_ms: u64,
+    outcome: String,
+}
+
+#[derive(Debug)]
+struct PostCoreUpdateResult {
+    note: Option<String>,
+    completion_deferred: bool,
+}
+
+fn parse_openclaw_finalize_phases(stdout: &str) -> Vec<OpenClawFinalizePhaseTiming> {
+    let Ok(receipt) = serde_json::from_str::<OpenClawFinalizeReceipt>(stdout.trim()) else {
+        return Vec::new();
+    };
+    receipt
+        .phase_timings
+        .into_iter()
+        .filter(|phase| {
+            matches!(
+                phase.phase.as_str(),
+                "configSnapshot"
+                    | "doctor"
+                    | "plugins"
+                    | "targetConfigValidation"
+                    | "targetConfigConvergence"
+                    | "completionCache"
+            ) && matches!(
+                phase.outcome.as_str(),
+                "completed" | "failed" | "warning" | "skipped" | "deferred"
+            )
+        })
+        .collect()
+}
+
 impl PreparedUpgradeTarget {
     fn commit(mut self) -> Result<Self, String> {
         if let Some(staged) = self.staged.take() {
@@ -3599,7 +4230,7 @@ impl SimulationCommandOutput {
     }
 
     fn failure_summary(&self) -> String {
-        let detail = summarize_command_text(&self.stderr, &self.stdout)
+        let detail = summarize_command_failure_text(&self.stderr, &self.stdout)
             .unwrap_or_else(|| "no output".to_string());
         format!(
             "exited with code {}: {detail}",
@@ -3719,6 +4350,7 @@ struct UpgradeTransaction {
     created_runtime_names: Vec<String>,
     rollback_enabled: bool,
     started_at: time::OffsetDateTime,
+    timings: UpgradeTimingRecorder,
     source: UpgradeHistoryBinding,
     target: UpgradeHistoryBinding,
     service_before: UpgradeHistoryServiceState,
@@ -4020,10 +4652,14 @@ fn summarize_command_text(primary: &str, secondary: &str) -> Option<String> {
     None
 }
 
+fn summarize_command_failure_text(primary: &str, secondary: &str) -> Option<String> {
+    crate::infra::command_output::summarize_command_failure(primary, secondary)
+}
+
 fn summarize_command_output(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
-    summarize_command_text(&stderr, &stdout).unwrap_or_else(|| "no output".to_string())
+    summarize_command_failure_text(&stderr, &stdout).unwrap_or_else(|| "no output".to_string())
 }
 
 fn command_output_reports_unsupported_command(stdout: &str, stderr: &str) -> bool {
@@ -4259,9 +4895,23 @@ fn gateway_auth_failure_proves_reachable(error: &str) -> bool {
 mod tests {
     use super::{
         candidate_codex_preflight_is_unsupported, command_output_reports_unsupported_command,
-        release_version_from_output, verify_gateway_status_readiness,
+        parse_openclaw_finalize_phases, release_version_from_output,
+        summarize_command_failure_text, verify_gateway_status_readiness,
         version_output_matches_expected,
     };
+
+    #[test]
+    fn command_summary_prefers_structured_cli_error_message() {
+        let stderr = "[openclaw] Could not start the CLI.\n[openclaw] Try: openclaw doctor\n";
+        let stdout = r#"{"ok":false,"error":{"type":"cli_error","message":"Cannot find package '@openclaw/plugin-api'; token=fixture-secret Authorization: Bearer bearer-secret"}}"#;
+
+        let summary = summarize_command_failure_text(stderr, stdout).unwrap();
+
+        assert!(summary.contains("Cannot find package '@openclaw/plugin-api'"));
+        assert!(!summary.contains("Could not start the CLI"));
+        assert!(!summary.contains("fixture-secret"));
+        assert!(!summary.contains("bearer-secret"));
+    }
 
     #[test]
     fn version_output_accepts_exact_version() {
@@ -4422,6 +5072,18 @@ mod tests {
             "",
             "OpenClaw config is invalid\nProblem: meta: Unrecognized key: lastTouchedAt"
         ));
+    }
+
+    #[test]
+    fn finalize_timing_parser_accepts_only_structured_safe_fields() {
+        let phases = parse_openclaw_finalize_phases(
+            r#"{"phaseTimings":[{"phase":"doctor","startedOffsetMs":7,"durationMs":11,"outcome":"warning","config":"secret"},{"phase":"config=/private/token","startedOffsetMs":0,"durationMs":1,"outcome":"completed"},{"phase":"plugins","startedOffsetMs":19,"durationMs":23,"outcome":"invented"}]}"#,
+        );
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0].phase, "doctor");
+        assert_eq!(phases[0].started_offset_ms, 7);
+        assert_eq!(phases[0].duration_ms, 11);
+        assert_eq!(phases[0].outcome, "warning");
     }
 
     #[test]

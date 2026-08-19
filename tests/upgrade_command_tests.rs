@@ -950,6 +950,10 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
         !command_log.contains("plugins update --all\n"),
         "{command_log}"
     );
+    assert!(
+        !command_log.contains("completion --write-state"),
+        "a finalizer without the structured defer receipt must not trigger duplicate completion work: {command_log}"
+    );
 
     let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "demo", "--json"]);
     assert!(snapshots.status.success(), "{}", stderr(&snapshots));

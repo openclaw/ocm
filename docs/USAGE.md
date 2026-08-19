@@ -136,6 +136,23 @@ Because the opt-in installs every omitted extension and its dependency closure,
 the resulting runtime can take longer to build and use substantially more disk
 space than the release-shaped default.
 
+To build for an existing environment without including unrelated source
+plugins, name the target explicitly:
+
+```bash
+ocm runtime build-local primary-test \
+  --repo /path/to/openclaw \
+  --for-env primary \
+  --force
+```
+
+OCM reads the target environment's effective config before `npm pack`, validates
+explicit plugin references against the checkout and installed-plugin records,
+and follows transitive local plugin package dependencies. The resulting runtime
+adds only required source plugins omitted from the core package. `--for-env` and
+`--include-source-extensions` are mutually exclusive. A build without either
+option remains release-shaped.
+
 ### 6. Keep an environment running in the background
 
 ```bash

@@ -1417,6 +1417,94 @@ fn dev_watch_force_takes_over_runtime_env_without_rebinding() {
     assert!(stdout(&error_logs).contains("source watch stderr"));
 }
 
+#[cfg(unix)]
+#[test]
+fn dev_watch_force_rejects_dependencies_from_another_checkout_before_takeover() {
+    let root = TestDir::new("dev-command-runtime-watch-external-dependencies");
+    let repo = init_openclaw_repo(&root);
+    let shared_dependencies = root.child("other-checkout/node_modules");
+    fs::create_dir_all(&shared_dependencies).unwrap();
+    std::os::unix::fs::symlink(&shared_dependencies, repo.join("node_modules")).unwrap();
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = service_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+    create_runtime_backed_env(&cwd, &env);
+
+    let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    let watch = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--watch",
+            "--force",
+        ],
+    );
+
+    assert!(!watch.status.success());
+    let error = stderr(&watch);
+    assert!(
+        error.contains("dependencies resolve outside the selected checkout"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&path_string(&shared_dependencies)),
+        "{error}"
+    );
+    assert!(error.contains("standalone checkout"), "{error}");
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    let show_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert_eq!(show_json["serviceRunning"], true);
+    assert!(!root.child("node.log").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_watch_force_rejects_dangling_dependency_link_before_takeover() {
+    let root = TestDir::new("dev-command-runtime-watch-dangling-dependencies");
+    let repo = init_openclaw_repo(&root);
+    let missing_dependencies = root.child("missing-checkout/node_modules");
+    std::os::unix::fs::symlink(&missing_dependencies, repo.join("node_modules")).unwrap();
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = service_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+    create_runtime_backed_env(&cwd, &env);
+
+    let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    let watch = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--watch",
+            "--force",
+        ],
+    );
+
+    assert!(!watch.status.success());
+    assert!(
+        stderr(&watch).contains("failed to resolve OpenClaw dependencies"),
+        "{}",
+        stderr(&watch)
+    );
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    let show_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert_eq!(show_json["serviceRunning"], true);
+    assert!(!root.child("node.log").exists());
+}
+
 #[test]
 fn dev_watch_force_warns_for_installed_plugins_missing_from_source() {
     let root = TestDir::new("dev-command-runtime-watch-external-plugin");
