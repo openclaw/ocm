@@ -209,22 +209,29 @@ impl ControlledHealthServer {
     }
 }
 
-fn health_ok(port: u32) -> bool {
+fn health_observation(port: u32) -> Option<bool> {
     let Ok(mut stream) = TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}").parse().unwrap(),
         Duration::from_millis(500),
     ) else {
-        return false;
+        return None;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     if stream
         .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .is_err()
     {
-        return false;
+        return None;
     }
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).is_ok() && response.starts_with(b"HTTP/1.1 200 OK")
+    stream.read_to_end(&mut response).ok()?;
+    if response.starts_with(b"HTTP/1.1 200 OK") {
+        Some(true)
+    } else if response.starts_with(b"HTTP/1.1 503 Service Unavailable") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn write_running_supervisor_runtime(
@@ -534,8 +541,9 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
     let samples_thread = Arc::clone(&samples);
     let health_poller = thread::spawn(move || {
         while !samples_done_thread.load(Ordering::Relaxed) {
-            let ok = health_ok(health_port);
-            samples_thread.lock().unwrap().push((Instant::now(), ok));
+            if let Some(ok) = health_observation(health_port) {
+                samples_thread.lock().unwrap().push((Instant::now(), ok));
+            }
             sleep(Duration::from_millis(20));
         }
     });
