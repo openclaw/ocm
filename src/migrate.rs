@@ -11,7 +11,8 @@ use crate::store::{
     OpenClawWorkspaceRuntime, copy_dir_recursive, default_env_root, derive_env_paths, display_path,
     list_environments, normalize_new_environment_sandbox_origin, prepare_migrated_runtime_state,
     reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
-    resolve_plain_openclaw_workspaces, resolve_user_home, rewrite_openclaw_config_for_migration,
+    resolve_plain_openclaw_workspaces, resolve_user_home,
+    rewrite_external_workspace_paths_for_migration, rewrite_openclaw_config_for_migration,
     validate_name,
 };
 
@@ -54,6 +55,130 @@ struct MigratedLauncherSpec {
     name: String,
     command_path: String,
     needs_creation: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ExternalWorkspaceCopy {
+    source: PathBuf,
+    target: PathBuf,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExternalWorkspaceCopyPlan {
+    default_workspace: Option<ExternalWorkspaceCopy>,
+    agent_workspaces: BTreeMap<String, ExternalWorkspaceCopy>,
+}
+
+impl ExternalWorkspaceCopyPlan {
+    fn for_migration(
+        source_home: &Path,
+        target_paths: &crate::store::EnvPaths,
+        env: &BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let source_home = fs::canonicalize(source_home).map_err(|error| {
+            format!(
+                "failed to resolve plain OpenClaw home {}: {error}",
+                display_path(source_home)
+            )
+        })?;
+        let sources = resolve_plain_openclaw_workspaces(&source_home, env)?
+            .external_workspace_sources_for_migration(&source_home)?;
+        let canonical_target_root = canonicalize_path_allow_missing(&target_paths.root)?;
+        let mut plan = Self::default();
+        if let Some(source) = sources.default_workspace {
+            plan.default_workspace = Some(ExternalWorkspaceCopy {
+                target: target_paths.state_dir.join("workspaces/default"),
+                source,
+            });
+        }
+        for (agent_id, source) in sources.agent_workspaces {
+            plan.agent_workspaces.insert(
+                agent_id.clone(),
+                ExternalWorkspaceCopy {
+                    target: target_paths
+                        .state_dir
+                        .join("workspaces/agents")
+                        .join(agent_id),
+                    source,
+                },
+            );
+        }
+        for workspace in plan
+            .default_workspace
+            .iter()
+            .chain(plan.agent_workspaces.values())
+        {
+            if workspace.source.starts_with(&canonical_target_root)
+                || canonical_target_root.starts_with(&workspace.source)
+            {
+                return Err(format!(
+                    "external OpenClaw workspace and migration target must not overlap: workspace={} target={}",
+                    display_path(&workspace.source),
+                    display_path(&canonical_target_root)
+                ));
+            }
+        }
+        Ok(plan)
+    }
+
+    fn copy_and_rewrite_config(&self, config_path: &Path) -> Result<(), String> {
+        remove_copied_external_default_workspace_link(config_path)?;
+        if let Some(workspace) = &self.default_workspace {
+            copy_dir_recursive(&workspace.source, &workspace.target)?;
+        }
+        for workspace in self.agent_workspaces.values() {
+            copy_dir_recursive(&workspace.source, &workspace.target)?;
+        }
+        let agent_workspaces = self
+            .agent_workspaces
+            .iter()
+            .map(|(agent_id, workspace)| (agent_id.clone(), workspace.target.clone()))
+            .collect::<BTreeMap<_, _>>();
+        rewrite_external_workspace_paths_for_migration(
+            config_path,
+            self.default_workspace
+                .as_ref()
+                .map(|workspace| workspace.target.as_path()),
+            &agent_workspaces,
+        )?;
+        Ok(())
+    }
+}
+
+fn remove_copied_external_default_workspace_link(config_path: &Path) -> Result<(), String> {
+    let Some(state_dir) = config_path.parent() else {
+        return Ok(());
+    };
+    let workspace = state_dir.join("workspace");
+    let Ok(metadata) = fs::symlink_metadata(&workspace) else {
+        return Ok(());
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let resolved = fs::canonicalize(&workspace).map_err(|error| {
+        format!(
+            "failed to resolve copied OpenClaw workspace symlink {}: {error}",
+            display_path(&workspace)
+        )
+    })?;
+    let canonical_state_dir = fs::canonicalize(state_dir).map_err(|error| {
+        format!(
+            "failed to resolve imported OpenClaw state directory {}: {error}",
+            display_path(state_dir)
+        )
+    })?;
+    if resolved.starts_with(&canonical_state_dir) {
+        return Ok(());
+    }
+    fs::remove_file(&workspace)
+        .or_else(|_| fs::remove_dir(&workspace))
+        .map_err(|error| {
+            format!(
+                "failed to remove copied external OpenClaw workspace symlink {}: {error}",
+                display_path(&workspace)
+            )
+        })
 }
 
 pub fn default_migration_source_home(env: &BTreeMap<String, String>) -> PathBuf {
@@ -162,14 +287,9 @@ fn migrate_plain_openclaw_home_inner(
         })?
         .to_string();
     reject_overlapping_migration_paths(&source_home, &target_root)?;
-    let workspace_source_home = fs::canonicalize(&source_home).map_err(|error| {
-        format!(
-            "failed to resolve plain OpenClaw home {}: {error}",
-            display_path(&source_home)
-        )
-    })?;
-    resolve_plain_openclaw_workspaces(&workspace_source_home, env)?
-        .archive_relative_roots(&workspace_source_home)?;
+    let target_paths = derive_env_paths(&target_root);
+    let external_workspace_plan =
+        ExternalWorkspaceCopyPlan::for_migration(&source_home, &target_paths, env)?;
     let migrated_launcher = preflight_migrated_launcher(&env_name, env, cwd)?;
 
     let created = service.create(CreateEnvironmentOptions {
@@ -190,6 +310,7 @@ fn migrate_plain_openclaw_home_inner(
         created,
         &target_paths,
         &source_home,
+        &external_workspace_plan,
         sandbox_origin.as_deref(),
         migrated_launcher.as_ref(),
         env,
@@ -255,6 +376,7 @@ fn complete_migration_import(
     created: crate::env::EnvMeta,
     target_paths: &crate::store::EnvPaths,
     source_home: &Path,
+    external_workspace_plan: &ExternalWorkspaceCopyPlan,
     sandbox_origin: Option<&str>,
     migrated_launcher: Option<&MigratedLauncherSpec>,
     env: &BTreeMap<String, String>,
@@ -265,6 +387,7 @@ fn complete_migration_import(
     }
 
     copy_dir_recursive(source_home, &target_paths.state_dir)?;
+    external_workspace_plan.copy_and_rewrite_config(&target_paths.config_path)?;
     reject_include_owned_sandbox_origin(&target_paths.config_path)?;
     let config_rewrite = rewrite_openclaw_config_for_migration(
         target_paths,

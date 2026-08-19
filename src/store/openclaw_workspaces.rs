@@ -43,7 +43,15 @@ pub(crate) struct OpenClawWorkspaceInventory {
     workspace_roots: BTreeSet<PathBuf>,
     config_include_paths: BTreeSet<PathBuf>,
     agent_workspace_roots: BTreeMap<String, PathBuf>,
+    configured_default_workspace: Option<PathBuf>,
+    configured_agent_workspace_roots: BTreeMap<String, PathBuf>,
     default_agent_id: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ExternalOpenClawWorkspaceSources {
+    pub(crate) default_workspace: Option<PathBuf>,
+    pub(crate) agent_workspaces: BTreeMap<String, PathBuf>,
 }
 
 impl OpenClawWorkspaceInventory {
@@ -121,6 +129,114 @@ impl OpenClawWorkspaceInventory {
     pub(crate) fn workspace_roots(&self) -> impl Iterator<Item = &Path> {
         self.workspace_roots.iter().map(PathBuf::as_path)
     }
+
+    /// An adopted plain home may use a repository checkout outside its state
+    /// directory. Those configured workspace roots are copied into the new
+    /// environment; config includes remain owned by their original config tree.
+    pub(crate) fn external_workspace_sources_for_migration(
+        &self,
+        source_root: &Path,
+    ) -> Result<ExternalOpenClawWorkspaceSources, String> {
+        let source_root = clean_path(source_root);
+        let canonical_source_root = canonicalize_path_allow_missing(&source_root)?;
+
+        for include_path in &self.config_include_paths {
+            validate_internal_migration_path(
+                include_path,
+                &source_root,
+                &canonical_source_root,
+                "config include",
+            )?;
+        }
+
+        let default_workspace = self
+            .configured_default_workspace
+            .as_deref()
+            .map(|workspace| {
+                migration_workspace_source(workspace, &source_root, &canonical_source_root)
+            })
+            .transpose()?
+            .flatten();
+        let mut agent_workspaces = BTreeMap::new();
+        for (agent_id, workspace) in &self.configured_agent_workspace_roots {
+            if let Some(source) =
+                migration_workspace_source(workspace, &source_root, &canonical_source_root)?
+            {
+                agent_workspaces.insert(agent_id.clone(), source);
+            }
+        }
+
+        Ok(ExternalOpenClawWorkspaceSources {
+            default_workspace,
+            agent_workspaces,
+        })
+    }
+}
+
+fn validate_internal_migration_path(
+    path: &Path,
+    source_root: &Path,
+    canonical_source_root: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let canonical_path = canonicalize_path_allow_missing(path)?;
+    if canonical_path == canonical_source_root || !canonical_path.starts_with(canonical_source_root)
+    {
+        return Err(format!(
+            "cannot safely preserve configured OpenClaw {label} that resolves outside the environment root: {} (resolved: {}; environment root resolves to: {})",
+            display_path(path),
+            display_path(&canonical_path),
+            display_path(canonical_source_root)
+        ));
+    }
+    let canonical_relative = canonical_path
+        .strip_prefix(canonical_source_root)
+        .map_err(|error| error.to_string())?;
+    if let Ok(relative) = path.strip_prefix(source_root)
+        && relative != canonical_relative
+    {
+        return Err(format!(
+            "cannot safely preserve configured OpenClaw {label} through a symlink: {}",
+            display_path(path)
+        ));
+    }
+    Ok(())
+}
+
+fn migration_workspace_source(
+    workspace: &Path,
+    source_root: &Path,
+    canonical_source_root: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let canonical_workspace = canonicalize_path_allow_missing(workspace)?;
+    if canonical_workspace == canonical_source_root {
+        return Err(format!(
+            "configured OpenClaw workspace cannot be the state directory itself: {}",
+            display_path(workspace)
+        ));
+    }
+    if canonical_workspace.starts_with(canonical_source_root) {
+        validate_internal_migration_path(
+            workspace,
+            source_root,
+            canonical_source_root,
+            "workspace",
+        )?;
+        return Ok(None);
+    }
+    let metadata = fs::metadata(&canonical_workspace).map_err(|error| {
+        format!(
+            "failed to inspect external OpenClaw workspace {}: {error}",
+            display_path(workspace)
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "configured external OpenClaw workspace must be a directory: {}",
+            display_path(workspace)
+        ));
+    }
+    Ok(Some(canonical_workspace))
 }
 
 pub(crate) fn resolve_env_openclaw_workspaces(
@@ -209,6 +325,9 @@ fn resolve_openclaw_workspaces(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let configured_default_workspace = default_workspace
+        .map(|workspace| resolve_workspace_path(workspace, openclaw_home))
+        .transpose()?;
 
     let mut agent_ids = entries
         .iter()
@@ -219,6 +338,7 @@ fn resolve_openclaw_workspaces(
 
     let mut workspace_roots = BTreeSet::new();
     let mut agent_workspace_roots = BTreeMap::new();
+    let mut configured_agent_workspace_roots = BTreeMap::new();
     for agent_id in agent_ids {
         let explicit = entries
             .iter()
@@ -232,6 +352,12 @@ fn resolve_openclaw_workspaces(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        let configured_workspace = explicit
+            .map(|workspace| resolve_workspace_path(workspace, openclaw_home))
+            .transpose()?;
+        if let Some(workspace) = configured_workspace.as_ref() {
+            configured_agent_workspace_roots.insert(agent_id.clone(), workspace.clone());
+        }
         let raw = if let Some(explicit) = explicit {
             explicit.to_string()
         } else if agent_id == default_agent_id {
@@ -257,6 +383,8 @@ fn resolve_openclaw_workspaces(
         workspace_roots,
         config_include_paths,
         agent_workspace_roots,
+        configured_default_workspace,
+        configured_agent_workspace_roots,
         default_agent_id,
     })
 }
@@ -629,7 +757,7 @@ fn resolve_default_agent_id(entries: &[Map<String, Value>]) -> String {
         .unwrap_or_else(|| DEFAULT_AGENT_ID.to_string())
 }
 
-fn normalize_agent_id(value: &str) -> String {
+pub(crate) fn normalize_agent_id(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return DEFAULT_AGENT_ID.to_string();

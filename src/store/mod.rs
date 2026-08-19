@@ -57,10 +57,10 @@ pub(crate) use openclaw_config::{
     ensure_minimum_local_openclaw_config, normalize_new_environment_sandbox_origin,
     openclaw_config_include_paths, openclaw_config_uses_includes,
     reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
-    repair_openclaw_config, rewrite_identity_bound_workspace_paths_for_target,
-    rewrite_openclaw_config_for_migration, rewrite_openclaw_config_for_new_environment,
-    rewrite_openclaw_config_for_simulation, rewrite_openclaw_config_for_target,
-    rewrite_openclaw_config_includes_for_target,
+    repair_openclaw_config, rewrite_external_workspace_paths_for_migration,
+    rewrite_identity_bound_workspace_paths_for_target, rewrite_openclaw_config_for_migration,
+    rewrite_openclaw_config_for_new_environment, rewrite_openclaw_config_for_simulation,
+    rewrite_openclaw_config_for_target, rewrite_openclaw_config_includes_for_target,
 };
 pub(crate) use openclaw_state::{
     OpenClawStateAudit, audit_openclaw_state, clear_nonportable_runtime_state,

@@ -233,6 +233,12 @@ ocm adopt plan --name mira
 
 `migrate` preserves config, auth, sessions, logs, and other durable user state, rewrites env-scoped paths for the new managed root, and clears only live runtime residue like locks, pid files, and sockets. If `openclaw` is already available on `PATH`, it also binds the imported env to an env-local migrated launcher so you can keep using it through OCM immediately.
 
+When a configured agent workspace is a repository checkout outside the plain
+OpenClaw home, including through a symlink, migration copies that workspace into
+the new environment and rewrites the imported config to use the copy. The source
+home and repository remain unchanged. Config `$include` files still must remain
+inside the plain home because OCM does not take ownership of external config.
+
 Environment clone, export, and import flows preserve managed OpenClaw plugin
 payloads under the legacy, extension, npm, and Git install roots. Clone and
 import still clear live sessions, logs, backups, and process residue so the new

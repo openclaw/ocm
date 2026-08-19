@@ -885,7 +885,7 @@ fn migrate_validates_the_target_origin_before_reading_the_source_home() {
 }
 
 #[test]
-fn migrate_rejects_external_workspaces_before_creating_the_environment() {
+fn adopt_import_copies_an_external_workspace_into_the_disposable_environment() {
     let root = TestDir::new("migrate-external-workspace");
     let cwd = root.child("workspace");
     let source_home = root.child("legacy-home/.openclaw");
@@ -902,23 +902,102 @@ fn migrate_rejects_external_workspaces_before_creating_the_environment() {
         ),
     )
     .unwrap();
-    let env = ocm_env(&root);
+    let mut env = ocm_env(&root);
+    install_fake_openclaw_on_path(&root, &mut env);
 
     let output = run_ocm(
         &cwd,
         &env,
-        &["migrate", "mira", source_home.to_string_lossy().as_ref()],
+        &[
+            "adopt",
+            "import",
+            "--name",
+            "mira",
+            source_home.to_string_lossy().as_ref(),
+        ],
     );
-    assert_eq!(output.status.code(), Some(1));
-    assert!(
-        stderr(&output).contains("outside the environment root"),
-        "{}",
-        stderr(&output)
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let imported_workspace = root.child("ocm-home/envs/mira/.openclaw/workspaces/default");
+    assert_eq!(
+        fs::read_to_string(imported_workspace.join("notes.txt")).unwrap(),
+        "external data\n"
     );
-    assert!(!root.child("ocm-home/envs/mira").exists());
+    let imported_config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.child("ocm-home/envs/mira/.openclaw/openclaw.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        imported_config["agents"]["defaults"]["workspace"].as_str(),
+        Some(imported_workspace.to_string_lossy().as_ref())
+    );
     assert_eq!(
         fs::read_to_string(external.join("notes.txt")).unwrap(),
         "external data\n"
+    );
+    assert_eq!(
+        fs::read_to_string(source_home.join("openclaw.json")).unwrap(),
+        format!(
+            r#"{{"agents":{{"defaults":{{"workspace":"{}"}}}}}}"#,
+            external.display()
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn adopt_import_copies_a_symlinked_external_workspace_into_the_disposable_environment() {
+    let root = TestDir::new("migrate-symlinked-external-workspace");
+    let cwd = root.child("workspace");
+    let source_home = root.child("legacy-home/.openclaw");
+    let external = root.child("lobster-workspace");
+    let linked_workspace = source_home.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&source_home).unwrap();
+    fs::create_dir_all(&external).unwrap();
+    fs::write(external.join("notes.txt"), "repo-backed data\n").unwrap();
+    std::os::unix::fs::symlink(&external, &linked_workspace).unwrap();
+    fs::write(
+        source_home.join("openclaw.json"),
+        format!(
+            r#"{{"agents":{{"defaults":{{"workspace":"{}"}}}}}}"#,
+            linked_workspace.display()
+        ),
+    )
+    .unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_openclaw_on_path(&root, &mut env);
+
+    let output = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "adopt",
+            "import",
+            "--name",
+            "mira",
+            source_home.to_string_lossy().as_ref(),
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let imported_workspace = root.child("ocm-home/envs/mira/.openclaw/workspaces/default");
+    assert_eq!(
+        fs::read_to_string(imported_workspace.join("notes.txt")).unwrap(),
+        "repo-backed data\n"
+    );
+    let imported_config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.child("ocm-home/envs/mira/.openclaw/openclaw.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        imported_config["agents"]["defaults"]["workspace"].as_str(),
+        Some(imported_workspace.to_string_lossy().as_ref())
+    );
+    assert_eq!(fs::read_link(&linked_workspace).unwrap(), external);
+    assert_eq!(
+        fs::read_to_string(external.join("notes.txt")).unwrap(),
+        "repo-backed data\n"
     );
 }
 

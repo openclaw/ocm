@@ -12,7 +12,9 @@ use crate::env::EnvMeta;
 use super::common::{ensure_dir, path_exists, write_file_replacing_path};
 use super::gateway_ports::read_port_number;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
-use super::openclaw_workspaces::{OpenClawWorkspaceInventory, load_effective_openclaw_config};
+use super::openclaw_workspaces::{
+    OpenClawWorkspaceInventory, load_effective_openclaw_config, normalize_agent_id,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct OpenClawConfigAudit {
@@ -149,6 +151,71 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
         gateway_port,
         SandboxOriginPolicy::NewEnvironment(sandbox_origin),
     )
+}
+
+pub(crate) fn rewrite_external_workspace_paths_for_migration(
+    config_path: &Path,
+    default_workspace: Option<&Path>,
+    agent_workspaces: &BTreeMap<String, PathBuf>,
+) -> Result<bool, String> {
+    if default_workspace.is_none() && agent_workspaces.is_empty() {
+        return Ok(false);
+    }
+    let Some(mut value) = read_config_value(config_path)? else {
+        return Ok(false);
+    };
+    let Some(agents) = value.get_mut("agents").and_then(Value::as_object_mut) else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+    if let Some(default_workspace) = default_workspace {
+        changed |= set_workspace_path(agents.get_mut("defaults"), default_workspace);
+    }
+    if let Some(entries) = agents.get_mut("entries").and_then(Value::as_object_mut) {
+        for (agent_id, entry) in entries {
+            let Some(workspace) = agent_workspaces.get(&normalize_agent_id(agent_id)) else {
+                continue;
+            };
+            changed |= set_workspace_path(Some(entry), workspace);
+        }
+    }
+    if let Some(entries) = agents.get_mut("list").and_then(Value::as_array_mut) {
+        for entry in entries {
+            let Some(agent_id) = entry
+                .as_object()
+                .and_then(|entry| entry.get("id"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(workspace) = agent_workspaces.get(&normalize_agent_id(agent_id)) else {
+                continue;
+            };
+            changed |= set_workspace_path(Some(entry), workspace);
+        }
+    }
+
+    if changed {
+        write_config_value(config_path, &value)?;
+    }
+    Ok(changed)
+}
+
+fn set_workspace_path(value: Option<&mut Value>, workspace: &Path) -> bool {
+    let Some(value) = value.and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let workspace = display_path(workspace);
+    if value
+        .get("workspace")
+        .and_then(Value::as_str)
+        .is_some_and(|current| current == workspace)
+    {
+        return false;
+    }
+    value.insert("workspace".to_string(), Value::String(workspace));
+    true
 }
 
 pub(crate) fn normalize_new_environment_sandbox_origin(
