@@ -2618,6 +2618,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        meta.runtime_sha256 = Some(tree_sha256(&target.install_files.join("node_modules"))?);
         publish_runtime(target, meta)
     })();
 
@@ -2904,11 +2905,92 @@ fn runtime_execution_issue(meta: &RuntimeMeta, env: &BTreeMap<String, String>) -
     None
 }
 
+fn runtime_companion_integrity_issue(meta: &RuntimeMeta) -> Option<String> {
+    let package_root = openclaw_package_root_from_binary(Path::new(&meta.binary_path))?;
+    for companion in &meta.companions {
+        if validate_local_companion_id(&companion.id).is_err() {
+            return Some(format!(
+                "runtime companion has invalid plugin id: {}",
+                companion.id
+            ));
+        }
+        if normalize_sha256(&companion.artifact_sha256).is_err() {
+            return Some(format!(
+                "runtime companion {} has invalid artifact sha256",
+                companion.id
+            ));
+        }
+        let entrypoint_prefix = format!("dist/extensions/{}/", companion.id);
+        let Some(entrypoint_relative) = companion.entrypoint.strip_prefix(&entrypoint_prefix)
+        else {
+            return Some(format!(
+                "runtime companion {} has invalid entrypoint path: {}",
+                companion.id, companion.entrypoint
+            ));
+        };
+        let entrypoint_relative = match safe_companion_runtime_entrypoint(entrypoint_relative) {
+            Ok(path) => path,
+            Err(error) => return Some(error),
+        };
+        let expected_entrypoint = PathBuf::from("dist/extensions")
+            .join(&companion.id)
+            .join(entrypoint_relative);
+        if display_path(&expected_entrypoint) != companion.entrypoint {
+            return Some(format!(
+                "runtime companion {} has invalid entrypoint path: {}",
+                companion.id, companion.entrypoint
+            ));
+        }
+        let companion_root = package_root.join("dist/extensions").join(&companion.id);
+        let package_json_path = companion_root.join("package.json");
+        let package = match load_json_value(&package_json_path, "runtime companion package.json") {
+            Ok(value) => value,
+            Err(error) => return Some(error),
+        };
+        if package.get("name").and_then(serde_json::Value::as_str)
+            != Some(companion.package_name.as_str())
+            || package.get("version").and_then(serde_json::Value::as_str)
+                != Some(companion.version.as_str())
+        {
+            return Some(format!(
+                "runtime companion {} package metadata does not match its runtime record",
+                companion.id
+            ));
+        }
+        let entrypoint_path = package_root.join(&companion.entrypoint);
+        if !entrypoint_path.is_file() {
+            return Some(format!(
+                "runtime companion {} entrypoint does not exist: {}",
+                companion.id,
+                display_path(&entrypoint_path)
+            ));
+        }
+        let expected_entrypoint_sha256 = match normalize_sha256(&companion.entrypoint_sha256) {
+            Ok(value) => value,
+            Err(error) => return Some(error),
+        };
+        let actual_entrypoint_sha256 = match file_sha256(&entrypoint_path) {
+            Ok(value) => value,
+            Err(error) => return Some(error),
+        };
+        if actual_entrypoint_sha256 != expected_entrypoint_sha256 {
+            return Some(format!(
+                "runtime companion {} entrypoint sha256 mismatch: expected {}, got {}",
+                companion.id, expected_entrypoint_sha256, actual_entrypoint_sha256
+            ));
+        }
+    }
+    None
+}
+
 pub fn runtime_integrity_issue(
     meta: &RuntimeMeta,
     env: &BTreeMap<String, String>,
 ) -> Option<String> {
     if let Some(issue) = runtime_execution_issue(meta, env) {
+        return Some(issue);
+    }
+    if let Some(issue) = runtime_companion_integrity_issue(meta) {
         return Some(issue);
     }
 
@@ -2929,85 +3011,6 @@ pub fn runtime_integrity_issue(
             return Some(format!(
                 "runtime sha256 mismatch: expected {expected_runtime_sha256}, got {actual_runtime_sha256}"
             ));
-        }
-    }
-
-    if (is_official_openclaw_package_runtime(meta, env) || is_openclaw_package_runtime(meta))
-        && let Some(package_root) = openclaw_package_root_from_binary(Path::new(&meta.binary_path))
-    {
-        for companion in &meta.companions {
-            if validate_local_companion_id(&companion.id).is_err() {
-                return Some(format!(
-                    "runtime companion has invalid plugin id: {}",
-                    companion.id
-                ));
-            }
-            if normalize_sha256(&companion.artifact_sha256).is_err() {
-                return Some(format!(
-                    "runtime companion {} has invalid artifact sha256",
-                    companion.id
-                ));
-            }
-            let entrypoint_prefix = format!("dist/extensions/{}/", companion.id);
-            let Some(entrypoint_relative) = companion.entrypoint.strip_prefix(&entrypoint_prefix)
-            else {
-                return Some(format!(
-                    "runtime companion {} has invalid entrypoint path: {}",
-                    companion.id, companion.entrypoint
-                ));
-            };
-            let entrypoint_relative = match safe_companion_runtime_entrypoint(entrypoint_relative) {
-                Ok(path) => path,
-                Err(error) => return Some(error),
-            };
-            let expected_entrypoint = PathBuf::from("dist/extensions")
-                .join(&companion.id)
-                .join(entrypoint_relative);
-            if display_path(&expected_entrypoint) != companion.entrypoint {
-                return Some(format!(
-                    "runtime companion {} has invalid entrypoint path: {}",
-                    companion.id, companion.entrypoint
-                ));
-            }
-            let companion_root = package_root.join("dist/extensions").join(&companion.id);
-            let package_json_path = companion_root.join("package.json");
-            let package =
-                match load_json_value(&package_json_path, "runtime companion package.json") {
-                    Ok(value) => value,
-                    Err(error) => return Some(error),
-                };
-            if package.get("name").and_then(serde_json::Value::as_str)
-                != Some(companion.package_name.as_str())
-                || package.get("version").and_then(serde_json::Value::as_str)
-                    != Some(companion.version.as_str())
-            {
-                return Some(format!(
-                    "runtime companion {} package metadata does not match its runtime record",
-                    companion.id
-                ));
-            }
-            let entrypoint_path = package_root.join(&companion.entrypoint);
-            if !entrypoint_path.is_file() {
-                return Some(format!(
-                    "runtime companion {} entrypoint does not exist: {}",
-                    companion.id,
-                    display_path(&entrypoint_path)
-                ));
-            }
-            let expected_entrypoint_sha256 = match normalize_sha256(&companion.entrypoint_sha256) {
-                Ok(value) => value,
-                Err(error) => return Some(error),
-            };
-            let actual_entrypoint_sha256 = match file_sha256(&entrypoint_path) {
-                Ok(value) => value,
-                Err(error) => return Some(error),
-            };
-            if actual_entrypoint_sha256 != expected_entrypoint_sha256 {
-                return Some(format!(
-                    "runtime companion {} entrypoint sha256 mismatch: expected {}, got {}",
-                    companion.id, expected_entrypoint_sha256, actual_entrypoint_sha256
-                ));
-            }
         }
     }
 

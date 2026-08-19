@@ -1512,7 +1512,12 @@ fn runtime_build_local_bundles_commit_matched_companion_with_isolated_dependenci
         &env,
         &["runtime", "verify", "main-with-codex", "--json"],
     );
-    assert!(verify.status.success(), "{}", stderr(&verify));
+    assert!(
+        verify.status.success(),
+        "stderr:\n{}\nstdout:\n{}",
+        stderr(&verify),
+        stdout(&verify)
+    );
     let verification: Value = serde_json::from_str(&stdout(&verify)).unwrap();
     assert_eq!(verification["healthy"], true);
 
