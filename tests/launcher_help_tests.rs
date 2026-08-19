@@ -567,6 +567,20 @@ fn env_and_service_status_style_help_mentions_raw_mode() {
     assert!(output.contains("ocm service install <env> [--raw] [--json]"));
     assert!(output.contains("Use `service start` to start the env after it is enabled."));
     assert!(output.contains("shared OCM background service"));
+
+    let refresh_daemon = run_ocm(&cwd, &env, &["help", "service", "refresh-daemon"]);
+    assert!(
+        refresh_daemon.status.success(),
+        "{}",
+        stderr(&refresh_daemon)
+    );
+    let output = stdout(&refresh_daemon);
+    assert!(
+        output.contains(
+            "ocm service refresh-daemon [--acknowledge-gateway-restarts] [--raw] [--json]"
+        )
+    );
+    assert!(output.contains("never rebuilds desired state"));
 }
 
 #[test]

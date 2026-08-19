@@ -1023,6 +1023,10 @@ pub fn service_help(cmd: &str) -> String {
                         "restart",
                         "Restart one env gateway under the background service",
                     ),
+                    (
+                        "refresh-daemon",
+                        "Explicitly activate the installed CLI in the background service",
+                    ),
                     ("uninstall", "Disable one env in the background service"),
                 ],
             ),
@@ -2147,6 +2151,31 @@ pub fn service_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             vec![format!("{cmd} service restart mira")],
             &[],
+        ),
+        "refresh-daemon" => render_leaf(
+            "Refresh the OCM background service",
+            "Explicitly restart the OCM background service from the installed CLI while preserving persisted gateway desired state.",
+            vec![format!(
+                "{cmd} service refresh-daemon [--acknowledge-gateway-restarts] [--raw] [--json]"
+            )],
+            &[
+                (
+                    "--acknowledge-gateway-restarts",
+                    "Acknowledge that active managed gateways will be interrupted and restarted",
+                ),
+                (
+                    "--raw",
+                    "Force plain line output instead of the TTY receipt view",
+                ),
+                ("--json", "Print the daemon refresh summary as JSON"),
+            ],
+            vec![format!(
+                "{cmd} service refresh-daemon --acknowledge-gateway-restarts"
+            )],
+            &[
+                "Run this only in a maintenance window when service status reports a CLI/daemon version mismatch.",
+                "The command never rebuilds desired state before restarting the daemon.",
+            ],
         ),
         "uninstall" => render_leaf(
             "Disable an env in the background service",

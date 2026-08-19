@@ -5,6 +5,7 @@ use crate::infra::terminal::{
 use crate::service::{
     ServiceActionSummary, ServiceInstallSummary, ServiceSummary, ServiceSummaryList,
 };
+use crate::supervisor::SupervisorDaemonRefreshSummary;
 
 fn ocm_service_state(installed: bool, loaded: bool, running: bool) -> &'static str {
     if running {
@@ -78,7 +79,15 @@ fn service_overview_with_width(
     }
 
     if summary.services.is_empty() {
-        return vec!["No supervised env gateways.".to_string()];
+        return vec![
+            "No supervised env gateways.".to_string(),
+            format!(
+                "OCM versions: CLI {}, service {} ({})",
+                summary.ocm_cli_version,
+                summary.ocm_service_version.as_deref().unwrap_or("unknown"),
+                summary.ocm_service_version_status
+            ),
+        ];
     }
 
     let rows = summary
@@ -125,6 +134,26 @@ fn service_overview_with_width(
         Tone::Muted,
         profile.color,
     ));
+    lines.push(paint(
+        &format!(
+            "OCM versions: CLI {}, service {} ({})",
+            summary.ocm_cli_version,
+            summary.ocm_service_version.as_deref().unwrap_or("unknown"),
+            summary.ocm_service_version_status
+        ),
+        if matches!(
+            summary.ocm_service_version_status.as_str(),
+            "mismatch" | "unknown"
+        ) {
+            Tone::Warning
+        } else {
+            Tone::Muted
+        },
+        profile.color,
+    ));
+    if let Some(note) = summary.ocm_service_version_note.as_deref() {
+        lines.push(paint(note, Tone::Warning, profile.color));
+    }
     lines
 }
 
@@ -137,6 +166,15 @@ fn service_overview_raw(summary: &ServiceSummaryList) -> Vec<String> {
             summary.ocm_service_running
         )
     )];
+    lines.push(format!(
+        "ocmVersion cli={} service={} status={}",
+        summary.ocm_cli_version,
+        summary.ocm_service_version.as_deref().unwrap_or("unknown"),
+        summary.ocm_service_version_status
+    ));
+    if let Some(note) = summary.ocm_service_version_note.as_deref() {
+        lines.push(format!("ocmVersionNote: {note}"));
+    }
     for service in &summary.services {
         let mut bits = vec![
             service.env_name.clone(),
@@ -179,6 +217,23 @@ pub fn service_status(
     let mut summary_rows = vec![
         KeyValueRow::new("Gateway", gateway, state_tone(gateway)),
         KeyValueRow::new("OCM service", daemon, state_tone(daemon)),
+        KeyValueRow::plain("OCM CLI version", summary.ocm_cli_version.clone()),
+        KeyValueRow::new(
+            "OCM service version",
+            format!(
+                "{} ({})",
+                summary.ocm_service_version.as_deref().unwrap_or("unknown"),
+                summary.ocm_service_version_status
+            ),
+            if matches!(
+                summary.ocm_service_version_status.as_str(),
+                "mismatch" | "unknown"
+            ) {
+                Tone::Warning
+            } else {
+                Tone::Plain
+            },
+        ),
         KeyValueRow::plain("Binding", binding_label(summary)),
         KeyValueRow::accent("Port", summary.gateway_port.to_string()),
         KeyValueRow::plain("URL", gateway_url(summary.gateway_port)),
@@ -194,6 +249,14 @@ pub fn service_status(
         &summary_rows,
         profile.color,
     ));
+
+    if let Some(note) = summary.ocm_service_version_note.as_deref() {
+        lines.extend(render_key_value_card(
+            "OCM version",
+            &[KeyValueRow::warning("Action required", note.to_string())],
+            profile.color,
+        ));
+    }
 
     if let Some(issue) = summary.issue.as_deref() {
         lines.extend(render_key_value_card(
@@ -229,6 +292,21 @@ pub fn service_status(
 }
 
 fn service_status_next_steps(summary: &ServiceSummary, command_example: &str) -> Vec<KeyValueRow> {
+    if matches!(
+        summary.ocm_service_version_status.as_str(),
+        "mismatch" | "unknown"
+    ) {
+        return vec![
+            KeyValueRow::warning(
+                "Refresh daemon",
+                format!("{command_example} service refresh-daemon --acknowledge-gateway-restarts"),
+            ),
+            KeyValueRow::plain(
+                "Inspect",
+                format!("{command_example} service status {}", summary.env_name),
+            ),
+        ];
+    }
     if !summary.installed {
         return vec![
             KeyValueRow::accent(
@@ -294,6 +372,25 @@ fn service_status_raw(summary: &ServiceSummary) -> Vec<String> {
                 .unwrap_or_else(|| "unknown".to_string())
         ),
         format!("ocmService: {daemon}"),
+        format!("ocmCliVersion: {}", summary.ocm_cli_version),
+        format!(
+            "ocmServiceVersion: {}",
+            summary
+                .ocm_service_version
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        format!(
+            "ocmServiceVersionStatus: {}",
+            summary.ocm_service_version_status
+        ),
+        format!(
+            "ocmServiceVersionNote: {}",
+            summary
+                .ocm_service_version_note
+                .clone()
+                .unwrap_or_else(|| "none".to_string())
+        ),
         format!(
             "childPid: {}",
             summary
@@ -382,6 +479,54 @@ pub fn service_action(
     if !next.is_empty() {
         lines.extend(render_key_value_card("Next", &next, profile.color));
     }
+    lines
+}
+
+pub fn service_daemon_refreshed(
+    summary: &SupervisorDaemonRefreshSummary,
+    profile: RenderProfile,
+) -> Vec<String> {
+    if !profile.pretty {
+        return vec![
+            format!("action: {}", summary.daemon.action),
+            format!(
+                "gatewayInterruptionExpected: {}",
+                summary.gateway_interruption_expected
+            ),
+            format!(
+                "gatewayInterruptionAcknowledged: {}",
+                summary.gateway_interruption_acknowledged
+            ),
+            format!("note: {}", summary.note),
+        ];
+    }
+
+    let mut lines = vec![paint(
+        "Refreshed OCM background service",
+        Tone::Strong,
+        profile.color,
+    )];
+    lines.extend(render_key_value_card(
+        "Result",
+        &[
+            KeyValueRow::plain("Action", summary.daemon.action.clone()),
+            KeyValueRow::new(
+                "OCM service",
+                if summary.daemon.running {
+                    "running"
+                } else {
+                    "not running"
+                },
+                if summary.daemon.running {
+                    Tone::Success
+                } else {
+                    Tone::Warning
+                },
+            ),
+            KeyValueRow::warning("Gateway impact", summary.note.clone()),
+        ],
+        profile.color,
+    ));
     lines
 }
 
@@ -580,6 +725,10 @@ mod tests {
             ocm_service_running: true,
             ocm_service_pid: Some(42),
             ocm_service_state: Some("running".to_string()),
+            ocm_cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            ocm_service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            ocm_service_version_status: "current".to_string(),
+            ocm_service_version_note: None,
             child_pid: Some(99),
             child_restart_count: Some(0),
             child_port: Some(18789),
@@ -603,6 +752,10 @@ mod tests {
                 ocm_service_running: true,
                 ocm_service_pid: Some(42),
                 ocm_service_state: Some("running".to_string()),
+                ocm_cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                ocm_service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                ocm_service_version_status: "current".to_string(),
+                ocm_service_version_note: None,
                 services: vec![sample_service()],
             },
             RenderProfile::pretty(false),
