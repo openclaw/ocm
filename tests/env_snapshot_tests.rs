@@ -35,6 +35,7 @@ fn write_running_snapshot_service(
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: env.get("OCM_HOME").unwrap().clone(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "source".to_string(),
@@ -70,6 +71,7 @@ fn write_empty_snapshot_service(runtime_path: &Path, ocm_home: &str) {
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: Vec::new(),
         children: Vec::new(),

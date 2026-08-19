@@ -1023,6 +1023,10 @@ pub fn service_help(cmd: &str) -> String {
                         "restart",
                         "Restart one env gateway under the background service",
                     ),
+                    (
+                        "refresh-daemon",
+                        "Explicitly activate the installed CLI in the background service",
+                    ),
                     ("uninstall", "Disable one env in the background service"),
                 ],
             ),
@@ -1883,7 +1887,7 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
             "Build a local OpenClaw package runtime",
             "Run the local OpenClaw package build/pack path and install the produced tarball as an OCM-managed runtime.",
             vec![format!(
-                "{cmd} runtime build-local <name> --repo <openclaw-repo> [--include-source-extensions] [--description <text>] [--force] [--raw] [--json]"
+                "{cmd} runtime build-local <name> --repo <openclaw-repo> [--include-source-extensions | --for-env <env>] [--description <text>] [--force] [--raw] [--json]"
             )],
             &[
                 (
@@ -1893,6 +1897,10 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
                 (
                     "--include-source-extensions",
                     "Include built extensions omitted from the release-shaped core package",
+                ),
+                (
+                    "--for-env <env>",
+                    "Include the source-plugin closure required by one target environment",
                 ),
                 ("--description <text>", "Optional human description"),
                 (
@@ -1910,10 +1918,15 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!(
                     "{cmd} runtime build-local upstream-main --repo /path/to/openclaw --include-source-extensions --force"
                 ),
+                format!(
+                    "{cmd} runtime build-local primary-test --repo /path/to/openclaw --for-env primary --force"
+                ),
             ],
             &[
                 "`build-local` uses `npm pack` so OpenClaw's prepack script performs the release-style build, UI build, package inventory, and built entry smoke checks.",
                 "By default the result remains release-shaped. `--include-source-extensions` adds only built extensions from the selected checkout that the core tarball omitted, together with their installed runtime dependencies.",
+                "`--for-env` resolves the target config before the build, validates its plugin references against the selected checkout and installed-plugin records, and adds only required omitted source plugins plus transitive local plugin dependencies.",
+                "`--for-env` and `--include-source-extensions` are mutually exclusive.",
                 "Source-extension runtimes can take longer to build and use substantially more disk space than the release-shaped default.",
                 "The resulting runtime is installed under OCM's package runtime layout: files/node_modules/openclaw/openclaw.mjs.",
                 "Use this when testing release and upgrade behavior from a local checkout without source/Jiti execution paths.",
@@ -2147,6 +2160,31 @@ pub fn service_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             vec![format!("{cmd} service restart mira")],
             &[],
+        ),
+        "refresh-daemon" => render_leaf(
+            "Refresh the OCM background service",
+            "Explicitly restart the OCM background service from the installed CLI while preserving persisted gateway desired state.",
+            vec![format!(
+                "{cmd} service refresh-daemon [--acknowledge-gateway-restarts] [--raw] [--json]"
+            )],
+            &[
+                (
+                    "--acknowledge-gateway-restarts",
+                    "Acknowledge that active managed gateways will be interrupted and restarted",
+                ),
+                (
+                    "--raw",
+                    "Force plain line output instead of the TTY receipt view",
+                ),
+                ("--json", "Print the daemon refresh summary as JSON"),
+            ],
+            vec![format!(
+                "{cmd} service refresh-daemon --acknowledge-gateway-restarts"
+            )],
+            &[
+                "Run this only in a maintenance window when service status reports a CLI/daemon version mismatch.",
+                "The command never rebuilds desired state before restarting the daemon.",
+            ],
         ),
         "uninstall" => render_leaf(
             "Disable an env in the background service",

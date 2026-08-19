@@ -65,6 +65,10 @@ pub struct ServiceSummary {
     pub ocm_service_running: bool,
     pub ocm_service_pid: Option<u32>,
     pub ocm_service_state: Option<String>,
+    pub ocm_cli_version: String,
+    pub ocm_service_version: Option<String>,
+    pub ocm_service_version_status: String,
+    pub ocm_service_version_note: Option<String>,
     pub child_pid: Option<u32>,
     pub child_restart_count: Option<usize>,
     pub child_port: Option<u32>,
@@ -86,11 +90,16 @@ pub struct ServiceSummaryList {
     pub ocm_service_running: bool,
     pub ocm_service_pid: Option<u32>,
     pub ocm_service_state: Option<String>,
+    pub ocm_cli_version: String,
+    pub ocm_service_version: Option<String>,
+    pub ocm_service_version_status: String,
+    pub ocm_service_version_note: Option<String>,
     pub services: Vec<ServiceSummary>,
 }
 
 struct ServiceSnapshot {
     daemon: SupervisorDaemonSummary,
+    daemon_version: Option<String>,
     planned_children: BTreeMap<String, SupervisorChildSpec>,
     skipped_envs: BTreeMap<String, String>,
     runtime_children: BTreeMap<String, SupervisorRuntimeChild>,
@@ -106,6 +115,8 @@ pub fn list_services(
     envs.sort_by(|left, right| left.name.cmp(&right.name));
 
     let snapshot = load_service_snapshot(env, cwd)?;
+    let version =
+        ocm_service_version_contract(&snapshot.daemon, snapshot.daemon_version.as_deref());
 
     let mut services = Vec::with_capacity(envs.len());
     for meta in envs {
@@ -125,6 +136,10 @@ pub fn list_services(
         ocm_service_running: snapshot.daemon.running,
         ocm_service_pid: snapshot.daemon.pid,
         ocm_service_state: snapshot.daemon.state,
+        ocm_cli_version: version.cli_version,
+        ocm_service_version: version.service_version,
+        ocm_service_version_status: version.status,
+        ocm_service_version_note: version.note,
         services,
     })
 }
@@ -148,6 +163,7 @@ fn load_service_snapshot(
     let supervisor = SupervisorService::new(env, cwd);
     let SupervisorInspection {
         daemon,
+        daemon_version,
         planned_children,
         skipped_envs,
         runtime_children,
@@ -156,6 +172,7 @@ fn load_service_snapshot(
 
     Ok(ServiceSnapshot {
         daemon,
+        daemon_version,
         planned_children: planned_children
             .into_iter()
             .map(|child| (child.env_name.clone(), child))
@@ -187,6 +204,7 @@ fn build_service_summary(
     let runtime_child = snapshot.runtime_children.get(&meta.name);
     let runtime_service = snapshot.runtime_services.get(&meta.name);
     let daemon = &snapshot.daemon;
+    let version = ocm_service_version_contract(daemon, snapshot.daemon_version.as_deref());
     let (gateway_port, _) = env_service.resolve_effective_gateway_port(meta)?;
     let resolved_process = resolve_summary_process(env_service, &meta.name, planned_child);
     let resolved_issue = resolved_process
@@ -299,6 +317,10 @@ fn build_service_summary(
         ocm_service_running: daemon.running,
         ocm_service_pid: daemon.pid,
         ocm_service_state: daemon.state.clone(),
+        ocm_cli_version: version.cli_version,
+        ocm_service_version: version.service_version,
+        ocm_service_version_status: version.status,
+        ocm_service_version_note: version.note,
         child_pid: runtime_child.map(|child| child.pid),
         child_restart_count: runtime_service.map(|child| child.restart_count),
         child_port: runtime_child.map(|child| child.child_port),
@@ -322,6 +344,49 @@ fn build_service_summary(
             .or(Some(fallback_stderr)),
         issue,
     })
+}
+
+struct OcmServiceVersionContract {
+    cli_version: String,
+    service_version: Option<String>,
+    status: String,
+    note: Option<String>,
+}
+
+fn ocm_service_version_contract(
+    daemon: &SupervisorDaemonSummary,
+    daemon_version: Option<&str>,
+) -> OcmServiceVersionContract {
+    let cli_version = env!("CARGO_PKG_VERSION").to_string();
+    let service_version = daemon_version.map(str::to_string);
+    let (status, note) = if !daemon.running {
+        ("stopped".to_string(), None)
+    } else if let Some(service_version) = daemon_version {
+        if service_version == cli_version {
+            ("current".to_string(), None)
+        } else {
+            (
+                "mismatch".to_string(),
+                Some(format!(
+                    "OCM CLI {cli_version} differs from running background service {service_version}; during a maintenance window run `ocm service refresh-daemon --acknowledge-gateway-restarts`"
+                )),
+            )
+        }
+    } else {
+        (
+            "unknown".to_string(),
+            Some(format!(
+                "running OCM background service does not report its version; during a maintenance window run `ocm service refresh-daemon --acknowledge-gateway-restarts` to activate CLI {cli_version}"
+            )),
+        )
+    };
+
+    OcmServiceVersionContract {
+        cli_version,
+        service_version,
+        status,
+        note,
+    }
 }
 
 fn resolve_summary_process(

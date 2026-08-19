@@ -288,6 +288,14 @@ impl Cli {
         let (args, force) = Self::consume_flag(args, "--force");
         let (args, include_source_extensions) =
             Self::consume_flag(args, "--include-source-extensions");
+        let (args, target_env) = Self::consume_option(args, "--for-env")?;
+        let target_env = Self::require_option_value(target_env, "--for-env")?;
+        if include_source_extensions && target_env.is_some() {
+            return Err(
+                "runtime build-local accepts only one of --include-source-extensions or --for-env"
+                    .to_string(),
+            );
+        }
         let (args, repo) = Self::consume_option(args, "--repo")?;
         let repo = Self::require_option_value(repo, "--repo")?;
         let Some(repo) = repo else {
@@ -307,6 +315,7 @@ impl Cli {
                     description,
                     force,
                     include_source_extensions,
+                    target_env,
                 })
         })?;
 

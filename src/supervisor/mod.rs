@@ -148,6 +148,16 @@ pub struct SupervisorDaemonSummary {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SupervisorDaemonRefreshSummary {
+    #[serde(flatten)]
+    pub daemon: SupervisorDaemonSummary,
+    pub gateway_interruption_acknowledged: bool,
+    pub gateway_interruption_expected: bool,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SupervisorChildRunResult {
     pub env_name: String,
     pub binding_kind: String,
@@ -185,6 +195,8 @@ pub struct SupervisorRuntimeChild {
 pub struct SupervisorRuntimeState {
     pub kind: String,
     pub ocm_home: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
     pub services: Vec<SupervisorRuntimeService>,
@@ -220,6 +232,7 @@ pub struct SupervisorRuntimeView {
     pub present: bool,
     pub kind: String,
     pub ocm_home: String,
+    pub daemon_version: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
     pub children: Vec<SupervisorRuntimeChild>,
@@ -228,6 +241,7 @@ pub struct SupervisorRuntimeView {
 #[derive(Clone, Debug)]
 pub struct SupervisorInspection {
     pub daemon: SupervisorDaemonSummary,
+    pub daemon_version: Option<String>,
     pub planned_children: Vec<SupervisorChildSpec>,
     pub skipped_envs: Vec<SkippedSupervisorEnv>,
     pub runtime_children: Vec<SupervisorRuntimeChild>,
@@ -365,6 +379,7 @@ impl<'a> SupervisorService<'a> {
                 present: false,
                 kind: SUPERVISOR_RUNTIME_KIND.to_string(),
                 ocm_home: display_path(&ocm_home),
+                daemon_version: None,
                 updated_at: now_utc(),
                 children: Vec::new(),
             });
@@ -376,6 +391,7 @@ impl<'a> SupervisorService<'a> {
             present: true,
             kind: runtime.kind,
             ocm_home: runtime.ocm_home,
+            daemon_version: runtime.daemon_version,
             updated_at: runtime.updated_at,
             children: runtime.children,
         })
@@ -392,6 +408,9 @@ impl<'a> SupervisorService<'a> {
 
         Ok(SupervisorInspection {
             daemon,
+            daemon_version: runtime
+                .as_ref()
+                .and_then(|runtime| runtime.daemon_version.clone()),
             planned_children: state.children,
             skipped_envs: state.skipped_envs,
             runtime_children: runtime
@@ -413,6 +432,45 @@ impl<'a> SupervisorService<'a> {
     pub fn install_daemon(&self) -> Result<SupervisorDaemonSummary, String> {
         let _lifecycle_lock = self.lock_daemon_lifecycle()?;
         self.refresh_daemon("install")
+    }
+
+    pub fn refresh_daemon_explicit(
+        &self,
+        acknowledge_gateway_restarts: bool,
+    ) -> Result<SupervisorDaemonRefreshSummary, String> {
+        let _lifecycle_lock = self.lock_daemon_lifecycle()?;
+        let before = self.daemon_status()?;
+        if !before.installed {
+            return Err(
+                "OCM background service is not installed; install an environment service first"
+                    .to_string(),
+            );
+        }
+
+        let gateway_interruption_expected =
+            before.running && self.has_desired_running_services()?;
+        if gateway_interruption_expected && !acknowledge_gateway_restarts {
+            return Err(
+                "refreshing the OCM background service interrupts managed gateways; rerun during a maintenance window with --acknowledge-gateway-restarts"
+                    .to_string(),
+            );
+        }
+
+        // Preserve the persisted desired state exactly. Rebuilding it here could
+        // apply unrelated latent drift before the daemon handoff.
+        let daemon = self.activate_daemon("refresh")?;
+        Ok(SupervisorDaemonRefreshSummary {
+            daemon,
+            gateway_interruption_acknowledged: acknowledge_gateway_restarts,
+            gateway_interruption_expected,
+            note: if gateway_interruption_expected {
+                "OCM background service refreshed; managed gateways were interrupted and will converge from the preserved desired state"
+                    .to_string()
+            } else {
+                "OCM background service refreshed without active managed gateway interruption"
+                    .to_string()
+            },
+        })
     }
 
     pub fn ensure_daemon_running(&self) -> Result<SupervisorDaemonSummary, String> {
@@ -2268,6 +2326,7 @@ fn write_supervisor_runtime_state(
         &SupervisorRuntimeState {
             kind: SUPERVISOR_RUNTIME_KIND.to_string(),
             ocm_home: ocm_home.to_string(),
+            daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             updated_at: now_utc(),
             services,
             children,

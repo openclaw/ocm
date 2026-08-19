@@ -57,6 +57,8 @@ pub struct BuildLocalRuntimeOptions {
     pub description: Option<String>,
     pub force: bool,
     pub include_source_extensions: bool,
+    /// Existing environment whose configured source-plugin closure must be packaged.
+    pub target_env: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -434,6 +436,7 @@ impl<'a> RuntimeService<'a> {
                     description: options.description,
                     force: options.force,
                     include_source_extensions: options.include_source_extensions,
+                    target_env: options.target_env,
                 },
                 InstallContext {
                     env: self.env,

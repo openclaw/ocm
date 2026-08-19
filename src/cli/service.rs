@@ -156,6 +156,25 @@ impl Cli {
         Ok(0)
     }
 
+    pub(super) fn handle_service_refresh_daemon(&self, args: Vec<String>) -> Result<i32, String> {
+        let (args, json_flag, profile) =
+            self.consume_human_output_flags(args, "service refresh-daemon")?;
+        let (args, acknowledge_gateway_restarts) =
+            Self::consume_flag(args, "--acknowledge-gateway-restarts");
+        Self::assert_no_extra_args(&args)?;
+
+        let summary = self
+            .supervisor_service()
+            .refresh_daemon_explicit(acknowledge_gateway_restarts)?;
+        if json_flag {
+            self.print_json(&summary)?;
+            return Ok(0);
+        }
+
+        self.stdout_lines(render::service::service_daemon_refreshed(&summary, profile));
+        Ok(0)
+    }
+
     pub(super) fn dispatch_service_command(
         &self,
         action: &str,
@@ -167,6 +186,7 @@ impl Cli {
             "start" => self.handle_service_start(rest),
             "stop" => self.handle_service_stop(rest),
             "restart" => self.handle_service_restart(rest),
+            "refresh-daemon" => self.handle_service_refresh_daemon(rest),
             "uninstall" => self.handle_service_uninstall(rest),
             _ => Err(format!("unknown service command: {action}")),
         }

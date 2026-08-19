@@ -1,7 +1,7 @@
 mod support;
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
-use ocm::store::{env_registry_path, now_utc, supervisor_runtime_path};
+use fs2::FileExt;
+use ocm::store::{env_registry_path, now_utc, supervisor_runtime_path, supervisor_state_path};
 use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
 use serde_json::Value;
 use sha2::{Digest, Sha512};
@@ -24,7 +25,14 @@ use crate::support::{
 };
 
 const PREPARE_DELAY: Duration = Duration::from_millis(1_500);
-const FINALIZE_DELAY: Duration = Duration::from_millis(1_500);
+const TARGET_CONFIG_DELAY_SECONDS: &str = "0.11";
+const CONFIG_SNAPSHOT_DELAY_SECONDS: &str = "0.13";
+const DOCTOR_DELAY_SECONDS: &str = "0.17";
+const PLUGIN_DELAY_SECONDS: &str = "0.19";
+const TARGET_CONVERGENCE_DELAY_SECONDS: &str = "0.23";
+const COMPLETION_DELAY_SECONDS: &str = "0.29";
+const FINALIZER_AND_PUBLICATION_DELAY: Duration = Duration::from_millis(1_830);
+const GATEWAY_STARTUP_DELAY: Duration = Duration::from_millis(370);
 
 #[derive(Clone, Default)]
 struct Timeline(Arc<Mutex<HashMap<&'static str, Instant>>>);
@@ -232,6 +240,7 @@ fn write_running_supervisor_runtime(
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -267,6 +276,7 @@ fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: Vec::new(),
         children: Vec::new(),
@@ -283,6 +293,7 @@ case "$1" in
     exit 0
     ;;
   config)
+    sleep "${{OCM_TEST_TARGET_CONFIG_VALIDATE_DELAY:-0}}"
     printf 'Config valid\n'
     exit 0
     ;;
@@ -292,13 +303,33 @@ case "$1" in
     ;;
   update)
     if [ "$2" = "finalize" ]; then
+      if [ "$OPENCLAW_UPDATE_POST_CORE" != "1" ]; then
+        printf 'missing post-core capability handshake\n' >&2
+        exit 32
+      fi
       : > "$OCM_TEST_UPDATE_FINALIZE_STARTED"
       while [ ! -e "$OCM_TEST_UPDATE_FINALIZE_RELEASE" ]; do
         sleep 0.01
       done
-      printf '{{"status":"ok","mode":"finalize"}}\n'
+      sleep "${{OCM_TEST_TARGET_CONFIG_VALIDATE_DELAY:-0}}"
+      sleep "${{OCM_TEST_CONFIG_SNAPSHOT_DELAY:-0}}"
+      sleep "${{OCM_TEST_DOCTOR_DELAY:-0}}"
+      sleep "${{OCM_TEST_PLUGIN_DELAY:-0}}"
+      sleep "${{OCM_TEST_TARGET_CONFIG_CONVERGENCE_DELAY:-0}}"
+      printf 'prepared\n' > "$OCM_TEST_COMPLETION_INPUT"
+      printf '{{"status":"ok","mode":"finalize","phaseTimings":[{{"phase":"targetConfigValidation","startedOffsetMs":0,"durationMs":110,"outcome":"completed"}},{{"phase":"configSnapshot","startedOffsetMs":110,"durationMs":130,"outcome":"completed"}},{{"phase":"doctor","startedOffsetMs":240,"durationMs":170,"outcome":"completed"}},{{"phase":"plugins","startedOffsetMs":410,"durationMs":190,"outcome":"completed"}},{{"phase":"targetConfigConvergence","startedOffsetMs":600,"durationMs":230,"outcome":"completed"}},{{"phase":"completionCache","startedOffsetMs":830,"durationMs":0,"outcome":"deferred"}}]}}\n'
       exit 0
     fi
+    ;;
+  completion)
+    : > "$OCM_TEST_COMPLETION_STARTED"
+    if [ "$(cat "$OCM_TEST_COMPLETION_INPUT")" != "committed" ]; then
+      printf 'completion used stale prepared input\n' >&2
+      exit 31
+    fi
+    sleep "${{OCM_TEST_COMPLETION_DELAY:-0}}"
+    printf 'Completion cache written\n'
+    exit 0
     ;;
   gateway)
     printf '{{"rpc":{{"ok":true}}}}\n'
@@ -399,7 +430,7 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
     let env_json: Value = serde_json::from_slice(&env_show.stdout).unwrap();
     let snapshot_fixture = PathBuf::from(env_json["root"].as_str().unwrap()).join("fanout");
     fs::create_dir_all(&snapshot_fixture).unwrap();
-    for index in 0..20_000 {
+    for index in 0..2_000 {
         fs::write(
             snapshot_fixture.join(format!("entry-{index:05}")),
             b"snapshot fixture\n",
@@ -417,8 +448,41 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
         "OCM_TEST_UPDATE_FINALIZE_RELEASE".to_string(),
         path_string(&finalize_release),
     );
+    let completion_started = root.child("completion-started");
+    let completion_input = root.child("completion-input");
+    env.insert(
+        "OCM_TEST_COMPLETION_STARTED".to_string(),
+        path_string(&completion_started),
+    );
+    env.insert(
+        "OCM_TEST_COMPLETION_INPUT".to_string(),
+        path_string(&completion_input),
+    );
+    for (key, value) in [
+        (
+            "OCM_TEST_TARGET_CONFIG_VALIDATE_DELAY",
+            TARGET_CONFIG_DELAY_SECONDS,
+        ),
+        (
+            "OCM_TEST_CONFIG_SNAPSHOT_DELAY",
+            CONFIG_SNAPSHOT_DELAY_SECONDS,
+        ),
+        ("OCM_TEST_DOCTOR_DELAY", DOCTOR_DELAY_SECONDS),
+        ("OCM_TEST_PLUGIN_DELAY", PLUGIN_DELAY_SECONDS),
+        (
+            "OCM_TEST_TARGET_CONFIG_CONVERGENCE_DELAY",
+            TARGET_CONVERGENCE_DELAY_SECONDS,
+        ),
+        ("OCM_TEST_COMPLETION_DELAY", COMPLETION_DELAY_SECONDS),
+    ] {
+        env.insert(key.to_string(), value.to_string());
+    }
 
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    let supervisor_lock_path = supervisor_state_path(&env, &cwd)
+        .unwrap()
+        .with_extension("lock");
+    fs::create_dir_all(supervisor_lock_path.parent().unwrap()).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     write_running_supervisor_runtime(&runtime_path, &ocm_home, "stable", 4242, health_server.port);
@@ -429,6 +493,8 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
     let observer_timeline = timeline.clone();
     let observer_runtime_path = runtime_path.clone();
     let observer_ocm_home = ocm_home.clone();
+    let observer_completion_started = completion_started.clone();
+    let observer_completion_input = completion_input.clone();
     let registry_path = env_registry_path(&env, &cwd).unwrap();
     let health_port = health_server.port;
     let observer = thread::spawn(move || {
@@ -437,6 +503,8 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
             let running = env_desired_running(&registry_path, last_running);
             if running != last_running {
                 if running {
+                    sleep(GATEWAY_STARTUP_DELAY);
+                    fs::write(&observer_completion_input, b"committed\n").unwrap();
                     write_running_supervisor_runtime(
                         &observer_runtime_path,
                         &observer_ocm_home,
@@ -452,6 +520,9 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
                     observer_timeline.mark("service_stopped");
                 }
                 last_running = running;
+            }
+            if observer_completion_started.exists() {
+                observer_timeline.mark("completion_started");
             }
             sleep(Duration::from_millis(1));
         }
@@ -471,15 +542,25 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
 
     let finalize_timeline = timeline.clone();
     let finalize_releaser = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(180);
         while !finalize_started.exists() {
             assert!(Instant::now() < deadline, "finalization never started");
             sleep(Duration::from_millis(5));
         }
         finalize_timeline.mark("finalization_started");
-        sleep(FINALIZE_DELAY);
+        let supervisor_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(supervisor_lock_path)
+            .unwrap();
+        supervisor_lock.lock_exclusive().unwrap();
         fs::write(finalize_release, b"release\n").unwrap();
         finalize_timeline.mark("finalization_released");
+        sleep(FINALIZER_AND_PUBLICATION_DELAY);
+        FileExt::unlock(&supervisor_lock).unwrap();
+        finalize_timeline.mark("publication_released");
     });
 
     timeline.mark("command_started");
@@ -499,7 +580,9 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
     let service_stopped = timeline.at("service_stopped");
     let finalization_started = timeline.at("finalization_started");
     let finalization_released = timeline.at("finalization_released");
+    let publication_released = timeline.at("publication_released");
     let target_ready = timeline.at("target_ready");
+    let completion_started = timeline.at("completion_started");
     let report = timeline.report(origin);
 
     let command_started = timeline.at("command_started");
@@ -535,9 +618,103 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
         finalization_released <= target_ready,
         "target became ready before finalization completed; {report}"
     );
+    assert!(
+        publication_released <= target_ready,
+        "target became ready before supervisor publication was released; {report}"
+    );
+    assert!(
+        target_ready <= completion_started,
+        "completion cache refresh started before the target was ready; {report}"
+    );
     let downtime = target_ready.duration_since(service_stopped);
     eprintln!(
         "availability proof: stop-to-ready={:.3}s {report}",
         downtime.as_secs_f64()
+    );
+
+    let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+    assert!(history.status.success(), "{}", stderr(&history));
+    let history_json: Value = serde_json::from_slice(&history.stdout).unwrap();
+    let phases = history_json[0]["phases"]
+        .as_array()
+        .expect("upgrade receipt must include structured phase timings");
+    eprintln!("phase receipt: {}", serde_json::to_string(phases).unwrap());
+    let phase = |owner: &str, name: &str, window: &str| {
+        phases
+            .iter()
+            .find(|phase| {
+                phase["owner"] == owner && phase["phase"] == name && phase["window"] == window
+            })
+            .unwrap_or_else(|| panic!("missing {owner}/{name}/{window} timing: {history_json}"))
+    };
+    for (owner, name, window) in [
+        ("ocm", "preparation", "preparation"),
+        ("ocm", "snapshotPreparation", "preparation"),
+        ("ocm", "quiescenceSnapshot", "stopped"),
+        ("ocm", "targetConfigValidation", "stopped"),
+        ("openclaw", "targetConfigValidation", "stopped"),
+        ("openclaw", "configSnapshot", "stopped"),
+        ("openclaw", "doctor", "stopped"),
+        ("openclaw", "plugins", "stopped"),
+        ("openclaw", "targetConfigConvergence", "stopped"),
+        ("openclaw", "completionCache", "stopped"),
+        ("ocm", "bindingPublish", "stopped"),
+        ("ocm", "supervisorConvergence", "stopped"),
+        ("ocm", "processSpawn", "stopped"),
+        ("ocm", "httpReady", "stopped"),
+        ("ocm", "completionCache", "post-ready"),
+        ("ocm", "deepVerification", "post-ready"),
+    ] {
+        let _ = phase(owner, name, window);
+    }
+    assert_eq!(
+        phase("openclaw", "completionCache", "stopped")["outcome"],
+        "deferred"
+    );
+    assert_eq!(
+        phase("ocm", "completionCache", "post-ready")["outcome"],
+        "completed"
+    );
+    for (name, expected_duration_ms) in [
+        ("targetConfigValidation", 110),
+        ("configSnapshot", 130),
+        ("doctor", 170),
+        ("plugins", 190),
+        ("targetConfigConvergence", 230),
+    ] {
+        assert_eq!(
+            phase("openclaw", name, "stopped")["durationMs"],
+            expected_duration_ms,
+            "controlled delay was attributed to the wrong phase"
+        );
+    }
+    let phase_start = |owner: &str, name: &str, window: &str| {
+        phase(owner, name, window)["startedOffsetMs"]
+            .as_u64()
+            .unwrap()
+    };
+    let phase_end = |owner: &str, name: &str, window: &str| {
+        let timing = phase(owner, name, window);
+        timing["startedOffsetMs"].as_u64().unwrap() + timing["durationMs"].as_u64().unwrap()
+    };
+    assert!(
+        phase_end("ocm", "preparation", "preparation")
+            <= phase_start("ocm", "snapshotPreparation", "preparation")
+    );
+    assert!(
+        phase_end("ocm", "snapshotPreparation", "preparation")
+            <= phase_start("ocm", "quiescenceSnapshot", "stopped")
+    );
+    assert!(
+        phase_end("openclaw", "targetConfigConvergence", "stopped")
+            <= phase_start("ocm", "bindingPublish", "stopped")
+    );
+    assert!(
+        phase_end("ocm", "httpReady", "stopped")
+            <= phase_start("ocm", "completionCache", "post-ready")
+    );
+    assert!(
+        phase_end("ocm", "completionCache", "post-ready")
+            <= phase_start("ocm", "deepVerification", "post-ready")
     );
 }
