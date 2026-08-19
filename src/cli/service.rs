@@ -110,12 +110,15 @@ impl Cli {
     pub(super) fn handle_service_restart(&self, args: Vec<String>) -> Result<i32, String> {
         let (args, json_flag, profile) =
             self.consume_human_output_flags(args, "service restart")?;
+        let (args, force) = Self::consume_flag(args, "--force");
         let Some(name) = args.first() else {
             return Err("service restart requires <env>".to_string());
         };
         Self::assert_no_extra_args(&args[1..])?;
 
-        let summary = self.service_service().restart_action(name)?;
+        let summary = self
+            .service_service()
+            .restart_action_with_options(name, crate::service::ServiceRestartOptions { force })?;
         let code = if summary.gateway_ready == Some(false) {
             1
         } else {

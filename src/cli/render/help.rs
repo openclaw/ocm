@@ -2149,9 +2149,15 @@ pub fn service_command_help(cmd: &str, action: &str) -> Option<String> {
         ),
         "restart" => render_leaf(
             "Restart an env under the background service",
-            "Restart one env under the shared OCM background service.",
-            vec![format!("{cmd} service restart <env> [--raw] [--json]")],
+            "Restart one env immediately through OpenClaw's recovery handoff so eligible interrupted work can resume after startup.",
+            vec![format!(
+                "{cmd} service restart <env> [--force] [--raw] [--json]"
+            )],
             &[
+                (
+                    "--force",
+                    "Bypass OpenClaw restart recovery and replace the supervised child directly",
+                ),
                 (
                     "--raw",
                     "Force plain line output instead of the TTY receipt view",
@@ -2159,7 +2165,11 @@ pub fn service_command_help(cmd: &str, action: &str) -> Option<String> {
                 ("--json", "Print the action summary as JSON"),
             ],
             vec![format!("{cmd} service restart mira")],
-            &[],
+            &[
+                "The default restart does not wait for active work; OpenClaw records eligible interrupted work for recovery before exiting.",
+                "Gateways without recovery handoff support keep the legacy direct-restart behavior and emit a warning.",
+                "Use --force only to bypass a recovery handoff that is advertised but unhealthy.",
+            ],
         ),
         "refresh-daemon" => render_leaf(
             "Refresh the OCM background service",
