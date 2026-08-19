@@ -1532,6 +1532,62 @@ fn daemon_stops_the_full_dev_process_tree_after_service_stop() {
     stop_process(&mut daemon);
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_cleans_descendants_after_a_child_exits_before_restart() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-exit-process-group-cleanup");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let service = SupervisorService::new(&env, &cwd);
+
+    let starts = root.child("starts.txt");
+    let descendant_pid_file = root.child("descendant.pid");
+    let script = root.child("bin/openclaw.mjs");
+    write_legacy_openclaw_script(
+        &script,
+        &format!(
+            "#!/bin/sh\ncount=0\nif [ -f '{starts}' ]; then count=$(cat '{starts}'); fi\ncount=$((count + 1))\nprintf '%s\n' \"$count\" > '{starts}'\nif [ \"$count\" -eq 1 ]; then\n  trap '' HUP\n  sleep 60 &\n  printf '%s\n' \"$!\" > '{descendant_pid_file}'\n  sleep 1\n  exit 1\nfi\nsleep 10\n",
+            starts = path_string(&starts),
+            descendant_pid_file = path_string(&descendant_pid_file),
+        ),
+    );
+
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "dev", "--command", &path_string(&script)],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo", "--launcher", "dev"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    set_service_enabled(&cwd, &env, "demo", true);
+    service.sync().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    assert!(wait_for_file(&descendant_pid_file, Duration::from_secs(5)));
+    let descendant_pid = fs::read_to_string(&descendant_pid_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert!(process_exists(descendant_pid));
+
+    assert!(wait_for_file_value(&starts, "2", Duration::from_secs(5)));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && process_exists(descendant_pid) {
+        sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_exists(descendant_pid),
+        "background descendant still alive after supervised child exit"
+    );
+
+    stop_process(&mut daemon);
+}
+
 #[test]
 fn daemon_restarts_quick_clean_exit_with_openclaw_handoff() {
     let _guard = daemon_runtime_test_lock();
