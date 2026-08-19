@@ -56,6 +56,15 @@ pub fn self_update(summary: &SelfUpdateSummary, profile: RenderProfile, cmd: &st
         ));
     } else if matches!(summary.status, SelfUpdateStatus::Updated) {
         next.push(KeyValueRow::accent("Run", format!("{cmd} --version")));
+        if summary.daemon_refresh_required {
+            next.push(KeyValueRow::warning(
+                "Refresh daemon",
+                format!("{cmd} service refresh-daemon --acknowledge-gateway-restarts"),
+            ));
+        }
+    }
+    if let Some(note) = summary.daemon_refresh_note.as_deref() {
+        next.push(KeyValueRow::warning("Background service", note.to_string()));
     }
     if !next.is_empty() {
         push_card(&mut lines, "Next", next, profile.color);
@@ -75,6 +84,13 @@ fn self_update_raw(summary: &SelfUpdateSummary) -> Vec<String> {
     lines.insert("targetVersion".to_string(), summary.target_version.clone());
     lines.insert("binaryPath".to_string(), summary.binary_path.clone());
     lines.insert("assetName".to_string(), summary.asset_name.clone());
+    lines.insert(
+        "daemonRefreshRequired".to_string(),
+        summary.daemon_refresh_required.to_string(),
+    );
+    if let Some(note) = summary.daemon_refresh_note.as_ref() {
+        lines.insert("daemonRefreshNote".to_string(), note.clone());
+    }
     format_key_value_lines(lines)
 }
 

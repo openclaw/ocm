@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::infra::archive::extract_tar_gz;
 use crate::infra::download::{download_to_file, verify_file_sha256};
+use crate::store::resolve_ocm_home;
 
 use super::{Cli, render};
 
@@ -57,6 +58,8 @@ pub(crate) struct SelfUpdateSummary {
     pub target_version: String,
     pub binary_path: String,
     pub asset_name: String,
+    pub daemon_refresh_required: bool,
+    pub daemon_refresh_note: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -264,6 +267,8 @@ impl Cli {
             target_version,
             binary_path: binary_path.to_string_lossy().into_owned(),
             asset_name,
+            daemon_refresh_required: false,
+            daemon_refresh_note: None,
         })
     }
 
@@ -282,6 +287,8 @@ impl Cli {
                 target_version,
                 binary_path: binary_path.to_string_lossy().into_owned(),
                 asset_name,
+                daemon_refresh_required: false,
+                daemon_refresh_note: None,
             });
         }
 
@@ -324,6 +331,9 @@ impl Cli {
             )
         })?;
 
+        let (daemon_refresh_required, daemon_refresh_note) =
+            self.daemon_refresh_notice_after_update(&target_version);
+
         Ok(SelfUpdateSummary {
             mode: SelfUpdateMode::Update,
             status: SelfUpdateStatus::Updated,
@@ -331,7 +341,40 @@ impl Cli {
             target_version,
             binary_path: binary_path.to_string_lossy().into_owned(),
             asset_name,
+            daemon_refresh_required,
+            daemon_refresh_note,
         })
+    }
+
+    fn daemon_refresh_notice_after_update(&self, target_version: &str) -> (bool, Option<String>) {
+        let Ok(ocm_home) = resolve_ocm_home(&self.env, &self.cwd) else {
+            return (
+                false,
+                Some(
+                    "CLI updated, but OCM could not resolve the active store; run `ocm service status` to check the background service"
+                        .to_string(),
+                ),
+            );
+        };
+        if !ocm_home.exists() {
+            return (false, None);
+        }
+
+        match self.supervisor_service().daemon_status() {
+            Ok(daemon) if daemon.running => (
+                true,
+                Some(format!(
+                    "CLI {target_version} is installed, but the running OCM background service still uses its previously mapped executable; during a maintenance window run `ocm service refresh-daemon --acknowledge-gateway-restarts`"
+                )),
+            ),
+            Ok(_) => (false, None),
+            Err(error) => (
+                false,
+                Some(format!(
+                    "CLI updated, but OCM could not inspect the background service ({error}); run `ocm service status`"
+                )),
+            ),
+        }
     }
 
     fn current_binary_path(&self) -> Result<PathBuf, String> {

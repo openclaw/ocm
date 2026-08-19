@@ -32,7 +32,8 @@ use crate::infra::process::run_direct;
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::infra::terminal::{Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table};
 use crate::openclaw_repo::{
-    detect_openclaw_checkout, discover_openclaw_checkout, ensure_openclaw_worktree,
+    detect_openclaw_checkout, discover_openclaw_checkout, ensure_checkout_owned_dependencies,
+    ensure_openclaw_worktree,
 };
 use crate::service::service_backend_support_error;
 use crate::store::{
@@ -411,6 +412,7 @@ impl Cli {
                 display_path(&repo_root)
             )
         })?;
+        ensure_checkout_owned_dependencies(&repo_root)?;
         let meta = self
             .environment_service()
             .apply_effective_gateway_port(existing)?;
@@ -704,6 +706,7 @@ impl Cli {
             .as_ref()
             .ok_or_else(|| format!("environment \"{}\" is missing its dev binding", meta.name))?;
         let worktree_root = Path::new(&dev.worktree_root);
+        ensure_checkout_owned_dependencies(worktree_root)?;
         let pnpm_store = worktree_root.join("node_modules").join(".pnpm");
         let tsx_bin = worktree_root.join("node_modules").join(".bin").join("tsx");
         if pnpm_store.exists() && tsx_bin.exists() {

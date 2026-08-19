@@ -12,6 +12,7 @@ use crate::infra::download::{
     normalize_sha256, verify_file_integrity, verify_file_sha256,
 };
 use crate::managed_node::{CommandSpec, managed_runtime_install_command};
+use crate::openclaw_repo::ensure_checkout_owned_dependencies;
 use crate::runtime::releases::{
     OpenClawRelease, RuntimeRelease, load_official_openclaw_release_selection,
     load_release_manifest, normalize_openclaw_channel_selector, official_openclaw_releases_url,
@@ -1922,6 +1923,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
     }
 
     let repo_path = fs::canonicalize(&repo_path).map_err(|error| error.to_string())?;
+    ensure_checkout_owned_dependencies(&repo_path)?;
     let version = load_openclaw_repo_version(&repo_path)?;
     let commit = git_short_commit(&repo_path);
     let target_source_plugins = options

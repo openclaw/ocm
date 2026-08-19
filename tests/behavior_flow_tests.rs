@@ -212,6 +212,7 @@ fn supervised_gateway_restart_requires_negotiated_external_handoff() {
     let runtime_state = |restart_handoff: &str| SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),

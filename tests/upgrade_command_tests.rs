@@ -78,6 +78,7 @@ fn write_running_supervisor_runtime(
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -113,6 +114,7 @@ fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: Vec::new(),
         children: Vec::new(),
@@ -130,6 +132,7 @@ fn write_backoff_supervisor_runtime(
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -926,6 +929,10 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
     assert!(
         !command_log.contains("plugins update --all\n"),
         "{command_log}"
+    );
+    assert!(
+        !command_log.contains("completion --write-state"),
+        "a finalizer without the structured defer receipt must not trigger duplicate completion work: {command_log}"
     );
 
     let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "demo", "--json"]);

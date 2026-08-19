@@ -90,9 +90,9 @@ pub use snapshots::{
     remove_env_snapshot, restore_env_snapshot, summarize_snapshot,
 };
 pub use upgrade_history::{
-    UpgradeHistoryBinding, UpgradeHistoryRecord, UpgradeHistoryRuntimeRecovery,
-    UpgradeHistoryServiceState, UpgradeHistoryStage, get_upgrade_history_record,
-    list_upgrade_history, save_upgrade_history_record,
+    UpgradeHistoryBinding, UpgradeHistoryPhaseTiming, UpgradeHistoryRecord,
+    UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState, UpgradeHistoryStage,
+    get_upgrade_history_record, list_upgrade_history, save_upgrade_history_record,
 };
 pub(crate) use upgrade_history::{
     UpgradeRuntimeRecovery, get_upgrade_runtime_recovery, lock_upgrade_transaction,
