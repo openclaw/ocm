@@ -313,14 +313,17 @@ fn relocate_installed_plugin_index_paths(
     source_state_root: &Path,
     target_state_root: &Path,
 ) -> Result<MigratedRuntimeStateResult, String> {
-    if !is_sqlite_database(database_path)? {
+    let Some(database_path) = contained_imported_database(database_path, target_state_root)? else {
+        return Ok(MigratedRuntimeStateResult::default());
+    };
+    if !is_sqlite_database(&database_path)? {
         return Ok(MigratedRuntimeStateResult::default());
     }
 
-    let connection = Connection::open(database_path).map_err(|error| {
+    let connection = Connection::open(&database_path).map_err(|error| {
         format!(
             "failed to open imported OpenClaw state database {}: {error}",
-            display_path(database_path)
+            display_path(&database_path)
         )
     })?;
     let table_exists = connection
@@ -333,7 +336,7 @@ fn relocate_installed_plugin_index_paths(
         .map_err(|error| {
             format!(
                 "failed to inspect imported OpenClaw plugin index {}: {error}",
-                display_path(database_path)
+                display_path(&database_path)
             )
         })?
         .is_some();
@@ -351,7 +354,7 @@ fn relocate_installed_plugin_index_paths(
         .map_err(|error| {
             format!(
                 "failed to read imported OpenClaw plugin install records {}: {error}",
-                display_path(database_path)
+                display_path(&database_path)
             )
         })?
     else {
@@ -361,13 +364,13 @@ fn relocate_installed_plugin_index_paths(
     let mut records: Value = serde_json::from_str(&raw_records).map_err(|error| {
         format!(
             "failed to parse imported OpenClaw plugin install records {}: {error}",
-            display_path(database_path)
+            display_path(&database_path)
         )
     })?;
     let Some(records) = records.as_object_mut() else {
         return Err(format!(
             "imported OpenClaw plugin install records are not an object: {}",
-            display_path(database_path)
+            display_path(&database_path)
         ));
     };
 
@@ -414,13 +417,40 @@ fn relocate_installed_plugin_index_paths(
         .map_err(|error| {
             format!(
                 "failed to relocate imported OpenClaw plugin install records {}: {error}",
-                display_path(database_path)
+                display_path(&database_path)
             )
         })?;
     Ok(MigratedRuntimeStateResult {
         changed: true,
         external_plugin_ids: external_plugin_ids.into_iter().collect(),
     })
+}
+
+fn contained_imported_database(
+    database_path: &Path,
+    target_state_root: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let metadata = match fs::symlink_metadata(database_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    // Resolve only regular imported files so a preserved symlink cannot redirect a writable open.
+    if !metadata.is_file() {
+        return Err(format!(
+            "imported OpenClaw state database must be a regular file inside the imported state: {}",
+            display_path(database_path)
+        ));
+    }
+    let canonical_root = fs::canonicalize(target_state_root).map_err(|error| error.to_string())?;
+    let canonical_database = fs::canonicalize(database_path).map_err(|error| error.to_string())?;
+    if !canonical_database.starts_with(&canonical_root) {
+        return Err(format!(
+            "imported OpenClaw state database must be a regular file inside the imported state: {}",
+            display_path(database_path)
+        ));
+    }
+    Ok(Some(canonical_database))
 }
 
 fn relocatable_plugin_path(

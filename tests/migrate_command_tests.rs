@@ -1186,6 +1186,59 @@ fn adopt_import_relocates_managed_plugin_install_records_into_the_imported_state
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn adopt_import_rejects_a_symlinked_plugin_database_without_mutating_its_target() {
+    let root = TestDir::new("adopt-import-symlinked-plugin-database");
+    let cwd = root.child("workspace");
+    let source_home = root.child("legacy-home/.openclaw");
+    let external_home = root.child("external-state");
+    fs::create_dir_all(&cwd).unwrap();
+    seed_plain_openclaw_home(&source_home);
+
+    let managed_plugin = source_home.join("extensions/managed-hub");
+    fs::create_dir_all(&managed_plugin).unwrap();
+    fs::write(managed_plugin.join("openclaw.plugin.json"), "{}\n").unwrap();
+    seed_installed_plugin_index(
+        &external_home,
+        serde_json::json!({
+            "managed-hub": {
+                "source": "clawhub",
+                "installPath": managed_plugin.display().to_string()
+            }
+        }),
+    );
+
+    let external_database = external_home.join("state/openclaw.sqlite");
+    let source_database = source_home.join("state/openclaw.sqlite");
+    fs::create_dir_all(source_database.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&external_database, &source_database).unwrap();
+    let external_before = fs::read(&external_database).unwrap();
+
+    let env = ocm_env(&root);
+    let output = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "adopt",
+            "import",
+            "--name",
+            "mira",
+            source_home.to_string_lossy().as_ref(),
+            "--json",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("must be a regular file inside the imported state"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!root.child("ocm-home/envs/mira").exists());
+    assert_eq!(fs::read(&external_database).unwrap(), external_before);
+}
+
 #[test]
 fn adopt_import_preserves_external_plugin_checkouts_with_an_isolation_warning() {
     let root = TestDir::new("adopt-import-external-plugin");
