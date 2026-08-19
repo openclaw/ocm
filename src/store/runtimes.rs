@@ -38,6 +38,9 @@ use super::layout::{
 use super::now_utc;
 use super::openclaw_workspaces::load_effective_openclaw_config;
 
+const OPENCLAW_OCM_RUNTIME_BUILD_PROFILE_ENV: &str = "OPENCLAW_OCM_RUNTIME_BUILD_PROFILE";
+const OPENCLAW_OCM_SOURCE_PERFORMANCE_BUILD_PROFILE: &str = "sourcePerformance";
+
 fn trim_description(description: Option<String>) -> Option<String> {
     description
         .map(|value| value.trim().to_string())
@@ -1006,6 +1009,10 @@ fn pack_local_openclaw_repo(
         .stderr(Stdio::piped());
     if let Some(local_adapter) = local_adapter {
         local_adapter.apply_environment(&mut command);
+        command.env(
+            OPENCLAW_OCM_RUNTIME_BUILD_PROFILE_ENV,
+            OPENCLAW_OCM_SOURCE_PERFORMANCE_BUILD_PROFILE,
+        );
     }
     let output = command.output().map_err(|error| {
         format!(

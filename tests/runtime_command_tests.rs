@@ -178,6 +178,7 @@ if [ "$1" = "--version" ]; then
   printf '10.0.0\n'
   exit 0
 fi
+printf 'build-profile-%s=%s\n' "$1" "${{OPENCLAW_OCM_RUNTIME_BUILD_PROFILE-unset}}" >> "{}"
 
 if [ "$1" = "pack" ]; then
   case " $* " in
@@ -277,6 +278,7 @@ if grep -q '"chokidar"' "$prefix/node_modules/openclaw/package.json"; then
   printf '{{"name":"@scope/tool","version":"1.0.0"}}\n' > "$prefix/node_modules/@scope/tool/package.json"
 fi
 "#,
+        path_string(&log_path),
         path_string(&log_path),
         path_string(&log_path),
         path_string(&log_path),
@@ -606,6 +608,8 @@ fn runtime_build_local_packs_and_installs_release_shaped_package() {
     assert!(npm_log.contains("ignore-scripts-lower=false"));
     assert!(npm_log.contains("ignore-scripts-upper=unset"));
     assert!(npm_log.contains("install --prefix"));
+    assert!(npm_log.contains("build-profile-pack=unset"));
+    assert!(npm_log.contains("build-profile-install=unset"));
 
     let install_root = runtime_install_root("main-local", &env, &cwd).unwrap();
     let expected_binary = installed_openclaw_runtime_entrypoint(&install_root);
@@ -1331,8 +1335,10 @@ printf 'adapter={adapter_extension}\n' >> "{}"
 printf 'args=%s\n' "$*" >> "{}"
 printf 'real-npm=%s\n' "$OPENCLAW_OCM_REAL_NPM_BIN" >> "{}"
 printf 'workspace-dirs=%s\n' "$OPENCLAW_OCM_WORKSPACE_DEPENDENCY_DIRS" >> "{}"
+printf 'build-profile=%s:%s\n' "$1" "${{OPENCLAW_OCM_RUNTIME_BUILD_PROFILE-unset}}" >> "{}"
 exec "$OPENCLAW_OCM_REAL_NPM_BIN" "$@"
 "#,
+            path_string(&adapter_log),
             path_string(&adapter_log),
             path_string(&adapter_log),
             path_string(&adapter_log),
@@ -1380,6 +1386,14 @@ exec "$OPENCLAW_OCM_REAL_NPM_BIN" "$@"
     assert!(adapter_log.contains("args=install --prefix"));
     assert!(adapter_log.contains("real-npm=npm"));
     assert!(adapter_log.contains(&format!("adapter={adapter_extension}")));
+    assert_eq!(
+        adapter_log
+            .lines()
+            .filter_map(|line| line.strip_prefix("build-profile="))
+            .collect::<Vec<_>>(),
+        ["pack:sourcePerformance", "install:unset"],
+        "{adapter_log}"
+    );
     if include_legacy_adapter {
         assert!(!adapter_log.contains("adapter=mjs"));
     }
