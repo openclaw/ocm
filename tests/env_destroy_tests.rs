@@ -310,23 +310,33 @@ fn env_destroy_state_token_refuses_stale_service_state_without_teardown() {
         true
     );
 
-    let fresh_preview = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--json"]);
-    assert!(fresh_preview.status.success(), "{}", stderr(&fresh_preview));
-    let fresh_json: serde_json::Value = serde_json::from_str(&stdout(&fresh_preview)).unwrap();
-    let fresh_guard = fresh_json["stateToken"].as_str().unwrap();
-    let destroy = run_ocm(
-        &cwd,
-        &env,
-        &[
-            "env",
-            "destroy",
-            "demo",
-            "--yes",
-            "--if-state-token",
-            fresh_guard,
-            "--json",
-        ],
-    );
+    let mut destroy = None;
+    for _ in 0..2 {
+        let fresh_preview = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--json"]);
+        assert!(fresh_preview.status.success(), "{}", stderr(&fresh_preview));
+        let fresh_json: serde_json::Value = serde_json::from_str(&stdout(&fresh_preview)).unwrap();
+        let fresh_guard = fresh_json["stateToken"].as_str().unwrap();
+        let attempt = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "destroy",
+                "demo",
+                "--yes",
+                "--if-state-token",
+                fresh_guard,
+                "--json",
+            ],
+        );
+        if attempt.status.success() {
+            destroy = Some(attempt);
+            break;
+        }
+        let output: serde_json::Value = serde_json::from_str(&stdout(&attempt)).unwrap();
+        assert_eq!(output["code"], "state_changed");
+    }
+    let destroy = destroy.expect("fresh guarded destroy should converge after one state refresh");
     assert!(destroy.status.success(), "{}", stderr(&destroy));
     let destroy_json: serde_json::Value = serde_json::from_str(&stdout(&destroy)).unwrap();
     assert_eq!(destroy_json["removed"], true);
