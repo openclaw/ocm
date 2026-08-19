@@ -59,6 +59,88 @@ fn setup_launcher_env(cwd: &Path, env: &BTreeMap<String, String>) {
     assert!(created.status.success(), "{}", stderr(&created));
 }
 
+fn setup_gateway_aware_restart_fixture(
+    root: &TestDir,
+    restart_handoff: &str,
+) -> (
+    std::path::PathBuf,
+    BTreeMap<String, String>,
+    std::path::PathBuf,
+) {
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = launchd_env(root);
+    let invocation_log = root.child("gateway-restart-invocations.log");
+    let launcher = root.child("bin/openclaw");
+    write_executable_script(
+        &launcher,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '{{\"ok\":true}}\\n'\n",
+            path_string(&invocation_log)
+        ),
+    );
+
+    let added = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "stable",
+            "--command",
+            &path_string(&launcher),
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--launcher", "stable"],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let runtime = SupervisorRuntimeState {
+        kind: "ocm-supervisor-runtime".to_string(),
+        ocm_home: env.get("OCM_HOME").unwrap().clone(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        updated_at: now_utc(),
+        services: vec![SupervisorRuntimeService {
+            env_name: "demo".to_string(),
+            binding_kind: "launcher".to_string(),
+            binding_name: "stable".to_string(),
+            gateway_state: "running".to_string(),
+            restart_handoff: Some(restart_handoff.to_string()),
+            restart_count: 0,
+            child_port: 18789,
+            pid: Some(4242),
+            stdout_path: path_string(&root.child("demo.stdout.log")),
+            stderr_path: path_string(&root.child("demo.stderr.log")),
+            last_exit_code: None,
+            last_error: None,
+            last_event_at: None,
+            next_retry_at: None,
+        }],
+        children: vec![SupervisorRuntimeChild {
+            env_name: "demo".to_string(),
+            binding_kind: "launcher".to_string(),
+            binding_name: "stable".to_string(),
+            pid: 4242,
+            restart_count: 0,
+            child_port: 18789,
+            stdout_path: path_string(&root.child("demo.stdout.log")),
+            stderr_path: path_string(&root.child("demo.stderr.log")),
+        }],
+    };
+    fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    env.insert("OCM_ACTIVE_ENV".to_string(), "demo".to_string());
+
+    (cwd, env, invocation_log)
+}
+
 fn json_output(output: &std::process::Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
@@ -473,6 +555,28 @@ fn service_restart_restores_running_policy() {
     let body = json_output(&output);
     assert_eq!(body["installed"], true);
     assert_eq!(body["desiredRunning"], true);
+}
+
+#[test]
+fn service_restart_requests_immediate_recovery_handoff_without_self_deadlock() {
+    let root = TestDir::new("service-restart-gateway-aware");
+    let (cwd, env, invocation_log) = setup_gateway_aware_restart_fixture(&root, "protocol-v1");
+
+    let output = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let body = json_output(&output);
+    assert_eq!(body["action"], "restart");
+    assert_eq!(body["running"], true);
+    assert!(body["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("scheduled without waiting")
+    }));
+    assert_eq!(
+        fs::read_to_string(invocation_log).unwrap(),
+        "gateway restart --force --json\n"
+    );
 }
 
 #[test]

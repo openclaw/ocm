@@ -1062,7 +1062,7 @@ fn targeted_runtime_refresh_ignores_unrelated_drift_and_restarts_effective_chang
 }
 
 #[test]
-fn service_restart_restarts_only_the_target_child() {
+fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("daemon-targeted-service-restart");
     let cwd = root.child("workspace");
@@ -1156,6 +1156,17 @@ fn service_restart_restarts_only_the_target_child() {
         &["service", "restart", "rescue", "--json"],
     );
     assert!(restart.status.success(), "{}", stderr(&restart));
+    let restart_body: serde_json::Value = serde_json::from_slice(&restart.stdout).unwrap();
+    assert!(
+        restart_body["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap()
+                .contains("used the legacy direct supervisor restart path"))
+    );
     let restarted = wait_for_runtime_child_pid_change(
         &runtime_path,
         "rescue",
@@ -1220,7 +1231,11 @@ fn service_restart_requeues_a_stopped_desired_child() {
         .expect("daemon runtime state did not report the quick clean exit as stopped");
     assert!(!started.exists());
 
-    let restart = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+    let restart = run_ocm(
+        &cwd,
+        &env,
+        &["service", "restart", "demo", "--force", "--json"],
+    );
     assert!(restart.status.success(), "{}", stderr(&restart));
     let runtime =
         wait_for_runtime_children(&runtime_path, 1, Some("demo"), Duration::from_secs(10))

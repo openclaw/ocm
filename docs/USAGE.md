@@ -344,6 +344,31 @@ ocm service stop mira
 ocm service restart mira
 ```
 
+Normal restart is gateway-aware when `ocm service status mira` reports restart
+handoff `protocol v1`: OpenClaw records eligible active sessions and subagents,
+hands the fresh-process restart back to OCM immediately, and resumes recoverable
+work after the replacement gateway starts. The old gateway process does not wait
+for an in-flight turn to finish.
+
+When a binding cannot negotiate the restart handoff, OCM preserves the existing
+direct-supervisor restart behavior and prints a warning that in-flight work may
+have been interrupted. Existing restart commands therefore remain compatible.
+
+Use the forced path only when a gateway advertises recovery support but is too
+unhealthy to accept the restart handoff:
+
+```bash
+ocm service restart mira --force
+```
+
+Forced restart explicitly replaces the supervised child directly. It bypasses
+OpenClaw's restart-recovery handoff and can lose in-flight work, so it is
+intentionally an emergency override rather than a compatibility requirement.
+
+Recovery is limited to work OpenClaw knows how to persist and resume. It does
+not make arbitrary child processes or non-idempotent external side effects
+transactional.
+
 ### Remove the service
 
 ```bash

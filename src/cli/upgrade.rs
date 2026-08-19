@@ -3112,9 +3112,12 @@ impl Cli {
 
         if service.running {
             let convergence_started = timings.start();
-            let restart_result = self
-                .with_progress(format!("Restarting service for {env_name}"), || {
-                    self.service_service().restart_locked(env_name)
+            let restart_result =
+                self.with_progress(format!("Restarting service for {env_name}"), || {
+                    self.service_service().restart_locked_with_options(
+                        env_name,
+                        crate::service::ServiceRestartOptions { force: true },
+                    )
                 });
             timings.finish(
                 "ocm",

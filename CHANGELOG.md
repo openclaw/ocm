@@ -16,6 +16,10 @@ All notable changes to OCM are documented here.
 - Copy repo-backed and symlinked plain-home agent workspaces into an adopted
   environment and rewrite the imported config to keep the fixture isolated.
 
+### Changed
+
+- Make `ocm service restart <env>` restart immediately through OpenClaw's protocol-v1 recovery handoff so eligible interrupted sessions and subagents resume after startup, preserve the legacy direct-restart behavior with a warning when recovery is unavailable, keep `--force` as an explicit bypass for an unhealthy handoff, and avoid self-restart deadlocks.
+
 ## 0.2.30 - 2026-07-23
 
 ### Added

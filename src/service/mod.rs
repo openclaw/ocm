@@ -9,7 +9,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 pub use inspect::{ServiceSummary, ServiceSummaryList};
-pub use manage::{ServiceActionSummary, ServiceInstallSummary};
+pub use manage::{ServiceActionSummary, ServiceInstallSummary, ServiceRestartOptions};
 pub(crate) use platform::{
     ServiceManagerKind, service_backend_support_error, service_manager_kind,
 };
@@ -209,20 +209,38 @@ impl<'a> ServiceService<'a> {
     }
 
     pub fn restart(&self, name: &str) -> Result<ServiceActionSummary, String> {
-        let summary = self.restart_action(name)?;
+        self.restart_with_options(name, ServiceRestartOptions::default())
+    }
+
+    pub fn restart_with_options(
+        &self,
+        name: &str,
+        options: ServiceRestartOptions,
+    ) -> Result<ServiceActionSummary, String> {
+        let summary = self.restart_action_with_options(name, options)?;
         summary.ensure_gateway_ready()?;
         Ok(summary)
     }
 
-    pub(crate) fn restart_action(&self, name: &str) -> Result<ServiceActionSummary, String> {
+    pub(crate) fn restart_action_with_options(
+        &self,
+        name: &str,
+        options: ServiceRestartOptions,
+    ) -> Result<ServiceActionSummary, String> {
         let _lock = crate::env::EnvironmentService::new(self.env, self.cwd).lock_operation(name)?;
-        let mut summary = self.restart_locked(name)?;
-        self.apply_gateway_readiness(name, &mut summary)?;
+        let mut summary = self.restart_locked_with_options(name, options)?;
+        if self.env.get("OCM_ACTIVE_ENV").map(String::as_str) != Some(name) {
+            self.apply_gateway_readiness(name, &mut summary)?;
+        }
         Ok(summary)
     }
 
-    pub(crate) fn restart_locked(&self, name: &str) -> Result<ServiceActionSummary, String> {
-        manage::restart_service(name, self.env, self.cwd)
+    pub(crate) fn restart_locked_with_options(
+        &self,
+        name: &str,
+        options: ServiceRestartOptions,
+    ) -> Result<ServiceActionSummary, String> {
+        manage::restart_service(name, options, self.env, self.cwd)
     }
 
     fn apply_gateway_readiness(

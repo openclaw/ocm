@@ -1,14 +1,20 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use serde::Serialize;
 
 use super::inspect::ServiceSummary;
 use super::readiness::GatewayReadiness;
 use super::service_backend_support_error;
-use crate::env::EnvironmentService;
+use crate::env::{EnvironmentService, ResolvedExecution};
+use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
+use crate::managed_node::apply_path_prepend_to_environment;
 use crate::store::{restore_environment_service_policy, set_environment_service_policy};
 use crate::supervisor::{SupervisorService, sync_supervisor_if_present};
 
@@ -58,6 +64,11 @@ impl ServiceActionSummary {
             Ok(())
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ServiceRestartOptions {
+    pub force: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -157,6 +168,7 @@ pub fn stop_service(
 
 pub fn restart_service(
     name: &str,
+    options: ServiceRestartOptions,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<ServiceActionSummary, String> {
@@ -172,6 +184,59 @@ pub fn restart_service(
         return update_service(name, ServiceUpdate::Restart, env, cwd);
     }
 
+    if options.force {
+        return restart_running_service_directly(
+            name,
+            before,
+            env,
+            cwd,
+            "forced supervisor restart bypassed OpenClaw restart recovery handoff",
+        );
+    }
+
+    if before.restart_handoff.as_deref() != Some("protocol-v1") {
+        return restart_running_service_directly(
+            name,
+            before,
+            env,
+            cwd,
+            "OpenClaw restart recovery handoff protocol v1 is unavailable; used the legacy direct supervisor restart path, so in-flight work may have been interrupted",
+        );
+    }
+
+    spawn_recovery_aware_restart(name, env, cwd)?;
+
+    if env.get("OCM_ACTIVE_ENV").map(String::as_str) == Some(name) {
+        let mut warnings = vec![
+            "recovery-aware restart was scheduled without waiting because the request originated inside the target gateway; OpenClaw will preserve and resume eligible interrupted work after restart"
+                .to_string(),
+        ];
+        let summary = super::inspect::service_status_fast(name, env, cwd)?;
+        if !summary.running {
+            warnings
+                .push("gateway is already transitioning to its replacement process".to_string());
+        }
+        return Ok(service_action_summary("restart", summary, warnings));
+    }
+
+    let status = wait_for_restart_action_summary(name, before.child_pid, env, cwd)?;
+    let mut warnings = status.warnings;
+    if !status.observed_restart {
+        warnings.push(
+            "recovery-aware restart was accepted, but OCM did not observe a replacement gateway within 30 seconds; no direct supervisor restart was attempted"
+                .to_string(),
+        );
+    }
+    Ok(service_action_summary("restart", status.summary, warnings))
+}
+
+fn restart_running_service_directly(
+    name: &str,
+    before: ServiceSummary,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    restart_warning: &str,
+) -> Result<ServiceActionSummary, String> {
     let supervisor = SupervisorService::new(env, cwd);
     let mut request_id = supervisor.request_child_restart(name)?;
     let restart_result = wait_for_restart_action_summary(name, before.child_pid, env, cwd);
@@ -208,6 +273,7 @@ pub fn restart_service(
                     "restart completed, but failed to clear restart request: {clear_error}"
                 ));
             }
+            status.warnings.push(restart_warning.to_string());
             Ok(service_action_summary(
                 "restart",
                 status.summary,
@@ -215,6 +281,132 @@ pub fn restart_service(
             ))
         }
         Err(restart_error) => Err(restart_error),
+    }
+}
+
+fn spawn_recovery_aware_restart(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(), String> {
+    let args = vec![
+        "gateway".to_string(),
+        "restart".to_string(),
+        "--force".to_string(),
+        "--json".to_string(),
+    ];
+    let resolved = EnvironmentService::new(env, cwd).resolve(name, None, None, &args)?;
+    let command = resolved_restart_command(resolved, env)?;
+    let mut process = Command::new(&command.program);
+    process
+        .args(&command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_clear()
+        .envs(&command.env)
+        .current_dir(&command.cwd);
+    #[cfg(unix)]
+    process.process_group(0);
+    let mut child = process
+        .spawn()
+        .map_err(|error| format!("failed to run \"{}\": {error}", command.program))?;
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "OpenClaw rejected the recovery-aware restart for env \"{name}\" (exit code {}); no direct supervisor restart was attempted. Inspect the gateway logs or use \"ocm service restart {name} --force\" to bypass OpenClaw recovery handoff",
+                    status.code().unwrap_or(1)
+                ));
+            }
+            Ok(None) => sleep(Duration::from_millis(25)),
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect the recovery-aware restart helper for env \"{name}\": {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct ResolvedRestartCommand {
+    program: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: PathBuf,
+}
+
+fn resolved_restart_command(
+    resolved: ResolvedExecution,
+    process_env: &BTreeMap<String, String>,
+) -> Result<ResolvedRestartCommand, String> {
+    match resolved {
+        ResolvedExecution::Launcher {
+            env,
+            command,
+            run_dir,
+            ..
+        } => {
+            let openclaw_env = build_openclaw_env(&env, process_env);
+            if cfg!(windows) {
+                Ok(ResolvedRestartCommand {
+                    program: "cmd".to_string(),
+                    args: vec!["/C".to_string(), command],
+                    env: openclaw_env,
+                    cwd: run_dir,
+                })
+            } else {
+                Ok(ResolvedRestartCommand {
+                    program: "sh".to_string(),
+                    args: vec!["-lc".to_string(), command],
+                    env: openclaw_env,
+                    cwd: run_dir,
+                })
+            }
+        }
+        ResolvedExecution::Runtime {
+            env,
+            program,
+            program_args,
+            path_prepend,
+            run_dir,
+            ..
+        } => {
+            let mut openclaw_env = build_openclaw_env(&env, process_env);
+            apply_path_prepend_to_environment(&mut openclaw_env, path_prepend.as_deref())?;
+            Ok(ResolvedRestartCommand {
+                program,
+                args: program_args,
+                env: openclaw_env,
+                cwd: run_dir,
+            })
+        }
+        ResolvedExecution::Dev {
+            env,
+            program,
+            program_args,
+            run_dir,
+            ..
+        }
+        | ResolvedExecution::SourceWatch {
+            env,
+            program,
+            program_args,
+            run_dir,
+            ..
+        } => {
+            let openclaw_env = build_openclaw_dev_source_env(&env, process_env, &run_dir);
+            Ok(ResolvedRestartCommand {
+                program,
+                args: program_args,
+                env: openclaw_env,
+                cwd: run_dir,
+            })
+        }
     }
 }
 
@@ -264,11 +456,7 @@ fn update_service(
     let _lifecycle_lock = supervisor.lock_daemon_lifecycle()?;
     supervisor.validate_daemon_owner_locked()?;
     let daemon_before = supervisor.daemon_status()?;
-    let change =
-        match set_environment_service_policy(name, service_enabled, service_running, env, cwd) {
-            Ok(change) => change,
-            Err(error) => return Err(error),
-        };
+    let change = set_environment_service_policy(name, service_enabled, service_running, env, cwd)?;
     let update_result = match supervisor_policy {
         ServiceSupervisorPolicy::EnsureRunning => {
             ensure_supervisor_running_locked(&supervisor, env)
