@@ -7,7 +7,7 @@ use semver::Version;
 use serde::Serialize;
 
 use crate::infra::archive::extract_tar_gz;
-use crate::infra::download::{download_to_file, verify_file_sha256};
+use crate::infra::download::{download_to_file, http_agent, verify_file_sha256};
 use crate::store::resolve_ocm_home;
 
 use super::{Cli, render};
@@ -404,7 +404,8 @@ impl Cli {
             format!("https://api.github.com/repos/{RELEASE_REPO}/releases/latest")
         };
 
-        let response = ureq::get(&url)
+        let response = http_agent()
+            .get(&url)
             .header("User-Agent", &format!("ocm/{}", env!("CARGO_PKG_VERSION")))
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")

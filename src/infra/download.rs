@@ -11,17 +11,24 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256, Sha512};
 
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
-// ureq 3 Agent defaults leave timeout_connect and timeout_global unset.
+// ureq carries a recv-response deadline into body reads. Bound the header wait from the
+// completed request-send phase instead, then use recv-body as the per-read stall timeout.
 static HTTP_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
-            .timeout_connect(Some(HTTP_TIMEOUT))
-            .timeout_global(Some(HTTP_TIMEOUT))
+            .timeout_resolve(Some(HTTP_PHASE_TIMEOUT))
+            .timeout_connect(Some(HTTP_PHASE_TIMEOUT))
+            .timeout_send_request(Some(HTTP_PHASE_TIMEOUT))
+            .timeout_recv_body(Some(HTTP_PHASE_TIMEOUT))
             .build(),
     )
 });
+
+pub(crate) fn http_agent() -> &'static ureq::Agent {
+    &HTTP_AGENT
+}
 
 pub fn artifact_file_name_from_url(url: &str) -> Result<String, String> {
     let trimmed = url.trim();
@@ -114,7 +121,7 @@ fn open_url_reader(
         return Err("runtime URL is required".to_string());
     }
 
-    let mut request = HTTP_AGENT.get(trimmed);
+    let mut request = http_agent().get(trimmed);
     if compressed_json {
         request = request.header("Accept-Encoding", "gzip");
     }
