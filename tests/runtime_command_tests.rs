@@ -676,6 +676,13 @@ fn runtime_verify_reports_package_tree_drift() {
     )
     .unwrap();
 
+    let tree_drift_which = run_ocm(&cwd, &env, &["runtime", "which", "main-local", "--raw"]);
+    assert!(
+        tree_drift_which.status.success(),
+        "{}",
+        stderr(&tree_drift_which)
+    );
+
     let verify = run_ocm(&cwd, &env, &["runtime", "verify", "main-local", "--json"]);
     assert_eq!(verify.status.code(), Some(1));
     let value: Value = serde_json::from_str(&stdout(&verify)).unwrap();
@@ -702,6 +709,10 @@ fn runtime_verify_reports_package_tree_drift() {
     let launcher_verify = run_ocm(&cwd, &env, &["runtime", "verify", "main-local", "--json"]);
     assert_eq!(launcher_verify.status.code(), Some(1));
     assert!(stdout(&launcher_verify).contains("sha256 mismatch:"));
+
+    let launcher_which = run_ocm(&cwd, &env, &["runtime", "which", "main-local", "--raw"]);
+    assert_eq!(launcher_which.status.code(), Some(1));
+    assert!(stderr(&launcher_which).contains("sha256 mismatch:"));
 }
 
 #[test]

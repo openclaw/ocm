@@ -1934,10 +1934,7 @@ pub(crate) fn prepare_runtime_from_selected_official_openclaw_release(
     }
 }
 
-pub fn runtime_integrity_issue(
-    meta: &RuntimeMeta,
-    env: &BTreeMap<String, String>,
-) -> Option<String> {
+fn runtime_execution_issue(meta: &RuntimeMeta, env: &BTreeMap<String, String>) -> Option<String> {
     let binary_path = Path::new(&meta.binary_path);
     if !path_exists(binary_path) {
         return Some(format!(
@@ -1980,6 +1977,17 @@ pub fn runtime_integrity_issue(
         return Some(issue);
     }
 
+    None
+}
+
+pub fn runtime_integrity_issue(
+    meta: &RuntimeMeta,
+    env: &BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(issue) = runtime_execution_issue(meta, env) {
+        return Some(issue);
+    }
+
     if let Some(expected_runtime_sha256) = meta.runtime_sha256.as_deref() {
         let expected_runtime_sha256 = match normalize_sha256(expected_runtime_sha256) {
             Ok(value) => value,
@@ -2007,7 +2015,7 @@ pub fn verify_runtime_binary(
     meta: RuntimeMeta,
     env: &BTreeMap<String, String>,
 ) -> Result<RuntimeMeta, String> {
-    if let Some(issue) = runtime_integrity_issue(&meta, env) {
+    if let Some(issue) = runtime_execution_issue(&meta, env) {
         return Err(format!("runtime \"{}\" {issue}", meta.name));
     }
 
