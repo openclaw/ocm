@@ -194,7 +194,14 @@ binding first when intentionally managing an unused runtime.
 For unreleased OpenClaw workspaces, `runtime build-local` follows the complete
 transitive closure of private `workspace:*` packages. It rewrites nested
 workspace specs only inside scratch archives before installation; the source
-checkout remains unchanged.
+checkout remains unchanged. Environment-targeted local plugins that peer-depend
+on `openclaw` receive a runtime-local host link before full-tree hashing.
+
+When a named Tailscale Service routes directly to an environment gateway,
+`upgrade` can migrate it after the verified checkpoint to an OCM-owned identity
+proxy and OpenClaw trusted-proxy auth. The stable Service hostname is retained,
+direct-local password fallback is preserved, and rollback restores the prior
+config, route, proxy service, runtime, and service policy.
 
 `upgrade simulate` clones the source env, leaves the real env untouched, and
 cleans temporary simulation envs and runtimes when the run finishes. For

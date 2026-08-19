@@ -12,6 +12,10 @@ use crate::env::{
     CloneEnvironmentOptions, CreateEnvSnapshotOptions, EnvDevMeta, RestoreEnvSnapshotOptions,
     resolve_runtime_run_dir,
 };
+use crate::identity_proxy::{
+    IdentityProxyPlan, IdentityProxyRollback, identity_proxy_trusted_proxies,
+    install_identity_proxy, plan_identity_proxy,
+};
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::openclaw_repo::{detect_openclaw_checkout, ensure_openclaw_worktree};
 use crate::runtime::releases::{
@@ -27,13 +31,18 @@ use crate::store::{
     InstallContext, RuntimeReleaseDetails, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming,
     UpgradeHistoryRecord, UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState,
     UpgradeHistoryStage, UpgradeRuntimeRecovery, clean_path, copy_dir_recursive, derive_env_paths,
-    display_path, ensure_minimum_local_openclaw_config, ensure_store, get_runtime,
-    get_upgrade_history_record, get_upgrade_runtime_recovery,
-    install_runtime_from_selected_official_openclaw_release, list_upgrade_history,
-    lock_env_registry, lock_upgrade_transaction, remove_runtime, remove_upgrade_recovery,
-    resolve_absolute_path, runtime_install_root, runtime_integrity_issue, runtime_meta_path,
-    save_environment, save_upgrade_history_record, upgrade_history_recovery_dir,
-    upgrade_history_runtime_recovery_dir, write_json,
+    display_path, ensure_minimum_local_openclaw_config, ensure_store,
+    gateway_tailscale_service_name, get_runtime, get_upgrade_history_record,
+    get_upgrade_runtime_recovery, install_runtime_from_selected_official_openclaw_release,
+    list_upgrade_history, lock_env_registry, lock_upgrade_transaction,
+    migrate_gateway_to_tailscale_trusted_proxy, plan_gateway_tailscale_trusted_proxy_migration,
+    remove_runtime, remove_upgrade_recovery, resolve_absolute_path, runtime_install_root,
+    runtime_integrity_issue, runtime_meta_path, save_environment, save_upgrade_history_record,
+    upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir, write_json,
+};
+use crate::tailscale::{
+    NamedServiceProxyRoute, TailscaleServeConfigBackup, named_service_routes_for_gateway,
+    restore_named_service_routes, rewrite_named_service_routes, summarize_named_service_routes,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -164,6 +173,26 @@ enum UpgradeSimulationScenario {
 struct UpgradeOptions {
     dry_run: bool,
     rollback_enabled: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NamedTailscaleIngressMigration {
+    routes: Vec<NamedServiceProxyRoute>,
+    tailnet_login: Option<String>,
+    proxy_plan: Option<IdentityProxyPlan>,
+    config_required: bool,
+}
+
+impl NamedTailscaleIngressMigration {
+    fn requires_change(&self) -> bool {
+        self.proxy_plan.is_some()
+    }
+}
+
+#[derive(Debug)]
+struct AppliedNamedTailscaleIngress {
+    proxy: IdentityProxyRollback,
+    routes: Vec<TailscaleServeConfigBackup>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1782,6 +1811,7 @@ impl Cli {
                 self.ensure_runtime_upgrade_isolated(env_name, &target_runtime_name)?;
             }
             let service = self.upgrade_service_status(env_name)?;
+            let ingress_migration = self.plan_named_tailscale_ingress_migration(env_name)?;
             if options.dry_run {
                 let binding_changed = target_runtime_name != current.name;
                 return Ok(UpgradeEnvSummary {
@@ -1804,9 +1834,7 @@ impl Cli {
                     ),
                     snapshot_id: None,
                     rollback: None,
-                    note: Some(
-                        "dry run: no runtime, env, service, or snapshot changed".to_string(),
-                    ),
+                    note: Some(dry_run_note(&ingress_migration)),
                 });
             }
             let runtime_names = if target.is_named_runtime() {
@@ -1816,7 +1844,12 @@ impl Cli {
             };
             let mut timings = UpgradeTimingRecorder::new();
             let preparation_started = timings.start();
-            let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
+            let prepared = match self.prepare_isolated_upgrade_target(
+                env_name,
+                target,
+                resolved,
+                &ingress_migration,
+            ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return self.fail_upgrade_before_cutover(
@@ -1879,28 +1912,31 @@ impl Cli {
                 }
             };
             let binding_changed = prepared.name != current.name;
-            let post_update =
-                match self.run_post_core_update(env_name, &prepared.name, &mut transaction.timings)
-                {
-                    Ok(result) => {
-                        transaction.mark_post_update_completed(result.note.as_deref());
-                        result
-                    }
-                    Err(error) => {
-                        transaction.mark_post_update_failed(&error);
-                        return self.rollback_failed_upgrade(
-                            env_name,
-                            "runtime",
-                            previous_binding_name,
-                            "runtime",
-                            prepared.name,
-                            prepared.meta.release_version,
-                            prepared.meta.release_channel,
-                            transaction,
-                            error,
-                        );
-                    }
-                };
+            let post_update = match self.run_post_core_update(
+                env_name,
+                &prepared.name,
+                &ingress_migration,
+                &mut transaction,
+            ) {
+                Ok(result) => {
+                    transaction.mark_post_update_completed(result.note.as_deref());
+                    result
+                }
+                Err(error) => {
+                    transaction.mark_post_update_failed(&error);
+                    return self.rollback_failed_upgrade(
+                        env_name,
+                        "runtime",
+                        previous_binding_name,
+                        "runtime",
+                        prepared.name,
+                        prepared.meta.release_version,
+                        prepared.meta.release_channel,
+                        transaction,
+                        error,
+                    );
+                }
+            };
             let post_update_note = post_update.note;
             let completion_deferred = post_update.completion_deferred;
             let publish_started = transaction.timings.start();
@@ -2025,6 +2061,10 @@ impl Cli {
                 binding_name: prepared.name.clone(),
                 outcome: if binding_changed {
                     "switched".to_string()
+                } else if ingress_migration.requires_change()
+                    && matches!(prepared.action, OfficialRuntimePrepareAction::Reused)
+                {
+                    "updated".to_string()
                 } else {
                     outcome_for_official_prepare_action(&prepared.action)
                 },
@@ -2095,6 +2135,7 @@ impl Cli {
                 current.release_version.as_deref(),
                 target_version.as_deref(),
             )?;
+            let ingress_migration = self.plan_named_tailscale_ingress_migration(env_name)?;
             if options.dry_run {
                 return Ok(UpgradeEnvSummary {
                     env_name: env_name.to_string(),
@@ -2108,14 +2149,17 @@ impl Cli {
                     service_action: service_action_for_dry_run(service.as_ref(), false, true),
                     snapshot_id: None,
                     rollback: None,
-                    note: Some(
-                        "dry run: no runtime, env, service, or snapshot changed".to_string(),
-                    ),
+                    note: Some(dry_run_note(&ingress_migration)),
                 });
             }
             let mut timings = UpgradeTimingRecorder::new();
             let preparation_started = timings.start();
-            let prepared = match self.prepare_isolated_upgrade_target(env_name, &target, resolved) {
+            let prepared = match self.prepare_isolated_upgrade_target(
+                env_name,
+                &target,
+                resolved,
+                &ingress_migration,
+            ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return self.fail_upgrade_before_cutover(
@@ -2137,10 +2181,11 @@ impl Cli {
                 preparation_started,
                 "completed",
             );
-            let changed = matches!(
+            let runtime_changed = matches!(
                 prepared.action,
                 OfficialRuntimePrepareAction::Installed | OfficialRuntimePrepareAction::Updated
             );
+            let changed = runtime_changed || ingress_migration.requires_change();
             let mut transaction = self.begin_upgrade_transaction_locked(
                 env_name,
                 UpgradeTransactionPlan {
@@ -2161,7 +2206,7 @@ impl Cli {
                 None,
                 timings,
             )?;
-            if changed {
+            if runtime_changed {
                 transaction.mark_runtime_mutated(&prepared.name);
             }
             let prepared = match prepared.commit() {
@@ -2181,8 +2226,12 @@ impl Cli {
                 }
             };
             let (post_update_note, completion_deferred) = if changed {
-                match self.run_post_core_update(env_name, &prepared.name, &mut transaction.timings)
-                {
+                match self.run_post_core_update(
+                    env_name,
+                    &prepared.name,
+                    &ingress_migration,
+                    &mut transaction,
+                ) {
                     Ok(result) => {
                         transaction.mark_post_update_completed(result.note.as_deref());
                         (result.note, result.completion_deferred)
@@ -2207,7 +2256,7 @@ impl Cli {
                 (None, false)
             };
             let publish_started = transaction.timings.start();
-            let publish_result = if changed {
+            let publish_result = if runtime_changed {
                 self.runtime_service()
                     .refresh_supervisor_if_present(&prepared.name)
             } else {
@@ -2219,7 +2268,11 @@ impl Cli {
                 "stopped",
                 publish_started,
                 if publish_result.is_ok() {
-                    if changed { "completed" } else { "skipped" }
+                    if runtime_changed {
+                        "completed"
+                    } else {
+                        "skipped"
+                    }
                 } else {
                     "failed"
                 },
@@ -2309,7 +2362,13 @@ impl Cli {
                 previous_binding_name: previous_binding_name.clone(),
                 binding_kind: "runtime".to_string(),
                 binding_name: prepared.name.clone(),
-                outcome: outcome_for_official_prepare_action(&prepared.action),
+                outcome: if ingress_migration.requires_change()
+                    && matches!(prepared.action, OfficialRuntimePrepareAction::Reused)
+                {
+                    "updated".to_string()
+                } else {
+                    outcome_for_official_prepare_action(&prepared.action)
+                },
                 runtime_release_version: prepared.meta.release_version.clone(),
                 runtime_release_channel: prepared.meta.release_channel.clone(),
                 service_action,
@@ -2340,6 +2399,7 @@ impl Cli {
             Some(&target_version),
         )?;
         let service = self.upgrade_service_status(env_name)?;
+        let ingress_migration = self.plan_named_tailscale_ingress_migration(env_name)?;
         if options.dry_run {
             return Ok(UpgradeEnvSummary {
                 env_name: env_name.to_string(),
@@ -2353,7 +2413,7 @@ impl Cli {
                 service_action: service_action_for_dry_run(service.as_ref(), false, true),
                 snapshot_id: None,
                 rollback: None,
-                note: Some("dry run: no runtime, env, service, or snapshot changed".to_string()),
+                note: Some(dry_run_note(&ingress_migration)),
             });
         }
         let mut timings = UpgradeTimingRecorder::new();
@@ -2423,27 +2483,31 @@ impl Cli {
                 );
             }
         };
-        let post_update =
-            match self.run_post_core_update(env_name, &updated.name, &mut transaction.timings) {
-                Ok(result) => {
-                    transaction.mark_post_update_completed(result.note.as_deref());
-                    result
-                }
-                Err(error) => {
-                    transaction.mark_post_update_failed(&error);
-                    return self.rollback_failed_upgrade(
-                        env_name,
-                        "runtime",
-                        previous_binding_name,
-                        "runtime",
-                        updated.name,
-                        updated.release_version,
-                        updated.release_channel,
-                        transaction,
-                        error,
-                    );
-                }
-            };
+        let post_update = match self.run_post_core_update(
+            env_name,
+            &updated.name,
+            &ingress_migration,
+            &mut transaction,
+        ) {
+            Ok(result) => {
+                transaction.mark_post_update_completed(result.note.as_deref());
+                result
+            }
+            Err(error) => {
+                transaction.mark_post_update_failed(&error);
+                return self.rollback_failed_upgrade(
+                    env_name,
+                    "runtime",
+                    previous_binding_name,
+                    "runtime",
+                    updated.name,
+                    updated.release_version,
+                    updated.release_channel,
+                    transaction,
+                    error,
+                );
+            }
+        };
         let post_update_note = post_update.note;
         let completion_deferred = post_update.completion_deferred;
         let publish_started = transaction.timings.start();
@@ -2628,6 +2692,7 @@ impl Cli {
             self.ensure_runtime_upgrade_isolated(env_name, &target_runtime_name)?;
         }
         let service = self.upgrade_service_status(env_name)?;
+        let ingress_migration = self.plan_named_tailscale_ingress_migration(env_name)?;
         if options.dry_run {
             return Ok(UpgradeEnvSummary {
                 env_name: env_name.to_string(),
@@ -2641,13 +2706,18 @@ impl Cli {
                 service_action: service_action_for_dry_run(service.as_ref(), true, true),
                 snapshot_id: None,
                 rollback: None,
-                note: Some("dry run: no runtime, env, service, or snapshot changed".to_string()),
+                note: Some(dry_run_note(&ingress_migration)),
             });
         }
 
         let mut timings = UpgradeTimingRecorder::new();
         let preparation_started = timings.start();
-        let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
+        let prepared = match self.prepare_isolated_upgrade_target(
+            env_name,
+            target,
+            resolved,
+            &ingress_migration,
+        ) {
             Ok(prepared) => prepared,
             Err(error) => {
                 return self.fail_upgrade_before_cutover(
@@ -2709,27 +2779,31 @@ impl Cli {
                 );
             }
         };
-        let post_update =
-            match self.run_post_core_update(env_name, &prepared.name, &mut transaction.timings) {
-                Ok(result) => {
-                    transaction.mark_post_update_completed(result.note.as_deref());
-                    result
-                }
-                Err(error) => {
-                    transaction.mark_post_update_failed(&error);
-                    return self.rollback_failed_upgrade(
-                        env_name,
-                        "launcher",
-                        launcher_name.to_string(),
-                        "runtime",
-                        prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
-                        transaction,
-                        error,
-                    );
-                }
-            };
+        let post_update = match self.run_post_core_update(
+            env_name,
+            &prepared.name,
+            &ingress_migration,
+            &mut transaction,
+        ) {
+            Ok(result) => {
+                transaction.mark_post_update_completed(result.note.as_deref());
+                result
+            }
+            Err(error) => {
+                transaction.mark_post_update_failed(&error);
+                return self.rollback_failed_upgrade(
+                    env_name,
+                    "launcher",
+                    launcher_name.to_string(),
+                    "runtime",
+                    prepared.name,
+                    prepared.meta.release_version,
+                    prepared.meta.release_channel,
+                    transaction,
+                    error,
+                );
+            }
+        };
         let post_update_note = post_update.note;
         let completion_deferred = post_update.completion_deferred;
         let publish_started = transaction.timings.start();
@@ -3011,6 +3085,7 @@ impl Cli {
         env_name: &str,
         target: &UpgradeTarget,
         resolved: ResolvedUpgradeTarget,
+        ingress_migration: &NamedTailscaleIngressMigration,
     ) -> Result<PreparedUpgradeTarget, String> {
         let prepared = if target.is_named_runtime() {
             self.prepare_resolved_upgrade_target(env_name, target, resolved)?
@@ -3020,7 +3095,7 @@ impl Cli {
                 self.prepare_resolved_upgrade_target(env_name, target, resolved)
             })?
         };
-        self.validate_prepared_upgrade_target(env_name, &prepared)?;
+        self.validate_prepared_upgrade_target(env_name, &prepared, ingress_migration)?;
         Ok(prepared)
     }
 
@@ -3028,6 +3103,7 @@ impl Cli {
         &self,
         env_name: &str,
         prepared: &PreparedUpgradeTarget,
+        ingress_migration: &NamedTailscaleIngressMigration,
     ) -> Result<(), String> {
         const CHECK_ID: &str = "codex/managed-app-server";
         let args = [
@@ -3073,6 +3149,12 @@ impl Cli {
             return Ok(());
         }
         if candidate_codex_preflight_is_unsupported(&output.stdout, &output.stderr) {
+            return Ok(());
+        }
+        if candidate_preflight_only_reports_owned_tailscale_migration(
+            &output.stdout,
+            ingress_migration,
+        ) {
             return Ok(());
         }
         Err(format!(
@@ -3164,6 +3246,40 @@ impl Cli {
         }
 
         Ok((None, None))
+    }
+
+    fn stop_service_for_update_finalization(&self, env_name: &str) -> Result<bool, String> {
+        let Some(service) = self.upgrade_service_status(env_name)? else {
+            return Ok(false);
+        };
+        if !service.installed || !service.running {
+            return Ok(false);
+        }
+
+        let stopped = self.with_progress(
+            format!("Stopping service for cold update finalization: {env_name}"),
+            || self.service_service().stop_locked(env_name),
+        )?;
+        if stopped.running {
+            return Err(format!(
+                "managed service for {env_name} remained running after the update finalization stop"
+            ));
+        }
+        Ok(true)
+    }
+
+    fn restore_service_after_failed_upgrade_locked(
+        &self,
+        env_name: &str,
+        service_before: &UpgradeHistoryServiceState,
+    ) -> Result<(), String> {
+        if !service_before.enabled || !service_before.running {
+            return Ok(());
+        }
+        self.service_service()
+            .start_locked(env_name)
+            .map(|_| ())
+            .map_err(|error| format!("failed to restore the pre-upgrade service state: {error}"))
     }
 
     pub(super) fn wait_for_restarted_gateway_health(
@@ -3324,13 +3440,21 @@ impl Cli {
         &self,
         env_name: &str,
         runtime_name: &str,
-        timings: &mut UpgradeTimingRecorder,
+        ingress_migration: &NamedTailscaleIngressMigration,
+        transaction: &mut UpgradeTransaction,
     ) -> Result<PostCoreUpdateResult, String> {
         // Resolve the replacement explicitly while the previous binding remains published.
         // A failed finalizer can then roll back without ever activating the replacement.
+        let service_stopped =
+            transaction.service_quiesced || self.stop_service_for_update_finalization(env_name)?;
+        let ingress_applied =
+            self.apply_named_tailscale_ingress_migration(env_name, ingress_migration)?;
+        if let Some(applied) = ingress_applied {
+            transaction.ingress_rollback = Some(applied);
+        }
         let config_repaired =
-            self.repair_target_openclaw_config(env_name, runtime_name, timings)?;
-        let finalize_started = timings.start();
+            self.repair_target_openclaw_config(env_name, runtime_name, &mut transaction.timings)?;
+        let finalize_started = transaction.timings.start();
         let output = match self.run_update_mode_openclaw_command_output_with_env(
             env_name,
             runtime_name,
@@ -3340,7 +3464,7 @@ impl Cli {
         ) {
             Ok(output) => output,
             Err(error) => {
-                timings.finish(
+                transaction.timings.finish(
                     "ocm",
                     "openclawFinalize",
                     "stopped",
@@ -3353,7 +3477,7 @@ impl Cli {
         let child_phases = parse_openclaw_finalize_phases(&output.stdout);
         if !output.status.success() {
             if child_phases.is_empty() {
-                timings.finish(
+                transaction.timings.finish(
                     "ocm",
                     "openclawFinalize",
                     "stopped",
@@ -3361,7 +3485,9 @@ impl Cli {
                     "failed",
                 );
             } else {
-                timings.append_openclaw_phases(finalize_started, &child_phases);
+                transaction
+                    .timings
+                    .append_openclaw_phases(finalize_started, &child_phases);
             }
             return Err(format!(
                 "openclaw update finalize failed: {}",
@@ -3372,7 +3498,7 @@ impl Cli {
             .iter()
             .any(|phase| phase.phase == "completionCache" && phase.outcome == "deferred");
         if child_phases.is_empty() {
-            timings.finish(
+            transaction.timings.finish(
                 "ocm",
                 "openclawFinalize",
                 "stopped",
@@ -3380,14 +3506,33 @@ impl Cli {
                 "completed",
             );
         } else {
-            timings.append_openclaw_phases(finalize_started, &child_phases);
+            transaction
+                .timings
+                .append_openclaw_phases(finalize_started, &child_phases);
         }
+        let note = if ingress_migration.requires_change() && config_repaired && service_stopped {
+            "named Tailscale Service ingress migration, OpenClaw config repair, and cold update finalization completed"
+                .to_string()
+        } else if ingress_migration.requires_change() && config_repaired {
+            "named Tailscale Service ingress migration, OpenClaw config repair, and update finalization completed"
+                .to_string()
+        } else if ingress_migration.requires_change() && service_stopped {
+            "named Tailscale Service ingress migration and cold update finalization completed"
+                .to_string()
+        } else if ingress_migration.requires_change() {
+            "named Tailscale Service ingress migration and update finalization completed"
+                .to_string()
+        } else if config_repaired && service_stopped {
+            "OpenClaw config repair and cold update finalization completed".to_string()
+        } else if config_repaired {
+            "OpenClaw config repair and update finalization completed".to_string()
+        } else if service_stopped {
+            "OpenClaw cold update finalization completed".to_string()
+        } else {
+            "OpenClaw update finalization completed".to_string()
+        };
         Ok(PostCoreUpdateResult {
-            note: Some(if config_repaired {
-                "OpenClaw config repair and update finalization completed".to_string()
-            } else {
-                "OpenClaw update finalization completed".to_string()
-            }),
+            note: Some(note),
             completion_deferred,
         })
     }
@@ -3425,6 +3570,98 @@ impl Cli {
                 "OpenClaw completion cache refresh failed after readiness and can be retried manually: {error}"
             )
         })
+    }
+
+    fn plan_named_tailscale_ingress_migration(
+        &self,
+        env_name: &str,
+    ) -> Result<NamedTailscaleIngressMigration, String> {
+        let env = self.environment_service().get(env_name)?;
+        let (gateway_port, _) = self
+            .environment_service()
+            .resolve_effective_gateway_port(&env)?;
+        let config_path = derive_env_paths(Path::new(&env.root)).config_path;
+        let configured_service_name = gateway_tailscale_service_name(&config_path)?;
+        let Some(ingress) = named_service_routes_for_gateway(
+            gateway_port,
+            configured_service_name.as_deref(),
+            &self.env,
+            &self.cwd,
+        )?
+        else {
+            return Ok(NamedTailscaleIngressMigration::default());
+        };
+        let requested = identity_proxy_trusted_proxies();
+        let config_required = plan_gateway_tailscale_trusted_proxy_migration(
+            &config_path,
+            &requested,
+            &ingress.tailnet_login,
+        )
+        .map_err(|error| {
+                format!(
+                    "named Tailscale Service ingress for env \"{env_name}\" targets the gateway directly through {}; {error}. The source environment and service were left unchanged",
+                    summarize_named_service_routes(&ingress.routes)
+                )
+            })?;
+        let proxy_plan = plan_identity_proxy(
+            env_name,
+            gateway_port,
+            ingress.identity_endpoints,
+            &self.env,
+            &self.cwd,
+        )?;
+        Ok(NamedTailscaleIngressMigration {
+            routes: ingress.routes,
+            tailnet_login: Some(ingress.tailnet_login),
+            proxy_plan: Some(proxy_plan),
+            config_required,
+        })
+    }
+
+    fn apply_named_tailscale_ingress_migration(
+        &self,
+        env_name: &str,
+        migration: &NamedTailscaleIngressMigration,
+    ) -> Result<Option<AppliedNamedTailscaleIngress>, String> {
+        let Some(proxy_plan) = migration.proxy_plan.as_ref() else {
+            return Ok(None);
+        };
+        let env = self.environment_service().get(env_name)?;
+        let config_path = derive_env_paths(Path::new(&env.root)).config_path;
+        let requested = identity_proxy_trusted_proxies();
+        let tailnet_login = migration.tailnet_login.as_deref().ok_or_else(|| {
+            "named Tailscale Service migration is missing its verified tailnet login".to_string()
+        })?;
+        if migration.config_required {
+            migrate_gateway_to_tailscale_trusted_proxy(
+                &config_path,
+                &requested,
+                tailnet_login,
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to migrate named Tailscale Service ingress for env \"{env_name}\" through {}: {error}",
+                    summarize_named_service_routes(&migration.routes)
+                )
+            })?;
+        }
+        let proxy = install_identity_proxy(proxy_plan, &self.env, &self.cwd).map_err(|error| {
+            format!("failed to install the OCM identity proxy for env \"{env_name}\": {error}")
+        })?;
+        match rewrite_named_service_routes(&migration.routes, proxy_plan.config.listen_port) {
+            Ok(routes) => Ok(Some(AppliedNamedTailscaleIngress { proxy, routes })),
+            Err(error) => {
+                let rollback_error = proxy.rollback(&self.env).err();
+                Err(match rollback_error {
+                    Some(rollback_error) => format!(
+                        "failed to route named Tailscale Service ingress through the OCM identity proxy: {error}; also failed to remove the proxy: {rollback_error}"
+                    ),
+                    None => format!(
+                        "failed to route named Tailscale Service ingress through the OCM identity proxy: {error}"
+                    ),
+                })
+            }
+        }
     }
 
     fn repair_target_openclaw_config(
@@ -3748,6 +3985,7 @@ impl Cli {
             },
             service_quiesced,
             mutated_runtime_names: BTreeSet::new(),
+            ingress_rollback: None,
             rollback_of,
         })
     }
@@ -3988,18 +4226,9 @@ impl Cli {
     ) -> Result<UpgradeEnvSummary, String> {
         if !transaction.rollback_enabled {
             let snapshot_id = transaction.snapshot_id.clone();
-            let service_restore_warning = if transaction.service_before.enabled
-                && transaction.service_before.running
-            {
-                self.service_service()
-                    .start_locked(env_name)
-                    .err()
-                    .map(|restore_error| {
-                        format!("failed to restore the pre-upgrade service state: {restore_error}")
-                    })
-            } else {
-                None
-            };
+            let service_restore_warning = self
+                .restore_service_after_failed_upgrade_locked(env_name, &transaction.service_before)
+                .err();
             let mut summary = UpgradeEnvSummary {
                 env_name: env_name.to_string(),
                 previous_binding_kind: previous_binding_kind.to_string(),
@@ -4081,46 +4310,58 @@ impl Cli {
         let changes_runtime_trees = !transaction.mutated_runtime_names.is_empty();
         let changes_binding = transaction.source.kind != transaction.target.kind
             || transaction.source.name != transaction.target.name;
-        if changes_runtime_trees || changes_binding {
+        let changes_ingress = transaction.ingress_rollback.is_some();
+        if changes_runtime_trees || changes_binding || changes_ingress {
             self.service_service()
                 .quiesce_for_runtime_mutation_locked(env_name)
                 .map_err(|error| {
                     format!("failed to quiesce the failed target before upgrade rollback: {error}")
                 })?;
         }
-        for runtime_backup in transaction.runtime_backups.iter().filter(|backup| {
-            transaction
-                .mutated_runtime_names
-                .contains(&backup.meta.name)
-        }) {
-            self.restore_runtime_backup(runtime_backup)?;
+        let rollback_result = (|| {
+            if let Some(ingress) = transaction.ingress_rollback.as_ref() {
+                restore_named_service_routes(&ingress.routes)?;
+                ingress.proxy.rollback(&self.env)?;
+            }
+            // Restore runtime bytes and metadata before the snapshot republishes supervisor
+            // state; otherwise rollback can briefly advertise the failed runtime revision.
+            for runtime_backup in transaction.runtime_backups.iter().filter(|backup| {
+                transaction
+                    .mutated_runtime_names
+                    .contains(&backup.meta.name)
+            }) {
+                self.restore_runtime_backup(runtime_backup)?;
+            }
+            self.environment_service()
+                .restore_snapshot_locked(RestoreEnvSnapshotOptions {
+                    env_name: env_name.to_string(),
+                    snapshot_id: transaction.snapshot_id.clone(),
+                })?;
+            if changes_runtime_trees {
+                self.service_service().wait_for_binding_convergence_locked(
+                    env_name,
+                    &transaction.source.kind,
+                    &transaction.source.name,
+                )?;
+            }
+            for runtime_name in transaction
+                .created_runtime_names
+                .iter()
+                .filter(|runtime_name| transaction.mutated_runtime_names.contains(*runtime_name))
+            {
+                self.remove_runtime_created_during_upgrade(runtime_name)?;
+            }
+            Ok(())
+        })();
+        let service_result =
+            self.restore_service_after_failed_upgrade_locked(env_name, &transaction.service_before);
+
+        match (rollback_result, service_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(service_error)) => Err(format!("{error}; {service_error}")),
         }
-        self.environment_service()
-            .restore_snapshot_locked(RestoreEnvSnapshotOptions {
-                env_name: env_name.to_string(),
-                snapshot_id: transaction.snapshot_id.clone(),
-            })?;
-        if changes_runtime_trees {
-            self.service_service().wait_for_binding_convergence_locked(
-                env_name,
-                &transaction.source.kind,
-                &transaction.source.name,
-            )?;
-        }
-        for runtime_name in transaction
-            .created_runtime_names
-            .iter()
-            .filter(|runtime_name| transaction.mutated_runtime_names.contains(*runtime_name))
-        {
-            self.remove_runtime_created_during_upgrade(runtime_name)?;
-        }
-        if transaction.service_before.enabled && transaction.service_before.running {
-            self.service_service()
-                .start_locked(env_name)
-                .map(|_| ())
-                .map_err(|error| format!("failed to restart the restored service: {error}"))?;
-        }
-        Ok(())
     }
 
     fn remove_runtime_created_during_upgrade(&self, runtime_name: &str) -> Result<(), String> {
@@ -4361,6 +4602,7 @@ struct UpgradeTransaction {
     finalization: UpgradeHistoryStage,
     service_quiesced: bool,
     mutated_runtime_names: BTreeSet<String>,
+    ingress_rollback: Option<AppliedNamedTailscaleIngress>,
     rollback_of: Option<String>,
 }
 
@@ -4393,13 +4635,16 @@ impl UpgradeTransaction {
         self.finalization.status = "not-needed".to_string();
     }
 
-    fn cleanup(self) {
+    fn cleanup(mut self) {
+        // Rollback-disabled failures intentionally keep the migrated ingress state.
+        self.ingress_rollback.take();
         for runtime_backup in self.runtime_backups {
             runtime_backup.cleanup();
         }
     }
 
-    fn commit(self) {
+    fn commit(mut self) {
+        self.ingress_rollback.take();
         for runtime_backup in self.runtime_backups {
             runtime_backup.commit();
         }
@@ -4717,6 +4962,43 @@ fn candidate_codex_preflight_is_unsupported(stdout: &str, stderr: &str) -> bool 
     .any(|marker| normalized.contains(marker))
 }
 
+fn candidate_preflight_only_reports_owned_tailscale_migration(
+    stdout: &str,
+    migration: &NamedTailscaleIngressMigration,
+) -> bool {
+    if !migration.config_required {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(stdout) else {
+        return false;
+    };
+    let Some(findings) = value.get("findings").and_then(Value::as_array) else {
+        return false;
+    };
+
+    let mut matched = false;
+    for finding in findings {
+        if finding.get("severity").and_then(Value::as_str) != Some("error") {
+            continue;
+        }
+        let message = finding
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let is_owned_migration_error = finding.get("checkId").and_then(Value::as_str)
+            == Some("core/doctor/final-config-validation")
+            && finding.get("path").and_then(Value::as_str) == Some("gateway.tailscale")
+            && message.contains("Unrecognized keys")
+            && message.contains("resetOnExit")
+            && message.contains("serviceName");
+        if !is_owned_migration_error {
+            return false;
+        }
+        matched = true;
+    }
+    matched
+}
+
 fn shell_command(command: &str) -> Command {
     if cfg!(windows) {
         let mut process = Command::new("cmd");
@@ -4781,6 +5063,26 @@ fn join_warnings(warnings: &[String]) -> Option<String> {
     } else {
         Some(warnings.join(" "))
     }
+}
+
+fn dry_run_note(migration: &NamedTailscaleIngressMigration) -> String {
+    let base = "dry run: no runtime, env, service, config, or snapshot changed";
+    if !migration.requires_change() {
+        return base.to_string();
+    }
+    format!(
+        "{base}; would install an OCM-owned Tailscale identity proxy on port {} and migrate gateway auth for {} through {}",
+        migration
+            .proxy_plan
+            .as_ref()
+            .map(|plan| plan.config.listen_port)
+            .unwrap_or_default(),
+        migration
+            .tailnet_login
+            .as_deref()
+            .unwrap_or("the tailnet owner"),
+        summarize_named_service_routes(&migration.routes)
+    )
 }
 
 fn join_optional_warnings(left: Option<String>, right: Option<String>) -> Option<String> {
@@ -4897,10 +5199,11 @@ fn gateway_auth_failure_proves_reachable(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_codex_preflight_is_unsupported, command_output_reports_unsupported_command,
-        parse_openclaw_finalize_phases, release_version_from_output,
-        summarize_command_failure_text, verify_gateway_status_readiness,
-        version_output_matches_expected,
+        NamedTailscaleIngressMigration, candidate_codex_preflight_is_unsupported,
+        candidate_preflight_only_reports_owned_tailscale_migration,
+        command_output_reports_unsupported_command, parse_openclaw_finalize_phases,
+        release_version_from_output, summarize_command_failure_text,
+        verify_gateway_status_readiness, version_output_matches_expected,
     };
 
     #[test]
@@ -5106,6 +5409,37 @@ mod tests {
         assert!(!candidate_codex_preflight_is_unsupported(
             "",
             "managed Codex binary command not found"
+        ));
+    }
+
+    #[test]
+    fn candidate_probe_allows_only_planned_tailscale_schema_migration_errors() {
+        let migration = NamedTailscaleIngressMigration {
+            config_required: true,
+            ..NamedTailscaleIngressMigration::default()
+        };
+        let owned_error = r#"{"ok":false,"findings":[{"checkId":"core/doctor/final-config-validation","severity":"error","path":"gateway.tailscale","message":"Unrecognized keys: \"resetOnExit\", \"serviceName\""},{"checkId":"codex/managed-app-server","severity":"info","path":"/candidate/codex","message":"managed app-server is compatible"}]}"#;
+        assert!(candidate_preflight_only_reports_owned_tailscale_migration(
+            owned_error,
+            &migration
+        ));
+
+        let unplanned = NamedTailscaleIngressMigration::default();
+        assert!(!candidate_preflight_only_reports_owned_tailscale_migration(
+            owned_error,
+            &unplanned
+        ));
+
+        let unrelated_error = r#"{"ok":false,"findings":[{"checkId":"core/doctor/final-config-validation","severity":"error","path":"gateway.tailscale","message":"Unrecognized keys: \"resetOnExit\", \"serviceName\""},{"checkId":"codex/managed-app-server","severity":"error","path":"/candidate/codex","message":"version mismatch"}]}"#;
+        assert!(!candidate_preflight_only_reports_owned_tailscale_migration(
+            unrelated_error,
+            &migration
+        ));
+
+        let other_config_error = r#"{"ok":false,"findings":[{"checkId":"core/doctor/final-config-validation","severity":"error","path":"gateway.auth","message":"Unrecognized key: \"legacyToken\""}]}"#;
+        assert!(!candidate_preflight_only_reports_owned_tailscale_migration(
+            other_config_error,
+            &migration
         ));
     }
 }

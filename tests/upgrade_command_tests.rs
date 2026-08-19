@@ -328,6 +328,10 @@ case "$1" in
           printf '{{"ok":false,"checksRun":1,"checksSkipped":0,"findings":[{{"checkId":"codex/managed-app-server","severity":"error","message":"Managed Codex app-server version mismatch: expected 0.147.0, detected 0.146.0.","path":"/candidate/codex"}}]}}\n'
           exit 1
           ;;
+        tailscale-migration)
+          printf '{{"ok":false,"checksRun":2,"checksSkipped":0,"findings":[{{"checkId":"core/doctor/final-config-validation","severity":"error","message":"Unrecognized keys: \\"resetOnExit\\", \\"serviceName\\"","path":"gateway.tailscale"}},{{"checkId":"codex/managed-app-server","severity":"info","message":"Managed Codex app-server is compatible.","path":"/candidate/codex"}}]}}\n'
+          exit 1
+          ;;
         unsupported)
           printf '{{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{{"checkId":"core/doctor/lint-selection","severity":"error","message":"Unknown health check id selected by --only: codex/managed-app-server.","path":"codex/managed-app-server"}}]}}\n'
           exit 1
@@ -735,6 +739,87 @@ fn prepend_fake_bin(env: &mut std::collections::BTreeMap<String, String>, bin_di
     env.insert("PATH".to_string(), combined_path);
 }
 
+fn install_fake_named_tailscale_service(
+    root: &TestDir,
+    env: &mut BTreeMap<String, String>,
+    gateway_port: u32,
+) {
+    let tailscale = root.child("fake-tailscale");
+    let serve_config = root.child("fake-tailscale-serve.json");
+    let serve_config_path = path_string(&serve_config);
+    fs::write(
+        &serve_config,
+        format!(
+            r#"{{"version":"0.0.1","endpoints":{{"tcp:443":"http://127.0.0.1:{gateway_port}"}}}}"#
+        ),
+    )
+    .unwrap();
+    write_executable_script(
+        &tailscale,
+        &format!(
+            r#"#!/bin/sh
+if [ "$*" = "serve status --json" ]; then
+  cat <<'EOF'
+{{
+  "Services": {{
+    "svc:demo": {{
+      "TCP": {{"443": {{"HTTPS": true}}}},
+      "Web": {{
+        "demo.tailnet.ts.net:443": {{
+          "Handlers": {{
+            "/": {{"Proxy": "http://127.0.0.1:{gateway_port}"}}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
+EOF
+  exit 0
+fi
+if [ "$1" = "serve" ] && [ "$2" = "--service=svc:demo" ] && [ "$3" = "--yes" ]; then
+  printf '{{"version":"0.0.1","endpoints":{{"tcp:443":"%s"}}}}' "$4" > "{serve_config_path}"
+  exit 0
+fi
+if [ "$*" = "status --json" ]; then
+  cat <<'EOF'
+{{
+  "CurrentTailnet": {{
+    "Name": "owner@example.com",
+    "MagicDNSSuffix": "tailnet.ts.net"
+  }},
+  "User": {{
+    "1": {{
+      "ID": 1,
+      "LoginName": "owner@example.com",
+      "DisplayName": "Owner"
+    }}
+  }}
+}}
+EOF
+  exit 0
+fi
+echo "unexpected args: $*" >&2
+exit 1
+"#
+        ),
+    );
+    env.insert(
+        "OCM_INTERNAL_TAILSCALE_BIN".to_string(),
+        path_string(&tailscale),
+    );
+    install_fake_node_and_npm(root, env, "22.22.3");
+    install_fake_launchctl(root, env);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    env.insert(
+        "OCM_INTERNAL_IDENTITY_PROXY_SKIP_READY".to_string(),
+        "1".to_string(),
+    );
+}
+
 fn install_fake_simulation_pnpm(
     root: &TestDir,
     env: &mut std::collections::BTreeMap<String, String>,
@@ -857,7 +942,6 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
         &["start", "demo", "--port", &health_port.to_string()],
     );
     assert!(start.status.success(), "{}", stderr(&start));
-
     env.insert(
         "OCM_TEST_GATEWAY_AUTH_HANDSHAKE".to_string(),
         "1".to_string(),
@@ -913,13 +997,17 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
     assert!(saw_stop, "upgrade did not stop the source service");
     assert!(saw_start, "upgrade did not start the updated service");
     assert!(health_requests.load(Ordering::SeqCst) >= 2);
-    assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+    assert!(
+        upgrade.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&upgrade),
+        stderr(&upgrade)
+    );
     let output = stdout(&upgrade);
     assert!(output.contains("outcome=updated"), "{output}");
     assert!(output.contains("service=started"), "{output}");
     assert!(output.contains("snapshot="), "{output}");
     assert!(output.contains("version=2026.3.25"), "{output}");
-
     let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
     assert!(runtime.status.success(), "{}", stderr(&runtime));
     let runtime_json: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
@@ -3047,7 +3135,7 @@ fn upgrade_simulate_reports_local_repo_doctor_failures() {
 }
 
 #[test]
-fn upgrade_rolls_back_runtime_when_service_restart_fails() {
+fn upgrade_restores_runtime_and_preserves_excluded_state_when_service_restart_fails() {
     let root = TestDir::new("upgrade-service-rollback");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -3117,6 +3205,16 @@ fn upgrade_rolls_back_runtime_when_service_restart_fails() {
     let future_state = env_root.join("durable-future/rollback-marker.txt");
     write_text(&dotenv, "OPENCLAW_ROLLBACK_SENTINEL=before\n");
     write_text(&future_state, "safe pre-upgrade state\n");
+    let secret_path = env_root.join(".openclaw/secrets/telegram/default.token");
+    fs::create_dir_all(secret_path.parent().unwrap()).unwrap();
+    fs::write(&secret_path, "keep-across-rollback\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let browser_cookie_path = env_root.join(".openclaw/browser/openclaw/user-data/Default/Cookies");
+    fs::create_dir_all(browser_cookie_path.parent().unwrap()).unwrap();
+    fs::write(&browser_cookie_path, "keep-browser-across-rollback\n").unwrap();
+    let plugin_state_path = env_root.join(".openclaw/lcm.db");
+    fs::write(&plugin_state_path, "keep-plugin-state-across-rollback\n").unwrap();
 
     let launchctl_bin = env.get("OCM_INTERNAL_LAUNCHCTL_BIN").unwrap();
     let stopped_marker = root.child("service-stopped");
@@ -3138,7 +3236,7 @@ fn upgrade_rolls_back_runtime_when_service_restart_fails() {
     );
     assert!(output.contains("rollback=failed"), "{output}");
     assert!(
-        output.contains("failed to restart the restored service"),
+        output.contains("failed to restore the pre-upgrade service state"),
         "{output}"
     );
     assert!(output.contains("snapshot="), "{output}");
@@ -3159,7 +3257,6 @@ fn upgrade_rolls_back_runtime_when_service_restart_fails() {
         "{}",
         stderr(&target_runtime)
     );
-
     let restored = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(restored.status.success(), "{}", stderr(&restored));
     let restored_json: Value = serde_json::from_str(&stdout(&restored)).unwrap();
@@ -3172,6 +3269,18 @@ fn upgrade_rolls_back_runtime_when_service_restart_fails() {
     assert_eq!(
         fs::read_to_string(&future_state).unwrap(),
         "safe pre-upgrade state\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&secret_path).unwrap(),
+        "keep-across-rollback\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&browser_cookie_path).unwrap(),
+        "keep-browser-across-rollback\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&plugin_state_path).unwrap(),
+        "keep-plugin-state-across-rollback\n"
     );
 }
 
@@ -4734,6 +4843,286 @@ fn upgrade_repairs_target_config_before_finalization() {
 }
 
 #[test]
+fn upgrade_migrates_direct_named_tailscale_service_to_trusted_proxy_auth() {
+    let root = TestDir::new("upgrade-named-tailscale-service");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let old_runtime = root.child("old-openclaw");
+    let new_runtime = root.child("new-openclaw");
+    write_executable_script(&old_runtime, &recording_openclaw_script("old-openclaw"));
+    write_executable_script(&new_runtime, &recording_openclaw_script("new-openclaw"));
+
+    let mut env = ocm_env(&root);
+    install_fake_named_tailscale_service(&root, &mut env, 19789);
+    env.insert(
+        "OCM_TEST_CODEX_PREFLIGHT".to_string(),
+        "tailscale-migration".to_string(),
+    );
+    for (name, runtime) in [("old-local", &old_runtime), ("new-local", &new_runtime)] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                name,
+                "--path",
+                &runtime.display().to_string(),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "demo",
+            "--port",
+            "19789",
+            "--runtime",
+            "old-local",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let env_root = root.child("ocm-home/envs/demo");
+    let config_path = env_root.join(".openclaw/openclaw.json");
+    let original_config = r#"{
+  "gateway": {
+    "port": 19789,
+    "auth": {"mode": "token", "token": "test-token"},
+    "tailscale": {
+      "mode": "serve",
+      "serviceName": "svc:demo",
+      "resetOnExit": false
+    },
+    "trustedProxies": ["10.0.0.10"]
+  }
+}
+"#;
+    fs::write(&config_path, original_config).unwrap();
+
+    let dry_run = run_ocm(
+        &cwd,
+        &env,
+        &["upgrade", "demo", "--runtime", "new-local", "--dry-run"],
+    );
+    assert!(dry_run.status.success(), "{}", stderr(&dry_run));
+    let dry_run_output = stdout(&dry_run);
+    assert!(
+        dry_run_output.contains(
+            "would install an OCM-owned Tailscale identity proxy on port 21789 and migrate gateway auth for owner@example.com"
+        ),
+        "{dry_run_output}"
+    );
+    assert!(
+        dry_run_output.contains("svc:demo (demo.tailnet.ts.net:443)"),
+        "{dry_run_output}"
+    );
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), original_config);
+
+    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new-local"]);
+    assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+    let output = stdout(&upgrade);
+    assert!(
+        output.contains("named Tailscale Service ingress migration"),
+        "{output}"
+    );
+
+    let config: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["gateway"]["trustedProxies"],
+        serde_json::json!(["10.0.0.10", "127.0.0.1/32"])
+    );
+    assert_eq!(
+        config["gateway"]["tailscale"],
+        serde_json::json!({"mode": "off"})
+    );
+    assert_eq!(config["gateway"]["auth"]["mode"], "trusted-proxy");
+    assert_eq!(config["gateway"]["auth"]["password"], "test-token");
+    assert!(config["gateway"]["auth"].get("token").is_none());
+    assert_eq!(
+        config["gateway"]["auth"]["trustedProxy"]["userHeader"],
+        "x-openclaw-user"
+    );
+    assert_eq!(
+        config["gateway"]["auth"]["trustedProxy"]["requiredHeaders"],
+        serde_json::json!(["x-forwarded-proto", "x-forwarded-host", "x-openclaw-proxy"])
+    );
+    assert_eq!(
+        config["gateway"]["auth"]["trustedProxy"]["allowUsers"],
+        serde_json::json!(["owner@example.com"])
+    );
+    assert_eq!(
+        config["gateway"]["auth"]["identityScopes"]["owner@example.com"],
+        serde_json::json!(["operator.admin"])
+    );
+    let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["defaultRuntime"], "new-local");
+    let serve_config: Value =
+        serde_json::from_str(&fs::read_to_string(root.child("fake-tailscale-serve.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        serve_config["endpoints"]["tcp:443"],
+        "http://127.0.0.1:21789"
+    );
+    assert!(
+        root.child("ocm-home/ingress/demo/identity-proxy.json")
+            .exists()
+    );
+    let proxy_script =
+        fs::read_to_string(root.child("ocm-home/ingress/demo/identity-proxy.mjs")).unwrap();
+    assert!(
+        proxy_script.contains("lower.startsWith(\"tailscale-\")"),
+        "identity proxy must strip every Tailscale-owned header before injecting OCM attribution"
+    );
+    assert!(
+        root.child("home/Library/LaunchAgents/ai.openclaw.ocm.ingress.demo.plist")
+            .exists()
+    );
+}
+
+#[test]
+fn upgrade_repairs_named_tailscale_ingress_when_tracked_runtime_is_current() {
+    let root = TestDir::new("upgrade-current-named-tailscale-service");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let version = "2026.8.1";
+    let tarball = openclaw_package_tarball(&recording_openclaw_script(version), version);
+    let integrity = sha512_integrity(&tarball);
+    let tarball_server = TestHttpServer::serve_bytes_times(
+        "/openclaw-2026.8.1.tgz",
+        "application/octet-stream",
+        &tarball,
+        2,
+    );
+    let packument = format!(
+        "{{\"dist-tags\":{{\"latest\":\"{version}\"}},\"versions\":{{\"{version}\":{{\"version\":\"{version}\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{integrity}\"}}}}}},\"time\":{{\"{version}\":\"2026-08-17T17:00:36.000Z\"}}}}",
+        tarball_server.url()
+    );
+    let packument_server =
+        TestHttpServer::serve_bytes_times("/openclaw", "application/json", packument.as_bytes(), 4);
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    install_fake_named_tailscale_service(&root, &mut env, 19789);
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
+        packument_server.url(),
+    );
+
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "demo",
+            "--port",
+            "19789",
+            "--channel",
+            "stable",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let config_path = root.child("ocm-home/envs/demo/.openclaw/openclaw.json");
+    fs::write(
+        &config_path,
+        r#"{"gateway":{"port":19789,"auth":{"mode":"token","token":"test-token"}}}"#,
+    )
+    .unwrap();
+
+    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo"]);
+    assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+    let output = stdout(&upgrade);
+    assert!(output.contains("outcome=updated"), "{output}");
+    assert!(
+        output.contains("named Tailscale Service ingress migration"),
+        "{output}"
+    );
+
+    let config: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["gateway"]["trustedProxies"],
+        serde_json::json!(["127.0.0.1/32"])
+    );
+    assert_eq!(config["gateway"]["auth"]["mode"], "trusted-proxy");
+}
+
+#[test]
+fn upgrade_blocks_named_tailscale_service_migration_without_gateway_auth() {
+    let root = TestDir::new("upgrade-named-tailscale-service-no-auth");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let old_runtime = root.child("old-openclaw");
+    let new_runtime = root.child("new-openclaw");
+    write_executable_script(&old_runtime, &recording_openclaw_script("old-openclaw"));
+    write_executable_script(&new_runtime, &recording_openclaw_script("new-openclaw"));
+
+    let mut env = ocm_env(&root);
+    install_fake_named_tailscale_service(&root, &mut env, 19789);
+    for (name, runtime) in [("old-local", &old_runtime), ("new-local", &new_runtime)] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                name,
+                "--path",
+                &runtime.display().to_string(),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "demo",
+            "--port",
+            "19789",
+            "--runtime",
+            "old-local",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let config_path = root.child("ocm-home/envs/demo/.openclaw/openclaw.json");
+    fs::write(
+        &config_path,
+        r#"{"gateway":{"port":19789,"auth":{"mode":"none"}}}"#,
+    )
+    .unwrap();
+
+    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new-local"]);
+    assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
+    let error = stderr(&upgrade);
+    assert!(error.contains("named Tailscale Service ingress"), "{error}");
+    assert!(
+        error.contains("without an explicit token or password auth boundary"),
+        "{error}"
+    );
+    assert!(error.contains("left unchanged"), "{error}");
+
+    let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["defaultRuntime"], "old-local");
+    let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "demo", "--json"]);
+    assert!(snapshots.status.success(), "{}", stderr(&snapshots));
+    let snapshots: Value = serde_json::from_str(&stdout(&snapshots)).unwrap();
+    assert!(snapshots.as_array().unwrap().is_empty());
+}
+
+#[test]
 fn upgrade_rolls_back_when_target_config_doctor_fails() {
     let root = TestDir::new("upgrade-target-config-doctor-failure");
     let cwd = root.child("workspace");
@@ -5008,6 +5397,7 @@ fn upgrade_rolls_back_runtime_binding_when_update_finalization_fails() {
     write_executable_script(&new_runtime, &recording_openclaw_script("new-openclaw"));
 
     let mut env = ocm_env(&root);
+    install_fake_named_tailscale_service(&root, &mut env, 19789);
     let add_old = run_ocm(
         &cwd,
         &env,
@@ -5037,15 +5427,33 @@ fn upgrade_rolls_back_runtime_binding_when_update_finalization_fails() {
     let create = run_ocm(
         &cwd,
         &env,
-        &["env", "create", "demo", "--runtime", "old-local"],
+        &[
+            "env",
+            "create",
+            "demo",
+            "--port",
+            "19789",
+            "--runtime",
+            "old-local",
+        ],
     );
     assert!(create.status.success(), "{}", stderr(&create));
 
-    fs::write(
-        root.child("ocm-home/envs/demo/.openclaw/openclaw.json"),
-        r#"{"agents":{"list":[{"id":"main","default":true},{"id":"clawforce"}]}}"#,
-    )
-    .unwrap();
+    let config_path = root.child("ocm-home/envs/demo/.openclaw/openclaw.json");
+    let original_config = r#"{
+  "gateway": {
+    "port": 19789,
+    "auth": {"mode": "token", "token": "test-token"}
+  },
+  "agents": {
+    "list": [
+      {"id": "main", "default": true},
+      {"id": "clawforce"}
+    ]
+  }
+}
+"#;
+    fs::write(&config_path, original_config).unwrap();
     let secondary_skill =
         root.child("ocm-home/envs/demo/.openclaw/workspace-clawforce/skills/social/SKILL.md");
     fs::create_dir_all(secondary_skill.parent().unwrap()).unwrap();
@@ -5069,6 +5477,24 @@ fn upgrade_rolls_back_runtime_binding_when_update_finalization_fails() {
     assert_eq!(
         fs::read_to_string(secondary_skill).unwrap(),
         "skill before upgrade\n"
+    );
+    assert_eq!(fs::read_to_string(config_path).unwrap(), original_config);
+    let serve_config: Value =
+        serde_json::from_str(&fs::read_to_string(root.child("fake-tailscale-serve.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        serve_config["endpoints"]["tcp:443"],
+        "http://127.0.0.1:19789"
+    );
+    assert!(
+        !root
+            .child("ocm-home/ingress/demo/identity-proxy.json")
+            .exists()
+    );
+    assert!(
+        !root
+            .child("home/Library/LaunchAgents/ai.openclaw.ocm.ingress.demo.plist")
+            .exists()
     );
 }
 

@@ -274,6 +274,278 @@ pub(crate) fn openclaw_config_include_paths(
     Ok(resolved.include_paths.into_iter().collect())
 }
 
+pub(crate) fn gateway_tailscale_service_name(config_path: &Path) -> Result<Option<String>, String> {
+    let effective = load_effective_openclaw_config(config_path)?
+        .map(|resolved| resolved.value)
+        .unwrap_or_else(|| json!({}));
+    Ok(effective
+        .get("gateway")
+        .and_then(Value::as_object)
+        .and_then(|gateway| gateway.get("tailscale"))
+        .and_then(Value::as_object)
+        .and_then(|tailscale| tailscale.get("serviceName"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string))
+}
+
+pub(crate) fn plan_gateway_tailscale_trusted_proxy_migration(
+    config_path: &Path,
+    requested: &[String],
+    tailnet_login: &str,
+) -> Result<bool, String> {
+    let effective = load_effective_openclaw_config(config_path)?
+        .map(|resolved| resolved.value)
+        .unwrap_or_else(|| json!({}));
+    let gateway = effective.get("gateway").and_then(Value::as_object);
+    let auth = gateway
+        .and_then(|gateway| gateway.get("auth"))
+        .and_then(Value::as_object);
+    let auth_mode = auth
+        .and_then(|auth| auth.get("mode"))
+        .and_then(Value::as_str);
+    match auth_mode {
+        Some("none") | None => {
+            return Err(
+                "cannot automatically migrate named Tailscale Service ingress without an explicit token or password auth boundary"
+                    .to_string(),
+            );
+        }
+        Some("trusted-proxy") => {
+            if gateway_tailscale_trusted_proxy_matches(gateway, auth, requested, tailnet_login)? {
+                return Ok(false);
+            }
+            return Err(
+                "gateway.auth.mode is already \"trusted-proxy\" but does not match OCM's Tailscale identity contract; reconcile it explicitly before upgrading"
+                    .to_string(),
+            );
+        }
+        Some("token" | "password") => {}
+        Some(other) => {
+            return Err(format!(
+                "cannot automatically migrate named Tailscale Service ingress from unsupported gateway.auth.mode \"{other}\""
+            ));
+        }
+    }
+    if auth
+        .and_then(|auth| auth.get("password").or_else(|| auth.get("token")))
+        .is_none()
+    {
+        return Err(
+            "named Tailscale Service migration requires an existing gateway token or password SecretRef to preserve as the direct-local password fallback"
+                .to_string(),
+        );
+    }
+    Ok(true)
+}
+
+pub(crate) fn migrate_gateway_to_tailscale_trusted_proxy(
+    config_path: &Path,
+    requested: &[String],
+    tailnet_login: &str,
+) -> Result<bool, String> {
+    if !plan_gateway_tailscale_trusted_proxy_migration(config_path, requested, tailnet_login)? {
+        return Ok(false);
+    }
+    let effective = load_effective_openclaw_config(config_path)?
+        .map(|resolved| resolved.value)
+        .unwrap_or_else(|| json!({}));
+    let effective_gateway = effective
+        .get("gateway")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "OpenClaw config gateway must be an object".to_string())?;
+    let effective_auth = effective_gateway
+        .get("auth")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "OpenClaw config gateway.auth must be an object".to_string())?;
+    let fallback_password = effective_auth
+        .get("password")
+        .or_else(|| effective_auth.get("token"))
+        .cloned()
+        .ok_or_else(|| {
+            "named Tailscale Service migration requires a gateway token or password fallback"
+                .to_string()
+        })?;
+
+    let mut trusted_proxies = gateway_trusted_proxies(&effective)?
+        .into_iter()
+        .filter(|proxy| !is_legacy_tailscale_or_loopback_proxy(proxy))
+        .collect::<Vec<_>>();
+    for proxy in requested {
+        if !trusted_proxies.contains(proxy) {
+            trusted_proxies.push(proxy.clone());
+        }
+    }
+    let mut auth = effective_auth.clone();
+    auth.insert(
+        "mode".to_string(),
+        Value::String("trusted-proxy".to_string()),
+    );
+    auth.remove("token");
+    auth.remove("allowTailscale");
+    auth.insert("password".to_string(), fallback_password);
+    let identity_scopes = ensure_object_field(&mut auth, "identityScopes");
+    let identity_key = identity_scopes
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case(tailnet_login))
+        .cloned()
+        .unwrap_or_else(|| tailnet_login.to_string());
+    let mut scopes = identity_scopes
+        .get(&identity_key)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !scopes.iter().any(|scope| scope == "operator.admin") {
+        scopes.push(Value::String("operator.admin".to_string()));
+    }
+    identity_scopes.insert(identity_key, Value::Array(scopes));
+
+    let trusted_proxy = ensure_object_field(&mut auth, "trustedProxy");
+    trusted_proxy.insert(
+        "userHeader".to_string(),
+        Value::String("x-openclaw-user".to_string()),
+    );
+    trusted_proxy.insert(
+        "requiredHeaders".to_string(),
+        json!(["x-forwarded-proto", "x-forwarded-host", "x-openclaw-proxy"]),
+    );
+    let mut allowed_users = trusted_proxy
+        .get("allowUsers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !allowed_users.iter().any(|user| {
+        user.as_str()
+            .is_some_and(|user| user.eq_ignore_ascii_case(tailnet_login))
+    }) {
+        allowed_users.push(Value::String(tailnet_login.to_string()));
+    }
+    trusted_proxy.insert("allowUsers".to_string(), Value::Array(allowed_users));
+    trusted_proxy.insert("allowLoopback".to_string(), Value::Bool(true));
+    trusted_proxy.insert(
+        "deviceAutoApprove".to_string(),
+        json!({
+            "enabled": true,
+            "scopes": ["operator.read", "operator.write", "operator.approvals"]
+        }),
+    );
+
+    let mut value = read_config_value(config_path)?.unwrap_or_else(|| json!({}));
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| "OpenClaw config root must be an object".to_string())?;
+    let gateway = ensure_object_field(root, "gateway");
+    if let Some(tailscale) = gateway.get_mut("tailscale").and_then(Value::as_object_mut) {
+        tailscale.insert("mode".to_string(), Value::String("off".to_string()));
+        tailscale.remove("serviceName");
+        tailscale.remove("resetOnExit");
+    }
+    gateway.insert("auth".to_string(), Value::Object(auth));
+    gateway.insert(
+        "trustedProxies".to_string(),
+        Value::Array(
+            trusted_proxies
+                .into_iter()
+                .map(Value::String)
+                .collect::<Vec<_>>(),
+        ),
+    );
+    write_config_value(config_path, &value)?;
+    Ok(true)
+}
+
+fn gateway_tailscale_trusted_proxy_matches(
+    gateway: Option<&serde_json::Map<String, Value>>,
+    auth: Option<&serde_json::Map<String, Value>>,
+    requested: &[String],
+    tailnet_login: &str,
+) -> Result<bool, String> {
+    let Some(gateway) = gateway else {
+        return Ok(false);
+    };
+    let Some(auth) = auth else {
+        return Ok(false);
+    };
+    let effective = Value::Object(
+        [("gateway".to_string(), Value::Object(gateway.clone()))]
+            .into_iter()
+            .collect(),
+    );
+    let trusted_proxies = gateway_trusted_proxies(&effective)?;
+    if trusted_proxies
+        .iter()
+        .any(|proxy| is_legacy_tailscale_or_loopback_proxy(proxy))
+    {
+        return Ok(false);
+    }
+    if requested
+        .iter()
+        .any(|proxy| !trusted_proxies.contains(proxy))
+    {
+        return Ok(false);
+    }
+    let trusted_proxy = auth.get("trustedProxy").and_then(Value::as_object);
+    let identity_scopes = auth.get("identityScopes").and_then(Value::as_object);
+    Ok(auth.get("password").is_some()
+        && auth.get("token").is_none()
+        && trusted_proxy
+            .and_then(|proxy| proxy.get("userHeader"))
+            .and_then(Value::as_str)
+            == Some("x-openclaw-user")
+        && trusted_proxy
+            .and_then(|proxy| proxy.get("allowLoopback"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        && trusted_proxy
+            .and_then(|proxy| proxy.get("allowUsers"))
+            .and_then(Value::as_array)
+            .is_some_and(|users| {
+                users.iter().any(|user| {
+                    user.as_str()
+                        .is_some_and(|user| user.eq_ignore_ascii_case(tailnet_login))
+                })
+            })
+        && identity_scopes.is_some_and(|grants| {
+            grants.iter().any(|(identity, scopes)| {
+                identity.eq_ignore_ascii_case(tailnet_login)
+                    && scopes
+                        .as_array()
+                        .is_some_and(|scopes| scopes.iter().any(|scope| scope == "operator.admin"))
+            })
+        }))
+}
+
+fn is_legacy_tailscale_or_loopback_proxy(proxy: &str) -> bool {
+    matches!(
+        proxy.trim().to_ascii_lowercase().as_str(),
+        "100.64.0.0/10" | "fd7a:115c:a1e0::/48" | "127.0.0.1" | "127.0.0.0/8" | "::1" | "::1/128"
+    )
+}
+
+fn gateway_trusted_proxies(config: &Value) -> Result<Vec<String>, String> {
+    let Some(value) = config
+        .get("gateway")
+        .and_then(Value::as_object)
+        .and_then(|gateway| gateway.get("trustedProxies"))
+    else {
+        return Ok(Vec::new());
+    };
+    let entries = value.as_array().ok_or_else(|| {
+        "gateway.trustedProxies must be an array before OCM can migrate named Tailscale Service ingress"
+            .to_string()
+    })?;
+    entries
+        .iter()
+        .map(|entry| {
+            entry.as_str().map(str::to_string).ok_or_else(|| {
+                "gateway.trustedProxies must contain only strings before OCM can migrate named Tailscale Service ingress"
+                    .to_string()
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 enum SandboxOriginPolicy<'a> {
     Preserve,
@@ -1360,6 +1632,118 @@ mod tests {
                 display_path(&paths.workspace_dir)
             );
 
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn named_tailscale_proxy_migration_preserves_existing_trusted_proxies() {
+        let root = test_root("named-tailscale-proxy");
+        let paths = derive_env_paths(&root);
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        write_config_value(
+            &paths.config_path,
+            &json!({
+                "gateway": {
+                    "auth": {
+                        "mode": "token",
+                        "token": {"source": "file", "provider": "local", "id": "/gateway/auth/token"}
+                    },
+                    "tailscale": {
+                        "mode": "serve",
+                        "serviceName": "svc:demo",
+                        "resetOnExit": false
+                    },
+                    "trustedProxies": [
+                        "100.64.0.0/10",
+                        "fd7a:115c:a1e0::/48",
+                        "10.0.0.10",
+                        "127.0.0.1"
+                    ]
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(
+            plan_gateway_tailscale_trusted_proxy_migration(
+                &paths.config_path,
+                &["127.0.0.1/32".to_string()],
+                "owner@example.com",
+            )
+            .unwrap()
+        );
+        assert!(
+            migrate_gateway_to_tailscale_trusted_proxy(
+                &paths.config_path,
+                &["127.0.0.1/32".to_string()],
+                "owner@example.com",
+            )
+            .unwrap()
+        );
+
+        let value = read_config_value(&paths.config_path).unwrap().unwrap();
+        assert_eq!(
+            value["gateway"]["trustedProxies"],
+            json!(["10.0.0.10", "127.0.0.1/32"])
+        );
+        assert_eq!(value["gateway"]["tailscale"], json!({"mode": "off"}));
+        assert_eq!(value["gateway"]["auth"]["mode"], "trusted-proxy");
+        assert!(value["gateway"]["auth"].get("token").is_none());
+        assert_eq!(
+            value["gateway"]["auth"]["password"],
+            json!({"source": "file", "provider": "local", "id": "/gateway/auth/token"})
+        );
+        assert_eq!(
+            value["gateway"]["auth"]["trustedProxy"]["userHeader"],
+            "x-openclaw-user"
+        );
+        assert_eq!(
+            value["gateway"]["auth"]["trustedProxy"]["requiredHeaders"],
+            json!(["x-forwarded-proto", "x-forwarded-host", "x-openclaw-proxy"])
+        );
+        assert_eq!(
+            value["gateway"]["auth"]["trustedProxy"]["allowUsers"],
+            json!(["owner@example.com"])
+        );
+        assert_eq!(
+            value["gateway"]["auth"]["identityScopes"]["owner@example.com"],
+            json!(["operator.admin"])
+        );
+        assert!(
+            !plan_gateway_tailscale_trusted_proxy_migration(
+                &paths.config_path,
+                &["127.0.0.1/32".to_string()],
+                "owner@example.com",
+            )
+            .unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn named_tailscale_proxy_migration_does_not_invent_an_auth_boundary() {
+        for mode in ["none", "trusted-proxy"] {
+            let root = test_root(&format!("named-tailscale-proxy-{mode}"));
+            let paths = derive_env_paths(&root);
+            fs::create_dir_all(&paths.state_dir).unwrap();
+            write_config_value(
+                &paths.config_path,
+                &json!({"gateway": {"auth": {"mode": mode}}}),
+            )
+            .unwrap();
+
+            let error = plan_gateway_tailscale_trusted_proxy_migration(
+                &paths.config_path,
+                &["127.0.0.1/32".to_string()],
+                "owner@example.com",
+            )
+            .unwrap_err();
+            if mode == "none" {
+                assert!(error.contains("token or password auth boundary"), "{error}");
+            } else {
+                assert!(error.contains("already \"trusted-proxy\""), "{error}");
+            }
             let _ = fs::remove_dir_all(root);
         }
     }

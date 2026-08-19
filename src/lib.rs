@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod env;
 pub mod host;
+pub(crate) mod identity_proxy;
 pub mod infra;
 pub mod launcher;
 pub mod logs;
@@ -11,3 +12,4 @@ pub mod runtime;
 pub mod service;
 pub mod store;
 pub mod supervisor;
+pub(crate) mod tailscale;

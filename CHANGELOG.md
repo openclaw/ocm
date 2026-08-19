@@ -19,7 +19,10 @@ All notable changes to OCM are documented here.
 ### Changed
 
 - Resolve and package the complete transitive closure of private OpenClaw `workspace:*` dependencies during `runtime build-local`, rewriting nested workspace specs only inside scratch archives so current source graphs install without mutating the checkout.
+- Materialize environment-targeted local plugins with a valid `node_modules/openclaw` host peer before recording the runtime's full-tree digest.
 - Make `ocm service restart <env>` restart immediately through OpenClaw's protocol-v1 recovery handoff so eligible interrupted sessions and subagents resume after startup, preserve the legacy direct-restart behavior with a warning when recovery is unavailable, keep `--force` as an explicit bypass for an unhealthy handoff, and avoid self-restart deadlocks.
+- Clean surviving process-group descendants after supervised gateway exit and always reap the process-group leader.
+- Migrate direct named Tailscale Service routes during upgrade to an OCM-owned identity proxy and OpenClaw trusted-proxy auth, preserving direct-local password fallback and restoring proxy, route, config, runtime, and service state on rollback.
 
 ## 0.2.30 - 2026-07-23
 
