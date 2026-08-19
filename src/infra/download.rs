@@ -3,13 +3,32 @@ use std::io;
 use std::io::Read;
 use std::path::Path;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use base64::Engine;
 use flate2::read::GzDecoder;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256, Sha512};
 
-static HTTP_AGENT: LazyLock<ureq::Agent> = LazyLock::new(ureq::agent);
+const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+const HTTP_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ureq carries a recv-response deadline into body reads. Bound the header wait from the
+// completed request-send phase instead, then use recv-body as the per-read stall timeout.
+static HTTP_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_resolve(Some(HTTP_PHASE_TIMEOUT))
+            .timeout_connect(Some(HTTP_PHASE_TIMEOUT))
+            .timeout_send_request(Some(HTTP_PHASE_TIMEOUT))
+            .timeout_recv_body(Some(HTTP_PHASE_TIMEOUT))
+            .build(),
+    )
+});
+
+pub(crate) fn http_agent() -> &'static ureq::Agent {
+    &HTTP_AGENT
+}
 
 pub fn artifact_file_name_from_url(url: &str) -> Result<String, String> {
     let trimmed = url.trim();
@@ -49,8 +68,29 @@ pub fn download_to_file(url: &str, destination: &Path) -> Result<(), String> {
     }
 
     let mut file = File::create(destination).map_err(|error| error.to_string())?;
-    io::copy(&mut reader, &mut file).map_err(|error| error.to_string())?;
+    copy_capped(&mut reader, &mut file, MAX_DOWNLOAD_BYTES).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn copy_capped<R: io::Read + ?Sized, W: io::Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+    max_bytes: u64,
+) -> io::Result<u64> {
+    let copied = {
+        let mut limited = reader.take(max_bytes);
+        io::copy(&mut limited, writer)?
+    };
+    if copied == max_bytes {
+        let mut extra = [0_u8; 1];
+        if reader.read(&mut extra)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("download exceeded {max_bytes} bytes"),
+            ));
+        }
+    }
+    Ok(copied)
 }
 
 pub fn fetch_json<T: DeserializeOwned>(url: &str) -> Result<T, String> {
@@ -81,7 +121,7 @@ fn open_url_reader(
         return Err("runtime URL is required".to_string());
     }
 
-    let mut request = HTTP_AGENT.get(trimmed);
+    let mut request = http_agent().get(trimmed);
     if compressed_json {
         request = request.header("Accept-Encoding", "gzip");
     }
@@ -211,7 +251,8 @@ fn verify_file_sha512_base64(
 
 #[cfg(test)]
 mod tests {
-    use super::artifact_file_name_from_url;
+    use super::{artifact_file_name_from_url, copy_capped};
+    use std::io::{self, Read};
 
     #[test]
     fn artifact_file_name_rejects_cross_platform_path_components() {
@@ -234,5 +275,39 @@ mod tests {
             .unwrap(),
             "openclaw.tar.gz"
         );
+    }
+
+    #[test]
+    fn copy_capped_errors_when_reader_exceeds_max() {
+        let mut reader = io::repeat(b'a').take(16);
+        let mut writer = Vec::new();
+        let error = copy_capped(&mut reader, &mut writer, 8).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            writer.len() <= 8,
+            "fail closed must not keep more than the cap: {}",
+            writer.len()
+        );
+    }
+
+    #[test]
+    fn copy_capped_copies_when_reader_is_within_max() {
+        let mut reader = &b"hello"[..];
+        let mut writer = Vec::new();
+        let copied = copy_capped(&mut reader, &mut writer, 8).unwrap();
+        assert_eq!(copied, 5);
+        assert_eq!(writer, b"hello");
+    }
+
+    #[test]
+    fn copy_capped_allows_a_reader_that_hits_the_max_exactly() {
+        let mut reader = &b"hello"[..];
+        let mut writer = Vec::new();
+        let copied = copy_capped(&mut reader, &mut writer, 5).unwrap();
+        assert_eq!(copied, 5);
+        assert_eq!(writer, b"hello");
     }
 }
