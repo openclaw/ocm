@@ -14,6 +14,8 @@ pub(crate) struct GatewayReadiness {
     pub(crate) ready: bool,
     pub(crate) status: ServiceSummary,
     pub(crate) issue: Option<String>,
+    pub(crate) process_observed_after_ms: Option<u64>,
+    pub(crate) ready_after_ms: Option<u64>,
 }
 
 pub(crate) fn wait_for_gateway_readiness(
@@ -35,15 +37,22 @@ fn wait_for_gateway_readiness_with_timeout(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<GatewayReadiness, String> {
+    let started = Instant::now();
     let deadline = Instant::now() + timeout;
     let mut permitted_retry_count = None;
+    let mut process_observed_after_ms = None;
     loop {
         let status = service_status_fast(name, env, cwd)?;
+        if process_observed_after_ms.is_none() && status.child_pid.is_some() {
+            process_observed_after_ms = Some(duration_ms(started.elapsed()));
+        }
         if status.running && gateway_health_ok(status.child_port.unwrap_or(status.gateway_port)) {
             return Ok(GatewayReadiness {
                 ready: true,
                 status,
                 issue: None,
+                process_observed_after_ms,
+                ready_after_ms: Some(duration_ms(started.elapsed())),
             });
         }
 
@@ -73,6 +82,8 @@ fn wait_for_gateway_readiness_with_timeout(
                 ready: false,
                 status,
                 issue: Some(issue),
+                process_observed_after_ms,
+                ready_after_ms: None,
             });
         }
 
@@ -88,12 +99,18 @@ fn wait_for_gateway_readiness_with_timeout(
                     "gateway did not become ready within {} seconds; latest status: {latest}",
                     timeout.as_secs_f64()
                 )),
+                process_observed_after_ms,
+                ready_after_ms: None,
             });
         }
         sleep(
             GATEWAY_READINESS_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
         );
     }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn gateway_health_ok(port: u32) -> bool {
