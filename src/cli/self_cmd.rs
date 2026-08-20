@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use crate::store::resolve_ocm_home;
 
 use super::{Cli, render};
 
-const RELEASE_REPO: &str = "shakkernerd/ocm";
+const RELEASE_REPO: &str = "openclaw/ocm";
 const INTERNAL_SELF_UPDATE_RELEASE_URL_ENV: &str = "OCM_INTERNAL_SELF_UPDATE_RELEASE_URL";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -387,22 +388,7 @@ impl Cli {
     }
 
     fn fetch_self_release(&self, version: Option<&str>) -> Result<GitHubRelease, String> {
-        let url = if let Some(override_url) = self
-            .env
-            .get(INTERNAL_SELF_UPDATE_RELEASE_URL_ENV)
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            override_url.to_string()
-        } else if let Some(version) = version {
-            format!(
-                "https://api.github.com/repos/{RELEASE_REPO}/releases/tags/{}",
-                normalize_release_tag(version)
-            )
-        } else {
-            format!("https://api.github.com/repos/{RELEASE_REPO}/releases/latest")
-        };
+        let url = self_release_url(&self.env, version);
 
         let response = http_agent()
             .get(&url)
@@ -413,6 +399,24 @@ impl Cli {
             .map_err(|error| format!("failed to query ocm releases: {error}"))?;
         serde_json::from_reader(response.into_body().into_reader())
             .map_err(|error| format!("failed to parse ocm release metadata: {error}"))
+    }
+}
+
+fn self_release_url(env: &BTreeMap<String, String>, version: Option<&str>) -> String {
+    if let Some(override_url) = env
+        .get(INTERNAL_SELF_UPDATE_RELEASE_URL_ENV)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        override_url.to_string()
+    } else if let Some(version) = version {
+        format!(
+            "https://api.github.com/repos/{RELEASE_REPO}/releases/tags/{}",
+            normalize_release_tag(version)
+        )
+    } else {
+        format!("https://api.github.com/repos/{RELEASE_REPO}/releases/latest")
     }
 }
 
@@ -531,13 +535,58 @@ fn should_treat_target_as_current(
 mod tests {
     use super::{
         SelfUpdateTempDir, display_version_from_tag, normalize_release_tag, parse_release_version,
-        release_asset_name, should_treat_target_as_current,
+        release_asset_name, self_release_url, should_treat_target_as_current,
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn normalize_release_tag_accepts_prefixed_and_bare_versions() {
         assert_eq!(normalize_release_tag("0.2.1"), "v0.2.1");
         assert_eq!(normalize_release_tag("v0.2.1"), "v0.2.1");
+    }
+
+    #[test]
+    fn self_release_urls_use_the_canonical_repository() {
+        let env = BTreeMap::new();
+        assert_eq!(
+            self_release_url(&env, None),
+            "https://api.github.com/repos/openclaw/ocm/releases/latest"
+        );
+        assert_eq!(
+            self_release_url(&env, Some("0.2.33")),
+            "https://api.github.com/repos/openclaw/ocm/releases/tags/v0.2.33"
+        );
+    }
+
+    #[test]
+    fn self_release_url_override_requires_a_non_empty_value() {
+        let mut env = BTreeMap::new();
+        env.insert(
+            super::INTERNAL_SELF_UPDATE_RELEASE_URL_ENV.to_string(),
+            " https://example.test/internal-release.json ".to_string(),
+        );
+        assert_eq!(
+            self_release_url(&env, Some("0.2.33")),
+            "https://example.test/internal-release.json"
+        );
+
+        env.insert(
+            super::INTERNAL_SELF_UPDATE_RELEASE_URL_ENV.to_string(),
+            String::new(),
+        );
+        assert_eq!(
+            self_release_url(&env, None),
+            "https://api.github.com/repos/openclaw/ocm/releases/latest"
+        );
+
+        env.insert(
+            super::INTERNAL_SELF_UPDATE_RELEASE_URL_ENV.to_string(),
+            " \t\n ".to_string(),
+        );
+        assert_eq!(
+            self_release_url(&env, Some("v0.2.33")),
+            "https://api.github.com/repos/openclaw/ocm/releases/tags/v0.2.33"
+        );
     }
 
     #[test]

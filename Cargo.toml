@@ -6,8 +6,8 @@ rust-version = "1.88"
 description = "OpenClaw Manager: the local control plane for isolated OpenClaw environments, launchers, runtimes, and services."
 readme = "README.md"
 license-file = "LICENSE"
-repository = "https://github.com/shakkernerd/ocm"
-homepage = "https://github.com/shakkernerd/ocm"
+repository = "https://github.com/openclaw/ocm"
+homepage = "https://github.com/openclaw/ocm"
 keywords = ["openclaw", "cli", "manager", "environment", "service"]
 categories = ["command-line-utilities", "development-tools"]
 

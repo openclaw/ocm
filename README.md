@@ -41,13 +41,13 @@ Use `ocm` when you want:
 Install the latest release:
 
 ```bash
-curl -fsSL https://github.com/shakkernerd/ocm/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/openclaw/ocm/releases/latest/download/install.sh | bash
 ```
 
 Install a specific release:
 
 ```bash
-curl -fsSL https://github.com/shakkernerd/ocm/releases/download/v<ocm-version>/install.sh | bash -s -- --version v<ocm-version>
+curl -fsSL https://github.com/openclaw/ocm/releases/download/v<ocm-version>/install.sh | bash -s -- --version v<ocm-version>
 ```
 
 Update an existing install:
