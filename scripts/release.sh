@@ -13,8 +13,15 @@ run_step() {
   local description="$1"
   shift
   local started_at="$SECONDS"
+  local status
   log_step "$description"
-  "$@"
+  if "$@"; then
+    status=0
+  else
+    status=$?
+    log_step "failed: ${description} ($((SECONDS - started_at))s)"
+    return "$status"
+  fi
   log_step "done: ${description} ($((SECONDS - started_at))s)"
 }
 
@@ -268,10 +275,9 @@ ensure_release_pr() {
 }
 
 verify_existing_remote_tag() {
-  local remote_main_sha remote_tag_commit_sha remote_tag_object_sha local_tag_object_sha tagged_version
+  local remote_tag_commit_sha="$1"
+  local remote_main_sha remote_tag_object_sha local_tag_object_sha tagged_version
   local repository verified_commit release_state gh_bin
-  remote_tag_commit_sha="$(remote_tag_commit)"
-  [[ -n "$remote_tag_commit_sha" ]] || return 1
   remote_tag_object_sha="$(remote_tag_object)"
 
   if git show-ref --verify --quiet "refs/tags/${tag}"; then
@@ -307,8 +313,8 @@ verify_existing_remote_tag() {
   run_step "Verifying exact-SHA main CI" \
     "${script_dir}/verify-release-ci.sh" \
     --repo "$repository" \
-    --commit "$remote_tag_commit_sha"
-  verified_commit="$(verify_published_tag "$repository" "$remote_tag_commit_sha")"
+    --commit "$remote_tag_commit_sha" || return
+  verified_commit="$(verify_published_tag "$repository" "$remote_tag_commit_sha")" || return
   gh_bin="$(github_cli)"
   release_state="$(
     "$gh_bin" release view "$tag" \
@@ -318,7 +324,7 @@ verify_existing_remote_tag() {
       2>/dev/null || true
   )"
   if [[ "$release_state" != "false" ]]; then
-    dispatch_release_workflow "$repository" "$verified_commit"
+    dispatch_release_workflow "$repository" "$verified_commit" || return
   fi
 
   cat <<EOF
@@ -386,7 +392,9 @@ release_branch="release/${tag}"
 release_commit_message="chore(release): bump version to ${version}"
 branch="$(git symbolic-ref --quiet --short HEAD || true)"
 
-if verify_existing_remote_tag; then
+existing_remote_tag_commit="$(remote_tag_commit)"
+if [[ -n "$existing_remote_tag_commit" ]]; then
+  verify_existing_remote_tag "$existing_remote_tag_commit" || exit $?
   exit 0
 fi
 

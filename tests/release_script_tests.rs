@@ -472,6 +472,37 @@ fn release_script_accepts_an_already_pushed_verified_tag() {
 }
 
 #[test]
+fn release_script_propagates_existing_tag_ci_failure_without_dispatching() {
+    let repo = init_release_repo("release-existing-tag-ci-failure");
+    assert!(repo.run_release("0.2.8").status.success());
+    let merged_head = repo.merge_release_pr("0.2.8");
+    repo.record_ci(&merged_head, "completed", "success");
+    assert!(repo.run_release("0.2.8").status.success());
+    let commands_before = fs::read_to_string(repo.repo.join(".git/test-ghx-commands")).unwrap();
+    let dispatches_before = commands_before
+        .lines()
+        .filter(|line| line.starts_with("workflow run"))
+        .count();
+
+    repo.record_ci(&merged_head, "completed", "failure");
+    let output = repo.run_release("0.2.8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("concluded failure"));
+    let commands_after = fs::read_to_string(repo.repo.join(".git/test-ghx-commands")).unwrap();
+    let dispatches_after = commands_after
+        .lines()
+        .filter(|line| line.starts_with("workflow run"))
+        .count();
+    assert_eq!(dispatches_after, dispatches_before);
+}
+
+#[test]
 fn release_script_refuses_to_tag_without_exact_sha_ci() {
     let repo = init_release_repo("release-ci-missing");
     assert!(repo.run_release("0.2.8").status.success());

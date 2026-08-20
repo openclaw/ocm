@@ -497,7 +497,8 @@ if [[ "${1:-}" == "api" ]]; then
       target="$TEST_EXPECTED_COMMIT"
       verified="true"
       [[ "$TEST_AUTHORITY" != "initial-tag-fail" ]] || verified="false"
-      if [[ "$TEST_AUTHORITY" == "retarget" && "$count" -gt 1 ]]; then
+      if [[ "$TEST_AUTHORITY" == "retarget" && "$count" -gt 1 ]] ||
+        [[ "$TEST_AUTHORITY" == "post-upload-retarget" && "$count" -gt 2 ]]; then
         target="0000000000000000000000000000000000000000"
       fi
       printf 'v0.2.32\tcommit\t%s\t%s\n' "$target" "$verified"
@@ -623,14 +624,19 @@ fn publish_release_settles_stable_draft_after_authority_and_asset_verification()
     assert_eq!(result.draft.as_deref(), Some("false\n"));
 
     let commands = result.commands;
+    let tag_checks = commands
+        .match_indices("/git/tags/")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(tag_checks.len(), 3);
     let ci = commands.find("actions/workflows/ci.yml/runs").unwrap();
-    let final_tag_check = commands.rfind("/git/tags/").unwrap();
     let create = commands.find("release create").unwrap();
     let upload = commands.find("release upload").unwrap();
     let query = commands.find("--json assets").unwrap();
     let publish = commands.find("release edit").unwrap();
-    assert!(ci < final_tag_check);
-    assert!(final_tag_check < create && create < upload && upload < query && query < publish);
+    assert!(tag_checks[0] < ci && ci < tag_checks[1]);
+    assert!(tag_checks[1] < create && create < upload && upload < query);
+    assert!(query < tag_checks[2] && tag_checks[2] < publish);
     let publish_command = commands
         .lines()
         .find(|line| line.starts_with("release edit"))
@@ -654,6 +660,24 @@ fn publish_release_stops_before_release_api_when_authority_fails_or_tag_moves() 
         assert!(!result.commands.contains("release upload"), "{authority}");
         assert!(!result.commands.contains("release edit"), "{authority}");
     }
+}
+
+#[test]
+fn publish_release_keeps_the_release_draft_when_tag_moves_after_upload() {
+    let result = run_publish_scenario(
+        "v0.2.32",
+        "post-upload-retarget",
+        "missing",
+        "success",
+        "success",
+        true,
+    );
+    assert_eq!(result.output.status.code(), Some(1));
+    assert!(result.commands.contains("release create"));
+    assert!(result.commands.contains("release upload"));
+    assert!(result.commands.contains("--json assets"));
+    assert!(!result.commands.contains("release edit"));
+    assert_eq!(result.draft.as_deref(), Some("true\n"));
 }
 
 #[test]
@@ -991,7 +1015,6 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
     assert!(release.contains("scripts/publish-release.sh"));
     assert!(release.contains("actions: read"));
     assert!(release.contains("pull-requests: read"));
-    assert!(release.contains("cp ./install.sh ./dist/install.sh"));
     assert!(release.contains("workflow_dispatch:"));
     assert!(release.contains("group: release-${{ inputs.tag }}"));
     assert!(release.contains("github.repository == 'openclaw/ocm'"));
@@ -999,7 +1022,11 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
     assert!(release.contains("RELEASE_COMMIT: ${{ inputs.commit }}"));
     assert!(release.contains("RELEASE_TAG: ${{ inputs.tag }}"));
     assert!(release.contains("ref: ${{ needs.verify.outputs.commit }}"));
-    assert!(release.contains("ref: ${{ github.event.repository.default_branch }}"));
+    assert!(release.contains("ref: ${{ github.sha }}"));
+    assert!(release.contains("path: trusted"));
+    assert!(release.contains("path: release-source"));
+    assert!(release.contains("cp ./release-source/install.sh ./dist/install.sh"));
+    assert!(release.contains("./trusted/scripts/publish-release.sh"));
     assert!(release.contains("--commit \"$RELEASE_COMMIT\""));
     assert!(!release.contains("push:\n    tags:"));
     assert!(!release.contains("repository_dispatch:"));

@@ -121,6 +121,17 @@ if [[ "$actual_assets" != "$expected_assets" ]]; then
   exit 1
 fi
 
+verified_commit="$(
+  "${script_dir}/verify-release-tag.sh" \
+    --repo "$repo" \
+    --tag "$tag" \
+    --commit "$commit"
+)"
+[[ "$verified_commit" == "$commit" ]] || {
+  echo "error: pre-publication release tag verification returned an unexpected commit" >&2
+  exit 1
+}
+
 release_flags=(--draft=false)
 version_without_build="${tag#v}"
 version_without_build="${version_without_build%%+*}"
