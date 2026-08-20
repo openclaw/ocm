@@ -36,6 +36,102 @@ fn script(name: &str) -> PathBuf {
         .join(name)
 }
 
+struct ReleaseCommitFixture {
+    _root: TestDir,
+    repo: PathBuf,
+    commit: String,
+}
+
+impl ReleaseCommitFixture {
+    fn new(label: &str) -> Self {
+        let root = TestDir::new(label);
+        let repo = root.child("repo");
+        fs::create_dir_all(repo.join("scripts")).unwrap();
+        for name in [
+            "prepare-release-assets.sh",
+            "publish-release.sh",
+            "read-package-version.sh",
+            "validate-version.sh",
+            "verify-release-ci.sh",
+            "verify-release-tag.sh",
+        ] {
+            write_executable_script(
+                &repo.join("scripts").join(name),
+                &fs::read_to_string(script(name)).unwrap(),
+            );
+        }
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"ocm\"\nversion = \"0.2.31\"\nrepository = \"https://github.com/shakkernerd/ocm\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"ocm\"\nversion = \"0.2.31\"\n",
+        )
+        .unwrap();
+
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "Test User"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["add", "."],
+            vec!["commit", "-m", "chore: seed release fixture"],
+        ] {
+            let output = Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", stderr(&output));
+        }
+
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"ocm\"\nversion = \"0.2.32\"\nrepository = \"https://github.com/shakkernerd/ocm\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"ocm\"\nversion = \"0.2.32\"\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["add", "Cargo.toml", "Cargo.lock"],
+            vec![
+                "commit",
+                "-m",
+                "chore(release): bump version to 0.2.32 (#81)",
+            ],
+        ] {
+            let output = Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", stderr(&output));
+        }
+        let output = Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let commit = String::from_utf8(output.stdout).unwrap().trim().to_string();
+
+        Self {
+            _root: root,
+            repo,
+            commit,
+        }
+    }
+
+    fn script(&self, name: &str) -> PathBuf {
+        self.repo.join("scripts").join(name)
+    }
+}
+
 fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
 }
@@ -449,6 +545,7 @@ fn run_publish_scenario(
     query: &str,
     valid_assets: bool,
 ) -> PublishResult {
+    let verification = ReleaseCommitFixture::new("publish-release-verification");
     let root = TestDir::new("publish-release-draft-first");
     let asset_dir = root.child("dist");
     let fake_bin = root.child("bin");
@@ -573,27 +670,21 @@ esac
         std::env::var("PATH").unwrap()
     );
 
-    let commit_output = Command::new("git")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["rev-parse", "v0.2.32^{}"])
-        .output()
-        .unwrap();
-    assert!(commit_output.status.success());
-    let commit = String::from_utf8(commit_output.stdout).unwrap();
-    let output = Command::new(script("publish-release.sh"))
+    let output = Command::new(verification.script("publish-release.sh"))
+        .current_dir(&verification.repo)
         .args([
             "--repo",
             "openclaw/ocm",
             "--tag",
             tag,
             "--commit",
-            commit.trim(),
+            &verification.commit,
             "--asset-dir",
         ])
         .arg(&asset_dir)
         .env("PATH", path)
         .env("TEST_GH_STATE", &state_dir)
-        .env("TEST_EXPECTED_COMMIT", commit.trim())
+        .env("TEST_EXPECTED_COMMIT", &verification.commit)
         .env("TEST_AUTHORITY", authority)
         .env("TEST_LOOKUP", lookup)
         .env("TEST_UPLOAD", upload)
@@ -827,19 +918,11 @@ fn package_version_reader_requires_one_matching_local_ocm_record() {
 
 #[test]
 fn verify_release_tag_requires_a_verified_annotated_tag_matching_the_package() {
+    let verification = ReleaseCommitFixture::new("verify-release-tag-repo");
     let root = TestDir::new("verify-release-tag");
     let fake_bin = root.child("bin");
     fs::create_dir_all(&fake_bin).unwrap();
-    let expected_commit_output = Command::new("git")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["rev-parse", "v0.2.32^{}"])
-        .output()
-        .unwrap();
-    assert!(expected_commit_output.status.success());
-    let expected_commit = String::from_utf8(expected_commit_output.stdout)
-        .unwrap()
-        .trim()
-        .to_string();
+    let expected_commit = verification.commit.clone();
     let package_tag = "v0.2.32";
     let tag_object = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     write_executable_script(
@@ -871,7 +954,8 @@ esac
         std::env::var("PATH").unwrap()
     );
 
-    let verified = Command::new(script("verify-release-tag.sh"))
+    let verified = Command::new(verification.script("verify-release-tag.sh"))
+        .current_dir(&verification.repo)
         .args(["--repo", "openclaw/ocm", "--tag"])
         .arg(&package_tag)
         .args(["--commit", &expected_commit])
@@ -880,7 +964,8 @@ esac
         .unwrap();
     assert!(verified.status.success(), "{}", stderr(&verified));
 
-    let unsigned = Command::new(script("verify-release-tag.sh"))
+    let unsigned = Command::new(verification.script("verify-release-tag.sh"))
+        .current_dir(&verification.repo)
         .args(["--repo", "openclaw/ocm", "--tag"])
         .arg(&package_tag)
         .args(["--commit", &expected_commit])
@@ -891,7 +976,8 @@ esac
     assert_eq!(unsigned.status.code(), Some(1));
     assert!(stderr(&unsigned).contains("did not verify the signature"));
 
-    let mismatched = Command::new(script("verify-release-tag.sh"))
+    let mismatched = Command::new(verification.script("verify-release-tag.sh"))
+        .current_dir(&verification.repo)
         .args([
             "--repo",
             "openclaw/ocm",
@@ -907,7 +993,8 @@ esac
     assert_eq!(mismatched.status.code(), Some(1));
     assert!(stderr(&mismatched).contains("does not match package version"));
 
-    let unreviewed = Command::new(script("verify-release-tag.sh"))
+    let unreviewed = Command::new(verification.script("verify-release-tag.sh"))
+        .current_dir(&verification.repo)
         .args(["--repo", "openclaw/ocm", "--tag"])
         .arg(&package_tag)
         .args(["--commit", &expected_commit])
