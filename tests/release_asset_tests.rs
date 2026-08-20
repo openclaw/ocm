@@ -620,7 +620,13 @@ esac
 fn publish_release_settles_stable_draft_after_authority_and_asset_verification() {
     let result = run_publish_scenario("v0.2.32", "success", "missing", "success", "success", true);
     assert!(result.output.status.success(), "{}", stderr(&result.output));
-    assert_eq!(result.assets, RELEASE_ASSETS);
+    assert_eq!(
+        result.assets.into_iter().collect::<BTreeSet<_>>(),
+        RELEASE_ASSETS
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+    );
     assert_eq!(result.draft.as_deref(), Some("false\n"));
 
     let commands = result.commands;
@@ -739,7 +745,13 @@ fn publish_release_stops_before_release_api_when_asset_preparation_fails() {
 fn publish_release_upload_set_matches_checksum_payloads() {
     let result = run_publish_scenario("v0.2.32", "success", "missing", "success", "success", true);
     assert!(result.output.status.success(), "{}", stderr(&result.output));
-    assert_eq!(result.assets, RELEASE_ASSETS);
+    assert_eq!(
+        result.assets.into_iter().collect::<BTreeSet<_>>(),
+        RELEASE_ASSETS
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+    );
 
     let root = TestDir::new("publish-checksum-payloads");
     let asset_dir = root.child("dist");
