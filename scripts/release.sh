@@ -32,17 +32,24 @@ EOF
 }
 
 package_version() {
-  perl -ne 'print "$1\n" if /^version = "([^"]+)"$/' Cargo.toml | head -n1
-}
-
-lockfile_version() {
-  perl -0ne 'print "$1\n" if /\[\[package\]\]\nname = "ocm"\nversion = "([^"]+)"/s' Cargo.lock | head -n1
+  "${script_dir}/read-package-version.sh" Cargo.toml Cargo.lock
 }
 
 version_at_ref() {
-  git show "$1:Cargo.toml" |
-    perl -ne 'print "$1\n" if /^version = "([^"]+)"$/' |
-    head -n1
+  local reference="$1"
+  local version_dir version_status
+  version_dir="$(mktemp -d "${TMPDIR:-/tmp}/ocm-release-version.XXXXXX")"
+  if git show "${reference}:Cargo.toml" >"${version_dir}/Cargo.toml" &&
+    git show "${reference}:Cargo.lock" >"${version_dir}/Cargo.lock" &&
+    "${script_dir}/read-package-version.sh" \
+      "${version_dir}/Cargo.toml" \
+      "${version_dir}/Cargo.lock"; then
+    version_status=0
+  else
+    version_status=$?
+  fi
+  rm -rf "$version_dir"
+  return "$version_status"
 }
 
 remote_ref_commit() {
@@ -196,11 +203,41 @@ github_repository() {
     esac
     repository="${repository%.git}"
   fi
-  if [[ ! "$repository" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]]; then
-    echo "error: invalid GitHub repository: ${repository}" >&2
+  if [[ "$repository" != "$canonical_repository" ]]; then
+    echo "error: release repository must be ${canonical_repository}: ${repository}" >&2
     return 1
   fi
   printf '%s\n' "$repository"
+}
+
+verify_published_tag() {
+  local repository="$1"
+  local commit="$2"
+  local verified_commit
+  verified_commit="$(
+    "${script_dir}/verify-release-tag.sh" \
+      --repo "$repository" \
+      --tag "$tag" \
+      --commit "$commit"
+  )"
+  if [[ ! "$verified_commit" =~ ^[0-9a-fA-F]{40}$ || "$verified_commit" != "$commit" ]]; then
+    echo "error: release tag verification returned an unexpected commit" >&2
+    return 1
+  fi
+  printf '%s\n' "$verified_commit"
+}
+
+dispatch_release_workflow() {
+  local repository="$1"
+  local commit="$2"
+  local gh_bin
+  gh_bin="$(github_cli)"
+  run_step "Dispatching trusted release workflow for ${tag}" \
+    "$gh_bin" workflow run release.yml \
+    --repo "$repository" \
+    --ref main \
+    -f "tag=${tag}" \
+    -f "commit=${commit}"
 }
 
 ensure_release_pr() {
@@ -232,6 +269,7 @@ ensure_release_pr() {
 
 verify_existing_remote_tag() {
   local remote_main_sha remote_tag_commit_sha remote_tag_object_sha local_tag_object_sha tagged_version
+  local repository verified_commit release_state gh_bin
   remote_tag_commit_sha="$(remote_tag_commit)"
   [[ -n "$remote_tag_commit_sha" ]] || return 1
   remote_tag_object_sha="$(remote_tag_object)"
@@ -265,9 +303,27 @@ verify_existing_remote_tag() {
     exit 1
   fi
 
+  repository="$(github_repository)"
+  run_step "Verifying exact-SHA main CI" \
+    "${script_dir}/verify-release-ci.sh" \
+    --repo "$repository" \
+    --commit "$remote_tag_commit_sha"
+  verified_commit="$(verify_published_tag "$repository" "$remote_tag_commit_sha")"
+  gh_bin="$(github_cli)"
+  release_state="$(
+    "$gh_bin" release view "$tag" \
+      --repo "$repository" \
+      --json isDraft \
+      --jq '.isDraft' \
+      2>/dev/null || true
+  )"
+  if [[ "$release_state" != "false" ]]; then
+    dispatch_release_workflow "$repository" "$verified_commit"
+  fi
+
   cat <<EOF
 Release tag ${tag} is already published from verified commit ${remote_tag_commit_sha}.
-The tag-push workflow owns artifact publication.
+The protected-main release workflow owns artifact publication.
 EOF
 }
 
@@ -315,6 +371,7 @@ fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
+canonical_repository="openclaw/ocm"
 cd "$repo_root"
 
 "${script_dir}/validate-version.sh" "$version"
@@ -334,15 +391,6 @@ if verify_existing_remote_tag; then
 fi
 
 current_version="$(package_version)"
-current_lock_version="$(lockfile_version)"
-if [[ -z "$current_version" || -z "$current_lock_version" ]]; then
-  echo "error: could not read the ocm version from Cargo.toml and Cargo.lock" >&2
-  exit 1
-fi
-if [[ "$current_version" != "$current_lock_version" ]]; then
-  echo "error: Cargo.toml and Cargo.lock are out of sync" >&2
-  exit 1
-fi
 
 case "$branch" in
   main)
@@ -380,9 +428,12 @@ case "$branch" in
         exit 1
       fi
       run_step "Pushing signed tag ${tag}" git push "$remote" "$tag"
+      repository="$(github_repository)"
+      verified_commit="$(verify_published_tag "$repository" "$head_sha")"
+      dispatch_release_workflow "$repository" "$verified_commit"
       cat <<EOF
 Release tag ${tag} pushed from $(git rev-parse HEAD).
-The tag-push workflow will verify, build, and publish the release.
+The protected-main workflow will verify, build, and publish the release.
 EOF
       exit 0
     fi

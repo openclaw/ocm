@@ -41,7 +41,7 @@ impl ReleaseRepo {
             .env("HOME", &self.home)
             .env("PATH", &self.env_path)
             .env("OCM_GH_BIN", &self.ghx)
-            .env("OCM_GITHUB_REPOSITORY", "example/ocm");
+            .env("OCM_GITHUB_REPOSITORY", "openclaw/ocm");
         self.apply_toolchain_env(&mut command);
         command.output().unwrap()
     }
@@ -111,7 +111,7 @@ impl ReleaseRepo {
         fs::write(
             self.repo.join(".git/test-ci-run"),
             format!(
-                "12345|{head_sha}|{status}|{conclusion}|https://github.com/example/ocm/actions/runs/12345\n"
+                "1|12345|{head_sha}|push|main|{status}|{conclusion}|https://github.com/openclaw/ocm/actions/runs/12345\n"
             ),
         )
         .unwrap();
@@ -176,7 +176,9 @@ fn init_release_repo(label: &str) -> ReleaseRepo {
         "scripts/release.sh",
         "scripts/update-version.sh",
         "scripts/validate-version.sh",
+        "scripts/read-package-version.sh",
         "scripts/verify-release-ci.sh",
+        "scripts/verify-release-tag.sh",
     ] {
         copy_script(&repo, script);
     }
@@ -220,10 +222,52 @@ exec "$real_git" "$@"
         r#"#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>.git/test-ghx-commands
-if [[ "${1:-}" == "api" && "${2:-}" == repos/example/ocm/actions/workflows/ci.yml/runs\?* ]]; then
-  [[ -f .git/test-ci-run ]] || exit 0
-  cat .git/test-ci-run
-  exit 0
+if [[ "${1:-}" == "api" ]]; then
+  endpoint=""
+  for arg in "$@"; do
+    case "$arg" in
+      repos/*) endpoint="$arg" ;;
+    esac
+  done
+  case "$endpoint" in
+    repos/openclaw/ocm/actions/workflows/ci.yml/runs\?*)
+      [[ -f .git/test-ci-run ]] || {
+        printf '0|||||||\n'
+        exit 0
+      }
+      cat .git/test-ci-run
+      exit 0
+      ;;
+    repos/openclaw/ocm/git/ref/tags/*)
+      tag="${endpoint##*/}"
+      printf 'tag\t%s\n' "$(git rev-parse "${tag}^{tag}")"
+      exit 0
+      ;;
+    repos/openclaw/ocm/git/tags/*)
+      tag="$(git tag --points-at HEAD | head -n1)"
+      printf '%s\tcommit\t%s\ttrue\n' "$tag" "$(git rev-parse "${tag}^{commit}")"
+      exit 0
+      ;;
+    repos/openclaw/ocm)
+      printf 'main\n'
+      exit 0
+      ;;
+    repos/openclaw/ocm/git/ref/heads/main)
+      git rev-parse main
+      exit 0
+      ;;
+    repos/openclaw/ocm/compare/*)
+      printf 'identical\n'
+      exit 0
+      ;;
+  esac
+  if [[ "$endpoint" == *"/commits/"*"/pulls"* ]]; then
+    commit="$(git rev-parse HEAD)"
+    version="$(./scripts/read-package-version.sh Cargo.toml Cargo.lock)"
+    printf '42\tclosed\t2026-08-20T12:00:00Z\tmain\trelease/v%s\t%s\tchore(release): bump version to %s\n' \
+      "$version" "$commit" "$version"
+    exit 0
+  fi
 fi
 case "${1:-} ${2:-}" in
   "pr view")
@@ -233,7 +277,12 @@ case "${1:-} ${2:-}" in
     ;;
   "pr create")
     [[ ! -f .git/test-ghx-create-fails ]] || exit 1
-    printf '%s\n' 'https://github.com/example/ocm/pull/42' | tee .git/test-pr-url
+    printf '%s\n' 'https://github.com/openclaw/ocm/pull/42' | tee .git/test-pr-url
+    ;;
+  "release view")
+    exit 1
+    ;;
+  "workflow run")
     ;;
   *)
     exit 1
@@ -336,7 +385,7 @@ fn release_script_prepares_a_pull_request_without_mutating_remote_main() {
 
     let output = repo.run_release("0.2.8");
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("https://github.com/example/ocm/pull/42"));
+    assert!(stdout(&output).contains("https://github.com/openclaw/ocm/pull/42"));
     assert_eq!(
         repo.git_stdout(&["branch", "--show-current"]).trim(),
         "release/v0.2.8"
@@ -354,7 +403,7 @@ fn release_script_prepares_a_pull_request_without_mutating_remote_main() {
     assert!(
         fs::read_to_string(repo.repo.join(".git/test-ghx-commands"))
             .unwrap()
-            .contains("pr create --repo example/ocm")
+            .contains("pr create --repo openclaw/ocm")
     );
 }
 
@@ -381,7 +430,7 @@ fn release_script_tags_only_after_the_release_pr_is_squash_merged() {
 
     let output = repo.run_release("0.2.8");
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("tag-push workflow"));
+    assert!(stdout(&output).contains("protected-main workflow"));
     assert_eq!(repo.remote_ref("refs/heads/main"), merged_head);
     assert_eq!(repo.remote_ref("refs/tags/v0.2.8^{}"), merged_head);
 }

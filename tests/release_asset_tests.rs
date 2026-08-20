@@ -520,8 +520,23 @@ esac
         std::env::var("PATH").unwrap()
     );
 
+    let commit_output = Command::new("git")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(commit_output.status.success());
+    let commit = String::from_utf8(commit_output.stdout).unwrap();
     let output = Command::new(script("publish-release.sh"))
-        .args(["--repo", "example/ocm", "--tag", tag, "--asset-dir"])
+        .args([
+            "--repo",
+            "example/ocm",
+            "--tag",
+            tag,
+            "--commit",
+            commit.trim(),
+            "--asset-dir",
+        ])
         .arg(&asset_dir)
         .env("PATH", path)
         .env("TEST_GH_STATE", &state_dir)
@@ -655,13 +670,64 @@ fn publish_release_upload_set_matches_checksum_payloads() {
 }
 
 #[test]
+fn package_version_reader_requires_one_matching_local_ocm_record() {
+    let root = TestDir::new("package-version-reader");
+    let manifest = root.child("Cargo.toml");
+    let lockfile = root.child("Cargo.lock");
+    fs::write(
+        &manifest,
+        "[package]\nname = \"ocm\"\nversion = \"1.2.3\"\n",
+    )
+    .unwrap();
+    fs::write(
+        &lockfile,
+        "version = 4\n\n[[package]]\nname = \"ocm\"\nversion = \"1.2.3\"\n",
+    )
+    .unwrap();
+
+    let valid = Command::new(script("read-package-version.sh"))
+        .args([&manifest, &lockfile])
+        .output()
+        .unwrap();
+    assert!(valid.status.success(), "{}", stderr(&valid));
+    assert_eq!(String::from_utf8(valid.stdout).unwrap(), "1.2.3\n");
+
+    for (label, contents) in [
+        (
+            "mismatch",
+            "version = 4\n\n[[package]]\nname = \"ocm\"\nversion = \"1.2.4\"\n",
+        ),
+        (
+            "duplicate",
+            "version = 4\n\n[[package]]\nname = \"ocm\"\nversion = \"1.2.3\"\n\n[[package]]\nname = \"ocm\"\nversion = \"1.2.3\"\n",
+        ),
+        (
+            "sourced",
+            "version = 4\n\n[[package]]\nname = \"ocm\"\nversion = \"1.2.3\"\nsource = \"registry+https://example.test/index\"\n",
+        ),
+        (
+            "checksum",
+            "version = 4\n\n[[package]]\nname = \"ocm\"\nversion = \"1.2.3\"\nchecksum = \"abc\"\n",
+        ),
+        ("missing", "version = 4\n"),
+    ] {
+        fs::write(&lockfile, contents).unwrap();
+        let rejected = Command::new(script("read-package-version.sh"))
+            .args([&manifest, &lockfile])
+            .output()
+            .unwrap();
+        assert_eq!(rejected.status.code(), Some(1), "{label}");
+    }
+}
+
+#[test]
 fn verify_release_tag_requires_a_verified_annotated_tag_matching_the_package() {
     let root = TestDir::new("verify-release-tag");
     let fake_bin = root.child("bin");
     fs::create_dir_all(&fake_bin).unwrap();
     let expected_commit_output = Command::new("git")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["rev-parse", "HEAD"])
+        .args(["rev-parse", "v0.2.32^{}"])
         .output()
         .unwrap();
     assert!(expected_commit_output.status.success());
@@ -669,33 +735,26 @@ fn verify_release_tag_requires_a_verified_annotated_tag_matching_the_package() {
         .unwrap()
         .trim()
         .to_string();
-    let committed_manifest_output = Command::new("git")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["show", &format!("{expected_commit}:Cargo.toml")])
-        .output()
-        .unwrap();
-    assert!(committed_manifest_output.status.success());
-    let committed_manifest = String::from_utf8(committed_manifest_output.stdout).unwrap();
-    let committed_version = committed_manifest
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("version = \"")
-                .and_then(|value| value.strip_suffix('"'))
-        })
-        .unwrap();
-    let package_tag = format!("v{committed_version}");
+    let package_tag = "v0.2.32";
     let tag_object = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     write_executable_script(
         &fake_bin.join("gh"),
         &format!(
             r#"#!/usr/bin/env bash
 set -euo pipefail
-case "$*" in
-  *"/git/ref/tags/"*) printf 'tag\t{tag_object}\n' ;;
-  *"/git/tags/"*) printf '%s\tcommit\t{expected_commit}\t%s\n' "${{TEST_TAG:-{package_tag}}}" "${{TEST_TAG_VERIFIED:-true}}" ;;
-  *"/git/ref/heads/main"*) printf '{expected_commit}\n' ;;
-  *"/compare/"*) printf '%s\n' "${{TEST_COMPARE_STATUS:-identical}}" ;;
-  "api repos/example/ocm --jq .default_branch") printf 'main\n' ;;
+endpoint=""
+for arg in "$@"; do
+  case "$arg" in
+    repos/*) endpoint="$arg" ;;
+  esac
+done
+case "$endpoint" in
+  repos/openclaw/ocm/git/ref/tags/*) printf 'tag\t{tag_object}\n' ;;
+  repos/openclaw/ocm/git/tags/*) printf '%s\tcommit\t{expected_commit}\t%s\n' "${{TEST_TAG:-{package_tag}}}" "${{TEST_TAG_VERIFIED:-true}}" ;;
+  repos/openclaw/ocm/git/ref/heads/main) printf '{expected_commit}\n' ;;
+  repos/openclaw/ocm/compare/*) printf '%s\n' "${{TEST_COMPARE_STATUS:-identical}}" ;;
+  repos/openclaw/ocm/commits/*/pulls) printf '81\tclosed\t2026-08-16T01:41:59Z\tmain\trelease/v0.2.32\t{expected_commit}\tchore(release): bump version to 0.2.32\n' ;;
+  repos/openclaw/ocm) printf 'main\n' ;;
   *) exit 1 ;;
 esac
 "#
@@ -708,7 +767,7 @@ esac
     );
 
     let verified = Command::new(script("verify-release-tag.sh"))
-        .args(["--repo", "example/ocm", "--tag"])
+        .args(["--repo", "openclaw/ocm", "--tag"])
         .arg(&package_tag)
         .args(["--commit", &expected_commit])
         .env("PATH", &path)
@@ -717,7 +776,7 @@ esac
     assert!(verified.status.success(), "{}", stderr(&verified));
 
     let unsigned = Command::new(script("verify-release-tag.sh"))
-        .args(["--repo", "example/ocm", "--tag"])
+        .args(["--repo", "openclaw/ocm", "--tag"])
         .arg(&package_tag)
         .args(["--commit", &expected_commit])
         .env("PATH", &path)
@@ -730,21 +789,21 @@ esac
     let mismatched = Command::new(script("verify-release-tag.sh"))
         .args([
             "--repo",
-            "example/ocm",
+            "openclaw/ocm",
             "--tag",
-            "v999.999.999",
+            "v0.2.31",
             "--commit",
             &expected_commit,
         ])
         .env("PATH", &path)
-        .env("TEST_TAG", "v999.999.999")
+        .env("TEST_TAG", "v0.2.31")
         .output()
         .unwrap();
     assert_eq!(mismatched.status.code(), Some(1));
     assert!(stderr(&mismatched).contains("does not match package version"));
 
     let unreviewed = Command::new(script("verify-release-tag.sh"))
-        .args(["--repo", "example/ocm", "--tag"])
+        .args(["--repo", "openclaw/ocm", "--tag"])
         .arg(&package_tag)
         .args(["--commit", &expected_commit])
         .env("PATH", path)
@@ -752,7 +811,7 @@ esac
         .output()
         .unwrap();
     assert_eq!(unreviewed.status.code(), Some(1));
-    assert!(stderr(&unreviewed).contains("is not on the protected main branch"));
+    assert!(stderr(&unreviewed).contains("is not on protected main"));
 }
 
 #[test]
@@ -864,14 +923,20 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
     assert!(release.contains("scripts/verify-release-ci.sh"));
     assert!(release.contains("scripts/publish-release.sh"));
     assert!(release.contains("actions: read"));
+    assert!(release.contains("pull-requests: read"));
     assert!(release.contains("cp ./install.sh ./dist/install.sh"));
-    assert!(release.contains("tags:"));
-    assert!(release.contains("- \"v*\""));
-    assert!(release.contains("github.ref_name"));
-    assert!(release.contains("group: release-${{ github.ref_name }}"));
+    assert!(release.contains("workflow_dispatch:"));
+    assert!(release.contains("group: release-${{ inputs.tag }}"));
+    assert!(release.contains("github.repository == 'openclaw/ocm'"));
+    assert!(release.contains("github.ref == 'refs/heads/main'"));
+    assert!(release.contains("RELEASE_COMMIT: ${{ inputs.commit }}"));
+    assert!(release.contains("RELEASE_TAG: ${{ inputs.tag }}"));
+    assert!(release.contains("ref: ${{ needs.verify.outputs.commit }}"));
+    assert!(release.contains("ref: ${{ github.event.repository.default_branch }}"));
+    assert!(release.contains("--commit \"$RELEASE_COMMIT\""));
+    assert!(!release.contains("push:\n    tags:"));
     assert!(!release.contains("repository_dispatch:"));
     assert!(!release.contains("github.event.client_payload.tag"));
-    assert!(!release.contains("workflow_dispatch:"));
     assert!(release.contains("os: macos-15-intel"));
     assert!(!release.contains("os: macos-13"));
 
@@ -881,7 +946,7 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
         .collect::<BTreeSet<_>>();
     assert_eq!(workflow_targets, SUPPORTED_TARGETS.into_iter().collect());
     assert!(release.contains("name: release-${{ matrix.target }}"));
-    assert!(release.contains("path: ./dist/*.tar.gz"));
+    assert!(release.contains("path: ./dist/ocm-${{ matrix.target }}.tar.gz"));
     assert!(release.contains("pattern: release-*"));
     assert!(release.contains("merge-multiple: true"));
     assert!(release.contains("--target \"${{ matrix.target }}\""));

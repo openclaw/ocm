@@ -1,16 +1,25 @@
 name: Release
+run-name: Release ${{ inputs.tag }}
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Signed release tag
+        required: true
+        type: string
+      commit:
+        description: Exact merged release commit
+        required: true
+        type: string
 
 permissions:
   actions: read
   contents: read
+  pull-requests: read
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 env:
@@ -19,6 +28,7 @@ env:
 jobs:
   verify:
     name: Verify release tag
+    if: github.repository == 'openclaw/ocm' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       commit: ${{ steps.verify.outputs.commit }}
@@ -32,13 +42,15 @@ jobs:
         id: verify
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ inputs.commit }}
           RELEASE_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           verified_commit="$(
             ./scripts/verify-release-tag.sh \
               --repo "$RELEASE_REPO" \
-              --tag "$RELEASE_TAG"
+              --tag "$RELEASE_TAG" \
+              --commit "$RELEASE_COMMIT"
           )"
           ./scripts/verify-release-ci.sh \
             --repo "$RELEASE_REPO" \
@@ -81,7 +93,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.target }}
-          path: ./dist/*.tar.gz
+          path: ./dist/ocm-${{ matrix.target }}.tar.gz
           if-no-files-found: error
           retention-days: 1
 
@@ -92,11 +104,13 @@ jobs:
       - build
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.verify.outputs.commit }}
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           persist-credentials: false
       - name: Download release archives
@@ -112,14 +126,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_COMMIT: ${{ needs.verify.outputs.commit }}
           RELEASE_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          ./scripts/verify-release-tag.sh \
+          verified_commit="$(
+            ./scripts/verify-release-tag.sh \
+              --repo "$RELEASE_REPO" \
+              --tag "$RELEASE_TAG" \
+              --commit "$RELEASE_COMMIT"
+          )"
+          [[ "$verified_commit" == "$RELEASE_COMMIT" ]]
+          ./scripts/verify-release-ci.sh \
             --repo "$RELEASE_REPO" \
-            --tag "$RELEASE_TAG" \
-            --commit "$RELEASE_COMMIT" \
-            >/dev/null
+            --commit "$RELEASE_COMMIT"
           ./scripts/publish-release.sh \
             --repo "$RELEASE_REPO" \
             --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
             --asset-dir ./dist

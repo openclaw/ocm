@@ -2,11 +2,12 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: scripts/publish-release.sh --repo <owner/repo> --tag <tag> --asset-dir <dir>" >&2
+  echo "Usage: scripts/publish-release.sh --repo <owner/repo> --tag <tag> --commit <sha> --asset-dir <dir>" >&2
 }
 
 repo=""
 tag=""
+commit=""
 asset_dir=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -19,6 +20,11 @@ while [[ $# -gt 0 ]]; do
       shift
       [[ $# -gt 0 ]] || { echo "error: --tag requires a value" >&2; exit 1; }
       tag="$1"
+      ;;
+    --commit)
+      shift
+      [[ $# -gt 0 ]] || { echo "error: --commit requires a value" >&2; exit 1; }
+      commit="$1"
       ;;
     --asset-dir)
       shift
@@ -36,6 +42,10 @@ done
 
 [[ -n "$repo" ]] || { usage; exit 1; }
 [[ -n "$tag" ]] || { usage; exit 1; }
+[[ "$commit" =~ ^[0-9a-fA-F]{40}$ ]] || {
+  echo "error: --commit requires a full commit SHA" >&2
+  exit 1
+}
 [[ -n "$asset_dir" ]] || { usage; exit 1; }
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
