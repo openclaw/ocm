@@ -9,14 +9,16 @@ use std::process::Command;
 
 use crate::support::{TestDir, path_string, stderr, write_executable_script};
 
-fn installer_requested_urls(version: Option<&str>) -> Vec<String> {
+fn installer_requested_urls(os: &str, arch: &str, version: Option<&str>) -> Vec<String> {
     let root = TestDir::new("install-release-urls");
     let fake_bin = root.child("bin");
     let url_log = root.child("urls");
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable_script(
         &fake_bin.join("uname"),
-        "#!/bin/sh\ncase \"$1\" in\n  -s) printf 'Darwin\\n' ;;\n  -m) printf 'x86_64\\n' ;;\n  *) exit 1 ;;\nesac\n",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n  -s) printf '{os}\\n' ;;\n  -m) printf '{arch}\\n' ;;\n  *) exit 1 ;;\nesac\n"
+        ),
     );
     write_executable_script(
         &fake_bin.join("curl"),
@@ -63,7 +65,7 @@ printf '%s\n' "$url" >>"$TEST_URL_LOG"
 #[test]
 fn installer_uses_canonical_latest_release_urls() {
     assert_eq!(
-        installer_requested_urls(None),
+        installer_requested_urls("Darwin", "x86_64", None),
         [
             "https://github.com/openclaw/ocm/releases/latest/download/ocm-x86_64-apple-darwin.tar.gz",
             "https://github.com/openclaw/ocm/releases/latest/download/SHA256SUMS",
@@ -74,12 +76,33 @@ fn installer_uses_canonical_latest_release_urls() {
 #[test]
 fn installer_uses_canonical_versioned_release_urls() {
     assert_eq!(
-        installer_requested_urls(Some("v0.2.33")),
+        installer_requested_urls("Darwin", "x86_64", Some("v0.2.33")),
         [
             "https://github.com/openclaw/ocm/releases/download/v0.2.33/ocm-x86_64-apple-darwin.tar.gz",
             "https://github.com/openclaw/ocm/releases/download/v0.2.33/SHA256SUMS",
         ]
     );
+}
+
+#[test]
+fn installer_selects_every_supported_release_target() {
+    for (os, arch, target) in [
+        ("Darwin", "arm64", "aarch64-apple-darwin"),
+        ("Darwin", "x86_64", "x86_64-apple-darwin"),
+        ("Linux", "x86_64", "x86_64-unknown-linux-gnu"),
+    ] {
+        let urls = installer_requested_urls(os, arch, Some("v0.2.33"));
+        assert_eq!(
+            urls[0],
+            format!(
+                "https://github.com/openclaw/ocm/releases/download/v0.2.33/ocm-{target}.tar.gz"
+            )
+        );
+        assert_eq!(
+            urls[1],
+            "https://github.com/openclaw/ocm/releases/download/v0.2.33/SHA256SUMS"
+        );
+    }
 }
 
 #[test]

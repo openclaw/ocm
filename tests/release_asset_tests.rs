@@ -1,10 +1,34 @@
 mod support;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use flate2::{Compression, write::GzEncoder};
+use tar::{Builder, EntryType, Header};
+
 use crate::support::{TestDir, path_string, write_executable_script};
+
+const SUPPORTED_TARGETS: [&str; 3] = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+];
+
+const RELEASE_ARCHIVES: [&str; 3] = [
+    "ocm-aarch64-apple-darwin.tar.gz",
+    "ocm-x86_64-apple-darwin.tar.gz",
+    "ocm-x86_64-unknown-linux-gnu.tar.gz",
+];
+
+const RELEASE_ASSETS: [&str; 5] = [
+    "SHA256SUMS",
+    "install.sh",
+    "ocm-aarch64-apple-darwin.tar.gz",
+    "ocm-x86_64-apple-darwin.tar.gz",
+    "ocm-x86_64-unknown-linux-gnu.tar.gz",
+];
 
 fn script(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -16,21 +40,102 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
 }
 
-fn make_valid_archive(path: &Path, root: &TestDir) {
-    let contents = root.child("archive-contents");
-    fs::create_dir_all(&contents).unwrap();
-    fs::write(contents.join("ocm"), "binary").unwrap();
-    fs::write(contents.join("LICENSE"), "license").unwrap();
-    fs::write(contents.join("README.md"), "readme").unwrap();
-    let output = Command::new("tar")
-        .args(["-czf"])
+enum TestArchiveEntry<'a> {
+    Regular(&'a str),
+    Symlink(&'a str, &'a str),
+    HardLink(&'a str, &'a str),
+    Fifo(&'a str),
+}
+
+fn make_archive(path: &Path, entries: &[TestArchiveEntry<'_>]) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    let file = fs::File::create(path).unwrap();
+    let encoder = GzEncoder::new(file, Compression::default());
+    let mut builder = Builder::new(encoder);
+    for entry in entries {
+        let mut header = Header::new_gnu();
+        match entry {
+            TestArchiveEntry::Regular(name) => {
+                let contents = format!("contents for {name}\n");
+                header.set_size(contents.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, contents.as_bytes())
+                    .unwrap();
+            }
+            TestArchiveEntry::Symlink(name, target) => {
+                header.set_entry_type(EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_link_name(target).unwrap();
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, std::io::empty())
+                    .unwrap();
+            }
+            TestArchiveEntry::HardLink(name, target) => {
+                header.set_entry_type(EntryType::Link);
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_link_name(target).unwrap();
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, std::io::empty())
+                    .unwrap();
+            }
+            TestArchiveEntry::Fifo(name) => {
+                header.set_entry_type(EntryType::Fifo);
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, std::io::empty())
+                    .unwrap();
+            }
+        }
+    }
+    builder.finish().unwrap();
+    builder.into_inner().unwrap().finish().unwrap();
+}
+
+fn make_valid_archive(path: &Path, _root: &TestDir) {
+    make_archive(
+        path,
+        &[
+            TestArchiveEntry::Regular("ocm"),
+            TestArchiveEntry::Regular("LICENSE"),
+            TestArchiveEntry::Regular("README.md"),
+        ],
+    );
+}
+
+fn archive_listing(path: &Path, verbose: bool) -> Output {
+    Command::new("tar")
+        .arg(if verbose { "-tvzf" } else { "-tzf" })
         .arg(path)
-        .arg("-C")
-        .arg(&contents)
-        .args(["ocm", "LICENSE", "README.md"])
         .output()
-        .unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
+        .unwrap()
+}
+
+fn assert_exact_regular_archive(path: &Path) {
+    let names = archive_listing(path, false);
+    assert!(names.status.success(), "{}", stderr(&names));
+    let mut names = String::from_utf8(names.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["LICENSE", "README.md", "ocm"]);
+
+    let verbose = archive_listing(path, true);
+    assert!(verbose.status.success(), "{}", stderr(&verbose));
+    let verbose = String::from_utf8(verbose.stdout).unwrap();
+    assert_eq!(verbose.lines().count(), 3);
+    assert!(verbose.lines().all(|line| line.starts_with('-')));
 }
 
 fn populate_release_archives(asset_dir: &Path, root: &TestDir) {
@@ -38,11 +143,7 @@ fn populate_release_archives(asset_dir: &Path, root: &TestDir) {
     fs::write(asset_dir.join("install.sh"), "#!/usr/bin/env bash\n").unwrap();
     let source = root.child("source.tar.gz");
     make_valid_archive(&source, root);
-    for name in [
-        "ocm-aarch64-apple-darwin.tar.gz",
-        "ocm-x86_64-apple-darwin.tar.gz",
-        "ocm-x86_64-unknown-linux-gnu.tar.gz",
-    ] {
+    for name in RELEASE_ARCHIVES {
         fs::copy(&source, asset_dir.join(name)).unwrap();
     }
 }
@@ -54,7 +155,7 @@ fn package_release_preserves_existing_archive_when_tar_fails() {
     let fake_bin = root.child("bin");
     fs::create_dir_all(&output_dir).unwrap();
     fs::create_dir_all(&fake_bin).unwrap();
-    let archive = output_dir.join("ocm-test-target.tar.gz");
+    let archive = output_dir.join("ocm-x86_64-apple-darwin.tar.gz");
     fs::write(&archive, "known-good").unwrap();
     let binary = root.child("ocm");
     fs::write(&binary, "binary").unwrap();
@@ -70,7 +171,7 @@ fn package_release_preserves_existing_archive_when_tar_fails() {
 
     let output = Command::new(script("package-release.sh"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["--target", "test-target", "--binary"])
+        .args(["--target", "x86_64-apple-darwin", "--binary"])
         .arg(&binary)
         .arg("--output-dir")
         .arg(&output_dir)
@@ -90,6 +191,49 @@ fn package_release_preserves_existing_archive_when_tar_fails() {
 }
 
 #[test]
+fn package_release_accepts_only_the_supported_matrix_and_emits_exact_bundles() {
+    let root = TestDir::new("package-release-matrix");
+    let output_dir = root.child("dist");
+    let binary = root.child("ocm");
+    fs::write(&binary, "binary").unwrap();
+
+    for target in SUPPORTED_TARGETS {
+        let output = Command::new(script("package-release.sh"))
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args(["--target", target, "--binary"])
+            .arg(&binary)
+            .arg("--output-dir")
+            .arg(&output_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_exact_regular_archive(&output_dir.join(format!("ocm-{target}.tar.gz")));
+    }
+
+    fs::write(output_dir.join("install.sh"), "#!/usr/bin/env bash\n").unwrap();
+    let prepared = Command::new(script("prepare-release-assets.sh"))
+        .arg(&output_dir)
+        .output()
+        .unwrap();
+    assert!(prepared.status.success(), "{}", stderr(&prepared));
+
+    for target in ["aarch64-unknown-linux-gnu", "test-target"] {
+        let rejected_dir = root.child(format!("rejected-{target}"));
+        let output = Command::new(script("package-release.sh"))
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args(["--target", target, "--binary"])
+            .arg(&binary)
+            .arg("--output-dir")
+            .arg(&rejected_dir)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stderr(&output).contains("unsupported release target"));
+        assert!(!rejected_dir.join(format!("ocm-{target}.tar.gz")).exists());
+    }
+}
+
+#[test]
 fn prepare_release_assets_requires_the_complete_matrix_and_writes_checksums() {
     let root = TestDir::new("prepare-release-assets");
     let asset_dir = root.child("dist");
@@ -103,14 +247,34 @@ fn prepare_release_assets_requires_the_complete_matrix_and_writes_checksums() {
 
     let checksums = fs::read_to_string(asset_dir.join("SHA256SUMS")).unwrap();
     assert_eq!(checksums.lines().count(), 4);
-    for name in [
-        "ocm-aarch64-apple-darwin.tar.gz",
-        "ocm-x86_64-apple-darwin.tar.gz",
-        "ocm-x86_64-unknown-linux-gnu.tar.gz",
-    ] {
-        assert!(checksums.contains(name));
-    }
-    assert!(checksums.contains("install.sh"));
+    let records = checksums
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let digest = fields.next().unwrap();
+            let name = fields.next().unwrap();
+            assert!(fields.next().is_none());
+            assert_eq!(digest.len(), 64);
+            assert!(
+                digest
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            );
+            name.to_string()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        records,
+        [
+            "install.sh",
+            "ocm-aarch64-apple-darwin.tar.gz",
+            "ocm-x86_64-apple-darwin.tar.gz",
+            "ocm-x86_64-unknown-linux-gnu.tar.gz",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
 
     fs::remove_file(asset_dir.join("ocm-aarch64-apple-darwin.tar.gz")).unwrap();
     let missing = Command::new(script("prepare-release-assets.sh"))
@@ -122,7 +286,168 @@ fn prepare_release_assets_requires_the_complete_matrix_and_writes_checksums() {
 }
 
 #[test]
-fn publish_release_keeps_the_release_draft_until_every_asset_is_uploaded() {
+fn prepare_release_assets_rejects_invalid_members_without_replacing_checksums() {
+    let cases = [
+        (
+            "missing-ocm",
+            vec![
+                TestArchiveEntry::Regular("LICENSE"),
+                TestArchiveEntry::Regular("README.md"),
+            ],
+        ),
+        (
+            "missing-license",
+            vec![
+                TestArchiveEntry::Regular("ocm"),
+                TestArchiveEntry::Regular("README.md"),
+            ],
+        ),
+        (
+            "missing-readme",
+            vec![
+                TestArchiveEntry::Regular("ocm"),
+                TestArchiveEntry::Regular("LICENSE"),
+            ],
+        ),
+        (
+            "qualified",
+            vec![
+                TestArchiveEntry::Regular("nested/ocm"),
+                TestArchiveEntry::Regular("LICENSE"),
+                TestArchiveEntry::Regular("README.md"),
+            ],
+        ),
+        (
+            "duplicate",
+            vec![
+                TestArchiveEntry::Regular("ocm"),
+                TestArchiveEntry::Regular("ocm"),
+                TestArchiveEntry::Regular("LICENSE"),
+                TestArchiveEntry::Regular("README.md"),
+            ],
+        ),
+        (
+            "symlink",
+            vec![
+                TestArchiveEntry::Symlink("ocm", "LICENSE"),
+                TestArchiveEntry::Regular("LICENSE"),
+                TestArchiveEntry::Regular("README.md"),
+            ],
+        ),
+        (
+            "hard-link",
+            vec![
+                TestArchiveEntry::HardLink("ocm", "LICENSE"),
+                TestArchiveEntry::Regular("LICENSE"),
+                TestArchiveEntry::Regular("README.md"),
+            ],
+        ),
+        (
+            "fifo",
+            vec![
+                TestArchiveEntry::Fifo("ocm"),
+                TestArchiveEntry::Regular("LICENSE"),
+                TestArchiveEntry::Regular("README.md"),
+            ],
+        ),
+        (
+            "extra",
+            vec![
+                TestArchiveEntry::Regular("ocm"),
+                TestArchiveEntry::Regular("LICENSE"),
+                TestArchiveEntry::Regular("README.md"),
+                TestArchiveEntry::Regular("NOTICE"),
+            ],
+        ),
+    ];
+
+    for (label, entries) in cases {
+        let root = TestDir::new(&format!("prepare-invalid-{label}"));
+        let asset_dir = root.child("dist");
+        populate_release_archives(&asset_dir, &root);
+        make_archive(&asset_dir.join("ocm-aarch64-apple-darwin.tar.gz"), &entries);
+        fs::write(asset_dir.join("SHA256SUMS"), "known-good\n").unwrap();
+
+        let output = Command::new(script("prepare-release-assets.sh"))
+            .arg(&asset_dir)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{label}");
+        assert_eq!(
+            fs::read_to_string(asset_dir.join("SHA256SUMS")).unwrap(),
+            "known-good\n",
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn prepare_release_assets_preserves_checksums_for_invalid_installer_or_matrix() {
+    for case in [
+        "installer-missing",
+        "installer-symlink",
+        "extra-archive",
+        "extra-archive-symlink",
+        "extra-archive-directory",
+    ] {
+        let root = TestDir::new(&format!("prepare-invalid-{case}"));
+        let asset_dir = root.child("dist");
+        populate_release_archives(&asset_dir, &root);
+        fs::write(asset_dir.join("SHA256SUMS"), "known-good\n").unwrap();
+        if case == "installer-missing" {
+            fs::remove_file(asset_dir.join("install.sh")).unwrap();
+        } else if case == "installer-symlink" {
+            fs::remove_file(asset_dir.join("install.sh")).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(
+                asset_dir.join("ocm-aarch64-apple-darwin.tar.gz"),
+                asset_dir.join("install.sh"),
+            )
+            .unwrap();
+        } else if case == "extra-archive" {
+            fs::copy(
+                asset_dir.join("ocm-aarch64-apple-darwin.tar.gz"),
+                asset_dir.join("ocm-aarch64-unknown-linux-gnu.tar.gz"),
+            )
+            .unwrap();
+        } else if case == "extra-archive-symlink" {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(
+                asset_dir.join("ocm-aarch64-apple-darwin.tar.gz"),
+                asset_dir.join("ocm-aarch64-unknown-linux-gnu.tar.gz"),
+            )
+            .unwrap();
+        } else {
+            fs::create_dir(asset_dir.join("ocm-aarch64-unknown-linux-gnu.tar.gz")).unwrap();
+        }
+
+        let output = Command::new(script("prepare-release-assets.sh"))
+            .arg(&asset_dir)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{case}");
+        assert_eq!(
+            fs::read_to_string(asset_dir.join("SHA256SUMS")).unwrap(),
+            "known-good\n",
+            "{case}"
+        );
+    }
+}
+
+struct PublishResult {
+    output: Output,
+    commands: String,
+    draft: Option<String>,
+    assets: Vec<String>,
+}
+
+fn run_publish_scenario(
+    tag: &str,
+    lookup: &str,
+    upload: &str,
+    query: &str,
+    valid_assets: bool,
+) -> PublishResult {
     let root = TestDir::new("publish-release-draft-first");
     let asset_dir = root.child("dist");
     let fake_bin = root.child("bin");
@@ -130,6 +455,14 @@ fn publish_release_keeps_the_release_draft_until_every_asset_is_uploaded() {
     fs::create_dir_all(&fake_bin).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
     populate_release_archives(&asset_dir, &root);
+    if !valid_assets {
+        fs::remove_file(asset_dir.join("ocm-aarch64-apple-darwin.tar.gz")).unwrap();
+    }
+    match lookup {
+        "draft" => fs::write(state_dir.join("draft"), "true\n").unwrap(),
+        "public" => fs::write(state_dir.join("draft"), "false\n").unwrap(),
+        _ => {}
+    }
 
     write_executable_script(
         &fake_bin.join("gh"),
@@ -139,9 +472,18 @@ printf '%s\n' "$*" >>"${TEST_GH_STATE}/commands"
 case "${1:-} ${2:-}" in
   "release view")
     if [[ "$*" == *"--json isDraft"* ]]; then
-      [[ -f "${TEST_GH_STATE}/draft" ]] || exit 1
-      cat "${TEST_GH_STATE}/draft"
+      case "$TEST_LOOKUP" in
+        missing) printf 'release not found\n' >&2; exit 1 ;;
+        error) printf 'authentication failed\n' >&2; exit 1 ;;
+        draft) printf 'true\n' ;;
+        public) printf 'false\n' ;;
+        *) exit 2 ;;
+      esac
     else
+      [[ "$TEST_QUERY" != "fail" ]] || {
+        printf 'asset query failed\n' >&2
+        exit 1
+      }
       cat "${TEST_GH_STATE}/assets"
     fi
     ;;
@@ -149,6 +491,10 @@ case "${1:-} ${2:-}" in
     printf 'true\n' >"${TEST_GH_STATE}/draft"
     ;;
   "release upload")
+    [[ "$TEST_UPLOAD" != "fail" ]] || {
+      printf 'upload failed\n' >&2
+      exit 1
+    }
     : >"${TEST_GH_STATE}/assets"
     for arg in "$@"; do
       case "$arg" in
@@ -156,6 +502,10 @@ case "${1:-} ${2:-}" in
       esac
     done
     sort -o "${TEST_GH_STATE}/assets" "${TEST_GH_STATE}/assets"
+    if [[ "$TEST_UPLOAD" == "mismatch" ]]; then
+      grep -v '^install\.sh$' "${TEST_GH_STATE}/assets" >"${TEST_GH_STATE}/assets.next"
+      mv "${TEST_GH_STATE}/assets.next" "${TEST_GH_STATE}/assets"
+    fi
     ;;
   "release edit")
     grep -q -- '--draft=false' <<<"$*"
@@ -171,36 +521,137 @@ esac
     );
 
     let output = Command::new(script("publish-release.sh"))
-        .args([
-            "--repo",
-            "example/ocm",
-            "--tag",
-            "v1.2.3+build-1",
-            "--asset-dir",
-        ])
+        .args(["--repo", "example/ocm", "--tag", tag, "--asset-dir"])
         .arg(&asset_dir)
         .env("PATH", path)
         .env("TEST_GH_STATE", &state_dir)
+        .env("TEST_LOOKUP", lookup)
+        .env("TEST_UPLOAD", upload)
+        .env("TEST_QUERY", query)
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
 
-    let commands = fs::read_to_string(state_dir.join("commands")).unwrap();
-    let create = commands.find("release create").unwrap();
-    let upload = commands.find("release upload").unwrap();
-    let publish = commands.find("release edit").unwrap();
-    assert!(create < upload && upload < publish);
-    let publish_command = commands
+    let commands = fs::read_to_string(state_dir.join("commands")).unwrap_or_default();
+    let draft = fs::read_to_string(state_dir.join("draft")).ok();
+    let assets = fs::read_to_string(state_dir.join("assets"))
+        .unwrap_or_default()
         .lines()
-        .find(|line| line.starts_with("release edit"))
+        .map(str::to_string)
+        .collect();
+    PublishResult {
+        output,
+        commands,
+        draft,
+        assets,
+    }
+}
+
+#[test]
+fn publish_release_settles_stable_and_prerelease_drafts_after_exact_asset_verification() {
+    for (tag, expected_flag, rejected_flag) in [
+        ("v1.2.3+build-1", "--latest", "--prerelease"),
+        (
+            "v1.2.3-beta.1+build-1",
+            "--prerelease --latest=false",
+            "--latest ",
+        ),
+    ] {
+        let result = run_publish_scenario(tag, "missing", "success", "success", true);
+        assert!(result.output.status.success(), "{}", stderr(&result.output));
+        assert_eq!(result.assets, RELEASE_ASSETS);
+        assert_eq!(result.draft.as_deref(), Some("false\n"));
+
+        let commands = result.commands;
+        let create = commands.find("release create").unwrap();
+        let upload = commands.find("release upload").unwrap();
+        let query = commands.find("--json assets").unwrap();
+        let publish = commands.find("release edit").unwrap();
+        assert!(create < upload && upload < query && query < publish);
+        let publish_command = commands
+            .lines()
+            .find(|line| line.starts_with("release edit"))
+            .unwrap();
+        assert!(publish_command.contains("--draft=false"));
+        assert!(publish_command.contains(expected_flag), "{publish_command}");
+        assert!(
+            !publish_command.contains(rejected_flag),
+            "{publish_command}"
+        );
+    }
+}
+
+#[test]
+fn publish_release_distinguishes_missing_lookup_errors_and_public_releases() {
+    let lookup_error = run_publish_scenario("v1.2.3", "error", "success", "success", true);
+    assert_eq!(lookup_error.output.status.code(), Some(1));
+    assert!(stderr(&lookup_error.output).contains("failed to inspect existing release"));
+    assert!(!lookup_error.commands.contains("release create"));
+    assert!(!lookup_error.commands.contains("release upload"));
+    assert!(!lookup_error.commands.contains("release edit"));
+
+    let public = run_publish_scenario("v1.2.3", "public", "success", "success", true);
+    assert_eq!(public.output.status.code(), Some(1));
+    assert!(stderr(&public.output).contains("already public"));
+    assert!(!public.commands.contains("release create"));
+    assert!(!public.commands.contains("release upload"));
+    assert!(!public.commands.contains("release edit"));
+    assert_eq!(public.draft.as_deref(), Some("false\n"));
+}
+
+#[test]
+fn publish_release_keeps_new_and_existing_releases_draft_on_failures() {
+    for (label, lookup, upload, query) in [
+        ("new-upload", "missing", "fail", "success"),
+        ("existing-upload", "draft", "fail", "success"),
+        ("existing-query", "draft", "success", "fail"),
+        ("existing-mismatch", "draft", "mismatch", "success"),
+    ] {
+        let result = run_publish_scenario("v1.2.3", lookup, upload, query, true);
+        assert_eq!(result.output.status.code(), Some(1), "{label}");
+        assert!(!result.commands.contains("release edit"), "{label}");
+        assert_eq!(result.draft.as_deref(), Some("true\n"), "{label}");
+        if lookup == "draft" {
+            assert!(!result.commands.contains("release create"), "{label}");
+        } else {
+            assert!(result.commands.contains("release create"), "{label}");
+        }
+    }
+}
+
+#[test]
+fn publish_release_does_not_contact_github_when_asset_preparation_fails() {
+    let result = run_publish_scenario("v1.2.3", "missing", "success", "success", false);
+    assert_eq!(result.output.status.code(), Some(1));
+    assert!(result.commands.is_empty());
+    assert!(result.draft.is_none());
+    assert!(result.assets.is_empty());
+}
+
+#[test]
+fn publish_release_upload_set_matches_checksum_payloads() {
+    let result = run_publish_scenario("v1.2.3", "missing", "success", "success", true);
+    assert!(result.output.status.success(), "{}", stderr(&result.output));
+    assert_eq!(result.assets, RELEASE_ASSETS);
+
+    let root = TestDir::new("publish-checksum-payloads");
+    let asset_dir = root.child("dist");
+    populate_release_archives(&asset_dir, &root);
+    let prepared = Command::new(script("prepare-release-assets.sh"))
+        .arg(&asset_dir)
+        .output()
         .unwrap();
-    assert!(publish_command.contains("--draft=false"));
-    assert!(publish_command.contains("--latest"));
-    assert!(!publish_command.contains("--prerelease"));
-    assert_eq!(
-        fs::read_to_string(state_dir.join("draft")).unwrap(),
-        "false\n"
-    );
+    assert!(prepared.status.success(), "{}", stderr(&prepared));
+    let checksum_names = fs::read_to_string(asset_dir.join("SHA256SUMS"))
+        .unwrap()
+        .lines()
+        .map(|line| line.split_whitespace().nth(1).unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    let upload_payloads = RELEASE_ASSETS
+        .into_iter()
+        .filter(|name| *name != "SHA256SUMS")
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(checksum_names, upload_payloads);
 }
 
 #[test]
@@ -423,4 +874,16 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
     assert!(!release.contains("workflow_dispatch:"));
     assert!(release.contains("os: macos-15-intel"));
     assert!(!release.contains("os: macos-13"));
+
+    let workflow_targets = release
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("target: "))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(workflow_targets, SUPPORTED_TARGETS.into_iter().collect());
+    assert!(release.contains("name: release-${{ matrix.target }}"));
+    assert!(release.contains("path: ./dist/*.tar.gz"));
+    assert!(release.contains("pattern: release-*"));
+    assert!(release.contains("merge-multiple: true"));
+    assert!(release.contains("--target \"${{ matrix.target }}\""));
+    assert!(release.contains("--binary \"./target/${{ matrix.target }}/release/ocm\""));
 }

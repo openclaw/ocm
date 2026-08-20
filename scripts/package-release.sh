@@ -46,6 +46,13 @@ done
 
 [[ -n "$target" ]] || { echo "error: --target is required" >&2; exit 1; }
 [[ -n "$binary" ]] || { echo "error: --binary is required" >&2; exit 1; }
+case "$target" in
+  aarch64-apple-darwin|x86_64-apple-darwin|x86_64-unknown-linux-gnu) ;;
+  *)
+    echo "error: unsupported release target: $target" >&2
+    exit 1
+    ;;
+esac
 [[ -f "$binary" ]] || { echo "error: binary not found: $binary" >&2; exit 1; }
 
 mkdir -p "$output_dir"

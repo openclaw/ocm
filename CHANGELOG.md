@@ -6,6 +6,8 @@ All notable changes to OCM are documented here.
 
 - Use the canonical `openclaw/ocm` repository for installation and self-update
   requests. Thanks @shakkernerd.
+- Require exact complete release archives and keep failed release settlement
+  unpublished or draft. Thanks @shakkernerd.
 - Require successful exact-SHA `main` CI before signed release tags can be created or packaged.
 - Copy repo-backed and symlinked plain-home agent workspaces into an adopted
   environment and rewrite the imported config to keep the fixture isolated.
