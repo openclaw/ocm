@@ -42,6 +42,10 @@ done
 
 [[ -n "$repo" ]] || { usage; exit 1; }
 [[ -n "$tag" ]] || { usage; exit 1; }
+if [[ "$repo" != "openclaw/ocm" ]]; then
+  echo "error: release repository must be openclaw/ocm: $repo" >&2
+  exit 1
+fi
 [[ "$commit" =~ ^[0-9a-fA-F]{40}$ ]] || {
   echo "error: --commit requires a full commit SHA" >&2
   exit 1
@@ -49,7 +53,28 @@ done
 [[ -n "$asset_dir" ]] || { usage; exit 1; }
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+verified_commit="$(
+  "${script_dir}/verify-release-tag.sh" \
+    --repo "$repo" \
+    --tag "$tag" \
+    --commit "$commit"
+)"
+[[ "$verified_commit" == "$commit" ]] || {
+  echo "error: initial release tag verification returned an unexpected commit" >&2
+  exit 1
+}
+"${script_dir}/verify-release-ci.sh" --repo "$repo" --commit "$commit"
 "${script_dir}/prepare-release-assets.sh" "$asset_dir" >/dev/null
+verified_commit="$(
+  "${script_dir}/verify-release-tag.sh" \
+    --repo "$repo" \
+    --tag "$tag" \
+    --commit "$commit"
+)"
+[[ "$verified_commit" == "$commit" ]] || {
+  echo "error: final release tag verification returned an unexpected commit" >&2
+  exit 1
+}
 
 lookup_error="$(mktemp "${TMPDIR:-/tmp}/ocm-release-lookup.XXXXXX")"
 cleanup() {

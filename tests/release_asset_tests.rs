@@ -443,6 +443,7 @@ struct PublishResult {
 
 fn run_publish_scenario(
     tag: &str,
+    authority: &str,
     lookup: &str,
     upload: &str,
     query: &str,
@@ -469,6 +470,57 @@ fn run_publish_scenario(
         r#"#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"${TEST_GH_STATE}/commands"
+if [[ "${1:-}" == "api" ]]; then
+  endpoint=""
+  for arg in "$@"; do
+    case "$arg" in
+      repos/*) endpoint="$arg" ;;
+    esac
+  done
+  case "$endpoint" in
+    repos/openclaw/ocm/actions/workflows/ci.yml/runs\?*)
+      conclusion="success"
+      [[ "$TEST_AUTHORITY" != "ci-fail" ]] || conclusion="failure"
+      printf '1|12345|%s|push|main|completed|%s|https://github.com/openclaw/ocm/actions/runs/12345\n' "$TEST_EXPECTED_COMMIT" "$conclusion"
+      exit 0
+      ;;
+    repos/openclaw/ocm/git/ref/tags/*)
+      printf 'tag\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
+      exit 0
+      ;;
+    repos/openclaw/ocm/git/tags/*)
+      count_file="${TEST_GH_STATE}/tag-verifier-count"
+      count=0
+      [[ ! -f "$count_file" ]] || count="$(cat "$count_file")"
+      count=$((count + 1))
+      printf '%s\n' "$count" >"$count_file"
+      target="$TEST_EXPECTED_COMMIT"
+      verified="true"
+      [[ "$TEST_AUTHORITY" != "initial-tag-fail" ]] || verified="false"
+      if [[ "$TEST_AUTHORITY" == "retarget" && "$count" -gt 1 ]]; then
+        target="0000000000000000000000000000000000000000"
+      fi
+      printf 'v0.2.32\tcommit\t%s\t%s\n' "$target" "$verified"
+      exit 0
+      ;;
+    repos/openclaw/ocm/git/ref/heads/main)
+      printf '%s\n' "$TEST_EXPECTED_COMMIT"
+      exit 0
+      ;;
+    repos/openclaw/ocm/compare/*)
+      printf 'identical\n'
+      exit 0
+      ;;
+    repos/openclaw/ocm/commits/*/pulls)
+      printf '81\tclosed\t2026-08-16T01:41:59Z\tmain\trelease/v0.2.32\t%s\tchore(release): bump version to 0.2.32\n' "$TEST_EXPECTED_COMMIT"
+      exit 0
+      ;;
+    repos/openclaw/ocm)
+      printf 'main\n'
+      exit 0
+      ;;
+  esac
+fi
 case "${1:-} ${2:-}" in
   "release view")
     if [[ "$*" == *"--json isDraft"* ]]; then
@@ -522,7 +574,7 @@ esac
 
     let commit_output = Command::new("git")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["rev-parse", "HEAD"])
+        .args(["rev-parse", "v0.2.32^{}"])
         .output()
         .unwrap();
     assert!(commit_output.status.success());
@@ -530,7 +582,7 @@ esac
     let output = Command::new(script("publish-release.sh"))
         .args([
             "--repo",
-            "example/ocm",
+            "openclaw/ocm",
             "--tag",
             tag,
             "--commit",
@@ -540,6 +592,8 @@ esac
         .arg(&asset_dir)
         .env("PATH", path)
         .env("TEST_GH_STATE", &state_dir)
+        .env("TEST_EXPECTED_COMMIT", commit.trim())
+        .env("TEST_AUTHORITY", authority)
         .env("TEST_LOOKUP", lookup)
         .env("TEST_UPLOAD", upload)
         .env("TEST_QUERY", query)
@@ -562,49 +616,57 @@ esac
 }
 
 #[test]
-fn publish_release_settles_stable_and_prerelease_drafts_after_exact_asset_verification() {
-    for (tag, expected_flag, rejected_flag) in [
-        ("v1.2.3+build-1", "--latest", "--prerelease"),
-        (
-            "v1.2.3-beta.1+build-1",
-            "--prerelease --latest=false",
-            "--latest ",
-        ),
-    ] {
-        let result = run_publish_scenario(tag, "missing", "success", "success", true);
-        assert!(result.output.status.success(), "{}", stderr(&result.output));
-        assert_eq!(result.assets, RELEASE_ASSETS);
-        assert_eq!(result.draft.as_deref(), Some("false\n"));
+fn publish_release_settles_stable_draft_after_authority_and_asset_verification() {
+    let result = run_publish_scenario("v0.2.32", "success", "missing", "success", "success", true);
+    assert!(result.output.status.success(), "{}", stderr(&result.output));
+    assert_eq!(result.assets, RELEASE_ASSETS);
+    assert_eq!(result.draft.as_deref(), Some("false\n"));
 
-        let commands = result.commands;
-        let create = commands.find("release create").unwrap();
-        let upload = commands.find("release upload").unwrap();
-        let query = commands.find("--json assets").unwrap();
-        let publish = commands.find("release edit").unwrap();
-        assert!(create < upload && upload < query && query < publish);
-        let publish_command = commands
-            .lines()
-            .find(|line| line.starts_with("release edit"))
-            .unwrap();
-        assert!(publish_command.contains("--draft=false"));
-        assert!(publish_command.contains(expected_flag), "{publish_command}");
-        assert!(
-            !publish_command.contains(rejected_flag),
-            "{publish_command}"
-        );
+    let commands = result.commands;
+    let ci = commands.find("actions/workflows/ci.yml/runs").unwrap();
+    let final_tag_check = commands.rfind("/git/tags/").unwrap();
+    let create = commands.find("release create").unwrap();
+    let upload = commands.find("release upload").unwrap();
+    let query = commands.find("--json assets").unwrap();
+    let publish = commands.find("release edit").unwrap();
+    assert!(ci < final_tag_check);
+    assert!(final_tag_check < create && create < upload && upload < query && query < publish);
+    let publish_command = commands
+        .lines()
+        .find(|line| line.starts_with("release edit"))
+        .unwrap();
+    assert!(publish_command.contains("--draft=false"));
+    assert!(publish_command.contains("--latest"));
+    assert!(!publish_command.contains("--prerelease"));
+
+    let publisher = fs::read_to_string(script("publish-release.sh")).unwrap();
+    assert!(publisher.contains("release_flags+=(--prerelease --latest=false)"));
+}
+
+#[test]
+fn publish_release_stops_before_release_api_when_authority_fails_or_tag_moves() {
+    for authority in ["initial-tag-fail", "ci-fail", "retarget"] {
+        let result =
+            run_publish_scenario("v0.2.32", authority, "missing", "success", "success", true);
+        assert_eq!(result.output.status.code(), Some(1), "{authority}");
+        assert!(!result.commands.contains("release view"), "{authority}");
+        assert!(!result.commands.contains("release create"), "{authority}");
+        assert!(!result.commands.contains("release upload"), "{authority}");
+        assert!(!result.commands.contains("release edit"), "{authority}");
     }
 }
 
 #[test]
 fn publish_release_distinguishes_missing_lookup_errors_and_public_releases() {
-    let lookup_error = run_publish_scenario("v1.2.3", "error", "success", "success", true);
+    let lookup_error =
+        run_publish_scenario("v0.2.32", "success", "error", "success", "success", true);
     assert_eq!(lookup_error.output.status.code(), Some(1));
     assert!(stderr(&lookup_error.output).contains("failed to inspect existing release"));
     assert!(!lookup_error.commands.contains("release create"));
     assert!(!lookup_error.commands.contains("release upload"));
     assert!(!lookup_error.commands.contains("release edit"));
 
-    let public = run_publish_scenario("v1.2.3", "public", "success", "success", true);
+    let public = run_publish_scenario("v0.2.32", "success", "public", "success", "success", true);
     assert_eq!(public.output.status.code(), Some(1));
     assert!(stderr(&public.output).contains("already public"));
     assert!(!public.commands.contains("release create"));
@@ -621,7 +683,7 @@ fn publish_release_keeps_new_and_existing_releases_draft_on_failures() {
         ("existing-query", "draft", "success", "fail"),
         ("existing-mismatch", "draft", "mismatch", "success"),
     ] {
-        let result = run_publish_scenario("v1.2.3", lookup, upload, query, true);
+        let result = run_publish_scenario("v0.2.32", "success", lookup, upload, query, true);
         assert_eq!(result.output.status.code(), Some(1), "{label}");
         assert!(!result.commands.contains("release edit"), "{label}");
         assert_eq!(result.draft.as_deref(), Some("true\n"), "{label}");
@@ -634,17 +696,22 @@ fn publish_release_keeps_new_and_existing_releases_draft_on_failures() {
 }
 
 #[test]
-fn publish_release_does_not_contact_github_when_asset_preparation_fails() {
-    let result = run_publish_scenario("v1.2.3", "missing", "success", "success", false);
+fn publish_release_stops_before_release_api_when_asset_preparation_fails() {
+    let result = run_publish_scenario("v0.2.32", "success", "missing", "success", "success", false);
     assert_eq!(result.output.status.code(), Some(1));
-    assert!(result.commands.is_empty());
+    assert!(result.commands.contains("/git/ref/tags/v0.2.32"));
+    assert!(result.commands.contains("actions/workflows/ci.yml/runs"));
+    assert!(!result.commands.contains("release view"));
+    assert!(!result.commands.contains("release create"));
+    assert!(!result.commands.contains("release upload"));
+    assert!(!result.commands.contains("release edit"));
     assert!(result.draft.is_none());
     assert!(result.assets.is_empty());
 }
 
 #[test]
 fn publish_release_upload_set_matches_checksum_payloads() {
-    let result = run_publish_scenario("v1.2.3", "missing", "success", "success", true);
+    let result = run_publish_scenario("v0.2.32", "success", "missing", "success", "success", true);
     assert!(result.output.status.success(), "{}", stderr(&result.output));
     assert_eq!(result.assets, RELEASE_ASSETS);
 

@@ -10,6 +10,8 @@ All notable changes to OCM are documented here.
   unpublished or draft. Thanks @shakkernerd.
 - Bind release identity to canonical producer, tag, pull request, CI, and
   protected-main workflow inputs. Thanks @shakkernerd.
+- Recheck tag identity and exact-SHA CI inside the publisher before any release
+  API mutation. Thanks @shakkernerd.
 - Require successful exact-SHA `main` CI before signed release tags can be created or packaged.
 - Copy repo-backed and symlinked plain-home agent workspaces into an adopted
   environment and rewrite the imported config to keep the fixture isolated.
