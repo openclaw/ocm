@@ -498,7 +498,7 @@ if [[ "${1:-}" == "api" ]]; then
       verified="true"
       [[ "$TEST_AUTHORITY" != "initial-tag-fail" ]] || verified="false"
       if [[ "$TEST_AUTHORITY" == "retarget" && "$count" -gt 1 ]] ||
-        [[ "$TEST_AUTHORITY" == "post-upload-retarget" && "$count" -gt 2 ]]; then
+        [[ "$TEST_AUTHORITY" == "post-upload-retarget" && "$count" -gt 4 ]]; then
         target="0000000000000000000000000000000000000000"
       fi
       printf 'v0.2.32\tcommit\t%s\t%s\n' "$target" "$verified"
@@ -628,15 +628,17 @@ fn publish_release_settles_stable_draft_after_authority_and_asset_verification()
         .match_indices("/git/tags/")
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    assert_eq!(tag_checks.len(), 3);
+    assert_eq!(tag_checks.len(), 6);
     let ci = commands.find("actions/workflows/ci.yml/runs").unwrap();
     let create = commands.find("release create").unwrap();
     let upload = commands.find("release upload").unwrap();
     let query = commands.find("--json assets").unwrap();
     let publish = commands.find("release edit").unwrap();
-    assert!(tag_checks[0] < ci && ci < tag_checks[1]);
-    assert!(tag_checks[1] < create && create < upload && upload < query);
-    assert!(query < tag_checks[2] && tag_checks[2] < publish);
+    assert!(tag_checks[0] < tag_checks[1] && tag_checks[1] < ci);
+    assert!(ci < tag_checks[2] && tag_checks[2] < tag_checks[3]);
+    assert!(tag_checks[3] < create && create < upload && upload < query);
+    assert!(query < tag_checks[4] && tag_checks[4] < tag_checks[5]);
+    assert!(tag_checks[5] < publish);
     let publish_command = commands
         .lines()
         .find(|line| line.starts_with("release edit"))

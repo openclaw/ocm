@@ -217,4 +217,29 @@ if [[ "$base_branch" != "$default_branch" ||
   exit 1
 fi
 
+final_ref_data="$(
+  github api "repos/${repo}/git/ref/tags/${tag}" \
+    --jq '[.object.type, .object.sha] | @tsv'
+)"
+IFS=$'\t' read -r final_ref_type final_tag_object_sha final_ref_extra <<<"$final_ref_data"
+if [[ -n "${final_ref_extra:-}" ||
+  "$final_ref_type" != "tag" ||
+  "$final_tag_object_sha" != "$tag_object_sha" ]]; then
+  echo "error: release tag ${tag} changed during verification" >&2
+  exit 1
+fi
+final_tag_data="$(
+  github api "repos/${repo}/git/tags/${final_tag_object_sha}" \
+    --jq '[.tag, .object.type, .object.sha, (.verification.verified | tostring)] | @tsv'
+)"
+IFS=$'\t' read -r final_verified_tag final_target_type final_target_sha final_signature_verified final_tag_extra <<<"$final_tag_data"
+if [[ -n "${final_tag_extra:-}" ||
+  "$final_verified_tag" != "$tag" ||
+  "$final_target_type" != "commit" ||
+  "$final_target_sha" != "$target_sha" ||
+  "$final_signature_verified" != "true" ]]; then
+  echo "error: release tag ${tag} changed during verification" >&2
+  exit 1
+fi
+
 printf '%s\n' "$target_sha"
