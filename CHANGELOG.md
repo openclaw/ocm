@@ -28,6 +28,10 @@ All notable changes to OCM are documented here.
 - Clean surviving process-group descendants after supervised gateway exit and always reap the process-group leader.
 - Migrate direct named Tailscale Service routes during upgrade to an OCM-owned identity proxy and OpenClaw trusted-proxy auth, preserving direct-local password fallback and restoring proxy, route, config, runtime, and service state on rollback.
 
+### Fixed
+
+- Keep unrelated supervised gateways on their persisted child specifications when an environment is destroyed, removed, or pruned, so latent metadata or process-environment drift cannot restart sibling gateways during cleanup.
+
 ## 0.2.30 - 2026-07-23
 
 ### Added
