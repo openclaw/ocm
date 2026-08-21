@@ -132,6 +132,29 @@ fn prepend_fake_bin(env: &mut BTreeMap<String, String>, bin_dir: &Path) {
     env.insert("PATH".to_string(), combined_path);
 }
 
+#[cfg(unix)]
+fn run_ocm_through_path_wrapper(
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    target_root: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    let mut command = Command::new("/bin/sh");
+    command
+        .current_dir(cwd)
+        .arg("-c")
+        .arg(
+            "target_root=$1; shift; binary=$1; shift; \"$binary\" \"$@\"; status=$?; : \"$target_root\"; exit \"$status\"",
+        )
+        .arg("ocm-destroy-wrapper")
+        .arg(target_root)
+        .arg(env!("CARGO_BIN_EXE_ocm"))
+        .args(args)
+        .env_clear()
+        .envs(env);
+    command.output().unwrap()
+}
+
 fn install_fake_dev_runners(root: &TestDir, env: &mut BTreeMap<String, String>) {
     let bin_dir = root.child("fake-dev-bin");
     fs::create_dir_all(&bin_dir).unwrap();
@@ -726,6 +749,67 @@ fn env_destroy_ignores_processes_in_sibling_prefix_paths() {
     assert!(
         sibling_process.try_wait().unwrap().is_none(),
         "destroy preview must not terminate a process from a sibling prefix path"
+    );
+
+    sibling_process.kill().unwrap();
+    sibling_process.wait().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn env_destroy_ignores_its_invocation_wrapper_when_the_command_mentions_the_target_root() {
+    let root = TestDir::new("env-destroy-invocation-wrapper");
+    let cwd = root.child("workspace");
+    let sibling_root = root.child("ocm-home/envs/demo-sibling");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&sibling_root).unwrap();
+    let env = ocm_launchd_env(&root);
+
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let stopped = run_ocm(&cwd, &env, &["service", "stop", "demo"]);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let target_root = PathBuf::from(get_environment("demo", &env, &cwd).unwrap().root);
+
+    let mut sibling_process = Command::new("python3")
+        .current_dir(&sibling_root)
+        .args(["-c", "import time; time.sleep(60)"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    sleep(Duration::from_millis(100));
+
+    let preview = run_ocm_through_path_wrapper(
+        &cwd,
+        &env,
+        &target_root,
+        &["env", "destroy", "demo", "--json"],
+    );
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    let preview_json: serde_json::Value = serde_json::from_str(&stdout(&preview)).unwrap();
+    assert_eq!(preview_json["processCount"], 0);
+    let guard = preview_json["stateToken"].as_str().unwrap();
+
+    let destroy = run_ocm_through_path_wrapper(
+        &cwd,
+        &env,
+        &target_root,
+        &[
+            "env",
+            "destroy",
+            "demo",
+            "--yes",
+            "--if-state-token",
+            guard,
+            "--json",
+        ],
+    );
+    assert!(destroy.status.success(), "{}", stderr(&destroy));
+    assert!(
+        sibling_process.try_wait().unwrap().is_none(),
+        "destroy must not terminate an independent sibling process"
     );
 
     sibling_process.kill().unwrap();

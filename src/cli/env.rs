@@ -1708,6 +1708,40 @@ fn associated_processes(meta: &EnvMeta) -> Result<Vec<EnvDestroyProcessIdentity>
 }
 
 #[cfg(unix)]
+fn active_invocation_processes(
+    current_pid: u32,
+    parent_map: &std::collections::HashMap<u32, u32>,
+    children_map: &std::collections::HashMap<u32, Vec<u32>>,
+) -> BTreeSet<u32> {
+    // The destroy command and its caller/inspection tree can mention the target
+    // path without being owned by that environment.
+    let mut excluded = BTreeSet::new();
+    let mut cursor = current_pid;
+    while cursor > 1 && excluded.insert(cursor) {
+        let Some(parent) = parent_map.get(&cursor).copied() else {
+            break;
+        };
+        if parent == cursor {
+            break;
+        }
+        cursor = parent;
+    }
+
+    let mut queue = vec![current_pid];
+    while let Some(pid) = queue.pop() {
+        let Some(children) = children_map.get(&pid) else {
+            continue;
+        };
+        for child in children {
+            if excluded.insert(*child) {
+                queue.push(*child);
+            }
+        }
+    }
+    excluded
+}
+
+#[cfg(unix)]
 fn associated_processes_once(meta: &EnvMeta) -> Result<Vec<EnvDestroyProcessIdentity>, String> {
     let processes = process_table()?;
     let cwd_map = process_cwd_map(&processes)?;
@@ -1722,10 +1756,14 @@ fn associated_processes_once(meta: &EnvMeta) -> Result<Vec<EnvDestroyProcessIden
             .or_default()
             .push(process.pid);
     }
+    let invocation_processes =
+        active_invocation_processes(std::process::id(), &parent_map, &children_map);
 
     let mut seeds = BTreeSet::new();
     for process in &processes {
-        if interactive_shell_command(&process.command) {
+        if invocation_processes.contains(&process.pid)
+            || interactive_shell_command(&process.command)
+        {
             continue;
         }
         if process_belongs_to_env(process.pid, &process.command, meta, &cwd_map) {
@@ -1745,7 +1783,9 @@ fn associated_processes_once(meta: &EnvMeta) -> Result<Vec<EnvDestroyProcessIden
                 let Some(process) = processes.iter().find(|process| process.pid == *child) else {
                     continue;
                 };
-                if interactive_shell_command(&process.command) {
+                if invocation_processes.contains(child)
+                    || interactive_shell_command(&process.command)
+                {
                     continue;
                 }
                 if related.insert(*child) {
@@ -2148,7 +2188,11 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{command_contains_process_path, process_path_is_within};
+    use std::collections::HashMap;
+
+    use super::{
+        active_invocation_processes, command_contains_process_path, process_path_is_within,
+    };
 
     #[test]
     fn process_path_containment_requires_component_boundaries() {
@@ -2174,5 +2218,22 @@ mod tests {
             "node /tmp/parent-demo/openclaw.mjs",
             "/tmp/demo"
         ));
+    }
+
+    #[test]
+    fn invocation_processes_include_ancestors_and_current_descendants_only() {
+        let parent_map = HashMap::from([(40, 20), (20, 10), (10, 1), (30, 20), (41, 40), (42, 41)]);
+        let children_map = HashMap::from([
+            (1, vec![10]),
+            (10, vec![20]),
+            (20, vec![30, 40]),
+            (40, vec![41]),
+            (41, vec![42]),
+        ]);
+
+        assert_eq!(
+            active_invocation_processes(40, &parent_map, &children_map),
+            [10, 20, 40, 41, 42].into_iter().collect()
+        );
     }
 }
