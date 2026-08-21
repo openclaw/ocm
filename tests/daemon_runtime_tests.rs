@@ -1062,6 +1062,123 @@ fn targeted_runtime_refresh_ignores_unrelated_drift_and_restarts_effective_chang
 }
 
 #[test]
+fn service_uninstall_removes_only_target_child_despite_unrelated_drift() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-targeted-service-uninstall");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_systemd_tools(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let target_started = root.child("target-started.txt");
+    let target_stopped = root.child("target-stopped.txt");
+    let sibling_started = root.child("sibling-started.txt");
+    let sibling_stopped = root.child("sibling-stopped.txt");
+
+    let target_runtime = root.child("bin/target-runtime");
+    write_legacy_openclaw_script(
+        &target_runtime,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            path_string(&target_started),
+            path_string(&target_stopped),
+        ),
+    );
+    let sibling_runtime = root.child("bin/sibling-runtime");
+    write_legacy_openclaw_script(
+        &sibling_runtime,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            path_string(&sibling_started),
+            path_string(&sibling_stopped),
+        ),
+    );
+
+    for (runtime_name, runtime_path, env_name) in [
+        ("target-runtime", &target_runtime, "target"),
+        ("sibling-runtime", &sibling_runtime, "sibling"),
+    ] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                runtime_name,
+                "--path",
+                &path_string(runtime_path),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", env_name, "--runtime", runtime_name],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        set_service_enabled(&cwd, &env, env_name, true);
+    }
+    service.sync().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
+        .expect("daemon runtime state did not report both children");
+    let target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
+    let sibling_pid = runtime_child_pid(&initial_runtime, "sibling").unwrap();
+
+    let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
+    let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
+    sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
+    write_persisted_service_state(&sibling_meta_path, &sibling_meta);
+
+    let uninstall = run_ocm(&cwd, &env, &["service", "uninstall", "target", "--json"]);
+    assert!(uninstall.status.success(), "{}", stderr(&uninstall));
+
+    let final_runtime =
+        wait_for_runtime_children(&runtime_path, 1, Some("sibling"), Duration::from_secs(5))
+            .expect("daemon runtime state did not retain only the sibling");
+    let final_state = read_persisted_service_state(&state_path);
+    let persisted_sibling = final_state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "sibling")
+        .unwrap();
+
+    assert_eq!(
+        runtime_child_pid(&final_runtime, "sibling"),
+        Some(sibling_pid),
+        "sibling child PID changed"
+    );
+    assert_ne!(
+        runtime_child_pid(&final_runtime, "target"),
+        Some(target_pid),
+        "target child remained active"
+    );
+    assert!(wait_for_file(&target_stopped, Duration::from_secs(5)));
+    assert!(
+        !sibling_stopped.exists(),
+        "sibling child was stopped by target uninstall"
+    );
+    assert_eq!(
+        fs::read_to_string(&sibling_started)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "sibling child restarted"
+    );
+    assert!(
+        persisted_sibling["runtimeReleaseVersion"].is_null(),
+        "target uninstall applied unrelated sibling drift"
+    );
+
+    stop_process(&mut daemon);
+}
+
+#[test]
 fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("daemon-targeted-service-restart");
