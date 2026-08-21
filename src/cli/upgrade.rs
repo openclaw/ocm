@@ -3607,6 +3607,8 @@ impl Cli {
             env_name,
             gateway_port,
             ingress.identity_endpoints,
+            ingress.same_host_ips,
+            &ingress.tailnet_login,
             &self.env,
             &self.cwd,
         )?;

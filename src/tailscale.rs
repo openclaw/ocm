@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -41,6 +42,7 @@ pub(crate) struct NamedServiceProxyRoute {
 pub(crate) struct NamedServiceIngress {
     pub routes: Vec<NamedServiceProxyRoute>,
     pub identity_endpoints: Vec<TailscaleCommandEndpoint>,
+    pub same_host_ips: Vec<String>,
     pub tailnet_login: String,
 }
 
@@ -56,6 +58,7 @@ pub(crate) fn named_service_routes_for_gateway(
     let endpoints = discover_tailscale_endpoints(env, cwd)?;
     let mut routes = Vec::new();
     let mut identity_endpoints = Vec::new();
+    let mut same_host_ips = BTreeSet::new();
     let mut tailnet_login: Option<String> = None;
     let mut resolved_sources = BTreeSet::new();
     for endpoint in endpoints {
@@ -122,6 +125,20 @@ pub(crate) fn named_service_routes_for_gateway(
             Err(_) if !explicitly_configured => continue,
             Err(error) => return Err(error),
         };
+        if let Some(ips) = status
+            .get("Self")
+            .and_then(Value::as_object)
+            .and_then(|self_node| self_node.get("TailscaleIPs"))
+            .and_then(Value::as_array)
+        {
+            for ip in ips {
+                if let Some(ip) = ip.as_str().map(str::trim)
+                    && ip.parse::<IpAddr>().is_ok()
+                {
+                    same_host_ips.insert(ip.to_string());
+                }
+            }
+        }
         let endpoint_login = status
             .get("CurrentTailnet")
             .and_then(Value::as_object)
@@ -185,6 +202,7 @@ pub(crate) fn named_service_routes_for_gateway(
     Ok(Some(NamedServiceIngress {
         routes,
         identity_endpoints,
+        same_host_ips: same_host_ips.into_iter().collect(),
         tailnet_login: tailnet_login.expect("routes require a tailnet login"),
     }))
 }

@@ -199,6 +199,7 @@ Use `upgrade simulate` when you want to test what would happen against a publish
 - once cold mutation begins, a running managed gateway is stopped before its verified pre-upgrade checkpoint and remains stopped through checkpoint capture, runtime publication, environment mutation, and finalization
 - when a named Tailscale Service routes directly to the gateway, dry-run reports the planned identity proxy and auth migration; the real upgrade applies it only after the checkpoint and rollback restores config, route, proxy service, runtime, and service policy
 - named-Service migration preserves direct-local password fallback, restricts trusted-proxy input to the OCM proxy, and fails before mutation when identity or existing auth policy is ambiguous
+- same-host named-Service requests are mapped to the verified tailnet owner only when the forwarded client address matches a local Tailscale endpoint
 - new checkpoints capture the complete environment root; APFS clone support is used when available and a metadata-preserving full copy is the fallback
 - when an env moves to a new runtime, OCM runs OpenClaw's update finalization path cold before service restart
 - if service reconciliation fails, OCM restores the snapshot and previous runtime unless `--no-rollback` is set

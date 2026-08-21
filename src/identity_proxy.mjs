@@ -65,26 +65,50 @@ function parseJsonOutput(stdout) {
   return JSON.parse(stdout.slice(start));
 }
 
-function createWhoisResolver({ endpoints, cacheTtlMs = 300_000 }) {
+async function runTailscaleJson(endpoint, args) {
+  const commandArgs = [];
+  if (endpoint.socket) {
+    commandArgs.push(`--socket=${endpoint.socket}`);
+  }
+  commandArgs.push(...args);
+  const { stdout } = await execFileAsync(endpoint.binary, commandArgs, {
+    timeout: 5_000,
+    maxBuffer: 1024 * 1024,
+  });
+  return parseJsonOutput(stdout);
+}
+
+function createWhoisResolver({
+  endpoints,
+  sameHostIps,
+  sameHostLogin,
+  cacheTtlMs = 300_000,
+}) {
   const cache = new Map();
+  const localIps = new Set(
+    (Array.isArray(sameHostIps) ? sameHostIps : []).filter(
+      (ip) => typeof ip === "string" && net.isIP(ip) !== 0,
+    ),
+  );
+
   return async (ip) => {
     const cached = cache.get(ip);
     if (cached && cached.expiresAt > Date.now()) {
       return cached.identity;
     }
+    if (
+      typeof sameHostLogin === "string" &&
+      sameHostLogin.trim() &&
+      localIps.has(ip)
+    ) {
+      const identity = { login: sameHostLogin.trim() };
+      cache.set(ip, { identity, expiresAt: Date.now() + cacheTtlMs });
+      return identity;
+    }
     let lastError;
     for (const endpoint of endpoints) {
-      const args = [];
-      if (endpoint.socket) {
-        args.push(`--socket=${endpoint.socket}`);
-      }
-      args.push("whois", "--json", ip);
       try {
-        const { stdout } = await execFileAsync(endpoint.binary, args, {
-          timeout: 5_000,
-          maxBuffer: 1024 * 1024,
-        });
-        const parsed = parseJsonOutput(stdout);
+        const parsed = await runTailscaleJson(endpoint, ["whois", "--json", ip]);
         const login = parsed?.UserProfile?.LoginName?.trim();
         if (!login) {
           throw new Error("tailscale whois returned no user login");
@@ -130,7 +154,11 @@ async function resolveRequestIdentity(req, resolveIdentity) {
 }
 
 function createIdentityProxy({ config, logger = console }) {
-  const resolveIdentity = createWhoisResolver({ endpoints: config.tailscaleEndpoints });
+  const resolveIdentity = createWhoisResolver({
+    endpoints: config.tailscaleEndpoints,
+    sameHostIps: config.sameHostIps,
+    sameHostLogin: config.sameHostLogin,
+  });
   const server = http.createServer(async (req, res) => {
     try {
       const { ip, identity } = await resolveRequestIdentity(req, resolveIdentity);

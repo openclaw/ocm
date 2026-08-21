@@ -784,6 +784,9 @@ fi
 if [ "$*" = "status --json" ]; then
   cat <<'EOF'
 {{
+  "Self": {{
+    "TailscaleIPs": ["100.64.0.10", "fd7a:115c:a1e0::10"]
+  }},
   "CurrentTailnet": {{
     "Name": "owner@example.com",
     "MagicDNSSuffix": "tailnet.ts.net"
@@ -4975,11 +4978,24 @@ fn upgrade_migrates_direct_named_tailscale_service_to_trusted_proxy_auth() {
         root.child("ocm-home/ingress/demo/identity-proxy.json")
             .exists()
     );
+    let proxy_config: Value = serde_json::from_str(
+        &fs::read_to_string(root.child("ocm-home/ingress/demo/identity-proxy.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(proxy_config["sameHostLogin"], "owner@example.com");
+    assert_eq!(
+        proxy_config["sameHostIps"],
+        serde_json::json!(["100.64.0.10", "fd7a:115c:a1e0::10"])
+    );
     let proxy_script =
         fs::read_to_string(root.child("ocm-home/ingress/demo/identity-proxy.mjs")).unwrap();
     assert!(
         proxy_script.contains("lower.startsWith(\"tailscale-\")"),
         "identity proxy must strip every Tailscale-owned header before injecting OCM attribution"
+    );
+    assert!(
+        proxy_script.contains("sameHostIps: config.sameHostIps"),
+        "identity proxy must recognize same-host named-Service hairpins"
     );
     assert!(
         root.child("home/Library/LaunchAgents/ai.openclaw.ocm.ingress.demo.plist")

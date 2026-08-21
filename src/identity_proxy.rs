@@ -29,6 +29,8 @@ pub(crate) struct IdentityProxyConfig {
     pub upstream_host: String,
     pub upstream_port: u16,
     pub tailscale_endpoints: Vec<TailscaleCommandEndpoint>,
+    pub same_host_ips: Vec<String>,
+    pub same_host_login: String,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +73,8 @@ pub(crate) fn plan_identity_proxy(
     env_name: &str,
     gateway_port: u32,
     tailscale_endpoints: Vec<TailscaleCommandEndpoint>,
+    same_host_ips: Vec<String>,
+    same_host_login: &str,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<IdentityProxyPlan, String> {
@@ -96,6 +100,8 @@ pub(crate) fn plan_identity_proxy(
             upstream_host: "127.0.0.1".to_string(),
             upstream_port,
             tailscale_endpoints,
+            same_host_ips,
+            same_host_login: same_host_login.to_string(),
         },
     })
 }

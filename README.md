@@ -200,8 +200,10 @@ on `openclaw` receive a runtime-local host link before full-tree hashing.
 When a named Tailscale Service routes directly to an environment gateway,
 `upgrade` can migrate it after the verified checkpoint to an OCM-owned identity
 proxy and OpenClaw trusted-proxy auth. The stable Service hostname is retained,
-direct-local password fallback is preserved, and rollback restores the prior
-config, route, proxy service, runtime, and service policy.
+direct-local password fallback is preserved, and same-host Service hairpins are
+attributed to the verified tailnet owner so the gateway host can use the stable
+URL. Rollback restores the prior config, route, proxy service, runtime, and
+service policy.
 
 For unreleased source builds with separately published, version-bound official
 plugins, repeat `runtime build-local --companion <plugin-id>`. OCM packages each
