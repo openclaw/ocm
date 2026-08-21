@@ -137,6 +137,7 @@ fn setup_gateway_aware_restart_fixture(
     };
     fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
     env.insert("OCM_ACTIVE_ENV".to_string(), "demo".to_string());
+    env.insert("OPENCLAW_SERVICE_KIND".to_string(), "gateway".to_string());
 
     (cwd, env, invocation_log)
 }

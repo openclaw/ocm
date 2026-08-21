@@ -229,7 +229,7 @@ impl<'a> ServiceService<'a> {
     ) -> Result<ServiceActionSummary, String> {
         let _lock = crate::env::EnvironmentService::new(self.env, self.cwd).lock_operation(name)?;
         let mut summary = self.restart_locked_with_options(name, options)?;
-        if self.env.get("OCM_ACTIVE_ENV").map(String::as_str) != Some(name) {
+        if !manage::restart_originates_inside_gateway(name, self.env) {
             self.apply_gateway_readiness(name, &mut summary)?;
         }
         Ok(summary)

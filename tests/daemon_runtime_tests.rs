@@ -1508,7 +1508,7 @@ fn service_restart_requeues_a_stopped_desired_child() {
 fn service_start_and_restart_wait_for_gateway_health() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("service-readiness-healthy");
-    let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
+    let (cwd, mut env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
     let mut daemon = spawn_daemon_process(&cwd, &env);
 
     let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
@@ -1518,6 +1518,7 @@ fn service_start_and_restart_wait_for_gateway_health() {
     assert_eq!(started_body["gatewayState"], "running");
     assert_eq!(started_body["issue"], Value::Null);
 
+    env.insert("OCM_ACTIVE_ENV".to_string(), "demo".to_string());
     let restarted = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
     assert!(restarted.status.success(), "{}", stderr(&restarted));
     let restarted_body: Value = serde_json::from_slice(&restarted.stdout).unwrap();

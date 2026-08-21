@@ -71,6 +71,14 @@ pub struct ServiceRestartOptions {
     pub force: bool,
 }
 
+pub(crate) fn restart_originates_inside_gateway(
+    name: &str,
+    env: &BTreeMap<String, String>,
+) -> bool {
+    env.get("OCM_ACTIVE_ENV").map(String::as_str) == Some(name)
+        && env.get("OPENCLAW_SERVICE_KIND").map(String::as_str) == Some("gateway")
+}
+
 #[derive(Clone, Copy)]
 enum ServiceSupervisorPolicy {
     LeaveAsIs,
@@ -206,7 +214,7 @@ pub fn restart_service(
 
     spawn_recovery_aware_restart(name, env, cwd)?;
 
-    if env.get("OCM_ACTIVE_ENV").map(String::as_str) == Some(name) {
+    if restart_originates_inside_gateway(name, env) {
         let mut warnings = vec![
             "recovery-aware restart was scheduled without waiting because the request originated inside the target gateway; OpenClaw will preserve and resume eligible interrupted work after restart"
                 .to_string(),
