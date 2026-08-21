@@ -1129,6 +1129,7 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
     assert!(release.contains("cp ./release-source/install.sh ./dist/install.sh"));
     assert!(release.contains("./trusted/scripts/publish-release.sh"));
     assert!(release.contains("--commit \"$RELEASE_COMMIT\""));
+    assert!(!release.contains("Swatinem/rust-cache"));
     assert!(!release.contains("push:\n    tags:"));
     assert!(!release.contains("repository_dispatch:"));
     assert!(!release.contains("github.event.client_payload.tag"));
