@@ -11,7 +11,7 @@ use crate::store::{
     now_utc, remove_environment, resolve_config_gateway_port, resolve_effective_gateway_ports,
     resolve_env_gateway_port, save_environment, set_environment_service_policy,
 };
-use crate::supervisor::sync_supervisor_if_present;
+use crate::supervisor::{sync_supervisor_env_if_present, sync_supervisor_if_present};
 
 pub fn default_service_enabled() -> bool {
     true
@@ -362,7 +362,7 @@ impl<'a> EnvironmentService<'a> {
 
     pub(crate) fn remove_locked(&self, name: &str, force: bool) -> Result<EnvMeta, String> {
         let meta = remove_environment(name, force, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, name)?;
         Ok(meta)
     }
 
@@ -376,10 +376,7 @@ impl<'a> EnvironmentService<'a> {
         let mut removed = Vec::with_capacity(candidates.len());
         for meta in candidates {
             let _lock = self.lock_operation(&meta.name)?;
-            removed.push(remove_environment(&meta.name, false, self.env, self.cwd)?);
-        }
-        if !removed.is_empty() {
-            sync_supervisor_if_present(self.env, self.cwd)?;
+            removed.push(self.remove_locked(&meta.name, false)?);
         }
         Ok(removed)
     }
