@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -56,8 +56,7 @@ const SERVICE_PROXY_ENV_KEYS: [&str; 8] = [
     "all_proxy",
 ];
 const SERVICE_EXTRA_ENV_KEYS: [&str; 2] = ["NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA"];
-const SUPERVISED_CHILD_BASE_ENV_KEYS: [&str; 6] =
-    ["HOME", "PATH", "TMPDIR", "OCM_HOME", "OCM_SELF", "SHELL"];
+const SUPERVISED_CHILD_BASE_ENV_KEYS: [&str; 5] = ["HOME", "PATH", "OCM_HOME", "OCM_SELF", "SHELL"];
 const SUPERVISED_CHILD_RUNTIME_ENV_KEYS: [&str; 4] =
     ["NODE_OPTIONS", "NODE_ENV", "NODE_PATH", "PNPM_HOME"];
 const SERVICE_EXECUTABLE_OVERRIDE: &str = "OCM_SERVICE_EXECUTABLE";
@@ -1034,6 +1033,11 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
                 spec.env_name
             )
         })?;
+    let mut process_env = spec.process_env.clone();
+    process_env.insert(
+        "TMPDIR".to_string(),
+        display_path(&prepare_supervisor_child_tmpdir()?),
+    );
 
     let mut command = Command::new(program);
     command
@@ -1042,7 +1046,7 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .env_clear()
-        .envs(&spec.process_env)
+        .envs(&process_env)
         .current_dir(Path::new(&spec.run_dir));
     #[cfg(unix)]
     {
@@ -1055,6 +1059,74 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
             child_binding_label(spec)
         )
     })
+}
+
+fn prepare_supervisor_child_tmpdir() -> Result<PathBuf, String> {
+    let preferred = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_dir());
+    if let Some(preferred) = preferred
+        && let Ok(path) = ensure_supervisor_child_tmpdir(&preferred)
+    {
+        return Ok(path);
+    }
+
+    #[cfg(unix)]
+    let fallback = PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let fallback = std::env::temp_dir();
+    ensure_supervisor_child_tmpdir(&fallback)
+}
+
+fn ensure_supervisor_child_tmpdir(base: &Path) -> Result<PathBuf, String> {
+    if !base.is_absolute() || !base.is_dir() {
+        return Err(format!(
+            "temporary directory base is unavailable: {}",
+            display_path(base)
+        ));
+    }
+
+    let path = base.join(format!("ocm-supervisor-{}", std::process::id()));
+    match fs::create_dir(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "failed creating supervised child temporary directory {}: {error}",
+                display_path(&path)
+            ));
+        }
+    }
+
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "failed inspecting supervised child temporary directory {}: {error}",
+            display_path(&path)
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "supervised child temporary path is not a directory: {}",
+            display_path(&path)
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != current_uid {
+            return Err(format!(
+                "supervised child temporary directory is not owned by the current user: {}",
+                display_path(&path)
+            ));
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "failed securing supervised child temporary directory {}: {error}",
+                display_path(&path)
+            )
+        })?;
+    }
+    Ok(path)
 }
 
 fn supervisor_program_arguments(spec: &SupervisorChildSpec) -> Vec<String> {
@@ -2011,12 +2083,6 @@ fn supervisor_service_environment(
             .map(|value| value.trim().to_string())
             .unwrap_or_else(|| DEFAULT_SERVICE_PATH.to_string()),
     );
-    if let Some(tmpdir) = process_env
-        .get("TMPDIR")
-        .filter(|value| !value.trim().is_empty())
-    {
-        service_env.insert("TMPDIR".to_string(), tmpdir.trim().to_string());
-    }
     for key in SERVICE_PROXY_ENV_KEYS {
         if let Some(value) = process_env
             .get(key)
@@ -3284,6 +3350,7 @@ mod tests {
             process_env.get("PATH").map(String::as_str),
             Some("/usr/bin:/bin")
         );
+        assert!(!process_env.contains_key("TMPDIR"));
         assert!(!process_env.contains_key("GH_TOKEN"));
         assert!(!process_env.contains_key("PWD"));
         assert!(!process_env.contains_key("XPC_SERVICE_NAME"));

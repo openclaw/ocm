@@ -31,6 +31,7 @@ All notable changes to OCM are documented here.
 ### Fixed
 
 - Keep unrelated supervised gateways on their persisted child specifications when an environment is destroyed, removed, or pruned, so latent metadata or process-environment drift cannot restart sibling gateways during cleanup.
+- Resolve `TMPDIR` from the live OCM daemon whenever a gateway is spawned, create a daemon-scoped private temporary directory, and fall back to a private directory under `/tmp` instead of persisting a per-login path across reboots.
 
 ## 0.2.30 - 2026-07-23
 
