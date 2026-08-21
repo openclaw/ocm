@@ -1048,6 +1048,7 @@ fn default_local_build_description(version: &str, commit: Option<&str>) -> Strin
 #[derive(Clone, Debug)]
 struct LocalCompanionSpec {
     id: String,
+    directory_name: String,
     package_name: String,
     version: String,
 }
@@ -1086,13 +1087,14 @@ fn load_local_companion_spec(
     openclaw_version: &str,
 ) -> Result<LocalCompanionSpec, String> {
     let id = validate_local_companion_id(raw_id)?;
-    let package_dir = repo_path.join("extensions").join(&id);
-    if !package_dir.is_dir() {
-        return Err(format!(
-            "local companion \"{id}\" does not exist at {}",
-            display_path(&package_dir)
-        ));
-    }
+    let inventory = source_plugin_inventory(repo_path)?;
+    let companion = inventory.by_id.get(&id).ok_or_else(|| {
+        format!(
+            "local companion plugin id \"{id}\" does not exist under {}",
+            display_path(&repo_path.join("extensions"))
+        )
+    })?;
+    let package_dir = repo_path.join("extensions").join(&companion.directory_name);
     let package = load_json_value(&package_dir.join("package.json"), "companion package.json")?;
     let package_name = package
         .get("name")
@@ -1128,19 +1130,6 @@ fn load_local_companion_spec(
             "local companion \"{id}\" is not an official npm-publishable plugin"
         ));
     }
-    let plugin_manifest = load_json_value(
-        &package_dir.join("openclaw.plugin.json"),
-        "companion plugin manifest",
-    )?;
-    let manifest_id = plugin_manifest
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if manifest_id != id {
-        return Err(format!(
-            "local companion directory \"{id}\" contains plugin manifest id \"{manifest_id}\""
-        ));
-    }
     for relative in [
         "scripts/lib/plugin-npm-runtime-build.mjs",
         "scripts/generate-npm-package-lock.mjs",
@@ -1154,6 +1143,7 @@ fn load_local_companion_spec(
     }
     Ok(LocalCompanionSpec {
         id,
+        directory_name: companion.directory_name.clone(),
         package_name: package_name.to_string(),
         version: version.to_string(),
     })
@@ -1189,7 +1179,7 @@ fn pack_local_openclaw_companion(
     spec: LocalCompanionSpec,
     env: &BTreeMap<String, String>,
 ) -> Result<PackedLocalCompanion, String> {
-    let package_dir = format!("extensions/{}", spec.id);
+    let package_dir = format!("extensions/{}", spec.directory_name);
     let output_dir = pack_dir.join("companions").join(&spec.id);
     ensure_dir(&output_dir)?;
 
@@ -1373,6 +1363,7 @@ fn install_local_openclaw_companion(
         .arg("--prefix")
         .arg(&install_root)
         .arg("--omit=dev")
+        .arg("--omit=peer")
         .arg("--no-save")
         .arg("--package-lock=false")
         .arg(&packed.archive_path)
@@ -1430,6 +1421,7 @@ fn install_local_openclaw_companion(
         &target_package_root.join("node_modules"),
         &package_path,
     )?;
+    ensure_local_extension_openclaw_peer(&openclaw_package_root, &target_package_root)?;
 
     let installed = load_json_value(
         &target_package_root.join("package.json"),
@@ -1862,7 +1854,7 @@ fn link_or_copy_openclaw_host(source: &Path, target: &Path) -> Result<(), String
     copy_dir_recursive(&staged_host, target)
 }
 
-fn ensure_local_source_extension_openclaw_peer(
+fn ensure_local_extension_openclaw_peer(
     host_package: &Path,
     extension_root: &Path,
 ) -> Result<(), String> {
@@ -1920,7 +1912,7 @@ fn materialize_local_source_extensions(
             ));
         }
         copy_dir_recursive(&installed_package, &target)?;
-        ensure_local_source_extension_openclaw_peer(
+        ensure_local_extension_openclaw_peer(
             &installed_openclaw_package_root(install_files),
             &target,
         )?;

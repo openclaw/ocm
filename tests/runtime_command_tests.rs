@@ -155,7 +155,7 @@ fn companion_package_tarball(id: &str, package_name: &str, version: &str) -> Vec
             &mut builder,
             "package/package.json",
             format!(
-                "{{\"name\":\"{package_name}\",\"version\":\"{version}\",\"type\":\"module\",\"openclaw\":{{\"build\":{{\"openclawVersion\":\"{version}\"}},\"runtimeExtensions\":[\"./dist/index.js\"]}}}}"
+                "{{\"name\":\"{package_name}\",\"version\":\"{version}\",\"type\":\"module\",\"peerDependencies\":{{\"openclaw\":\">={version}\"}},\"openclaw\":{{\"build\":{{\"openclawVersion\":\"{version}\"}},\"runtimeExtensions\":[\"./dist/index.js\"]}}}}"
             )
             .as_bytes(),
             0o644,
@@ -275,7 +275,7 @@ while [ "$#" -gt 0 ]; do
       shift
       prefix="$1"
       ;;
-    install|--omit=dev|--no-save|--package-lock=false)
+    install|--omit=dev|--omit=peer|--no-save|--package-lock=false)
       ;;
     *)
       source_extension_archive="$archive"
@@ -420,6 +420,8 @@ case "$(basename "$archive")" in
     tar -xzf "$archive" -C "$prefix/node_modules/@openclaw/codex" --strip-components=1 package
     mkdir -p "$prefix/node_modules/@openai/codex"
     printf '{{"name":"@openai/codex","version":"0.147.0"}}\n' > "$prefix/node_modules/@openai/codex/package.json"
+    mkdir -p "$prefix/node_modules/openclaw"
+    printf '{{"name":"openclaw","version":"9999.0.0","registryPeer":true}}\n' > "$prefix/node_modules/openclaw/package.json"
     ;;
   *)
     mkdir -p "$prefix/node_modules/openclaw"
@@ -1407,11 +1409,11 @@ fn runtime_build_local_rejects_conflicting_source_plugin_modes() {
 }
 
 #[test]
-fn runtime_build_local_bundles_commit_matched_companion_with_isolated_dependencies() {
+fn runtime_build_local_resolves_companion_manifest_id_and_staged_host_peer() {
     let root = TestDir::new("runtime-build-local-companion");
     let cwd = root.child("workspace");
     let repo = cwd.join("openclaw");
-    fs::create_dir_all(repo.join("extensions/codex")).unwrap();
+    fs::create_dir_all(repo.join("extensions/codex-published")).unwrap();
     for relative in [
         "scripts/lib/plugin-npm-runtime-build.mjs",
         "scripts/generate-npm-package-lock.mjs",
@@ -1427,12 +1429,12 @@ fn runtime_build_local_bundles_commit_matched_companion_with_isolated_dependenci
     )
     .unwrap();
     fs::write(
-        repo.join("extensions/codex/package.json"),
-        br#"{"name":"@openclaw/codex","version":"2026.8.1","openclaw":{"build":{"openclawVersion":"2026.8.1"},"release":{"publishToNpm":true}}}"#,
+        repo.join("extensions/codex-published/package.json"),
+        br#"{"name":"@openclaw/codex","version":"2026.8.1","peerDependencies":{"openclaw":">=2026.8.1"},"openclaw":{"build":{"openclawVersion":"2026.8.1"},"release":{"publishToNpm":true}}}"#,
     )
     .unwrap();
     fs::write(
-        repo.join("extensions/codex/openclaw.plugin.json"),
+        repo.join("extensions/codex-published/openclaw.plugin.json"),
         br#"{"id":"codex","configSchema":{}}"#,
     )
     .unwrap();
@@ -1481,6 +1483,12 @@ fn runtime_build_local_bundles_commit_matched_companion_with_isolated_dependenci
             .is_file()
     );
     assert!(!companion_root.join("node_modules/@openclaw/codex").exists());
+    let host_peer = companion_root.join("node_modules/openclaw");
+    assert!(host_peer.join("openclaw.mjs").is_file());
+    let host_peer_package: Value =
+        serde_json::from_slice(&fs::read(host_peer.join("package.json")).unwrap()).unwrap();
+    assert_eq!(host_peer_package["version"], "2026.8.1");
+    assert!(host_peer_package.get("registryPeer").is_none());
 
     let show = run_ocm(
         &cwd,
@@ -1538,9 +1546,11 @@ fn runtime_build_local_bundles_commit_matched_companion_with_isolated_dependenci
     );
 
     let tool_log = fs::read_to_string(tool_log).unwrap();
-    assert!(tool_log.contains("plugin-npm-runtime-build.mjs extensions/codex"));
-    assert!(tool_log.contains("generate-npm-package-lock.mjs --package-dir extensions/codex"));
-    assert!(tool_log.contains("plugin-npm-package-manifest.mjs --run extensions/codex"));
+    assert!(tool_log.contains("plugin-npm-runtime-build.mjs extensions/codex-published"));
+    assert!(
+        tool_log.contains("generate-npm-package-lock.mjs --package-dir extensions/codex-published")
+    );
+    assert!(tool_log.contains("plugin-npm-package-manifest.mjs --run extensions/codex-published"));
 }
 
 #[test]
