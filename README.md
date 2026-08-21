@@ -202,8 +202,9 @@ When a named Tailscale Service routes directly to an environment gateway,
 proxy and OpenClaw trusted-proxy auth. The stable Service hostname is retained,
 direct-local password fallback is preserved, and same-host Service hairpins are
 attributed to the verified tailnet owner so the gateway host can use the stable
-URL. Rollback restores the prior config, route, proxy service, runtime, and
-service policy.
+URL. Identity lookup prefers a standalone headless Tailscale CLI and retains
+other discovered daemons as fallbacks. Rollback restores the prior config,
+route, proxy service, runtime, and service policy.
 
 For unreleased source builds with separately published, version-bound official
 plugins, repeat `runtime build-local --companion <plugin-id>`. OCM packages each

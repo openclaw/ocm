@@ -215,20 +215,7 @@ fn discover_tailscale_endpoints(
         .get(INTERNAL_TAILSCALE_BIN_ENV)
         .map(String::as_str)
         .filter(|value| !value.trim().is_empty());
-    let default_binaries = configured_binary.map_or_else(
-        || {
-            [
-                "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-                "/opt/homebrew/bin/tailscale",
-                "/usr/local/bin/tailscale",
-                "tailscale",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-        },
-        |binary| vec![binary.to_string()],
-    );
+    let default_binaries = tailscale_binary_candidates(configured_binary);
     let mut endpoints = Vec::new();
     let mut seen = BTreeSet::new();
     for binary in &default_binaries {
@@ -240,20 +227,7 @@ fn discover_tailscale_endpoints(
         }
     }
     let stores = resolve_store_paths(env, cwd)?;
-    let socket_binaries = configured_binary.map_or_else(
-        || {
-            [
-                "/opt/homebrew/bin/tailscale",
-                "/usr/local/bin/tailscale",
-                "tailscale",
-                "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-        },
-        |binary| vec![binary.to_string()],
-    );
+    let socket_binaries = tailscale_binary_candidates(configured_binary);
     if stores.envs_dir.exists() {
         for env_meta in list_environments(env, cwd)? {
             let socket = Path::new(&env_meta.root)
@@ -275,6 +249,23 @@ fn discover_tailscale_endpoints(
         }
     }
     Ok(endpoints)
+}
+
+fn tailscale_binary_candidates(configured_binary: Option<&str>) -> Vec<String> {
+    configured_binary.map_or_else(
+        || {
+            [
+                "/opt/homebrew/bin/tailscale",
+                "/usr/local/bin/tailscale",
+                "tailscale",
+                "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        },
+        |binary| vec![binary.to_string()],
+    )
 }
 
 fn parse_tailscale_json(stdout: &[u8]) -> Result<Value, String> {
@@ -456,13 +447,25 @@ fn command_failure_summary(stdout: &[u8], stderr: &[u8]) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{TailscaleCommandEndpoint, named_service_routes_from_status};
+    use super::{
+        TailscaleCommandEndpoint, named_service_routes_from_status, tailscale_binary_candidates,
+    };
 
     fn endpoint() -> TailscaleCommandEndpoint {
         TailscaleCommandEndpoint {
             binary: "tailscale".to_string(),
             socket: None,
         }
+    }
+
+    #[test]
+    fn endpoint_discovery_prefers_headless_cli_before_the_macos_app_binary() {
+        let candidates = tailscale_binary_candidates(None);
+        assert_eq!(candidates[0], "/opt/homebrew/bin/tailscale");
+        assert_eq!(
+            candidates.last().map(String::as_str),
+            Some("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+        );
     }
 
     #[test]
