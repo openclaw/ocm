@@ -16,7 +16,7 @@ use crate::env::{EnvironmentService, ResolvedExecution};
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::managed_node::apply_path_prepend_to_environment;
 use crate::store::{restore_environment_service_policy, set_environment_service_policy};
-use crate::supervisor::{SupervisorService, sync_supervisor_if_present};
+use crate::supervisor::{SupervisorService, sync_supervisor_env_if_present};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -461,7 +461,9 @@ fn update_service(
         ServiceSupervisorPolicy::EnsureRunning => {
             ensure_supervisor_running_locked(&supervisor, env)
         }
-        ServiceSupervisorPolicy::LeaveAsIs => sync_supervisor_if_present(env, cwd).map(|_| ()),
+        ServiceSupervisorPolicy::LeaveAsIs => {
+            sync_supervisor_env_if_present(env, cwd, name).map(|_| ())
+        }
     };
     if let Err(error) = update_result {
         return Err(rollback_service_update(
@@ -519,7 +521,10 @@ fn rollback_service_update(
     let mut rollback_errors = Vec::new();
     match restore_environment_service_policy(change, env, cwd) {
         Ok(restored) => {
-            if restored && let Err(rollback_error) = sync_supervisor_if_present(env, cwd) {
+            if restored
+                && let Err(rollback_error) =
+                    sync_supervisor_env_if_present(env, cwd, &change.applied.name)
+            {
                 rollback_errors.push(rollback_error);
             }
         }
