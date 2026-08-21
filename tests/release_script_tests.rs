@@ -244,7 +244,11 @@ if [[ "${1:-}" == "api" ]]; then
       exit 0
       ;;
     repos/openclaw/ocm/git/tags/*)
-      tag="$(git tag --points-at HEAD | head -n1)"
+      tag_object="${endpoint##*/}"
+      tag="$(
+        git for-each-ref --format='%(refname:short) %(objectname)' refs/tags |
+          awk -v object="$tag_object" '$2 == object { print $1; exit }'
+      )"
       printf '%s\tcommit\t%s\ttrue\n' "$tag" "$(git rev-parse "${tag}^{commit}")"
       exit 0
       ;;
@@ -262,7 +266,8 @@ if [[ "${1:-}" == "api" ]]; then
       ;;
   esac
   if [[ "$endpoint" == *"/commits/"*"/pulls"* ]]; then
-    commit="$(git rev-parse HEAD)"
+    commit="${endpoint#repos/openclaw/ocm/commits/}"
+    commit="${commit%/pulls}"
     version="$(./scripts/read-package-version.sh Cargo.toml Cargo.lock)"
     printf '42\tclosed\t2026-08-20T12:00:00Z\tmain\trelease/v%s\t%s\tchore(release): bump version to %s\n' \
       "$version" "$commit" "$version"
@@ -433,6 +438,52 @@ fn release_script_tags_only_after_the_release_pr_is_squash_merged() {
     assert!(stdout(&output).contains("protected-main workflow"));
     assert_eq!(repo.remote_ref("refs/heads/main"), merged_head);
     assert_eq!(repo.remote_ref("refs/tags/v0.2.8^{}"), merged_head);
+    let commands = fs::read_to_string(repo.repo.join(".git/test-ghx-commands")).unwrap();
+    assert!(
+        commands.contains("workflow run release.yml --repo openclaw/ocm --ref main -f tag=v0.2.8")
+    );
+    assert!(!commands.contains("-f commit="));
+}
+
+#[test]
+fn release_script_retries_a_verified_tag_after_main_advances() {
+    let repo = init_release_repo("release-tag-after-main-advance");
+    assert!(repo.run_release("0.2.8").status.success());
+    let release_head = repo.merge_release_pr("0.2.8");
+    repo.record_ci(&release_head, "completed", "success");
+    assert!(repo.run_release("0.2.8").status.success());
+
+    fs::write(repo.repo.join("README.md"), "later main change\n").unwrap();
+    assert!(repo.git_output(&["add", "README.md"]).status.success());
+    assert!(
+        repo.git_output(&["commit", "-m", "docs: advance main"])
+            .status
+            .success()
+    );
+    assert!(repo.git_output(&["push", "fake", "main"]).status.success());
+
+    let commands_before = fs::read_to_string(repo.repo.join(".git/test-ghx-commands")).unwrap();
+    let output = repo.run_release("0.2.8");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let commands_after = fs::read_to_string(repo.repo.join(".git/test-ghx-commands")).unwrap();
+    assert_eq!(
+        commands_after
+            .lines()
+            .filter(|line| line.starts_with("workflow run"))
+            .count(),
+        commands_before
+            .lines()
+            .filter(|line| line.starts_with("workflow run"))
+            .count()
+            + 1
+    );
+    assert!(
+        commands_after
+            .lines()
+            .last()
+            .unwrap()
+            .contains("workflow run release.yml --repo openclaw/ocm --ref main -f tag=v0.2.8")
+    );
 }
 
 #[test]

@@ -8,10 +8,6 @@ on:
         description: Signed release tag
         required: true
         type: string
-      commit:
-        description: Exact merged release commit
-        required: true
-        type: string
 
 permissions:
   actions: read
@@ -31,7 +27,9 @@ jobs:
     if: github.repository == 'openclaw/ocm' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
-      commit: ${{ steps.verify.outputs.commit }}
+      # Build and publish consume only the signed tag target validated below.
+      # Dispatch inputs never select executable release source.
+      source: ${{ steps.verify.outputs.source }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -42,20 +40,18 @@ jobs:
         id: verify
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_COMMIT: ${{ inputs.commit }}
           RELEASE_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           verified_commit="$(
             ./scripts/verify-release-tag.sh \
               --repo "$RELEASE_REPO" \
-              --tag "$RELEASE_TAG" \
-              --commit "$RELEASE_COMMIT"
+              --tag "$RELEASE_TAG"
           )"
           ./scripts/verify-release-ci.sh \
             --repo "$RELEASE_REPO" \
             --commit "$verified_commit"
-          printf 'commit=%s\n' "$verified_commit" >>"$GITHUB_OUTPUT"
+          printf 'source=%s\n' "$verified_commit" >>"$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.target }}
@@ -74,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.verify.outputs.commit }}
+          ref: ${{ needs.verify.outputs.source }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
@@ -115,7 +111,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.verify.outputs.commit }}
+          ref: ${{ needs.verify.outputs.source }}
           path: release-source
           persist-credentials: false
       - name: Download release archives
@@ -129,7 +125,7 @@ jobs:
       - name: Publish verified release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_COMMIT: ${{ needs.verify.outputs.commit }}
+          RELEASE_COMMIT: ${{ needs.verify.outputs.source }}
           RELEASE_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |

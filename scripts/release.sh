@@ -236,15 +236,13 @@ verify_published_tag() {
 
 dispatch_release_workflow() {
   local repository="$1"
-  local commit="$2"
   local gh_bin
   gh_bin="$(github_cli)"
   run_step "Dispatching trusted release workflow for ${tag}" \
     "$gh_bin" workflow run release.yml \
     --repo "$repository" \
     --ref main \
-    -f "tag=${tag}" \
-    -f "commit=${commit}"
+    -f "tag=${tag}"
 }
 
 ensure_release_pr() {
@@ -324,7 +322,7 @@ verify_existing_remote_tag() {
       2>/dev/null || true
   )"
   if [[ "$release_state" != "false" ]]; then
-    dispatch_release_workflow "$repository" "$verified_commit" || return
+    dispatch_release_workflow "$repository" || return
   fi
 
   cat <<EOF
@@ -438,7 +436,7 @@ case "$branch" in
       run_step "Pushing signed tag ${tag}" git push "$remote" "$tag"
       repository="$(github_repository)"
       verified_commit="$(verify_published_tag "$repository" "$head_sha")"
-      dispatch_release_workflow "$repository" "$verified_commit"
+      dispatch_release_workflow "$repository"
       cat <<EOF
 Release tag ${tag} pushed from $(git rev-parse HEAD).
 The protected-main workflow will verify, build, and publish the release.
