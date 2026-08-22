@@ -234,7 +234,7 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn clone(&self, options: CloneEnvironmentOptions) -> Result<EnvMeta, String> {
         let meta = clone_environment(options, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
         Ok(meta)
     }
 
@@ -243,7 +243,7 @@ impl<'a> EnvironmentService<'a> {
         options: CloneEnvironmentOptions,
     ) -> Result<EnvMeta, String> {
         let meta = clone_environment_for_simulation(options, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
         Ok(meta)
     }
 
@@ -258,7 +258,7 @@ impl<'a> EnvironmentService<'a> {
             self.env,
             self.cwd,
         )?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &result.meta.name)?;
         Ok(result)
     }
 
