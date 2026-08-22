@@ -1179,6 +1179,89 @@ fn service_uninstall_removes_only_target_child_despite_unrelated_drift() {
 }
 
 #[test]
+fn service_start_preserves_running_siblings_despite_unrelated_drift() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-targeted-service-start");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_systemd_tools(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let state_path = root.child("ocm-home/supervisor/state.json");
+
+    for (runtime_name, env_name) in [("target-runtime", "target"), ("sibling-runtime", "sibling")] {
+        let runtime = root.child(format!("bin/{runtime_name}"));
+        write_legacy_openclaw_script(
+            &runtime,
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+        );
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                runtime_name,
+                "--path",
+                &path_string(&runtime),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", env_name, "--runtime", runtime_name],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        set_service_enabled(&cwd, &env, env_name, true);
+    }
+    service.sync().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
+        .expect("daemon runtime state did not report both children");
+    let target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
+    let sibling_pid = runtime_child_pid(&initial_runtime, "sibling").unwrap();
+
+    let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
+    let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
+    sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
+    write_persisted_service_state(&sibling_meta_path, &sibling_meta);
+
+    let start = run_ocm(&cwd, &env, &["service", "start", "target", "--json"]);
+    assert!(start.status.success(), "{}", stderr(&start));
+    sleep(Duration::from_millis(800));
+
+    let final_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(2))
+        .expect("daemon runtime state stopped reporting both children");
+    let final_state = read_persisted_service_state(&state_path);
+    let persisted_sibling = final_state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "sibling")
+        .unwrap();
+
+    assert_eq!(
+        runtime_child_pid(&final_runtime, "target"),
+        Some(target_pid),
+        "already-running target child PID changed"
+    );
+    assert_eq!(
+        runtime_child_pid(&final_runtime, "sibling"),
+        Some(sibling_pid),
+        "sibling child PID changed"
+    );
+    assert!(
+        persisted_sibling["runtimeReleaseVersion"].is_null(),
+        "target start applied unrelated sibling drift"
+    );
+
+    stop_process(&mut daemon);
+}
+
+#[test]
 fn env_destroy_removes_only_target_child_despite_unrelated_drift() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("daemon-targeted-env-destroy");

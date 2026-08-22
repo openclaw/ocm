@@ -466,9 +466,9 @@ fn update_service(
     let daemon_before = supervisor.daemon_status()?;
     let change = set_environment_service_policy(name, service_enabled, service_running, env, cwd)?;
     let update_result = match supervisor_policy {
-        ServiceSupervisorPolicy::EnsureRunning => {
-            ensure_supervisor_running_locked(&supervisor, env)
-        }
+        ServiceSupervisorPolicy::EnsureRunning => sync_supervisor_env_if_present(env, cwd, name)
+            .map(|_| ())
+            .and_then(|()| ensure_supervisor_running_locked(&supervisor, env)),
         ServiceSupervisorPolicy::LeaveAsIs => {
             sync_supervisor_env_if_present(env, cwd, name).map(|_| ())
         }

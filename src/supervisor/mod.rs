@@ -480,10 +480,13 @@ impl<'a> SupervisorService<'a> {
     pub(crate) fn ensure_daemon_running_locked(&self) -> Result<SupervisorDaemonSummary, String> {
         let definition = self.supervisor_daemon_definition()?;
         validate_managed_service_owner(&definition, self.env)?;
-        let _ = self.sync()?;
         let status = self.daemon_status()?;
         if status.running {
             return Ok(status);
+        }
+        let state_path = supervisor_state_path(self.env, self.cwd)?;
+        if !state_path.exists() {
+            let _ = self.sync()?;
         }
         self.activate_daemon("install")
     }
