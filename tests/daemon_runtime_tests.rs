@@ -884,7 +884,7 @@ fn publishing_an_unbound_runtime_preserves_unrelated_active_child_spec_and_pid()
     write_legacy_openclaw_script(
         &runtime_a,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 3600; done\n",
             path_string(&started),
             path_string(&stopped),
         ),
@@ -984,7 +984,7 @@ fn targeted_runtime_refresh_ignores_unrelated_drift_and_restarts_effective_chang
     write_legacy_openclaw_script(
         &runtime_a,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 3600; done\n",
             path_string(&runtime_a_started),
             path_string(&runtime_a_stopped),
         ),
