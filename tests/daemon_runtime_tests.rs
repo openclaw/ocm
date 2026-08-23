@@ -13,8 +13,8 @@ use ocm::supervisor::{SupervisorService, sync_supervisor_binding_if_present};
 use serde_json::{Value, to_value};
 
 use crate::support::{
-    TestDir, install_fake_systemd_tools, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script,
+    TestDir, install_fake_launchctl, install_fake_systemd_tools, ocm_env, path_string, run_ocm,
+    stderr, stdout, write_executable_script,
 };
 
 static DAEMON_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1185,7 +1185,11 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
-    install_fake_systemd_tools(&root, &mut env);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
     let service = SupervisorService::new(&env, &cwd);
     let runtime_path = root.child("ocm-home/supervisor/runtime.json");
     let state_path = root.child("ocm-home/supervisor/state.json");
@@ -1217,6 +1221,12 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
         set_service_enabled(&cwd, &env, env_name, true);
     }
     service.sync().unwrap();
+    service.install_daemon().unwrap();
+    let daemon_status = service.daemon_status().unwrap();
+    assert!(
+        daemon_status.running,
+        "fixture must report the managed daemon as running: {daemon_status:?}"
+    );
 
     let mut daemon = spawn_daemon_process(&cwd, &env);
     let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
@@ -1259,6 +1269,71 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
     );
 
     stop_process(&mut daemon);
+}
+
+#[test]
+fn service_start_reconciles_siblings_before_activating_stopped_daemon() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-stopped-targeted-service-start");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+
+    for (runtime_name, env_name) in [("target-runtime", "target"), ("sibling-runtime", "sibling")] {
+        let runtime = root.child(format!("bin/{runtime_name}"));
+        write_legacy_openclaw_script(
+            &runtime,
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+        );
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                runtime_name,
+                "--path",
+                &path_string(&runtime),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", env_name, "--runtime", runtime_name],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        set_service_enabled(&cwd, &env, env_name, true);
+    }
+    service.sync().unwrap();
+
+    let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
+    let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
+    sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
+    write_persisted_service_state(&sibling_meta_path, &sibling_meta);
+
+    let start = run_ocm(&cwd, &env, &["service", "start", "target", "--json"]);
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    let final_state = read_persisted_service_state(&state_path);
+    let persisted_sibling = final_state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "sibling")
+        .expect("sibling child spec should remain present");
+
+    assert_eq!(
+        persisted_sibling["runtimeReleaseVersion"], "latent-sibling-v2",
+        "stopped-daemon activation must reconcile stale sibling state"
+    );
 }
 
 #[test]

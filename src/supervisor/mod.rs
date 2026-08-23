@@ -484,10 +484,7 @@ impl<'a> SupervisorService<'a> {
         if status.running {
             return Ok(status);
         }
-        let state_path = supervisor_state_path(self.env, self.cwd)?;
-        if !state_path.exists() {
-            let _ = self.sync()?;
-        }
+        let _ = self.sync()?;
         self.activate_daemon("install")
     }
 
