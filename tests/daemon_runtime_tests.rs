@@ -665,6 +665,62 @@ fn env_clone_preserves_unrelated_supervisor_child_specs() {
 }
 
 #[test]
+fn env_import_preserves_unrelated_supervisor_child_specs() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("env-import-preserves-supervisor-siblings");
+    let (cwd, mut env) = setup_service_fixture(&root);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+
+    service.sync().unwrap();
+    let exported = run_ocm(&cwd, &env, &["env", "export", "demo"]);
+    assert!(exported.status.success(), "{}", stderr(&exported));
+
+    env.insert(
+        "NODE_OPTIONS".to_string(),
+        "--max-old-space-size=2048".to_string(),
+    );
+    let imported = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "import",
+            "./demo.ocm-env.tar",
+            "--name",
+            "demo-import",
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+
+    let state = read_persisted_service_state(&state_path);
+    let demo = state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "demo")
+        .expect("demo child spec should remain present");
+    assert!(
+        demo["processEnv"]["NODE_OPTIONS"].is_null(),
+        "import must not rebuild unrelated child specs from caller environment"
+    );
+    assert!(
+        state["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|child| child["envName"] != "demo-import")
+    );
+    assert!(
+        state["skippedEnvs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["envName"] == "demo-import")
+    );
+}
+
+#[test]
 fn child_restart_request_rebuilds_missing_or_stale_state() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("restart-request-rebuilds-state");

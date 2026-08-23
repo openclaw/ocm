@@ -268,7 +268,7 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn import(&self, options: ImportEnvironmentOptions) -> Result<EnvImportSummary, String> {
         let summary = import_environment(options, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &summary.name)?;
         Ok(summary)
     }
 
@@ -283,7 +283,7 @@ impl<'a> EnvironmentService<'a> {
             self.env,
             self.cwd,
         )?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &result.summary.name)?;
         Ok(result)
     }
 
