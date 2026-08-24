@@ -228,7 +228,7 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn create(&self, options: CreateEnvironmentOptions) -> Result<EnvMeta, String> {
         let meta = create_environment_with_validated_runtime(options, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
         Ok(meta)
     }
 

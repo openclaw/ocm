@@ -621,6 +621,80 @@ fn env_changes_refresh_persisted_service_state_without_extra_commands() {
 }
 
 #[test]
+fn start_create_preserves_running_siblings_despite_caller_environment_drift() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("start-create-preserves-supervisor-siblings");
+    let (cwd, mut env, _, _) = setup_daemon_run_fixture_with_child_sleep(&root, 3600);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+
+    // Start two supervised siblings and capture the exact persisted and runtime identities.
+    service.sync().unwrap();
+    let initial_state = read_persisted_service_state(&state_path);
+    let initial_children = initial_state["children"].clone();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
+        .expect("daemon runtime state did not report both children");
+    let demo_pid = runtime_child_pid(&initial_runtime, "demo").unwrap();
+    let prod_pid = runtime_child_pid(&initial_runtime, "prod").unwrap();
+
+    env.insert(
+        "NODE_OPTIONS".to_string(),
+        "--max-old-space-size=2048".to_string(),
+    );
+    // Reproduce the incident-shaped no-service creation under caller-environment drift.
+    let started = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "start",
+            "pr121799-macos-proof",
+            "--command",
+            "node openclaw.mjs",
+            "--cwd",
+            &path_string(&cwd),
+            "--port",
+            "19079",
+            "--no-service",
+            "--json",
+        ],
+    );
+    assert!(started.status.success(), "{}", stderr(&started));
+    sleep(Duration::from_millis(800));
+
+    let final_state = read_persisted_service_state(&state_path);
+    let final_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(2))
+        .expect("daemon runtime state stopped reporting both children");
+
+    // The new disabled env may be recorded, but neither running sibling may change.
+    assert_eq!(
+        final_state["children"], initial_children,
+        "creating a no-service env changed unrelated child specs"
+    );
+    assert_eq!(
+        runtime_child_pid(&final_runtime, "demo"),
+        Some(demo_pid),
+        "creating a no-service env restarted the demo child"
+    );
+    assert_eq!(
+        runtime_child_pid(&final_runtime, "prod"),
+        Some(prod_pid),
+        "creating a no-service env restarted the prod child"
+    );
+    assert!(
+        final_state["skippedEnvs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["envName"] == "pr121799-macos-proof")
+    );
+
+    stop_process(&mut daemon);
+}
+
+#[test]
 fn env_clone_preserves_unrelated_supervisor_child_specs() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("env-clone-preserves-supervisor-siblings");
