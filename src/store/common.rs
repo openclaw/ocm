@@ -7,6 +7,8 @@ use fs2::FileExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
@@ -83,6 +85,10 @@ pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String>
     }
     if file_type.is_dir() {
         return copy_dir_recursive(source, destination);
+    }
+    #[cfg(unix)]
+    if file_type.is_socket() {
+        return Ok(());
     }
     if let Some(parent) = destination.parent() {
         ensure_dir(parent)?;
@@ -280,6 +286,32 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_skips_unix_sockets() {
+        use std::os::unix::net::UnixListener;
+
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from("/tmp").join(format!("ocm-socket-{}-{id}", std::process::id()));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("note.txt"), "copied\n").unwrap();
+        let socket_path = source.join("service.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        copy_dir_recursive(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("note.txt")).unwrap(),
+            "copied\n"
+        );
+        assert!(!destination.join("service.sock").exists());
+
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
