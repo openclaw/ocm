@@ -11,7 +11,7 @@ use crate::store::{
     prepare_env_snapshot_restore, remove_env_snapshot, restore_env_snapshot,
     rollback_env_snapshot_restore, summarize_snapshot,
 };
-use crate::supervisor::sync_supervisor_if_present;
+use crate::supervisor::sync_supervisor_env_if_present;
 
 #[derive(Clone, Debug)]
 pub struct CreateEnvSnapshotOptions {
@@ -194,8 +194,9 @@ impl<'a> EnvironmentService<'a> {
         &self,
         options: RestoreEnvSnapshotOptions,
     ) -> Result<EnvSnapshotRestoreSummary, String> {
+        let env_name = options.env_name.clone();
         let summary = restore_env_snapshot(options, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &env_name)?;
         Ok(summary)
     }
 
@@ -203,8 +204,9 @@ impl<'a> EnvironmentService<'a> {
         &self,
         options: RestoreEnvSnapshotOptions,
     ) -> Result<EnvSnapshotRestoreTransaction, String> {
+        let env_name = options.env_name.clone();
         let transaction = prepare_env_snapshot_restore(options, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &env_name)?;
         Ok(transaction)
     }
 
@@ -219,8 +221,9 @@ impl<'a> EnvironmentService<'a> {
         &self,
         transaction: EnvSnapshotRestoreTransaction,
     ) -> Result<(), String> {
+        let env_name = transaction.summary.env_name.clone();
         let cleanup_warning = rollback_env_snapshot_restore(transaction, self.env, self.cwd)?;
-        let sync_result = sync_supervisor_if_present(self.env, self.cwd).map(|_| ());
+        let sync_result = sync_supervisor_env_if_present(self.env, self.cwd, &env_name).map(|_| ());
         match (cleanup_warning, sync_result) {
             (None, Ok(())) => Ok(()),
             (Some(cleanup_warning), Ok(())) => Err(cleanup_warning),

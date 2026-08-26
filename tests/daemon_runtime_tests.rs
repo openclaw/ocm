@@ -8,7 +8,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use ocm::env::EnvironmentService;
+use ocm::env::{CreateEnvSnapshotOptions, EnvironmentService};
 use ocm::supervisor::{SupervisorService, sync_supervisor_binding_if_present};
 use serde_json::{Value, to_value};
 
@@ -185,6 +185,90 @@ fn write_legacy_openclaw_script(path: &Path, contents: &str) {
             "#!/bin/sh\nif [ \"${{1:-}}\" = 'gateway' ] && [ \"${{2:-}}\" = 'restart-handoff' ]; then exit 64; fi\n{body}"
         ),
     );
+}
+
+fn write_upgrade_aware_gateway_script(
+    path: &Path,
+    version: &str,
+    started: &Path,
+    stopped: &Path,
+    fail_finalize: bool,
+) {
+    let finalize = if fail_finalize {
+        "printf 'mutated by failed upgrade\\n' > \"$home/.openclaw/workspace/rollback-marker.txt\"\necho 'forced update finalize failure' >&2\nexit 23"
+    } else {
+        "printf '{\"status\":\"ok\",\"mode\":\"finalize\"}\\n'\nexit 0"
+    };
+    write_executable_script(
+        path,
+        &format!(
+            r#"#!/bin/sh
+home="${{OPENCLAW_HOME:-$PWD}}"
+if [ "${{1:-}}" = "gateway" ] && [ "${{2:-}}" = "restart-handoff" ]; then
+  exit 64
+fi
+if [ "${{1:-}}" = "gateway" ] && [ "${{2:-}}" = "status" ]; then
+  printf '{{"rpc":{{"ok":true}}}}\n'
+  exit 0
+fi
+if [ "${{1:-}}" = "gateway" ]; then
+  printf '%s\n' "$$" >> '{started}'
+  trap 'printf "%s\n" "$$" >> "{stopped}"; exit 0' TERM INT
+  while :; do sleep 3600; done
+fi
+case "${{1:-}}" in
+  --version)
+    printf '{version}\n'
+    exit 0
+    ;;
+  config)
+    printf 'Config valid\n'
+    exit 0
+    ;;
+  doctor)
+    if [ "${{2:-}}" = "--lint" ]; then
+      printf '{{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{{"checkId":"core/doctor/lint-selection","severity":"error","message":"Unknown health check id selected by --only: codex/managed-app-server.","path":"codex/managed-app-server"}}]}}\n'
+      exit 1
+    fi
+    printf 'doctor ok\n'
+    exit 0
+    ;;
+  plugins)
+    printf 'No tracked plugins or hook packs to update.\n'
+    exit 0
+    ;;
+  update)
+    if [ "${{2:-}}" = "finalize" ]; then
+      {finalize}
+    fi
+    printf '{{"dryRun":true}}\n'
+    exit 0
+    ;;
+esac
+printf 'unexpected args: %s\n' "$*" >&2
+exit 1
+"#,
+            started = path_string(started),
+            stopped = path_string(stopped),
+        ),
+    );
+}
+
+fn runtime_child(body: &Value, env_name: &str) -> Value {
+    body["children"]
+        .as_array()
+        .and_then(|children| children.iter().find(|child| child["envName"] == env_name))
+        .cloned()
+        .unwrap_or_else(|| panic!("runtime child {env_name} was not present"))
+}
+
+fn persisted_child(path: &Path, env_name: &str) -> Value {
+    let state = read_persisted_service_state(path);
+    state["children"]
+        .as_array()
+        .and_then(|children| children.iter().find(|child| child["envName"] == env_name))
+        .cloned()
+        .unwrap_or_else(|| panic!("persisted child {env_name} was not present"))
 }
 
 fn write_health_gateway_script(path: &Path, mode: &str, delay_ms: u64) {
@@ -431,6 +515,325 @@ fn setup_daemon_run_fixture_with_child_sleep(
     set_service_enabled(&cwd, &env, "prod", true);
 
     (cwd, env, launcher_marker, runtime_marker)
+}
+
+#[test]
+fn snapshot_restore_preserves_running_sibling_despite_unrelated_drift() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("snapshot-restore-preserves-supervisor-sibling");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let target_started = root.child("target-started");
+    let target_stopped = root.child("target-stopped");
+    let sibling_started = root.child("sibling-started");
+    let sibling_stopped = root.child("sibling-stopped");
+
+    for (runtime_name, env_name, started, stopped) in [
+        (
+            "target-runtime",
+            "target",
+            target_started.as_path(),
+            target_stopped.as_path(),
+        ),
+        (
+            "sibling-runtime",
+            "sibling",
+            sibling_started.as_path(),
+            sibling_stopped.as_path(),
+        ),
+    ] {
+        let runtime = root.child(format!("bin/{runtime_name}"));
+        write_upgrade_aware_gateway_script(&runtime, "2026.8.1", started, stopped, false);
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                runtime_name,
+                "--path",
+                &path_string(&runtime),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", env_name, "--runtime", runtime_name],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        set_service_enabled(&cwd, &env, env_name, true);
+    }
+
+    EnvironmentService::new(&env, &cwd)
+        .set_service_policy("target", Some(true), Some(false))
+        .unwrap();
+    let notes = root.child("ocm-home/envs/target/.openclaw/workspace/notes.txt");
+    fs::create_dir_all(notes.parent().unwrap()).unwrap();
+    fs::write(&notes, "before snapshot\n").unwrap();
+    let snapshot = EnvironmentService::new(&env, &cwd)
+        .create_snapshot(CreateEnvSnapshotOptions {
+            env_name: "target".to_string(),
+            label: Some("before restore".to_string()),
+        })
+        .unwrap();
+    fs::write(&notes, "after snapshot\n").unwrap();
+    set_service_enabled(&cwd, &env, "target", true);
+
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
+        .expect("daemon runtime state did not report both children");
+    let initial_sibling_runtime = runtime_child(&initial_runtime, "sibling");
+    let initial_sibling_state = persisted_child(&state_path, "sibling");
+    let initial_sibling = run_ocm(&cwd, &env, &["env", "show", "sibling", "--json"]);
+    assert!(
+        initial_sibling.status.success(),
+        "{}",
+        stderr(&initial_sibling)
+    );
+    let initial_sibling: Value = serde_json::from_str(&stdout(&initial_sibling)).unwrap();
+
+    let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
+    let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
+    sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
+    write_persisted_service_state(&sibling_meta_path, &sibling_meta);
+
+    let restore = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "snapshot",
+            "restore",
+            "target",
+            &snapshot.id,
+            "--json",
+        ],
+    );
+    assert!(
+        restore.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&restore),
+        stderr(&restore)
+    );
+    sleep(Duration::from_millis(800));
+
+    let final_runtime =
+        wait_for_runtime_children(&runtime_path, 1, Some("sibling"), Duration::from_secs(2))
+            .expect("daemon runtime state did not converge to the restored target state");
+    let final_target = run_ocm(&cwd, &env, &["env", "show", "target", "--json"]);
+    assert!(final_target.status.success(), "{}", stderr(&final_target));
+    let final_target: Value = serde_json::from_str(&stdout(&final_target)).unwrap();
+    let final_sibling = run_ocm(&cwd, &env, &["env", "show", "sibling", "--json"]);
+    assert!(final_sibling.status.success(), "{}", stderr(&final_sibling));
+    let final_sibling: Value = serde_json::from_str(&stdout(&final_sibling)).unwrap();
+
+    assert_eq!(fs::read_to_string(&notes).unwrap(), "before snapshot\n");
+    assert_eq!(final_target["defaultRuntime"], "target-runtime");
+    assert_eq!(final_target["serviceEnabled"], true);
+    assert_eq!(final_target["serviceRunning"], false);
+    assert_eq!(runtime_child_pid(&final_runtime, "target"), None);
+    assert_eq!(
+        persisted_child(&state_path, "sibling"),
+        initial_sibling_state,
+        "target snapshot restore changed the sibling supervisor spec"
+    );
+    assert_eq!(
+        runtime_child(&final_runtime, "sibling"),
+        initial_sibling_runtime,
+        "target snapshot restore changed the sibling PID, binding, or restart state"
+    );
+    assert_eq!(
+        final_sibling["defaultRuntime"], initial_sibling["defaultRuntime"],
+        "target snapshot restore changed the sibling binding"
+    );
+    assert!(
+        !sibling_stopped.exists(),
+        "target snapshot restore stopped the sibling"
+    );
+    assert_eq!(
+        fs::read_to_string(&sibling_started)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "target snapshot restore restarted the sibling"
+    );
+
+    stop_process(&mut daemon);
+}
+
+#[test]
+fn failed_upgrade_rollback_preserves_running_sibling_despite_unrelated_drift() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("failed-upgrade-preserves-supervisor-sibling");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let target_started = root.child("target-started");
+    let target_stopped = root.child("target-stopped");
+    let sibling_started = root.child("sibling-started");
+    let sibling_stopped = root.child("sibling-stopped");
+
+    for (runtime_name, version, started, stopped, fail_finalize) in [
+        (
+            "old-runtime",
+            "2026.8.1",
+            target_started.as_path(),
+            target_stopped.as_path(),
+            false,
+        ),
+        (
+            "new-runtime",
+            "2026.8.2",
+            target_started.as_path(),
+            target_stopped.as_path(),
+            true,
+        ),
+        (
+            "sibling-runtime",
+            "2026.8.1",
+            sibling_started.as_path(),
+            sibling_stopped.as_path(),
+            false,
+        ),
+    ] {
+        let runtime = root.child(format!("bin/{runtime_name}"));
+        write_upgrade_aware_gateway_script(&runtime, version, started, stopped, fail_finalize);
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                runtime_name,
+                "--path",
+                &path_string(&runtime),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    for (env_name, runtime_name) in [("target", "old-runtime"), ("sibling", "sibling-runtime")] {
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", env_name, "--runtime", runtime_name],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        set_service_enabled(&cwd, &env, env_name, true);
+    }
+
+    let rollback_marker =
+        root.child("ocm-home/envs/target/.openclaw/workspace/rollback-marker.txt");
+    fs::create_dir_all(rollback_marker.parent().unwrap()).unwrap();
+    fs::write(&rollback_marker, "safe pre-upgrade state\n").unwrap();
+
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
+        .expect("daemon runtime state did not report both children");
+    let initial_target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
+    let initial_sibling_runtime = runtime_child(&initial_runtime, "sibling");
+    let initial_sibling_state = persisted_child(&state_path, "sibling");
+    let initial_sibling = run_ocm(&cwd, &env, &["env", "show", "sibling", "--json"]);
+    assert!(
+        initial_sibling.status.success(),
+        "{}",
+        stderr(&initial_sibling)
+    );
+    let initial_sibling: Value = serde_json::from_str(&stdout(&initial_sibling)).unwrap();
+
+    let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
+    let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
+    sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
+    write_persisted_service_state(&sibling_meta_path, &sibling_meta);
+
+    let upgrade = run_ocm(
+        &cwd,
+        &env,
+        &["upgrade", "target", "--runtime", "new-runtime"],
+    );
+    assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
+    let output = stdout(&upgrade);
+    assert!(output.contains("outcome=rolled-back"), "{output}");
+    assert!(output.contains("rollback=restored"), "{output}");
+    assert!(
+        output.contains("forced update finalize failure"),
+        "{output}"
+    );
+    sleep(Duration::from_millis(800));
+
+    let final_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(2))
+        .expect("daemon runtime state stopped reporting both children");
+    let final_target = run_ocm(&cwd, &env, &["env", "show", "target", "--json"]);
+    assert!(final_target.status.success(), "{}", stderr(&final_target));
+    let final_target: Value = serde_json::from_str(&stdout(&final_target)).unwrap();
+    let final_sibling = run_ocm(&cwd, &env, &["env", "show", "sibling", "--json"]);
+    assert!(final_sibling.status.success(), "{}", stderr(&final_sibling));
+    let final_sibling: Value = serde_json::from_str(&stdout(&final_sibling)).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(&rollback_marker).unwrap(),
+        "safe pre-upgrade state\n"
+    );
+    assert_eq!(final_target["defaultRuntime"], "old-runtime");
+    assert_eq!(
+        runtime_child(&final_runtime, "target")["bindingName"],
+        "old-runtime"
+    );
+    assert_ne!(
+        runtime_child_pid(&final_runtime, "target"),
+        Some(initial_target_pid),
+        "rolled-back target did not restart"
+    );
+    assert_eq!(
+        persisted_child(&state_path, "sibling"),
+        initial_sibling_state,
+        "failed-upgrade rollback changed the sibling supervisor spec"
+    );
+    assert_eq!(
+        runtime_child(&final_runtime, "sibling"),
+        initial_sibling_runtime,
+        "failed-upgrade rollback changed the sibling PID, binding, or restart state"
+    );
+    assert_eq!(
+        final_sibling["defaultRuntime"], initial_sibling["defaultRuntime"],
+        "failed-upgrade rollback changed the sibling binding"
+    );
+    assert!(
+        !sibling_stopped.exists(),
+        "failed-upgrade rollback stopped the sibling"
+    );
+    assert_eq!(
+        fs::read_to_string(&sibling_started)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "failed-upgrade rollback restarted the sibling"
+    );
+
+    stop_process(&mut daemon);
 }
 
 #[test]
