@@ -74,6 +74,7 @@ pub(crate) use runtimes::install_runtime_from_selected_official_openclaw_release
 pub(crate) use runtimes::{
     BuildLocalRuntimeOptions, InstallContext, PreparedRuntimeInstall, RuntimeReleaseDetails,
     prepare_runtime_from_selected_official_openclaw_release, prepare_runtime_from_selected_release,
+    runtime_operational_issue,
 };
 pub use runtimes::{
     add_runtime, get_runtime, get_runtime_verified, install_runtime,

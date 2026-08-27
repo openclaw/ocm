@@ -15,7 +15,8 @@ use sha2::{Digest, Sha512};
 use tar::{Builder, Header};
 
 use crate::support::{
-    TestDir, TestHttpServer, install_fake_managed_node_archive, install_fake_node_and_npm, ocm_env,
+    TestDir, TestHttpServer, install_fake_managed_node_archive, install_fake_node_and_npm,
+    install_fake_service_manager, ocm_env,
     openclaw_package_tarball as openclaw_package_tarball_with_version, path_string, run_ocm,
     stderr, stdout, write_executable_script,
 };
@@ -895,7 +896,7 @@ fn runtime_build_local_rejects_dangling_dependency_link_before_pack() {
 }
 
 #[test]
-fn runtime_verify_reports_package_tree_drift() {
+fn runtime_status_stays_operational_while_verify_reports_package_tree_drift() {
     let root = TestDir::new("runtime-verify-package-tree-drift");
     let cwd = root.child("workspace");
     let repo = cwd.join("openclaw");
@@ -916,6 +917,7 @@ fn runtime_verify_reports_package_tree_drift() {
     .unwrap();
 
     let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
     let _npm_log = install_fake_node_and_packing_npm(&root, &mut env, &archive_path);
     let build = run_ocm(
         &cwd,
@@ -930,6 +932,13 @@ fn runtime_verify_reports_package_tree_drift() {
     );
     assert!(build.status.success(), "{}", stderr(&build));
 
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--runtime", "main-local"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+
     let install_root = runtime_install_root("main-local", &env, &cwd).unwrap();
     fs::write(
         install_root.join("files/node_modules/openclaw/package.json"),
@@ -942,6 +951,27 @@ fn runtime_verify_reports_package_tree_drift() {
         tree_drift_which.status.success(),
         "{}",
         stderr(&tree_drift_which)
+    );
+
+    let tree_drift_status = run_ocm(&cwd, &env, &["env", "status", "demo", "--json"]);
+    assert!(
+        tree_drift_status.status.success(),
+        "{}",
+        stderr(&tree_drift_status)
+    );
+    let status_value: Value = serde_json::from_str(&stdout(&tree_drift_status)).unwrap();
+    assert_eq!(status_value["runtimeHealth"], "ok");
+    assert_eq!(status_value["issue"], Value::Null);
+
+    let doctor = run_ocm(&cwd, &env, &["env", "doctor", "demo", "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let doctor_value: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert_eq!(doctor_value["runtimeStatus"], "broken");
+    assert!(
+        doctor_value["issues"][0]
+            .as_str()
+            .unwrap()
+            .contains("runtime sha256 mismatch:")
     );
 
     let verify = run_ocm(&cwd, &env, &["runtime", "verify", "main-local", "--json"]);
@@ -974,6 +1004,21 @@ fn runtime_verify_reports_package_tree_drift() {
     let launcher_which = run_ocm(&cwd, &env, &["runtime", "which", "main-local", "--raw"]);
     assert_eq!(launcher_which.status.code(), Some(1));
     assert!(stderr(&launcher_which).contains("sha256 mismatch:"));
+
+    let launcher_status = run_ocm(&cwd, &env, &["env", "status", "demo", "--json"]);
+    assert!(
+        launcher_status.status.success(),
+        "{}",
+        stderr(&launcher_status)
+    );
+    let status_value: Value = serde_json::from_str(&stdout(&launcher_status)).unwrap();
+    assert_eq!(status_value["runtimeHealth"], "broken");
+    assert!(
+        status_value["issue"]
+            .as_str()
+            .unwrap()
+            .contains("sha256 mismatch:")
+    );
 }
 
 #[test]

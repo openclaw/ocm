@@ -5,7 +5,7 @@ use super::{
 };
 use crate::launcher::resolve_launcher_run_dir;
 use crate::service::ServiceService;
-use crate::store::{get_launcher, runtime_integrity_issue};
+use crate::store::{get_launcher, runtime_operational_issue};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,7 +103,9 @@ impl<'a> EnvironmentService<'a> {
                             Some(runtime.source_kind.as_str().to_string());
                         summary.runtime_release_version = runtime.release_version.clone();
                         summary.runtime_release_channel = runtime.release_channel.clone();
-                        match runtime_integrity_issue(&runtime, self.env) {
+                        // Status checks whether the runtime can execute. Full-tree integrity remains
+                        // an explicit `runtime verify` operation because packaged trees can be large.
+                        match runtime_operational_issue(&runtime, self.env) {
                             None => summary.runtime_health = Some("ok".to_string()),
                             Some(error) => {
                                 summary.runtime_health = Some("broken".to_string());

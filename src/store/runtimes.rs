@@ -2975,7 +2975,7 @@ fn runtime_companion_integrity_issue(meta: &RuntimeMeta) -> Option<String> {
     None
 }
 
-pub fn runtime_integrity_issue(
+pub(crate) fn runtime_operational_issue(
     meta: &RuntimeMeta,
     env: &BTreeMap<String, String>,
 ) -> Option<String> {
@@ -2983,6 +2983,17 @@ pub fn runtime_integrity_issue(
         return Some(issue);
     }
     if let Some(issue) = runtime_companion_integrity_issue(meta) {
+        return Some(issue);
+    }
+
+    None
+}
+
+pub fn runtime_integrity_issue(
+    meta: &RuntimeMeta,
+    env: &BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(issue) = runtime_operational_issue(meta, env) {
         return Some(issue);
     }
 
