@@ -527,6 +527,9 @@ pub fn upgrade_help(cmd: &str) -> String {
             format!(
                 "{cmd} upgrade <env> [--version <version> | --channel <channel> | --runtime <runtime>] [--dry-run] [--no-rollback] [--raw] [--json]"
             ),
+            format!(
+                "{cmd} upgrade batch --runtime <runtime> --envs <env,env,...> [--parallel <count>] [--failure-policy rollback|continue] [--accept-fleet-outage] [--dry-run] [--raw] [--json]"
+            ),
             format!("{cmd} upgrade --all [--dry-run] [--raw] [--json]"),
         ],
         &[
@@ -543,6 +546,22 @@ pub fn upgrade_help(cmd: &str) -> String {
                 "Move one env to an already installed runtime, including a local build",
             ),
             ("--all", "Upgrade every env that can be updated safely"),
+            (
+                "--envs <env,env,...>",
+                "Select the environments for one coordinated fast batch",
+            ),
+            (
+                "--parallel <count>",
+                "Bound concurrent snapshot and upgrade workers; defaults to 4",
+            ),
+            (
+                "--failure-policy <mode>",
+                "rollback failed envs immediately or leave them stopped for external recovery",
+            ),
+            (
+                "--accept-fleet-outage",
+                "Acknowledge that selected gateways can be unavailable together",
+            ),
             (
                 "--dry-run",
                 "Preview an upgrade or rollback without changing runtime, env, service, snapshot, or history state",
@@ -578,6 +597,9 @@ pub fn upgrade_help(cmd: &str) -> String {
             format!("{cmd} upgrade mira --channel beta"),
             format!("{cmd} upgrade mira --version 2026.3.24"),
             format!("{cmd} upgrade mira --runtime origin-main-local"),
+            format!(
+                "{cmd} upgrade batch --runtime origin-main-local --envs alpha,beta --parallel 2 --failure-policy continue --accept-fleet-outage"
+            ),
             format!("{cmd} upgrade --all"),
         ],
         &[
@@ -596,6 +618,8 @@ pub fn upgrade_help(cmd: &str) -> String {
             "When current and target OpenClaw versions are known, older targets are rejected before snapshot creation or runtime mutation because config and SQLite state migrations cannot be reversed by switching binaries.",
             "An env upgrade will not replace runtime bytes shared with another env; use --runtime to reuse those bytes or an exact --version for an isolated target.",
             "Upgrades create a pre-upgrade snapshot before changing env state.",
+            "Batch upgrades create and verify a cold checkpoint for every selected environment before any runtime transition begins, then run bounded parallel per-environment upgrades under one coordinator lock.",
+            "Batch failure policy `continue` leaves failed gateways stopped with both fleet checkpoints and per-environment upgrade history available for external recovery.",
             "When an env moves to a new runtime, upgrade runs OpenClaw update finalization inside the env before service restart.",
             "Managed-service upgrades require both HTTP health and OpenClaw gateway reachability before reporting success.",
             "If service restart/start fails, ocm restores the snapshot and previous runtime unless --no-rollback is set.",

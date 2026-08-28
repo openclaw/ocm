@@ -282,6 +282,34 @@ case "$1" in
         echo "forced update finalize failure" >&2
         exit 23
       fi
+      if [ -n "${{OCM_TEST_FAIL_UPDATE_FINALIZE_ENV:-}}" ] &&
+         [ "$OCM_TEST_FAIL_UPDATE_FINALIZE_ENV" = "${{OCM_ACTIVE_ENV:-}}" ]; then
+        echo "forced update finalize failure for $OCM_ACTIVE_ENV" >&2
+        exit 23
+      fi
+      if [ -n "${{OCM_TEST_REQUIRE_BATCH_SNAPSHOT_ENVS:-}}" ]; then
+        for batch_env in $(printf '%s' "$OCM_TEST_REQUIRE_BATCH_SNAPSHOT_ENVS" | tr ',' ' '); do
+          snapshot_dir="${{OCM_HOME:?}}/snapshots/$batch_env"
+          if ! grep -R -q '"label": "fast-batch-' "$snapshot_dir" 2>/dev/null; then
+            echo "batch snapshot barrier missing for $batch_env" >&2
+            exit 25
+          fi
+        done
+      fi
+      if [ -n "${{OCM_TEST_BATCH_FINALIZE_BARRIER_DIR:-}}" ]; then
+        mkdir -p "$OCM_TEST_BATCH_FINALIZE_BARRIER_DIR"
+        : > "$OCM_TEST_BATCH_FINALIZE_BARRIER_DIR/${{OCM_ACTIVE_ENV:?}}"
+        expected="${{OCM_TEST_BATCH_FINALIZE_BARRIER_COUNT:-1}}"
+        attempts=0
+        while [ "$(find "$OCM_TEST_BATCH_FINALIZE_BARRIER_DIR" -type f | wc -l | tr -d ' ')" -lt "$expected" ]; do
+          attempts=$((attempts + 1))
+          if [ "$attempts" -ge 100 ]; then
+            echo "parallel finalize barrier timed out" >&2
+            exit 26
+          fi
+          sleep 0.05
+        done
+      fi
       has_arg "--json" "$@" && has_arg "--yes" "$@" && has_arg "--no-restart" "$@" || {{
         echo "missing update finalize flags" >&2
         exit 1
@@ -5128,6 +5156,266 @@ fn upgrade_keeps_a_stopped_installed_service_stopped() {
     assert!(output.contains("from=launcher:hacking.local"), "{output}");
     assert!(output.contains("to=runtime:stable"), "{output}");
     assert!(!output.contains("service="), "{output}");
+}
+
+#[test]
+fn upgrade_batch_dry_run_creates_no_journal_snapshot_or_runtime_change() {
+    let root = TestDir::new("upgrade-fast-batch-dry-run");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let old_runtime = root.child("old-openclaw");
+    let new_runtime = root.child("new-openclaw");
+    write_executable_script(&old_runtime, &recording_openclaw_script("2026.8.1"));
+    write_executable_script(&new_runtime, &recording_openclaw_script("2026.8.2"));
+
+    let env = ocm_env(&root);
+    for (name, runtime) in [("old", &old_runtime), ("new", &new_runtime)] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", name, "--path", &path_string(runtime)],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    for env_name in ["alpha", "beta"] {
+        let start = run_ocm(
+            &cwd,
+            &env,
+            &["start", env_name, "--runtime", "old", "--no-service"],
+        );
+        assert!(start.status.success(), "{}", stderr(&start));
+    }
+
+    let batch = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "batch",
+            "--runtime",
+            "new",
+            "--envs",
+            "alpha,beta",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert!(batch.status.success(), "{}", stderr(&batch));
+    let summary: Value = serde_json::from_str(&stdout(&batch)).unwrap();
+    assert_eq!(summary["outcome"], "dry-run");
+    assert!(summary["journalPath"].is_null());
+    assert!(!root.child("ocm-home/upgrade-batches").exists());
+
+    let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "--all", "--json"]);
+    assert!(snapshots.status.success(), "{}", stderr(&snapshots));
+    assert!(
+        serde_json::from_str::<Value>(&stdout(&snapshots))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for env_name in ["alpha", "beta"] {
+        let shown = run_ocm(&cwd, &env, &["env", "show", env_name, "--json"]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&shown)).unwrap()["defaultRuntime"],
+            "old"
+        );
+    }
+}
+
+#[test]
+fn upgrade_batch_snapshots_every_selected_env_before_parallel_runtime_switches() {
+    let root = TestDir::new("upgrade-fast-batch");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let old_runtime = root.child("old-openclaw");
+    let new_runtime = root.child("new-openclaw");
+    write_executable_script(&old_runtime, &recording_openclaw_script("2026.8.1"));
+    write_executable_script(&new_runtime, &recording_openclaw_script("2026.8.2"));
+
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_TEST_REQUIRE_BATCH_SNAPSHOT_ENVS".to_string(),
+        "alpha,beta".to_string(),
+    );
+    env.insert(
+        "OCM_TEST_BATCH_FINALIZE_BARRIER_DIR".to_string(),
+        path_string(&root.child("batch-finalize-barrier")),
+    );
+    env.insert(
+        "OCM_TEST_BATCH_FINALIZE_BARRIER_COUNT".to_string(),
+        "2".to_string(),
+    );
+    for (name, runtime) in [("old", &old_runtime), ("new", &new_runtime)] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", name, "--path", &path_string(runtime)],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    for env_name in ["alpha", "beta", "rescue"] {
+        let start = run_ocm(
+            &cwd,
+            &env,
+            &["start", env_name, "--runtime", "old", "--no-service"],
+        );
+        assert!(start.status.success(), "{}", stderr(&start));
+    }
+
+    let batch = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "batch",
+            "--runtime",
+            "new",
+            "--envs",
+            "alpha,beta",
+            "--parallel",
+            "2",
+            "--failure-policy",
+            "continue",
+            "--accept-fleet-outage",
+            "--json",
+        ],
+    );
+    assert!(
+        batch.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&batch),
+        stderr(&batch)
+    );
+    let summary: Value = serde_json::from_str(&stdout(&batch)).unwrap();
+    assert_eq!(summary["outcome"], "completed");
+    assert_eq!(summary["parallel"], 2);
+    assert_eq!(summary["checkpoints"].as_array().unwrap().len(), 2);
+    assert_eq!(summary["results"].as_array().unwrap().len(), 2);
+    let journal = PathBuf::from(summary["journalPath"].as_str().unwrap());
+    assert!(journal.exists());
+    let journal: Value = serde_json::from_slice(&fs::read(journal).unwrap()).unwrap();
+    assert_eq!(journal["outcome"], "completed");
+
+    for env_name in ["alpha", "beta", "rescue"] {
+        let shown = run_ocm(&cwd, &env, &["env", "show", env_name, "--json"]);
+        assert!(shown.status.success(), "{}", stderr(&shown));
+        let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+        let expected = if env_name == "rescue" { "old" } else { "new" };
+        assert_eq!(shown["defaultRuntime"], expected);
+    }
+
+    let all_snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "--all", "--json"]);
+    assert!(all_snapshots.status.success(), "{}", stderr(&all_snapshots));
+    let all_snapshots: Value = serde_json::from_str(&stdout(&all_snapshots)).unwrap();
+    assert!(all_snapshots.as_array().unwrap().iter().any(|snapshot| {
+        snapshot["envName"] == "alpha"
+            && snapshot["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("fast-batch-"))
+    }));
+    assert!(all_snapshots.as_array().unwrap().iter().any(|snapshot| {
+        snapshot["envName"] == "beta"
+            && snapshot["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("fast-batch-"))
+    }));
+    assert!(
+        !all_snapshots
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|snapshot| snapshot["envName"] == "rescue")
+    );
+}
+
+#[test]
+fn upgrade_batch_continue_finishes_other_envs_and_leaves_failure_for_external_recovery() {
+    let root = TestDir::new("upgrade-fast-batch-continue");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let old_runtime = root.child("old-openclaw");
+    let new_runtime = root.child("new-openclaw");
+    write_executable_script(&old_runtime, &recording_openclaw_script("2026.8.1"));
+    write_executable_script(&new_runtime, &recording_openclaw_script("2026.8.2"));
+
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_TEST_FAIL_UPDATE_FINALIZE_ENV".to_string(),
+        "alpha".to_string(),
+    );
+    for (name, runtime) in [("old", &old_runtime), ("new", &new_runtime)] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", name, "--path", &path_string(runtime)],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    for env_name in ["alpha", "beta"] {
+        let start = run_ocm(
+            &cwd,
+            &env,
+            &["start", env_name, "--runtime", "old", "--no-service"],
+        );
+        assert!(start.status.success(), "{}", stderr(&start));
+    }
+
+    let batch = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "batch",
+            "--runtime",
+            "new",
+            "--envs",
+            "alpha,beta",
+            "--parallel",
+            "2",
+            "--failure-policy",
+            "continue",
+            "--accept-fleet-outage",
+            "--json",
+        ],
+    );
+    assert_eq!(batch.status.code(), Some(1));
+    let summary: Value = serde_json::from_str(&stdout(&batch)).unwrap();
+    assert_eq!(summary["outcome"], "partial");
+    assert_eq!(summary["checkpoints"].as_array().unwrap().len(), 2);
+    let results = summary["results"].as_array().unwrap();
+    let alpha = results
+        .iter()
+        .find(|result| result["envName"] == "alpha")
+        .unwrap();
+    let beta = results
+        .iter()
+        .find(|result| result["envName"] == "beta")
+        .unwrap();
+    assert_eq!(alpha["outcome"], "failed");
+    assert_eq!(alpha["rollback"], "disabled");
+    assert!(
+        alpha["note"]
+            .as_str()
+            .unwrap()
+            .contains("left the gateway stopped for external recovery")
+    );
+    assert_eq!(beta["outcome"], "switched");
+
+    let alpha_env = run_ocm(&cwd, &env, &["env", "show", "alpha", "--json"]);
+    let beta_env = run_ocm(&cwd, &env, &["env", "show", "beta", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&alpha_env)).unwrap()["defaultRuntime"],
+        "old"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&beta_env)).unwrap()["defaultRuntime"],
+        "new"
+    );
 }
 
 #[test]

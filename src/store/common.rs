@@ -34,6 +34,16 @@ impl Drop for ExclusiveFileLock {
     }
 }
 
+pub(crate) struct SharedFileLock {
+    file: File,
+}
+
+impl Drop for SharedFileLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
 pub(crate) fn lock_file(path: &Path, label: &str) -> Result<ExclusiveFileLock, String> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
@@ -52,6 +62,26 @@ pub(crate) fn lock_file(path: &Path, label: &str) -> Result<ExclusiveFileLock, S
         )
     })?;
     Ok(ExclusiveFileLock { file })
+}
+
+pub(crate) fn lock_file_shared(path: &Path, label: &str) -> Result<SharedFileLock, String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("failed to open {label} lock at {}: {error}", path.display()))?;
+    FileExt::lock_shared(&file).map_err(|error| {
+        format!(
+            "failed to acquire shared {label} lock at {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(SharedFileLock { file })
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {

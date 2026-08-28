@@ -96,8 +96,9 @@ pub use upgrade_history::{
     get_upgrade_history_record, list_upgrade_history, save_upgrade_history_record,
 };
 pub(crate) use upgrade_history::{
-    UpgradeRuntimeRecovery, get_upgrade_runtime_recovery, lock_upgrade_transaction,
-    remove_upgrade_recovery, remove_upgrade_recovery_for_snapshot,
+    UpgradeRuntimeRecovery, get_upgrade_runtime_recovery, lock_upgrade_batch,
+    lock_upgrade_participant, lock_upgrade_transaction, remove_upgrade_recovery,
+    remove_upgrade_recovery_for_snapshot,
 };
 
 pub fn now_utc() -> OffsetDateTime {

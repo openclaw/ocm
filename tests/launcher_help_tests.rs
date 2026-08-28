@@ -276,6 +276,9 @@ fn upgrade_help_is_available_from_help_and_flag() {
     assert!(output.contains("--dry-run"));
     assert!(output.contains("--no-rollback"));
     assert!(output.contains("ocm upgrade --all"));
+    assert!(output.contains("ocm upgrade batch --runtime <runtime> --envs <env,env,...>"));
+    assert!(output.contains("--accept-fleet-outage"));
+    assert!(output.contains("cold checkpoint for every selected environment"));
     assert!(output.contains("Simulations clone the source env"));
     assert!(output.contains("Channel-tracked runtimes move forward automatically."));
     assert!(output.contains("older targets are rejected before snapshot creation"));

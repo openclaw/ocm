@@ -1,7 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -9,8 +11,8 @@ use serde_json::{Value, json};
 
 use super::{Cli, render};
 use crate::env::{
-    CloneEnvironmentOptions, CreateEnvSnapshotOptions, EnvDevMeta, RestoreEnvSnapshotOptions,
-    resolve_runtime_run_dir,
+    CloneEnvironmentOptions, CreateEnvSnapshotOptions, EnvDevMeta, EnvSnapshotSummary,
+    RestoreEnvSnapshotOptions, resolve_runtime_run_dir,
 };
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::openclaw_repo::{detect_openclaw_checkout, ensure_openclaw_worktree};
@@ -30,10 +32,10 @@ use crate::store::{
     display_path, ensure_minimum_local_openclaw_config, ensure_store, get_runtime,
     get_upgrade_history_record, get_upgrade_runtime_recovery,
     install_runtime_from_selected_official_openclaw_release, list_upgrade_history,
-    lock_env_registry, lock_upgrade_transaction, remove_runtime, remove_upgrade_recovery,
-    resolve_absolute_path, runtime_install_root, runtime_integrity_issue, runtime_meta_path,
-    save_environment, save_upgrade_history_record, upgrade_history_recovery_dir,
-    upgrade_history_runtime_recovery_dir, write_json,
+    lock_env_registry, lock_upgrade_batch, lock_upgrade_participant, lock_upgrade_transaction,
+    remove_runtime, remove_upgrade_recovery, resolve_absolute_path, runtime_install_root,
+    runtime_integrity_issue, runtime_meta_path, save_environment, save_upgrade_history_record,
+    upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir, write_json,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -63,6 +65,36 @@ pub(crate) struct UpgradeBatchSummary {
     pub restarted: usize,
     pub failed: usize,
     pub results: Vec<UpgradeEnvSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpgradeFleetCheckpoint {
+    pub env_name: String,
+    pub snapshot_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpgradeFleetError {
+    pub env_name: Option<String>,
+    pub phase: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpgradeFleetBatchSummary {
+    pub batch_id: String,
+    pub runtime: String,
+    pub envs: Vec<String>,
+    pub parallel: usize,
+    pub failure_policy: String,
+    pub outcome: String,
+    pub journal_path: Option<String>,
+    pub checkpoints: Vec<UpgradeFleetCheckpoint>,
+    pub results: Vec<UpgradeEnvSummary>,
+    pub errors: Vec<UpgradeFleetError>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -164,6 +196,39 @@ enum UpgradeSimulationScenario {
 struct UpgradeOptions {
     dry_run: bool,
     rollback_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpgradeFleetFailurePolicy {
+    Rollback,
+    Continue,
+}
+
+impl UpgradeFleetFailurePolicy {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "rollback" => Ok(Self::Rollback),
+            "continue" => Ok(Self::Continue),
+            _ => Err("--failure-policy must be rollback or continue".to_string()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rollback => "rollback",
+            Self::Continue => "continue",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UpgradeFleetOptions {
+    env_names: Vec<String>,
+    runtime: String,
+    parallel: usize,
+    failure_policy: UpgradeFleetFailurePolicy,
+    dry_run: bool,
+    accept_fleet_outage: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -362,6 +427,9 @@ impl Cli {
 
     pub(super) fn handle_upgrade_command(&self, args: Vec<String>) -> Result<i32, String> {
         let (args, json_flag, profile) = self.consume_human_output_flags(args, "upgrade")?;
+        if matches!(args.first().map(String::as_str), Some("batch")) {
+            return self.handle_upgrade_batch(args[1..].to_vec(), json_flag, profile);
+        }
         if matches!(args.first().map(String::as_str), Some("rollback")) {
             return self.handle_upgrade_rollback(args[1..].to_vec(), json_flag, profile);
         }
@@ -510,6 +578,378 @@ impl Cli {
         Ok(if failed { 1 } else { 0 })
     }
 
+    fn handle_upgrade_batch(
+        &self,
+        args: Vec<String>,
+        json_flag: bool,
+        profile: render::RenderProfile,
+    ) -> Result<i32, String> {
+        let options = Self::parse_upgrade_batch_options(args)?;
+        if !options.dry_run && !options.accept_fleet_outage {
+            return Err(
+                "upgrade batch requires --accept-fleet-outage because selected gateways can be unavailable together"
+                    .to_string(),
+            );
+        }
+
+        let _batch_lock = lock_upgrade_batch(&self.env, &self.cwd)?;
+        let mut lock_names = options.env_names.clone();
+        lock_names.sort();
+        let mut transaction_locks = Vec::with_capacity(lock_names.len());
+        let mut operation_locks = Vec::with_capacity(lock_names.len());
+        for env_name in &lock_names {
+            transaction_locks.push(lock_upgrade_transaction(env_name, &self.env, &self.cwd)?);
+            operation_locks.push(self.environment_service().lock_operation(env_name)?);
+        }
+        let target = UpgradeTarget {
+            version: None,
+            channel: None,
+            runtime: Some(options.runtime.clone()),
+        };
+        let preflight_options = UpgradeOptions {
+            dry_run: true,
+            rollback_enabled: options.failure_policy == UpgradeFleetFailurePolicy::Rollback,
+        };
+        let mut preflight = Vec::with_capacity(options.env_names.len());
+        for env_name in &options.env_names {
+            let result = self.upgrade_env_locked(env_name, &target, preflight_options)?;
+            if is_failed_upgrade_outcome(&result.outcome) {
+                return Err(format!(
+                    "upgrade batch preflight failed for env \"{env_name}\": {}",
+                    result
+                        .note
+                        .as_deref()
+                        .unwrap_or("target cannot be upgraded")
+                ));
+            }
+            preflight.push(result);
+        }
+
+        let batch_id = new_upgrade_batch_id();
+        let journal_path = if options.dry_run {
+            None
+        } else {
+            Some(self.upgrade_batch_journal_path(&batch_id)?)
+        };
+        let mut summary = UpgradeFleetBatchSummary {
+            batch_id: batch_id.clone(),
+            runtime: options.runtime.clone(),
+            envs: options.env_names.clone(),
+            parallel: options.parallel,
+            failure_policy: options.failure_policy.as_str().to_string(),
+            outcome: if options.dry_run {
+                "dry-run".to_string()
+            } else {
+                "preparing".to_string()
+            },
+            journal_path: journal_path.as_deref().map(display_path),
+            checkpoints: Vec::new(),
+            results: if options.dry_run {
+                preflight
+            } else {
+                Vec::new()
+            },
+            errors: Vec::new(),
+        };
+
+        if options.dry_run {
+            return self.finish_upgrade_batch(summary, json_flag, profile);
+        }
+        let journal_path = journal_path.expect("live batch journal path");
+        self.save_upgrade_batch_journal(&journal_path, &summary)?;
+
+        let checkpoint_label = format!("fast-batch-{batch_id}");
+        let checkpoint_results = self.run_parallel_batch_work(
+            &options.env_names,
+            options.parallel,
+            move |cli, env_name| {
+                cli.create_upgrade_batch_checkpoint_locked(env_name, &checkpoint_label)
+            },
+        );
+        for (env_name, result) in checkpoint_results {
+            match result {
+                Ok(snapshot) => summary.checkpoints.push(UpgradeFleetCheckpoint {
+                    env_name,
+                    snapshot_id: snapshot.id,
+                }),
+                Err(error) => summary.errors.push(UpgradeFleetError {
+                    env_name: Some(env_name),
+                    phase: "snapshot".to_string(),
+                    message: error,
+                }),
+            }
+        }
+        for env_name in &options.env_names {
+            let recorded = summary
+                .checkpoints
+                .iter()
+                .any(|checkpoint| &checkpoint.env_name == env_name)
+                || summary
+                    .errors
+                    .iter()
+                    .any(|error| error.env_name.as_ref() == Some(env_name));
+            if !recorded {
+                summary.errors.push(UpgradeFleetError {
+                    env_name: Some(env_name.clone()),
+                    phase: "snapshot".to_string(),
+                    message: "snapshot worker exited without a result".to_string(),
+                });
+            }
+        }
+        sort_batch_checkpoints(&mut summary.checkpoints, &options.env_names);
+        if !summary.errors.is_empty() {
+            summary.outcome = "snapshot-failed".to_string();
+            self.save_upgrade_batch_journal(&journal_path, &summary)?;
+            return self.finish_upgrade_batch(summary, json_flag, profile);
+        }
+
+        summary.outcome = "snapshotted".to_string();
+        self.save_upgrade_batch_journal(&journal_path, &summary)?;
+
+        let target_for_workers = target.clone();
+        let failure_policy = options.failure_policy;
+        let upgrade_results = self.run_parallel_batch_work(
+            &options.env_names,
+            options.parallel,
+            move |cli, env_name| {
+                let result = cli.upgrade_env_locked(
+                    env_name,
+                    &target_for_workers,
+                    UpgradeOptions {
+                        dry_run: false,
+                        rollback_enabled: failure_policy == UpgradeFleetFailurePolicy::Rollback,
+                    },
+                );
+                match result {
+                    Ok(mut result)
+                        if failure_policy == UpgradeFleetFailurePolicy::Continue
+                            && is_failed_upgrade_outcome(&result.outcome) =>
+                    {
+                        let stop_note = match cli.service_service().stop_locked(env_name) {
+                            Ok(_) => {
+                                "failure policy left the gateway stopped for external recovery"
+                                    .to_string()
+                            }
+                            Err(error) => format!(
+                                "failed to leave the gateway stopped for external recovery: {error}"
+                            ),
+                        };
+                        result.note = join_optional_warnings(result.note, Some(stop_note));
+                        Ok(result)
+                    }
+                    other => other,
+                }
+            },
+        );
+        for (env_name, result) in upgrade_results {
+            match result {
+                Ok(result) => summary.results.push(result),
+                Err(error) => summary.errors.push(UpgradeFleetError {
+                    env_name: Some(env_name),
+                    phase: "upgrade".to_string(),
+                    message: error,
+                }),
+            }
+        }
+        for env_name in &options.env_names {
+            let recorded = summary
+                .results
+                .iter()
+                .any(|result| &result.env_name == env_name)
+                || summary
+                    .errors
+                    .iter()
+                    .any(|error| error.env_name.as_ref() == Some(env_name));
+            if !recorded {
+                summary.errors.push(UpgradeFleetError {
+                    env_name: Some(env_name.clone()),
+                    phase: "upgrade".to_string(),
+                    message: "upgrade worker exited without a result".to_string(),
+                });
+            }
+        }
+        sort_batch_results(&mut summary.results, &options.env_names);
+        let failed = summary
+            .results
+            .iter()
+            .any(|result| is_failed_upgrade_outcome(&result.outcome))
+            || !summary.errors.is_empty();
+        summary.outcome = if failed {
+            "partial".to_string()
+        } else {
+            "completed".to_string()
+        };
+        self.save_upgrade_batch_journal(&journal_path, &summary)?;
+        self.finish_upgrade_batch(summary, json_flag, profile)
+    }
+
+    fn parse_upgrade_batch_options(args: Vec<String>) -> Result<UpgradeFleetOptions, String> {
+        let (args, dry_run) = Self::consume_flag(args, "--dry-run");
+        let (args, accept_fleet_outage) = Self::consume_flag(args, "--accept-fleet-outage");
+        let (args, envs) = Self::consume_option(args, "--envs")?;
+        let envs = Self::require_option_value(envs, "--envs")?
+            .ok_or_else(|| "upgrade batch requires --envs".to_string())?;
+        let (args, runtime) = Self::consume_option(args, "--runtime")?;
+        let runtime = Self::require_option_value(runtime, "--runtime")?
+            .ok_or_else(|| "upgrade batch requires --runtime".to_string())?;
+        let (args, parallel) = Self::consume_option(args, "--parallel")?;
+        let parallel = Self::require_option_value(parallel, "--parallel")?
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| "--parallel must be a positive integer".to_string())
+            })
+            .transpose()?;
+        let (args, failure_policy) = Self::consume_option(args, "--failure-policy")?;
+        let failure_policy = match Self::require_option_value(failure_policy, "--failure-policy")? {
+            Some(value) => UpgradeFleetFailurePolicy::parse(&value)?,
+            None => UpgradeFleetFailurePolicy::Continue,
+        };
+        Self::assert_no_extra_args(&args)?;
+
+        let mut seen = BTreeSet::new();
+        let env_names = envs
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .filter(|value| seen.insert(value.clone()))
+            .collect::<Vec<_>>();
+        if env_names.len() < 2 {
+            return Err("upgrade batch requires at least two unique environments".to_string());
+        }
+        let parallel = parallel.unwrap_or_else(|| env_names.len().min(4));
+        if parallel == 0 {
+            return Err("--parallel must be a positive integer".to_string());
+        }
+        if parallel > env_names.len() {
+            return Err("--parallel cannot exceed the number of selected environments".to_string());
+        }
+
+        Ok(UpgradeFleetOptions {
+            env_names,
+            runtime,
+            parallel,
+            failure_policy,
+            dry_run,
+            accept_fleet_outage,
+        })
+    }
+
+    fn create_upgrade_batch_checkpoint_locked(
+        &self,
+        env_name: &str,
+        label: &str,
+    ) -> Result<EnvSnapshotSummary, String> {
+        let prepared = self
+            .environment_service()
+            .prepare_snapshot_capture_locked(env_name)?;
+        let service_state = self
+            .service_service()
+            .quiesce_for_snapshot_locked(env_name)?;
+        let snapshot_result = self
+            .environment_service()
+            .create_snapshot_locked_from_preparation(
+                CreateEnvSnapshotOptions {
+                    env_name: env_name.to_string(),
+                    label: Some(label.to_string()),
+                },
+                service_state.map(|state| (state.enabled, state.running)),
+                prepared,
+            );
+        let service_result = self
+            .service_service()
+            .restore_after_snapshot_locked(env_name, service_state);
+        match (snapshot_result, service_result) {
+            (Ok(snapshot), Ok(())) => Ok(snapshot),
+            (Ok(snapshot), Err(service_error)) => Err(format!(
+                "snapshot {} was created, but the managed service could not be restored: {service_error}",
+                snapshot.id
+            )),
+            (Err(snapshot_error), Ok(())) => Err(snapshot_error),
+            (Err(snapshot_error), Err(service_error)) => Err(format!(
+                "{snapshot_error}; also failed to restore the managed service after snapshot capture: {service_error}"
+            )),
+        }
+    }
+
+    fn run_parallel_batch_work<T, F>(
+        &self,
+        env_names: &[String],
+        parallel: usize,
+        work: F,
+    ) -> Vec<(String, Result<T, String>)>
+    where
+        T: Send + 'static,
+        F: Fn(&Cli, &str) -> Result<T, String> + Send + Sync + 'static,
+    {
+        let queue = Arc::new(Mutex::new(VecDeque::from(env_names.to_vec())));
+        let work = Arc::new(work);
+        let (sender, receiver) = mpsc::channel();
+        let mut workers = Vec::with_capacity(parallel);
+
+        for _ in 0..parallel {
+            let queue = Arc::clone(&queue);
+            let work = Arc::clone(&work);
+            let sender = sender.clone();
+            let env = self.env.clone();
+            let cwd = self.cwd.clone();
+            workers.push(thread::spawn(move || {
+                loop {
+                    let env_name = match queue.lock() {
+                        Ok(mut queue) => queue.pop_front(),
+                        Err(_) => None,
+                    };
+                    let Some(env_name) = env_name else {
+                        break;
+                    };
+                    let cli = Cli {
+                        env: env.clone(),
+                        cwd: cwd.clone(),
+                    };
+                    let result = work(&cli, &env_name);
+                    let _ = sender.send((env_name, result));
+                }
+            }));
+        }
+        drop(sender);
+        for worker in workers {
+            let _ = worker.join();
+        }
+        receiver.into_iter().collect()
+    }
+
+    fn upgrade_batch_journal_path(&self, batch_id: &str) -> Result<PathBuf, String> {
+        let dir = ensure_store(&self.env, &self.cwd)?
+            .home
+            .join("upgrade-batches");
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        Ok(dir.join(format!("{batch_id}.json")))
+    }
+
+    fn save_upgrade_batch_journal(
+        &self,
+        path: &Path,
+        summary: &UpgradeFleetBatchSummary,
+    ) -> Result<(), String> {
+        write_json(path, summary)
+    }
+
+    fn finish_upgrade_batch(
+        &self,
+        summary: UpgradeFleetBatchSummary,
+        json_flag: bool,
+        profile: render::RenderProfile,
+    ) -> Result<i32, String> {
+        let failed = matches!(summary.outcome.as_str(), "partial" | "snapshot-failed");
+        if json_flag {
+            self.print_json(&summary)?;
+        } else {
+            self.stdout_lines(render::upgrade::upgrade_fleet_batch(&summary, profile));
+        }
+        Ok(if failed { 1 } else { 0 })
+    }
+
     fn handle_upgrade_rollback(
         &self,
         args: Vec<String>,
@@ -524,6 +964,7 @@ impl Cli {
         };
         Self::assert_no_extra_args(&args[1..])?;
 
+        let _batch_lock = lock_upgrade_participant(&self.env, &self.cwd)?;
         let summary =
             self.rollback_completed_upgrade(env_name, transaction_id.as_deref(), dry_run)?;
         let failed = matches!(summary.outcome.as_str(), "failed" | "rollback-failed");
@@ -1728,6 +2169,16 @@ impl Cli {
     }
 
     fn upgrade_env(
+        &self,
+        name: &str,
+        target: &UpgradeTarget,
+        options: UpgradeOptions,
+    ) -> Result<UpgradeEnvSummary, String> {
+        let _batch_lock = lock_upgrade_participant(&self.env, &self.cwd)?;
+        self.upgrade_env_in_batch(name, target, options)
+    }
+
+    fn upgrade_env_in_batch(
         &self,
         name: &str,
         target: &UpgradeTarget,
@@ -4743,6 +5194,29 @@ fn service_action_for_dry_run(
     } else {
         Some("would-start".to_string())
     }
+}
+
+fn new_upgrade_batch_id() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    format!("{}-{:09}", now.unix_timestamp(), now.nanosecond())
+}
+
+fn sort_batch_checkpoints(checkpoints: &mut [UpgradeFleetCheckpoint], env_names: &[String]) {
+    checkpoints.sort_by_key(|checkpoint| {
+        env_names
+            .iter()
+            .position(|env_name| env_name == &checkpoint.env_name)
+            .unwrap_or(usize::MAX)
+    });
+}
+
+fn sort_batch_results(results: &mut [UpgradeEnvSummary], env_names: &[String]) {
+    results.sort_by_key(|result| {
+        env_names
+            .iter()
+            .position(|env_name| env_name == &result.env_name)
+            .unwrap_or(usize::MAX)
+    });
 }
 
 fn is_changed_upgrade_outcome(outcome: &str) -> bool {

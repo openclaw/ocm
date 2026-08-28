@@ -1,6 +1,6 @@
 use crate::cli::upgrade::{
-    UpgradeBatchSummary, UpgradeEnvSummary, UpgradeRollbackSummary, UpgradeSimulationBatchSummary,
-    UpgradeSimulationSummary,
+    UpgradeBatchSummary, UpgradeEnvSummary, UpgradeFleetBatchSummary, UpgradeRollbackSummary,
+    UpgradeSimulationBatchSummary, UpgradeSimulationSummary,
 };
 use crate::infra::terminal::{
     Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table, terminal_width,
@@ -295,6 +295,138 @@ pub fn upgrade_batch(
         lines.push(paint(
             &format!("Use {command_example} upgrade <env> or --raw for notes."),
             Tone::Muted,
+            profile.color,
+        ));
+    }
+    lines
+}
+
+pub fn upgrade_fleet_batch(
+    summary: &UpgradeFleetBatchSummary,
+    profile: RenderProfile,
+) -> Vec<String> {
+    if !profile.pretty {
+        let mut lines = vec![
+            format!("batchId: {}", summary.batch_id),
+            format!("runtime: {}", summary.runtime),
+            format!("outcome: {}", summary.outcome),
+            format!("parallel: {}", summary.parallel),
+            format!("failurePolicy: {}", summary.failure_policy),
+            format!(
+                "journal: {}",
+                summary.journal_path.as_deref().unwrap_or("not created")
+            ),
+        ];
+        for checkpoint in &summary.checkpoints {
+            lines.push(format!(
+                "checkpoint: {}={}",
+                checkpoint.env_name, checkpoint.snapshot_id
+            ));
+        }
+        for result in &summary.results {
+            lines.extend(upgrade_env_raw(result));
+        }
+        for error in &summary.errors {
+            lines.push(format!(
+                "error: {} {}: {}",
+                error.env_name.as_deref().unwrap_or("batch"),
+                error.phase,
+                error.message
+            ));
+        }
+        return lines;
+    }
+
+    let mut lines = render_key_value_card(
+        "Fast Fleet Upgrade",
+        &[
+            KeyValueRow::accent("Batch", &summary.batch_id),
+            KeyValueRow::accent("Runtime", &summary.runtime),
+            KeyValueRow::new("Outcome", &summary.outcome, outcome_tone(&summary.outcome)),
+            KeyValueRow::plain("Parallel", summary.parallel.to_string()),
+            KeyValueRow::plain("Failure policy", &summary.failure_policy),
+            KeyValueRow::plain(
+                "Journal",
+                summary.journal_path.as_deref().unwrap_or("not created"),
+            ),
+        ],
+        profile.color,
+    );
+    if !summary.checkpoints.is_empty() {
+        lines.push(String::new());
+        let rows = summary
+            .checkpoints
+            .iter()
+            .map(|checkpoint| {
+                vec![
+                    Cell::accent(checkpoint.env_name.clone()),
+                    Cell::plain(checkpoint.snapshot_id.clone()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        lines.extend(render_table(
+            &["Env", "Fleet checkpoint"],
+            &rows,
+            profile.color,
+        ));
+    }
+    if !summary.results.is_empty() {
+        lines.push(String::new());
+        lines.extend(upgrade_batch(
+            &UpgradeBatchSummary {
+                count: summary.results.len(),
+                changed: summary
+                    .results
+                    .iter()
+                    .filter(|result| {
+                        matches!(
+                            result.outcome.as_str(),
+                            "switched" | "updated" | "installed"
+                        )
+                    })
+                    .count(),
+                current: summary
+                    .results
+                    .iter()
+                    .filter(|result| result.outcome == "up-to-date")
+                    .count(),
+                skipped: 0,
+                restarted: summary
+                    .results
+                    .iter()
+                    .filter(|result| result.service_action.is_some())
+                    .count(),
+                failed: summary
+                    .results
+                    .iter()
+                    .filter(|result| {
+                        matches!(
+                            result.outcome.as_str(),
+                            "failed" | "rolled-back" | "rollback-failed"
+                        )
+                    })
+                    .count(),
+                results: summary.results.clone(),
+            },
+            profile,
+            "ocm",
+        ));
+    }
+    if !summary.errors.is_empty() {
+        lines.push(String::new());
+        lines.extend(render_key_value_card(
+            "Errors",
+            &summary
+                .errors
+                .iter()
+                .map(|error| {
+                    KeyValueRow::new(
+                        error.env_name.as_deref().unwrap_or("Batch"),
+                        format!("{}: {}", error.phase, error.message),
+                        Tone::Danger,
+                    )
+                })
+                .collect::<Vec<_>>(),
             profile.color,
         ));
     }

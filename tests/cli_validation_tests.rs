@@ -335,6 +335,71 @@ fn env_snapshot_prune_validates_scope_and_numeric_values() {
 }
 
 #[test]
+fn upgrade_batch_requires_explicit_scope_runtime_and_outage_acknowledgement() {
+    let root = TestDir::new("cli-upgrade-batch-validation");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    let missing_envs = run_ocm(&cwd, &env, &["upgrade", "batch", "--runtime", "target"]);
+    assert_eq!(missing_envs.status.code(), Some(1));
+    assert!(stderr(&missing_envs).contains("upgrade batch requires --envs"));
+
+    let missing_runtime = run_ocm(&cwd, &env, &["upgrade", "batch", "--envs", "alpha,beta"]);
+    assert_eq!(missing_runtime.status.code(), Some(1));
+    assert!(stderr(&missing_runtime).contains("upgrade batch requires --runtime"));
+
+    let one_env = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "batch",
+            "--runtime",
+            "target",
+            "--envs",
+            "alpha",
+            "--accept-fleet-outage",
+        ],
+    );
+    assert_eq!(one_env.status.code(), Some(1));
+    assert!(stderr(&one_env).contains("at least two unique environments"));
+
+    let zero_parallel = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "batch",
+            "--runtime",
+            "target",
+            "--envs",
+            "alpha,beta",
+            "--parallel",
+            "0",
+            "--accept-fleet-outage",
+        ],
+    );
+    assert_eq!(zero_parallel.status.code(), Some(1));
+    assert!(stderr(&zero_parallel).contains("--parallel must be a positive integer"));
+
+    let missing_ack = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "batch",
+            "--runtime",
+            "target",
+            "--envs",
+            "alpha,beta",
+        ],
+    );
+    assert_eq!(missing_ack.status.code(), Some(1));
+    assert!(stderr(&missing_ack).contains("--accept-fleet-outage"));
+}
+
+#[test]
 fn env_doctor_requires_a_name() {
     let root = TestDir::new("cli-env-doctor-validation");
     let cwd = root.child("workspace");

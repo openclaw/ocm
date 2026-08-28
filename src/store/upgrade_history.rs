@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::common::{
-    ExclusiveFileLock, load_json_files, lock_file, path_exists, read_json, write_json,
+    ExclusiveFileLock, SharedFileLock, load_json_files, lock_file, lock_file_shared, path_exists,
+    read_json, write_json,
 };
 use super::layout::{
     display_path, runtime_install_root, upgrade_history_env_dir, upgrade_history_meta_path,
@@ -173,6 +174,28 @@ pub(crate) fn lock_upgrade_transaction(
         .join("upgrades")
         .join(format!("{env_name}.lock"));
     lock_file(&path, "upgrade transaction")
+}
+
+fn upgrade_batch_lock_path(env: &BTreeMap<String, String>, cwd: &Path) -> Result<PathBuf, String> {
+    Ok(super::ensure_store(env, cwd)?
+        .home
+        .join("locks")
+        .join("upgrades")
+        .join("batch.lock"))
+}
+
+pub(crate) fn lock_upgrade_batch(
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<ExclusiveFileLock, String> {
+    lock_file(&upgrade_batch_lock_path(env, cwd)?, "upgrade batch")
+}
+
+pub(crate) fn lock_upgrade_participant(
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<SharedFileLock, String> {
+    lock_file_shared(&upgrade_batch_lock_path(env, cwd)?, "upgrade batch")
 }
 
 pub(crate) fn get_upgrade_runtime_recovery(
@@ -383,8 +406,8 @@ mod tests {
         RuntimeMeta, RuntimeSourceKind, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming,
         UpgradeHistoryRecord, UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState,
         UpgradeHistoryStage, get_upgrade_history_record, get_upgrade_runtime_recovery,
-        list_upgrade_history, lock_upgrade_transaction, runtime_install_root,
-        save_upgrade_history_record, write_json,
+        list_upgrade_history, lock_upgrade_batch, lock_upgrade_participant,
+        lock_upgrade_transaction, runtime_install_root, save_upgrade_history_record, write_json,
     };
     use crate::store::layout::upgrade_history_runtime_recovery_dir;
 
@@ -703,6 +726,31 @@ mod tests {
                 .is_err()
         );
         drop(first);
+        acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        waiter.join().unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upgrade_batch_lock_blocks_regular_upgrade_participants() {
+        let (root, env) = test_env("batch-lock");
+        let cwd = root.as_path();
+        let batch = lock_upgrade_batch(&env, cwd).unwrap();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let thread_env = env.clone();
+        let thread_cwd = root.clone();
+        let waiter = thread::spawn(move || {
+            let _participant = lock_upgrade_participant(&thread_env, thread_cwd.as_path()).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+        drop(batch);
         acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         waiter.join().unwrap();
 
