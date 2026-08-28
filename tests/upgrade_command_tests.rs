@@ -4530,6 +4530,11 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
         ],
     );
     assert!(start.status.success(), "{}", stderr(&start));
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    write_running_supervisor_runtime(&runtime_path, &ocm_home, "old", 4241, health_port);
+    let state_path = supervisor_state_path(&env, &cwd).unwrap();
     let env_show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(env_show.status.success(), "{}", stderr(&env_show));
     let env_json: Value = serde_json::from_str(&stdout(&env_show)).unwrap();
@@ -4538,15 +4543,56 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
     fs::create_dir_all(marker.parent().unwrap()).unwrap();
     fs::write(&marker, "before-upgrade").unwrap();
 
+    let snapshot_observer_done = Arc::new(AtomicBool::new(false));
+    let snapshot_observer_done_thread = Arc::clone(&snapshot_observer_done);
+    let snapshot_runtime_path = runtime_path.clone();
+    let snapshot_ocm_home = ocm_home.clone();
+    let snapshot_state_path = state_path.clone();
+    let snapshot_observer = thread::spawn(move || {
+        let mut observed_running = true;
+        let mut saw_stop = false;
+        let mut saw_start = false;
+        while !snapshot_observer_done_thread.load(Ordering::Relaxed) {
+            let state = fs::read_to_string(&snapshot_state_path).unwrap_or_default();
+            let parsed: Value = serde_json::from_str(&state).unwrap_or(Value::Null);
+            let desired_running = parsed["children"]
+                .as_array()
+                .is_some_and(|children| children.iter().any(|child| child["envName"] == "demo"));
+            if desired_running != observed_running {
+                if desired_running {
+                    write_running_supervisor_runtime(
+                        &snapshot_runtime_path,
+                        &snapshot_ocm_home,
+                        "old",
+                        4242,
+                        health_port,
+                    );
+                    saw_start = true;
+                } else {
+                    write_empty_supervisor_runtime(&snapshot_runtime_path, &snapshot_ocm_home);
+                    saw_stop = true;
+                }
+                observed_running = desired_running;
+            }
+            sleep(Duration::from_millis(5));
+        }
+        (saw_stop, saw_start)
+    });
     let snapshot = run_ocm(&cwd, &env, &["env", "snapshot", "create", "demo", "--json"]);
+    snapshot_observer_done.store(true, Ordering::Relaxed);
+    let (snapshot_saw_stop, snapshot_saw_start) = snapshot_observer.join().unwrap();
     assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+    assert!(
+        snapshot_saw_stop,
+        "snapshot did not stop the managed service"
+    );
+    assert!(
+        snapshot_saw_start,
+        "snapshot did not restore the managed service"
+    );
     let snapshot_json: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
     let snapshot_id = snapshot_json["id"].as_str().unwrap();
-    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
-    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
-    let ocm_home = env.get("OCM_HOME").unwrap().clone();
     write_running_supervisor_runtime(&runtime_path, &ocm_home, "old", 4242, health_port);
-    let state_path = supervisor_state_path(&env, &cwd).unwrap();
     let bind_observer_done = Arc::new(AtomicBool::new(false));
     let bind_observer_done_thread = Arc::clone(&bind_observer_done);
     let bind_runtime_path = runtime_path.clone();

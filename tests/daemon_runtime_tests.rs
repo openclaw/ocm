@@ -13,8 +13,8 @@ use ocm::supervisor::{SupervisorService, sync_supervisor_binding_if_present};
 use serde_json::{Value, to_value};
 
 use crate::support::{
-    TestDir, install_fake_launchctl, install_fake_systemd_tools, ocm_env, path_string, run_ocm,
-    stderr, stdout, write_executable_script,
+    TestDir, install_fake_launchctl, install_fake_systemd_tools, ocm_env, ocm_test_binary_path,
+    path_string, run_ocm, stderr, stdout, write_executable_script,
 };
 
 static DAEMON_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -26,7 +26,7 @@ fn daemon_runtime_test_lock() -> MutexGuard<'static, ()> {
 }
 
 fn spawn_daemon_process(cwd: &Path, env: &BTreeMap<String, String>) -> Child {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ocm"));
+    let mut command = Command::new(ocm_test_binary_path());
     command.current_dir(cwd);
     command.args(["__daemon", "run"]);
     command.env_clear();
@@ -670,6 +670,294 @@ fn snapshot_restore_preserves_running_sibling_despite_unrelated_drift() {
         1,
         "target snapshot restore restarted the sibling"
     );
+
+    stop_process(&mut daemon);
+}
+
+#[test]
+fn snapshot_create_preserves_all_running_siblings_and_restores_target() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("snapshot-create-preserves-supervisor-siblings");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let env_names = ["target", "sibling-a", "sibling-b", "sibling-c", "sibling-d"];
+
+    for env_name in env_names {
+        let runtime_name = format!("{env_name}-runtime");
+        let runtime = root.child(format!("bin/{runtime_name}"));
+        let started = root.child(format!("{env_name}-started"));
+        let stopped = root.child(format!("{env_name}-stopped"));
+        write_upgrade_aware_gateway_script(&runtime, "2026.8.1", &started, &stopped, false);
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                &runtime_name,
+                "--path",
+                &path_string(&runtime),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", env_name, "--runtime", &runtime_name],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        set_service_enabled(&cwd, &env, env_name, true);
+    }
+
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime =
+        wait_for_runtime_children(&runtime_path, env_names.len(), None, Duration::from_secs(5))
+            .expect("daemon runtime state did not report the complete fixture");
+    for env_name in env_names {
+        assert!(
+            wait_for_file(
+                &root.child(format!("{env_name}-started")),
+                Duration::from_secs(5)
+            ),
+            "{env_name} did not enter its gateway loop"
+        );
+    }
+    let initial_target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
+    let initial_siblings = env_names[1..]
+        .iter()
+        .map(|name| {
+            (
+                *name,
+                persisted_child(&state_path, name),
+                runtime_child(&initial_runtime, name),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for env_name in &env_names[1..] {
+        let runtime_meta_path = root.child(format!("ocm-home/runtimes/{env_name}-runtime.json"));
+        let mut runtime_meta = read_persisted_service_state(&runtime_meta_path);
+        runtime_meta["releaseVersion"] = Value::String(format!("latent-{env_name}-drift"));
+        write_persisted_service_state(&runtime_meta_path, &runtime_meta);
+    }
+
+    let snapshot = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "snapshot",
+            "create",
+            "target",
+            "--label",
+            "sibling-preservation",
+            "--json",
+        ],
+    );
+    assert!(
+        snapshot.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&snapshot),
+        stderr(&snapshot)
+    );
+    let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    assert_eq!(snapshot["serviceEnabled"], true);
+    assert_eq!(snapshot["serviceRunning"], true);
+
+    let final_runtime = read_persisted_service_state(&runtime_path);
+    assert_eq!(
+        final_runtime["children"].as_array().map(Vec::len),
+        Some(env_names.len()),
+        "snapshot creation returned before the complete fleet was running"
+    );
+
+    let target = run_ocm(&cwd, &env, &["env", "show", "target", "--json"]);
+    assert!(target.status.success(), "{}", stderr(&target));
+    let target: Value = serde_json::from_str(&stdout(&target)).unwrap();
+    assert_eq!(target["serviceEnabled"], true);
+    assert_eq!(target["serviceRunning"], true);
+    assert_ne!(
+        runtime_child_pid(&final_runtime, "target"),
+        Some(initial_target_pid),
+        "snapshot target PID did not change across cold capture"
+    );
+    assert_eq!(
+        fs::read_to_string(root.child("target-started"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "snapshot target was not restarted exactly once"
+    );
+    assert_eq!(
+        fs::read_to_string(root.child("target-stopped"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "snapshot target was not stopped exactly once"
+    );
+
+    for (env_name, initial_state, initial_child) in initial_siblings {
+        assert_eq!(
+            persisted_child(&state_path, env_name),
+            initial_state,
+            "snapshot creation changed the persisted spec for {env_name}"
+        );
+        assert_eq!(
+            runtime_child(&final_runtime, env_name),
+            initial_child,
+            "snapshot creation changed the PID, binding, or restart state for {env_name}"
+        );
+        assert!(
+            !root.child(format!("{env_name}-stopped")).exists(),
+            "snapshot creation stopped {env_name}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.child(format!("{env_name}-started")))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "snapshot creation restarted {env_name}"
+        );
+    }
+
+    stop_process(&mut daemon);
+}
+
+#[test]
+fn snapshot_create_preserves_stopped_target_and_running_siblings() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("snapshot-create-preserves-stopped-target");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+
+    for env_name in ["target", "sibling-a", "sibling-b"] {
+        let runtime_name = format!("{env_name}-runtime");
+        let runtime = root.child(format!("bin/{runtime_name}"));
+        let started = root.child(format!("{env_name}-started"));
+        let stopped = root.child(format!("{env_name}-stopped"));
+        write_upgrade_aware_gateway_script(&runtime, "2026.8.1", &started, &stopped, false);
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                &runtime_name,
+                "--path",
+                &path_string(&runtime),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", env_name, "--runtime", &runtime_name],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
+    EnvironmentService::new(&env, &cwd)
+        .set_service_policy("target", Some(true), Some(false))
+        .unwrap();
+    for env_name in ["sibling-a", "sibling-b"] {
+        set_service_enabled(&cwd, &env, env_name, true);
+    }
+
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime =
+        wait_for_runtime_children(&runtime_path, 2, Some("sibling-a"), Duration::from_secs(5))
+            .expect("daemon runtime state did not report both running siblings");
+    for env_name in ["sibling-a", "sibling-b"] {
+        assert!(wait_for_file(
+            &root.child(format!("{env_name}-started")),
+            Duration::from_secs(5)
+        ));
+    }
+    let initial_siblings = ["sibling-a", "sibling-b"].map(|name| {
+        (
+            name,
+            persisted_child(&state_path, name),
+            runtime_child(&initial_runtime, name),
+        )
+    });
+
+    let snapshot = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "snapshot",
+            "create",
+            "target",
+            "--label",
+            "stopped-target",
+            "--json",
+        ],
+    );
+    assert!(
+        snapshot.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&snapshot),
+        stderr(&snapshot)
+    );
+    let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    assert_eq!(snapshot["serviceEnabled"], true);
+    assert_eq!(snapshot["serviceRunning"], false);
+
+    let target = run_ocm(&cwd, &env, &["env", "show", "target", "--json"]);
+    assert!(target.status.success(), "{}", stderr(&target));
+    let target: Value = serde_json::from_str(&stdout(&target)).unwrap();
+    assert_eq!(target["serviceEnabled"], true);
+    assert_eq!(target["serviceRunning"], false);
+    assert!(runtime_child_pid(&read_persisted_service_state(&runtime_path), "target").is_none());
+    assert!(!root.child("target-started").exists());
+    assert!(!root.child("target-stopped").exists());
+
+    let final_runtime = read_persisted_service_state(&runtime_path);
+    for (env_name, initial_state, initial_child) in initial_siblings {
+        assert_eq!(
+            persisted_child(&state_path, env_name),
+            initial_state,
+            "snapshot creation changed the persisted spec for {env_name}"
+        );
+        assert_eq!(
+            runtime_child(&final_runtime, env_name),
+            initial_child,
+            "snapshot creation changed the PID, binding, or restart state for {env_name}"
+        );
+        assert!(!root.child(format!("{env_name}-stopped")).exists());
+        assert_eq!(
+            fs::read_to_string(root.child(format!("{env_name}-started")))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
 
     stop_process(&mut daemon);
 }

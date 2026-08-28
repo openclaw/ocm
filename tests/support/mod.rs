@@ -727,8 +727,14 @@ pub fn sha512_integrity(body: &[u8]) -> String {
     )
 }
 
+pub fn ocm_test_binary_path() -> PathBuf {
+    std::env::var_os("OCM_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ocm")))
+}
+
 pub fn run_ocm(cwd: &Path, env: &BTreeMap<String, String>, args: &[&str]) -> Output {
-    run_ocm_binary(Path::new(env!("CARGO_BIN_EXE_ocm")), cwd, env, args)
+    run_ocm_binary(&ocm_test_binary_path(), cwd, env, args)
 }
 
 pub fn run_ocm_binary(
@@ -751,7 +757,7 @@ pub fn run_ocm_with_stdin(
     args: &[&str],
     input: &str,
 ) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ocm"));
+    let mut command = Command::new(ocm_test_binary_path());
     command.current_dir(cwd);
     command.args(args);
     command.env_clear();

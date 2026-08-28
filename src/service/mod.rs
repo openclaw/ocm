@@ -204,8 +204,24 @@ impl<'a> ServiceService<'a> {
                 return Ok(());
             }
             self.start_locked(name)?;
+            self.wait_for_snapshot_running_state_locked(name)?;
         }
         Ok(())
+    }
+
+    fn wait_for_snapshot_running_state_locked(&self, name: &str) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if self.status(name)?.running {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "supervisor did not restore the running service state for env \"{name}\" after snapshot maintenance"
+                ));
+            }
+            sleep(Duration::from_millis(25));
+        }
     }
 
     pub fn restart(&self, name: &str) -> Result<ServiceActionSummary, String> {
