@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread::{self, sleep};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ocm::env::EnvironmentService;
 use ocm::store::{now_utc, supervisor_runtime_path, supervisor_state_path};
@@ -574,10 +574,19 @@ fn service_restart_requests_immediate_recovery_handoff_without_self_deadlock() {
             .unwrap()
             .contains("scheduled without waiting")
     }));
-    assert_eq!(
-        fs::read_to_string(invocation_log).unwrap(),
-        "gateway restart --force --json\n"
-    );
+    // The handoff returns before the detached command necessarily writes its log.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let invocation = fs::read_to_string(&invocation_log).unwrap_or_default();
+        if invocation == "gateway restart --force --json\n" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restart handoff invocation was not observed: {invocation:?}"
+        );
+        sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
