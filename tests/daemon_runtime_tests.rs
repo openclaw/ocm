@@ -1929,24 +1929,40 @@ fn env_destroy_removes_only_target_child_despite_unrelated_drift() {
     let sibling_started = root.child("sibling-started.txt");
     let sibling_stopped = root.child("sibling-stopped.txt");
 
+    // Keep the fixture in one process so guarded destroy sees stable identities.
     let target_runtime = root.child("bin/target-runtime");
-    write_legacy_openclaw_script(
-        &target_runtime,
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
-            path_string(&target_started),
-            path_string(&target_stopped),
-        ),
-    );
     let sibling_runtime = root.child("bin/sibling-runtime");
-    write_legacy_openclaw_script(
-        &sibling_runtime,
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
-            path_string(&sibling_started),
-            path_string(&sibling_stopped),
-        ),
-    );
+    for (runtime, started, stopped) in [
+        (&target_runtime, &target_started, &target_stopped),
+        (&sibling_runtime, &sibling_started, &sibling_stopped),
+    ] {
+        write_legacy_openclaw_script(
+            runtime,
+            &format!(
+                r#"#!/bin/sh
+exec python3 - '{started}' '{stopped}' <<'PYTHON'
+import os
+import signal
+import sys
+
+def stop(signum, frame):
+    with open(sys.argv[2], "a") as log:
+        print(os.getpid(), file=log)
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+with open(sys.argv[1], "a") as log:
+    print(os.getpid(), file=log)
+while True:
+    signal.pause()
+PYTHON
+"#,
+                started = path_string(started),
+                stopped = path_string(stopped),
+            ),
+        );
+    }
 
     for (runtime_name, runtime_path, env_name) in [
         ("target-runtime", &target_runtime, "target"),
@@ -1979,6 +1995,8 @@ fn env_destroy_removes_only_target_child_despite_unrelated_drift() {
         .expect("daemon runtime state did not report both children");
     let target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
     let sibling_pid = runtime_child_pid(&initial_runtime, "sibling").unwrap();
+    assert!(wait_for_file(&target_started, Duration::from_secs(5)));
+    assert!(wait_for_file(&sibling_started, Duration::from_secs(5)));
 
     let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
     let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);

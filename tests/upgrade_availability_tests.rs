@@ -522,9 +522,10 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
                     observer_available.store(true, Ordering::SeqCst);
                     observer_timeline.mark("target_ready");
                 } else {
+                    // Record the cutoff before health probes can observe the outage.
+                    observer_timeline.mark("service_stopped");
                     observer_available.store(false, Ordering::SeqCst);
                     write_empty_supervisor_runtime(&observer_runtime_path, &observer_ocm_home);
-                    observer_timeline.mark("service_stopped");
                 }
                 last_running = running;
             }
