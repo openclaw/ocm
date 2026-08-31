@@ -2531,6 +2531,20 @@ fn upgrade_accepts_correction_release_and_freezes_channel_selection() {
     assert_eq!(runtime["releaseVersion"], correction_version);
     let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
     assert_repair_candidate_finalize_order(&command_log);
+
+    let command_log_path = env_root.join("sim-commands.log");
+    fs::write(&command_log_path, "").unwrap();
+    let current = run_ocm(&cwd, &env, &["upgrade", "demo"]);
+    assert!(current.status.success(), "{}", stderr(&current));
+    assert!(stdout(&current).contains("outcome=up-to-date"));
+    let command_log = fs::read_to_string(command_log_path).unwrap();
+    let validate = command_log.find("config validate").unwrap();
+    let candidate = command_log
+        .find("doctor --lint --only codex/managed-app-server --json")
+        .unwrap();
+    assert!(validate < candidate, "{command_log}");
+    assert!(!command_log.contains("doctor --non-interactive --fix"));
+    assert!(!command_log.contains("update finalize"));
 }
 
 #[test]

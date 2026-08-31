@@ -2664,8 +2664,32 @@ impl Cli {
                     }
                 }
             } else {
-                transaction.mark_post_update_not_needed();
-                (None, false)
+                let config_repaired = match self.prepare_target_openclaw_update(
+                    env_name,
+                    &prepared.meta,
+                    &mut transaction.timings,
+                ) {
+                    Ok(config_repaired) => config_repaired,
+                    Err(error) => {
+                        transaction.mark_post_update_failed(&error);
+                        return self.rollback_failed_upgrade(
+                            env_name,
+                            "runtime",
+                            previous_binding_name,
+                            "runtime",
+                            prepared.name,
+                            prepared.meta.release_version,
+                            prepared.meta.release_channel,
+                            transaction,
+                            error,
+                        );
+                    }
+                };
+                transaction.mark_target_validation_completed(config_repaired);
+                (
+                    config_repaired.then(|| "OpenClaw config repair completed".to_string()),
+                    false,
+                )
             };
             let publish_started = transaction.timings.start();
             let publish_result = if changed {
@@ -3537,7 +3561,7 @@ impl Cli {
             return Ok(());
         }
         Err(format!(
-            "candidate managed Codex preflight failed: {}. Repair or reinstall the target OpenClaw runtime, then rerun the upgrade",
+            "candidate managed Codex preflight failed: {}. Repair or reinstall the staged OpenClaw runtime, then rerun the upgrade; the source environment was not changed",
             output.failure_summary()
         ))
     }
@@ -3789,28 +3813,7 @@ impl Cli {
     ) -> Result<PostCoreUpdateResult, String> {
         // Resolve the replacement explicitly while the previous binding remains published.
         // A failed finalizer can then roll back without ever activating the replacement.
-        let config_repaired =
-            self.repair_target_openclaw_config(env_name, &runtime.name, timings)?;
-        let candidate_started = timings.start();
-        let candidate_result = self.validate_committed_upgrade_target(env_name, runtime);
-        timings.finish(
-            "ocm",
-            "managedCodexCandidate",
-            "stopped",
-            candidate_started,
-            if candidate_result.is_ok() {
-                "completed"
-            } else {
-                "failed"
-            },
-        );
-        candidate_result.map_err(|error| {
-            if config_repaired {
-                format!("candidate validation failed after target config repair: {error}")
-            } else {
-                error
-            }
-        })?;
+        let config_repaired = self.prepare_target_openclaw_update(env_name, runtime, timings)?;
         let finalize_started = timings.start();
         let output = match self.run_update_mode_openclaw_command_output_with_env(
             env_name,
@@ -3871,6 +3874,37 @@ impl Cli {
             }),
             completion_deferred,
         })
+    }
+
+    fn prepare_target_openclaw_update(
+        &self,
+        env_name: &str,
+        runtime: &RuntimeMeta,
+        timings: &mut UpgradeTimingRecorder,
+    ) -> Result<bool, String> {
+        let config_repaired =
+            self.repair_target_openclaw_config(env_name, &runtime.name, timings)?;
+        let candidate_started = timings.start();
+        let candidate_result = self.validate_committed_upgrade_target(env_name, runtime);
+        timings.finish(
+            "ocm",
+            "managedCodexCandidate",
+            "stopped",
+            candidate_started,
+            if candidate_result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        candidate_result.map_err(|error| {
+            if config_repaired {
+                format!("candidate validation failed after target config repair: {error}")
+            } else {
+                error
+            }
+        })?;
+        Ok(config_repaired)
     }
 
     fn refresh_deferred_completion_cache(
@@ -4875,6 +4909,15 @@ impl UpgradeTransaction {
             self.migration.status = "failed".to_string();
             self.finalization.status = "not-run".to_string();
         }
+    }
+
+    fn mark_target_validation_completed(&mut self, config_repaired: bool) {
+        self.migration.status = if config_repaired {
+            "repaired".to_string()
+        } else {
+            "validated".to_string()
+        };
+        self.finalization.status = "not-needed".to_string();
     }
 
     fn mark_post_update_not_needed(&mut self) {
