@@ -6,8 +6,9 @@ use std::net::TcpListener;
 use serde_json::Value;
 
 use crate::support::{
-    TestDir, TestHttpServer, install_fake_node_and_npm, install_fake_service_manager, ocm_env,
-    openclaw_package_tarball, run_ocm, sha512_integrity, stderr, stdout, write_executable_script,
+    TestDir, TestHttpServer, install_fake_managed_node_archive, install_fake_node_and_npm,
+    install_fake_service_manager, ocm_env, openclaw_package_tarball, run_ocm, sha512_integrity,
+    stderr, stdout, write_executable_script,
 };
 
 fn allocate_free_port() -> u16 {
@@ -276,6 +277,7 @@ fn env_status_keeps_official_runtime_healthy_when_managed_fallback_is_available(
             .to_string_lossy()
             .to_string(),
     );
+    let _managed_node_server = install_fake_managed_node_archive(&root, &mut status_env, "24.15.0");
 
     let status = run_ocm(&cwd, &status_env, &["env", "status", "demo", "--json"]);
     assert!(status.status.success(), "{}", stderr(&status));

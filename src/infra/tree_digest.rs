@@ -105,7 +105,11 @@ pub(crate) fn tree_sha256(root: &Path) -> Result<String, String> {
             hasher.update(sha256);
         }
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn hash_path(path: &Path, hasher: &mut Sha256) -> Result<(), String> {
@@ -147,6 +151,20 @@ fn metadata_mode(metadata: &fs::Metadata) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::tree_sha256;
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_digest_preserves_v1_encoding() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            tree_sha256(root.path()).unwrap(),
+            "47d8bf62e61e92d5b7e76a8669b829db917ffdeaf8e1b6484ec4882c3d42d005"
+        );
+    }
 
     #[test]
     fn tree_digest_is_stable_and_covers_nested_files() {

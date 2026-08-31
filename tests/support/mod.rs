@@ -665,7 +665,10 @@ pub fn install_fake_managed_node_archive(
     let archive = fake_managed_node_archive(version);
     let archive_sha256 = {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(&archive))
+        Sha256::digest(&archive)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     };
     let server = TestHttpServer::serve_bytes(
         "/managed-node-toolchain",

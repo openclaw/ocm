@@ -630,7 +630,7 @@ fn env_destroy_yes_terminates_live_listener_processes() {
     let second_listener_log = root.child("listener-2.log");
     fs::write(
         &server,
-        r#"import argparse, socket, time
+        r#"import argparse, os, socket, time
 parser = argparse.ArgumentParser()
 parser.add_argument("--ready", required=True)
 args = parser.parse_args()
@@ -638,9 +638,9 @@ s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 0))
 s.listen(1)
-with open(args.ready, "w", encoding="utf-8") as ready:
+with open(args.ready + ".tmp", "w", encoding="utf-8") as ready:
     ready.write(str(s.getsockname()[1]))
-    ready.flush()
+os.replace(args.ready + ".tmp", args.ready)
 time.sleep(60)
 "#,
     )
@@ -926,9 +926,9 @@ def replace(_signum, _frame):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    with open(replacement_pid_path, "w", encoding="utf-8") as output:
+    with open(replacement_pid_path + ".tmp", "w", encoding="utf-8") as output:
         output.write(str(replacement.pid))
-        output.flush()
+    os.replace(replacement_pid_path + ".tmp", replacement_pid_path)
     raise SystemExit(0)
 signal.signal(signal.SIGTERM, replace)
 with open(ready_path, "w", encoding="utf-8") as output:

@@ -1599,7 +1599,11 @@ fn env_destroy_state_token(
     };
     let encoded = serde_json::to_vec(&state)
         .map_err(|error| format!("failed to encode environment destroy state: {error}"))?;
-    Ok(format!("v1:{:x}", Sha256::digest(encoded)))
+    let digest: String = Sha256::digest(encoded)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(format!("v1:{digest}"))
 }
 
 #[cfg(unix)]

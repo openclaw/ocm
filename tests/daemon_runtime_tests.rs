@@ -88,6 +88,14 @@ fn wait_for_file_value(path: &Path, expected: &str, timeout: Duration) -> bool {
     false
 }
 
+fn wait_for_started_pid(path: &Path, pid: u64) {
+    assert!(
+        wait_for_file_value(path, &pid.to_string(), Duration::from_secs(5)),
+        "{} did not record startup for PID {pid}",
+        path.display()
+    );
+}
+
 fn wait_for_runtime_service_state(
     path: &Path,
     env_name: &str,
@@ -212,8 +220,8 @@ if [ "${{1:-}}" = "gateway" ] && [ "${{2:-}}" = "status" ]; then
   exit 0
 fi
 if [ "${{1:-}}" = "gateway" ]; then
-  printf '%s\n' "$$" >> '{started}'
   trap 'printf "%s\n" "$$" >> "{stopped}"; exit 0' TERM INT
+  printf '%s\n' "$$" >> '{started}'
   while :; do sleep 3600; done
 fi
 case "${{1:-}}" in
@@ -596,6 +604,14 @@ fn snapshot_restore_preserves_running_sibling_despite_unrelated_drift() {
         .expect("daemon runtime state did not report both children");
     let initial_sibling_runtime = runtime_child(&initial_runtime, "sibling");
     let initial_sibling_state = persisted_child(&state_path, "sibling");
+    wait_for_started_pid(
+        &target_started,
+        runtime_child_pid(&initial_runtime, "target").unwrap(),
+    );
+    wait_for_started_pid(
+        &sibling_started,
+        runtime_child_pid(&initial_runtime, "sibling").unwrap(),
+    );
     let initial_sibling = run_ocm(&cwd, &env, &["env", "show", "sibling", "--json"]);
     assert!(
         initial_sibling.status.success(),
@@ -725,12 +741,9 @@ fn snapshot_create_preserves_all_running_siblings_and_restores_target() {
         wait_for_runtime_children(&runtime_path, env_names.len(), None, Duration::from_secs(5))
             .expect("daemon runtime state did not report the complete fixture");
     for env_name in env_names {
-        assert!(
-            wait_for_file(
-                &root.child(format!("{env_name}-started")),
-                Duration::from_secs(5)
-            ),
-            "{env_name} did not enter its gateway loop"
+        wait_for_started_pid(
+            &root.child(format!("{env_name}-started")),
+            runtime_child_pid(&initial_runtime, env_name).unwrap(),
         );
     }
     let initial_target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
@@ -792,6 +805,14 @@ fn snapshot_create_preserves_all_running_siblings_and_restores_target() {
         Some(initial_target_pid),
         "snapshot target PID did not change across cold capture"
     );
+    assert!(wait_for_file_value(
+        &root.child("target-started"),
+        &format!(
+            "{initial_target_pid}\n{}",
+            runtime_child_pid(&final_runtime, "target").unwrap()
+        ),
+        Duration::from_secs(5)
+    ));
     assert_eq!(
         fs::read_to_string(root.child("target-started"))
             .unwrap()
@@ -892,10 +913,10 @@ fn snapshot_create_preserves_stopped_target_and_running_siblings() {
         wait_for_runtime_children(&runtime_path, 2, Some("sibling-a"), Duration::from_secs(5))
             .expect("daemon runtime state did not report both running siblings");
     for env_name in ["sibling-a", "sibling-b"] {
-        assert!(wait_for_file(
+        wait_for_started_pid(
             &root.child(format!("{env_name}-started")),
-            Duration::from_secs(5)
-        ));
+            runtime_child_pid(&initial_runtime, env_name).unwrap(),
+        );
     }
     let initial_siblings = ["sibling-a", "sibling-b"].map(|name| {
         (
@@ -1043,6 +1064,11 @@ fn failed_upgrade_rollback_preserves_running_sibling_despite_unrelated_drift() {
     let initial_target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
     let initial_sibling_runtime = runtime_child(&initial_runtime, "sibling");
     let initial_sibling_state = persisted_child(&state_path, "sibling");
+    wait_for_started_pid(&target_started, initial_target_pid);
+    wait_for_started_pid(
+        &sibling_started,
+        runtime_child_pid(&initial_runtime, "sibling").unwrap(),
+    );
     let initial_sibling = run_ocm(&cwd, &env, &["env", "show", "sibling", "--json"]);
     assert!(
         initial_sibling.status.success(),
@@ -1736,6 +1762,7 @@ fn publishing_an_unbound_runtime_preserves_unrelated_active_child_spec_and_pid()
         wait_for_runtime_children(&runtime_path, 1, Some("env-a"), Duration::from_secs(5))
             .expect("daemon runtime state did not report env-a");
     let initial_pid = runtime_child_pid(&initial_runtime, "env-a").unwrap();
+    wait_for_started_pid(&started, initial_pid);
 
     let mut latent_runtime_meta = read_persisted_service_state(&runtime_meta_path);
     latent_runtime_meta["releaseVersion"] = Value::String("latent-v2".to_string());
@@ -1850,6 +1877,8 @@ fn targeted_runtime_refresh_ignores_unrelated_drift_and_restarts_effective_chang
     let env_b_pid = runtime_child_pid(&initial_runtime, "env-b").unwrap();
 
     let mut runtime_a_meta = read_persisted_service_state(&runtime_a_meta_path);
+    wait_for_started_pid(&runtime_a_started, env_a_pid);
+    wait_for_started_pid(&runtime_b_started, env_b_pid);
     runtime_a_meta["releaseVersion"] = Value::String("latent-a-v2".to_string());
     write_persisted_service_state(&runtime_a_meta_path, &runtime_a_meta);
 
@@ -1891,9 +1920,15 @@ fn targeted_runtime_refresh_ignores_unrelated_drift_and_restarts_effective_chang
         Duration::from_secs(10),
     )
     .expect("effective runtime change did not replace only env-b");
-    sleep(Duration::from_millis(500));
     let final_a_pid = runtime_child_pid(&changed_runtime, "env-a").unwrap();
     let final_b_pid = runtime_child_pid(&changed_runtime, "env-b").unwrap();
+    // A published child PID can precede the fixture's startup record.
+    assert!(wait_for_file_value(
+        &runtime_b_started,
+        &format!("{env_b_pid}\n{final_b_pid}"),
+        Duration::from_secs(5)
+    ));
+    sleep(Duration::from_millis(500));
     let runtime_a_start_count = fs::read_to_string(&runtime_a_started)
         .unwrap()
         .lines()
@@ -1992,6 +2027,8 @@ fn service_uninstall_removes_only_target_child_despite_unrelated_drift() {
         .expect("daemon runtime state did not report both children");
     let target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
     let sibling_pid = runtime_child_pid(&initial_runtime, "sibling").unwrap();
+    wait_for_started_pid(&target_started, target_pid);
+    wait_for_started_pid(&sibling_started, sibling_pid);
 
     let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
     let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
@@ -2780,10 +2817,15 @@ fn daemon_stops_the_full_dev_process_tree_after_service_stop() {
     write_legacy_openclaw_script(
         &script,
         &format!(
-            "#!/bin/sh\nsh -c 'echo $$ > \"{}\"; trap \"exit 0\" TERM INT; while :; do sleep 1; done' &\nprintf 'started\\n' >> '{}'\ntrap 'printf \"stopped\\n\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
-            path_string(&child_pid_file),
-            path_string(&started),
-            path_string(&stopped),
+            r#"#!/bin/sh
+sh -c 'trap "exit 0" TERM INT; printf "%s\n" "$$" > "$1.tmp"; mv "$1.tmp" "$1"; while :; do sleep 1; done' sh '{child_pid_file}' &
+trap 'printf "stopped\n" >> "{stopped}"; exit 0' TERM INT
+printf 'started\n' >> '{started}'
+while :; do sleep 1; done
+"#,
+            child_pid_file = path_string(&child_pid_file),
+            started = path_string(&started),
+            stopped = path_string(&stopped),
         ),
     );
 
@@ -2847,7 +2889,7 @@ fn daemon_cleans_descendants_after_a_child_exits_before_restart() {
     write_legacy_openclaw_script(
         &script,
         &format!(
-            "#!/bin/sh\ncount=0\nif [ -f '{starts}' ]; then count=$(cat '{starts}'); fi\ncount=$((count + 1))\nprintf '%s\n' \"$count\" > '{starts}'\nif [ \"$count\" -eq 1 ]; then\n  trap '' HUP\n  sleep 60 &\n  printf '%s\n' \"$!\" > '{descendant_pid_file}'\n  sleep 1\n  exit 1\nfi\nsleep 10\n",
+            "#!/bin/sh\ncount=0\nif [ -f '{starts}' ]; then count=$(cat '{starts}'); fi\ncount=$((count + 1))\nprintf '%s\n' \"$count\" > '{starts}'\nif [ \"$count\" -eq 1 ]; then\n  trap '' HUP\n  sleep 60 &\n  printf '%s\n' \"$!\" > '{descendant_pid_file}.tmp'\n  mv '{descendant_pid_file}.tmp' '{descendant_pid_file}'\n  sleep 1\n  exit 1\nfi\nsleep 10\n",
             starts = path_string(&starts),
             descendant_pid_file = path_string(&descendant_pid_file),
         ),

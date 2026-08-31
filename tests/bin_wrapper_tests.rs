@@ -26,8 +26,10 @@ fn bin_wrapper_runs_with_an_overridden_home() {
     std::fs::create_dir_all(&ocm_home).unwrap();
     std::fs::create_dir_all(&shim_bin).unwrap();
 
-    let rustup = find_executable("rustup").expect("rustup must be available for wrapper tests");
-    std::os::unix::fs::symlink(rustup, shim_bin.join("cargo")).unwrap();
+    let cargo = find_executable("rustup")
+        .or_else(|| find_executable("cargo"))
+        .expect("cargo must be available for wrapper tests");
+    std::os::unix::fs::symlink(cargo, shim_bin.join("cargo")).unwrap();
     let path = std::env::join_paths(std::iter::once(shim_bin).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     )))
