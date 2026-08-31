@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
+use ocm::infra::download::file_sha256;
 use ocm::store::{env_registry_path, now_utc, supervisor_runtime_path, supervisor_state_path};
 use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
 use serde_json::Value;
@@ -347,6 +348,11 @@ case "$1" in
         echo "missing managed Codex candidate flags" >&2
         exit 1
       }}
+      if [ "${{OCM_TEST_INVALID_CONFIG_UNTIL_DOCTOR:-}}" = "1" ] &&
+         [ ! -f "$home/.openclaw/config-repaired" ]; then
+        printf '{{"ok":false,"checksRun":1,"checksSkipped":0,"findings":[{{"checkId":"core/doctor/final-config-validation","severity":"error","message":"Unrecognized legacy config key","path":"meta.lastTouchedAt"}}]}}\n'
+        exit 1
+      fi
       case "${{OCM_TEST_CODEX_PREFLIGHT:-unsupported}}" in
         pass)
           printf '{{"ok":true,"checksRun":1,"checksSkipped":0,"findings":[]}}\n'
@@ -680,6 +686,37 @@ fn sha512_integrity(body: &[u8]) -> String {
     )
 }
 
+fn enable_migratable_target_config(env_root: &Path, env: &mut BTreeMap<String, String>) {
+    fs::write(
+        env_root.join(".openclaw/openclaw.json"),
+        "{\"meta\":{\"lastTouchedAt\":\"legacy\"}}\n",
+    )
+    .unwrap();
+    env.insert(
+        "OCM_TEST_INVALID_CONFIG_UNTIL_DOCTOR".to_string(),
+        "1".to_string(),
+    );
+    env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "pass".to_string());
+}
+
+fn assert_repair_candidate_finalize_order(command_log: &str) {
+    let validate_before = command_log.find("config validate").unwrap();
+    let doctor = command_log
+        .find("doctor --non-interactive --fix")
+        .expect("target config repair must run");
+    let validate_after = command_log.rfind("config validate").unwrap();
+    let candidate = command_log
+        .find("doctor --lint --only codex/managed-app-server --json")
+        .expect("candidate managed Codex check must run");
+    let finalize = command_log
+        .find("update finalize --json --yes --no-restart")
+        .expect("target finalization must run");
+    assert!(validate_before < doctor, "{command_log}");
+    assert!(doctor < validate_after, "{command_log}");
+    assert!(validate_after < candidate, "{command_log}");
+    assert!(candidate < finalize, "{command_log}");
+}
+
 fn init_openclaw_repo(root: &TestDir) -> PathBuf {
     let repo = root.child("repo/openclaw");
     fs::create_dir_all(repo.join("scripts")).unwrap();
@@ -885,6 +922,8 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
         &["start", "demo", "--port", &health_port.to_string()],
     );
     assert!(start.status.success(), "{}", stderr(&start));
+    let env_root = root.child("ocm-home/envs/demo");
+    enable_migratable_target_config(&env_root, &mut env);
 
     env.insert(
         "OCM_TEST_GATEWAY_AUTH_HANDSHAKE".to_string(),
@@ -956,22 +995,16 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
     let env_show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(env_show.status.success(), "{}", stderr(&env_show));
     let env_json: Value = serde_json::from_str(&stdout(&env_show)).unwrap();
-    let env_root = Path::new(env_json["root"].as_str().unwrap());
+    assert_eq!(env_json["root"], path_string(&env_root));
     let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
-    let candidate_preflight = command_log
-        .find("doctor --lint --only codex/managed-app-server --json")
-        .expect("staged official runtime must run the candidate preflight");
-    let finalization = command_log
-        .find("update finalize --json --yes --no-restart")
-        .expect("updated runtime must finalize");
-    assert!(candidate_preflight < finalization, "{command_log}");
+    assert_repair_candidate_finalize_order(&command_log);
     assert!(
         command_log.contains("update finalize --json --yes --no-restart"),
         "{command_log}"
     );
     assert!(command_log.contains("--version"), "{command_log}");
     assert!(
-        !command_log.contains("doctor --non-interactive --fix"),
+        command_log.contains("doctor --non-interactive --fix"),
         "{command_log}"
     );
     assert!(
@@ -1001,7 +1034,7 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
     assert_eq!(record["target"]["openclawVersion"], "2026.3.25");
     assert_eq!(record["snapshotId"], snapshot_json[0]["id"]);
     assert_eq!(record["outcome"], "updated");
-    assert_eq!(record["migration"]["status"], "validated");
+    assert_eq!(record["migration"]["status"], "repaired");
     assert_eq!(record["finalization"]["status"], "completed");
     assert_eq!(record["serviceBefore"]["running"], true);
     assert_eq!(record["serviceAfter"]["running"], true);
@@ -2476,6 +2509,8 @@ fn upgrade_accepts_correction_release_and_freezes_channel_selection() {
         &["start", "demo", "--version", stable_version, "--no-service"],
     );
     assert!(start.status.success(), "{}", stderr(&start));
+    let env_root = root.child("ocm-home/envs/demo");
+    enable_migratable_target_config(&env_root, &mut env);
     let requests_before_upgrade = packument_server.requests().len();
 
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--channel", "stable"]);
@@ -2494,6 +2529,89 @@ fn upgrade_accepts_correction_release_and_freezes_channel_selection() {
     assert!(runtime.status.success(), "{}", stderr(&runtime));
     let runtime: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
     assert_eq!(runtime["releaseVersion"], correction_version);
+    let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
+    assert_repair_candidate_finalize_order(&command_log);
+}
+
+#[test]
+fn upgrade_manifest_backed_runtime_repairs_config_before_candidate_validation() {
+    let root = TestDir::new("upgrade-manifest-runtime-config-repair");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let source_version = "2026.7.1";
+    let target_version = "2026.8.1";
+    let source_body = recording_openclaw_script(source_version).into_bytes();
+    let target_body = recording_openclaw_script(target_version).into_bytes();
+    let source_digest_path = root.child("sha256/openclaw-2026.7.1");
+    let target_digest_path = root.child("sha256/openclaw-2026.8.1");
+    fs::create_dir_all(source_digest_path.parent().unwrap()).unwrap();
+    fs::write(&source_digest_path, &source_body).unwrap();
+    fs::write(&target_digest_path, &target_body).unwrap();
+    let source_sha256 = file_sha256(&source_digest_path).unwrap();
+    let target_sha256 = file_sha256(&target_digest_path).unwrap();
+    let source_server = TestHttpServer::serve_bytes(
+        "/artifacts/openclaw-2026.7.1",
+        "application/octet-stream",
+        &source_body,
+    );
+    let target_server = TestHttpServer::serve_bytes(
+        "/artifacts/openclaw-2026.8.1",
+        "application/octet-stream",
+        &target_body,
+    );
+    let initial_manifest = format!(
+        "{{\"releases\":[{{\"version\":\"{source_version}\",\"channel\":\"stable\",\"url\":\"{}\",\"sha256\":\"{source_sha256}\"}}]}}",
+        source_server.url()
+    );
+    let updated_manifest = format!(
+        "{{\"releases\":[{{\"version\":\"{target_version}\",\"channel\":\"stable\",\"url\":\"{}\",\"sha256\":\"{target_sha256}\"}}]}}",
+        target_server.url()
+    );
+    let manifest_server = TestHttpServer::serve_bytes_sequence(
+        "/manifests/releases.json",
+        "application/json",
+        vec![
+            initial_manifest.into_bytes(),
+            updated_manifest.clone().into_bytes(),
+            updated_manifest.into_bytes(),
+        ],
+    );
+    let mut env = ocm_env(&root);
+
+    let install = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "stable",
+            "--manifest-url",
+            &manifest_server.url(),
+            "--channel",
+            "stable",
+        ],
+    );
+    assert!(install.status.success(), "{}", stderr(&install));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--runtime", "stable"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let env_root = root.child("ocm-home/envs/demo");
+    enable_migratable_target_config(&env_root, &mut env);
+
+    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo"]);
+    assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+    assert!(stdout(&upgrade).contains("outcome=updated"));
+
+    let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
+    assert!(runtime.status.success(), "{}", stderr(&runtime));
+    let runtime: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
+    assert_eq!(runtime["releaseVersion"], target_version);
+    let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
+    assert_repair_candidate_finalize_order(&command_log);
 }
 
 #[test]
@@ -3532,6 +3650,8 @@ fn upgrade_can_switch_a_local_launcher_env_to_a_published_runtime() {
         ],
     );
     assert!(start.status.success(), "{}", stderr(&start));
+    let env_root = root.child("ocm-home/envs/hacking");
+    enable_migratable_target_config(&env_root, &mut env);
 
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "hacking", "--channel", "stable"]);
     assert!(upgrade.status.success(), "{}", stderr(&upgrade));
@@ -3545,6 +3665,8 @@ fn upgrade_can_switch_a_local_launcher_env_to_a_published_runtime() {
     let env_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
     assert_eq!(env_json["defaultRuntime"], "stable");
     assert!(env_json["defaultLauncher"].is_null());
+    let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
+    assert_repair_candidate_finalize_order(&command_log);
 }
 
 #[test]
@@ -5648,7 +5770,7 @@ fn setup_named_runtime_candidate_fixture(
 }
 
 #[test]
-fn upgrade_validates_managed_codex_candidate_before_transactional_cutover() {
+fn upgrade_validates_managed_codex_candidate_before_finalization() {
     let root = TestDir::new("upgrade-codex-candidate-preflight");
     let (cwd, mut env, env_root) = setup_named_runtime_candidate_fixture(&root);
     env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "pass".to_string());
@@ -5667,43 +5789,122 @@ fn upgrade_validates_managed_codex_candidate_before_transactional_cutover() {
 }
 
 #[test]
-fn managed_codex_candidate_failure_stops_before_upgrade_mutation() {
+fn upgrade_repairs_migratable_config_before_managed_codex_candidate_validation() {
+    let root = TestDir::new("upgrade-codex-candidate-after-config-repair");
+    let (cwd, mut env, env_root) = setup_named_runtime_candidate_fixture(&root);
+    enable_migratable_target_config(&env_root, &mut env);
+
+    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new-local"]);
+    assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+
+    let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
+    assert_repair_candidate_finalize_order(&command_log);
+}
+
+#[test]
+fn managed_codex_candidate_failure_rolls_back_repaired_state_before_publication() {
     let root = TestDir::new("upgrade-codex-candidate-preflight-failure");
     let (cwd, mut env, env_root) = setup_named_runtime_candidate_fixture(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let install = run_ocm(&cwd, &env, &["service", "install", "demo"]);
+    assert!(install.status.success(), "{}", stderr(&install));
+    let stop = run_ocm(&cwd, &env, &["service", "stop", "demo"]);
+    assert!(stop.status.success(), "{}", stderr(&stop));
+    enable_migratable_target_config(&env_root, &mut env);
     env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "fail".to_string());
     let config_path = env_root.join(".openclaw/openclaw.json");
     let config_before = fs::read(&config_path).unwrap();
+    let state_marker = env_root.join(".openclaw/workspace/state-marker");
+    fs::create_dir_all(state_marker.parent().unwrap()).unwrap();
+    fs::write(&state_marker, "source-state\n").unwrap();
+    let command_log_path = root.child("candidate-failure-commands.log");
+    env.insert(
+        "OCM_TEST_COMMAND_LOG".to_string(),
+        path_string(&command_log_path),
+    );
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let observer_done = Arc::new(AtomicBool::new(false));
+    let observer_done_thread = Arc::clone(&observer_done);
+    let saw_target_binding = Arc::new(AtomicBool::new(false));
+    let saw_target_binding_thread = Arc::clone(&saw_target_binding);
+    let observer = thread::spawn(move || {
+        while !observer_done_thread.load(Ordering::Relaxed) {
+            let binding = fs::read(&registry_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|registry| registry["envs"].as_array().cloned())
+                .and_then(|envs| envs.into_iter().find(|entry| entry["name"] == "demo"))
+                .and_then(|entry| entry["defaultRuntime"].as_str().map(str::to_string));
+            if binding.as_deref() == Some("new-local") {
+                saw_target_binding_thread.store(true, Ordering::Relaxed);
+            }
+            sleep(Duration::from_millis(1));
+        }
+    });
 
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new-local"]);
+    observer_done.store(true, Ordering::Relaxed);
+    observer.join().unwrap();
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
     let output = stdout(&upgrade);
-    assert!(output.contains("outcome=failed"), "{output}");
-    assert!(
-        output.contains("source environment and service were left unchanged"),
-        "{output}"
-    );
+    assert!(output.contains("outcome=rolled-back"), "{output}");
+    assert!(output.contains("rollback=restored"), "{output}");
     assert!(
         output.contains("expected 0.147.0, detected 0.146.0"),
         "{output}"
     );
+    assert!(!saw_target_binding.load(Ordering::Relaxed));
 
     let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(show.status.success(), "{}", stderr(&show));
     let env_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
     assert_eq!(env_json["defaultRuntime"], "old-local");
+    assert_eq!(env_json["serviceEnabled"], true);
+    assert_eq!(env_json["serviceRunning"], false);
     assert_eq!(fs::read(&config_path).unwrap(), config_before);
+    assert_eq!(fs::read_to_string(&state_marker).unwrap(), "source-state\n");
+    assert!(!env_root.join(".openclaw/config-repaired").exists());
 
     let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "demo", "--json"]);
     assert!(snapshots.status.success(), "{}", stderr(&snapshots));
     let snapshots_json: Value = serde_json::from_str(&stdout(&snapshots)).unwrap();
-    assert!(snapshots_json.as_array().unwrap().is_empty());
-    assert!(!root.child("ocm-home/upgrade-history/demo").exists());
+    assert_eq!(snapshots_json.as_array().unwrap().len(), 1);
 
-    let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
+    let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+    assert!(history.status.success(), "{}", stderr(&history));
+    let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
+    assert_eq!(history[0]["outcome"], "rolled-back");
+    assert_eq!(history[0]["rollback"], "restored");
+    assert_eq!(history[0]["migration"]["status"], "repaired");
+    assert_eq!(history[0]["finalization"]["status"], "not-run");
+    let phases = history[0]["phases"].as_array().unwrap();
     assert!(
-        command_log.contains("doctor --lint --only codex/managed-app-server --json"),
-        "{command_log}"
+        phases
+            .iter()
+            .any(|phase| phase["phase"] == "managedCodexCandidate" && phase["outcome"] == "failed")
     );
-    assert!(!command_log.contains("config validate"), "{command_log}");
+    assert!(
+        !phases
+            .iter()
+            .any(|phase| phase["phase"] == "openclawFinalize"),
+        "{phases:?}"
+    );
+    assert!(
+        !phases
+            .iter()
+            .any(|phase| phase["phase"] == "bindingPublish"),
+        "{phases:?}"
+    );
+
+    let command_log = fs::read_to_string(command_log_path).unwrap();
+    let doctor = command_log.find("doctor --non-interactive --fix").unwrap();
+    let candidate = command_log
+        .find("doctor --lint --only codex/managed-app-server --json")
+        .unwrap();
+    assert!(doctor < candidate, "{command_log}");
     assert!(!command_log.contains("update finalize"), "{command_log}");
 }

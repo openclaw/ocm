@@ -395,6 +395,16 @@ impl UpgradeTarget {
     }
 }
 
+fn managed_codex_candidate_args() -> [String; 5] {
+    [
+        "doctor".to_string(),
+        "--lint".to_string(),
+        "--only".to_string(),
+        "codex/managed-app-server".to_string(),
+        "--json".to_string(),
+    ]
+}
+
 impl Cli {
     pub(super) fn upgrade_env_to_runtime_target(
         &self,
@@ -2331,7 +2341,7 @@ impl Cli {
             };
             let binding_changed = prepared.name != current.name;
             let post_update =
-                match self.run_post_core_update(env_name, &prepared.name, &mut transaction.timings)
+                match self.run_post_core_update(env_name, &prepared.meta, &mut transaction.timings)
                 {
                     Ok(result) => {
                         transaction.mark_post_update_completed(result.note.as_deref());
@@ -2632,7 +2642,7 @@ impl Cli {
                 }
             };
             let (post_update_note, completion_deferred) = if changed {
-                match self.run_post_core_update(env_name, &prepared.name, &mut transaction.timings)
+                match self.run_post_core_update(env_name, &prepared.meta, &mut transaction.timings)
                 {
                     Ok(result) => {
                         transaction.mark_post_update_completed(result.note.as_deref());
@@ -2875,7 +2885,7 @@ impl Cli {
             }
         };
         let post_update =
-            match self.run_post_core_update(env_name, &updated.name, &mut transaction.timings) {
+            match self.run_post_core_update(env_name, &updated, &mut transaction.timings) {
                 Ok(result) => {
                     transaction.mark_post_update_completed(result.note.as_deref());
                     result
@@ -3161,7 +3171,7 @@ impl Cli {
             }
         };
         let post_update =
-            match self.run_post_core_update(env_name, &prepared.name, &mut transaction.timings) {
+            match self.run_post_core_update(env_name, &prepared.meta, &mut transaction.timings) {
                 Ok(result) => {
                     transaction.mark_post_update_completed(result.note.as_deref());
                     result
@@ -3471,26 +3481,26 @@ impl Cli {
                 self.prepare_resolved_upgrade_target(env_name, target, resolved)
             })?
         };
-        self.validate_prepared_upgrade_target(env_name, &prepared)?;
+        let mut candidate_meta = prepared.meta.clone();
+        candidate_meta.binary_path = display_path(&prepared.prepared_binary_path);
+        resolve_runtime_launch(
+            &candidate_meta,
+            &managed_codex_candidate_args(),
+            &self.env,
+            &self.cwd,
+            true,
+        )
+        .map_err(|error| format!("candidate managed Codex preflight failed: {error}"))?;
         Ok(prepared)
     }
 
-    fn validate_prepared_upgrade_target(
+    fn validate_committed_upgrade_target(
         &self,
         env_name: &str,
-        prepared: &PreparedUpgradeTarget,
+        runtime: &RuntimeMeta,
     ) -> Result<(), String> {
-        const CHECK_ID: &str = "codex/managed-app-server";
-        let args = [
-            "doctor".to_string(),
-            "--lint".to_string(),
-            "--only".to_string(),
-            CHECK_ID.to_string(),
-            "--json".to_string(),
-        ];
-        let mut meta = prepared.meta.clone();
-        meta.binary_path = display_path(&prepared.prepared_binary_path);
-        let launch = resolve_runtime_launch(&meta, &args, &self.env, &self.cwd, true)
+        let args = managed_codex_candidate_args();
+        let launch = resolve_runtime_launch(runtime, &args, &self.env, &self.cwd, true)
             .map_err(|error| format!("candidate managed Codex preflight failed: {error}"))?;
         let env_meta = self
             .environment_service()
@@ -3527,7 +3537,7 @@ impl Cli {
             return Ok(());
         }
         Err(format!(
-            "candidate managed Codex preflight failed: {}. Repair or reinstall the staged OpenClaw runtime, then rerun the upgrade; the source environment was not changed",
+            "candidate managed Codex preflight failed: {}. Repair or reinstall the target OpenClaw runtime, then rerun the upgrade",
             output.failure_summary()
         ))
     }
@@ -3774,17 +3784,37 @@ impl Cli {
     fn run_post_core_update(
         &self,
         env_name: &str,
-        runtime_name: &str,
+        runtime: &RuntimeMeta,
         timings: &mut UpgradeTimingRecorder,
     ) -> Result<PostCoreUpdateResult, String> {
         // Resolve the replacement explicitly while the previous binding remains published.
         // A failed finalizer can then roll back without ever activating the replacement.
         let config_repaired =
-            self.repair_target_openclaw_config(env_name, runtime_name, timings)?;
+            self.repair_target_openclaw_config(env_name, &runtime.name, timings)?;
+        let candidate_started = timings.start();
+        let candidate_result = self.validate_committed_upgrade_target(env_name, runtime);
+        timings.finish(
+            "ocm",
+            "managedCodexCandidate",
+            "stopped",
+            candidate_started,
+            if candidate_result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        candidate_result.map_err(|error| {
+            if config_repaired {
+                format!("candidate validation failed after target config repair: {error}")
+            } else {
+                error
+            }
+        })?;
         let finalize_started = timings.start();
         let output = match self.run_update_mode_openclaw_command_output_with_env(
             env_name,
-            runtime_name,
+            &runtime.name,
             "openclaw update finalize",
             &["update", "finalize", "--json", "--yes", "--no-restart"],
             &[("OPENCLAW_UPDATE_POST_CORE", "1")],
@@ -4833,6 +4863,14 @@ impl UpgradeTransaction {
         if error.contains("openclaw update finalize failed") {
             self.migration.status = "validated".to_string();
             self.finalization.status = "failed".to_string();
+        } else if error.contains("candidate managed Codex preflight failed") {
+            self.migration.status =
+                if error.starts_with("candidate validation failed after target config repair") {
+                    "repaired".to_string()
+                } else {
+                    "validated".to_string()
+                };
+            self.finalization.status = "not-run".to_string();
         } else {
             self.migration.status = "failed".to_string();
             self.finalization.status = "not-run".to_string();
