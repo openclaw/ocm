@@ -460,14 +460,14 @@ impl Cli {
         }
         if matches!(args.first().map(String::as_str), Some("simulate")) {
             let summaries = self.upgrade_simulate(args[1..].to_vec())?;
-            let failed = summaries.iter().any(|summary| summary.outcome == "failed");
+            let requires_attention = summaries.iter().any(simulation_requires_attention);
             if json_flag {
                 if summaries.len() == 1 {
                     self.print_json(&summaries[0])?;
                 } else {
                     self.print_json(&build_simulation_batch_summary(summaries))?;
                 }
-                return Ok(if failed { 1 } else { 0 });
+                return Ok(if requires_attention { 1 } else { 0 });
             }
             if summaries.len() == 1 {
                 self.stdout_lines(render::upgrade::upgrade_simulation(
@@ -482,7 +482,7 @@ impl Cli {
                     &self.command_example(),
                 ));
             }
-            return Ok(if failed { 1 } else { 0 });
+            return Ok(if requires_attention { 1 } else { 0 });
         }
 
         let (args, dry_run) = Self::consume_flag(args, "--dry-run");
@@ -2135,12 +2135,7 @@ impl Cli {
                 summary.cleanup = "cleaned".to_string();
             }
             Err(error) => {
-                summary.cleanup = "failed".to_string();
-                summary.checks.push(UpgradeSimulationCheck::failed(
-                    "cleanup simulation env",
-                    error,
-                ));
-                summary.outcome = "failed".to_string();
+                record_simulation_cleanup_failure(&mut summary, "cleanup simulation env", error);
             }
         }
         Ok(summary)
@@ -2166,12 +2161,11 @@ impl Cli {
                     .iter_mut()
                     .filter(|summary| summary.to_binding_name == prepared_runtime.name)
                 {
-                    summary.cleanup = "failed".to_string();
-                    summary.checks.push(UpgradeSimulationCheck::failed(
+                    record_simulation_cleanup_failure(
+                        summary,
                         "cleanup simulation runtime",
                         error.clone(),
-                    ));
-                    summary.outcome = "failed".to_string();
+                    );
                 }
                 Ok(())
             }
@@ -5048,6 +5042,21 @@ fn build_simulation_batch_summary(
     }
 }
 
+fn simulation_requires_attention(summary: &UpgradeSimulationSummary) -> bool {
+    summary.outcome == "failed" || summary.cleanup == "failed"
+}
+
+fn record_simulation_cleanup_failure(
+    summary: &mut UpgradeSimulationSummary,
+    check_name: &str,
+    error: String,
+) {
+    summary.cleanup = "failed".to_string();
+    summary
+        .checks
+        .push(UpgradeSimulationCheck::failed(check_name, error));
+}
+
 fn missing_simulation_version_error(version: &str, releases: &[OpenClawRelease]) -> String {
     let prefix = format!("{version}-");
     let nearby = releases
@@ -5452,11 +5461,65 @@ fn gateway_auth_failure_proves_reachable(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_codex_preflight_is_unsupported, command_output_reports_unsupported_command,
-        parse_openclaw_finalize_phases, release_version_from_output,
-        summarize_command_failure_text, verify_gateway_status_readiness,
-        version_output_matches_expected,
+        UpgradeSimulationSummary, candidate_codex_preflight_is_unsupported,
+        command_output_reports_unsupported_command, parse_openclaw_finalize_phases,
+        record_simulation_cleanup_failure, release_version_from_output,
+        simulation_requires_attention, summarize_command_failure_text,
+        verify_gateway_status_readiness, version_output_matches_expected,
     };
+
+    fn simulation_summary(outcome: &str, cleanup: &str) -> UpgradeSimulationSummary {
+        UpgradeSimulationSummary {
+            scenario: "current".to_string(),
+            source_env: "source".to_string(),
+            simulation_env: "simulation".to_string(),
+            from_binding_kind: "runtime".to_string(),
+            from_binding_name: "from".to_string(),
+            to_binding_kind: "runtime".to_string(),
+            to_binding_name: "to".to_string(),
+            to: "target".to_string(),
+            outcome: outcome.to_string(),
+            checks: Vec::new(),
+            cleanup_command: "ocm env destroy simulation --yes".to_string(),
+            cleanup: cleanup.to_string(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn simulation_exit_status_requires_attention_for_validation_or_cleanup_failure() {
+        assert!(!simulation_requires_attention(&simulation_summary(
+            "passed", "cleaned"
+        )));
+        assert!(simulation_requires_attention(&simulation_summary(
+            "failed", "cleaned"
+        )));
+        assert!(simulation_requires_attention(&simulation_summary(
+            "passed", "failed"
+        )));
+    }
+
+    #[test]
+    fn simulation_cleanup_failure_preserves_functional_outcome() {
+        let mut summary = simulation_summary("passed", "pending");
+
+        record_simulation_cleanup_failure(
+            &mut summary,
+            "cleanup simulation env",
+            "generated output remains".to_string(),
+        );
+
+        assert_eq!(summary.outcome, "passed");
+        assert_eq!(summary.cleanup, "failed");
+        assert!(simulation_requires_attention(&summary));
+        assert_eq!(summary.checks.len(), 1);
+        assert_eq!(summary.checks[0].name, "cleanup simulation env");
+        assert_eq!(summary.checks[0].status, "failed");
+        assert_eq!(
+            summary.checks[0].note.as_deref(),
+            Some("generated output remains")
+        );
+    }
 
     #[test]
     fn command_summary_prefers_structured_cli_error_message() {

@@ -725,6 +725,7 @@ fn init_openclaw_repo(root: &TestDir) -> PathBuf {
         r#"{"name":"openclaw","version":"2026.4.20-local"}"#,
     )
     .unwrap();
+    fs::write(repo.join(".gitignore"), "dist/\nnode_modules/\n").unwrap();
     fs::write(repo.join("scripts/run-node.mjs"), "console.log('run');\n").unwrap();
     fs::write(
         repo.join("scripts/watch-node.mjs"),
@@ -733,7 +734,7 @@ fn init_openclaw_repo(root: &TestDir) -> PathBuf {
     .unwrap();
     fs::write(
         repo.join(".gitignore"),
-        "node_modules/\n.artifacts/\ndist/\ndist-runtime/\npackages/*/dist/\n",
+        "node_modules/\n.artifacts/\ndist/\ndist-runtime/\npackages/*/dist/\n.env\n",
     )
     .unwrap();
 
@@ -821,6 +822,9 @@ case "$1" in
   build)
     mkdir -p .artifacts dist dist-runtime packages/demo/dist
     touch .artifacts/build.json dist/index.js dist-runtime/index.js packages/demo/dist/index.js
+    if [ "${OCM_TEST_SIMULATION_PRESERVED_IGNORED_FILE:-}" = "1" ]; then
+      touch .env
+    fi
     echo "$1 ok"
     exit 0
     ;;
@@ -836,6 +840,10 @@ case "$1" in
         exit 0
         ;;
       doctor)
+        if [ "${OCM_TEST_SIMULATION_DOCTOR_OK:-}" = "1" ]; then
+          echo '{"status":"ok"}'
+          exit 0
+        fi
         echo "Error: Cannot find module 'grammy'" >&2
         exit 1
         ;;
@@ -3216,6 +3224,70 @@ fn upgrade_simulate_reports_local_repo_doctor_failures() {
     let source_json: Value = serde_json::from_str(&stdout(&source)).unwrap();
     assert_eq!(source_json["defaultRuntime"], "stable");
     assert!(source_json["devRepoRoot"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
+    let root = TestDir::new("upgrade-simulate-cleanup-outcome");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let repo = init_openclaw_repo(&root);
+
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    install_fake_simulation_pnpm(&root, &mut env);
+
+    let start = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "start",
+            "demo",
+            "--command",
+            "pnpm openclaw",
+            "--cwd",
+            &path_string(&repo),
+            "--no-service",
+        ],
+    );
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    env.insert("OCM_TEST_SIMULATION_DOCTOR_OK".to_string(), "1".to_string());
+    env.insert(
+        "OCM_TEST_SIMULATION_PRESERVED_IGNORED_FILE".to_string(),
+        "1".to_string(),
+    );
+    let simulate = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "simulate",
+            "demo",
+            "--to",
+            &path_string(&repo),
+            "--json",
+        ],
+    );
+
+    assert_eq!(simulate.status.code(), Some(1), "{}", stderr(&simulate));
+    let json: Value = serde_json::from_str(&stdout(&simulate)).unwrap();
+    assert_eq!(json["outcome"], "passed", "{json:#}");
+    assert_eq!(json["cleanup"], "failed");
+    assert!(
+        json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["name"] == "cleanup simulation env"
+                && check["status"] == "failed"
+                && check["note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("contains ignored local files")),
+        "{json:#}"
+    );
 }
 
 #[test]
