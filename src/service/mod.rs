@@ -179,6 +179,7 @@ impl<'a> ServiceService<'a> {
         if !state.running && !status.running {
             return Ok(None);
         }
+        self.preserve_operation_owner_before_managed_quiescence(name, &status)?;
         if state.running {
             self.stop_locked(name)?;
         }
@@ -191,6 +192,51 @@ impl<'a> ServiceService<'a> {
             };
         }
         Ok(Some(state))
+    }
+
+    #[cfg(unix)]
+    fn preserve_operation_owner_before_managed_quiescence(
+        &self,
+        name: &str,
+        status: &ServiceSummary,
+    ) -> Result<(), String> {
+        // SAFETY: getpgrp has no preconditions and does not mutate memory.
+        let process_group = unsafe { libc::getpgrp() };
+        if !operation_owner_is_in_managed_gateway_group(
+            name,
+            self.env.get("OCM_ACTIVE_ENV").map(String::as_str),
+            status.child_pid,
+            process_group,
+        ) {
+            return Ok(());
+        }
+
+        // SAFETY: getpid has no preconditions and does not mutate memory.
+        let process_id = unsafe { libc::getpid() };
+        if process_id == process_group {
+            return Err(format!(
+                "cannot quiesce env \"{name}\" from inside its managed Gateway process group because the OCM operation owns that group; run the command from a process outside the Gateway"
+            ));
+        }
+
+        // SAFETY: setpgid(0, 0) moves only the calling process into a new group
+        // whose id is its own pid. No borrowed memory crosses the syscall.
+        if unsafe { libc::setpgid(0, 0) } == -1 {
+            return Err(format!(
+                "failed to preserve the OCM operation before quiescing env \"{name}\": could not move process {process_id} out of managed Gateway process group {process_group}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn preserve_operation_owner_before_managed_quiescence(
+        &self,
+        _name: &str,
+        _status: &ServiceSummary,
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     pub(crate) fn restore_after_snapshot_locked(
@@ -283,5 +329,52 @@ impl<'a> ServiceService<'a> {
 
     pub(crate) fn uninstall_locked(&self, name: &str) -> Result<ServiceActionSummary, String> {
         manage::uninstall_service(name, self.env, self.cwd)
+    }
+}
+
+#[cfg(unix)]
+fn operation_owner_is_in_managed_gateway_group(
+    target_env: &str,
+    active_env: Option<&str>,
+    managed_gateway_pid: Option<u32>,
+    process_group: libc::pid_t,
+) -> bool {
+    active_env == Some(target_env)
+        && managed_gateway_pid.and_then(|pid| libc::pid_t::try_from(pid).ok())
+            == Some(process_group)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::operation_owner_is_in_managed_gateway_group;
+
+    #[test]
+    fn recognizes_an_operation_owned_by_its_target_gateway_group() {
+        assert!(operation_owner_is_in_managed_gateway_group(
+            "odin",
+            Some("odin"),
+            Some(4100),
+            4100,
+        ));
+    }
+
+    #[test]
+    fn leaves_another_environment_operation_in_its_existing_group() {
+        assert!(!operation_owner_is_in_managed_gateway_group(
+            "nimbus",
+            Some("odin"),
+            Some(4100),
+            4100,
+        ));
+    }
+
+    #[test]
+    fn leaves_an_external_operation_in_its_existing_group() {
+        assert!(!operation_owner_is_in_managed_gateway_group(
+            "odin",
+            Some("odin"),
+            Some(4100),
+            5200,
+        ));
     }
 }
