@@ -344,6 +344,170 @@ exit 1
     );
 }
 
+#[cfg(unix)]
+fn install_self_refreshing_launchctl(
+    root: &TestDir,
+    env: &mut BTreeMap<String, String>,
+    old_daemon_pid_path: &Path,
+    replacement_daemon_pid_path: &Path,
+) {
+    let bin_dir = root.child("refresh-launchctl-bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let log_path = root.child("refresh-launchctl.log");
+    let print_path = root.child("refresh-launchctl-print.txt");
+    let old_daemon_stopped_path = root.child("old-daemon-stopped");
+    let daemon_log_path = root.child("replacement-daemon.log");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log_path}'
+case "$1" in
+  managername)
+    printf 'Aqua\n'
+    exit 0
+    ;;
+  print)
+    if [ -f '{print_path}' ]; then
+      /bin/cat '{print_path}'
+      exit 0
+    fi
+    printf 'Could not find service "%s" in domain for user gui\n' "$2" >&2
+    exit 1
+    ;;
+  bootout)
+    if [ -f '{old_daemon_pid_path}' ] && [ ! -f '{old_daemon_stopped_path}' ]; then
+      : > '{old_daemon_stopped_path}'
+      old_daemon_pid=$(/bin/cat '{old_daemon_pid_path}')
+      /bin/kill -TERM "$old_daemon_pid"
+      attempt=0
+      while /bin/kill -0 "$old_daemon_pid" 2>/dev/null && [ "$attempt" -lt 100 ]; do
+        /bin/sleep 0.05
+        attempt=$((attempt + 1))
+      done
+    fi
+    /bin/rm -f '{print_path}'
+    exit 0
+    ;;
+  unload)
+    /bin/rm -f '{print_path}'
+    exit 0
+    ;;
+  enable)
+    exit 0
+    ;;
+  bootstrap)
+    if [ -f '{old_daemon_stopped_path}' ]; then
+      '{ocm}' __daemon run > '{daemon_log_path}' 2>&1 &
+      replacement_daemon_pid=$!
+      printf '%s\n' "$replacement_daemon_pid" > '{replacement_daemon_pid_path}'
+      printf 'state = running\npid = %s\n' "$replacement_daemon_pid" > '{print_path}'
+    else
+      printf 'state = running\npid = 23613\n' > '{print_path}'
+    fi
+    exit 0
+    ;;
+  print-disabled)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+        log_path = path_string(&log_path),
+        print_path = path_string(&print_path),
+        old_daemon_pid_path = path_string(old_daemon_pid_path),
+        old_daemon_stopped_path = path_string(&old_daemon_stopped_path),
+        replacement_daemon_pid_path = path_string(replacement_daemon_pid_path),
+        daemon_log_path = path_string(&daemon_log_path),
+        ocm = path_string(&ocm_test_binary_path()),
+    );
+    let launchctl_path = bin_dir.join("launchctl");
+    write_executable_script(&launchctl_path, &script);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    env.insert(
+        "OCM_INTERNAL_LAUNCHCTL_BIN".to_string(),
+        path_string(&launchctl_path),
+    );
+}
+
+#[cfg(unix)]
+fn write_self_refreshing_gateway_script(
+    path: &Path,
+    started_path: &Path,
+    refresh_gate_path: &Path,
+    refresh_pid_path: &Path,
+    refresh_output_path: &Path,
+    process_groups_path: &Path,
+) {
+    let refresh_launcher = path.with_extension("refresh-ocm");
+    write_executable_script(
+        &refresh_launcher,
+        &format!(
+            r#"#!/bin/sh
+printf 'gateway_pid=%s gateway_pgid=%s refresh_pid=%s refresh_pgid=%s\n' \
+  "$PPID" "$(ps -o pgid= -p "$PPID" | tr -d ' ')" \
+  "$$" "$(ps -o pgid= -p "$$" | tr -d ' ')" > '{process_groups_path}'
+exec '{ocm}' "$@"
+"#,
+            process_groups_path = path_string(process_groups_path),
+            ocm = path_string(&ocm_test_binary_path()),
+        ),
+    );
+    write_executable_script(
+        path,
+        &format!(
+            r#"#!/bin/sh
+if [ "${{1:-}}" = "gateway" ] && [ "${{2:-}}" = "restart-handoff" ]; then
+  exit 64
+fi
+if [ "${{1:-}}" = "gateway" ] && [ "${{2:-}}" = "status" ]; then
+  printf '{{"rpc":{{"ok":true}}}}\n'
+  exit 0
+fi
+if [ "${{1:-}}" = "gateway" ]; then
+  printf '%s\n' "$$" >> '{started_path}'
+  while [ ! -f '{refresh_gate_path}' ]; do
+    /bin/sleep 0.05
+  done
+  if [ ! -f '{refresh_pid_path}' ]; then
+    OPENCLAW_SERVICE_KIND=gateway '{refresh_launcher}' service refresh-daemon \
+      --acknowledge-gateway-restarts --json > '{refresh_output_path}' 2>&1 &
+    printf '%s\n' "$!" > '{refresh_pid_path}'
+  fi
+  exec node - "${{4:-0}}" <<'NODE'
+const http = require('node:http');
+const port = Number(process.argv[2]);
+const server = http.createServer((request, response) => {{
+  response.writeHead(request.url === '/health' ? 200 : 404);
+  response.end(request.url === '/health' ? 'ok' : 'not found');
+}});
+server.listen(port, '127.0.0.1');
+NODE
+fi
+case "${{1:-}}" in
+  --version)
+    printf '2026.8.1\n'
+    exit 0
+    ;;
+  config)
+    printf 'Config valid\n'
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            started_path = path_string(started_path),
+            refresh_gate_path = path_string(refresh_gate_path),
+            refresh_pid_path = path_string(refresh_pid_path),
+            refresh_launcher = path_string(&refresh_launcher),
+            refresh_output_path = path_string(refresh_output_path),
+        ),
+    );
+}
+
 fn runtime_child(body: &Value, env_name: &str) -> Value {
     body["children"]
         .as_array()
@@ -1203,6 +1367,135 @@ exec '{ocm}' "$@"
         stdout(&history),
     );
     assert!(new_started.exists(), "new Gateway was not started");
+}
+
+#[cfg(unix)]
+#[test]
+fn gateway_owned_daemon_refresh_survives_its_source_process_group() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("gateway-owned-daemon-refresh");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS".to_string(),
+        "5000".to_string(),
+    );
+
+    let old_daemon_pid_path = root.child("old-daemon-pid");
+    let replacement_daemon_pid_path = root.child("replacement-daemon-pid");
+    install_self_refreshing_launchctl(
+        &root,
+        &mut env,
+        &old_daemon_pid_path,
+        &replacement_daemon_pid_path,
+    );
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let gateway_port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+
+    let started_path = root.child("gateway-started");
+    let refresh_gate_path = root.child("refresh-gate");
+    let refresh_pid_path = root.child("refresh-pid");
+    let refresh_output_path = root.child("refresh-output");
+    let process_groups_path = root.child("process-groups");
+    let runtime_path = root.child("bin/openclaw");
+    write_self_refreshing_gateway_script(
+        &runtime_path,
+        &started_path,
+        &refresh_gate_path,
+        &refresh_pid_path,
+        &refresh_output_path,
+        &process_groups_path,
+    );
+
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "add",
+            "managed",
+            "--path",
+            &path_string(&runtime_path),
+        ],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "self",
+            "--runtime",
+            "managed",
+            "--port",
+            &gateway_port,
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    set_service_enabled(&cwd, &env, "self", true);
+
+    let service = SupervisorService::new(&env, &cwd);
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+    fs::write(root.child("refresh-launchctl.log"), "").unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    fs::write(&old_daemon_pid_path, daemon.id().to_string()).unwrap();
+    assert!(
+        wait_for_file(&started_path, Duration::from_secs(5)),
+        "managed Gateway did not start"
+    );
+    fs::write(&refresh_gate_path, "go\n").unwrap();
+    assert!(
+        wait_for_file(&refresh_pid_path, Duration::from_secs(5)),
+        "managed Gateway did not launch its daemon refresh"
+    );
+    assert!(
+        wait_for_file(&process_groups_path, Duration::from_secs(2)),
+        "daemon refresh did not record process-group ownership"
+    );
+
+    let process_groups = fs::read_to_string(&process_groups_path).unwrap();
+    let group_values = process_groups
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        group_values.get("gateway_pgid"),
+        group_values.get("refresh_pgid")
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut contract_met = false;
+    while Instant::now() < deadline {
+        let calls = fs::read_to_string(root.child("refresh-launchctl.log")).unwrap_or_default();
+        let output = fs::read_to_string(&refresh_output_path).unwrap_or_default();
+        let starts = fs::read_to_string(&started_path).unwrap_or_default();
+        contract_met = calls.lines().any(|line| line.starts_with("bootstrap "))
+            && output.contains("\"action\": \"refresh\"")
+            && starts.lines().count() >= 2;
+        if contract_met {
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
+
+    let calls = fs::read_to_string(root.child("refresh-launchctl.log")).unwrap_or_default();
+    let output = fs::read_to_string(&refresh_output_path).unwrap_or_default();
+    let starts = fs::read_to_string(&started_path).unwrap_or_default();
+    if let Ok(pid) = fs::read_to_string(&replacement_daemon_pid_path) {
+        let _ = Command::new("kill").args(["-INT", pid.trim()]).status();
+    }
+    stop_process(&mut daemon);
+
+    assert!(
+        contract_met,
+        "gateway-owned daemon refresh did not complete and restart the Gateway\nprocess-groups={process_groups}\nlaunchctl-calls={calls}\nrefresh-output={output}\ngateway-starts={starts}"
+    );
 }
 
 #[test]

@@ -455,6 +455,10 @@ impl<'a> SupervisorService<'a> {
             );
         }
 
+        if before.running {
+            self.preserve_operation_owner_before_daemon_refresh()?;
+        }
+
         // Preserve the persisted desired state exactly. Rebuilding it here could
         // apply unrelated latent drift before the daemon handoff.
         let daemon = self.activate_daemon("refresh")?;
@@ -709,6 +713,25 @@ impl<'a> SupervisorService<'a> {
         write_managed_service_definition(&definition, self.env)?;
         activate_managed_service(&definition.label, &definition.definition_path, self.env)?;
         self.daemon_summary(action)
+    }
+
+    fn preserve_operation_owner_before_daemon_refresh(&self) -> Result<(), String> {
+        let Some(active_env) = self.env.get("OCM_ACTIVE_ENV") else {
+            return Ok(());
+        };
+        let managed_gateway_pid = self.read_runtime_state()?.and_then(|runtime| {
+            runtime
+                .children
+                .into_iter()
+                .find(|child| child.env_name == *active_env)
+                .map(|child| child.pid)
+        });
+        crate::service::preserve_operation_owner_before_managed_gateway_stop(
+            active_env,
+            managed_gateway_pid,
+            self.env,
+            "refreshing the OCM background service",
+        )
     }
 
     fn daemon_summary(&self, action: &str) -> Result<SupervisorDaemonSummary, String> {
