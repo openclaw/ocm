@@ -2,6 +2,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
@@ -13,8 +14,8 @@ use ocm::supervisor::{SupervisorService, sync_supervisor_binding_if_present};
 use serde_json::{Value, to_value};
 
 use crate::support::{
-    TestDir, install_fake_launchctl, install_fake_systemd_tools, ocm_env, ocm_test_binary_path,
-    path_string, run_ocm, stderr, stdout, write_executable_script,
+    TestDir, install_fake_launchctl, install_fake_service_manager, install_fake_systemd_tools,
+    ocm_env, ocm_test_binary_path, path_string, run_ocm, stderr, stdout, write_executable_script,
 };
 
 static DAEMON_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -258,6 +259,97 @@ exit 1
 "#,
             started = path_string(started),
             stopped = path_string(stopped),
+        ),
+    );
+}
+
+#[cfg(unix)]
+fn write_self_upgrading_gateway_script(
+    path: &Path,
+    version: &str,
+    started: &Path,
+    self_upgrade: Option<(&Path, &Path, &Path)>,
+) {
+    let upgrade = self_upgrade.map_or_else(String::new, |(pid_path, groups_path, output_path)| {
+        format!(
+            r#"if [ ! -f '{pid_path}' ]; then
+  OPENCLAW_SERVICE_KIND=gateway '{ocm}' upgrade self --runtime new-runtime --json > '{output_path}' 2>&1 &
+  upgrade_pid=$!
+  printf '%s\n' "$upgrade_pid" > '{pid_path}'
+  printf 'gateway_pid=%s gateway_pgid=%s upgrade_pid=%s upgrade_pgid=%s\n' \
+    "$$" "$(ps -o pgid= -p "$$" | tr -d ' ')" \
+    "$upgrade_pid" "$(ps -o pgid= -p "$upgrade_pid" | tr -d ' ')" > '{groups_path}'
+fi"#,
+            pid_path = path_string(pid_path),
+            groups_path = path_string(groups_path),
+            output_path = path_string(output_path),
+            ocm = path_string(&ocm_test_binary_path()),
+        )
+    });
+    write_executable_script(
+        path,
+        &format!(
+            r#"#!/bin/sh
+if [ "${{1:-}}" = "gateway" ] && [ "${{2:-}}" = "restart-handoff" ]; then
+  exit 64
+fi
+if [ "${{1:-}}" = "gateway" ] && [ "${{2:-}}" = "status" ]; then
+  printf '{{"rpc":{{"ok":true}}}}\n'
+  exit 0
+fi
+if [ "${{1:-}}" = "gateway" ]; then
+  printf '%s\n' "$$" >> '{started}'
+  {upgrade}
+  exec python3 - "${{4:-0}}" <<'PYTHON'
+import http.server
+import sys
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200 if self.path == "/health" else 404)
+        self.end_headers()
+        self.wfile.write(b"ok" if self.path == "/health" else b"not found")
+
+    def log_message(self, *_args):
+        pass
+
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+PYTHON
+fi
+case "${{1:-}}" in
+  --version)
+    printf '{version}\n'
+    exit 0
+    ;;
+  config)
+    printf 'Config valid\n'
+    exit 0
+    ;;
+  doctor)
+    if [ "${{2:-}}" = "--lint" ]; then
+      printf '{{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{{"checkId":"core/doctor/lint-selection","severity":"error","message":"Unknown health check id selected by --only: codex/managed-app-server.","path":"codex/managed-app-server"}}]}}\n'
+      exit 1
+    fi
+    printf 'doctor ok\n'
+    exit 0
+    ;;
+  plugins)
+    printf 'No tracked plugins or hook packs to update.\n'
+    exit 0
+    ;;
+  update)
+    if [ "${{2:-}}" = "finalize" ]; then
+      printf '{{"status":"ok","mode":"finalize"}}\n'
+      exit 0
+    fi
+    printf '{{"dryRun":true}}\n'
+    exit 0
+    ;;
+esac
+printf 'unexpected args: %s\n' "$*" >&2
+exit 1
+"#,
+            started = path_string(started),
         ),
     );
 }
@@ -981,6 +1073,136 @@ fn snapshot_create_preserves_stopped_target_and_running_siblings() {
     }
 
     stop_process(&mut daemon);
+}
+
+#[cfg(unix)]
+#[test]
+fn gateway_owned_upgrade_survives_its_source_process_group() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("gateway-owned-upgrade");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS".to_string(),
+        "5000".to_string(),
+    );
+    install_fake_service_manager(&root, &mut env);
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let gateway_port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+
+    let old_started = root.child("old-started");
+    let new_started = root.child("new-started");
+    let upgrade_pid_path = root.child("upgrade-pid");
+    let process_groups_path = root.child("process-groups");
+    let upgrade_output_path = root.child("upgrade-output");
+    let old_runtime = root.child("bin/old-openclaw");
+    let new_runtime = root.child("bin/new-openclaw");
+    write_self_upgrading_gateway_script(
+        &old_runtime,
+        "2026.8.1",
+        &old_started,
+        Some((
+            &upgrade_pid_path,
+            &process_groups_path,
+            &upgrade_output_path,
+        )),
+    );
+    write_self_upgrading_gateway_script(&new_runtime, "2026.8.2", &new_started, None);
+
+    for (name, path) in [("old-runtime", &old_runtime), ("new-runtime", &new_runtime)] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", name, "--path", &path_string(path)],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "self",
+            "--runtime",
+            "old-runtime",
+            "--port",
+            &gateway_port,
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    set_service_enabled(&cwd, &env, "self", true);
+
+    let service = SupervisorService::new(&env, &cwd);
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    assert!(
+        wait_for_file(&upgrade_pid_path, Duration::from_secs(5)),
+        "managed Gateway did not launch its self-upgrade"
+    );
+    assert!(
+        wait_for_file(&process_groups_path, Duration::from_secs(2)),
+        "managed Gateway did not record process-group ownership"
+    );
+
+    let process_groups = fs::read_to_string(&process_groups_path).unwrap();
+    let group_values = process_groups
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        group_values.get("gateway_pid"),
+        group_values.get("gateway_pgid")
+    );
+    assert_eq!(
+        group_values.get("gateway_pgid"),
+        group_values.get("upgrade_pgid")
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut contract_met = false;
+    while Instant::now() < deadline {
+        let shown = run_ocm(&cwd, &env, &["env", "show", "self", "--json"]);
+        let history = run_ocm(&cwd, &env, &["upgrade", "history", "self", "--json"]);
+        if shown.status.success() && history.status.success() {
+            let shown_json: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+            let history_json: Value = serde_json::from_str(&stdout(&history)).unwrap();
+            contract_met = shown_json["defaultRuntime"] == "new-runtime"
+                && shown_json["serviceRunning"] == true
+                && history_json.as_array().is_some_and(|records| {
+                    records.len() == 1 && records[0]["outcome"] == "switched"
+                });
+            if contract_met {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(100));
+    }
+
+    let shown = run_ocm(&cwd, &env, &["env", "show", "self", "--json"]);
+    let history = run_ocm(&cwd, &env, &["upgrade", "history", "self", "--json"]);
+    let upgrade_output = fs::read_to_string(&upgrade_output_path).unwrap_or_default();
+    if !contract_met
+        && let Ok(upgrade_pid) = fs::read_to_string(&upgrade_pid_path)
+        && process_exists(upgrade_pid.trim().parse().unwrap())
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", upgrade_pid.trim()])
+            .status();
+    }
+    stop_process(&mut daemon);
+
+    assert!(
+        contract_met,
+        "gateway-owned upgrade did not reach a terminal transaction\nprocess-groups={process_groups}\nenv={}\nhistory={}\nupgrade-output={upgrade_output}",
+        stdout(&shown),
+        stdout(&history),
+    );
+    assert!(new_started.exists(), "new Gateway was not started");
 }
 
 #[test]
