@@ -270,20 +270,16 @@ fn write_self_upgrading_gateway_script(
     started: &Path,
     self_upgrade: Option<(&Path, &Path, &Path)>,
 ) {
-    let upgrade = self_upgrade.map_or_else(String::new, |(pid_path, groups_path, output_path)| {
+    let upgrade = self_upgrade.map_or_else(String::new, |(launcher, pid_path, output_path)| {
         format!(
             r#"if [ ! -f '{pid_path}' ]; then
-  OPENCLAW_SERVICE_KIND=gateway '{ocm}' upgrade self --runtime new-runtime --json > '{output_path}' 2>&1 &
+  OPENCLAW_SERVICE_KIND=gateway '{launcher}' upgrade self --runtime new-runtime --json > '{output_path}' 2>&1 &
   upgrade_pid=$!
   printf '%s\n' "$upgrade_pid" > '{pid_path}'
-  printf 'gateway_pid=%s gateway_pgid=%s upgrade_pid=%s upgrade_pgid=%s\n' \
-    "$$" "$(ps -o pgid= -p "$$" | tr -d ' ')" \
-    "$upgrade_pid" "$(ps -o pgid= -p "$upgrade_pid" | tr -d ' ')" > '{groups_path}'
 fi"#,
             pid_path = path_string(pid_path),
-            groups_path = path_string(groups_path),
             output_path = path_string(output_path),
-            ocm = path_string(&ocm_test_binary_path()),
+            launcher = path_string(launcher),
         )
     });
     write_executable_script(
@@ -1098,17 +1094,27 @@ fn gateway_owned_upgrade_survives_its_source_process_group() {
     let upgrade_pid_path = root.child("upgrade-pid");
     let process_groups_path = root.child("process-groups");
     let upgrade_output_path = root.child("upgrade-output");
+    let upgrade_launcher = root.child("bin/self-upgrade-ocm");
     let old_runtime = root.child("bin/old-openclaw");
     let new_runtime = root.child("bin/new-openclaw");
+    write_executable_script(
+        &upgrade_launcher,
+        &format!(
+            r#"#!/bin/sh
+printf 'gateway_pid=%s gateway_pgid=%s upgrade_pid=%s upgrade_pgid=%s\n' \
+  "$PPID" "$(ps -o pgid= -p "$PPID" | tr -d ' ')" \
+  "$$" "$(ps -o pgid= -p "$$" | tr -d ' ')" > '{process_groups}'
+exec '{ocm}' "$@"
+"#,
+            process_groups = path_string(&process_groups_path),
+            ocm = path_string(&ocm_test_binary_path()),
+        ),
+    );
     write_self_upgrading_gateway_script(
         &old_runtime,
         "2026.8.1",
         &old_started,
-        Some((
-            &upgrade_pid_path,
-            &process_groups_path,
-            &upgrade_output_path,
-        )),
+        Some((&upgrade_launcher, &upgrade_pid_path, &upgrade_output_path)),
     );
     write_self_upgrading_gateway_script(&new_runtime, "2026.8.2", &new_started, None);
 
