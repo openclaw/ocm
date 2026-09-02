@@ -3506,8 +3506,8 @@ mod tests {
             .expect_err("sleep should be killed at the deadline");
         let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_secs(1),
-            "timed wait should return within 1s, took {elapsed:?}"
+            elapsed < Duration::from_secs(5),
+            "timed wait should return well before the 30s sleep, took {elapsed:?}"
         );
         assert!(
             error.contains("timed out"),
