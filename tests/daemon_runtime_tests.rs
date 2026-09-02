@@ -296,21 +296,15 @@ fi
 if [ "${{1:-}}" = "gateway" ]; then
   printf '%s\n' "$$" >> '{started}'
   {upgrade}
-  exec python3 - "${{4:-0}}" <<'PYTHON'
-import http.server
-import sys
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200 if self.path == "/health" else 404)
-        self.end_headers()
-        self.wfile.write(b"ok" if self.path == "/health" else b"not found")
-
-    def log_message(self, *_args):
-        pass
-
-http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
-PYTHON
+  exec node - "${{4:-0}}" <<'NODE'
+const http = require('node:http');
+const port = Number(process.argv[2]);
+const server = http.createServer((request, response) => {{
+  response.writeHead(request.url === '/health' ? 200 : 404);
+  response.end(request.url === '/health' ? 'ok' : 'not found');
+}});
+server.listen(port, '127.0.0.1');
+NODE
 fi
 case "${{1:-}}" in
   --version)
