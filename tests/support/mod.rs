@@ -445,6 +445,9 @@ if [ "$1" = "--version" ]; then
   printf '10.0.0\n'
   exit 0
 fi
+if [ -n "${OCM_TEST_NPM_LIFECYCLE_PROBE:-}" ]; then
+  "$OCM_TEST_NPM_LIFECYCLE_PROBE"
+fi
 
 prefix=""
 archive=""
@@ -561,6 +564,9 @@ case "$script" in
         echo "managed npm lifecycle PATH resolved node to ${{resolved_node:-missing}}, expected $0" >&2
         exit 1
       fi
+    fi
+    if [ -n "${{OCM_TEST_NPM_LIFECYCLE_PROBE:-}}" ]; then
+      "$OCM_TEST_NPM_LIFECYCLE_PROBE"
     fi
     prefix=""
     archive=""
