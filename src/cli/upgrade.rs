@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     mpsc,
 };
 use std::thread;
@@ -42,18 +42,59 @@ use crate::store::{
     upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir, write_json,
 };
 
-static UPGRADE_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
-static UPGRADE_CRITICAL_DEPTH: AtomicUsize = AtomicUsize::new(0);
+const UPGRADE_INTERRUPT_REQUESTED: usize = 1 << (usize::BITS - 1);
+const UPGRADE_CRITICAL_DEPTH_MASK: usize = !UPGRADE_INTERRUPT_REQUESTED;
+static UPGRADE_INTERRUPT_STATE: AtomicUsize = AtomicUsize::new(0);
 static UPGRADE_SIGNAL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn request_upgrade_interrupt_in(interrupt_state: &AtomicUsize) -> bool {
+    interrupt_state
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            (state & UPGRADE_CRITICAL_DEPTH_MASK != 0)
+                .then_some(state | UPGRADE_INTERRUPT_REQUESTED)
+        })
+        .is_ok()
+}
+
+fn close_upgrade_interrupt_fence(interrupt_state: &AtomicUsize) -> bool {
+    interrupt_state
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            let depth = state & UPGRADE_CRITICAL_DEPTH_MASK;
+            (depth > 0 && state & UPGRADE_INTERRUPT_REQUESTED == 0).then_some(state - 1)
+        })
+        .is_ok()
+}
+
+fn drop_upgrade_interrupt_fence(interrupt_state: &AtomicUsize) {
+    let dropped = interrupt_state.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+        (state & UPGRADE_CRITICAL_DEPTH_MASK != 0).then_some(state - 1)
+    });
+    assert!(
+        dropped.is_ok(),
+        "dropping an inactive upgrade interrupt fence"
+    );
+}
+
+fn enter_upgrade_interrupt_fence(interrupt_state: &AtomicUsize) -> Result<(), String> {
+    interrupt_state
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            let depth = state & UPGRADE_CRITICAL_DEPTH_MASK;
+            (depth < UPGRADE_CRITICAL_DEPTH_MASK).then_some(state + 1)
+        })
+        .map(|_| ())
+        .map_err(|_| "upgrade interrupt fence depth overflow".to_string())
+}
+
+fn request_upgrade_interrupt() -> bool {
+    request_upgrade_interrupt_in(&UPGRADE_INTERRUPT_STATE)
+}
 
 fn install_upgrade_interrupt_handler() -> Result<(), String> {
     UPGRADE_SIGNAL_HANDLER
         .get_or_init(|| {
-            UPGRADE_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+            UPGRADE_INTERRUPT_STATE.store(0, Ordering::SeqCst);
             ctrlc::set_handler(|| {
-                if UPGRADE_CRITICAL_DEPTH.load(Ordering::SeqCst) > 0 {
-                    UPGRADE_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
-                } else {
+                if !request_upgrade_interrupt() {
                     std::process::exit(130);
                 }
             })
@@ -63,23 +104,36 @@ fn install_upgrade_interrupt_handler() -> Result<(), String> {
 }
 
 #[derive(Debug)]
-struct UpgradeInterruptFence;
+struct UpgradeInterruptFence {
+    active: bool,
+}
 
 impl UpgradeInterruptFence {
     fn enter() -> Result<Self, String> {
         install_upgrade_interrupt_handler()?;
-        UPGRADE_CRITICAL_DEPTH.fetch_add(1, Ordering::SeqCst);
-        Ok(Self)
+        enter_upgrade_interrupt_fence(&UPGRADE_INTERRUPT_STATE)?;
+        Ok(Self { active: true })
     }
 
     fn requested(&self) -> bool {
-        UPGRADE_INTERRUPT_REQUESTED.load(Ordering::SeqCst)
+        UPGRADE_INTERRUPT_STATE.load(Ordering::SeqCst) & UPGRADE_INTERRUPT_REQUESTED != 0
+    }
+
+    fn try_close(&mut self) -> bool {
+        if close_upgrade_interrupt_fence(&UPGRADE_INTERRUPT_STATE) {
+            self.active = false;
+            true
+        } else {
+            false
+        }
     }
 }
 
 impl Drop for UpgradeInterruptFence {
     fn drop(&mut self) {
-        UPGRADE_CRITICAL_DEPTH.fetch_sub(1, Ordering::SeqCst);
+        if self.active {
+            drop_upgrade_interrupt_fence(&UPGRADE_INTERRUPT_STATE);
+        }
     }
 }
 
@@ -1411,6 +1465,14 @@ impl Cli {
                 &plan,
                 transaction,
                 format!("failed to record rollback history: {error}"),
+            ));
+        }
+        if !transaction.close_interrupt_fence_for_commit() {
+            return Ok(self.fail_upgrade_rollback_locked(
+                env_name,
+                &plan,
+                transaction,
+                UPGRADE_INTERRUPTED_ERROR.to_string(),
             ));
         }
         transaction.commit();
@@ -4427,7 +4489,7 @@ impl Cli {
                 format!("failed to record upgrade history: {error}"),
             );
         }
-        if transaction.interrupted() {
+        if !transaction.close_interrupt_fence_for_commit() {
             return self.rollback_failed_upgrade(
                 &summary.env_name,
                 &summary.previous_binding_kind,
@@ -5076,9 +5138,52 @@ impl UpgradeTransaction {
         }
     }
 
+    fn close_interrupt_fence_for_commit(&mut self) -> bool {
+        self.interrupt_fence.try_close()
+    }
+
     fn commit(self) {
         for runtime_backup in self.runtime_backups {
             runtime_backup.commit();
+        }
+    }
+}
+
+#[cfg(test)]
+mod interrupt_fence_tests {
+    use super::{
+        UPGRADE_CRITICAL_DEPTH_MASK, close_upgrade_interrupt_fence, request_upgrade_interrupt_in,
+    };
+    use std::sync::{Arc, Barrier, atomic::AtomicUsize, atomic::Ordering};
+
+    #[test]
+    fn final_commit_and_interrupt_cannot_both_win() {
+        let interrupt_first = AtomicUsize::new(1);
+        assert!(request_upgrade_interrupt_in(&interrupt_first));
+        assert!(!close_upgrade_interrupt_fence(&interrupt_first));
+
+        let commit_first = AtomicUsize::new(1);
+        assert!(close_upgrade_interrupt_fence(&commit_first));
+        assert!(!request_upgrade_interrupt_in(&commit_first));
+
+        for _ in 0..1_000 {
+            let interrupt_state = Arc::new(AtomicUsize::new(1));
+            let barrier = Arc::new(Barrier::new(2));
+            let interrupt_barrier = Arc::clone(&barrier);
+            let handler_state = Arc::clone(&interrupt_state);
+            let interrupt = std::thread::spawn(move || {
+                interrupt_barrier.wait();
+                request_upgrade_interrupt_in(&handler_state)
+            });
+            barrier.wait();
+            let committed = close_upgrade_interrupt_fence(&interrupt_state);
+            let interrupted = interrupt.join().unwrap();
+
+            assert_ne!(committed, interrupted);
+            assert_eq!(
+                interrupt_state.load(Ordering::SeqCst) & UPGRADE_CRITICAL_DEPTH_MASK,
+                usize::from(!committed)
+            );
         }
     }
 }
