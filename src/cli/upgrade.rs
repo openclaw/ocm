@@ -2,7 +2,11 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,6 +41,50 @@ use crate::store::{
     runtime_integrity_issue, runtime_meta_path, save_environment, save_upgrade_history_record,
     upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir, write_json,
 };
+
+static UPGRADE_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static UPGRADE_CRITICAL_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static UPGRADE_SIGNAL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn install_upgrade_interrupt_handler() -> Result<(), String> {
+    UPGRADE_SIGNAL_HANDLER
+        .get_or_init(|| {
+            UPGRADE_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+            ctrlc::set_handler(|| {
+                if UPGRADE_CRITICAL_DEPTH.load(Ordering::SeqCst) > 0 {
+                    UPGRADE_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+                } else {
+                    std::process::exit(130);
+                }
+            })
+            .map_err(|error| format!("failed to install upgrade signal handler: {error}"))
+        })
+        .clone()
+}
+
+#[derive(Debug)]
+struct UpgradeInterruptFence;
+
+impl UpgradeInterruptFence {
+    fn enter() -> Result<Self, String> {
+        install_upgrade_interrupt_handler()?;
+        UPGRADE_CRITICAL_DEPTH.fetch_add(1, Ordering::SeqCst);
+        Ok(Self)
+    }
+
+    fn requested(&self) -> bool {
+        UPGRADE_INTERRUPT_REQUESTED.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for UpgradeInterruptFence {
+    fn drop(&mut self) {
+        UPGRADE_CRITICAL_DEPTH.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+const UPGRADE_INTERRUPTED_ERROR: &str =
+    "upgrade interrupted by SIGINT or SIGTERM; restoring the pre-upgrade state";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -851,6 +899,7 @@ impl Cli {
         env_name: &str,
         label: &str,
     ) -> Result<EnvSnapshotSummary, String> {
+        let interrupt_fence = UpgradeInterruptFence::enter()?;
         let prepared = self
             .environment_service()
             .prepare_snapshot_capture_locked(env_name)?;
@@ -870,6 +919,9 @@ impl Cli {
         let service_result = self
             .service_service()
             .restore_after_snapshot_locked(env_name, service_state);
+        if interrupt_fence.requested() && service_result.is_ok() {
+            return Err(UPGRADE_INTERRUPTED_ERROR.to_string());
+        }
         match (snapshot_result, service_result) {
             (Ok(snapshot), Ok(())) => Ok(snapshot),
             (Ok(snapshot), Err(service_error)) => Err(format!(
@@ -1260,6 +1312,14 @@ impl Cli {
             Some(plan.record.id.clone()),
             UpgradeTimingRecorder::new(),
         )?;
+        if transaction.interrupted() {
+            return Ok(self.fail_upgrade_rollback_locked(
+                env_name,
+                &plan,
+                transaction,
+                UPGRADE_INTERRUPTED_ERROR.to_string(),
+            ));
+        }
         let rollback_transaction_id = transaction.id.clone();
         let safety_snapshot_id = transaction.snapshot_id.clone();
 
@@ -2314,6 +2374,19 @@ impl Cli {
                 None,
                 timings,
             )?;
+            if transaction.interrupted() {
+                return self.rollback_failed_upgrade(
+                    env_name,
+                    "runtime",
+                    previous_binding_name,
+                    "runtime",
+                    target_runtime_name,
+                    target_version,
+                    target.release_channel_hint(),
+                    transaction,
+                    UPGRADE_INTERRUPTED_ERROR.to_string(),
+                );
+            }
             if target_changed {
                 transaction.mark_runtime_mutated(&prepared.name);
             }
@@ -2616,6 +2689,19 @@ impl Cli {
                 None,
                 timings,
             )?;
+            if transaction.interrupted() {
+                return self.rollback_failed_upgrade(
+                    env_name,
+                    "runtime",
+                    previous_binding_name,
+                    "runtime",
+                    target_runtime_name,
+                    target_version,
+                    target.release_channel_hint(),
+                    transaction,
+                    UPGRADE_INTERRUPTED_ERROR.to_string(),
+                );
+            }
             if changed {
                 transaction.mark_runtime_mutated(&prepared.name);
             }
@@ -2885,6 +2971,19 @@ impl Cli {
             None,
             timings,
         )?;
+        if transaction.interrupted() {
+            return self.rollback_failed_upgrade(
+                env_name,
+                "runtime",
+                previous_binding_name,
+                "runtime",
+                current.name,
+                current.release_version,
+                current.release_channel,
+                transaction,
+                UPGRADE_INTERRUPTED_ERROR.to_string(),
+            );
+        }
         transaction.mark_runtime_mutated(&current.name);
         let updated = match prepared.commit() {
             Ok(updated) => updated,
@@ -3169,6 +3268,19 @@ impl Cli {
             None,
             timings,
         )?;
+        if transaction.interrupted() {
+            return self.rollback_failed_upgrade(
+                env_name,
+                "launcher",
+                launcher_name.to_string(),
+                "runtime",
+                target_runtime_name,
+                target_version,
+                target.release_channel_hint(),
+                transaction,
+                UPGRADE_INTERRUPTED_ERROR.to_string(),
+            );
+        }
         if target_changed {
             transaction.mark_runtime_mutated(&prepared.name);
         }
@@ -4124,6 +4236,7 @@ impl Cli {
         rollback_of: Option<String>,
         mut timings: UpgradeTimingRecorder,
     ) -> Result<UpgradeTransaction, String> {
+        let interrupt_fence = UpgradeInterruptFence::enter()?;
         let snapshot_preparation_started = timings.start();
         let env_meta = self.environment_service().get(env_name)?;
         let prepared = self
@@ -4177,6 +4290,12 @@ impl Cli {
             snapshot_preparation_started,
             "completed",
         );
+        if interrupt_fence.requested() {
+            for backup in runtime_backups {
+                backup.cleanup();
+            }
+            return Err(UPGRADE_INTERRUPTED_ERROR.to_string());
+        }
         let quiescence_started = timings.start();
         let service_state = match self.service_service().quiesce_for_snapshot_locked(env_name) {
             Ok(service_state) => service_state,
@@ -4258,6 +4377,7 @@ impl Cli {
             service_quiesced,
             mutated_runtime_names: BTreeSet::new(),
             rollback_of,
+            interrupt_fence,
         })
     }
 
@@ -4266,6 +4386,19 @@ impl Cli {
         summary: UpgradeEnvSummary,
         mut transaction: UpgradeTransaction,
     ) -> Result<UpgradeEnvSummary, String> {
+        if transaction.interrupted() {
+            return self.rollback_failed_upgrade(
+                &summary.env_name,
+                &summary.previous_binding_kind,
+                summary.previous_binding_name.clone(),
+                &summary.binding_kind,
+                summary.binding_name.clone(),
+                summary.runtime_release_version.clone(),
+                summary.runtime_release_channel.clone(),
+                transaction,
+                UPGRADE_INTERRUPTED_ERROR.to_string(),
+            );
+        }
         if let Err(error) =
             self.retain_required_runtime_recovery(&summary.env_name, &mut transaction)
         {
@@ -4292,6 +4425,19 @@ impl Cli {
                 summary.runtime_release_channel.clone(),
                 transaction,
                 format!("failed to record upgrade history: {error}"),
+            );
+        }
+        if transaction.interrupted() {
+            return self.rollback_failed_upgrade(
+                &summary.env_name,
+                &summary.previous_binding_kind,
+                summary.previous_binding_name.clone(),
+                &summary.binding_kind,
+                summary.binding_name.clone(),
+                summary.runtime_release_version.clone(),
+                summary.runtime_release_channel.clone(),
+                transaction,
+                UPGRADE_INTERRUPTED_ERROR.to_string(),
             );
         }
         transaction.commit();
@@ -4871,9 +5017,14 @@ struct UpgradeTransaction {
     service_quiesced: bool,
     mutated_runtime_names: BTreeSet<String>,
     rollback_of: Option<String>,
+    interrupt_fence: UpgradeInterruptFence,
 }
 
 impl UpgradeTransaction {
+    fn interrupted(&self) -> bool {
+        self.interrupt_fence.requested()
+    }
+
     fn mark_runtime_mutated(&mut self, runtime_name: &str) {
         self.mutated_runtime_names.insert(runtime_name.to_string());
     }
