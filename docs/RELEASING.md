@@ -1,6 +1,6 @@
 # Release prerequisites
 
-The canonical `.github/workflows/release.yml` workflow publishes OCM releases from signed tags on `main`. Linux packaging needs no repository credentials. Each macOS matrix job imports one Developer ID Application certificate, signs `ocm` with the identifier `com.openclaw.ocm`, submits a temporary ZIP to Apple's notary service, checks Gatekeeper acceptance, and verifies the executable again after extracting the final tarball.
+The canonical `.github/workflows/release.yml` workflow publishes OCM releases from signed tags on `main`. Linux packaging needs no repository credentials. Each macOS matrix job imports one Developer ID Application certificate, signs `ocm` with the identifier `com.openclaw.ocm`, submits a temporary ZIP to Apple's notary service, checks the executable's notarization ticket, and verifies the executable again after extracting the final tarball.
 
 Configure these GitHub Actions repository secrets:
 
@@ -14,10 +14,11 @@ Configure `MACOS_TEAM_ID` as a GitHub Actions repository variable. It must conta
 
 Use the same Apple Developer team and `com.openclaw.ocm` identifier for every release. Certificate renewal within that team preserves the stable designated requirement macOS uses to identify OCM across updates. Changing the team or identifier causes macOS to treat the executable as different code.
 
-OCM keeps the existing `.tar.gz` install and self-update format. Apple cannot staple tickets to a standalone command-line executable or tar archive. The workflow therefore notarizes a ZIP containing the signed executable and verifies the ticket through Gatekeeper before packaging. The Mach-O code signature is embedded in the executable, and `package-release.sh` verifies it after a tar create-and-extract round trip. `install.sh` and `ocm self update` continue to verify the published tarball against `SHA256SUMS` before installing it.
+OCM keeps the existing `.tar.gz` install and self-update format. Apple cannot staple tickets to a standalone command-line executable or tar archive. The workflow therefore notarizes a ZIP containing the signed executable and verifies the ticket with `codesign --verify --strict --check-notarization --test-requirement '=notarized'` before packaging. `--check-notarization` forces an online ticket check, and the explicit `notarized` requirement makes a missing ticket fail validation. Unlike `spctl --assess --type execute`, this checks standalone command-line tools without requiring an app bundle. The Mach-O code signature is embedded in the executable, and `package-release.sh` verifies it after a tar create-and-extract round trip. `install.sh` and `ocm self update` continue to verify the published tarball against `SHA256SUMS` before installing it.
 
 References:
 
+- Apple's `man codesign`: `--check-notarization` and `--test-requirement`.
 - [Apple: Notarizing macOS software before distribution](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
 - [Apple: Customizing the notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow)
 - [Apple: Packaging Mac software for distribution](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution)

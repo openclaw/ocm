@@ -93,23 +93,15 @@ grep -Eq '^Timestamp=' <<<"$metadata" || {
 }
 
 if [[ "$require_notarization" == "1" ]]; then
-  command -v spctl >/dev/null 2>&1 || {
-    echo "error: required command not found: spctl" >&2
-    exit 1
-  }
-  if ! assessment="$(spctl --assess --type execute --verbose=4 "$binary" 2>&1)"; then
+  if ! assessment="$(codesign --verify --strict --verbose=2 \
+    --check-notarization --test-requirement '=notarized' "$binary" 2>&1)"; then
     printf '%s\n' "$assessment" >&2
-    echo "error: Gatekeeper rejected the macOS release binary" >&2
+    echo "error: macOS release binary does not satisfy Apple's notarization requirement" >&2
     exit 1
   fi
-  grep -Fq 'source=Notarized Developer ID' <<<"$assessment" || {
-    printf '%s\n' "$assessment" >&2
-    echo "error: Gatekeeper did not report a notarized Developer ID signature" >&2
-    exit 1
-  }
 fi
 
 echo "Verified macOS release signature: ${identifier} (${team_id})"
 if [[ "$require_notarization" == "1" ]]; then
-  echo "Verified macOS notarization with Gatekeeper"
+  echo "Verified macOS notarization with codesign"
 fi
