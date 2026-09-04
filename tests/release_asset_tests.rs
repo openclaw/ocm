@@ -30,6 +30,8 @@ const RELEASE_ASSETS: [&str; 5] = [
     "ocm-x86_64-unknown-linux-gnu.tar.gz",
 ];
 
+const TEST_MACOS_TEAM_ID: &str = "ABCDE12345";
+
 fn script(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
@@ -234,6 +236,48 @@ fn assert_exact_regular_archive(path: &Path) {
     assert!(verbose.lines().all(|line| line.starts_with('-')));
 }
 
+fn fake_macos_verification_tools(root: &TestDir) -> PathBuf {
+    let fake_bin = root.child("macos-verification-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable_script(
+        &fake_bin.join("codesign"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-d" ]]; then
+  if [[ "${TEST_MACOS_SIGNATURE:-valid}" == "adhoc" ]]; then
+    cat >&2 <<'EOF'
+Identifier=ocm-changing-hash
+CodeDirectory v=20400 flags=0x20002(adhoc,linker-signed)
+Signature=adhoc
+TeamIdentifier=not set
+EOF
+  else
+    cat >&2 <<'EOF'
+Identifier=com.openclaw.ocm
+CodeDirectory v=20500 flags=0x10000(runtime)
+Authority=Developer ID Application: OpenClaw Test (ABCDE12345)
+TeamIdentifier=ABCDE12345
+Timestamp=Sep 3, 2026 at 12:00:00
+EOF
+  fi
+fi
+"#,
+    );
+    write_executable_script(
+        &fake_bin.join("spctl"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${TEST_MACOS_NOTARIZATION:-accepted}" == "accepted" ]]; then
+  printf '%s\n' 'ocm: accepted' 'source=Notarized Developer ID' >&2
+  exit 0
+fi
+printf '%s\n' 'ocm: rejected' >&2
+exit 3
+"#,
+    );
+    fake_bin
+}
+
 fn populate_release_archives(asset_dir: &Path, root: &TestDir) {
     fs::create_dir_all(asset_dir).unwrap();
     fs::write(asset_dir.join("install.sh"), "#!/usr/bin/env bash\n").unwrap();
@@ -269,6 +313,7 @@ fn package_release_preserves_existing_archive_when_tar_fails() {
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args(["--target", "x86_64-apple-darwin", "--binary"])
         .arg(&binary)
+        .args(["--macos-team-id", TEST_MACOS_TEAM_ID])
         .arg("--output-dir")
         .arg(&output_dir)
         .env("PATH", path)
@@ -292,18 +337,43 @@ fn package_release_accepts_only_the_supported_matrix_and_emits_exact_bundles() {
     let output_dir = root.child("dist");
     let binary = root.child("ocm");
     fs::write(&binary, "binary").unwrap();
+    let fake_bin = fake_macos_verification_tools(&root);
+    let path = format!(
+        "{}:{}",
+        path_string(&fake_bin),
+        std::env::var("PATH").unwrap()
+    );
 
     for target in SUPPORTED_TARGETS {
-        let output = Command::new(script("package-release.sh"))
+        let mut command = Command::new(script("package-release.sh"));
+        command
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .args(["--target", target, "--binary"])
-            .arg(&binary)
+            .arg(&binary);
+        if target.ends_with("-apple-darwin") {
+            command.args(["--macos-team-id", TEST_MACOS_TEAM_ID]);
+        }
+        let output = command
             .arg("--output-dir")
             .arg(&output_dir)
+            .env("PATH", &path)
             .output()
             .unwrap();
         assert!(output.status.success(), "{}", stderr(&output));
-        assert_exact_regular_archive(&output_dir.join(format!("ocm-{target}.tar.gz")));
+        let archive = output_dir.join(format!("ocm-{target}.tar.gz"));
+        assert_exact_regular_archive(&archive);
+
+        let extract_dir = root.child(format!("extract-{target}"));
+        fs::create_dir_all(&extract_dir).unwrap();
+        let extracted = Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&extract_dir)
+            .output()
+            .unwrap();
+        assert!(extracted.status.success(), "{}", stderr(&extracted));
+        assert_eq!(fs::read(extract_dir.join("ocm")).unwrap(), b"binary");
     }
 
     fs::write(output_dir.join("install.sh"), "#!/usr/bin/env bash\n").unwrap();
@@ -327,6 +397,50 @@ fn package_release_accepts_only_the_supported_matrix_and_emits_exact_bundles() {
         assert!(stderr(&output).contains("unsupported release target"));
         assert!(!rejected_dir.join(format!("ocm-{target}.tar.gz")).exists());
     }
+}
+
+#[test]
+fn macos_release_verifier_rejects_ad_hoc_and_unnotarized_code() {
+    let root = TestDir::new("verify-macos-release");
+    let binary = root.child("ocm");
+    fs::write(&binary, "binary").unwrap();
+    let fake_bin = fake_macos_verification_tools(&root);
+    let path = format!(
+        "{}:{}",
+        path_string(&fake_bin),
+        std::env::var("PATH").unwrap()
+    );
+
+    let ad_hoc = Command::new(script("verify-macos-release.sh"))
+        .arg("--binary")
+        .arg(&binary)
+        .args(["--team-id", TEST_MACOS_TEAM_ID])
+        .env("PATH", &path)
+        .env("TEST_MACOS_SIGNATURE", "adhoc")
+        .output()
+        .unwrap();
+    assert_eq!(ad_hoc.status.code(), Some(1));
+    assert!(stderr(&ad_hoc).contains("ad-hoc signature"));
+
+    let unnotarized = Command::new(script("verify-macos-release.sh"))
+        .arg("--binary")
+        .arg(&binary)
+        .args(["--team-id", TEST_MACOS_TEAM_ID, "--require-notarization"])
+        .env("PATH", &path)
+        .env("TEST_MACOS_NOTARIZATION", "rejected")
+        .output()
+        .unwrap();
+    assert_eq!(unnotarized.status.code(), Some(1));
+    assert!(stderr(&unnotarized).contains("Gatekeeper rejected"));
+
+    let accepted = Command::new(script("verify-macos-release.sh"))
+        .arg("--binary")
+        .arg(&binary)
+        .args(["--team-id", TEST_MACOS_TEAM_ID, "--require-notarization"])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
 }
 
 #[test]
@@ -1111,6 +1225,19 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
     assert!(ci.contains("cargo test --locked"));
     assert!(ci.contains("cargo install --locked"));
     assert!(release.contains("cargo build --locked --release"));
+    assert!(
+        release.contains(
+            "Apple-Actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466"
+        )
+    );
+    assert!(release.contains("secrets.APPSTORE_CERTIFICATES_FILE_BASE64"));
+    assert!(release.contains("secrets.APPSTORE_CERTIFICATES_PASSWORD"));
+    assert!(release.contains("secrets.APPSTORE_API_PRIVATE_KEY"));
+    assert!(release.contains("secrets.APPSTORE_API_KEY_ID"));
+    assert!(release.contains("secrets.APPSTORE_ISSUER_ID"));
+    assert!(release.contains("vars.MACOS_TEAM_ID"));
+    assert!(release.contains("scripts/sign-notarize-macos.sh"));
+    assert!(release.contains("--macos-team-id \"$OCM_MACOS_TEAM_ID\""));
     assert!(release.contains("scripts/verify-release-tag.sh"));
     assert!(release.contains("scripts/verify-release-ci.sh"));
     assert!(release.contains("scripts/publish-release.sh"));
