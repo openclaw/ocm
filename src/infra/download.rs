@@ -11,6 +11,9 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256, Sha512};
 
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+// JSON is parsed in memory. 64 MiB is above today's official npm packument
+// (~16 MiB) and well below the 512 MiB artifact cap.
+pub const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const HTTP_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ureq carries a recv-response deadline into body reads. Bound the header wait from the
@@ -104,10 +107,13 @@ pub fn fetch_json_with_accept<T: DeserializeOwned>(url: &str, accept: &str) -> R
 }
 
 fn parse_json_reader<T: DeserializeOwned>(
-    reader: Box<dyn io::Read>,
+    mut reader: Box<dyn io::Read>,
     url: &str,
 ) -> Result<T, String> {
-    serde_json::from_reader(reader)
+    let mut body = Vec::new();
+    copy_capped(&mut reader, &mut body, MAX_JSON_BYTES)
+        .map_err(|error| format!("failed to download runtime URL \"{}\": {error}", url.trim()))?;
+    serde_json::from_slice(&body)
         .map_err(|error| format!("failed to parse runtime URL \"{}\": {error}", url.trim()))
 }
 

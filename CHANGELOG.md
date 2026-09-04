@@ -28,6 +28,7 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Cap decoded JSON from runtime manifests and npm packuments so a huge or gzip-expanded body is rejected instead of growing without bound. Thanks @SebTardif.
 - Keep unrelated supervised gateways on their persisted child specifications when an environment is destroyed, removed, or pruned, so latent metadata or process-environment drift cannot restart sibling gateways during cleanup.
 - Resolve `TMPDIR` from the live OCM daemon whenever a gateway is spawned, create a daemon-scoped private temporary directory, and fall back to a private directory under `/tmp` instead of persisting a per-login path across reboots.
 
