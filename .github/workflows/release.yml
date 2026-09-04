@@ -1,6 +1,8 @@
 name: Release
 run-name: Release ${{ inputs.tag }}
 
+# macOS signing and notarization prerequisites: docs/RELEASING.md
+
 on:
   workflow_dispatch:
     inputs:
@@ -63,10 +65,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            macos: false
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            macos: true
           - os: macos-14
             target: aarch64-apple-darwin
+            macos: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,7 +83,34 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --locked --release --target "${{ matrix.target }}"
-      - name: Package release archive
+      - name: Import Developer ID certificate
+        if: ${{ matrix.macos }}
+        uses: Apple-Actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7.0.0
+        with:
+          p12-file-base64: ${{ secrets.APPSTORE_CERTIFICATES_FILE_BASE64 }}
+          p12-password: ${{ secrets.APPSTORE_CERTIFICATES_PASSWORD }}
+      - name: Sign and notarize macOS executable
+        if: ${{ matrix.macos }}
+        env:
+          OCM_MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+          OCM_NOTARY_API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          OCM_NOTARY_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          OCM_NOTARY_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+        run: |
+          ./scripts/sign-notarize-macos.sh \
+            --binary "./target/${{ matrix.target }}/release/ocm"
+      - name: Package macOS release archive
+        if: ${{ matrix.macos }}
+        env:
+          OCM_MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+        run: |
+          ./scripts/package-release.sh \
+            --target "${{ matrix.target }}" \
+            --binary "./target/${{ matrix.target }}/release/ocm" \
+            --macos-team-id "$OCM_MACOS_TEAM_ID" \
+            --output-dir ./dist
+      - name: Package Linux release archive
+        if: ${{ !matrix.macos }}
         run: |
           ./scripts/package-release.sh \
             --target "${{ matrix.target }}" \
