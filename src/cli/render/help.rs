@@ -901,7 +901,7 @@ pub fn self_command_help(cmd: &str, action: &str) -> Option<String> {
     match action {
         "update" => Some(render_leaf(
             "Update ocm",
-            "Check for or install a newer ocm release in place.",
+            "Check for or install an ocm release with local recovery.",
             vec![format!(
                 "{cmd} self update [--version <version>] [--check] [--raw] [--json]"
             )],
@@ -911,6 +911,11 @@ pub fn self_command_help(cmd: &str, action: &str) -> Option<String> {
                     "Install one exact ocm release tag or version",
                 ),
                 ("--check", "Only report whether an update is available"),
+                ("--status", "Read the durable transaction receipt as JSON"),
+                (
+                    "--recover",
+                    "Roll back an interrupted transaction using retained OCM",
+                ),
                 ("--raw", "Use plain text instead of pretty TTY cards"),
                 ("--json", "Print the update summary as JSON"),
             ],
@@ -921,6 +926,10 @@ pub fn self_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "The current binary is replaced in place on supported macOS and Linux installs.",
+                "A running daemon and its gateways are briefly interrupted and health-checked.",
+                "The local helper survives caller disconnection. Inspect --status after reconnecting.",
+                "Use --recover with the original HOME and OCM_HOME after an interrupted helper.",
+                "If the installed CLI cannot run, use the printed .ocm.self-update/previous recovery executable.",
                 "Exact versions accept either `1.2.3` or `v1.2.3`.",
             ],
         )),

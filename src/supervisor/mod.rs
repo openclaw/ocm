@@ -497,6 +497,12 @@ impl<'a> SupervisorService<'a> {
         validate_managed_service_owner(&definition, self.env)
     }
 
+    pub(crate) fn validate_self_update_daemon_locked(&self) -> Result<(), String> {
+        let definition = self.supervisor_daemon_definition()?;
+        validate_managed_service_owner(&definition, self.env)?;
+        crate::service::platform::validate_managed_service_executable(&definition, self.env)
+    }
+
     pub(crate) fn restore_daemon_state_locked(
         &self,
         before: &SupervisorDaemonSummary,
@@ -708,7 +714,7 @@ impl<'a> SupervisorService<'a> {
         self.activate_daemon(action)
     }
 
-    fn activate_daemon(&self, action: &str) -> Result<SupervisorDaemonSummary, String> {
+    pub(crate) fn activate_daemon(&self, action: &str) -> Result<SupervisorDaemonSummary, String> {
         let definition = self.supervisor_daemon_definition()?;
         write_managed_service_definition(&definition, self.env)?;
         activate_managed_service(&definition.label, &definition.definition_path, self.env)?;

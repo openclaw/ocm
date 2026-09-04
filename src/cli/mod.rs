@@ -11,6 +11,7 @@ mod release;
 pub(crate) mod render;
 mod runtime;
 mod self_cmd;
+mod self_update_transaction;
 mod service;
 mod setup;
 mod start;
