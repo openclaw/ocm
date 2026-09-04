@@ -243,6 +243,9 @@ fn fake_macos_verification_tools(root: &TestDir) -> PathBuf {
         &fake_bin.join("codesign"),
         r#"#!/usr/bin/env bash
 set -euo pipefail
+if [[ -n "${TEST_MACOS_CODESIGN_LOG:-}" ]]; then
+  printf '%s\n' "$*" >>"$TEST_MACOS_CODESIGN_LOG"
+fi
 if [[ "${1:-}" == "-d" ]]; then
   if [[ "${TEST_MACOS_SIGNATURE:-valid}" == "adhoc" ]]; then
     cat >&2 <<'EOF'
@@ -260,6 +263,17 @@ TeamIdentifier=ABCDE12345
 Timestamp=Sep 3, 2026 at 12:00:00
 EOF
   fi
+elif [[ "$*" == *"--check-notarization"* ]]; then
+  [[ "$#" == "7" && "$1" == "--verify" && "$2" == "--strict" &&
+    "$3" == "--verbose=2" && "$4" == "--check-notarization" &&
+    "$5" == "--test-requirement" && "$6" == "=notarized" ]] || exit 99
+  if [[ "${TEST_MACOS_NOTARIZATION:-accepted}" != "accepted" ]]; then
+    printf '%s\n' 'ocm: code failed to satisfy specified code requirement(s)' >&2
+    exit 3
+  fi
+elif [[ "${TEST_MACOS_SIGNATURE:-valid}" == "unsigned" ]]; then
+  printf '%s\n' 'ocm: code object is not signed at all' >&2
+  exit 1
 fi
 "#,
     );
@@ -267,11 +281,7 @@ fi
         &fake_bin.join("spctl"),
         r#"#!/usr/bin/env bash
 set -euo pipefail
-if [[ "${TEST_MACOS_NOTARIZATION:-accepted}" == "accepted" ]]; then
-  printf '%s\n' 'ocm: accepted' 'source=Notarized Developer ID' >&2
-  exit 0
-fi
-printf '%s\n' 'ocm: rejected' >&2
+printf '%s\n' 'ocm: rejected (the code is valid but does not seem to be an app)' >&2
 exit 3
 "#,
     );
@@ -400,7 +410,7 @@ fn package_release_accepts_only_the_supported_matrix_and_emits_exact_bundles() {
 }
 
 #[test]
-fn macos_release_verifier_rejects_ad_hoc_and_unnotarized_code() {
+fn macos_release_verifier_rejects_unsigned_ad_hoc_and_unnotarized_code() {
     let root = TestDir::new("verify-macos-release");
     let binary = root.child("ocm");
     fs::write(&binary, "binary").unwrap();
@@ -410,6 +420,17 @@ fn macos_release_verifier_rejects_ad_hoc_and_unnotarized_code() {
         path_string(&fake_bin),
         std::env::var("PATH").unwrap()
     );
+
+    let unsigned = Command::new(script("verify-macos-release.sh"))
+        .arg("--binary")
+        .arg(&binary)
+        .args(["--team-id", TEST_MACOS_TEAM_ID, "--require-notarization"])
+        .env("PATH", &path)
+        .env("TEST_MACOS_SIGNATURE", "unsigned")
+        .output()
+        .unwrap();
+    assert_eq!(unsigned.status.code(), Some(1));
+    assert!(stderr(&unsigned).contains("invalid code signature"));
 
     let ad_hoc = Command::new(script("verify-macos-release.sh"))
         .arg("--binary")
@@ -431,16 +452,22 @@ fn macos_release_verifier_rejects_ad_hoc_and_unnotarized_code() {
         .output()
         .unwrap();
     assert_eq!(unnotarized.status.code(), Some(1));
-    assert!(stderr(&unnotarized).contains("Gatekeeper rejected"));
+    assert!(stderr(&unnotarized).contains("does not satisfy Apple's notarization requirement"));
+
+    let codesign_log = root.child("codesign.log");
 
     let accepted = Command::new(script("verify-macos-release.sh"))
         .arg("--binary")
         .arg(&binary)
         .args(["--team-id", TEST_MACOS_TEAM_ID, "--require-notarization"])
         .env("PATH", path)
+        .env("TEST_MACOS_CODESIGN_LOG", &codesign_log)
         .output()
         .unwrap();
     assert!(accepted.status.success(), "{}", stderr(&accepted));
+    assert!(fs::read_to_string(&codesign_log).unwrap().contains(
+        "--verify --strict --verbose=2 --check-notarization --test-requirement =notarized"
+    ));
 }
 
 #[test]
