@@ -5,7 +5,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -62,6 +62,7 @@ const SUPERVISED_CHILD_RUNTIME_ENV_KEYS: [&str; 4] =
 const SERVICE_EXECUTABLE_OVERRIDE: &str = "OCM_SERVICE_EXECUTABLE";
 pub(crate) const SERVICE_EXECUTABLE_IDENTITY: &str = "ocm-service-supervisor";
 const SERVICE_EXECUTABLE_IDENTITY_TIMEOUT_MS: u64 = 1_000;
+const SERVICE_ONCE_CHILD_TIMEOUT_MS: u64 = 15_000;
 const SERVICE_EXECUTABLE_IDENTITY_BUSY_ATTEMPTS: usize = 5;
 const SERVICE_EXECUTABLE_IDENTITY_BUSY_RETRY_MS: u64 = 20;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -829,9 +830,11 @@ impl<'a> SupervisorService<'a> {
                 child_binding_label(&spec)
             );
             let mut child = spawn_supervisor_child(&spec)?;
-            let status = child.wait().map_err(|error| {
-                format!("failed waiting for env \"{}\": {error}", spec.env_name)
-            })?;
+            let status = wait_child_with_timeout(
+                &mut child,
+                Duration::from_millis(SERVICE_ONCE_CHILD_TIMEOUT_MS),
+                &format!("env \"{}\"", spec.env_name),
+            )?;
             child_results.push(child_run_result(&spec, status.code(), 0));
         }
 
@@ -1082,6 +1085,56 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
             child_binding_label(spec)
         )
     })
+}
+
+fn wait_child_with_timeout(
+    child: &mut Child,
+    timeout: Duration,
+    label: &str,
+) -> Result<ExitStatus, String> {
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started_at.elapsed() < timeout => {
+                sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                terminate_child(child);
+                return Err(format!("{label} timed out after {}ms", timeout.as_millis()));
+            }
+            Err(error) => {
+                terminate_child(child);
+                return Err(format!("failed waiting for {label}: {error}"));
+            }
+        }
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .args(["-TERM", "--", &process_group])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        for _ in 0..20 {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => sleep(Duration::from_millis(25)),
+                Err(_) => break,
+            }
+        }
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &process_group])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn prepare_supervisor_child_tmpdir() -> Result<PathBuf, String> {
@@ -3461,5 +3514,45 @@ mod tests {
         );
         assert!(!process_env.contains_key("GH_TOKEN"));
         assert!(!process_env.contains_key("PWD"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_child_with_timeout_kills_sleep_after_deadline() {
+        let started = Instant::now();
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn /bin/sleep 30");
+        let pid = child.id();
+        let error = wait_child_with_timeout(&mut child, Duration::from_millis(200), "sleep")
+            .expect_err("sleep should be killed at the deadline");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timed wait should return well before the 30s sleep, took {elapsed:?}"
+        );
+        assert!(
+            error.contains("timed out"),
+            "expected timeout error, got {error}"
+        );
+        let still_alive = Command::new("kill")
+            .args(["-0", "--", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(!still_alive, "child {pid} should be dead after timeout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_child_with_timeout_returns_status_when_child_exits() {
+        let mut child = Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let status = wait_child_with_timeout(&mut child, Duration::from_millis(200), "true")
+            .expect("exited child should not time out");
+        assert!(status.success());
     }
 }
