@@ -18,6 +18,7 @@ All notable changes to OCM are documented here.
 
 ### Added
 
+- Make `ocm self update` a recoverable local transaction that retains the previous executable, survives caller disconnection, refreshes a running daemon, checks gateway recovery, and records a durable result. Add `--status` and `--recover` for interrupted updates.
 - Let `runtime build-local` assemble repeatable, commit-matched official companion plugins through OpenClaw's release packaging contract, stage them as trusted runtime-owned bundled plugins with isolated dependencies, and record artifact and entrypoint hashes for verification.
 
 ### Changed

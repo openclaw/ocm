@@ -45,6 +45,9 @@ pub fn self_update(summary: &SelfUpdateSummary, profile: RenderProfile, cmd: &st
     );
 
     let mut next = Vec::new();
+    if let Some(path) = &summary.receipt_path {
+        next.push(KeyValueRow::plain("Receipt", path.clone()));
+    }
     if matches!(summary.status, SelfUpdateStatus::UpdateAvailable) {
         next.push(KeyValueRow::accent(
             "Install",
@@ -90,6 +93,9 @@ fn self_update_raw(summary: &SelfUpdateSummary) -> Vec<String> {
     );
     if let Some(note) = summary.daemon_refresh_note.as_ref() {
         lines.insert("daemonRefreshNote".to_string(), note.clone());
+    }
+    if let Some(path) = &summary.receipt_path {
+        lines.insert("receiptPath".to_string(), path.clone());
     }
     format_key_value_lines(lines)
 }

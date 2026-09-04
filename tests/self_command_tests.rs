@@ -213,14 +213,57 @@ fn self_update_replaces_a_copied_binary_in_place() {
         .unwrap();
     assert!(updated.status.success());
     assert_eq!(String::from_utf8(updated.stdout).unwrap(), "9.9.9\n");
+    let journal = copied_binary.parent().unwrap().join(".ocm.self-update");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(journal.join("receipt.json")).unwrap()).unwrap();
+    assert_eq!(receipt["phase"], "updated");
+    assert_eq!(receipt["daemonWasRunning"], false);
+    assert_eq!(
+        file_sha256(&journal.join("previous")).unwrap(),
+        file_sha256(Path::new(env!("CARGO_BIN_EXE_ocm"))).unwrap()
+    );
+    assert!(
+        !root
+            .child("home/Library/LaunchAgents/ai.openclaw.ocm.plist")
+            .exists()
+    );
+    assert!(
+        !root
+            .child("home/.config/systemd/user/ai.openclaw.ocm.service")
+            .exists()
+    );
 }
 
 #[test]
-fn self_update_reports_running_daemon_skew_without_restarting_it() {
+fn self_update_unchanged_and_check_do_not_create_a_receipt() {
+    let root = TestDir::new("self-update-unchanged");
+    let copied = copied_ocm(&root);
+    let metadata = format!(
+        "{{\"tag_name\":\"v{}\",\"assets\":[]}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let release =
+        TestHttpServer::serve_bytes_times("/release", "application/json", metadata.as_bytes(), 2);
+    let env = release_env(&root, &release.url());
+    for args in [
+        vec!["self", "update", "--check", "--json"],
+        vec!["self", "update", "--json"],
+    ] {
+        let output = run_ocm_binary(&copied, root.path(), &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(summary["status"], "upToDate");
+        assert!(!root.child("bin/.ocm.self-update/receipt.json").exists());
+    }
+}
+
+#[test]
+fn self_update_refuses_an_unknown_daemon_version_before_replacement() {
     let root = TestDir::new("self-update-running-daemon-skew");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let copied_binary = copied_ocm(&root);
+    let original = fs::read(&copied_binary).unwrap();
     let mut env = ocm_env(&root);
     env.insert(
         "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
@@ -271,10 +314,9 @@ fn self_update_reports_running_daemon_skew_without_restarting_it() {
         &env,
         &["self", "update", "--version", target_version, "--raw"],
     );
-    assert!(output.status.success(), "{}", stderr(&output));
-    let text = stdout(&output);
-    assert!(text.contains("daemonRefreshRequired: true"));
-    assert!(text.contains("service refresh-daemon --acknowledge-gateway-restarts"));
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("running daemon version is unknown"));
+    assert_eq!(fs::read(&copied_binary).unwrap(), original);
 
     let calls = fs::read_to_string(&launchctl_log).unwrap();
     assert!(calls.contains("print"));

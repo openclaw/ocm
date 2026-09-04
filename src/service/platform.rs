@@ -307,6 +307,31 @@ pub(crate) fn validate_managed_service_owner(
     ))
 }
 
+pub(crate) fn validate_managed_service_executable(
+    definition: &ManagedServiceDefinition,
+    env: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if !definition.definition_path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&definition.definition_path).map_err(|e| e.to_string())?;
+    let marker = match service_manager_kind(env) {
+        ServiceManagerKind::Launchd => format!(
+            "<key>ProgramArguments</key>\n    <array>\n      <string>{}</string>",
+            plist_escape(&definition.program_arguments[0])
+        ),
+        ServiceManagerKind::SystemdUser => format!(
+            "\nExecStart={} __daemon run\n",
+            systemd_quote(&definition.program_arguments[0])
+        ),
+        ServiceManagerKind::Unsupported => return Err(unsupported_service_manager_message().into()),
+    };
+    if !raw.contains(&marker) {
+        return Err("managed daemon uses a different executable or a nonstandard service definition; refusing self-update".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn deactivate_managed_service(
     definition: &ManagedServiceDefinition,
     env: &BTreeMap<String, String>,

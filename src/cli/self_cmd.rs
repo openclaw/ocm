@@ -1,15 +1,16 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use semver::Version;
 use serde::Serialize;
 
+use super::self_update_transaction::{Phase, Transaction};
 use crate::infra::archive::extract_tar_gz;
 use crate::infra::download::{download_to_file, http_agent, verify_file_sha256};
-use crate::store::resolve_ocm_home;
 
 use super::{Cli, render};
 
@@ -61,6 +62,8 @@ pub(crate) struct SelfUpdateSummary {
     pub asset_name: String,
     pub daemon_refresh_required: bool,
     pub daemon_refresh_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_path: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -121,12 +124,12 @@ impl Drop for SelfUpdateTempDir {
     }
 }
 
-struct StagedBinary {
+pub(super) struct StagedBinary {
     path: PathBuf,
 }
 
 impl StagedBinary {
-    fn copy_from(source: &Path, parent: &Path) -> Result<Self, String> {
+    pub(super) fn copy_from(source: &Path, parent: &Path) -> Result<Self, String> {
         let metadata = fs::symlink_metadata(source)
             .map_err(|error| format!("failed to inspect release archive binary: {error}"))?;
         if !metadata.file_type().is_file() {
@@ -193,7 +196,7 @@ impl StagedBinary {
         ))
     }
 
-    fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -208,9 +211,29 @@ impl Cli {
     pub(super) fn handle_self_update(&self, args: Vec<String>) -> Result<i32, String> {
         let (args, json_flag, profile) = self.consume_human_output_flags(args, "self update")?;
         let (args, check) = Self::consume_flag(args, "--check");
+        let (args, status) = Self::consume_flag(args, "--status");
+        let (args, recover) = Self::consume_flag(args, "--recover");
         let (args, version) = Self::consume_option(args, "--version")?;
         let version = Self::require_option_value(version, "--version")?;
         Self::assert_no_extra_args(&args)?;
+
+        if status || recover {
+            if check || version.is_some() || (status && recover) {
+                return Err("--status and --recover must be used alone".into());
+            }
+            let receipt = self.self_update_receipt(recover)?;
+            self.print_json(&receipt)?;
+            return Ok(
+                if matches!(
+                    receipt.phase,
+                    Phase::RolledBack | Phase::RollbackFailed | Phase::Failed
+                ) {
+                    1
+                } else {
+                    0
+                },
+            );
+        }
 
         let target_display = version.clone().unwrap_or_else(|| "latest".to_string());
         let summary = if check {
@@ -270,6 +293,7 @@ impl Cli {
             asset_name,
             daemon_refresh_required: false,
             daemon_refresh_note: None,
+            receipt_path: None,
         })
     }
 
@@ -277,6 +301,8 @@ impl Cli {
         let current_version = env!("CARGO_PKG_VERSION").to_string();
         let binary_path = self.current_binary_path()?;
         let asset_name = self.current_release_asset_name()?;
+        let transaction = Transaction::open(&binary_path, false)?;
+        transaction.admit()?;
         let release = self.fetch_self_release(version)?;
         let target_version = display_version_from_tag(&release.tag_name)?;
 
@@ -290,6 +316,7 @@ impl Cli {
                 asset_name,
                 daemon_refresh_required: false,
                 daemon_refresh_note: None,
+                receipt_path: None,
             });
         }
 
@@ -324,16 +351,26 @@ impl Cli {
         let extracted_binary = extract_dir.join("ocm");
         let staged_binary = StagedBinary::copy_from(&extracted_binary, parent)?;
         validate_staged_binary(staged_binary.path(), &target_version)?;
-
-        fs::rename(staged_binary.path(), &binary_path).map_err(|error| {
-            format!(
-                "failed to replace {}: {error}. If this path is managed elsewhere, reinstall ocm or use your package manager instead.",
-                binary_path.display()
-            )
-        })?;
-
-        let (daemon_refresh_required, daemon_refresh_note) =
-            self.daemon_refresh_notice_after_update(&target_version);
+        // Downloads and extraction no longer belong to the interruptible caller
+        // once the durable helper takes over.
+        drop(temp_root);
+        let receipt = transaction.launch(
+            self,
+            &binary_path,
+            staged_binary,
+            &current_version,
+            &target_version,
+        )?;
+        if receipt.phase != Phase::Updated {
+            return Err(format!(
+                "self-update {:?}: {}; inspect `ocm self update --status`",
+                receipt.phase,
+                receipt
+                    .error
+                    .as_deref()
+                    .unwrap_or("update did not complete")
+            ));
+        }
 
         Ok(SelfUpdateSummary {
             mode: SelfUpdateMode::Update,
@@ -342,40 +379,14 @@ impl Cli {
             target_version,
             binary_path: binary_path.to_string_lossy().into_owned(),
             asset_name,
-            daemon_refresh_required,
-            daemon_refresh_note,
+            daemon_refresh_required: false,
+            daemon_refresh_note: None,
+            receipt_path: Some(
+                super::self_update_transaction::receipt_path(&binary_path)?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         })
-    }
-
-    fn daemon_refresh_notice_after_update(&self, target_version: &str) -> (bool, Option<String>) {
-        let Ok(ocm_home) = resolve_ocm_home(&self.env, &self.cwd) else {
-            return (
-                false,
-                Some(
-                    "CLI updated, but OCM could not resolve the active store; run `ocm service status` to check the background service"
-                        .to_string(),
-                ),
-            );
-        };
-        if !ocm_home.exists() {
-            return (false, None);
-        }
-
-        match self.supervisor_service().daemon_status() {
-            Ok(daemon) if daemon.running => (
-                true,
-                Some(format!(
-                    "CLI {target_version} is installed, but the running OCM background service still uses its previously mapped executable; during a maintenance window run `ocm service refresh-daemon --acknowledge-gateway-restarts`"
-                )),
-            ),
-            Ok(_) => (false, None),
-            Err(error) => (
-                false,
-                Some(format!(
-                    "CLI updated, but OCM could not inspect the background service ({error}); run `ocm service status`"
-                )),
-            ),
-        }
     }
 
     fn current_binary_path(&self) -> Result<PathBuf, String> {
@@ -468,25 +479,47 @@ fn github_asset_sha256(asset: &GitHubReleaseAsset) -> Result<&str, String> {
     Ok(value)
 }
 
-fn validate_staged_binary(path: &Path, target_version: &str) -> Result<(), String> {
+pub(super) fn validate_staged_binary(path: &Path, target_version: &str) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("failed to inspect staged ocm binary: {error}"))?;
     if !metadata.file_type().is_file() {
         return Err("staged ocm binary is not a regular file".to_string());
     }
 
-    let output = Command::new(path)
+    let mut capture = tempfile::tempfile().map_err(|e| e.to_string())?;
+    let mut child = Command::new(path)
         .arg("--version")
         .env_clear()
-        .output()
+        .stdin(Stdio::null())
+        .stdout(capture.try_clone().map_err(|e| e.to_string())?)
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|error| format!("failed to execute staged ocm binary: {error}"))?;
-    if !output.status.success() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(
+                    "staged ocm binary version check did not finish within 5 seconds".into(),
+                );
+            }
+        }
+    };
+    if !status.success() {
         return Err(format!(
             "staged ocm binary failed its version check with status {}",
-            output.status
+            status
         ));
     }
-    let stdout = String::from_utf8(output.stdout)
+    capture.rewind().map_err(|e| e.to_string())?;
+    let mut stdout = String::new();
+    capture
+        .take(1024)
+        .read_to_string(&mut stdout)
         .map_err(|_| "staged ocm binary returned a non-UTF-8 version".to_string())?;
     let reported = stdout.strip_suffix('\n').unwrap_or(&stdout);
     let reported = reported.strip_suffix('\r').unwrap_or(reported);
