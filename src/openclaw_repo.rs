@@ -1,14 +1,27 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 
 use serde_json::Value;
 
+use crate::infra::process::command_output;
 use crate::store::{clean_path, display_path};
+
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn git_output(
+    cwd: &Path,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> Result<Output, String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(cwd).args(args);
+    command_output(command, GIT_COMMAND_TIMEOUT, "git")
+}
 
 pub(crate) fn detect_openclaw_checkout(path: &Path) -> Option<PathBuf> {
     let package_json = path.join("package.json");
@@ -120,13 +133,16 @@ pub(crate) fn ensure_openclaw_worktree(
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&repo_root)
-        .args(["worktree", "add", "--detach"])
-        .arg(&worktree_root)
-        .output()
-        .map_err(|error| format!("failed to run git worktree add: {error}"))?;
+    let output = git_output(
+        &repo_root,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--detach"),
+            worktree_root.as_os_str(),
+        ],
+    )
+    .map_err(|error| format!("failed to run git worktree add: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -213,10 +229,9 @@ fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), Strin
         return Ok(());
     }
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_root)
-        .args([
+    let output = git_output(
+        worktree_root,
+        [
             "clean",
             "-ffdX",
             "--",
@@ -230,9 +245,9 @@ fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), Strin
             "extensions/diffs-language-pack/assets",
             "extensions/diffs/assets",
             "extensions/discord/assets",
-        ])
-        .output()
-        .map_err(|error| format!("failed to remove generated simulation output: {error}"))?;
+        ],
+    )
+    .map_err(|error| format!("failed to remove generated simulation output: {error}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -248,13 +263,16 @@ fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), Strin
 fn remove_registered_worktree(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
     ensure_worktree_clean(worktree_root)?;
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["worktree", "remove", "--force"])
-        .arg(worktree_root)
-        .output()
-        .map_err(|error| format!("failed to run git worktree remove: {error}"))?;
+    let output = git_output(
+        repo_root,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("remove"),
+            OsStr::new("--force"),
+            worktree_root.as_os_str(),
+        ],
+    )
+    .map_err(|error| format!("failed to run git worktree remove: {error}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -270,18 +288,18 @@ fn ensure_worktree_clean(worktree_root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let output = Command::new("git")
-        .args(["-c", "status.showUntrackedFiles=all"])
-        .arg("-C")
-        .arg(worktree_root)
-        .args([
+    let output = git_output(
+        worktree_root,
+        [
+            "-c",
+            "status.showUntrackedFiles=all",
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
             "--ignore-submodules=none",
-        ])
-        .output()
-        .map_err(|error| format!("failed to inspect git worktree status: {error}"))?;
+        ],
+    )
+    .map_err(|error| format!("failed to inspect git worktree status: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -300,18 +318,17 @@ fn ensure_worktree_clean(worktree_root: &Path) -> Result<(), String> {
 }
 
 fn ensure_no_ignored_local_files(worktree_root: &Path) -> Result<(), String> {
-    let worktree_output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_root)
-        .args([
+    let worktree_output = git_output(
+        worktree_root,
+        [
             "ls-files",
             "--others",
             "--ignored",
             "--exclude-standard",
             "-z",
-        ])
-        .output()
-        .map_err(|error| format!("failed to inspect ignored worktree files: {error}"))?;
+        ],
+    )
+    .map_err(|error| format!("failed to inspect ignored worktree files: {error}"))?;
     if !worktree_output.status.success() {
         let stderr = String::from_utf8_lossy(&worktree_output.stderr)
             .trim()
@@ -323,18 +340,17 @@ fn ensure_no_ignored_local_files(worktree_root: &Path) -> Result<(), String> {
         return Err(format!("git ignored-file inspection failed: {detail}"));
     }
 
-    let submodule_output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_root)
-        .args([
+    let submodule_output = git_output(
+        worktree_root,
+        [
             "submodule",
             "foreach",
             "--quiet",
             "--recursive",
             "git ls-files --others --ignored --exclude-standard -z",
-        ])
-        .output()
-        .map_err(|error| format!("failed to inspect ignored submodule files: {error}"))?;
+        ],
+    )
+    .map_err(|error| format!("failed to inspect ignored submodule files: {error}"))?;
     if !submodule_output.status.success() {
         let stderr = String::from_utf8_lossy(&submodule_output.stderr)
             .trim()
@@ -373,28 +389,23 @@ fn is_disposable_ignored_path(path: &Path) -> bool {
 }
 
 fn registered_worktree_paths(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["worktree", "list", "--porcelain", "-z"])
-        .output()
+    let output = git_output(repo_root, ["worktree", "list", "--porcelain", "-z"])
         .map_err(|error| format!("failed to run git worktree list: {error}"))?;
     if output.status.success() {
         return parse_registered_worktree_paths(&output.stdout);
     }
 
-    let fallback = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args([
+    let fallback = git_output(
+        repo_root,
+        [
             "-c",
             "core.quotePath=false",
             "worktree",
             "list",
             "--porcelain",
-        ])
-        .output()
-        .map_err(|error| format!("failed to run compatible git worktree list: {error}"))?;
+        ],
+    )
+    .map_err(|error| format!("failed to run compatible git worktree list: {error}"))?;
     if fallback.status.success() {
         return parse_legacy_registered_worktree_paths(&fallback.stdout);
     }
@@ -513,12 +524,7 @@ fn git_worktree_backlink(path: &Path) -> Option<PathBuf> {
 }
 
 fn git_rev_parse_path(path: &Path, selector: &str) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["rev-parse", selector])
-        .output()
-        .ok()?;
+    let output = git_output(path, ["rev-parse", selector]).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -575,10 +581,33 @@ mod tests {
 
     #[cfg(unix)]
     use super::parse_registered_worktree_paths;
+    use crate::infra::process::command_output;
+
     use super::{
         ensure_openclaw_worktree, parse_legacy_registered_worktree_paths,
         prepare_openclaw_simulation_worktree_cleanup, remove_openclaw_worktree,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn git_timeout_kills_sleep_after_deadline() {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let error = command_output(command, Duration::from_millis(200), "sleep")
+            .expect_err("sleep should be killed at the deadline");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "timed runner should return within 1s, took {elapsed:?}"
+        );
+        assert!(
+            error.contains("timed out"),
+            "expected timeout error, got {error}"
+        );
+    }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
         let output = Command::new("git")
