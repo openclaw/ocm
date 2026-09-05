@@ -278,27 +278,48 @@ pub(crate) fn validate_managed_service_owner(
     let Some(ocm_home) = definition.environment.get("OCM_HOME") else {
         return Ok(());
     };
-    let raw = fs::read_to_string(&definition.definition_path).map_err(|error| {
+    let raw = fs::read(&definition.definition_path).map_err(|error| {
         format!(
             "failed to read existing service definition {}: {error}",
             display_path(&definition.definition_path)
         )
     })?;
-    let owner_markers = match service_manager_kind(env) {
-        ServiceManagerKind::Launchd => vec![format!(
-            "<key>OCM_HOME</key>\n      <string>{}</string>",
-            plist_escape(ocm_home)
-        )],
-        ServiceManagerKind::SystemdUser => vec![
-            format!("Environment=\"OCM_HOME={}\"", systemd_escape(ocm_home)),
-            format!(
-                "Environment=\"OCM_HOME={}\"",
-                systemd_legacy_escape(ocm_home)
-            ),
-        ],
+    let owner_matches = match service_manager_kind(env) {
+        ServiceManagerKind::Launchd => {
+            let value = plist::Value::from_reader(std::io::Cursor::new(&raw)).map_err(|error| {
+                format!(
+                    "failed to parse existing service definition {}: {error}",
+                    display_path(&definition.definition_path)
+                )
+            })?;
+            value
+                .as_dictionary()
+                .and_then(|dict| dict.get("EnvironmentVariables"))
+                .and_then(plist::Value::as_dictionary)
+                .and_then(|dict| dict.get("OCM_HOME"))
+                .and_then(plist::Value::as_string)
+                == Some(ocm_home.as_str())
+        }
+        ServiceManagerKind::SystemdUser => {
+            let raw = std::str::from_utf8(&raw).map_err(|error| {
+                format!(
+                    "failed to read existing service definition {}: {error}",
+                    display_path(&definition.definition_path)
+                )
+            })?;
+            [
+                format!("Environment=\"OCM_HOME={}\"", systemd_escape(ocm_home)),
+                format!(
+                    "Environment=\"OCM_HOME={}\"",
+                    systemd_legacy_escape(ocm_home)
+                ),
+            ]
+            .iter()
+            .any(|marker| raw.contains(marker))
+        }
         ServiceManagerKind::Unsupported => return Ok(()),
     };
-    if owner_markers.iter().any(|marker| raw.contains(marker)) {
+    if owner_matches {
         return Ok(());
     }
     Err(format!(
@@ -1690,6 +1711,70 @@ mod tests {
         assert!(error.contains("Description cannot contain a line break"));
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn launchd_service_owner_accepts_reformatted_plist() {
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([(
+            "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+            "launchd".to_string(),
+        )]);
+        let definition = ManagedServiceDefinition {
+            label: OCM_SERVICE_LABEL.to_string(),
+            description: "owner fixture".to_string(),
+            definition_path: root.path().join("owner.plist"),
+            program_arguments: vec!["/bin/true".to_string()],
+            working_directory: root.path().to_path_buf(),
+            stdout_path: root.path().join("stdout.log"),
+            stderr_path: root.path().join("stderr.log"),
+            environment: BTreeMap::from([(
+                "OCM_HOME".to_string(),
+                "/tmp/store & data".to_string(),
+            )]),
+        };
+        write_managed_service_definition(&definition, &env).unwrap();
+        let original = fs::read_to_string(&definition.definition_path).unwrap();
+        let reformatted = original.replace("      <string>", "\t<string>");
+        assert_ne!(original, reformatted);
+        fs::write(&definition.definition_path, &reformatted).unwrap();
+        super::validate_managed_service_owner(&definition, &env).unwrap();
+        assert_eq!(
+            fs::read_to_string(&definition.definition_path).unwrap(),
+            reformatted
+        );
+        let value = plist::Value::from_reader_xml(reformatted.as_bytes()).unwrap();
+        value.to_file_binary(&definition.definition_path).unwrap();
+        super::validate_managed_service_owner(&definition, &env).unwrap();
+
+        // Only EnvironmentVariables.OCM_HOME owns the service. A matching string
+        // elsewhere (including comments) must never authorize another store.
+        for body in [
+            "<dict><key>EnvironmentVariables</key><dict><key>OCM_HOME</key><string>/tmp/other</string></dict></dict>",
+            "<dict><key>OCM_HOME</key><string>/tmp/store &amp; data</string></dict>",
+            "<dict><key>EnvironmentVariables</key><dict><key>OCM_HOME</key><integer>7</integer></dict></dict>",
+            "<dict><key>EnvironmentVariables</key><string>/tmp/store &amp; data</string></dict>",
+            "<dict><!-- <key>OCM_HOME</key>\n      <string>/tmp/store &amp; data</string> --></dict>",
+            "<dict/>",
+        ] {
+            let fixture = format!("<?xml version=\"1.0\"?><plist version=\"1.0\">{body}</plist>");
+            fs::write(&definition.definition_path, &fixture).unwrap();
+            let error = write_managed_service_definition(&definition, &env).unwrap_err();
+            assert!(
+                error.contains("already bound to a different OCM_HOME"),
+                "{error}"
+            );
+            assert_eq!(
+                fs::read_to_string(&definition.definition_path).unwrap(),
+                fixture
+            );
+        }
+        fs::write(&definition.definition_path, "not a plist").unwrap();
+        let error = super::validate_managed_service_owner(&definition, &env).unwrap_err();
+        assert!(
+            error.contains("failed to parse existing service definition"),
+            "{error}"
+        );
     }
 
     #[test]
