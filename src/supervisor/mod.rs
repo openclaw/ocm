@@ -60,6 +60,7 @@ const SUPERVISED_CHILD_BASE_ENV_KEYS: [&str; 5] = ["HOME", "PATH", "OCM_HOME", "
 const SUPERVISED_CHILD_RUNTIME_ENV_KEYS: [&str; 4] =
     ["NODE_OPTIONS", "NODE_ENV", "NODE_PATH", "PNPM_HOME"];
 const SERVICE_EXECUTABLE_OVERRIDE: &str = "OCM_SERVICE_EXECUTABLE";
+const DAEMON_LOG_DIR_OVERRIDE: &str = "OCM_DAEMON_LOG_DIR";
 pub(crate) const SERVICE_EXECUTABLE_IDENTITY: &str = "ocm-service-supervisor";
 const SERVICE_EXECUTABLE_IDENTITY_TIMEOUT_MS: u64 = 1_000;
 const SERVICE_EXECUTABLE_IDENTITY_BUSY_ATTEMPTS: usize = 5;
@@ -739,7 +740,7 @@ impl<'a> SupervisorService<'a> {
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let state_path = supervisor_state_path(self.env, self.cwd)?;
         let identity = managed_service_identity(self.env, self.cwd)?;
-        let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;
+        let logs_dir = self.daemon_logs_dir()?;
         let stdout_path = logs_dir.join("daemon.stdout.log");
         let stderr_path = logs_dir.join("daemon.stderr.log");
         let status = inspect_job(&identity.label, &identity.definition_path, self.env);
@@ -772,7 +773,7 @@ impl<'a> SupervisorService<'a> {
     fn supervisor_daemon_definition(&self) -> Result<ManagedServiceDefinition, String> {
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let identity = managed_service_identity(self.env, self.cwd)?;
-        let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;
+        let logs_dir = self.daemon_logs_dir()?;
         let executable_path = self.supervisor_executable_path()?;
 
         Ok(ManagedServiceDefinition {
@@ -792,6 +793,21 @@ impl<'a> SupervisorService<'a> {
             stderr_path: logs_dir.join("daemon.stderr.log"),
             environment: supervisor_service_environment(self.env, &ocm_home, &executable_path),
         })
+    }
+
+    fn daemon_logs_dir(&self) -> Result<PathBuf, String> {
+        match self.env.get(DAEMON_LOG_DIR_OVERRIDE) {
+            Some(value) => {
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    return Err(format!(
+                        "{DAEMON_LOG_DIR_OVERRIDE} must be an absolute directory path"
+                    ));
+                }
+                Ok(path)
+            }
+            None => supervisor_logs_dir(self.env, self.cwd),
+        }
     }
 
     fn supervisor_executable_path(&self) -> Result<PathBuf, String> {
@@ -2124,6 +2140,9 @@ fn supervisor_service_environment(
     }
     service_env.insert("OCM_HOME".to_string(), display_path(ocm_home));
     service_env.insert("OCM_SELF".to_string(), display_path(executable_path));
+    if let Some(value) = process_env.get(DAEMON_LOG_DIR_OVERRIDE) {
+        service_env.insert(DAEMON_LOG_DIR_OVERRIDE.to_string(), value.clone());
+    }
     service_env
 }
 
@@ -2714,6 +2733,62 @@ mod tests {
             let mut permissions = fs::metadata(path).unwrap().permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    #[test]
+    fn daemon_bootstrap_log_override_preserves_store_logs() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let store = root.path().join("external-store");
+        let logs = root.path().join("internal-logs");
+        let mut env = BTreeMap::from([
+            ("HOME".to_string(), display_path(&home)),
+            ("OCM_HOME".to_string(), display_path(&store)),
+            ("OCM_DAEMON_LOG_DIR".to_string(), display_path(&logs)),
+            (
+                "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+                "launchd".to_string(),
+            ),
+        ]);
+        let service = super::SupervisorService::new(&env, root.path());
+        let definition = service.supervisor_daemon_definition().unwrap();
+        assert_eq!(definition.stdout_path, logs.join("daemon.stdout.log"));
+        assert_eq!(definition.stderr_path, logs.join("daemon.stderr.log"));
+        assert_eq!(definition.working_directory, store);
+        assert_eq!(
+            super::supervisor_logs_dir(&env, root.path()).unwrap(),
+            store.join("supervisor/logs")
+        );
+        assert_eq!(
+            definition.environment.get("OCM_DAEMON_LOG_DIR"),
+            env.get("OCM_DAEMON_LOG_DIR")
+        );
+        let summary = service.daemon_status().unwrap();
+        assert_eq!(summary.stdout_path, display_path(&definition.stdout_path));
+        assert_eq!(summary.stderr_path, display_path(&definition.stderr_path));
+        super::write_managed_service_definition(&definition, &env).unwrap();
+        assert!(logs.is_dir());
+        let again = service.supervisor_daemon_definition().unwrap();
+        super::write_managed_service_definition(&again, &env).unwrap();
+        assert_eq!(again.stdout_path, definition.stdout_path);
+
+        env.remove("OCM_DAEMON_LOG_DIR");
+        let default = super::SupervisorService::new(&env, root.path())
+            .supervisor_daemon_definition()
+            .unwrap();
+        assert_eq!(
+            default.stdout_path,
+            store.join("supervisor/logs/daemon.stdout.log")
+        );
+        for invalid in ["", "relative/logs"] {
+            env.insert("OCM_DAEMON_LOG_DIR".to_string(), invalid.to_string());
+            assert!(
+                super::SupervisorService::new(&env, root.path())
+                    .supervisor_daemon_definition()
+                    .unwrap_err()
+                    .contains("absolute")
+            );
         }
     }
 

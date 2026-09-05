@@ -338,6 +338,33 @@ ocm service status mira
 
 Use `service install` when you want a background service for an environment that was created with `--no-service`, or when you want to bring an older env under background management later.
 
+### Supervisor bootstrap logs on a separate filesystem
+
+By default, the supervisor's own stdout/stderr logs live under
+`$OCM_HOME/supervisor/logs`. If the OS service manager cannot open logs there
+(for example, on an affected macOS external volume), select a dedicated,
+absolute directory on an accessible filesystem before installing the service:
+
+```bash
+export OCM_DAEMON_LOG_DIR="$HOME/Library/Logs/OCM"
+ocm service install mira
+```
+
+Only `daemon.stdout.log` and `daemon.stderr.log` use this directory. Environment
+data, runtimes, workspaces, gateway logs and the supervisor working directory
+stay under their existing paths. OCM creates the log directory using its normal
+private-directory permissions; choose a dedicated directory, not a shared one.
+
+Keep the same variable set for subsequent OCM lifecycle/inspection commands.
+It is also included in the generated supervisor environment so daemon-initiated
+operations retain the selection. Unsetting it selects the default again; this
+is not a persistent per-store configuration setting. Changing the variable
+alone does not reload an already-running OS service. Apply changes through the
+normal OCM service refresh workflow in a maintenance window.
+
+This does not grant macOS privacy permissions or make an unmounted store
+available. The store and executable must still be accessible at startup.
+
 ### Read logs
 
 ```bash
