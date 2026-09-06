@@ -70,7 +70,11 @@ workflow and complete public assets have all been observed.
 - A manually owned release PR is never adopted, modified or merged. Finish it
   using `scripts/release.sh`, or close it before resuming automation.
 - To change a pending release's version increment, close its PR and dispatch
-  with the desired bump. Old branches are not deleted automatically.
+  with the desired different bump. Old branches are not deleted automatically.
+  A previously closed proposal is never recreated, even if its branch was
+  deleted. Reopen that proposal explicitly to resume the same version.
+- Merging a manually prepared version PR does not authorize automatic signing
+  or publication. Its owner must complete the existing manual release flow.
 - Existing signed tags are never moved. Existing public releases and their
   assets are never rewritten. An active build is not dispatched again.
 - A failed or cancelled release build stops reconciliation visibly. Inspect and
@@ -82,14 +86,24 @@ workflow and complete public assets have all been observed.
 
 ## Verification
 
-Run the policy, Git fixture and mocked GitHub lifecycle tests without network
+Run the policy, lifecycle and subprocess boundary tests without public network
 access or publishing:
 
 ```sh
-python3 -B -m unittest discover -s scripts/tests -p 'test_auto_release.py'
+python3 -B -m unittest discover -s scripts/tests -p 'test_auto_release*.py'
 ```
 
-These tests run in the existing CI Format job. Cargo, Perl, Git and Python 3
-are required because the tests use OCM's real version editors and validators.
+These tests run in the existing Linux CI Format job. Cargo, Perl, Git, Python 3,
+`gh` and `ssh-keygen` are required. The subprocess proof runs the production CLI
+and unchanged release verifiers, pushes real signed tags to an isolated bare
+Git repository, and uses real `gh` HTTP requests through its documented Unix
+socket transport. The local service verifies the real tag signature before
+reporting it verified. It checks successful dispatch and retry deduplication,
+plus zero writes for a merged manual release and a closed proposal (with or
+without its branch). Temporary keys and state are removed after each test.
+
+GitHub responses and build completion are still service fixtures, not a live
+GitHub release or a proof that the production signing account is configured.
+Activation therefore still requires the observed live sequence described above.
 The existing Rust release-script and release-asset suites remain authoritative
 for signed-tag verification and complete-asset publication.

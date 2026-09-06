@@ -168,6 +168,8 @@ class Reconciler:
             raise ReleaseError("Unpublished version is not a canonical merged release PR")
         commit, number = candidates[0]
         pr = api(f"pulls/{number}")
+        if pr["user"]["login"] != self.actor or MARKER not in (pr["body"] or ""):
+            raise ReleaseError("Unpublished release is manually owned; leaving signing and dispatch to its owner")
         if not pr["merged"] or pr["base"]["ref"] != "main" or \
                 pr["head"]["ref"] != f"release/{tag}" or \
                 pr["merge_commit_sha"] != commit or pr["title"] != title or \
@@ -269,7 +271,7 @@ class Reconciler:
     def reconcile(self):
         if self.git("status", "--porcelain"):
             raise ReleaseError("Use a clean disposable checkout")
-        if self.git("remote", "get-url", "origin") not in {
+        if self.git("config", "--get", "remote.origin.url") not in {
                 f"https://github.com/{REPO}", f"https://github.com/{REPO}.git", f"git@github.com:{REPO}.git"}:
             raise ReleaseError("Origin must be the canonical OCM repository")
         self.actor = api("/user")["login"]
@@ -314,6 +316,9 @@ class Reconciler:
             return
         branch = f"release/v{target}"
         if not pr:
+            previous = pages(f"pulls?state=closed&base=main&head=openclaw:{branch}")
+            if previous:
+                raise ReleaseError("A prior release proposal was closed; reopen it explicitly or select another version")
             # Recover a push that succeeded before PR creation failed. Adopt only
             # our signed, canonical version-only commit, never a manual branch.
             refs = pages("git/matching-refs/heads/" + branch)

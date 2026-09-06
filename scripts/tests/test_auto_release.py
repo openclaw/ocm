@@ -168,7 +168,7 @@ class ReconciliationTests(unittest.TestCase):
 
     def setup_reconcile(self, pr=None, base=A, ready=True):
         self.r.git = Mock(side_effect=lambda *a: {
-            "status": "", "remote": f"https://github.com/{release.REPO}.git",
+            "status": "", "config": f"https://github.com/{release.REPO}.git",
             "rev-parse": C, "merge-base": C}.get(a[0], ""))
         self.r.current_main = Mock(return_value=A)
         self.r.version_at = Mock(side_effect=lambda sha: "0.2.39" if sha == B else "0.2.38")
@@ -191,7 +191,7 @@ class ReconciliationTests(unittest.TestCase):
                 return self.pr
             self.fail(endpoint)
         with patch.object(release, "api", side_effect=api), \
-                patch.object(release, "pages", side_effect=[self.published, []]):
+                patch.object(release, "pages", side_effect=[self.published, [], []]):
             self.r.reconcile()
         self.r.git.assert_any_call("push", "--force-with-lease=refs/heads/release/v0.2.39:",
                                   "origin", f"{B}:refs/heads/release/v0.2.39")
@@ -254,7 +254,7 @@ class ReconciliationTests(unittest.TestCase):
                 "verification": {"verified": verified},
                 "message": f"chore(release): bump version to 0.2.39\n\n{release.MARKER}"}}
             with patch.object(release, "api", side_effect=[{"login": "release-bot"}, data, self.pr]) as api, \
-                    patch.object(release, "pages", side_effect=[self.published, [{
+                    patch.object(release, "pages", side_effect=[self.published, [], [{
                         "ref": "refs/heads/release/v0.2.39", "object": {"sha": B}}]]):
                 if verified and committer == "release-bot":
                     self.r.reconcile()
@@ -264,6 +264,27 @@ class ReconciliationTests(unittest.TestCase):
                         self.r.reconcile()
                     self.assertEqual(api.call_count, 2)
             self.r.create_version_commit.assert_not_called()
+
+    def test_closed_proposal_is_not_recreated_even_when_its_branch_was_deleted(self):
+        self.setup_reconcile()
+        with patch.object(release, "api", return_value={"login": "release-bot"}) as api, \
+                patch.object(release, "pages", side_effect=[self.published, [dict(self.pr, state="closed")]]), \
+                self.assertRaisesRegex(release.ReleaseError, "closed"):
+            self.r.reconcile()
+        self.r.create_version_commit.assert_not_called()
+        self.assertEqual(api.call_count, 1)
+
+    def test_merged_manual_release_is_rejected_before_ci_signing_or_dispatch(self):
+        self.r.git = Mock(return_value=f"{C}\0chore(release): bump version to 0.2.39 (#10)")
+        self.r.ci = Mock()
+        self.r.script = Mock()
+        for manual in (dict(self.pr, body="manual release"), dict(self.pr, user={"login": "human"})):
+            with patch.object(release, "api", return_value=manual), patch.object(release, "run") as run, \
+                    self.assertRaisesRegex(release.ReleaseError, "manually owned"):
+                self.r.finish_release("0.2.39", self.published)
+            run.assert_not_called()
+        self.r.ci.assert_not_called()
+        self.r.script.assert_not_called()
 
     def test_release_signs_only_checked_merge_commit_and_dispatches_once(self):
         self.r.git = Mock(return_value=f"{A}\0fix: newer dependency edit\n{C}\0chore(release): bump version to 0.2.39 (#10)")
