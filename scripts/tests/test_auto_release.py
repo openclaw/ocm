@@ -248,15 +248,15 @@ class ReconciliationTests(unittest.TestCase):
             self.assertEqual(api.call_count, 2)
 
     def test_interrupted_branch_push_is_recovered_only_for_signed_automation_commit(self):
-        for verified in (True, False):
+        for verified, committer in ((True, "release-bot"), (False, "release-bot"), (True, "another-user")):
             self.setup_reconcile()
-            data = {"author": {"login": "release-bot"}, "commit": {
+            data = {"author": {"login": "release-bot"}, "committer": {"login": committer}, "commit": {
                 "verification": {"verified": verified},
                 "message": f"chore(release): bump version to 0.2.39\n\n{release.MARKER}"}}
             with patch.object(release, "api", side_effect=[{"login": "release-bot"}, data, self.pr]) as api, \
                     patch.object(release, "pages", side_effect=[self.published, [{
                         "ref": "refs/heads/release/v0.2.39", "object": {"sha": B}}]]):
-                if verified:
+                if verified and committer == "release-bot":
                     self.r.reconcile()
                     self.assertEqual(api.call_args.args[:2], ("pulls", "POST"))
                 else:

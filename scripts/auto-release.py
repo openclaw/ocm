@@ -323,6 +323,7 @@ class Reconciler:
                 self.git("fetch", "origin", "refs/heads/" + branch)
                 data = api(f"commits/{orphan}")
                 if (data.get("author") or {}).get("login") != self.actor or \
+                        (data.get("committer") or {}).get("login") != self.actor or \
                         not data["commit"]["verification"]["verified"] or \
                         data["commit"]["message"].strip() != \
                         f"chore(release): bump version to {target}\n\n{MARKER}":
