@@ -1,0 +1,67 @@
+name: Automatic release
+
+on:
+  workflow_run:
+    workflows: [CI, Release]
+    types: [completed]
+    branches: [main, 'release/**']
+  # Reconcile after missed events or an interrupted run. No release if unchanged.
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump (auto stops on declared breaking changes)
+        type: choice
+        default: auto
+        options: [auto, patch, minor, major]
+
+permissions:
+  contents: read
+
+# Serialize version allocation, branch writes, tag signing, and dispatch.
+# Replacing a queued event is safe: each run reconciles all unreleased changes.
+concurrency:
+  group: ocm-automatic-release
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: >-
+      github.repository == 'openclaw/ocm' &&
+      github.ref == 'refs/heads/main' &&
+      vars.OCM_AUTO_RELEASE_ENABLED == 'true' &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.head_repository.full_name == 'openclaw/ocm' &&
+        (github.event.workflow_run.event == 'push' ||
+         github.event.workflow_run.event == 'pull_request' ||
+         github.event.workflow_run.event == 'workflow_dispatch')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Never check out the triggering PR or download its artifacts with secrets.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.88.0
+      - name: Import release identity
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7
+        with:
+          gpg_private_key: ${{ secrets.OCM_RELEASE_GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.OCM_RELEASE_GPG_PASSPHRASE }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+          git_tag_gpgsign: true
+      - name: Reconcile checked release
+        env:
+          # A dedicated account token, not GITHUB_TOKEN: its branch/PR/merge
+          # events must start CI. Keep its account's public signing key registered.
+          GH_TOKEN: ${{ secrets.OCM_RELEASE_TOKEN }}
+          OCM_RELEASE_BUMP: ${{ inputs.bump || 'auto' }}
+        run: |
+          gh auth setup-git
+          python3 scripts/auto-release.py --bump "$OCM_RELEASE_BUMP"

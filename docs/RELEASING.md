@@ -1,5 +1,9 @@
 # Release prerequisites
 
+For automatic post-merge version PRs and signed release dispatch, see
+[Automatic OCM releases](AUTOMATIC_RELEASES.md). The same signing, CI and complete
+asset checks below apply to both automatic and manual releases.
+
 The canonical `.github/workflows/release.yml` workflow publishes OCM releases from signed tags on `main`. Linux packaging needs no repository credentials. Each macOS matrix job imports one Developer ID Application certificate, signs `ocm` with the identifier `com.openclaw.ocm`, submits a temporary ZIP to Apple's notary service, checks the executable's notarization ticket, and verifies the executable again after extracting the final tarball.
 
 Configure these GitHub Actions repository secrets:
