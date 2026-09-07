@@ -59,15 +59,16 @@ impl ReleaseRepo {
     }
 
     fn verify_crate_release(&self, tag: &str, commit: &str) -> Output {
-        Command::new(self.repo.join("scripts/verify-crate-release.sh"))
+        let mut command = Command::new(self.repo.join("scripts/verify-crate-release.sh"));
+        command
             .current_dir(&self.repo)
             .args(["openclaw/ocm", tag, commit])
             .env_clear()
             .env("HOME", &self.home)
             .env("PATH", &self.env_path)
-            .env("OCM_GH_BIN", &self.ghx)
-            .output()
-            .unwrap()
+            .env("OCM_GH_BIN", &self.ghx);
+        self.apply_toolchain_env(&mut command);
+        command.output().unwrap()
     }
 
     fn git_output(&self, args: &[&str]) -> Output {
@@ -764,7 +765,11 @@ fn crate_publication_requires_the_new_package_and_a_published_verified_release()
         let output = repo.verify_crate_release("v0.2.8", &commit);
         assert!(!output.status.success());
         if name == "ocm" {
-            assert!(stderr(&output).contains("crates.io publishing requires openclawocm"));
+            assert!(
+                stderr(&output).contains("crates.io publishing requires openclawocm"),
+                "{}",
+                stderr(&output)
+            );
             continue;
         }
         assert!(stderr(&output).contains("publish the complete binary release"));
