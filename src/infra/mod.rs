@@ -1,6 +1,7 @@
 pub mod archive;
 pub(crate) mod command_output;
 pub mod download;
+pub(crate) mod install_owner;
 pub mod process;
 pub mod shell;
 mod sqlite_snapshot;

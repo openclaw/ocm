@@ -1,0 +1,133 @@
+name: Publish npm
+run-name: Publish npm ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Signed tag with an already published binary release
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Verify and package npm
+    if: >-
+      github.repository == 'openclaw/ocm' &&
+      github.ref == 'refs/heads/main' &&
+      github.workflow_ref == 'openclaw/ocm/.github/workflows/publish-npm.yml@refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      source: ${{ steps.prepare.outputs.source }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.88.0
+      - name: Verify signed source, CI, original checksums, and GitHub asset digests
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python3 -B scripts/npm_release.py prepare "$RELEASE_REPO" "$RELEASE_TAG" "$RUNNER_TEMP/npm-packages"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-packages
+          path: ${{ runner.temp }}/npm-packages
+          if-no-files-found: error
+          retention-days: 7
+
+  native:
+    name: Test npm (${{ matrix.os }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15-intel, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+      - run: npm install --global --ignore-scripts npm@11.19.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-packages
+          path: ${{ runner.temp }}/npm-packages
+      - name: Install exact tarballs and verify native bytes, CLI, and macOS notarization
+        env:
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+        run: python3 -B scripts/tests/test_npm_install.py --packages "$RUNNER_TEMP/npm-packages"
+
+  publish:
+    name: Publish verified npm packages
+    needs: [prepare, native]
+    if: >-
+      github.repository == 'openclaw/ocm' &&
+      github.ref == 'refs/heads/main' &&
+      github.workflow_ref == 'openclaw/ocm/.github/workflows/publish-npm.yml@refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.88.0
+      - name: Install the pinned OIDC-capable npm CLI
+        run: |
+          npm install --global --ignore-scripts npm@11.19.0
+          test "$(npm --version)" = 11.19.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-packages
+          path: ${{ runner.temp }}/npm-packages
+      - name: Revalidate source, release assets, and exact tested tarballs before OIDC
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.source }}
+        run: python3 -B scripts/npm_release.py verify "$RUNNER_TEMP/npm-packages" "$RELEASE_REPO" "$RELEASE_TAG" "$RELEASE_COMMIT"
+      - name: Publish platform payloads serially, then advance the root channel
+        run: python3 -B scripts/npm_release.py publish "$RUNNER_TEMP/npm-packages"

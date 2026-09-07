@@ -1043,6 +1043,55 @@ fn service_refresh_daemon_requires_interruption_ack_and_preserves_desired_state(
     assert_eq!(fs::read(&state_path).unwrap(), state_before);
 }
 
+#[cfg(unix)]
+#[test]
+fn npx_cannot_rebind_daemon_but_can_inspect_and_stop_it() {
+    let root = TestDir::new("npx-daemon-owner");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = launchd_env(&root);
+    setup_launcher_env(&cwd, &env);
+    let Some((entrypoint, _)) =
+        crate::support::npm_fixture(&root.child("cache/_npx/hash/node_modules/@openclaw/ocm"))
+    else {
+        return;
+    };
+    let before =
+        crate::support::run_ocm_binary(&entrypoint, &cwd, &env, &["service", "start", "demo"]);
+    assert!(!before.status.success());
+    assert!(
+        stderr(&before).contains("temporary npx cache"),
+        "{}",
+        stderr(&before)
+    );
+
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    let definition = managed_service_definition_path(&env, &cwd, "ocm");
+    let original = fs::read(&definition).unwrap();
+    let refresh = crate::support::run_ocm_binary(
+        &entrypoint,
+        &cwd,
+        &env,
+        &[
+            "service",
+            "refresh-daemon",
+            "--acknowledge-gateway-restarts",
+        ],
+    );
+    assert!(!refresh.status.success());
+    assert!(
+        stderr(&refresh).contains("temporary npx cache"),
+        "{}",
+        stderr(&refresh)
+    );
+    assert_eq!(fs::read(&definition).unwrap(), original);
+    for args in [vec!["service", "status"], vec!["service", "stop", "demo"]] {
+        let output = crate::support::run_ocm_binary(&entrypoint, &cwd, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+}
+
 #[test]
 fn systemd_service_install_writes_the_ocm_unit() {
     let root = TestDir::new("service-systemd-install");

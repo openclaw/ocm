@@ -464,6 +464,10 @@ fn update_service(
     let _lifecycle_lock = supervisor.lock_daemon_lifecycle()?;
     supervisor.validate_daemon_owner_locked()?;
     let daemon_before = supervisor.daemon_status()?;
+    if matches!(supervisor_policy, ServiceSupervisorPolicy::EnsureRunning) && !daemon_before.running
+    {
+        supervisor.require_durable_daemon_executable()?;
+    }
     let change = set_environment_service_policy(name, service_enabled, service_running, env, cwd)?;
     let update_result = match supervisor_policy {
         ServiceSupervisorPolicy::EnsureRunning => sync_supervisor_env_if_present(env, cwd, name)

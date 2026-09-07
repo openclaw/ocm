@@ -34,6 +34,19 @@ cargo install --locked --path . --root "$install_root"
 "$install_root/bin/ocm" --version
 ```
 
+The npm launcher integration tests need Node.js `^22.15.0 || >=24.0.0`.
+Packaging tests use Python 3.13 and npm 11.19.0, with a private local fixture
+registry, cache, prefix, and home:
+
+```sh
+python3 -B -m unittest discover -s scripts/tests -p 'test_npm_*.py'
+```
+
+These tests do not publish packages or change installed services. CI also
+checks npm installation of the existing signed v0.2.39 binaries on all three
+release platforms; that fixture proves byte preservation, not support for
+publishing v0.2.39 through the new workflow.
+
 Tests use [tests/support/mod.rs](tests/support/mod.rs) for temporary directories,
 isolated `HOME` and `OCM_HOME`, and service fixtures. Reuse those helpers; do not
 point tests at a real environment or service. Manual state-changing experiments

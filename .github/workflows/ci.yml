@@ -74,9 +74,45 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '22.15.0'
+          package-manager-cache: false
       - name: Run test suite
         run: cargo test --locked
       - name: Smoke test cargo install
         run: |
           cargo install --locked --path . --root "$RUNNER_TEMP/ocm-install"
           "$RUNNER_TEMP/ocm-install/bin/ocm" --version
+
+  npm:
+    name: npm (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, node: '22.15.0' }
+          - { os: ubuntu-latest, node: '24' }
+          - { os: macos-15-intel, node: '24' }
+          - { os: macos-15, node: '24' }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+      - run: npm install --global --ignore-scripts npm@11.19.0
+      - name: Test npm packaging, recovery, launcher, and isolated installation lifecycle
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_npm_*.py'
+      - name: Prove signed native byte preservation through npm
+        if: matrix.node == '24'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+        run: python3 -B scripts/tests/test_npm_install.py --published-binary-fixture

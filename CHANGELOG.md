@@ -18,6 +18,8 @@ All notable changes to OCM are documented here.
 
 ### Added
 
+- Prepare `@openclaw/ocm` npm distribution of signed Rust binaries, with a
+  no-download launcher, exact platform aliases, and manual OIDC publishing.
 - Prepare the `openclawocm` Cargo package and manual crates.io trusted publishing
   from verified signed releases, while preserving the `ocm` command and library.
 - Let `runtime build-local` assemble repeatable, commit-matched official companion plugins through OpenClaw's release packaging contract, stage them as trusted runtime-owned bundled plugins with isolated dependencies, and record artifact and entrypoint hashes for verification.
@@ -30,6 +32,10 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Keep npm-owned executable updates with npm, prevent temporary npx caches from
+  owning background services, and preserve process identity during npm-launched
+  gateway refreshes. Protect managed and symlinked installer destinations even
+  with `--force`.
 - Refuse mutating `ocm self update` for Homebrew-owned executables and direct
   users to `brew upgrade openclaw/tap/ocm`; keep release checks available.
 - Keep unrelated supervised gateways on their persisted child specifications when an environment is destroyed, removed, or pruned, so latent metadata or process-environment drift cannot restart sibling gateways during cleanup.

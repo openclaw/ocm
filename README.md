@@ -38,6 +38,12 @@ Use `ocm` when you want:
 
 ## Install
 
+The npm distribution is prepared but not published yet. Its first publication
+must use a future signed release containing npm ownership protection, not
+v0.2.39. Once available, install with `npm install --global @openclaw/ocm`.
+See [npm installation and updates](npm/README.md) for Node requirements,
+project-local installs, npx, and daemon refresh behavior.
+
 Install with Homebrew on macOS (Apple Silicon or Intel) or Linux x86_64:
 
 ```bash

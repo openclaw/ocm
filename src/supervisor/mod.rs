@@ -429,6 +429,7 @@ impl<'a> SupervisorService<'a> {
     }
 
     pub fn install_daemon(&self) -> Result<SupervisorDaemonSummary, String> {
+        self.require_durable_daemon_executable()?;
         let _lifecycle_lock = self.lock_daemon_lifecycle()?;
         self.refresh_daemon("install")
     }
@@ -437,6 +438,7 @@ impl<'a> SupervisorService<'a> {
         &self,
         acknowledge_gateway_restarts: bool,
     ) -> Result<SupervisorDaemonRefreshSummary, String> {
+        self.require_durable_daemon_executable()?;
         let _lifecycle_lock = self.lock_daemon_lifecycle()?;
         let before = self.daemon_status()?;
         if !before.installed {
@@ -488,6 +490,7 @@ impl<'a> SupervisorService<'a> {
         if status.running {
             return Ok(status);
         }
+        self.require_durable_daemon_executable()?;
         let _ = self.sync()?;
         self.activate_daemon("install")
     }
@@ -501,6 +504,9 @@ impl<'a> SupervisorService<'a> {
         &self,
         before: &SupervisorDaemonSummary,
     ) -> Result<(), String> {
+        if before.installed {
+            self.require_durable_daemon_executable()?;
+        }
         let definition = self.supervisor_daemon_definition()?;
         deactivate_managed_service(&definition, self.env)?;
         if before.installed {
@@ -709,6 +715,7 @@ impl<'a> SupervisorService<'a> {
     }
 
     fn activate_daemon(&self, action: &str) -> Result<SupervisorDaemonSummary, String> {
+        self.require_durable_daemon_executable()?;
         let definition = self.supervisor_daemon_definition()?;
         write_managed_service_definition(&definition, self.env)?;
         activate_managed_service(&definition.label, &definition.definition_path, self.env)?;
@@ -805,6 +812,15 @@ impl<'a> SupervisorService<'a> {
             self.cwd,
             &current_exe,
         ))
+    }
+
+    pub(crate) fn require_durable_daemon_executable(&self) -> Result<(), String> {
+        if let Some(npm) = crate::infra::install_owner::NpmInstallation::from_executable(
+            &self.supervisor_executable_path()?,
+        ) {
+            npm.require_durable()?;
+        }
+        Ok(())
     }
 
     fn read_runtime_state(&self) -> Result<Option<SupervisorRuntimeState>, String> {

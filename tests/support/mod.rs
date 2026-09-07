@@ -298,6 +298,29 @@ pub fn write_executable_script(path: &Path, contents: &str) {
     }
 }
 
+#[cfg(unix)]
+pub fn npm_fixture(package: &Path) -> Option<(PathBuf, PathBuf)> {
+    let (platform, target) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("darwin-arm64", "aarch64-apple-darwin"),
+        ("macos", "x86_64") => ("darwin-x64", "x86_64-apple-darwin"),
+        ("linux", "x86_64") if cfg!(target_env = "gnu") => {
+            ("linux-x64", "x86_64-unknown-linux-gnu")
+        }
+        _ => return None,
+    };
+    let payload = package.join(format!("node_modules/@openclaw/ocm-{platform}"));
+    write_text(
+        &payload.join("package.json"),
+        r#"{"name":"@openclaw/ocm","version":"9.0.0"}"#,
+    );
+    let binary = payload.join(format!("vendor/{target}/bin/ocm"));
+    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    fs::hard_link(ocm_test_binary_path(), &binary).unwrap();
+    let entrypoint = package.join("bin/ocm.cjs");
+    write_executable_script(&entrypoint, include_str!("../../npm/ocm.cjs"));
+    Some((entrypoint, binary))
+}
+
 pub fn install_fake_launchctl(root: &TestDir, env: &mut BTreeMap<String, String>) {
     let bin_dir = root.child("fake-bin");
     fs::create_dir_all(&bin_dir).unwrap();

@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use crate::infra::archive::extract_tar_gz;
 use crate::infra::download::{download_to_file, http_agent, verify_file_sha256};
+use crate::infra::install_owner::NpmInstallation;
 use crate::store::resolve_ocm_home;
 
 use super::{Cli, render};
@@ -61,6 +62,8 @@ pub(crate) struct SelfUpdateSummary {
     pub asset_name: String,
     pub daemon_refresh_required: bool,
     pub daemon_refresh_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_manager_note: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -212,7 +215,11 @@ impl Cli {
         let version = Self::require_option_value(version, "--version")?;
         Self::assert_no_extra_args(&args)?;
 
+        let npm = NpmInstallation::from_executable(&self.current_binary_path()?);
         if !check {
+            if let Some(npm) = &npm {
+                return Err(npm.update_guidance());
+            }
             let binary = self
                 .current_binary_path()?
                 .canonicalize()
@@ -234,13 +241,19 @@ impl Cli {
         }
 
         let target_display = version.clone().unwrap_or_else(|| "latest".to_string());
-        let summary = if check {
+        let mut summary = if check {
             self.self_update_check(version.as_deref())?
         } else {
             self.with_progress(format!("Updating ocm to {target_display}"), || {
                 self.self_update_install(version.as_deref())
             })?
         };
+        if let Some(npm) = npm {
+            summary.package_manager_note = Some(format!(
+                "This checks GitHub binary releases, not npm availability. {}",
+                npm.update_guidance()
+            ));
+        }
 
         if json_flag {
             self.print_json(&summary)?;
@@ -252,6 +265,9 @@ impl Cli {
             profile,
             &self.command_example(),
         ));
+        if let Some(note) = summary.package_manager_note {
+            self.stdout_lines([note]);
+        }
         Ok(0)
     }
 
@@ -291,6 +307,7 @@ impl Cli {
             asset_name,
             daemon_refresh_required: false,
             daemon_refresh_note: None,
+            package_manager_note: None,
         })
     }
 
@@ -311,6 +328,7 @@ impl Cli {
                 asset_name,
                 daemon_refresh_required: false,
                 daemon_refresh_note: None,
+                package_manager_note: None,
             });
         }
 
@@ -365,6 +383,7 @@ impl Cli {
             asset_name,
             daemon_refresh_required,
             daemon_refresh_note,
+            package_manager_note: None,
         })
     }
 

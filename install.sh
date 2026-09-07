@@ -121,6 +121,40 @@ if [[ -z "$bin_dir" ]]; then
   bin_dir="${prefix}/bin"
 fi
 
+destination="${bin_dir}/ocm"
+protect_destination() {
+  local resolved_bin suffix
+  if [[ -L "$destination" ]]; then
+    echo "error: refusing to replace a symlink; update ocm through its owning installer or package manager" >&2
+    exit 1
+  fi
+  resolved_bin="$bin_dir"
+  suffix=""
+  while [[ ! -d "$resolved_bin" ]]; do
+    suffix="/$(basename -- "$resolved_bin")${suffix}"
+    resolved_bin="$(dirname -- "$resolved_bin")"
+  done
+  resolved_bin="$(cd -- "$resolved_bin" && pwd -P)${suffix}"
+  # npm owns files below node_modules even when aliases or manifests change.
+  # Do not execute an existing binary or require Node to protect that boundary.
+  case "${resolved_bin}/" in
+    */node_modules/*)
+      echo "error: npm manages this destination; update @openclaw/ocm with npm" >&2
+      exit 1
+      ;;
+  esac
+  if [[ -f "${resolved_bin}/../INSTALL_RECEIPT.json" ]]; then
+    echo "error: Homebrew manages this destination; run brew upgrade openclaw/tap/ocm" >&2
+    exit 1
+  fi
+  if [[ -e "$destination" && "$force" != "true" ]]; then
+    echo "error: ${destination} already exists; run \"ocm self update\" or rerun with --force to replace it" >&2
+    exit 1
+  fi
+}
+
+protect_destination
+
 target="$(detect_target)"
 asset="ocm-${target}.tar.gz"
 url="$(download_url_for "$version" "$asset")"
@@ -179,11 +213,7 @@ if [[ ! -f "$binary_path" || -L "$binary_path" ]]; then
 fi
 
 mkdir -p "$bin_dir"
-destination="${bin_dir}/ocm"
-if [[ -e "$destination" && "$force" != "true" ]]; then
-  echo "error: ${destination} already exists; run \"ocm self update\" or rerun with --force to replace it" >&2
-  exit 1
-fi
+protect_destination
 
 install -m 0755 "$binary_path" "$destination"
 
