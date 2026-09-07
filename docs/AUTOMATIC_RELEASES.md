@@ -15,7 +15,7 @@ as Odin's scheduled updater still install OCM first, then update OpenClaw.
 3. The automation creates one `release/vX.Y.Z` PR changing only the OCM version
    in `Cargo.toml` and `Cargo.lock`. The default increment is a patch. It refreshes
    a stale automation-owned branch with an exact-head lease, then waits for CI.
-4. Once the release PR is current, all five CI jobs pass and GitHub reports normal
+4. Once the release PR is current, all CI jobs pass and GitHub reports normal
    mergeability, it squash-merges that exact head without bypassing protection.
    No tag is created until the resulting exact `main` commit passes CI too.
 5. The configured signer creates a signed annotated tag for that release commit.

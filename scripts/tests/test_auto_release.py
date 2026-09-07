@@ -133,8 +133,12 @@ class CIGateTests(unittest.TestCase):
         self.ci = {"id": 42, "head_sha": A, "head_branch": "main", "event": "push",
                    "head_repository": {"full_name": release.REPO}, "status": "completed",
                    "conclusion": "success", "html_url": "https://github.com/openclaw/ocm/actions/runs/42"}
-        self.jobs = {"total_count": 5, "jobs": [{"name": n, "conclusion": "success"}
-                                                for n in release.CI_JOBS]}
+        names = ("Format", "Rust 1.88 minimum", "Windows compile",
+                 "Test (ubuntu-latest)", "Test (macos-latest)",
+                 "npm (ubuntu-latest, Node 22.15.0)", "npm (ubuntu-latest, Node 24)",
+                 "npm (macos-15-intel, Node 24)", "npm (macos-15, Node 24)")
+        self.jobs = {"total_count": len(names), "jobs": [
+            {"name": name, "conclusion": "success"} for name in names]}
 
     def check(self, runs, jobs=None):
         with patch.object(release, "api", side_effect=[{"workflow_runs": runs}, jobs or self.jobs]):
@@ -162,7 +166,27 @@ class CIGateTests(unittest.TestCase):
             with self.assertRaises(release.ReleaseError):
                 self.check([self.ci], jobs)
         with self.assertRaises(release.ReleaseError):
-            self.check([self.ci], {"total_count": 5, "jobs": self.jobs["jobs"][:-1]})
+            self.check([self.ci], {"total_count": self.jobs["total_count"],
+                                   "jobs": self.jobs["jobs"][:-1]})
+
+    def test_missing_failed_or_replaced_npm_jobs_stop_release(self):
+        for index, job in enumerate(self.jobs["jobs"]):
+            if not job["name"].startswith("npm ("):
+                continue
+            for outcome in ["missing", "failure", "skipped", None, "renamed", "duplicate"]:
+                with self.subTest(job=job["name"], outcome=outcome):
+                    jobs = copy.deepcopy(self.jobs)
+                    if outcome == "missing":
+                        jobs["jobs"].pop(index)
+                        jobs["total_count"] -= 1
+                    elif outcome == "renamed":
+                        jobs["jobs"][index]["name"] = "unexpected npm job"
+                    elif outcome == "duplicate":
+                        jobs["jobs"][index]["name"] = "Format"
+                    else:
+                        jobs["jobs"][index]["conclusion"] = outcome
+                    with self.assertRaisesRegex(release.ReleaseError, "every required release job"):
+                        self.check([self.ci], jobs)
 
 
 class ReconciliationTests(unittest.TestCase):

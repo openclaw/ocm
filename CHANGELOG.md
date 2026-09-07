@@ -20,6 +20,7 @@ All notable changes to OCM are documented here.
 
 - Prepare `@openclaw/ocm` npm distribution of signed Rust binaries, with a
   no-download launcher, exact platform aliases, and manual OIDC publishing.
+  Include every npm CI lane in automatic-release verification.
 - Prepare the `openclawocm` Cargo package and manual crates.io trusted publishing
   from verified signed releases, while preserving the `ocm` command and library.
 - Let `runtime build-local` assemble repeatable, commit-matched official companion plugins through OpenClaw's release packaging contract, stage them as trusted runtime-owned bundled plugins with isolated dependencies, and record artifact and entrypoint hashes for verification.
