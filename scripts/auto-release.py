@@ -214,14 +214,19 @@ class Reconciler:
             raise ReleaseError("Release version must increase")
         # Verify bytes, not just filenames: no dependency or package changes may
         # be smuggled into a PR that this automation can merge.
-        for name in paths:
-            before = self.git("show", f"{parent}:{name}")
-            after = self.git("show", f"{commit}:{name}")
-            pattern = (r'(?m)^(version = ")[^"]+("\s*)$' if name == "Cargo.toml" else
-                       r'(\[\[package\]\]\nname = "ocm"\nversion = ")[^"]+(")')
-            expected, count = re.subn(pattern, lambda m: m[1] + version + m[2], before, count=1)
-            if count != 1 or after != expected:
-                raise ReleaseError("Release PR contains changes beyond the package version")
+        with tempfile.TemporaryDirectory(prefix="ocm-version-diff-") as directory:
+            expected = Path(directory)
+            (expected / "scripts").mkdir()
+            for name in ("update-version.sh", "read-package-version.sh", "validate-version.sh"):
+                target = expected / "scripts" / name
+                target.write_bytes((ROOT / "scripts" / name).read_bytes())
+                target.chmod(0o755)
+            for name in paths:
+                (expected / name).write_text(self.git("show", f"{parent}:{name}"))
+            run(str(expected / "scripts/update-version.sh"), version)
+            for name in paths:
+                if self.git("show", f"{commit}:{name}") != (expected / name).read_text():
+                    raise ReleaseError("Release PR contains changes beyond the package version")
         return parent
 
     def pending(self):

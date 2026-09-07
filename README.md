@@ -38,6 +38,17 @@ Use `ocm` when you want:
 
 ## Install
 
+Install with Homebrew on macOS (Apple Silicon or Intel) or Linux x86_64:
+
+```bash
+brew install openclaw/tap/ocm
+```
+
+Upgrade Homebrew installations with `brew upgrade openclaw/tap/ocm`, not
+`ocm self update`. The initial Homebrew package, v0.2.39, does not yet enforce this
+restriction; the next OCM release will refuse to overwrite a Homebrew-managed
+executable. `ocm self update --check` remains available.
+
 Install the latest release:
 
 ```bash
@@ -50,7 +61,7 @@ Install a specific release:
 curl -fsSL https://github.com/openclaw/ocm/releases/download/v<ocm-version>/install.sh | bash -s -- --version v<ocm-version>
 ```
 
-Update an existing install:
+Update an installer-managed install:
 
 ```bash
 ocm self update
@@ -64,6 +75,12 @@ cargo install --locked --path .
 ```
 
 Source installs require Rust 1.88 or newer. Release installers verify the selected archive against the published `SHA256SUMS` before extraction.
+
+The crates.io package is prepared as `openclawocm`, but is not yet published.
+After the first crate release, `cargo install --locked openclawocm` will install
+the same `ocm` command. The existing crates.io package named `ocm` is unrelated.
+See [release prerequisites](docs/RELEASING.md#cratesio) for the initial publication
+and trusted-publisher setup.
 
 Inside this repo, use the development wrapper:
 

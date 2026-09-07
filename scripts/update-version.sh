@@ -28,6 +28,7 @@ cd "$repo_root"
 "${script_dir}/validate-version.sh" "$new_version"
 
 current_version="$("${script_dir}/read-package-version.sh" Cargo.toml Cargo.lock)"
+package_name="$("${script_dir}/read-package-version.sh" --name Cargo.toml Cargo.lock)"
 
 if [[ "$current_version" == "$new_version" ]]; then
   echo "ocm is already on ${new_version}"
@@ -35,6 +36,7 @@ if [[ "$current_version" == "$new_version" ]]; then
 fi
 
 export OCM_NEW_VERSION="$new_version"
+export OCM_PACKAGE_NAME="$package_name"
 
 echo "Updating Cargo.toml and Cargo.lock from ${current_version} to ${new_version}" >&2
 
@@ -53,9 +55,24 @@ rollback() {
 }
 trap rollback EXIT
 
-perl -0pi -e 's/^(version = ")[^"]+(")/$1.$ENV{OCM_NEW_VERSION}.$2/me' Cargo.toml
+perl -0pi -e '
+  my @sections = split(/(?=^\[)/m, $_);
+  for my $section (@sections) {
+    next unless $section =~ /^\[package\]\s*$/m;
+    $section =~ s/^(version\s*=\s*")[^"]+(")/$1.$ENV{OCM_NEW_VERSION}.$2/me;
+  }
+  $_ = join("", @sections);
+' Cargo.toml
 
-perl -0pi -e 's/(\[\[package\]\]\nname = "ocm"\nversion = ")[^"]+(")/$1.$ENV{OCM_NEW_VERSION}.$2/se' Cargo.lock
+perl -0pi -e '
+  my @sections = split(/(?=^\[\[package\]\])/m, $_);
+  for my $section (@sections) {
+    next unless $section =~ /^\[\[package\]\]\s*$/m;
+    next unless $section =~ /^name\s*=\s*"\Q$ENV{OCM_PACKAGE_NAME}\E"\s*$/m;
+    $section =~ s/^(version\s*=\s*")[^"]+(")/$1.$ENV{OCM_NEW_VERSION}.$2/me;
+  }
+  $_ = join("", @sections);
+' Cargo.lock
 
 updated_version="$("${script_dir}/read-package-version.sh" Cargo.toml Cargo.lock)"
 if [[ "$updated_version" != "$new_version" ]]; then

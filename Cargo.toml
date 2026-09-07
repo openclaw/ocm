@@ -1,5 +1,5 @@
 [package]
-name = "ocm"
+name = "openclawocm"
 version = "0.2.39"
 edition = "2024"
 rust-version = "1.88"
@@ -10,6 +10,14 @@ repository = "https://github.com/openclaw/ocm"
 homepage = "https://github.com/openclaw/ocm"
 keywords = ["openclaw", "cli", "manager", "environment", "service"]
 categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "ocm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ocm"
+path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

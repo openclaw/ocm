@@ -151,6 +151,53 @@ fn self_update_check_reports_when_a_newer_release_exists() {
     assert!(text.contains(&format!("assetName: {asset_name}")));
 }
 
+#[cfg(unix)]
+#[test]
+fn homebrew_self_update_preserves_the_keg_and_allows_checks_through_symlinks() {
+    let root = TestDir::new("self-update-homebrew");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let keg = root.child("brew/custom-cellar/ocm/0.2.39");
+    let binary = keg.join("bin/ocm");
+    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_ocm"), &binary).unwrap();
+    fs::write(
+        keg.join("INSTALL_RECEIPT.json"),
+        r#"{"homebrew_version":"4.6.0","source":{"tap":"openclaw/tap"}}"#,
+    )
+    .unwrap();
+    let linked = root.child("brew/bin/ocm");
+    fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&binary, &linked).unwrap();
+    let original = file_sha256(&binary).unwrap();
+    let release = TestHttpServer::serve_bytes(
+        "/release.json",
+        "application/json",
+        br#"{"tag_name":"v9.9.9","assets":[]}"#,
+    );
+    let env = release_env(&root, &release.url());
+
+    for command in [&binary, &linked] {
+        let output = run_ocm_binary(command, &cwd, &env, &["self", "update", "--raw"]);
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("brew upgrade openclaw/tap/ocm"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert!(release.requests().is_empty());
+    assert_eq!(file_sha256(&binary).unwrap(), original);
+    assert_eq!(fs::read_dir(keg.join("bin")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(root.child("ocm-home")).unwrap().count(), 0);
+
+    let output = run_ocm_binary(&linked, &cwd, &env, &["self", "update", "--check", "--raw"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("status: update_available"));
+    assert_eq!(release.requests().len(), 1);
+    assert_eq!(file_sha256(&binary).unwrap(), original);
+}
+
 #[test]
 fn self_update_check_ignores_older_latest_release_when_current_is_newer() {
     let root = TestDir::new("self-update-check-older-latest");

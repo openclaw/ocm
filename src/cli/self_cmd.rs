@@ -212,6 +212,27 @@ impl Cli {
         let version = Self::require_option_value(version, "--version")?;
         Self::assert_no_extra_args(&args)?;
 
+        if !check {
+            let binary = self
+                .current_binary_path()?
+                .canonicalize()
+                .map_err(|error| format!("failed to resolve the current ocm binary: {error}"))?;
+            if let Some(bin) = binary.parent()
+                && bin.file_name().is_some_and(|name| name == "bin")
+                && let Some(keg) = bin.parent()
+                && keg
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "ocm")
+                && keg.join("INSTALL_RECEIPT.json").is_file()
+            {
+                return Err(
+                    "Homebrew manages this ocm installation; run `brew upgrade openclaw/tap/ocm` instead"
+                        .to_string(),
+                );
+            }
+        }
+
         let target_display = version.clone().unwrap_or_else(|| "latest".to_string());
         let summary = if check {
             self.self_update_check(version.as_deref())?

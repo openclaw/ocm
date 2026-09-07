@@ -38,6 +38,8 @@ class PolicyTests(unittest.TestCase):
 
 
 class GitVersionTests(unittest.TestCase):
+    package_name = "ocm"
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
@@ -56,8 +58,15 @@ class GitVersionTests(unittest.TestCase):
             target = self.root / "scripts" / name
             target.write_bytes((SOURCE.parent / name).read_bytes())
             target.chmod(0o755)
-        (self.root / "Cargo.toml").write_text('[package]\nname = "ocm"\nversion = "0.2.38"\n')
-        (self.root / "Cargo.lock").write_text('version = 4\n\n[[package]]\nname = "ocm"\nversion = "0.2.38"\n')
+        other_name = "ocm" if self.package_name == "openclawocm" else "openclawocm"
+        (self.root / "Cargo.toml").write_text(
+            '[lib]\nname = "ocm"\npath = "src/lib.rs"\n\n'
+            f'[package]\nname = "{self.package_name}"\nversion = "0.2.38"\n'
+            '\n[[bin]]\nname = "ocm"\npath = "src/main.rs"\n')
+        (self.root / "Cargo.lock").write_text(
+            f'version = 4\n\n[[package]]\nname = "{other_name}"\nversion = "0.1.0"\n'
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            f'\n[[package]]\nname = "{self.package_name}"\nversion = "0.2.38"\n')
         self.r.git("add", ".")
         self.r.git("commit", "-m", "initial")
         self.base = self.r.git("rev-parse", "HEAD")
@@ -103,6 +112,19 @@ class GitVersionTests(unittest.TestCase):
         self.r.git("commit", "--amend", "--no-edit")
         with self.assertRaisesRegex(release.ReleaseError, "only the two"):
             self.r.verify_version_diff(self.r.git("rev-parse", "HEAD"), "0.2.39")
+
+    def test_rejects_target_changes_alongside_the_version(self):
+        self.commit_version()
+        manifest = self.root / "Cargo.toml"
+        manifest.write_text(manifest.read_text().replace('path = "src/main.rs"', 'path = "src/other.rs"'))
+        self.r.git("add", "Cargo.toml")
+        self.r.git("commit", "--amend", "--no-edit")
+        with self.assertRaisesRegex(release.ReleaseError, "beyond"):
+            self.r.verify_version_diff(self.r.git("rev-parse", "HEAD"), "0.2.39")
+
+
+class RenamedGitVersionTests(GitVersionTests):
+    package_name = "openclawocm"
 
 
 class CIGateTests(unittest.TestCase):

@@ -58,6 +58,18 @@ impl ReleaseRepo {
         command.output().unwrap()
     }
 
+    fn verify_crate_release(&self, tag: &str, commit: &str) -> Output {
+        Command::new(self.repo.join("scripts/verify-crate-release.sh"))
+            .current_dir(&self.repo)
+            .args(["openclaw/ocm", tag, commit])
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("PATH", &self.env_path)
+            .env("OCM_GH_BIN", &self.ghx)
+            .output()
+            .unwrap()
+    }
+
     fn git_output(&self, args: &[&str]) -> Output {
         Command::new("git")
             .current_dir(&self.repo)
@@ -126,25 +138,29 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
 }
 
-fn write_release_fixture(path: &Path) {
+fn write_release_fixture(path: &Path, package_name: &str) {
     fs::create_dir_all(path.join("scripts")).unwrap();
     fs::write(
         path.join("Cargo.toml"),
-        r#"[package]
-name = "ocm"
+        format!(
+            r#"[package]
+name = "{package_name}"
 version = "0.2.7"
 edition = "2024"
-"#,
+"#
+        ),
     )
     .unwrap();
     fs::write(
         path.join("Cargo.lock"),
-        r#"version = 4
+        format!(
+            r#"version = 4
 
 [[package]]
-name = "ocm"
+name = "{package_name}"
 version = "0.2.7"
-"#,
+"#
+        ),
     )
     .unwrap();
     fs::write(path.join("README.md"), "release fixture\n").unwrap();
@@ -162,6 +178,10 @@ fn copy_script(repo: &Path, relative: &str) {
 }
 
 fn init_release_repo(label: &str) -> ReleaseRepo {
+    init_release_repo_named(label, "ocm")
+}
+
+fn init_release_repo_named(label: &str, package_name: &str) -> ReleaseRepo {
     let root = TestDir::new(label);
     let repo = root.child("repo");
     let remote = root.child("remote.git");
@@ -171,7 +191,7 @@ fn init_release_repo(label: &str) -> ReleaseRepo {
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&fake_bin).unwrap();
 
-    write_release_fixture(&repo);
+    write_release_fixture(&repo, package_name);
     for script in [
         "scripts/release.sh",
         "scripts/update-version.sh",
@@ -179,6 +199,7 @@ fn init_release_repo(label: &str) -> ReleaseRepo {
         "scripts/read-package-version.sh",
         "scripts/verify-release-ci.sh",
         "scripts/verify-release-tag.sh",
+        "scripts/verify-crate-release.sh",
     ] {
         copy_script(&repo, script);
     }
@@ -236,6 +257,14 @@ if [[ "${1:-}" == "api" ]]; then
         exit 0
       }
       cat .git/test-ci-run
+      exit 0
+      ;;
+    repos/openclaw/ocm/releases/tags/*)
+      [[ -f .git/test-published-release ]] || {
+        printf '%s\ttrue\t\n' "${endpoint##*/}"
+        exit 0
+      }
+      cat .git/test-published-release
       exit 0
       ;;
     repos/openclaw/ocm/git/ref/tags/*)
@@ -654,4 +683,116 @@ fn update_version_accepts_semver_build_metadata_without_running_cargo() {
             .unwrap()
             .contains("version = \"0.2.8+build.1\"")
     );
+}
+
+#[test]
+fn update_version_changes_only_the_selected_root_package() {
+    let repo = init_release_repo("update-version-package-identity");
+    for name in ["ocm", "openclawocm"] {
+        let other = if name == "ocm" { "openclawocm" } else { "ocm" };
+        let manifest = format!(
+            "[lib]\nname = \"ocm\"\npath = \"src/lib.rs\"\n\n[package]\nname = \"{name}\"\nversion = \"0.2.7\"\n\n[[bin]]\nname = \"ocm\"\npath = \"src/main.rs\"\n"
+        );
+        let dependency = format!(
+            "[[package]]\nname = \"{other}\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n",
+            "0".repeat(64)
+        );
+        let lockfile = format!(
+            "version = 4\n\n{dependency}\n[[package]]\nname = \"{name}\"\nversion = \"0.2.7\"\n"
+        );
+        fs::write(repo.repo.join("Cargo.toml"), &manifest).unwrap();
+        fs::write(repo.repo.join("Cargo.lock"), &lockfile).unwrap();
+        let output = repo.run_update_version("0.2.8");
+        assert!(output.status.success(), "{name}: {}", stderr(&output));
+        assert_eq!(
+            fs::read_to_string(repo.repo.join("Cargo.toml")).unwrap(),
+            manifest.replace("\"0.2.7\"", "\"0.2.8\"")
+        );
+        assert_eq!(
+            fs::read_to_string(repo.repo.join("Cargo.lock")).unwrap(),
+            lockfile.replace("\"0.2.7\"", "\"0.2.8\"")
+        );
+    }
+}
+
+#[test]
+fn package_version_rejects_ambiguous_remote_or_mismatched_root_records() {
+    let repo = init_release_repo("package-version-invalid-records");
+    for name in ["ocm", "openclawocm"] {
+        let manifest = format!("[package]\nname = \"{name}\"\nversion = \"0.2.7\"\n");
+        let record = format!("[[package]]\nname = \"{name}\"\nversion = \"0.2.7\"\n");
+        for lockfile in [
+            record.replace("0.2.7", "0.2.8"),
+            record.replace("0.2.7", "0.2.7..1"),
+            record.replace(name, "unrelated"),
+            format!("{record}\n{record}"),
+            format!("{record}name = \"duplicate\"\n"),
+            format!("{record}source = \"registry+https://github.com/rust-lang/crates.io-index\"\n"),
+            format!("{record}checksum = \"{}\"\n", "0".repeat(64)),
+        ] {
+            fs::write(repo.repo.join("Cargo.toml"), &manifest).unwrap();
+            fs::write(repo.repo.join("Cargo.lock"), &lockfile).unwrap();
+            let output = repo.run_update_version("0.2.9");
+            assert!(!output.status.success(), "{name}: {lockfile}");
+            assert_eq!(
+                fs::read_to_string(repo.repo.join("Cargo.toml")).unwrap(),
+                manifest
+            );
+            assert_eq!(
+                fs::read_to_string(repo.repo.join("Cargo.lock")).unwrap(),
+                lockfile
+            );
+        }
+    }
+}
+
+#[test]
+fn crate_publication_requires_the_new_package_and_a_published_verified_release() {
+    for name in ["ocm", "openclawocm"] {
+        let repo = init_release_repo_named("crate-release-identity", name);
+        let prepare = repo.run_release("0.2.8");
+        assert!(prepare.status.success(), "{}", stderr(&prepare));
+        let commit = repo.merge_release_pr("0.2.8");
+        repo.record_ci(&commit, "completed", "success");
+        let binary_release = repo.run_release("0.2.8");
+        assert!(
+            binary_release.status.success(),
+            "{}",
+            stderr(&binary_release)
+        );
+
+        let output = repo.verify_crate_release("v0.2.8", &commit);
+        assert!(!output.status.success());
+        if name == "ocm" {
+            assert!(stderr(&output).contains("crates.io publishing requires openclawocm"));
+            continue;
+        }
+        assert!(stderr(&output).contains("publish the complete binary release"));
+        for metadata in [
+            "v0.2.8\ttrue\t2026-09-07T00:00:00Z\n",
+            "v0.2.7\tfalse\t2026-09-07T00:00:00Z\n",
+            "v0.2.8\tfalse\t\n",
+        ] {
+            fs::write(repo.repo.join(".git/test-published-release"), metadata).unwrap();
+            let output = repo.verify_crate_release("v0.2.8", &commit);
+            assert!(!output.status.success());
+            assert!(stderr(&output).contains("publish the complete binary release"));
+        }
+        fs::write(
+            repo.repo.join(".git/test-published-release"),
+            "v0.2.8\tfalse\t2026-09-07T00:00:00Z\n",
+        )
+        .unwrap();
+        let output = repo.verify_crate_release("v0.2.8", &commit);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(stdout(&output).trim(), commit);
+
+        repo.record_ci(&commit, "completed", "failure");
+        let output = repo.verify_crate_release("v0.2.8", &commit);
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("concluded failure"));
+        let output = repo.verify_crate_release("v0.2.8", &"0".repeat(40));
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("moved away from verified commit"));
+    }
 }
