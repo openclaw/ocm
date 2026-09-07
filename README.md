@@ -38,9 +38,12 @@ Use `ocm` when you want:
 
 ## Install
 
-The npm distribution is prepared but not published yet. Its first publication
-must use a future signed release containing npm ownership protection, not
-v0.2.39. Once available, install with `npm install --global @openclaw/ocm`.
+Install the npm distribution, available starting with OCM v0.2.40:
+
+```bash
+npm install --global @openclaw/ocm
+```
+
 See [npm installation and updates](npm/README.md) for Node requirements,
 project-local installs, npx, and daemon refresh behavior.
 
@@ -51,9 +54,8 @@ brew install openclaw/tap/ocm
 ```
 
 Upgrade Homebrew installations with `brew upgrade openclaw/tap/ocm`, not
-`ocm self update`. The initial Homebrew package, v0.2.39, does not yet enforce this
-restriction; the next OCM release will refuse to overwrite a Homebrew-managed
-executable. `ocm self update --check` remains available.
+`ocm self update`. Since v0.2.40, OCM refuses to overwrite a
+Homebrew-managed executable. `ocm self update --check` remains available.
 
 Install the latest release:
 

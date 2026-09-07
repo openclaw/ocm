@@ -39,9 +39,8 @@ Do not add Linux ARM64 until the release workflow publishes and tests that targe
 
 Homebrew owns upgrades to its installed executable. Use
 `brew upgrade openclaw/tap/ocm`; `ocm self update --check` can still inspect release
-availability. The initial formula installs v0.2.39, which predates the ownership
-guard. The guard takes effect only after the next approved OCM release reaches
-the tap, not when this source change merges.
+availability. Since v0.2.40, OCM refuses mutating self-updates of
+Homebrew-owned executables.
 
 ## npm
 
@@ -51,10 +50,10 @@ same package, such as `V-darwin-arm64`. Only macOS ARM64/x64 and Linux x64 glibc
 are supported. There are no install hooks, binary downloads during installation,
 or Rust compiler requirements. See [npm usage](../npm/README.md).
 
-The distribution is prepared, not published. The first npm publication must
-use the next approved signed release containing the npm launcher and native
-ownership guard. The workflow rejects v0.2.39 and other older sources. Merging
-this preparation does not authorize a version bump, release, or publication.
+The first npm release, v0.2.40, is published with the npm launcher and native
+ownership guard. The workflow rejects v0.2.39 and other older sources. Future
+version bumps, signed releases, and publications still require explicit
+maintainer authorization.
 
 ### Account setup
 
@@ -62,13 +61,16 @@ An npm maintainer with write access to the `openclaw` scope must separately
 approve and perform the first legitimate package publication. npm requires an
 existing package before a trusted publisher can be configured.
 
-For that first approved release, use the exact tarballs from the workflow's
-successful read-only preparation and three-platform validation. Bootstrap one
-platform payload under its `platform-latest-<platform>` tag (or
-`platform-next-<platform>` for a prerelease) using an authenticated
-maintainer account with 2FA. Do not publish a placeholder, advance `latest`,
-or put a bootstrap token in GitHub. Until this bootstrap and trust setup are
-complete, the workflow's publication job cannot authenticate.
+The one-time bootstrap is complete for `@openclaw/ocm`; do not repeat it.
+For a new package, use the exact tarballs from successful workflow preparation
+and three-platform validation. The workflow has no prepare-only switch: wait
+for its publication attempt to finish and inspect the failed step and registry
+state before any manual publication. Authentication errors are not absence.
+Bootstrap only one verified platform payload under its
+`platform-latest-<platform>` tag (or `platform-next-<platform>` for a prerelease)
+using an authenticated maintainer account with 2FA, `--ignore-scripts`,
+`--provenance=false`, and `--access public`. Do not publish a placeholder,
+manually move `latest`, or put a bootstrap token in GitHub.
 
 Configure a GitHub trusted publisher in the package's npm settings:
 
@@ -98,9 +100,43 @@ permissions, and `id-token: write` only in the publication job. There is no
 `NPM_TOKEN` or `NODE_AUTH_TOKEN` fallback.
 
 After a real OIDC publication and provenance verification, set npm publishing
-access to **Require two-factor authentication and disallow tokens**, and revoke
-any bootstrap publishing token. Preparation and local registry tests do not
-prove that npm's account-side trust configuration works.
+access to **Require two-factor authentication and disallow tokens**:
+
+```sh
+npm access set mfa=publish @openclaw/ocm --registry=https://registry.npmjs.org
+```
+
+Complete the account's 2FA approval. Do not use `mfa=automation`, which permits
+token overrides. Verify the setting in npm's package settings; `npm access get
+status` reports visibility, not MFA enforcement. Revoke only a dedicated
+temporary bootstrap token, if one was created. Preparation and local registry
+tests do not prove that account-side trust or hardening is configured.
+
+### First publication: v0.2.40
+
+On September 7, 2026, the ARM bootstrap created both its explicit
+`platform-latest-darwin-arm64` tag and an implicit `latest` pointing to
+`0.2.40-darwin-arm64`. Removing `latest` returned HTTP 400. These are observed
+bootstrap results, not a guarantee for other packages. Do not repeat the
+deletion or republish an accepted version.
+
+The full package metadata briefly returned 404 after the successful publish,
+while the exact-version endpoint and tarball were available. Reconcile an
+accepted publication with bounded exact-version, tarball-integrity, ownership,
+and dist-tag checks; a transient metadata 404 alone is not permission to retry.
+
+After trust configuration and integrity verification, only the failed job in
+the [original workflow run](https://github.com/openclaw/ocm/actions/runs/34113713509/attempts/2)
+was rerun, reusing its tested artifacts. The unchanged publisher accepted the
+matching ARM payload, published the remaining platforms, then published the
+stable root last. Its existing version-order and channel guards allowed the
+platform prerelease to advance to `latest=0.2.40`; no tag workaround was needed.
+
+The manually bootstrapped `0.2.40-darwin-arm64` payload has a registry signature
+and contains the original signed, notarized binary, but has **no OIDC
+provenance**. The root, Intel macOS, and Linux versions were published through
+OIDC and have verified provenance. Binary signing and registry signatures do
+not replace an npm provenance statement.
 
 ### Publishing and recovery
 

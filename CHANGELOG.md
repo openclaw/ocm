@@ -25,6 +25,8 @@ All notable changes to OCM are documented here.
 
 ### Changed
 
+- Document live npm and Homebrew availability in v0.2.40, observed one-time
+  bootstrap recovery, and the manual ARM payload's provenance exception.
 - Keep package-manager distribution on npm and Homebrew only; disable Cargo
   publication while retaining source installation and the internal `ocm` name.
 - Refresh Rust dependencies and pinned CI actions while preserving Rust 1.88 support.
