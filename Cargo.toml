@@ -1,6 +1,7 @@
 [package]
-name = "openclawocm"
+name = "ocm"
 version = "0.2.39"
+publish = false
 edition = "2024"
 rust-version = "1.88"
 description = "OpenClaw Manager: the local control plane for isolated OpenClaw environments, launchers, runtimes, and services."

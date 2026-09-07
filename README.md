@@ -82,12 +82,6 @@ cargo install --locked --path .
 
 Source installs require Rust 1.88 or newer. Release installers verify the selected archive against the published `SHA256SUMS` before extraction.
 
-The crates.io package is prepared as `openclawocm`, but is not yet published.
-After the first crate release, `cargo install --locked openclawocm` will install
-the same `ocm` command. The existing crates.io package named `ocm` is unrelated.
-See [release prerequisites](docs/RELEASING.md#cratesio) for the initial publication
-and trusted-publisher setup.
-
 Inside this repo, use the development wrapper:
 
 ```bash

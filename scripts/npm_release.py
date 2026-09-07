@@ -107,7 +107,7 @@ def release_snapshot(repo, tag):
 def verify_source(repo, tag, expected=None):
     if repo != "openclaw/ocm":
         raise ValueError("npm publication requires openclaw/ocm")
-    args = [str(ROOT / "scripts/verify-crate-release.sh"), repo, tag]
+    args = [str(ROOT / "scripts/verify-published-release.sh"), repo, tag]
     if expected:
         args.append(expected)
     commit = subprocess.check_output(args, text=True).strip()

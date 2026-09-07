@@ -58,8 +58,8 @@ impl ReleaseRepo {
         command.output().unwrap()
     }
 
-    fn verify_crate_release(&self, tag: &str, commit: &str) -> Output {
-        let mut command = Command::new(self.repo.join("scripts/verify-crate-release.sh"));
+    fn verify_published_release(&self, tag: &str, commit: &str) -> Output {
+        let mut command = Command::new(self.repo.join("scripts/verify-published-release.sh"));
         command
             .current_dir(&self.repo)
             .args(["openclaw/ocm", tag, commit])
@@ -147,6 +147,7 @@ fn write_release_fixture(path: &Path, package_name: &str) {
             r#"[package]
 name = "{package_name}"
 version = "0.2.7"
+publish = false
 edition = "2024"
 "#
         ),
@@ -200,7 +201,7 @@ fn init_release_repo_named(label: &str, package_name: &str) -> ReleaseRepo {
         "scripts/read-package-version.sh",
         "scripts/verify-release-ci.sh",
         "scripts/verify-release-tag.sh",
-        "scripts/verify-crate-release.sh",
+        "scripts/verify-published-release.sh",
     ] {
         copy_script(&repo, script);
     }
@@ -692,7 +693,7 @@ fn update_version_changes_only_the_selected_root_package() {
     for name in ["ocm", "openclawocm"] {
         let other = if name == "ocm" { "openclawocm" } else { "ocm" };
         let manifest = format!(
-            "[lib]\nname = \"ocm\"\npath = \"src/lib.rs\"\n\n[package]\nname = \"{name}\"\nversion = \"0.2.7\"\n\n[[bin]]\nname = \"ocm\"\npath = \"src/main.rs\"\n"
+            "[lib]\nname = \"ocm\"\npath = \"src/lib.rs\"\n\n[package]\nname = \"{name}\"\nversion = \"0.2.7\"\npublish = false\n\n[[bin]]\nname = \"ocm\"\npath = \"src/main.rs\"\n"
         );
         let dependency = format!(
             "[[package]]\nname = \"{other}\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n",
@@ -748,9 +749,9 @@ fn package_version_rejects_ambiguous_remote_or_mismatched_root_records() {
 }
 
 #[test]
-fn crate_publication_requires_the_new_package_and_a_published_verified_release() {
+fn published_release_requires_verified_source_and_publication_for_both_package_names() {
     for name in ["ocm", "openclawocm"] {
-        let repo = init_release_repo_named("crate-release-identity", name);
+        let repo = init_release_repo_named("published-release-identity", name);
         let prepare = repo.run_release("0.2.8");
         assert!(prepare.status.success(), "{}", stderr(&prepare));
         let commit = repo.merge_release_pr("0.2.8");
@@ -762,16 +763,8 @@ fn crate_publication_requires_the_new_package_and_a_published_verified_release()
             stderr(&binary_release)
         );
 
-        let output = repo.verify_crate_release("v0.2.8", &commit);
+        let output = repo.verify_published_release("v0.2.8", &commit);
         assert!(!output.status.success());
-        if name == "ocm" {
-            assert!(
-                stderr(&output).contains("crates.io publishing requires openclawocm"),
-                "{}",
-                stderr(&output)
-            );
-            continue;
-        }
         assert!(stderr(&output).contains("publish the complete binary release"));
         for metadata in [
             "v0.2.8\ttrue\t2026-09-07T00:00:00Z\n",
@@ -779,7 +772,7 @@ fn crate_publication_requires_the_new_package_and_a_published_verified_release()
             "v0.2.8\tfalse\t\n",
         ] {
             fs::write(repo.repo.join(".git/test-published-release"), metadata).unwrap();
-            let output = repo.verify_crate_release("v0.2.8", &commit);
+            let output = repo.verify_published_release("v0.2.8", &commit);
             assert!(!output.status.success());
             assert!(stderr(&output).contains("publish the complete binary release"));
         }
@@ -788,16 +781,76 @@ fn crate_publication_requires_the_new_package_and_a_published_verified_release()
             "v0.2.8\tfalse\t2026-09-07T00:00:00Z\n",
         )
         .unwrap();
-        let output = repo.verify_crate_release("v0.2.8", &commit);
+        let output = repo.verify_published_release("v0.2.8", &commit);
         assert!(output.status.success(), "{}", stderr(&output));
         assert_eq!(stdout(&output).trim(), commit);
 
         repo.record_ci(&commit, "completed", "failure");
-        let output = repo.verify_crate_release("v0.2.8", &commit);
+        let output = repo.verify_published_release("v0.2.8", &commit);
         assert!(!output.status.success());
         assert!(stderr(&output).contains("concluded failure"));
-        let output = repo.verify_crate_release("v0.2.8", &"0".repeat(40));
+        let output = repo.verify_published_release("v0.2.8", &"0".repeat(40));
         assert!(!output.status.success());
         assert!(stderr(&output).contains("moved away from verified commit"));
     }
+}
+
+#[test]
+fn npm_source_verification_requires_the_published_release() {
+    let repo = init_release_repo("npm-published-release");
+    for file in [
+        "scripts/npm_release.py",
+        "npm/ocm.cjs",
+        "src/infra/install_owner.rs",
+    ] {
+        copy_script(&repo.repo, file);
+    }
+    assert!(repo.git_output(&["add", "."]).status.success());
+    assert!(
+        repo.git_output(&["commit", "-m", "test: seed npm source"])
+            .status
+            .success()
+    );
+    assert!(repo.git_output(&["push", "fake", "main"]).status.success());
+    let prepare = repo.run_release("0.2.8");
+    assert!(prepare.status.success(), "{}", stderr(&prepare));
+    let commit = repo.merge_release_pr("0.2.8");
+    repo.record_ci(&commit, "completed", "success");
+    let binary_release = repo.run_release("0.2.8");
+    assert!(
+        binary_release.status.success(),
+        "{}",
+        stderr(&binary_release)
+    );
+
+    let mut command = Command::new("python3");
+    command
+        .current_dir(&repo.repo)
+        .args([
+            "-B",
+            "-c",
+            "from scripts import npm_release; print(*npm_release.verify_source('openclaw/ocm', 'v0.2.8'))",
+        ])
+        .env_clear()
+        .env("HOME", &repo.home)
+        .env("PATH", &repo.env_path)
+        .env("OCM_GH_BIN", &repo.ghx);
+    repo.apply_toolchain_env(&mut command);
+    // The real npm entry point invokes the release verifier, including its Git
+    // and GitHub boundaries; a stale helper path must not pass this check.
+    let unpublished = command.output().unwrap();
+    assert!(!unpublished.status.success());
+    assert!(
+        stderr(&unpublished).contains("publish the complete binary release"),
+        "{}",
+        stderr(&unpublished)
+    );
+    fs::write(
+        repo.repo.join(".git/test-published-release"),
+        "v0.2.8\tfalse\t2026-09-07T00:00:00Z\n",
+    )
+    .unwrap();
+    let published = command.output().unwrap();
+    assert!(published.status.success(), "{}", stderr(&published));
+    assert_eq!(stdout(&published).trim(), format!("{commit} 0.2.8"));
 }

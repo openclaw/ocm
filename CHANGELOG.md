@@ -21,12 +21,12 @@ All notable changes to OCM are documented here.
 - Prepare `@openclaw/ocm` npm distribution of signed Rust binaries, with a
   no-download launcher, exact platform aliases, and manual OIDC publishing.
   Include every npm CI lane in automatic-release verification.
-- Prepare the `openclawocm` Cargo package and manual crates.io trusted publishing
-  from verified signed releases, while preserving the `ocm` command and library.
 - Let `runtime build-local` assemble repeatable, commit-matched official companion plugins through OpenClaw's release packaging contract, stage them as trusted runtime-owned bundled plugins with isolated dependencies, and record artifact and entrypoint hashes for verification.
 
 ### Changed
 
+- Keep package-manager distribution on npm and Homebrew only; disable Cargo
+  publication while retaining source installation and the internal `ocm` name.
 - Refresh Rust dependencies and pinned CI actions while preserving Rust 1.88 support.
 - Make `ocm service restart <env>` restart immediately through OpenClaw's protocol-v1 recovery handoff so eligible interrupted sessions and subagents resume after startup, preserve the legacy direct-restart behavior with a warning when recovery is unavailable, keep `--force` as an explicit bypass for an unhealthy handoff, and avoid self-restart deadlocks.
 - Resolve and package the complete transitive closure of private OpenClaw `workspace:*` dependencies during `runtime build-local`, rewriting nested workspace specs only inside scratch archives so current source graphs install without mutating the checkout.
