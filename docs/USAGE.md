@@ -446,6 +446,15 @@ sidecars, modes, symlinks, plugin data, and unknown future paths. Restore stages
 an exclusive candidate beside the live root and retains the displaced root
 until service acceptance; failed acceptance restores the displaced root.
 
+Unix sockets are transient process endpoints and are omitted from checkpoints,
+including inactive socket files left by stopped processes. Snapshot creation
+leaves source endpoints untouched. Restore does not recreate sockets; their
+owning processes create them when needed. This rule uses the entry's file type,
+so ordinary files named `*.sock` and symlinks remain part of the checkpoint.
+Other unsupported special entries, such as FIFOs and devices, are rejected
+during preparation before a running gateway is stopped. Final capture also
+checks for unsupported entries introduced after preparation.
+
 APFS checkpoints begin as space-efficient copy-on-write clones. Other
 filesystems require a full metadata-preserving copy. Plan space for checkpoint
 divergence and a temporary restore candidate. These same-disk, secret-bearing

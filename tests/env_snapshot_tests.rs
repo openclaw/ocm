@@ -1703,6 +1703,70 @@ fn env_snapshot_removes_partial_artifacts_when_sqlite_snapshot_fails() {
     assert_eq!(shown["serviceRunning"], true);
 }
 
+#[cfg(unix)]
+#[test]
+fn env_snapshot_refuses_fifo_before_stopping_the_running_gateway() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let root = TestDir::new("env-snapshot-fifo-preflight");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let health = TestHttpServer::serve_bytes_times("/health", "text/plain", b"ok", 10);
+    let port = url::Url::parse(&health.url()).unwrap().port().unwrap() as u32;
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--port",
+            &port.to_string(),
+            "--launcher",
+            "stable",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let started = run_ocm(&cwd, &env, &["service", "start", "source"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    write_running_snapshot_service(&root, &cwd, &env, port);
+
+    let fifo = root.child("ocm-home/envs/source/unsupported");
+    let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    fs::write(root.child("launchctl.log"), "").unwrap();
+    let snapshot = run_ocm(&cwd, &env, &["env", "snapshot", "create", "source"]);
+    assert_eq!(snapshot.status.code(), Some(1));
+    assert!(
+        stderr(&snapshot).contains("unsupported special file in checkpoint"),
+        "{}",
+        stderr(&snapshot)
+    );
+    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+    assert!(!root.child("ocm-home/snapshots/source").exists());
+    let lifecycle = fs::read_to_string(root.child("launchctl.log")).unwrap();
+    assert!(!lifecycle.contains("bootout "), "{lifecycle}");
+    let shown = run_ocm(&cwd, &env, &["env", "show", "source", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["serviceEnabled"], true);
+    assert_eq!(shown["serviceRunning"], true);
+}
+
 #[test]
 fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
     let root = TestDir::new("env-snapshot-sqlite-mutated-after-preflight");
