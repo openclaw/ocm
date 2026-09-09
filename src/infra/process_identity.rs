@@ -119,7 +119,9 @@ pub(crate) fn observe_process(pid: u32) -> Result<Option<ProcessObservation>, St
         libc::proc_pidinfo(
             pid as i32,
             libc::PROC_PIDTBSDINFO,
-            0,
+            // Include unreaped exited processes so their recorded identity and
+            // non-running status remain inspectable during group shutdown.
+            1,
             std::ptr::from_mut(&mut info).cast(),
             size,
         )
@@ -204,4 +206,40 @@ pub(crate) fn observe_process(pid: u32) -> Result<Option<ProcessObservation>, St
     Err(format!(
         "process start identity inspection is unsupported for pid {pid} on this platform"
     ))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::observe_process;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn observes_an_unreaped_exited_process() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                std::ptr::from_mut(&mut info),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        let observed = observe_process(pid);
+        let reaped = child.wait();
+
+        assert_eq!(waited, 0);
+        assert!(reaped.unwrap().success());
+        let observed = observed.unwrap().expect("unreaped process identity");
+        assert_eq!(observed.identity.pid, pid);
+        assert!(!observed.running);
+        assert!(!observed.stopped);
+    }
 }
