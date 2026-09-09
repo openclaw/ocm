@@ -33,7 +33,7 @@ use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::infra::terminal::{Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table};
 use crate::openclaw_repo::{
     detect_openclaw_checkout, discover_openclaw_checkout, ensure_checkout_owned_dependencies,
-    ensure_openclaw_worktree,
+    ensure_openclaw_worktree, validate_openclaw_worktree,
 };
 use crate::service::service_backend_support_error;
 use crate::store::{
@@ -554,7 +554,19 @@ impl Cli {
             let existing_repo = PathBuf::from(&dev.repo_root);
             if let Some(repo_root) = repo_root {
                 let requested = resolve_absolute_path(&repo_root, &self.env, &self.cwd)?;
-                if requested != existing_repo {
+                let requested = fs::canonicalize(&requested).map_err(|error| {
+                    format!(
+                        "failed to resolve OpenClaw repo {}: {error}",
+                        display_path(&requested)
+                    )
+                })?;
+                let saved_repo = fs::canonicalize(&existing_repo).map_err(|error| {
+                    format!(
+                        "failed to resolve saved OpenClaw repo {}: {error}",
+                        display_path(&existing_repo)
+                    )
+                })?;
+                if requested != saved_repo {
                     return Err(format!(
                         "dev cannot change the repo for existing env {}; current repo is {}",
                         existing.name, dev.repo_root
@@ -572,7 +584,7 @@ impl Cli {
                 }
             }
 
-            ensure_openclaw_worktree(&existing_repo, &existing.name)?;
+            validate_openclaw_worktree(&existing_repo, Path::new(&dev.worktree_root))?;
             let meta = self
                 .environment_service()
                 .apply_effective_gateway_port(existing)?;

@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ocm::store::{now_utc, supervisor_runtime_path};
+use ocm::store::{get_environment, now_utc, save_environment, supervisor_runtime_path};
 use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
 use serde_json::Value;
 
@@ -577,7 +577,7 @@ fn dev_command_rejects_an_unregistered_clone_at_the_managed_path() {
 }
 
 #[test]
-fn dev_command_recreates_an_exactly_registered_missing_worktree() {
+fn dev_command_does_not_recreate_a_missing_saved_worktree() {
     let root = TestDir::new("dev-command-missing-worktree");
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
@@ -590,19 +590,138 @@ fn dev_command_recreates_an_exactly_registered_missing_worktree() {
     let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     let show_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
     let worktree_root = PathBuf::from(show_json["devWorktreeRoot"].as_str().unwrap());
+    let registered = git_worktree_paths(&repo);
     fs::remove_dir_all(&worktree_root).unwrap();
+    fs::remove_file(root.child("pnpm.log")).unwrap();
 
     let second = run_ocm(&cwd, &env, &["dev", "demo"]);
-    assert!(second.status.success(), "{}", stderr(&second));
-    assert!(worktree_root.join(".git").exists());
-    let canonical_worktree_root = fs::canonicalize(&worktree_root).unwrap();
+    assert!(!second.status.success());
+    assert!(stderr(&second).contains("saved dev worktree is missing"));
+    assert!(!worktree_root.exists());
+    assert_eq!(git_worktree_paths(&repo), registered);
+    assert!(!root.child("pnpm.log").exists());
+    let meta = get_environment("demo", &env, &cwd).unwrap();
+    assert_eq!(meta.dev.unwrap().worktree_root, path_string(&worktree_root));
+}
+
+#[test]
+fn dev_command_resumes_the_recorded_worktree_without_recreating_the_default() {
+    let root = TestDir::new("dev-command-recorded-worktree");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+
+    let first = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let mut meta = get_environment("demo", &env, &cwd).unwrap();
+    let dev = meta.dev.as_mut().unwrap();
+    let original_worktree = PathBuf::from(&dev.worktree_root);
+    let recorded_worktree = repo.join(".worktrees/recorded-source");
+    let moved = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["worktree", "move"])
+        .arg(&original_worktree)
+        .arg(&recorded_worktree)
+        .output()
+        .unwrap();
+    assert!(moved.status.success(), "{}", stderr(&moved));
+    dev.worktree_root = path_string(&recorded_worktree);
+    save_environment(meta, &env, &cwd).unwrap();
+    fs::write(recorded_worktree.join("SENTINEL"), "keep my edits\n").unwrap();
+    fs::write(
+        recorded_worktree.join("scripts/run-node.mjs"),
+        "console.log('edited');\n",
+    )
+    .unwrap();
+    fs::remove_file(root.child("pnpm.log")).unwrap();
+
+    let resumed = run_ocm(&cwd, &env, &["dev", "demo"]);
+    assert!(resumed.status.success(), "{}", stderr(&resumed));
+    assert!(!original_worktree.exists());
     assert_eq!(
-        git_worktree_paths(&repo)
-            .into_iter()
-            .filter(|path| fs::canonicalize(path).ok().as_ref() == Some(&canonical_worktree_root))
-            .count(),
-        1
+        fs::read_to_string(recorded_worktree.join("SENTINEL")).unwrap(),
+        "keep my edits\n"
     );
+    assert_eq!(
+        fs::read_to_string(recorded_worktree.join("scripts/run-node.mjs")).unwrap(),
+        "console.log('edited');\n"
+    );
+    let pnpm_log = fs::read_to_string(root.child("pnpm.log")).unwrap();
+    assert!(pnpm_log.contains("openclaw gateway run --port"));
+    let source_prefix = format!(
+        "{}|",
+        path_string(&fs::canonicalize(&recorded_worktree).unwrap())
+    );
+    assert!(
+        pnpm_log
+            .lines()
+            .all(|line| line.starts_with(&source_prefix))
+    );
+}
+
+#[test]
+fn dev_command_rejects_an_unrelated_recorded_worktree_before_running_source() {
+    let root = TestDir::new("dev-command-unrelated-recorded-worktree");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+
+    let first = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let unrelated_worktree = root.child("unrelated-source");
+    init_nested_openclaw_repo(&unrelated_worktree);
+    let mut meta = get_environment("demo", &env, &cwd).unwrap();
+    meta.dev.as_mut().unwrap().worktree_root = path_string(&unrelated_worktree);
+    save_environment(meta, &env, &cwd).unwrap();
+    fs::remove_file(root.child("pnpm.log")).unwrap();
+
+    let resumed = run_ocm(&cwd, &env, &["dev", "demo"]);
+    assert!(!resumed.status.success());
+    assert!(stderr(&resumed).contains("saved dev worktree is not registered"));
+    assert!(!root.child("pnpm.log").exists());
+    assert_eq!(
+        fs::read_to_string(unrelated_worktree.join("SENTINEL")).unwrap(),
+        "preserve me\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_command_accepts_a_repo_alias_without_rebinding_the_env() {
+    let root = TestDir::new("dev-command-repo-alias");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+
+    let first = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let before = get_environment("demo", &env, &cwd).unwrap().dev.unwrap();
+    let alias = root.child("source-alias");
+    std::os::unix::fs::symlink(&repo, &alias).unwrap();
+
+    let resumed = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&alias)]);
+    assert!(resumed.status.success(), "{}", stderr(&resumed));
+    let after = get_environment("demo", &env, &cwd).unwrap().dev.unwrap();
+    assert_eq!(after.repo_root, before.repo_root);
+    assert_eq!(after.worktree_root, before.worktree_root);
+
+    let unrelated_repo = root.child("unrelated-repo");
+    init_nested_openclaw_repo(&unrelated_repo);
+    fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&unrelated_repo, &alias).unwrap();
+    let changed = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&alias)]);
+    assert!(!changed.status.success());
+    assert!(stderr(&changed).contains("dev cannot change the repo for existing env"));
+    let after = get_environment("demo", &env, &cwd).unwrap().dev.unwrap();
+    assert_eq!(after.repo_root, before.repo_root);
+    assert_eq!(after.worktree_root, before.worktree_root);
 }
 
 #[test]

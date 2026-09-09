@@ -86,6 +86,32 @@ pub(crate) fn default_worktree_root(repo_root: &Path, env_name: &str) -> PathBuf
     clean_path(&repo_root.join(".worktrees").join(env_name))
 }
 
+pub(crate) fn validate_openclaw_worktree(
+    repo_root: &Path,
+    worktree_root: &Path,
+) -> Result<(), String> {
+    if !worktree_root.exists() {
+        return Err(format!(
+            "saved dev worktree is missing: {}; restore that checkout before resuming the env",
+            display_path(worktree_root)
+        ));
+    }
+    let registered = registered_worktree_paths(repo_root)?;
+    if !contains_worktree_path(&registered, worktree_root) {
+        return Err(format!(
+            "saved dev worktree is not registered to this OpenClaw checkout: {}",
+            display_path(worktree_root)
+        ));
+    }
+    if !is_existing_openclaw_worktree(repo_root, worktree_root) {
+        return Err(format!(
+            "registered worktree is not a valid OpenClaw checkout: {}",
+            display_path(worktree_root)
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_openclaw_worktree(
     repo_root: &Path,
     env_name: &str,
