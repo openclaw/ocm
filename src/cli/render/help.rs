@@ -790,6 +790,10 @@ pub fn env_help(cmd: &str) -> String {
                 "Portability",
                 &[
                     ("export", "Export an environment archive"),
+                    (
+                        "artifact export",
+                        "Export one bounded file to stdout (Unix)",
+                    ),
                     ("import", "Import an environment archive"),
                 ],
             ),
@@ -803,6 +807,30 @@ pub fn env_help(cmd: &str) -> String {
             format!("{cmd} help env create"),
             format!("{cmd} help env run"),
             format!("{cmd} help env snapshot"),
+        ],
+    )
+}
+
+pub fn env_artifact_help(cmd: &str) -> String {
+    render_leaf(
+        "Export an environment artifact",
+        "Read one regular file beneath the environment home on Unix.",
+        vec![format!(
+            "{cmd} env artifact export <name> --path <relative-path> --max-bytes <bytes>"
+        )],
+        &[
+            ("--path <relative-path>", "File relative to OPENCLAW_HOME"),
+            ("--max-bytes <bytes>", "Required nonnegative byte limit"),
+        ],
+        vec![format!(
+            "{cmd} env artifact export mira --path .openclaw/openclaw.json --max-bytes 1048576 > config.json"
+        )],
+        &[
+            "stdout contains raw file bytes only; errors go to stderr.",
+            "Rejects traversal, symlinks, nonregular files, multiple hard links, and observed file changes.",
+            "Discard all output on a nonzero exit, including any partial bytes.",
+            "The caller owns its destination and must independently bound incoming bytes and time.",
+            "This does not attest candidate data or execute any environment command.",
         ],
     )
 }

@@ -18,6 +18,9 @@ All notable changes to OCM are documented here.
 
 ### Added
 
+- Add Unix `env artifact export` for bounded, raw file reads beneath an environment
+  home, rejecting unsafe paths and observed file changes without choosing the
+  caller's destination.
 - Make `ocm self update` a recoverable local transaction that retains the previous executable, survives caller disconnection, refreshes a running daemon, checks gateway recovery, and records a durable result. Add `--status` and `--recover` for interrupted updates.
 - Prepare `@openclaw/ocm` npm distribution of signed Rust binaries, with a
   no-download launcher, exact platform aliases, and manual OIDC publishing.

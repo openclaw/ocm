@@ -1,3 +1,4 @@
+mod artifact;
 mod binding;
 mod execution;
 mod health;

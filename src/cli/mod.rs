@@ -1,6 +1,7 @@
 mod dev;
 mod doctor;
 mod env;
+mod env_artifact;
 mod help;
 mod init;
 mod internal;

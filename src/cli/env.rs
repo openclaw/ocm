@@ -1129,6 +1129,7 @@ impl Cli {
             "create" => self.handle_env_create(args),
             "clone" => self.handle_env_clone(args),
             "export" => self.handle_env_export(args),
+            "artifact" => self.handle_env_artifact(args),
             "import" => self.handle_env_import(args),
             "snapshot" => self.dispatch_env_snapshot_command(args),
             "list" => self.handle_env_list(args),

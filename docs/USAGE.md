@@ -324,6 +324,36 @@ that service registration and repair are managed outside OpenClaw in this
 context. Commands like `openclaw doctor --fix` can still repair normal env
 state, but background service lifecycle should be handled with `ocm service`.
 
+### Export one bounded artifact
+
+On Unix, export a file relative to an environment's `OPENCLAW_HOME` without
+executing an environment command:
+
+```bash
+ocm env artifact export mira \
+  --path .openclaw/openclaw.json --max-bytes 1048576 > config.json
+```
+
+`--path` and the nonnegative decimal `--max-bytes` are required. stdout contains
+only the raw file bytes; errors go to stderr. There is no destination option.
+The caller owns the destination and must discard it on a nonzero exit, including
+any partial bytes. Consumers must independently limit incoming bytes and time.
+
+The registered environment home must be a directory, not a symlink. Beneath
+that home, OCM opens each component relative to pinned directory descriptors
+and rejects traversal, symlinks, nonregular files and files with multiple hard
+links. It checks the file's size, identity, link count and modification/change
+timestamps before and after reading, and rejects observed changes or leaf
+replacement. This detects instability, but is not an atomic snapshot or an
+attestation of candidate-produced data. Stop the producer before exporting
+final diagnostics.
+
+The command uses the invoking OCM user's permissions and does not change service
+or environment state. When crossing user boundaries, run the whole OCM command
+as the environment owner; the receiving process retains destination ownership.
+Non-Unix platforms fail closed because this command requires descriptor-relative
+no-follow access. Existing archive export and other commands are unchanged.
+
 ## Service management
 
 Use `service` when an environment should run in the background.

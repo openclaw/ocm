@@ -37,6 +37,9 @@ impl Cli {
             ["self", action] => render::help::self_command_help(&cmd, action)
                 .ok_or_else(|| format!("unknown self command: {action}")),
             ["env", "snapshot"] => Ok(render::help::env_snapshot_help(&cmd)),
+            ["env", "artifact"] | ["env", "artifact", "export"] => {
+                Ok(render::help::env_artifact_help(&cmd))
+            }
             ["env", action] => render::help::env_command_help(&cmd, action)
                 .ok_or_else(|| format!("unknown env command: {action}")),
             ["release", action] => render::help::release_command_help(&cmd, action)
@@ -174,6 +177,14 @@ impl Cli {
             }
             [group, subcommand] if group == "env" && subcommand == "snapshot" => {
                 Some(vec!["env", "snapshot"])
+            }
+            [group, subcommand] if group == "env" && subcommand == "artifact" => {
+                Some(vec!["env", "artifact"])
+            }
+            [group, subcommand, action, flag]
+                if group == "env" && subcommand == "artifact" && Self::is_help_flag(flag) =>
+            {
+                Some(vec!["env", "artifact", action.as_str()])
             }
             [group, subcommand, next, rest @ ..]
                 if group == "env" && subcommand == "snapshot" && Self::is_help_token(next) =>
