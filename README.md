@@ -284,6 +284,8 @@ An existing dev env resumes its recorded worktree, preserving its uncommitted ch
 
 Before starting source, `dev` checks the installed entry points for the tooling declared by that checkout. It reuses hoisted or isolated installs whose tooling resolves. Missing tooling in an OCM-owned dev worktree is prepared with `pnpm install --frozen-lockfile` and checked again. Source takeover of a runtime or launcher env only validates the borrowed checkout and fails before stopping its service if preparation is needed. OCM does not reinstall through linked dependency directories. A modules-directory environment override may select dependencies inside that checkout, including before OpenClaw creates its `node_modules` link. OCM inspects the configured tree without creating that link and rejects overrides that resolve outside the checkout. These are startup checks; OpenClaw still owns builds and validation of the running application.
 
+Use `ocm dev status [env]` to inspect dev environments and temporary source watches on runtime or launcher environments. It reports the source path, gateway URL, and watch ownership (`starting`, `active`, `restoring`, `inactive`, or `unknown`). Active watch ownership can outlive the wrapper process and does not imply that the Gateway is ready. JSON keeps `serviceRunning` separate from the saved `serviceDesiredRunning` policy and includes the watch PID, start time, and any inspection issue. Status leaves watch metadata unchanged and omits lease tokens.
+
 ### Try beta or pin a specific release
 
 ```bash

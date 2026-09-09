@@ -41,6 +41,14 @@ pub struct SourceWatchOverride {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum SourceWatchState {
+    Inactive,
+    Starting,
+    Active(SourceWatchOverride),
+    Restoring,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct CreateSourceWatchOverrideOptions {
     pub(crate) env_name: String,
     pub(crate) repo_root: PathBuf,
@@ -328,6 +336,24 @@ impl<'a> EnvironmentService<'a> {
         &self,
         env_name: &str,
     ) -> Result<Option<SourceWatchOverride>, String> {
+        match self.inspect_source_watch_state(env_name, true)? {
+            SourceWatchState::Active(meta) => Ok(Some(meta)),
+            SourceWatchState::Inactive | SourceWatchState::Restoring => Ok(None),
+            SourceWatchState::Starting => Err(format!(
+                "source watch for env \"{env_name}\" is active or starting, but its metadata is unavailable"
+            )),
+        }
+    }
+
+    pub(crate) fn observe_source_watch(&self, env_name: &str) -> Result<SourceWatchState, String> {
+        self.inspect_source_watch_state(env_name, false)
+    }
+
+    fn inspect_source_watch_state(
+        &self,
+        env_name: &str,
+        cleanup_stale: bool,
+    ) -> Result<SourceWatchState, String> {
         let env_name = validate_name(env_name, "Environment name")?;
         let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
         let lock_path = path.with_extension("lock");
@@ -336,8 +362,13 @@ impl<'a> EnvironmentService<'a> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 // A lookup with no watch state remains read-only. If an override exists,
                 // create the lock before cleanup so lease creation cannot interleave.
-                if !path.exists() {
-                    return Ok(None);
+                if !source_watch_metadata_exists(&path)? {
+                    return Ok(SourceWatchState::Inactive);
+                }
+                if !cleanup_stale {
+                    return Ok(read_active_legacy_source_watch(&path, &env_name)?
+                        .map(SourceWatchState::Active)
+                        .unwrap_or(SourceWatchState::Inactive));
                 }
                 if let Some(parent) = lock_path.parent() {
                     ensure_dir(parent)?;
@@ -354,44 +385,20 @@ impl<'a> EnvironmentService<'a> {
 
         #[cfg(windows)]
         if let Some(_lease_event) = open_windows_source_watch_event(&lock_path)? {
-            let lock_lease_id = fs::read_to_string(&lock_path)
-                .map_err(|error| {
-                    format!(
-                        "failed reading active source watch lock {}: {error}",
-                        display_path(&lock_path)
-                    )
-                })?
-                .trim()
-                .to_string();
-            if source_watch_lock_is_restoring(&lock_lease_id) {
-                remove_file_if_present(&path)?;
-                return Ok(None);
-            }
-            let meta = read_json::<SourceWatchOverride>(&path).map_err(|error| {
-                format!(
-                    "source watch for env \"{env_name}\" is active or starting, but its metadata is unavailable: {error}"
-                )
-            })?;
-            if source_watch_matches_lease(&meta, &lock_lease_id)
-                && is_valid_source_watch_structure(&meta, &env_name)
-            {
-                return Ok(Some(meta));
-            }
-            return Err(format!(
-                "source watch for env \"{env_name}\" is active or starting, but its metadata does not match the active lease"
-            ));
+            return read_leased_source_watch_state(&path, &lock_path, &env_name, cleanup_stale);
         }
 
         match FileExt::try_lock_shared(&lock_file) {
             Ok(()) => {
                 // Shared readers prove no watcher owns the exclusive lease. They may clean the
                 // same stale metadata concurrently without impersonating an active watcher.
-                let active_legacy = read_json::<SourceWatchOverride>(&path).ok().filter(|meta| {
-                    !is_leased_source_watch(meta)
-                        && is_valid_source_watch_metadata(meta, &env_name)
-                        && is_legacy_source_watch_process(meta)
-                });
-                if active_legacy.is_none() {
+                let legacy = read_active_legacy_source_watch(&path, &env_name);
+                let active_legacy = if cleanup_stale {
+                    legacy.unwrap_or(None)
+                } else {
+                    legacy?
+                };
+                if cleanup_stale && active_legacy.is_none() {
                     remove_file_if_present(&path)?;
                 }
                 FileExt::unlock(&lock_file).map_err(|error| {
@@ -400,42 +407,82 @@ impl<'a> EnvironmentService<'a> {
                         display_path(&lock_path)
                     )
                 })?;
-                Ok(active_legacy)
+                Ok(active_legacy
+                    .map(SourceWatchState::Active)
+                    .unwrap_or(SourceWatchState::Inactive))
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                let lock_lease_id = fs::read_to_string(&lock_path)
-                    .map_err(|error| {
-                        format!(
-                            "failed reading active source watch lock {}: {error}",
-                            display_path(&lock_path)
-                        )
-                    })?
-                    .trim()
-                    .to_string();
-                if source_watch_lock_is_restoring(&lock_lease_id) {
-                    remove_file_if_present(&path)?;
-                    return Ok(None);
-                }
-                let meta = read_json::<SourceWatchOverride>(&path).map_err(|error| {
-                    format!(
-                        "source watch for env \"{env_name}\" is active or starting, but its metadata is unavailable: {error}"
-                    )
-                })?;
-                let metadata_valid = source_watch_matches_lease(&meta, &lock_lease_id)
-                    && is_valid_source_watch_structure(&meta, &env_name);
-                if metadata_valid {
-                    Ok(Some(meta))
-                } else {
-                    Err(format!(
-                        "source watch for env \"{env_name}\" is active or starting, but its metadata does not match the active lease"
-                    ))
-                }
+                read_leased_source_watch_state(&path, &lock_path, &env_name, cleanup_stale)
             }
             Err(error) => Err(format!(
                 "failed checking source watch lock {}: {error}",
                 display_path(&lock_path)
             )),
         }
+    }
+}
+
+fn read_active_legacy_source_watch(
+    path: &Path,
+    env_name: &str,
+) -> Result<Option<SourceWatchOverride>, String> {
+    if !source_watch_metadata_exists(path)? {
+        return Ok(None);
+    }
+    let meta = read_json::<SourceWatchOverride>(path)?;
+    Ok(Some(meta).filter(|meta| {
+        !is_leased_source_watch(meta)
+            && is_valid_source_watch_metadata(meta, env_name)
+            && is_legacy_source_watch_process(meta)
+    }))
+}
+
+fn source_watch_metadata_exists(path: &Path) -> Result<bool, String> {
+    path.try_exists().map_err(|error| {
+        format!(
+            "failed inspecting source watch metadata {}: {error}",
+            display_path(path)
+        )
+    })
+}
+
+fn read_leased_source_watch_state(
+    path: &Path,
+    lock_path: &Path,
+    env_name: &str,
+    cleanup_stale: bool,
+) -> Result<SourceWatchState, String> {
+    let lock_lease_id = fs::read_to_string(lock_path)
+        .map_err(|error| {
+            format!(
+                "failed reading active source watch lock {}: {error}",
+                display_path(lock_path)
+            )
+        })?
+        .trim()
+        .to_string();
+    if source_watch_lock_is_restoring(&lock_lease_id) {
+        if cleanup_stale {
+            remove_file_if_present(path)?;
+        }
+        return Ok(SourceWatchState::Restoring);
+    }
+    if !source_watch_metadata_exists(path)? {
+        return Ok(SourceWatchState::Starting);
+    }
+    let meta = read_json::<SourceWatchOverride>(path).map_err(|error| {
+        format!(
+            "source watch for env \"{env_name}\" is active or starting, but its metadata is unavailable: {error}"
+        )
+    })?;
+    if source_watch_matches_lease(&meta, &lock_lease_id)
+        && is_valid_source_watch_structure(&meta, env_name)
+    {
+        Ok(SourceWatchState::Active(meta))
+    } else {
+        Err(format!(
+            "source watch for env \"{env_name}\" is active or starting, but its metadata does not match the active lease"
+        ))
     }
 }
 

@@ -670,7 +670,9 @@ impl Cli {
             };
         }
 
-        if let Err(error) = ensure_store(&cli.env, &cli.cwd) {
+        if !(group == "dev" && action == "status")
+            && let Err(error) = ensure_store(&cli.env, &cli.cwd)
+        {
             cli.stderr_line(format!("ocm: {error}"));
             cli.stderr_line(format!("Run \"{} help\" for usage.", cli.command_example()));
             return 1;

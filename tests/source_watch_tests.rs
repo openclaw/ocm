@@ -175,6 +175,138 @@ fn wait_for_path(path: &Path, timeout: Duration) -> bool {
 }
 
 #[test]
+fn dev_status_observes_active_and_transitional_source_watch() {
+    let root = TestDir::new("dev-status-watch-lifecycle");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let source_repo = create_source_repo(&root);
+    let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
+    create_runtime_backed_env(&root, &cwd, &env);
+    let watch = lock_source_watch(&root);
+    write_active_source_watch_override(&root, &source_repo);
+    let override_path = root.child("ocm-home/source-watch/demo.json");
+    let lock_path = root.child("ocm-home/source-watch/demo.lock");
+    let metadata_before = fs::read(&override_path).unwrap();
+    let lock_before = fs::read(&lock_path).unwrap();
+
+    let status = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let public_status = stdout(&status);
+    let status: Value = serde_json::from_str(&public_status).unwrap();
+    assert_eq!(status["sourceWatch"]["state"], "active");
+    assert_eq!(status["sourceWatch"]["pid"], std::process::id());
+    assert_eq!(status["sourceWatch"]["startedAt"], "2026-06-17T00:00:00Z");
+    assert_eq!(status["repoRoot"], path_string(&source_repo));
+    assert_eq!(status["worktreeRoot"], path_string(&source_repo));
+    assert_eq!(status["serviceRunning"], false);
+    assert!(!public_status.contains("test-source-watch"));
+    assert!(status["sourceWatch"].get("token").is_none());
+
+    let all = run_ocm(&cwd, &env, &["dev", "status", "--json"]);
+    assert!(all.status.success(), "{}", stderr(&all));
+    let all: Value = serde_json::from_str(&stdout(&all)).unwrap();
+    assert_eq!(all.as_array().unwrap().len(), 1);
+    assert_eq!(all[0]["sourceWatch"]["state"], "active");
+    let raw = run_ocm(&cwd, &env, &["dev", "status", "demo", "--raw"]);
+    assert!(raw.status.success(), "{}", stderr(&raw));
+    assert!(stdout(&raw).contains("watch=active"));
+    assert_eq!(fs::read(&override_path).unwrap(), metadata_before);
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+
+    fs::remove_file(&override_path).unwrap();
+    let starting = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    assert!(starting.status.success(), "{}", stderr(&starting));
+    let starting: Value = serde_json::from_str(&stdout(&starting)).unwrap();
+    assert_eq!(starting["sourceWatch"]["state"], "starting");
+    assert!(starting["repoRoot"].is_null());
+    assert!(!override_path.exists());
+
+    drop(watch);
+    let restoring = lock_source_watch_with_id(&root, "restoring:status-fixture");
+    let status = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(status["sourceWatch"]["state"], "restoring");
+    assert!(!override_path.exists());
+
+    drop(restoring);
+    let stopped = run_ocm(&cwd, &env, &["dev", "status", "--json"]);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&stopped)).unwrap(),
+        json!([])
+    );
+}
+
+#[test]
+fn dev_status_reports_uncertain_ownership_without_repairing_watch_metadata() {
+    let root = TestDir::new("dev-status-watch-metadata");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let source_repo = create_source_repo(&root);
+    let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
+    create_runtime_backed_env(&root, &cwd, &env);
+    write_active_source_watch_override(&root, &source_repo);
+    let override_path = root.child("ocm-home/source-watch/demo.json");
+    let lock_path = root.child("ocm-home/source-watch/demo.lock");
+    let metadata_before = fs::read(&override_path).unwrap();
+
+    let stale = run_ocm(&cwd, &env, &["dev", "status", "--json"]);
+    assert!(stale.status.success(), "{}", stderr(&stale));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&stale)).unwrap(),
+        json!([])
+    );
+    assert_eq!(fs::read(&override_path).unwrap(), metadata_before);
+    assert!(!lock_path.exists());
+
+    let _watch = lock_source_watch_with_id(&root, "different-status-generation");
+    let uncertain = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    assert!(uncertain.status.success(), "{}", stderr(&uncertain));
+    let uncertain: Value = serde_json::from_str(&stdout(&uncertain)).unwrap();
+    assert_eq!(uncertain["sourceWatch"]["state"], "unknown");
+    assert!(
+        uncertain["sourceWatch"]["issue"]
+            .as_str()
+            .unwrap()
+            .contains("does not match the active lease")
+    );
+    assert!(uncertain["repoRoot"].is_null());
+    assert_eq!(fs::read(&override_path).unwrap(), metadata_before);
+
+    drop(_watch);
+    fs::write(&override_path, "{invalid metadata").unwrap();
+    for with_lock in [true, false] {
+        if !with_lock {
+            fs::remove_file(&lock_path).unwrap();
+        }
+        let corrupt = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+        assert!(corrupt.status.success(), "{}", stderr(&corrupt));
+        let corrupt: Value = serde_json::from_str(&stdout(&corrupt)).unwrap();
+        assert_eq!(corrupt["sourceWatch"]["state"], "unknown");
+        assert!(corrupt["sourceWatch"]["issue"].is_string());
+        assert_eq!(
+            fs::read_to_string(&override_path).unwrap(),
+            "{invalid metadata"
+        );
+        assert_eq!(lock_path.exists(), with_lock);
+    }
+
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&override_path, fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+        fs::set_permissions(&override_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(unreadable.status.success(), "{}", stderr(&unreadable));
+        let unreadable: Value = serde_json::from_str(&stdout(&unreadable)).unwrap();
+        assert_eq!(unreadable["sourceWatch"]["state"], "unknown");
+        assert!(!lock_path.exists());
+    }
+}
+
+#[test]
 fn source_watch_override_takes_precedence_for_resolve_and_run() {
     let root = TestDir::new("source-watch-resolve-run");
     let cwd = root.child("workspace");

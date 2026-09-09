@@ -1784,16 +1784,24 @@ fn dev_status_reports_dev_envs() {
     let canonical_repo = fs::canonicalize(&repo).unwrap();
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = ocm_env(&root);
+    let mut env = service_env(&root);
     install_fake_dev_runners(&root, &mut env);
 
     let run = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
     assert!(run.status.success(), "{}", stderr(&run));
 
+    let mut meta = get_environment("demo", &env, &cwd).unwrap();
+    meta.service_enabled = true;
+    meta.service_running = true;
+    save_environment(meta, &env, &cwd).unwrap();
+
     let status = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
     assert!(status.status.success(), "{}", stderr(&status));
     let summary: Value = serde_json::from_str(&stdout(&status)).unwrap();
     assert_eq!(summary["envName"], "demo");
+    assert_eq!(summary["serviceDesiredRunning"], true);
+    assert_eq!(summary["serviceRunning"], false);
+    assert_eq!(summary["sourceWatch"]["state"], "inactive");
     assert_eq!(summary["repoRoot"], path_string(&canonical_repo));
     assert!(
         summary["worktreeRoot"]
@@ -1813,7 +1821,7 @@ fn dev_status_reports_dev_envs() {
         summary["statusCommand"]
             .as_str()
             .unwrap()
-            .contains("service status demo")
+            .contains("dev status demo")
     );
     assert!(
         summary["logsCommand"]
@@ -1821,6 +1829,124 @@ fn dev_status_reports_dev_envs() {
             .unwrap()
             .contains("logs demo --follow")
     );
+
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let runtime = SupervisorRuntimeState {
+        kind: "ocm-supervisor-runtime".to_string(),
+        ocm_home: path_string(&root.child("ocm-home")),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        updated_at: now_utc(),
+        services: vec![],
+        children: vec![SupervisorRuntimeChild {
+            env_name: "demo".to_string(),
+            binding_kind: "dev".to_string(),
+            binding_name: summary["worktreeRoot"].as_str().unwrap().to_string(),
+            pid: std::process::id(),
+            restart_count: 0,
+            child_port: summary["gatewayPort"].as_u64().unwrap() as u32,
+            stdout_path: path_string(&root.child("demo.stdout.log")),
+            stderr_path: path_string(&root.child("demo.stderr.log")),
+        }],
+    };
+    let runtime_bytes = serde_json::to_vec(&runtime).unwrap();
+    fs::write(&runtime_path, &runtime_bytes).unwrap();
+    let stale = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    assert!(stale.status.success(), "{}", stderr(&stale));
+    let stale: Value = serde_json::from_str(&stdout(&stale)).unwrap();
+    assert_eq!(stale["serviceRunning"], false);
+    assert_eq!(fs::read(&runtime_path).unwrap(), runtime_bytes);
+
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    let live = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    assert!(live.status.success(), "{}", stderr(&live));
+    let live: Value = serde_json::from_str(&stdout(&live)).unwrap();
+    assert_eq!(live["serviceRunning"], true);
+    assert_eq!(live["servicePid"], std::process::id());
+    assert_eq!(fs::read(&runtime_path).unwrap(), runtime_bytes);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = runtime_path.parent().unwrap();
+        let permissions = fs::metadata(directory).unwrap().permissions();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+        fs::set_permissions(directory, permissions).unwrap();
+        assert!(!unreadable.status.success());
+        assert!(stderr(&unreadable).contains("failed inspecting supervisor runtime state"));
+        assert_eq!(fs::read(&runtime_path).unwrap(), runtime_bytes);
+    }
+
+    let mut other_env = env.clone();
+    let other_home = root.child("other-ocm-home");
+    other_env.insert("OCM_HOME".to_string(), path_string(&other_home));
+    save_environment(
+        get_environment("demo", &env, &cwd).unwrap(),
+        &other_env,
+        &cwd,
+    )
+    .unwrap();
+    let mut other_runtime = runtime.clone();
+    other_runtime.ocm_home = path_string(&other_home);
+    let other_runtime_path = supervisor_runtime_path(&other_env, &cwd).unwrap();
+    fs::create_dir_all(other_runtime_path.parent().unwrap()).unwrap();
+    fs::write(
+        &other_runtime_path,
+        serde_json::to_vec(&other_runtime).unwrap(),
+    )
+    .unwrap();
+    let foreign = run_ocm(&cwd, &other_env, &["dev", "status", "demo", "--json"]);
+    assert!(foreign.status.success(), "{}", stderr(&foreign));
+    let foreign: Value = serde_json::from_str(&stdout(&foreign)).unwrap();
+    assert_eq!(foreign["serviceRunning"], false);
+    assert!(foreign["servicePid"].is_null());
+
+    for invalid_kind in [true, false] {
+        let mut invalid = runtime.clone();
+        if invalid_kind {
+            invalid.kind = "another-runtime-kind".to_string();
+        } else {
+            invalid.ocm_home = path_string(&other_home);
+        }
+        let bytes = serde_json::to_vec(&invalid).unwrap();
+        fs::write(&runtime_path, &bytes).unwrap();
+        let rejected = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+        assert!(!rejected.status.success());
+        assert!(stderr(&rejected).contains("runtime state does not belong"));
+        assert_eq!(fs::read(&runtime_path).unwrap(), bytes);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_status_preserves_absent_and_read_only_stores() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("dev-status-read-only-store");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = service_env(&root);
+    let store = root.child("ocm-home");
+    fs::remove_dir(&store).unwrap();
+    let absent = run_ocm(&cwd, &env, &["dev", "status", "--json"]);
+    assert!(absent.status.success(), "{}", stderr(&absent));
+    assert_eq!(stdout(&absent).trim(), "[]");
+    assert!(!store.exists());
+
+    let repo = init_openclaw_repo(&root);
+    install_fake_dev_runners(&root, &mut env);
+    let prepared = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
+    assert!(prepared.status.success(), "{}", stderr(&prepared));
+    let unused = store.join("runtimes");
+    fs::remove_dir(&unused).unwrap();
+    let permissions = fs::metadata(&store).unwrap().permissions();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o500)).unwrap();
+    let status = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    fs::set_permissions(&store, permissions).unwrap();
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert!(!unused.exists());
 }
 
 #[test]

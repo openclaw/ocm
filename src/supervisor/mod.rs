@@ -832,9 +832,38 @@ impl<'a> SupervisorService<'a> {
         Ok(())
     }
 
+    pub(crate) fn live_runtime_state(&self) -> Result<Option<SupervisorRuntimeState>, String> {
+        let identity = managed_service_identity(self.env, self.cwd)?;
+        if !inspect_job(&identity.label, &identity.definition_path, self.env).running {
+            return Ok(None);
+        }
+        let ocm_home = display_path(&resolve_ocm_home(self.env, self.cwd)?);
+        if !crate::service::platform::managed_service_owner_matches(
+            &identity.definition_path,
+            &ocm_home,
+            self.env,
+        )? {
+            return Ok(None);
+        }
+        let runtime = self.read_runtime_state()?;
+        if let Some(runtime) = &runtime
+            && (runtime.kind != SUPERVISOR_RUNTIME_KIND || runtime.ocm_home != ocm_home)
+        {
+            return Err(format!(
+                "supervisor runtime state does not belong to OCM_HOME {ocm_home}"
+            ));
+        }
+        Ok(runtime)
+    }
+
     fn read_runtime_state(&self) -> Result<Option<SupervisorRuntimeState>, String> {
         let runtime_path = supervisor_runtime_path(self.env, self.cwd)?;
-        if !runtime_path.exists() {
+        if !runtime_path.try_exists().map_err(|error| {
+            format!(
+                "failed inspecting supervisor runtime state {}: {error}",
+                display_path(&runtime_path)
+            )
+        })? {
             return Ok(None);
         }
 

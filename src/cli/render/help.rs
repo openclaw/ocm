@@ -248,7 +248,7 @@ pub fn dev_help(cmd: &str) -> String {
         )],
         &[(
             "Commands",
-            &[("status", "Show one dev env or all dev envs")],
+            &[("status", "Show dev envs and active source watches")],
         )],
         vec![
             format!("{cmd} dev shaks"),
@@ -272,7 +272,7 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
     match action {
         "status" => Some(render_leaf(
             "Show dev env status",
-            "List dev envs or inspect one dev env, including the repo checkout, worktree path, and effective gateway port.",
+            "Inspect source watch ownership, source paths, gateway ports, and observed service state for one env or all dev sessions.",
             vec![format!("{cmd} dev status [env] [--raw] [--json]")],
             &[
                 ("[env]", "Optional env name"),
@@ -285,7 +285,9 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} dev status shaks --json"),
             ],
             &[
-                "Only envs created through `ocm dev` appear here.",
+                "Includes dev envs and runtime or launcher envs with an active or starting source watch.",
+                "Source watch state distinguishes active, starting, restoring, inactive, and unknown ownership. Active ownership does not establish gateway readiness.",
+                "Service running reflects the live daemon runtime; service desired running records the saved policy.",
                 "Use `ocm dev <env>` to create or reuse a dev env and start its gateway.",
             ],
         )),

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ use super::Cli;
 use super::render::RenderProfile;
 use crate::env::{
     CreateEnvironmentOptions, CreateSourceWatchOverrideOptions, EnvDevMeta, EnvMeta,
-    SourceWatchLease,
+    SourceWatchLease, SourceWatchState,
 };
 use crate::infra::process::run_direct;
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
@@ -91,16 +91,29 @@ impl From<String> for SourceWatchError {
 struct DevStatusSummary {
     env_name: String,
     root: String,
-    repo_root: String,
-    worktree_root: String,
+    repo_root: Option<String>,
+    worktree_root: Option<String>,
     gateway_port: u32,
     gateway_url: String,
     config_path: String,
     workspace_dir: String,
     service_enabled: bool,
     service_running: bool,
+    service_desired_running: bool,
+    service_pid: Option<u32>,
+    source_watch: DevSourceWatchSummary,
     logs_command: String,
     status_command: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevSourceWatchSummary {
+    state: &'static str,
+    pid: Option<u32>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    started_at: Option<time::OffsetDateTime>,
+    issue: Option<String>,
 }
 
 struct ExistingEnvSourceWatchOptions {
@@ -123,18 +136,33 @@ impl Cli {
 
     fn handle_dev_status(&self, args: Vec<String>) -> Result<i32, String> {
         let (args, json_flag, profile) = self.consume_human_output_flags(args, "dev status")?;
-        let target = args.first().cloned();
+        let target = args
+            .first()
+            .map(|name| validate_name(name, "Environment name"))
+            .transpose()?;
         Self::assert_no_extra_args(&args[target.is_some() as usize..])?;
 
-        let envs = self.environment_service().list()?;
+        let envs = match target.as_deref() {
+            Some(name) => vec![self.environment_service().get(name)?],
+            None => self.environment_service().list()?,
+        };
+        let service_pids = self
+            .supervisor_service()
+            .live_runtime_state()?
+            .into_iter()
+            .flat_map(|runtime| runtime.children)
+            .map(|child| (child.env_name, child.pid))
+            .collect::<BTreeMap<_, _>>();
         let mut summaries = envs
             .into_iter()
-            .filter_map(|meta| self.build_dev_status_summary(meta).transpose())
+            .filter_map(|meta| {
+                let service_pid = service_pids.get(&meta.name).copied();
+                self.build_dev_status_summary(meta, service_pid).transpose()
+            })
             .collect::<Result<Vec<_>, _>>()?;
         summaries.sort_by(|left, right| left.env_name.cmp(&right.env_name));
 
         if let Some(target) = target {
-            let target = validate_name(&target, "Environment name")?;
             let summary = summaries
                 .into_iter()
                 .find(|summary| summary.env_name == target)
@@ -972,10 +1000,44 @@ impl Cli {
         ))
     }
 
-    fn build_dev_status_summary(&self, meta: EnvMeta) -> Result<Option<DevStatusSummary>, String> {
-        let Some(dev) = meta.dev.as_ref() else {
+    fn build_dev_status_summary(
+        &self,
+        meta: EnvMeta,
+        service_pid: Option<u32>,
+    ) -> Result<Option<DevStatusSummary>, String> {
+        let observation = self.environment_service().observe_source_watch(&meta.name);
+        if meta.dev.is_none() && matches!(observation, Ok(SourceWatchState::Inactive)) {
             return Ok(None);
+        }
+        let mut source_watch = DevSourceWatchSummary {
+            state: "inactive",
+            pid: None,
+            started_at: None,
+            issue: None,
         };
+        let active_source = match observation {
+            Ok(SourceWatchState::Inactive) => None,
+            Ok(SourceWatchState::Starting) => {
+                source_watch.state = "starting";
+                None
+            }
+            Ok(SourceWatchState::Restoring) => {
+                source_watch.state = "restoring";
+                None
+            }
+            Ok(SourceWatchState::Active(watch)) => {
+                source_watch.state = "active";
+                source_watch.pid = Some(watch.watch_pid);
+                source_watch.started_at = Some(watch.started_at);
+                Some(watch.repo_root)
+            }
+            Err(error) => {
+                source_watch.state = "unknown";
+                source_watch.issue = Some(error);
+                None
+            }
+        };
+        let dev = meta.dev.as_ref();
         let (gateway_port, _) = self
             .environment_service()
             .resolve_effective_gateway_port(&meta)?;
@@ -984,16 +1046,21 @@ impl Cli {
         Ok(Some(DevStatusSummary {
             env_name: env_name.clone(),
             root: meta.root,
-            repo_root: dev.repo_root.clone(),
-            worktree_root: dev.worktree_root.clone(),
+            repo_root: dev
+                .map(|dev| dev.repo_root.clone())
+                .or_else(|| active_source.clone()),
+            worktree_root: active_source.or_else(|| dev.map(|dev| dev.worktree_root.clone())),
             gateway_port,
             gateway_url: dev_gateway_url(gateway_port),
             config_path: display_path(&paths.config_path),
             workspace_dir: display_path(&paths.workspace_dir),
             service_enabled: meta.service_enabled,
-            service_running: meta.service_running,
+            service_running: service_pid.is_some(),
+            service_desired_running: meta.service_running,
+            service_pid,
+            source_watch,
             logs_command: format!("{} logs {} --follow", self.command_example(), env_name),
-            status_command: format!("{} service status {}", self.command_example(), env_name),
+            status_command: format!("{} dev status {}", self.command_example(), env_name),
         }))
     }
 }
@@ -1736,18 +1803,34 @@ fn source_watch_allows_override_clear(
 
 fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<String> {
     if !profile.pretty {
-        return vec![
+        let mut lines = vec![
             format!("env={}", summary.env_name),
             format!("port={}", summary.gateway_port),
-            format!("repo={}", summary.repo_root),
-            format!("worktree={}", summary.worktree_root),
+            format!("repo={}", summary.repo_root.as_deref().unwrap_or("unknown")),
+            format!(
+                "worktree={}",
+                summary.worktree_root.as_deref().unwrap_or("unknown")
+            ),
             format!("root={}", summary.root),
             format!("url={}", summary.gateway_url),
+            format!("watch={}", summary.source_watch.state),
+            format!("service_running={}", summary.service_running),
+            format!(
+                "service_desired_running={}",
+                summary.service_desired_running
+            ),
             format!("config={}", summary.config_path),
             format!("workspace={}", summary.workspace_dir),
             format!("status={}", summary.status_command),
             format!("logs={}", summary.logs_command),
         ];
+        if let Some(pid) = summary.source_watch.pid {
+            lines.push(format!("watch_pid={pid}"));
+        }
+        if let Some(issue) = &summary.source_watch.issue {
+            lines.push(format!("watch_issue={issue}"));
+        }
+        return lines;
     }
 
     let mut lines = vec![paint(
@@ -1760,24 +1843,19 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
         &[
             KeyValueRow::accent("Port", summary.gateway_port.to_string()),
             KeyValueRow::plain("URL", summary.gateway_url.clone()),
-            KeyValueRow::plain(
-                "Service",
-                if summary.service_running {
-                    "running".to_string()
-                } else if summary.service_enabled {
-                    "enabled".to_string()
-                } else {
-                    "disabled".to_string()
-                },
-            ),
+            KeyValueRow::plain("Source watch", summary.source_watch.state),
+            KeyValueRow::plain("Service", dev_service_state(summary)),
         ],
         profile.color,
     ));
     lines.extend(render_key_value_card(
         "Source",
         &[
-            KeyValueRow::plain("Repo", summary.repo_root.clone()),
-            KeyValueRow::plain("Worktree", summary.worktree_root.clone()),
+            KeyValueRow::plain("Repo", summary.repo_root.as_deref().unwrap_or("unknown")),
+            KeyValueRow::plain(
+                "Worktree",
+                summary.worktree_root.as_deref().unwrap_or("unknown"),
+            ),
         ],
         profile.color,
     ));
@@ -1789,7 +1867,22 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
         ],
         profile.color,
     ));
+    if let Some(issue) = &summary.source_watch.issue {
+        lines.push(paint(issue, Tone::Warning, profile.color));
+    }
     lines
+}
+
+fn dev_service_state(summary: &DevStatusSummary) -> &'static str {
+    if summary.service_running {
+        "running"
+    } else if summary.service_desired_running {
+        "requested, not running"
+    } else if summary.service_enabled {
+        "stopped"
+    } else {
+        "disabled"
+    }
 }
 
 fn render_dev_run_summary(
@@ -2350,23 +2443,18 @@ fn render_dev_status_list(summaries: &[DevStatusSummary], profile: RenderProfile
     }
 
     render_table(
-        &["Env", "Port", "Repo", "Worktree", "Service"],
+        &["Env", "Port", "Repo", "Worktree", "Watch", "Service"],
         &summaries
             .iter()
             .map(|summary| {
                 vec![
                     Cell::accent(summary.env_name.clone()),
                     Cell::right(summary.gateway_port.to_string(), Tone::Accent),
-                    Cell::plain(summary.repo_root.clone()),
-                    Cell::plain(summary.worktree_root.clone()),
+                    Cell::plain(summary.repo_root.as_deref().unwrap_or("unknown")),
+                    Cell::plain(summary.worktree_root.as_deref().unwrap_or("unknown")),
+                    Cell::plain(summary.source_watch.state),
                     Cell::new(
-                        if summary.service_running {
-                            "running"
-                        } else if summary.service_enabled {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        },
+                        dev_service_state(summary),
                         crate::infra::terminal::Align::Left,
                         if summary.service_running {
                             Tone::Success
@@ -2386,9 +2474,9 @@ fn render_dev_status_list(summaries: &[DevStatusSummary], profile: RenderProfile
 #[cfg(test)]
 mod tests {
     use super::{
-        DevStatusSummary, RenderProfile, SourceWatchError, combine_watch_and_restore_results,
-        render_dev_status, source_watch_allows_service_restore, source_watch_exit_code,
-        source_watch_stop_timeout_error,
+        DevSourceWatchSummary, DevStatusSummary, RenderProfile, SourceWatchError,
+        combine_watch_and_restore_results, render_dev_status, source_watch_allows_service_restore,
+        source_watch_exit_code, source_watch_stop_timeout_error,
     };
     use crate::service::ServiceActionSummary;
 
@@ -2396,16 +2484,24 @@ mod tests {
         DevStatusSummary {
             env_name: "demo".to_string(),
             root: "/tmp/demo".to_string(),
-            repo_root: "/repo/openclaw".to_string(),
-            worktree_root: "/repo/openclaw/.worktrees/demo".to_string(),
+            repo_root: Some("/repo/openclaw".to_string()),
+            worktree_root: Some("/repo/openclaw/.worktrees/demo".to_string()),
             gateway_port: 18789,
             gateway_url: "http://127.0.0.1:18789".to_string(),
             config_path: "/tmp/demo/.openclaw/openclaw.json".to_string(),
             workspace_dir: "/tmp/demo/.openclaw/workspace".to_string(),
             service_enabled: true,
             service_running: true,
+            service_desired_running: true,
+            service_pid: Some(123),
+            source_watch: DevSourceWatchSummary {
+                state: "inactive",
+                pid: None,
+                started_at: None,
+                issue: None,
+            },
             logs_command: "ocm logs demo --follow".to_string(),
-            status_command: "ocm service status demo".to_string(),
+            status_command: "ocm dev status demo".to_string(),
         }
     }
 
