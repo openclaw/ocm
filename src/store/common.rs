@@ -64,6 +64,27 @@ pub(crate) fn lock_file(path: &Path, label: &str) -> Result<ExclusiveFileLock, S
     Ok(ExclusiveFileLock { file })
 }
 
+pub(crate) fn try_lock_file(path: &Path, label: &str) -> Result<Option<ExclusiveFileLock>, String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("failed to open {label} lock at {}: {error}", path.display()))?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(ExclusiveFileLock { file })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(format!(
+            "failed to acquire {label} lock at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 pub(crate) fn lock_file_shared(path: &Path, label: &str) -> Result<SharedFileLock, String> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;

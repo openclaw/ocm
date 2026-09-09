@@ -1822,6 +1822,159 @@ fn daemon_defers_a_saved_service_start_until_source_watch_releases_the_env() {
 }
 
 #[test]
+fn contended_admission_preserves_sibling_supervision_and_desired_starts() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-admission-contention");
+    let (cwd, env, launcher_marker, _) = setup_daemon_run_fixture_with_child_sleep(&root, 60);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let supervisor = SupervisorService::new(&env, &cwd);
+    supervisor.sync().unwrap();
+    let admission_path = root.child("ocm-home/source-watch/demo.admission.lock");
+    fs::create_dir_all(admission_path.parent().unwrap()).unwrap();
+    let hold_admission = || {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&admission_path)
+            .unwrap();
+        FileExt::lock_exclusive(&file).unwrap();
+        file
+    };
+
+    let admission = hold_admission();
+    let plan = to_value(supervisor.plan().unwrap()).unwrap();
+    assert_eq!(plan["children"].as_array().unwrap().len(), 2);
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let during = wait_for_runtime_children(&runtime_path, 1, Some("prod"), Duration::from_secs(5));
+    let source_was_started = launcher_marker.exists();
+    drop(admission);
+    let resumed =
+        wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(10));
+
+    let admission = hold_admission();
+    let restart = supervisor.request_child_restart("demo");
+    let deferred_restart =
+        wait_for_runtime_children(&runtime_path, 1, Some("prod"), Duration::from_secs(5));
+    let signal = Command::new("kill")
+        .args(["-INT", &daemon.id().to_string()])
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let graceful = loop {
+        if daemon.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        sleep(Duration::from_millis(25));
+    };
+    drop(admission);
+    if !graceful {
+        stop_process(&mut daemon);
+    }
+
+    assert!(
+        during.is_some(),
+        "contention prevented the sibling from starting"
+    );
+    assert!(
+        !source_was_started,
+        "contended env started without admission"
+    );
+    assert!(resumed.is_some(), "contention discarded the desired start");
+    assert!(restart.is_ok(), "{}", restart.unwrap_err());
+    assert!(
+        deferred_restart.is_some(),
+        "contended restart stopped sibling supervision"
+    );
+    assert!(signal.is_ok_and(|status| status.success()));
+    assert!(graceful, "admission contention blocked daemon shutdown");
+}
+
+#[test]
+fn daemon_publishes_a_started_child_before_a_sibling_probe_can_block() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-spawn-publication");
+    let (cwd, mut env, launcher_marker, _) = setup_daemon_run_fixture_with_child_sleep(&root, 60);
+    install_fake_service_manager(&root, &mut env);
+    let probe_started = root.child("probe-started");
+    let probe_release = root.child("probe-release");
+    let slow_script = root.child("slow/openclaw.mjs");
+    write_executable_script(
+        &slow_script,
+        &format!(
+            "#!/bin/sh\nif [ \"${{1:-}}\" = gateway ] && [ \"${{2:-}}\" = restart-handoff ]; then\n  printf 'ready\\n' > '{}'\n  while [ ! -f '{}' ]; do /bin/sleep 0.01; done\n  exit 64\nfi\ntrap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n",
+            path_string(&probe_started),
+            path_string(&probe_release),
+        ),
+    );
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "slow",
+            "--command",
+            &path_string(&slow_script),
+        ],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    EnvironmentService::new(&env, &cwd)
+        .set_launcher("prod", "slow")
+        .unwrap();
+    let install = run_ocm(&cwd, &env, &["service", "install", "prod"]);
+    assert!(install.status.success(), "{}", stderr(&install));
+    EnvironmentService::new(&env, &cwd)
+        .set_service_running("prod", true)
+        .unwrap();
+    SupervisorService::new(&env, &cwd).sync().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let probe_is_blocked = wait_for_file(&probe_started, Duration::from_secs(10));
+    let first_child_started = wait_for_file(&launcher_marker, Duration::from_secs(5));
+    let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+    let sibling_status = run_ocm(&cwd, &env, &["service", "status", "prod", "--json"]);
+    let runtime =
+        fs::read_to_string(root.child("ocm-home/supervisor/runtime.json")).unwrap_or_default();
+    let admission = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.child("ocm-home/source-watch/demo.admission.lock"))
+        .unwrap();
+    let admission_available = FileExt::try_lock_exclusive(&admission).is_ok();
+    fs::write(&probe_release, "release\n").unwrap();
+    drop(admission);
+    stop_process(&mut daemon);
+
+    assert!(
+        probe_is_blocked,
+        "sibling did not reach the controlled probe"
+    );
+    assert!(first_child_started, "first gateway did not start");
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert!(
+        sibling_status.status.success(),
+        "{}",
+        stderr(&sibling_status)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status["running"], true,
+        "service stop could not observe the started gateway; status={status}; runtime={runtime}"
+    );
+    assert!(status["childPid"].as_u64().is_some());
+    assert!(
+        admission_available,
+        "sibling probe retained another env's admission"
+    );
+    let sibling_status: Value = serde_json::from_slice(&sibling_status.stdout).unwrap();
+    assert_eq!(sibling_status["gatewayState"], "pending");
+}
+
+#[test]
 fn daemon_run_persists_live_runtime_children() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("daemon-runtime-state");

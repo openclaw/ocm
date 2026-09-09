@@ -21,7 +21,7 @@ use time::OffsetDateTime;
 use super::EnvironmentService;
 use crate::store::{
     ExclusiveFileLock, display_path, ensure_dir, lock_file, now_utc, read_json,
-    source_watch_override_path, validate_name, write_json,
+    source_watch_override_path, try_lock_file, validate_name, write_json,
 };
 
 const SOURCE_WATCH_OVERRIDE_KIND: &str = "ocm-source-watch-override";
@@ -149,10 +149,20 @@ impl<'a> EnvironmentService<'a> {
         &self,
         env_name: &str,
     ) -> Result<ExclusiveFileLock, String> {
+        lock_file(&self.gateway_admission_path(env_name)?, "gateway admission")
+    }
+
+    pub(crate) fn try_lock_gateway_admission(
+        &self,
+        env_name: &str,
+    ) -> Result<Option<ExclusiveFileLock>, String> {
+        try_lock_file(&self.gateway_admission_path(env_name)?, "gateway admission")
+    }
+
+    fn gateway_admission_path(&self, env_name: &str) -> Result<PathBuf, String> {
         let env_name = validate_name(env_name, "Environment name")?;
-        let path = source_watch_override_path(&env_name, self.env, self.cwd)?
-            .with_extension("admission.lock");
-        lock_file(&path, "gateway admission")
+        Ok(source_watch_override_path(&env_name, self.env, self.cwd)?
+            .with_extension("admission.lock"))
     }
 
     pub(crate) fn ensure_source_watch_allows_service(&self, env_name: &str) -> Result<(), String> {

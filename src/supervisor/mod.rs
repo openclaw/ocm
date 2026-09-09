@@ -853,10 +853,10 @@ impl<'a> SupervisorService<'a> {
                 spec.env_name,
                 child_binding_label(&spec)
             );
-            let mut child = {
-                let _admission = admit_supervisor_child_start(&spec, self.env, self.cwd)?;
-                spawn_supervisor_child(&spec)?
-            };
+            // This diagnostic mode has no runtime acknowledgement. Keep its
+            // admission until the child exits instead of exposing an unseen child.
+            let _admission = admit_supervisor_child_start(&spec, self.env, self.cwd)?;
+            let mut child = spawn_supervisor_child(&spec)?;
             let status = child.wait().map_err(|error| {
                 format!("failed waiting for env \"{}\": {error}", spec.env_name)
             })?;
@@ -1874,6 +1874,8 @@ fn start_due_children(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<bool, String> {
+    let runtime_path = supervisor_runtime_path(env, cwd)?;
+    let ocm_home = display_path(&resolve_ocm_home(env, cwd)?);
     let now = Instant::now();
     let due = pending
         .iter()
@@ -1908,23 +1910,40 @@ fn start_due_children(
             eprintln!("{error}");
             continue;
         }
-        // Capability probing can invoke OpenClaw. Keep it outside admission,
-        // then recheck ownership immediately before spawning the gateway.
-        let restart_handoff_support = probe_restart_handoff_support(&next_child.spec);
-        let start_result = (|| {
-            let _admission = admit_supervisor_child_start(&next_child.spec, env, cwd)?;
-            spawn_running_child(
+        let start_result: Result<_, String> = (|| {
+            // Do not probe a contended child. Probing itself stays outside
+            // admission, so a slow OpenClaw command cannot block watch claims.
+            drop(admit_supervisor_child_start(&next_child.spec, env, cwd)?);
+            let restart_handoff_support = probe_restart_handoff_support(&next_child.spec);
+            let admission = admit_supervisor_child_start(&next_child.spec, env, cwd)?;
+            let child = spawn_running_child(
                 next_child.spec.clone(),
                 next_child.restart_count,
                 next_child.quick_clean_restart_count,
                 restart_handoff_support,
-            )
+            )?;
+            Ok((child, admission))
         })();
         match start_result {
-            Ok(running_child) => {
+            Ok((running_child, _admission)) => {
                 pending.remove(&env_name);
                 running.insert(env_name.clone(), running_child);
                 inactive.remove(&env_name);
+                // A forced watch may claim admission as soon as this guard
+                // drops. Publish the process identity that service stop reads
+                // before any slow work for another environment can intervene.
+                if let Err(error) = write_supervisor_runtime_state(
+                    &runtime_path,
+                    &ocm_home,
+                    running,
+                    pending,
+                    inactive,
+                ) {
+                    if let Some(mut child) = running.remove(&env_name) {
+                        stop_supervisor_child(&mut child);
+                    }
+                    return Err(error);
+                }
                 runtime_dirty = true;
             }
             Err(error) => {
@@ -2144,7 +2163,9 @@ fn admit_supervisor_child_start(
     cwd: &Path,
 ) -> Result<crate::store::ExclusiveFileLock, String> {
     let service = EnvironmentService::new(env, cwd);
-    let admission = service.lock_gateway_admission(&spec.env_name)?;
+    let admission = service
+        .try_lock_gateway_admission(&spec.env_name)?
+        .ok_or_else(|| format!("gateway admission for env \"{}\" is busy", spec.env_name))?;
     service.ensure_source_watch_allows_service(&spec.env_name)?;
     if spec.binding_kind == "source-watch" {
         return Err(format!(
@@ -2503,7 +2524,15 @@ fn write_supervisor_runtime_state(
         .map(supervisor_runtime_service_running)
         .collect::<Vec<_>>();
     services.extend(pending.values().map(|child| {
-        supervisor_runtime_service_inactive(&inactive_from_pending(child, "backoff"))
+        // A per-child acknowledgement can expose siblings before their first
+        // attempt. Keep those pending; reporting backoff would fail readiness
+        // while a sibling's capability probe is still running.
+        let state = if child.last_event_at.is_none() {
+            "pending"
+        } else {
+            "backoff"
+        };
+        supervisor_runtime_service_inactive(&inactive_from_pending(child, state))
     }));
     services.extend(
         inactive
