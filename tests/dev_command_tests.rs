@@ -510,6 +510,7 @@ fn service_env(root: &TestDir) -> std::collections::BTreeMap<String, String> {
 fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
     let root = TestDir::new("dev-command-run");
     let repo = init_openclaw_repo(&root);
+    let canonical_repo = fs::canonicalize(&repo).unwrap();
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
@@ -525,8 +526,8 @@ fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
     let config_path = PathBuf::from(show_json["configPath"].as_str().unwrap());
     let workspace_dir = PathBuf::from(show_json["workspaceDir"].as_str().unwrap());
 
-    assert_eq!(show_json["devRepoRoot"], path_string(&repo));
-    assert!(worktree_root.starts_with(repo.join(".worktrees")));
+    assert_eq!(show_json["devRepoRoot"], path_string(&canonical_repo));
+    assert!(worktree_root.starts_with(canonical_repo.join(".worktrees")));
     assert!(worktree_root.join(".git").exists());
 
     let config: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -1212,6 +1213,7 @@ fn dev_command_can_onboard_then_watch() {
 fn dev_status_reports_dev_envs() {
     let root = TestDir::new("dev-status");
     let repo = init_openclaw_repo(&root);
+    let canonical_repo = fs::canonicalize(&repo).unwrap();
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
@@ -1224,7 +1226,7 @@ fn dev_status_reports_dev_envs() {
     assert!(status.status.success(), "{}", stderr(&status));
     let summary: Value = serde_json::from_str(&stdout(&status)).unwrap();
     assert_eq!(summary["envName"], "demo");
-    assert_eq!(summary["repoRoot"], path_string(&repo));
+    assert_eq!(summary["repoRoot"], path_string(&canonical_repo));
     assert!(
         summary["worktreeRoot"]
             .as_str()
