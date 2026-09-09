@@ -41,6 +41,10 @@ pub(crate) fn discover_openclaw_checkout(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
+pub(crate) fn discover_enclosing_openclaw_checkout(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors().find_map(detect_openclaw_checkout)
+}
+
 /// Rejects checkout dependencies that resolve through another checkout.
 pub(crate) fn ensure_checkout_owned_dependencies(repo_root: &Path) -> Result<(), String> {
     let node_modules = repo_root.join("node_modules");

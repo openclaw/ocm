@@ -19,7 +19,7 @@ use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 #[cfg(windows)]
 use std::os::windows::{io::AsRawHandle, process::CommandExt as _};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use super::Cli;
@@ -32,16 +32,15 @@ use crate::infra::process::run_direct;
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::infra::terminal::{Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table};
 use crate::openclaw_repo::{
-    detect_openclaw_checkout, discover_openclaw_checkout, ensure_checkout_owned_dependencies,
-    ensure_openclaw_worktree, validate_openclaw_worktree,
+    detect_openclaw_checkout, discover_enclosing_openclaw_checkout,
+    ensure_checkout_owned_dependencies, ensure_openclaw_worktree, validate_openclaw_worktree,
 };
 use crate::service::service_backend_support_error;
 use crate::store::{
-    derive_env_paths, display_path, ensure_minimum_local_openclaw_config, ensure_store, read_json,
-    resolve_absolute_path, validate_name, write_json,
+    derive_env_paths, display_path, ensure_minimum_local_openclaw_config, resolve_absolute_path,
+    validate_name,
 };
 
-const DEV_PREFERENCES_KIND: &str = "ocm-dev-preferences";
 const SOURCE_WATCH_TREE_ACTIVE_ERROR: &str = "source watch process tree is still active";
 #[cfg(unix)]
 const SOURCE_WATCH_NODE_SHIM: &str = r#"import fs from "node:fs";
@@ -84,13 +83,6 @@ impl From<String> for SourceWatchError {
             cleanup_verified: true,
         }
     }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DevPreferences {
-    kind: String,
-    preferred_repo_root: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -597,19 +589,11 @@ impl Cli {
                     ));
                 }
             }
-            self.save_preferred_dev_repo(&existing_repo)?;
             self.bootstrap_dev_env(&meta)?;
             return Ok((meta, false));
         }
 
         let repo_root = self.resolve_dev_repo_root(repo_root)?;
-        let repo_root = detect_openclaw_checkout(&repo_root).ok_or_else(|| {
-            format!(
-                "OpenClaw checkout not found at {}",
-                display_path(&repo_root)
-            )
-        })?;
-        self.save_preferred_dev_repo(&repo_root)?;
         let worktree_root = ensure_openclaw_worktree(&repo_root, name)?;
 
         let created = self.environment_service().create(CreateEnvironmentOptions {
@@ -646,62 +630,20 @@ impl Cli {
     }
 
     fn resolve_dev_repo_root(&self, repo_root: Option<String>) -> Result<PathBuf, String> {
-        if let Some(repo_root) = repo_root {
-            return resolve_absolute_path(&repo_root, &self.env, &self.cwd);
-        }
-
-        if let Some(repo_root) = discover_openclaw_checkout(&self.cwd) {
-            return Ok(repo_root);
-        }
-
-        if let Some(repo_root) = self.load_preferred_dev_repo()?
-            && let Some(repo_root) = detect_openclaw_checkout(&repo_root)
-        {
-            return Ok(repo_root);
-        }
-
-        let repo_root = self.prompt_dev_repo_root()?;
-        resolve_absolute_path(&repo_root, &self.env, &self.cwd)
-    }
-
-    fn prompt_dev_repo_root(&self) -> Result<String, String> {
-        loop {
-            let value = self.prompt_required("OpenClaw repo path").map_err(|_| {
-                "OpenClaw repo path is required; pass --repo /path/to/openclaw".to_string()
-            })?;
-            let repo_root = resolve_absolute_path(&value, &self.env, &self.cwd)?;
-            if detect_openclaw_checkout(&repo_root).is_some() {
-                return Ok(display_path(&repo_root));
-            }
-            self.stderr_line(format!(
-                "ocm: OpenClaw checkout not found at {}",
-                display_path(&repo_root)
-            ));
-        }
-    }
-
-    fn load_preferred_dev_repo(&self) -> Result<Option<PathBuf>, String> {
-        let path = self.dev_preferences_path()?;
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let prefs = read_json::<DevPreferences>(&path)?;
-        Ok(prefs.preferred_repo_root.map(PathBuf::from))
-    }
-
-    fn save_preferred_dev_repo(&self, repo_root: &Path) -> Result<(), String> {
-        let path = self.dev_preferences_path()?;
-        let prefs = DevPreferences {
-            kind: DEV_PREFERENCES_KIND.to_string(),
-            preferred_repo_root: Some(display_path(repo_root)),
+        let selected = match repo_root {
+            Some(repo_root) => resolve_absolute_path(&repo_root, &self.env, &self.cwd)?,
+            None => discover_enclosing_openclaw_checkout(&self.cwd).ok_or_else(|| {
+                "OpenClaw checkout not found in the current directory or its parents; pass --repo /path/to/openclaw".to_string()
+            })?,
         };
-        write_json(&path, &prefs)
-    }
-
-    fn dev_preferences_path(&self) -> Result<PathBuf, String> {
-        let stores = ensure_store(&self.env, &self.cwd)?;
-        Ok(stores.home.join("dev.json"))
+        let checkout = detect_openclaw_checkout(&selected)
+            .ok_or_else(|| format!("OpenClaw checkout not found at {}", display_path(&selected)))?;
+        fs::canonicalize(&checkout).map_err(|error| {
+            format!(
+                "failed to resolve OpenClaw checkout {}: {error}",
+                display_path(&checkout)
+            )
+        })
     }
 
     fn bootstrap_dev_env(&self, meta: &EnvMeta) -> Result<(), String> {
