@@ -2,6 +2,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -9,6 +10,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use ocm::env::{CreateEnvSnapshotOptions, EnvironmentService};
 use ocm::supervisor::{SupervisorService, sync_supervisor_binding_if_present};
 use serde_json::{Value, to_value};
@@ -1779,6 +1781,44 @@ fn service_state_plans_runnable_children_and_skips_disabled_envs() {
             .iter()
             .any(|entry| entry["envName"] == "demo" && entry["reason"] == "service is stopped")
     );
+}
+
+#[test]
+fn daemon_defers_a_saved_service_start_until_source_watch_releases_the_env() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-source-watch-exclusion");
+    let (cwd, env, launcher_marker, runtime_marker) =
+        setup_daemon_run_fixture_with_child_sleep(&root, 30);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    SupervisorService::new(&env, &cwd).sync().unwrap();
+    let watch_path = root.child("ocm-home/source-watch/demo.lock");
+    fs::create_dir_all(watch_path.parent().unwrap()).unwrap();
+    let mut source_watch = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(watch_path)
+        .unwrap();
+    FileExt::lock_exclusive(&source_watch).unwrap();
+    writeln!(source_watch, "starting-lease").unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let during = wait_for_runtime_children(&runtime_path, 1, Some("prod"), Duration::from_secs(5));
+    let source_was_started = launcher_marker.exists();
+    let sibling_was_started = runtime_marker.exists();
+    drop(source_watch);
+    let after = wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(10));
+    stop_process(&mut daemon);
+
+    assert!(during.is_some(), "unwatched sibling should remain runnable");
+    assert!(!source_was_started, "saved plan started the watched env");
+    assert!(sibling_was_started);
+    assert!(
+        after.is_some(),
+        "service did not resume after watch released"
+    );
+    assert!(launcher_marker.exists());
 }
 
 #[test]

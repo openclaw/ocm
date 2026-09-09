@@ -1749,6 +1749,70 @@ fn dev_watch_force_restores_runtime_service_when_source_watch_cannot_spawn() {
 
 #[cfg(unix)]
 #[test]
+fn dev_watch_rejects_service_activation_until_the_watch_exits() {
+    for runtime_backed in [false, true] {
+        let root = TestDir::new("dev-command-watch-service-exclusion");
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env(&root);
+        let (started, release, _) = install_blocking_fake_dev_runners(&root, &mut env);
+        if runtime_backed {
+            create_runtime_backed_env(&cwd, &env);
+        }
+        let mut watch = Command::new(env!("CARGO_BIN_EXE_ocm"));
+        watch
+            .current_dir(&cwd)
+            .args([
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--watch",
+                "--force",
+            ])
+            .env_clear()
+            .envs(&env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let watch = watch.spawn().unwrap();
+        let did_start = wait_for_path(&started, Duration::from_secs(30));
+        let did_publish = wait_for_path(
+            &source_watch_override_path(&root, "demo"),
+            Duration::from_secs(30),
+        );
+        let attempts = [
+            vec!["service", "install", "demo"],
+            vec!["service", "start", "demo"],
+            vec!["service", "restart", "demo"],
+            vec!["service", "restart", "demo", "--force"],
+        ]
+        .map(|args| run_ocm(&cwd, &env, &args));
+        let during = ocm::env::EnvironmentService::new(&env, &cwd)
+            .get("demo")
+            .unwrap();
+        fs::write(&release, "release\n").unwrap();
+        let watch = watch.wait_with_output().unwrap();
+
+        assert!(did_start && did_publish, "{}", stderr(&watch));
+        assert!(watch.status.success(), "{}", stderr(&watch));
+        for attempt in attempts {
+            assert!(!attempt.status.success(), "{}", stdout(&attempt));
+            assert!(
+                stderr(&attempt).contains("source watch is active"),
+                "{}",
+                stderr(&attempt)
+            );
+        }
+        assert!(!during.service_enabled);
+        assert!(!during.service_running);
+        let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(start.status.success(), "{}", stderr(&start));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_watch_rejects_overlap_and_reclaims_the_released_lock() {
     let root = TestDir::new("dev-command-watch-overlap");
     let repo = init_openclaw_repo(&root);

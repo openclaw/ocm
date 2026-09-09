@@ -242,7 +242,7 @@ pub fn logs_help(cmd: &str) -> String {
 pub fn dev_help(cmd: &str) -> String {
     render_group(
         "Development envs",
-        "Provision OpenClaw dev envs from a checkout worktree, bootstrap the minimum local config, and run the gateway in the foreground with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. New envs use the explicit --repo checkout or the checkout enclosing the current directory. Outside a checkout, pass --repo; neighboring and remembered repositories are not selected. Existing dev envs use their recorded source.",
+        "Provision OpenClaw dev envs from a checkout worktree, bootstrap the minimum local config, and run the gateway in the foreground with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. Background service installation, start, and restart are refused while source watch is active. After updating OCM, refresh an older running daemon during a maintenance window with service refresh-daemon --acknowledge-gateway-restarts so it enforces the same watch exclusion. New envs use the explicit --repo checkout or the checkout enclosing the current directory. Outside a checkout, pass --repo; neighboring and remembered repositories are not selected. Existing dev envs use their recorded source.",
         vec![format!(
             "{cmd} dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch] [--force] [--service] [--onboard]"
         )],
@@ -261,7 +261,10 @@ pub fn dev_help(cmd: &str) -> String {
             format!("{cmd} dev status"),
             format!("{cmd} dev status shaks --json"),
         ],
-        vec![format!("{cmd} help dev status")],
+        vec![
+            format!("{cmd} help dev status"),
+            format!("{cmd} help service refresh-daemon"),
+        ],
     )
 }
 

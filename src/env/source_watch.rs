@@ -20,8 +20,8 @@ use time::OffsetDateTime;
 
 use super::EnvironmentService;
 use crate::store::{
-    display_path, ensure_dir, now_utc, read_json, source_watch_override_path, validate_name,
-    write_json,
+    ExclusiveFileLock, display_path, ensure_dir, lock_file, now_utc, read_json,
+    source_watch_override_path, validate_name, write_json,
 };
 
 const SOURCE_WATCH_OVERRIDE_KIND: &str = "ocm-source-watch-override";
@@ -52,6 +52,7 @@ pub(crate) struct SourceWatchLease {
     env_name: String,
     lease_id: String,
     lock_file: File,
+    service_was_running: bool,
     #[cfg(windows)]
     lease_event: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -66,6 +67,10 @@ impl Drop for SourceWatchLease {
 }
 
 impl SourceWatchLease {
+    pub(crate) fn service_was_running(&self) -> bool {
+        self.service_was_running
+    }
+
     pub(crate) fn begin_service_restore(&mut self) -> Result<(), String> {
         write_source_watch_lock(&mut self.lock_file, &format!("restoring:{}", self.lease_id))
     }
@@ -140,11 +145,41 @@ impl SourceWatchOverride {
 }
 
 impl<'a> EnvironmentService<'a> {
+    pub(crate) fn lock_gateway_admission(
+        &self,
+        env_name: &str,
+    ) -> Result<ExclusiveFileLock, String> {
+        let env_name = validate_name(env_name, "Environment name")?;
+        let path = source_watch_override_path(&env_name, self.env, self.cwd)?
+            .with_extension("admission.lock");
+        lock_file(&path, "gateway admission")
+    }
+
+    pub(crate) fn ensure_source_watch_allows_service(&self, env_name: &str) -> Result<(), String> {
+        if self.active_source_watch_override(env_name)?.is_some() {
+            return Err(format!(
+                "background service for env \"{env_name}\" cannot start while source watch is active; stop the watch session first"
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn acquire_source_watch_lease(
         &self,
         env_name: &str,
+        allow_service_takeover: bool,
     ) -> Result<SourceWatchLease, String> {
         let env_name = validate_name(env_name, "Environment name")?;
+        // Commands keep the operation lock while changing service policy; the
+        // shorter admission lock also covers starts from an already planned daemon.
+        let _operation_lock = self.lock_operation(&env_name)?;
+        let _admission_lock = self.lock_gateway_admission(&env_name)?;
+        let meta = self.get(&env_name)?;
+        if meta.service_running && !allow_service_takeover {
+            return Err(format!(
+                "dev env {env_name} is already running in the background; stop it first or rerun with --watch --force to take it over temporarily"
+            ));
+        }
         let override_path = source_watch_override_path(&env_name, self.env, self.cwd)?;
         let lock_path = override_path.with_extension("lock");
         if let Ok(meta) = read_json::<SourceWatchOverride>(&override_path)
@@ -212,6 +247,7 @@ impl<'a> EnvironmentService<'a> {
             env_name,
             lease_id,
             lock_file,
+            service_was_running: meta.service_running,
             #[cfg(windows)]
             lease_event,
         })

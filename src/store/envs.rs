@@ -247,12 +247,17 @@ pub fn save_environment(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
+    let service = crate::env::EnvironmentService::new(env, cwd);
+    let _admission_lock = service.lock_gateway_admission(&meta.name)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     let policy_changed = find_environment(&registry, &meta.name).is_some_and(|current| {
         current.service_enabled != meta.service_enabled
             || current.service_running != meta.service_running
     });
+    if policy_changed && meta.service_enabled && meta.service_running {
+        service.ensure_source_watch_allows_service(&meta.name)?;
+    }
     meta = upsert_environment(&mut registry, meta)?;
     if policy_changed {
         bump_service_policy_revision(&mut registry, &meta.name);
@@ -301,6 +306,8 @@ pub(crate) fn set_environment_service_policy(
     cwd: &Path,
 ) -> Result<EnvironmentServicePolicyChange, String> {
     let safe_name = validate_name(name, "Environment name")?;
+    let service = crate::env::EnvironmentService::new(env, cwd);
+    let _admission_lock = service.lock_gateway_admission(&safe_name)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     let (applied, previous_service_enabled, previous_service_running) = {
@@ -316,6 +323,9 @@ pub(crate) fn set_environment_service_policy(
         }
         if let Some(service_running) = service_running {
             meta.service_running = service_running;
+        }
+        if meta.service_enabled && meta.service_running {
+            service.ensure_source_watch_allows_service(&safe_name)?;
         }
         meta.updated_at = now_utc();
         (
@@ -339,6 +349,8 @@ pub(crate) fn restore_environment_service_policy(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<bool, String> {
+    let service = crate::env::EnvironmentService::new(env, cwd);
+    let _admission_lock = service.lock_gateway_admission(&change.applied.name)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     let current_revision = registry
@@ -385,6 +397,11 @@ fn create_environment_with_runtime_validation(
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
     let name = validate_name(&options.name, "Environment name")?;
+    let service = crate::env::EnvironmentService::new(env, cwd);
+    let _admission_lock = service.lock_gateway_admission(&name)?;
+    if options.service_enabled && options.service_running {
+        service.ensure_source_watch_allows_service(&name)?;
+    }
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     if find_environment(&registry, &name).is_some() {

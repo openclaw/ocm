@@ -180,6 +180,7 @@ pub fn restart_service(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<ServiceActionSummary, String> {
+    EnvironmentService::new(env, cwd).ensure_source_watch_allows_service(name)?;
     ensure_gateway_binding(name, env, cwd)?;
     let env_service = EnvironmentService::new(env, cwd);
     let meta = env_service.get(name)?;
@@ -455,6 +456,9 @@ fn update_service(
 ) -> Result<ServiceActionSummary, String> {
     let (action, service_enabled, service_running, require_binding, supervisor_policy) =
         update.settings();
+    if service_running == Some(true) || matches!(update, ServiceUpdate::Install) {
+        EnvironmentService::new(env, cwd).ensure_source_watch_allows_service(name)?;
+    }
     if require_binding {
         ensure_gateway_binding(name, env, cwd)?;
     }

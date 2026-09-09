@@ -211,8 +211,7 @@ impl Cli {
             .as_ref()
             .ok_or_else(|| format!("environment \"{}\" is missing its dev binding", meta.name))?;
         let stderr_profile = self.dev_stderr_profile();
-        let watch_takes_over_service = watch && force && meta.service_running;
-        if !service_requested && meta.service_running && !watch_takes_over_service {
+        if !watch && !service_requested && meta.service_running {
             return Err(format!(
                 "dev env {} is already running in the background; stop it first with {} service stop {}, inspect it with {} logs {} --follow, or rerun with --watch --force to take it over temporarily",
                 meta.name,
@@ -225,11 +224,14 @@ impl Cli {
         let mut source_watch_lease = if watch {
             Some(
                 self.environment_service()
-                    .acquire_source_watch_lease(&meta.name)?,
+                    .acquire_source_watch_lease(&meta.name, force)?,
             )
         } else {
             None
         };
+        let watch_takes_over_service = source_watch_lease
+            .as_ref()
+            .is_some_and(SourceWatchLease::service_was_running);
         self.stderr_lines(render_dev_run_summary(
             &meta,
             created,
@@ -410,7 +412,7 @@ impl Cli {
             .apply_effective_gateway_port(existing)?;
         let mut source_watch_lease = Some(
             self.environment_service()
-                .acquire_source_watch_lease(&meta.name)?,
+                .acquire_source_watch_lease(&meta.name, true)?,
         );
         let stderr_profile = self.dev_stderr_profile();
         self.stderr_lines(render_source_watch_takeover_summary(
@@ -424,7 +426,9 @@ impl Cli {
             stderr_profile,
         ));
 
-        let restore_service = meta.service_running;
+        let restore_service = source_watch_lease
+            .as_ref()
+            .is_some_and(SourceWatchLease::service_was_running);
         if restore_service {
             self.stderr_lines(render_dev_run_step(
                 "Takeover",

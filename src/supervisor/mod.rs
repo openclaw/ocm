@@ -651,7 +651,10 @@ impl<'a> SupervisorService<'a> {
                 });
                 continue;
             }
-            match env_service.resolve_gateway_process(&env_meta.name, false) {
+            match env_service
+                .ensure_source_watch_allows_service(&env_meta.name)
+                .and_then(|()| env_service.resolve_gateway_process(&env_meta.name, false))
+            {
                 Ok(process) => {
                     let restart_handoff_pid_bound = process.restart_handoff_pid_bound();
                     let args = process.args.clone();
@@ -850,7 +853,10 @@ impl<'a> SupervisorService<'a> {
                 spec.env_name,
                 child_binding_label(&spec)
             );
-            let mut child = spawn_supervisor_child(&spec)?;
+            let mut child = {
+                let _admission = admit_supervisor_child_start(&spec, self.env, self.cwd)?;
+                spawn_supervisor_child(&spec)?
+            };
             let status = child.wait().map_err(|error| {
                 format!("failed waiting for env \"{}\": {error}", spec.env_name)
             })?;
@@ -890,7 +896,13 @@ impl<'a> SupervisorService<'a> {
             0,
             Instant::now(),
         );
-        start_due_children(&mut running, &mut pending, &mut inactive)?;
+        start_due_children(
+            &mut running,
+            &mut pending,
+            &mut inactive,
+            self.env,
+            self.cwd,
+        )?;
         write_supervisor_runtime_state(
             &runtime_path,
             &active_state.ocm_home,
@@ -923,7 +935,13 @@ impl<'a> SupervisorService<'a> {
                 },
             )?;
 
-            runtime_dirty |= start_due_children(&mut running, &mut pending, &mut inactive)?;
+            runtime_dirty |= start_due_children(
+                &mut running,
+                &mut pending,
+                &mut inactive,
+                self.env,
+                self.cwd,
+            )?;
             if runtime_dirty {
                 write_supervisor_runtime_state(
                     &runtime_path,
@@ -1026,8 +1044,8 @@ fn spawn_running_child(
     spec: SupervisorChildSpec,
     restart_count: usize,
     quick_clean_restart_count: usize,
+    restart_handoff_support: RestartHandoffSupport,
 ) -> Result<RunningSupervisorChild, String> {
-    let restart_handoff_support = probe_restart_handoff_support(&spec);
     let prepared_spec = prepare_supervisor_child_spec(&spec, &restart_handoff_support);
     eprintln!(
         "ocm service: starting {} ({})",
@@ -1853,6 +1871,8 @@ fn start_due_children(
     running: &mut BTreeMap<String, RunningSupervisorChild>,
     pending: &mut BTreeMap<String, PendingSupervisorChild>,
     inactive: &mut BTreeMap<String, InactiveSupervisorChild>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
 ) -> Result<bool, String> {
     let now = Instant::now();
     let due = pending
@@ -1865,7 +1885,9 @@ fn start_due_children(
         let Some(next_child) = pending.get(&env_name).cloned() else {
             continue;
         };
-        if let Err(error) = preflight_supervisor_child_start(&next_child, running) {
+        if let Err(error) = preflight_supervisor_child_start(&next_child, running).and_then(|()| {
+            EnvironmentService::new(env, cwd).ensure_source_watch_allows_service(&env_name)
+        }) {
             if let Some(entry) = pending.get_mut(&env_name) {
                 entry.restart_count += 1;
                 let delay_ms = restart_delay_ms(entry.restart_count);
@@ -1886,11 +1908,19 @@ fn start_due_children(
             eprintln!("{error}");
             continue;
         }
-        match spawn_running_child(
-            next_child.spec.clone(),
-            next_child.restart_count,
-            next_child.quick_clean_restart_count,
-        ) {
+        // Capability probing can invoke OpenClaw. Keep it outside admission,
+        // then recheck ownership immediately before spawning the gateway.
+        let restart_handoff_support = probe_restart_handoff_support(&next_child.spec);
+        let start_result = (|| {
+            let _admission = admit_supervisor_child_start(&next_child.spec, env, cwd)?;
+            spawn_running_child(
+                next_child.spec.clone(),
+                next_child.restart_count,
+                next_child.quick_clean_restart_count,
+                restart_handoff_support,
+            )
+        })();
+        match start_result {
             Ok(running_child) => {
                 pending.remove(&env_name);
                 running.insert(env_name.clone(), running_child);
@@ -2106,6 +2136,30 @@ fn preflight_supervisor_child_start(
     }
 
     Ok(())
+}
+
+fn admit_supervisor_child_start(
+    spec: &SupervisorChildSpec,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<crate::store::ExclusiveFileLock, String> {
+    let service = EnvironmentService::new(env, cwd);
+    let admission = service.lock_gateway_admission(&spec.env_name)?;
+    service.ensure_source_watch_allows_service(&spec.env_name)?;
+    if spec.binding_kind == "source-watch" {
+        return Err(format!(
+            "refusing to start env \"{}\": its saved service plan belongs to a source-watch session; start the background service again after watch exits to resolve its registered binding",
+            spec.env_name
+        ));
+    }
+    let meta = service.get(&spec.env_name)?;
+    if !meta.service_enabled || !meta.service_running {
+        return Err(format!(
+            "refusing to start env \"{}\": its background service is disabled or stopped",
+            spec.env_name
+        ));
+    }
+    Ok(admission)
 }
 
 fn supervisor_service_environment(
@@ -3077,7 +3131,8 @@ mod tests {
             descendant_pid_path.to_string_lossy().into_owned(),
         );
 
-        let mut running_child = spawn_running_child(spec, 0, 0).unwrap();
+        let support = probe_restart_handoff_support(&spec);
+        let mut running_child = spawn_running_child(spec, 0, 0, support).unwrap();
         let process_group = format!("-{}", running_child.child.id());
         let status = running_child.child.wait().unwrap();
         assert_eq!(status.code(), Some(1));
@@ -3125,7 +3180,8 @@ mod tests {
         spec.stdout_path = test_dir.join("stdout.log").to_string_lossy().into_owned();
         spec.stderr_path = test_dir.join("stderr.log").to_string_lossy().into_owned();
 
-        let mut running_child = spawn_running_child(spec, 0, 0).unwrap();
+        let support = probe_restart_handoff_support(&spec);
+        let mut running_child = spawn_running_child(spec, 0, 0, support).unwrap();
         let child_pid = running_child.child.id().to_string();
         sleep(Duration::from_millis(50));
 
