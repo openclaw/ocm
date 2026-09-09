@@ -32,8 +32,9 @@ use crate::infra::process::run_direct;
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::infra::terminal::{Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table};
 use crate::openclaw_repo::{
-    detect_openclaw_checkout, discover_enclosing_openclaw_checkout,
-    ensure_checkout_owned_dependencies, ensure_openclaw_worktree, validate_openclaw_worktree,
+    detect_openclaw_checkout, discover_enclosing_openclaw_checkout, ensure_openclaw_worktree,
+    ensure_source_dependency_install_target, inspect_source_dependencies,
+    validate_openclaw_worktree,
 };
 use crate::service::service_backend_support_error;
 use crate::store::{
@@ -246,7 +247,7 @@ impl Cli {
             stderr_profile,
         ));
 
-        let install_code = self.ensure_dev_dependencies(&meta)?;
+        let install_code = self.ensure_dev_dependencies(&meta, watch)?;
         if install_code != 0 {
             return Ok(install_code);
         }
@@ -406,7 +407,13 @@ impl Cli {
                 display_path(&repo_root)
             )
         })?;
-        ensure_checkout_owned_dependencies(&repo_root)?;
+        if let Some(issue) = inspect_source_dependencies(
+            &repo_root,
+            &build_openclaw_env(&existing, &self.env),
+            true,
+        )? {
+            return Err(source_dependency_preparation_error(&repo_root, &issue));
+        }
         let meta = self
             .environment_service()
             .apply_effective_gateway_port(existing)?;
@@ -658,30 +665,36 @@ impl Cli {
         ensure_minimum_local_openclaw_config(&paths, gateway_port)
     }
 
-    fn ensure_dev_dependencies(&self, meta: &EnvMeta) -> Result<i32, String> {
+    fn ensure_dev_dependencies(&self, meta: &EnvMeta, watch: bool) -> Result<i32, String> {
         let dev = meta
             .dev
             .as_ref()
             .ok_or_else(|| format!("environment \"{}\" is missing its dev binding", meta.name))?;
         let worktree_root = Path::new(&dev.worktree_root);
-        ensure_checkout_owned_dependencies(worktree_root)?;
-        let pnpm_store = worktree_root.join("node_modules").join(".pnpm");
-        let tsx_bin = worktree_root.join("node_modules").join(".bin").join("tsx");
-        if pnpm_store.exists() && tsx_bin.exists() {
+        let process_env = build_openclaw_env(meta, &self.env);
+        if inspect_source_dependencies(worktree_root, &process_env, watch)?.is_none() {
             return Ok(0);
         }
+        ensure_source_dependency_install_target(worktree_root)?;
 
         self.stderr_lines(render_dev_run_step(
             "Dependencies",
             format!("Installing dependencies in {}", dev.worktree_root),
             self.dev_stderr_profile(),
         ));
-        run_direct(
+        let code = run_direct(
             "pnpm",
-            &["install".to_string()],
-            &build_openclaw_env(meta, &self.env),
+            &["install".to_string(), "--frozen-lockfile".to_string()],
+            &process_env,
             worktree_root,
-        )
+        )?;
+        if code != 0 {
+            return Ok(code);
+        }
+        if let Some(issue) = inspect_source_dependencies(worktree_root, &process_env, watch)? {
+            return Err(source_dependency_preparation_error(worktree_root, &issue));
+        }
+        Ok(0)
     }
 
     fn dev_stderr_profile(&self) -> RenderProfile {
@@ -983,6 +996,13 @@ impl Cli {
             status_command: format!("{} service status {}", self.command_example(), env_name),
         }))
     }
+}
+
+fn source_dependency_preparation_error(repo_root: &Path, issue: &str) -> String {
+    format!(
+        "OpenClaw source dependencies are not ready in {}: {issue}. Run `pnpm install --frozen-lockfile` in that checkout before retrying",
+        display_path(repo_root)
+    )
 }
 
 fn source_watch_stop_timeout_error(summary: &crate::service::ServiceActionSummary) -> String {

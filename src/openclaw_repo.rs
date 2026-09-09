@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -9,6 +10,40 @@ use std::os::unix::ffi::OsStringExt;
 use serde_json::Value;
 
 use crate::store::{clean_path, display_path};
+
+const SOURCE_DEPENDENCY_PROBE: &str = r#"import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+if (typeof import.meta.resolve !== "function") {
+  throw new Error("Use the Node version supported by the selected OpenClaw checkout.");
+}
+const requirements = JSON.parse(process.argv[2]);
+const issues = [];
+for (const [name, specifier] of requirements) {
+  const manifest = path.join(process.cwd(), "node_modules", name, "package.json");
+  if (!fs.existsSync(manifest)) {
+    issues.push(`${name}: not installed in this checkout`);
+    continue;
+  }
+  try {
+    const entry = fileURLToPath(import.meta.resolve(specifier));
+    if (!fs.statSync(entry).isFile()) {
+      issues.push(`${specifier}: resolved entry is not a file`);
+    }
+    if (name === "tsdown") {
+      const metadata = JSON.parse(fs.readFileSync(manifest, "utf8"));
+      const bin = typeof metadata.bin === "string" ? metadata.bin : metadata.bin?.tsdown;
+      if (typeof bin !== "string" || !fs.statSync(path.resolve(path.dirname(manifest), bin)).isFile()) {
+        issues.push("tsdown: declared executable is missing");
+      }
+      const shim = path.join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "tsdown.cmd" : "tsdown");
+      fs.accessSync(shim, process.platform === "win32" ? fs.constants.F_OK : fs.constants.X_OK);
+    }
+  } catch (error) {
+    issues.push(`${specifier}: ${error.code || "cannot resolve installed entry"}`);
+  }
+}
+process.stdout.write(JSON.stringify(issues));"#;
 
 pub(crate) fn detect_openclaw_checkout(path: &Path) -> Option<PathBuf> {
     let package_json = path.join("package.json");
@@ -84,6 +119,167 @@ pub(crate) fn ensure_checkout_owned_dependencies(repo_root: &Path) -> Result<(),
         display_path(&node_modules),
         display_path(&resolved_dependencies)
     ))
+}
+
+pub(crate) fn inspect_source_dependencies(
+    repo_root: &Path,
+    env: &BTreeMap<String, String>,
+    watch: bool,
+) -> Result<Option<String>, String> {
+    ensure_checkout_owned_dependencies(repo_root)?;
+    for script in ["scripts/run-node.mjs"]
+        .into_iter()
+        .chain(watch.then_some("scripts/watch-node.mjs"))
+    {
+        if !repo_root.join(script).is_file() {
+            return Err(format!(
+                "OpenClaw source entry is missing: {}",
+                display_path(&repo_root.join(script))
+            ));
+        }
+    }
+    let manifest_path = repo_root.join("package.json");
+    let contents = fs::read_to_string(&manifest_path).map_err(|error| {
+        format!(
+            "failed reading OpenClaw package metadata {}: {error}",
+            display_path(&manifest_path)
+        )
+    })?;
+    let manifest: Value = serde_json::from_str(&contents).map_err(|error| {
+        format!(
+            "invalid OpenClaw package metadata {}: {error}",
+            display_path(&manifest_path)
+        )
+    })?;
+    for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+        if let Some(value) = manifest.get(section)
+            && !value.is_object()
+            && !value.is_null()
+        {
+            return Err(format!(
+                "invalid OpenClaw package metadata: {section} must be an object"
+            ));
+        }
+    }
+    // These are the source runner's build tools and the watch runner's watcher,
+    // not a completeness check for the application's runtime dependency graph.
+    let declares = |name: &str| {
+        ["dependencies", "devDependencies", "optionalDependencies"]
+            .into_iter()
+            .any(|section| {
+                manifest
+                    .get(section)
+                    .and_then(Value::as_object)
+                    .is_some_and(|dependencies| dependencies.contains_key(name))
+            })
+    };
+    let mut requirements = Vec::new();
+    if declares("tsx") {
+        requirements.push(("tsx", "tsx"));
+        if repo_root.join("scripts/tsx.mjs").is_file() {
+            requirements.push(("tsx", "tsx/esm"));
+        }
+    }
+    if declares("tsdown") {
+        requirements.push(("tsdown", "tsdown"));
+    }
+    if watch && declares("chokidar") {
+        requirements.push(("chokidar", "chokidar"));
+    }
+    if requirements.is_empty() {
+        return Ok(None);
+    }
+    ensure_source_modules_override(repo_root, env)?;
+    let requirements = serde_json::to_string(&requirements).map_err(|error| error.to_string())?;
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            SOURCE_DEPENDENCY_PROBE,
+            "--",
+            "ocm-source-dependencies",
+            &requirements,
+        ])
+        .env_clear()
+        .envs(env)
+        // Validation resolves installed files without running user preload hooks.
+        .env_remove("NODE_OPTIONS")
+        .env_remove("NODE_PATH")
+        .env_remove("NODE_COMPILE_CACHE")
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| {
+            format!("failed to run node for OpenClaw source prerequisite checks: {error}")
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "OpenClaw source prerequisite check failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let issues: Vec<String> = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("invalid OpenClaw source prerequisite result: {error}"))?;
+    Ok((!issues.is_empty()).then(|| issues.join("; ")))
+}
+
+fn ensure_source_modules_override(
+    repo_root: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let configured = env
+        .get_key_value("PNPM_CONFIG_MODULES_DIR")
+        .or_else(|| env.get_key_value("pnpm_config_modules_dir"))
+        .filter(|(_, value)| !value.is_empty())
+        .or_else(|| {
+            env.get_key_value("npm_config_modules_dir")
+                .filter(|(_, value)| !value.is_empty())
+        });
+    let Some((key, value)) = configured else {
+        return Ok(());
+    };
+    let expected = repo_root.join("node_modules");
+    let configured = clean_path(&repo_root.join(value));
+    let same = match (fs::canonicalize(&expected), fs::canonicalize(&configured)) {
+        (Ok(expected), Ok(configured)) => expected == configured,
+        _ => clean_path(&expected) == configured,
+    };
+    if same {
+        Ok(())
+    } else {
+        Err(format!(
+            "OpenClaw source dependency override {key} selects a different modules tree; unset it or point it at {}",
+            display_path(&expected)
+        ))
+    }
+}
+
+pub(crate) fn ensure_source_dependency_install_target(repo_root: &Path) -> Result<(), String> {
+    ensure_checkout_owned_dependencies(repo_root)?;
+    for directory in [
+        repo_root.join("node_modules"),
+        repo_root.join("node_modules/.pnpm"),
+    ] {
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(format!(
+                    "refusing to install OpenClaw source dependencies through {}; preserve the linked or invalid dependency tree and prepare it explicitly",
+                    display_path(&directory)
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed inspecting OpenClaw dependency install target {}: {error}",
+                    display_path(&directory)
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn default_worktree_root(repo_root: &Path, env_name: &str) -> PathBuf {

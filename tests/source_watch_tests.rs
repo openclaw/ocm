@@ -49,6 +49,7 @@ fn create_source_repo(root: &TestDir) -> PathBuf {
     fs::write(repo.join("package.json"), r#"{"name":"openclaw"}"#).unwrap();
     fs::write(repo.join("openclaw.mjs"), "console.log('openclaw');\n").unwrap();
     fs::write(repo.join("scripts/run-node.mjs"), "").unwrap();
+    fs::write(repo.join("scripts/watch-node.mjs"), "").unwrap();
     fs::write(
         repo.join("extensions/codex/openclaw.plugin.json"),
         r#"{"id":"codex"}"#,

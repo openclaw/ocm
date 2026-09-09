@@ -293,6 +293,101 @@ fn install_fake_dev_runners(root: &TestDir, env: &mut std::collections::BTreeMap
     prepend_fake_bin(env, &bin_dir);
 }
 
+fn declare_source_tooling(repo: &Path) {
+    let manifest_path = repo.join("package.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["devDependencies"] = serde_json::json!({
+        "tsx": "0.0.0",
+        "tsdown": "0.0.0"
+    });
+    manifest["dependencies"] = serde_json::json!({"chokidar": "0.0.0"});
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    fs::write(repo.join("scripts/tsx.mjs"), "// Fixture source loader.\n").unwrap();
+}
+
+fn write_resolvable_source_tool(repo: &Path, name: &str) {
+    let package_root = repo.join("node_modules").join(name);
+    fs::create_dir_all(&package_root).unwrap();
+    fs::write(
+        package_root.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": name,
+            "type": "module",
+            "bin": "./cli.mjs",
+            "exports": {
+                ".": {"import": "./entry.mjs", "require": "./missing.cjs"},
+                "./esm": "./entry.mjs"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        package_root.join("entry.mjs"),
+        "throw new Error('Prerequisite checks must not execute dependency code');\n",
+    )
+    .unwrap();
+    if name == "tsdown" {
+        fs::write(
+            package_root.join("cli.mjs"),
+            "throw new Error('Prerequisite checks must not execute dependency code');\n",
+        )
+        .unwrap();
+        let bin_dir = repo.join("node_modules/.bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        write_executable_script(
+            &bin_dir.join(if cfg!(windows) {
+                "tsdown.cmd"
+            } else {
+                "tsdown"
+            }),
+            "#!/bin/sh\nexit 0\n",
+        );
+    }
+}
+
+fn install_probe_aware_fake_dev_runners(
+    root: &TestDir,
+    env: &mut std::collections::BTreeMap<String, String>,
+) {
+    let real_node = Command::new("node")
+        .args(["-p", "process.execPath"])
+        .env_clear()
+        .envs(&*env)
+        .output()
+        .expect("source prerequisite tests require Node");
+    assert!(real_node.status.success(), "{}", stderr(&real_node));
+    let real_node = stdout(&real_node).trim().replace('\'', "'\\''");
+    install_fake_dev_runners(root, env);
+    let node_path = root.child("fake-dev-bin/node");
+    let script = fs::read_to_string(&node_path).unwrap();
+    let prefix = format!(
+        "#!/bin/sh\nif [ \"$5\" = ocm-source-dependencies ]; then exec '{real_node}' \"$@\"; fi\n"
+    );
+    write_executable_script(&node_path, &script.replacen("#!/bin/sh\n", &prefix, 1));
+}
+
+fn install_frozen_source_dependency_runner(root: &TestDir) {
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s|%s\n' "$PWD" "$*" >> '{}'
+if [ "$1" != install ]; then exit 0; fi
+if [ "$2" != --frozen-lockfile ]; then exit 41; fi
+if [ -n "$OCM_TEST_INSTALL_EXIT_CODE" ]; then exit "$OCM_TEST_INSTALL_EXIT_CODE"; fi
+for name in tsx tsdown chokidar; do
+  mkdir -p "node_modules/$name"
+  printf '{{"name":"%s","type":"module","bin":"./entry.mjs","exports":{{".":"./entry.mjs","./esm":"./entry.mjs"}}}}\n' "$name" > "node_modules/$name/package.json"
+  printf "throw new Error('Prerequisite checks must not execute dependency code');\n" > "node_modules/$name/entry.mjs"
+done
+mkdir -p node_modules/.bin
+printf '#!/bin/sh\nexit 0\n' > node_modules/.bin/tsdown
+chmod +x node_modules/.bin/tsdown
+"#,
+        path_string(&root.child("pnpm.log"))
+    );
+    write_executable_script(&root.child("fake-dev-bin/pnpm"), &script);
+}
+
 fn source_watch_override_path(root: &TestDir, name: &str) -> PathBuf {
     root.child(format!("ocm-home/source-watch/{name}.json"))
 }
@@ -543,7 +638,7 @@ fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
     assert!(workspace_dir.exists());
 
     let pnpm_log = fs::read_to_string(root.child("pnpm.log")).unwrap();
-    assert!(pnpm_log.contains("|install"));
+    assert!(!pnpm_log.contains("|install"));
     assert!(pnpm_log.contains("openclaw gateway run --port"));
     assert!(pnpm_log.contains(&path_string(&worktree_root)));
     assert!(pnpm_log.contains(&path_string(&config_path)));
@@ -575,6 +670,284 @@ fn dev_command_rejects_an_unregistered_clone_at_the_managed_path() {
         fs::read_to_string(worktree_root.join("SENTINEL")).unwrap(),
         "preserve me\n"
     );
+}
+
+#[test]
+fn dev_dependencies_reuse_flat_source_tooling_without_running_it() {
+    let root = TestDir::new("dev-dependencies-reuse");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_probe_aware_fake_dev_runners(&root, &mut env);
+    let created = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let meta = get_environment("demo", &env, &cwd).unwrap();
+    let worktree = PathBuf::from(meta.dev.unwrap().worktree_root);
+    declare_source_tooling(&worktree);
+    // The normal source runner does not require the watch-only package.
+    write_resolvable_source_tool(&worktree, "tsx");
+    write_resolvable_source_tool(&worktree, "tsdown");
+    assert!(!worktree.join("node_modules/.pnpm").exists());
+    assert!(!worktree.join("node_modules/.bin/tsx").exists());
+    env.insert(
+        "PNPM_CONFIG_MODULES_DIR".to_string(),
+        path_string(&worktree.join("node_modules")),
+    );
+    fs::remove_file(root.child("pnpm.log")).unwrap();
+
+    let resumed = run_ocm(&cwd, &env, &["dev", "demo"]);
+    assert!(resumed.status.success(), "{}", stderr(&resumed));
+    let log = fs::read_to_string(root.child("pnpm.log")).unwrap();
+    assert!(log.contains("openclaw gateway run"));
+    assert!(!log.contains("|install"));
+
+    #[cfg(unix)]
+    {
+        let modules = worktree.join("node_modules");
+        let linked_modules = worktree.join("installed-modules");
+        fs::rename(&modules, &linked_modules).unwrap();
+        std::os::unix::fs::symlink(&linked_modules, &modules).unwrap();
+        fs::remove_file(root.child("pnpm.log")).unwrap();
+        let resumed = run_ocm(&cwd, &env, &["dev", "demo"]);
+        assert!(resumed.status.success(), "{}", stderr(&resumed));
+        let log = fs::read_to_string(root.child("pnpm.log")).unwrap();
+        assert!(!log.contains("|install"));
+        assert_eq!(fs::read_link(&modules).unwrap(), linked_modules);
+    }
+}
+
+#[test]
+fn dev_dependencies_bootstrap_with_a_frozen_lockfile_and_retry_after_failure() {
+    let root = TestDir::new("dev-dependencies-frozen-install");
+    let repo = init_openclaw_repo(&root);
+    declare_source_tooling(&repo);
+    let lockfile = "fixture lockfile must remain unchanged\n";
+    fs::write(repo.join("pnpm-lock.yaml"), lockfile).unwrap();
+    let staged = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["add", "package.json", "pnpm-lock.yaml", "scripts/tsx.mjs"])
+        .output()
+        .unwrap();
+    assert!(staged.status.success(), "{}", stderr(&staged));
+    let committed = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["commit", "-m", "declare source tooling"])
+        .output()
+        .unwrap();
+    assert!(committed.status.success(), "{}", stderr(&committed));
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_probe_aware_fake_dev_runners(&root, &mut env);
+    install_frozen_source_dependency_runner(&root);
+    env.insert("OCM_TEST_INSTALL_EXIT_CODE".to_string(), "42".to_string());
+
+    let failed = run_ocm(
+        &cwd,
+        &env,
+        &["dev", "demo", "--repo", &path_string(&repo), "--watch"],
+    );
+    assert_eq!(failed.status.code(), Some(42), "{}", stderr(&failed));
+    let meta = get_environment("demo", &env, &cwd).unwrap();
+    let worktree = PathBuf::from(meta.dev.unwrap().worktree_root);
+    assert!(!root.child("node.log").exists());
+    assert!(!source_watch_override_path(&root, "demo").exists());
+    assert_eq!(
+        fs::read_to_string(worktree.join("pnpm-lock.yaml")).unwrap(),
+        lockfile
+    );
+
+    env.remove("OCM_TEST_INSTALL_EXIT_CODE");
+    let retried = run_ocm(&cwd, &env, &["dev", "demo", "--watch"]);
+    assert!(retried.status.success(), "{}", stderr(&retried));
+    let log = fs::read_to_string(root.child("pnpm.log")).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.ends_with("|install --frozen-lockfile"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("pnpm-lock.yaml")).unwrap(),
+        lockfile
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("pnpm-lock.yaml")).unwrap(),
+        lockfile
+    );
+    assert!(
+        fs::read_to_string(root.child("node.log"))
+            .unwrap()
+            .contains("gateway run")
+    );
+}
+
+#[test]
+fn dev_dependencies_reject_unready_borrowed_source_before_service_changes() {
+    let root = TestDir::new("dev-dependencies-borrowed");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = service_env(&root);
+    install_probe_aware_fake_dev_runners(&root, &mut env);
+    create_runtime_backed_env(&cwd, &env);
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    let before = serde_json::to_value(get_environment("demo", &env, &cwd).unwrap()).unwrap();
+
+    for case in [
+        "watch-package",
+        "loader-entry",
+        "build-bin",
+        "build-shim",
+        "watch-entry",
+        "metadata",
+    ] {
+        declare_source_tooling(&repo);
+        fs::write(
+            repo.join("scripts/watch-node.mjs"),
+            "console.log('watch');\n",
+        )
+        .unwrap();
+        for name in ["tsx", "tsdown", "chokidar"] {
+            write_resolvable_source_tool(&repo, name);
+        }
+        match case {
+            "watch-package" => fs::remove_dir_all(repo.join("node_modules/chokidar")).unwrap(),
+            "loader-entry" => fs::remove_file(repo.join("node_modules/tsx/entry.mjs")).unwrap(),
+            "build-bin" => fs::remove_file(repo.join("node_modules/tsdown/cli.mjs")).unwrap(),
+            "build-shim" => {
+                fs::remove_file(repo.join("node_modules/.bin").join(if cfg!(windows) {
+                    "tsdown.cmd"
+                } else {
+                    "tsdown"
+                }))
+                .unwrap()
+            }
+            "watch-entry" => fs::remove_file(repo.join("scripts/watch-node.mjs")).unwrap(),
+            "metadata" => {
+                let manifest = serde_json::json!({"name": "openclaw", "devDependencies": []});
+                fs::write(
+                    repo.join("package.json"),
+                    serde_json::to_vec(&manifest).unwrap(),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let failed = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--watch",
+                "--force",
+            ],
+        );
+        assert!(!failed.status.success(), "{case}: {}", stdout(&failed));
+        let expected = match case {
+            "watch-package" => "chokidar: not installed",
+            "loader-entry" => "tsx",
+            "build-bin" | "build-shim" => "tsdown",
+            "watch-entry" => "source entry is missing",
+            "metadata" => "devDependencies must be an object",
+            _ => unreachable!(),
+        };
+        assert!(
+            stderr(&failed).contains(expected),
+            "{case}: {}",
+            stderr(&failed)
+        );
+        if !matches!(case, "watch-entry" | "metadata") {
+            assert!(stderr(&failed).contains("pnpm install --frozen-lockfile"));
+        }
+        assert_eq!(
+            serde_json::to_value(get_environment("demo", &env, &cwd).unwrap()).unwrap(),
+            before,
+            "{case}"
+        );
+        assert!(!root.child("pnpm.log").exists(), "{case}");
+        assert!(!root.child("node.log").exists(), "{case}");
+        assert!(
+            !source_watch_override_path(&root, "demo").exists(),
+            "{case}"
+        );
+    }
+
+    declare_source_tooling(&repo);
+    fs::write(repo.join("scripts/watch-node.mjs"), "").unwrap();
+    for name in ["tsx", "tsdown", "chokidar"] {
+        write_resolvable_source_tool(&repo, name);
+    }
+    for key in [
+        "PNPM_CONFIG_MODULES_DIR",
+        "pnpm_config_modules_dir",
+        "npm_config_modules_dir",
+    ] {
+        env.insert(key.to_string(), path_string(&root.child("other-modules")));
+        let failed = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--watch",
+                "--force",
+            ],
+        );
+        assert!(!failed.status.success(), "{key}: {}", stdout(&failed));
+        assert!(stderr(&failed).contains("different modules tree"));
+        assert_eq!(
+            serde_json::to_value(get_environment("demo", &env, &cwd).unwrap()).unwrap(),
+            before
+        );
+        assert!(!root.child("pnpm.log").exists());
+        assert!(!root.child("node.log").exists());
+        env.remove(key);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_dependencies_do_not_repair_through_linked_install_targets() {
+    for relative in ["node_modules", "node_modules/.pnpm"] {
+        let root = TestDir::new("dev-dependencies-linked-install");
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_probe_aware_fake_dev_runners(&root, &mut env);
+        let created = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let worktree = PathBuf::from(
+            get_environment("demo", &env, &cwd)
+                .unwrap()
+                .dev
+                .unwrap()
+                .worktree_root,
+        );
+        declare_source_tooling(&worktree);
+        let link = worktree.join(relative);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let target = worktree.join("borrowed-modules");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        fs::remove_file(root.child("pnpm.log")).unwrap();
+
+        let failed = run_ocm(&cwd, &env, &["dev", "demo"]);
+        assert!(!failed.status.success());
+        assert!(stderr(&failed).contains("refusing to install"));
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert!(!root.child("pnpm.log").exists());
+    }
 }
 
 #[test]
@@ -1200,7 +1573,6 @@ fn dev_command_can_onboard_then_watch() {
     assert!(run.status.success(), "{}", stderr(&run));
 
     let pnpm_log = fs::read_to_string(root.child("pnpm.log")).unwrap();
-    assert!(pnpm_log.contains("|install"));
     assert!(pnpm_log.contains("openclaw onboard --mode local --no-install-daemon"));
 
     let node_log = fs::read_to_string(root.child("node.log")).unwrap();
@@ -1455,8 +1827,6 @@ fn dev_command_can_start_a_background_service() {
     assert_eq!(status_json["bindingName"], "dev");
     assert_eq!(status_json["desiredRunning"], true);
 
-    let pnpm_log = fs::read_to_string(root.child("pnpm.log")).unwrap();
-    assert!(pnpm_log.contains("|install"));
     assert!(stdout(&run).contains("http://127.0.0.1:"));
 }
 

@@ -282,6 +282,8 @@ managed gateways.
 
 An existing dev env resumes its recorded worktree, preserving its uncommitted changes. If that worktree is missing or has been replaced by an unrelated checkout, `dev` reports an error instead of recreating it; restore the recorded checkout before retrying. An explicit `--repo` must still identify the env's original repository, including equivalent path aliases, and cannot rebind the env to another checkout.
 
+Before starting source, `dev` checks the installed entry points for the tooling declared by that checkout. It reuses hoisted or isolated installs whose tooling resolves. Missing tooling in an OCM-owned dev worktree is prepared with `pnpm install --frozen-lockfile` and checked again. Source takeover of a runtime or launcher env only validates the borrowed checkout and fails before stopping its service if preparation is needed. OCM does not reinstall through linked dependency directories. A modules-directory environment override must resolve to the same checkout-owned `node_modules` tree. These are startup checks; OpenClaw still owns builds and validation of the running application.
+
 ### Try beta or pin a specific release
 
 ```bash
