@@ -17,13 +17,17 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
+use crate::infra::process_identity::{
+    ProcessIdentity, current_process_identity, observe_process, process_scope_id,
+};
 use crate::infra::shell::apply_external_supervision_hint;
-use crate::service::inspect::inspect_job;
+use crate::service::inspect::{ManagedJobObservation, inspect_job, observe_job_for_source_watch};
 use crate::service::platform::{
     ManagedServiceDefinition, ManagedServiceEnablement, ServiceManagerKind,
     activate_managed_service, deactivate_managed_service, ensure_service_definition_dir,
-    managed_service_enablement, managed_service_identity, restore_managed_service_registration,
-    service_manager_kind, validate_managed_service_owner, write_managed_service_definition,
+    managed_service_enablement, managed_service_identity, managed_service_owner_matches,
+    restore_managed_service_registration, service_manager_kind, validate_managed_service_owner,
+    write_managed_service_definition,
 };
 use crate::store::{
     display_path, ensure_dir, ensure_store, list_environments, lock_file, now_utc,
@@ -40,6 +44,8 @@ use openclaw_handoff::{
 
 const SUPERVISOR_STATE_KIND: &str = "ocm-supervisor-state";
 const SUPERVISOR_RUNTIME_KIND: &str = "ocm-supervisor-runtime";
+// This capability covers the current admission filename through child publication.
+const GATEWAY_ADMISSION_VERSION: u32 = 1;
 const SUPERVISOR_POLL_INTERVAL_MS: u64 = 200;
 const SUPERVISOR_RESTART_DELAY_MS: u64 = 1_000;
 const SUPERVISOR_MAX_RESTART_DELAY_MS: u64 = 30_000;
@@ -196,10 +202,30 @@ pub struct SupervisorRuntimeState {
     pub ocm_home: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_admission: Option<SupervisorGatewayAdmission>,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
     pub services: Vec<SupervisorRuntimeService>,
     pub children: Vec<SupervisorRuntimeChild>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupervisorGatewayAdmission {
+    version: u32,
+    process: ProcessIdentity,
+    process_scope: Option<String>,
+}
+
+impl SupervisorGatewayAdmission {
+    fn current() -> Result<Self, String> {
+        Ok(Self {
+            version: GATEWAY_ADMISSION_VERSION,
+            process: current_process_identity()?,
+            process_scope: process_scope_id()?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -856,6 +882,92 @@ impl<'a> SupervisorService<'a> {
         Ok(runtime)
     }
 
+    pub(crate) fn preflight_source_watch_daemon(&self) -> Result<(), String> {
+        if service_manager_kind(self.env) == ServiceManagerKind::Unsupported {
+            return Ok(());
+        }
+        let _lifecycle_lock = self.lock_daemon_lifecycle()?;
+        self.ensure_source_watch_daemon_compatible()
+    }
+
+    /// The caller holds daemon lifecycle and Gateway admission until its lease
+    /// is published. Existing watches and stop/recovery do not use this check.
+    pub(crate) fn ensure_source_watch_daemon_compatible(&self) -> Result<(), String> {
+        if service_manager_kind(self.env) == ServiceManagerKind::Unsupported {
+            return Ok(());
+        }
+        let result = (|| {
+            let identity = managed_service_identity(self.env, self.cwd)?;
+            // A store that has never published desired or runtime daemon state
+            // cannot have an admitted managed child, including on hosts without
+            // a user service manager. A deleted definition alone proves nothing.
+            let state_path = supervisor_state_path(self.env, self.cwd)?;
+            let runtime_path = supervisor_runtime_path(self.env, self.cwd)?;
+            if !identity.definition_path.try_exists().map_err(|error| {
+                format!("failed to inspect the managed service definition: {error}")
+            })? && !state_path
+                .try_exists()
+                .map_err(|error| format!("failed to inspect daemon desired state: {error}"))?
+                && !runtime_path
+                    .try_exists()
+                    .map_err(|error| format!("failed to inspect daemon runtime state: {error}"))?
+            {
+                return Ok(());
+            }
+            let ocm_home = display_path(&resolve_ocm_home(self.env, self.cwd)?);
+            let pid = match observe_job_for_source_watch(
+                &identity.label,
+                &identity.definition_path,
+                self.env,
+            )? {
+                ManagedJobObservation::Absent | ManagedJobObservation::Stopped => return Ok(()),
+                ManagedJobObservation::Running(pid) => pid,
+            };
+            if !identity.definition_path.try_exists().map_err(|error| {
+                format!("failed to inspect the managed service definition: {error}")
+            })? {
+                return Err("the running daemon has no service definition to verify".to_string());
+            }
+            if !managed_service_owner_matches(&identity.definition_path, &ocm_home, self.env)? {
+                return Err("the running daemon's service definition belongs to another store; its loaded ownership cannot be verified".to_string());
+            }
+            let runtime = self
+                .read_runtime_state()?
+                .ok_or_else(|| "the running daemon has no runtime ownership record".to_string())?;
+            if runtime.kind != SUPERVISOR_RUNTIME_KIND || runtime.ocm_home != ocm_home {
+                return Err("the daemon runtime record belongs to another owner".to_string());
+            }
+            let capability = runtime.gateway_admission.ok_or_else(|| {
+                "the running daemon does not advertise Gateway admission compatibility".to_string()
+            })?;
+            if capability.version != GATEWAY_ADMISSION_VERSION {
+                return Err(
+                    "the running daemon uses an unsupported Gateway admission version".to_string(),
+                );
+            }
+            if capability.process_scope != process_scope_id()? {
+                return Err(
+                    "the daemon runtime record belongs to another boot or process namespace"
+                        .to_string(),
+                );
+            }
+            let process = observe_process(pid)?
+                .ok_or_else(|| "the observed daemon process exited before admission".to_string())?;
+            if !process.running || process.identity != capability.process {
+                return Err(
+                    "the daemon runtime record does not identify the current managed process"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        })();
+        result.map_err(|error| {
+            format!(
+                "cannot start source watch: {error}; wait for daemon startup or refresh it from the updated OCM installation with \"ocm service refresh-daemon --acknowledge-gateway-restarts\" during a maintenance window"
+            )
+        })
+    }
+
     fn read_runtime_state(&self) -> Result<Option<SupervisorRuntimeState>, String> {
         let runtime_path = supervisor_runtime_path(self.env, self.cwd)?;
         if !runtime_path.try_exists().map_err(|error| {
@@ -914,6 +1026,7 @@ impl<'a> SupervisorService<'a> {
         .map_err(|error| format!("failed to install service signal handler: {error}"))?;
 
         let runtime_path = supervisor_runtime_path(self.env, self.cwd)?;
+        let gateway_admission = SupervisorGatewayAdmission::current()?;
         let mut active_state = state;
         let mut running = BTreeMap::new();
         let mut pending = BTreeMap::new();
@@ -925,12 +1038,23 @@ impl<'a> SupervisorService<'a> {
             0,
             Instant::now(),
         );
+        // Publish the process-bound capability before any probe or child start.
+        // A stale record from an earlier daemon can never authorize this process.
+        write_supervisor_runtime_state(
+            &runtime_path,
+            &active_state.ocm_home,
+            &running,
+            &pending,
+            &inactive,
+            &gateway_admission,
+        )?;
         start_due_children(
             &mut running,
             &mut pending,
             &mut inactive,
             self.env,
             self.cwd,
+            &gateway_admission,
         )?;
         write_supervisor_runtime_state(
             &runtime_path,
@@ -938,6 +1062,7 @@ impl<'a> SupervisorService<'a> {
             &running,
             &pending,
             &inactive,
+            &gateway_admission,
         )?;
         let mut managed_child_count = active_state.children.len();
         let mut child_results = Vec::new();
@@ -970,6 +1095,7 @@ impl<'a> SupervisorService<'a> {
                 &mut inactive,
                 self.env,
                 self.cwd,
+                &gateway_admission,
             )?;
             if runtime_dirty {
                 write_supervisor_runtime_state(
@@ -978,6 +1104,7 @@ impl<'a> SupervisorService<'a> {
                     &running,
                     &pending,
                     &inactive,
+                    &gateway_admission,
                 )?;
             }
 
@@ -995,6 +1122,7 @@ impl<'a> SupervisorService<'a> {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &gateway_admission,
         )?;
 
         Ok(SupervisorRunSummary {
@@ -1902,6 +2030,7 @@ fn start_due_children(
     inactive: &mut BTreeMap<String, InactiveSupervisorChild>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
+    gateway_admission: &SupervisorGatewayAdmission,
 ) -> Result<bool, String> {
     let runtime_path = supervisor_runtime_path(env, cwd)?;
     let ocm_home = display_path(&resolve_ocm_home(env, cwd)?);
@@ -1967,6 +2096,7 @@ fn start_due_children(
                     running,
                     pending,
                     inactive,
+                    gateway_admission,
                 ) {
                     if let Some(mut child) = running.remove(&env_name) {
                         stop_supervisor_child(&mut child);
@@ -2538,6 +2668,7 @@ fn write_supervisor_runtime_state(
     running: &BTreeMap<String, RunningSupervisorChild>,
     pending: &BTreeMap<String, PendingSupervisorChild>,
     inactive: &BTreeMap<String, InactiveSupervisorChild>,
+    gateway_admission: &SupervisorGatewayAdmission,
 ) -> Result<(), String> {
     if let Some(parent) = runtime_path.parent() {
         ensure_dir(parent)?;
@@ -2577,6 +2708,7 @@ fn write_supervisor_runtime_state(
             kind: SUPERVISOR_RUNTIME_KIND.to_string(),
             ocm_home: ocm_home.to_string(),
             daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            gateway_admission: Some(gateway_admission.clone()),
             updated_at: now_utc(),
             services,
             children,

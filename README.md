@@ -275,12 +275,14 @@ ocm dev existing-env --repo ~/src/openclaw --watch --force
 
 Use `ocm dev` when you want an isolated source-run checkout with its own env root and gateway port, or when you want to temporarily run source against an existing env in watch mode without rebinding it. While watch mode is running, OCM's OpenClaw-running commands for that env resolve to the watched checkout, so one-shot checks use the same built `openclaw.mjs` that the watcher is maintaining. OCM refuses background service installation, start, and restart for that env until watch exits; a running service taken over with `--watch --force` is restored by the watch session after its source processes stop. Existing-env watch output is saved under that env's `.openclaw/logs/` directory, so `ocm logs <env>` remains useful while the foreground watcher is running. If you are already inside an OpenClaw checkout, `ocm setup` can detect that and suggest a local path automatically.
 
-After updating OCM, a background daemon still running the previous code needs an
-explicit refresh to enforce this watch exclusion. `ocm service status` reports
-CLI and daemon versions. During a maintenance window, run
-`ocm service refresh-daemon --acknowledge-gateway-restarts`; this restarts the
-managed gateways. Run the refresh from the updated OCM installation so the
-daemon and source-watch commands use the same ownership locks.
+Before starting a new watch, OCM checks that a running background daemon uses
+compatible ownership locks and that its runtime record identifies the current
+process. A daemon whose compatibility cannot be verified must finish starting
+or be refreshed before the watch can claim ownership. During a maintenance
+window, run `ocm service refresh-daemon --acknowledge-gateway-restarts` from the
+updated OCM installation; this restarts managed gateways. Package version alone
+does not establish compatibility. A confirmed stopped or unloaded daemon does
+not require refresh, and existing watch reuse and stop remain available.
 
 An existing dev env resumes its recorded worktree, preserving its uncommitted changes. If that worktree is missing or has been replaced by an unrelated checkout, `dev` reports an error instead of recreating it; restore the recorded checkout before retrying. An explicit `--repo` must still identify the env's original repository, including equivalent path aliases, and cannot rebind the env to another checkout.
 

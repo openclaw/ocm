@@ -21,10 +21,12 @@ use time::OffsetDateTime;
 use super::EnvironmentService;
 use super::source_watch_session::{SourceWatchSession, SourceWatchSessionPaths};
 use crate::infra::process_identity::{current_process_identity, observe_process, process_scope_id};
+use crate::service::platform::{ServiceManagerKind, service_manager_kind};
 use crate::store::{
     ExclusiveFileLock, display_path, ensure_dir, lock_file, now_utc, read_json,
     source_watch_override_path, try_lock_file, validate_name, write_json,
 };
+use crate::supervisor::SupervisorService;
 
 const SOURCE_WATCH_OVERRIDE_KIND: &str = "ocm-source-watch-override";
 const SOURCE_WATCH_LOCK_RETRY_ATTEMPTS: usize = 20;
@@ -383,10 +385,17 @@ impl<'a> EnvironmentService<'a> {
         allow_service_takeover: bool,
     ) -> Result<SourceWatchLease, String> {
         let env_name = validate_name(env_name, "Environment name")?;
-        // Commands keep the operation lock while changing service policy; the
-        // shorter admission lock also covers starts from an already planned daemon.
+        // Match service updates: operation, daemon lifecycle, then Gateway
+        // admission. Keep the daemon generation stable through lease publication.
         let _operation_lock = self.lock_operation(&env_name)?;
+        let supervisor = SupervisorService::new(self.env, self.cwd);
+        let _lifecycle_lock = if service_manager_kind(self.env) == ServiceManagerKind::Unsupported {
+            None
+        } else {
+            Some(supervisor.lock_daemon_lifecycle()?)
+        };
         let _admission_lock = self.lock_gateway_admission(&env_name)?;
+        supervisor.ensure_source_watch_daemon_compatible()?;
         let meta = self.get(&env_name)?;
         if meta.service_running && !allow_service_takeover {
             return Err(format!(

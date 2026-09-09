@@ -19,8 +19,8 @@ use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, Supervis
 use serde_json::Value;
 
 use crate::support::{
-    TestDir, install_fake_service_manager, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script,
+    TestDir, enable_fake_daemon_gateway_admission, install_fake_service_manager, ocm_env,
+    path_string, run_ocm, stderr, stdout, write_executable_script,
 };
 
 fn init_openclaw_repo(root: &TestDir) -> PathBuf {
@@ -724,6 +724,14 @@ fn service_env(root: &TestDir) -> std::collections::BTreeMap<String, String> {
     env
 }
 
+fn service_env_with_gateway_admission(
+    root: &TestDir,
+) -> std::collections::BTreeMap<String, String> {
+    let mut env = service_env(root);
+    enable_fake_daemon_gateway_admission(root, &mut env);
+    env
+}
+
 #[test]
 fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
     let root = TestDir::new("dev-command-run");
@@ -846,7 +854,7 @@ fn dev_dependencies_reuse_configured_modules_before_native_linking() {
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env(&root);
+    let mut env = service_env_with_gateway_admission(&root);
     install_probe_aware_fake_dev_runners(&root, &mut env);
     create_runtime_backed_env(&cwd, &env);
     let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
@@ -1065,7 +1073,7 @@ fn dev_dependencies_reject_unready_borrowed_source_before_service_changes() {
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env(&root);
+    let mut env = service_env_with_gateway_admission(&root);
     install_probe_aware_fake_dev_runners(&root, &mut env);
     create_runtime_backed_env(&cwd, &env);
     let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
@@ -1979,6 +1987,7 @@ fn dev_status_reports_dev_envs() {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: vec![],
         children: vec![SupervisorRuntimeChild {
@@ -2341,7 +2350,7 @@ fn dev_watch_force_takes_over_runtime_env_without_rebinding() {
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env(&root);
+    let mut env = service_env_with_gateway_admission(&root);
     install_fake_dev_runners(&root, &mut env);
     env.insert(
         "OCM_TEST_NODE_STDOUT".to_string(),
@@ -2424,7 +2433,7 @@ fn dev_watch_force_rejects_dependencies_from_another_checkout_before_takeover() 
     std::os::unix::fs::symlink(&shared_dependencies, repo.join("node_modules")).unwrap();
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env(&root);
+    let mut env = service_env_with_gateway_admission(&root);
     install_fake_dev_runners(&root, &mut env);
     create_runtime_backed_env(&cwd, &env);
 
@@ -2470,7 +2479,7 @@ fn dev_watch_force_rejects_dangling_dependency_link_before_takeover() {
     std::os::unix::fs::symlink(&missing_dependencies, repo.join("node_modules")).unwrap();
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env(&root);
+    let mut env = service_env_with_gateway_admission(&root);
     install_fake_dev_runners(&root, &mut env);
     create_runtime_backed_env(&cwd, &env);
 
@@ -2508,7 +2517,7 @@ fn dev_watch_force_warns_for_installed_plugins_missing_from_source() {
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env(&root);
+    let mut env = service_env_with_gateway_admission(&root);
     install_fake_dev_runners(&root, &mut env);
     create_runtime_backed_env(&cwd, &env);
 
@@ -2545,7 +2554,7 @@ fn dev_watch_force_restores_runtime_service_when_source_watch_cannot_spawn() {
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let env = service_env(&root);
+    let env = service_env_with_gateway_admission(&root);
     create_runtime_backed_env(&cwd, &env);
 
     let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
@@ -2669,7 +2678,7 @@ fn dev_stop_restores_service_and_preserves_the_env_and_borrowed_source() {
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env(&root);
+    let mut env = service_env_with_gateway_admission(&root);
     let (started, _, _) = install_blocking_fake_dev_runners(&root, &mut env);
     create_runtime_backed_env(&cwd, &env);
     let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
@@ -2922,7 +2931,7 @@ fn dev_stop_recovers_a_crashed_controller_and_its_stubborn_tree_before_restorati
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env(&root);
+    let mut env = service_env_with_gateway_admission(&root);
     install_fake_dev_runners(&root, &mut env);
     create_runtime_backed_env(&cwd, &env);
     let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
@@ -3695,6 +3704,7 @@ fn dev_watch_aborts_and_restores_policy_when_service_stop_times_out() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = service_env(&root);
+    let capability = enable_fake_daemon_gateway_admission(&root, &mut env);
     install_fake_dev_runners(&root, &mut env);
     create_runtime_backed_env(&cwd, &env);
 
@@ -3709,6 +3719,7 @@ fn dev_watch_aborts_and_restores_policy_when_service_stop_times_out() {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: Some(capability),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -3779,7 +3790,7 @@ fn assert_dev_watch_signal_restores_service(test_name: &str, signal_name: &str) 
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env(&root);
+    let mut env = service_env_with_gateway_admission(&root);
     let (started, release, _) = install_blocking_fake_dev_runners(&root, &mut env);
     create_runtime_backed_env(&cwd, &env);
 
@@ -3851,7 +3862,7 @@ fn dev_watch_nonzero_child_exit_restores_the_service() {
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env(&root);
+    let mut env = service_env_with_gateway_admission(&root);
     let started = install_failing_fake_dev_runners(&root, &mut env);
     create_runtime_backed_env(&cwd, &env);
 
@@ -3906,7 +3917,7 @@ fn dev_watch_force_temporarily_takes_over_and_restores_the_background_service() 
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env(&root);
+    let mut env = service_env_with_gateway_admission(&root);
     install_fake_dev_runners(&root, &mut env);
 
     let service = run_ocm(

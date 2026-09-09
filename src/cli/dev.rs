@@ -422,6 +422,11 @@ impl Cli {
             }
         }
 
+        // Reject an already incompatible daemon before creating a new env or
+        // worktree. Lease admission rechecks after any concurrent daemon change.
+        if watch {
+            self.supervisor_service().preflight_source_watch_daemon()?;
+        }
         let (meta, created) =
             self.ensure_dev_env(&name, repo_root.clone(), root.clone(), gateway_port)?;
         let stderr_profile = self.dev_stderr_profile();
