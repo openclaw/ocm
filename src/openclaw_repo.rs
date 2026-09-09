@@ -12,31 +12,50 @@ use serde_json::Value;
 use crate::store::{clean_path, display_path};
 
 const SOURCE_DEPENDENCY_PROBE: &str = r#"import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 if (typeof import.meta.resolve !== "function") {
   throw new Error("Use the Node version supported by the selected OpenClaw checkout.");
 }
 const requirements = JSON.parse(process.argv[2]);
+const localModules = path.join(process.cwd(), "node_modules");
+const configuredModules = process.argv[3];
+// Match OpenClaw's source loader without creating its startup node_modules link.
+const tsxModules = configuredModules && fs.existsSync(path.join(configuredModules, "tsx", "package.json"))
+  ? configuredModules : localModules;
+const runtimeModules = fs.existsSync(localModules) ? localModules : tsxModules;
 const issues = [];
 for (const [name, specifier] of requirements) {
-  const manifest = path.join(process.cwd(), "node_modules", name, "package.json");
+  const modules = name === "tsx" ? tsxModules : runtimeModules;
+  const manifest = path.join(modules, name, "package.json");
   if (!fs.existsSync(manifest)) {
     issues.push(`${name}: not installed in this checkout`);
     continue;
   }
   try {
-    const entry = fileURLToPath(import.meta.resolve(specifier));
+    const metadata = JSON.parse(fs.readFileSync(manifest, "utf8"));
+    const require = createRequire(manifest);
+    let entry;
+    if (specifier === "tsx/esm") {
+      entry = require.resolve(specifier);
+    } else if (modules === localModules) {
+      entry = fileURLToPath(import.meta.resolve(specifier));
+    } else if (metadata.exports != null) {
+      entry = fileURLToPath(import.meta.resolve(specifier, pathToFileURL(manifest)));
+    } else {
+      // Node's legacy package-main resolver handles packages without exports.
+      entry = require.resolve(specifier === name ? "./" : `./${specifier.slice(name.length + 1)}`);
+    }
     if (!fs.statSync(entry).isFile()) {
       issues.push(`${specifier}: resolved entry is not a file`);
     }
     if (name === "tsdown") {
-      const metadata = JSON.parse(fs.readFileSync(manifest, "utf8"));
       const bin = typeof metadata.bin === "string" ? metadata.bin : metadata.bin?.tsdown;
       if (typeof bin !== "string" || !fs.statSync(path.resolve(path.dirname(manifest), bin)).isFile()) {
         issues.push("tsdown: declared executable is missing");
       }
-      const shim = path.join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "tsdown.cmd" : "tsdown");
+      const shim = path.join(runtimeModules, ".bin", process.platform === "win32" ? "tsdown.cmd" : "tsdown");
       fs.accessSync(shim, process.platform === "win32" ? fs.constants.F_OK : fs.constants.X_OK);
     }
   } catch (error) {
@@ -189,16 +208,21 @@ pub(crate) fn inspect_source_dependencies(
     if requirements.is_empty() {
         return Ok(None);
     }
-    ensure_source_modules_override(repo_root, env)?;
+    let modules_override = source_modules_override(repo_root, env)?
+        .as_deref()
+        .map(display_path)
+        .unwrap_or_default();
     let requirements = serde_json::to_string(&requirements).map_err(|error| error.to_string())?;
     let output = Command::new("node")
         .args([
             "--input-type=module",
+            "--experimental-import-meta-resolve",
             "--eval",
             SOURCE_DEPENDENCY_PROBE,
             "--",
             "ocm-source-dependencies",
             &requirements,
+            &modules_override,
         ])
         .env_clear()
         .envs(env)
@@ -225,10 +249,10 @@ pub(crate) fn inspect_source_dependencies(
     Ok((!issues.is_empty()).then(|| issues.join("; ")))
 }
 
-fn ensure_source_modules_override(
+fn source_modules_override(
     repo_root: &Path,
     env: &BTreeMap<String, String>,
-) -> Result<(), String> {
+) -> Result<Option<PathBuf>, String> {
     let configured = env
         .get_key_value("PNPM_CONFIG_MODULES_DIR")
         .or_else(|| env.get_key_value("pnpm_config_modules_dir"))
@@ -238,30 +262,50 @@ fn ensure_source_modules_override(
                 .filter(|(_, value)| !value.is_empty())
         });
     let Some((key, value)) = configured else {
-        return Ok(());
+        return Ok(None);
     };
-    let expected = repo_root.join("node_modules");
     let configured = clean_path(&repo_root.join(value));
-    let same = match (fs::canonicalize(&expected), fs::canonicalize(&configured)) {
-        (Ok(expected), Ok(configured)) => expected == configured,
-        _ => clean_path(&expected) == configured,
-    };
-    if same {
-        Ok(())
-    } else {
-        Err(format!(
-            "OpenClaw source dependency override {key} selects a different modules tree; unset it or point it at {}",
-            display_path(&expected)
-        ))
+    let resolved_repo = fs::canonicalize(repo_root).map_err(|error| error.to_string())?;
+    // An absent install target is safe only when its nearest existing ancestor
+    // belongs to this checkout. Do not skip broken links while finding it.
+    let mut existing = configured.as_path();
+    loop {
+        match fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or_else(|| error.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
     }
+    let resolved = fs::canonicalize(existing).map_err(|error| {
+        format!("failed resolving OpenClaw source dependency override {key}: {error}")
+    })?;
+    if !resolved.starts_with(&resolved_repo) {
+        return Err(format!(
+            "OpenClaw source dependency override {key} resolves outside the selected checkout: {}; unset it or select dependencies inside {}",
+            display_path(&configured),
+            display_path(repo_root)
+        ));
+    }
+    Ok(Some(configured))
 }
 
-pub(crate) fn ensure_source_dependency_install_target(repo_root: &Path) -> Result<(), String> {
+pub(crate) fn ensure_source_dependency_install_target(
+    repo_root: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<(), String> {
     ensure_checkout_owned_dependencies(repo_root)?;
-    for directory in [
-        repo_root.join("node_modules"),
-        repo_root.join("node_modules/.pnpm"),
-    ] {
+    let mut modules = vec![repo_root.join("node_modules")];
+    if let Some(configured) = source_modules_override(repo_root, env)?
+        && !modules.contains(&configured)
+    {
+        modules.push(configured);
+    }
+    for directory in modules
+        .into_iter()
+        .flat_map(|root| [root.clone(), root.join(".pnpm")])
+    {
         match fs::symlink_metadata(&directory) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(format!(

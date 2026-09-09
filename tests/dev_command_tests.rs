@@ -362,7 +362,7 @@ fn install_probe_aware_fake_dev_runners(
     let node_path = root.child("fake-dev-bin/node");
     let script = fs::read_to_string(&node_path).unwrap();
     let prefix = format!(
-        "#!/bin/sh\nif [ \"$5\" = ocm-source-dependencies ]; then exec '{real_node}' \"$@\"; fi\n"
+        "#!/bin/sh\nif [ \"$6\" = ocm-source-dependencies ]; then exec '{real_node}' \"$@\"; fi\n"
     );
     write_executable_script(&node_path, &script.replacen("#!/bin/sh\n", &prefix, 1));
 }
@@ -374,14 +374,15 @@ printf '%s|%s\n' "$PWD" "$*" >> '{}'
 if [ "$1" != install ]; then exit 0; fi
 if [ "$2" != --frozen-lockfile ]; then exit 41; fi
 if [ -n "$OCM_TEST_INSTALL_EXIT_CODE" ]; then exit "$OCM_TEST_INSTALL_EXIT_CODE"; fi
+modules_dir="${{PNPM_CONFIG_MODULES_DIR:-node_modules}}"
 for name in tsx tsdown chokidar; do
-  mkdir -p "node_modules/$name"
-  printf '{{"name":"%s","type":"module","bin":"./entry.mjs","exports":{{".":"./entry.mjs","./esm":"./entry.mjs"}}}}\n' "$name" > "node_modules/$name/package.json"
-  printf "throw new Error('Prerequisite checks must not execute dependency code');\n" > "node_modules/$name/entry.mjs"
+  mkdir -p "$modules_dir/$name"
+  printf '{{"name":"%s","type":"module","bin":"./entry.mjs","exports":{{".":"./entry.mjs","./esm":"./entry.mjs"}}}}\n' "$name" > "$modules_dir/$name/package.json"
+  printf "throw new Error('Prerequisite checks must not execute dependency code');\n" > "$modules_dir/$name/entry.mjs"
 done
-mkdir -p node_modules/.bin
-printf '#!/bin/sh\nexit 0\n' > node_modules/.bin/tsdown
-chmod +x node_modules/.bin/tsdown
+mkdir -p "$modules_dir/.bin"
+printf '#!/bin/sh\nexit 0\n' > "$modules_dir/.bin/tsdown"
+chmod +x "$modules_dir/.bin/tsdown"
 "#,
         path_string(&root.child("pnpm.log"))
     );
@@ -718,6 +719,133 @@ fn dev_dependencies_reuse_flat_source_tooling_without_running_it() {
 }
 
 #[test]
+fn dev_dependencies_reuse_configured_modules_before_native_linking() {
+    let root = TestDir::new("dev-dependencies-configured-modules");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = service_env(&root);
+    install_probe_aware_fake_dev_runners(&root, &mut env);
+    create_runtime_backed_env(&cwd, &env);
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    declare_source_tooling(&repo);
+    for name in ["tsx", "tsdown", "chokidar"] {
+        write_resolvable_source_tool(&repo, name);
+    }
+    // Older watcher packages use Node's legacy main entry instead of exports.
+    let watcher_manifest = repo.join("node_modules/chokidar/package.json");
+    fs::write(
+        &watcher_manifest,
+        br#"{"name":"chokidar","type":"module","main":"./entry.mjs"}"#,
+    )
+    .unwrap();
+    let modules = repo.join("installed-modules");
+    fs::rename(repo.join("node_modules"), &modules).unwrap();
+
+    for key in [
+        "PNPM_CONFIG_MODULES_DIR",
+        "pnpm_config_modules_dir",
+        "npm_config_modules_dir",
+    ] {
+        env.insert(key.to_string(), "installed-modules".to_string());
+        let reused = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--watch",
+                "--force",
+            ],
+        );
+        assert!(reused.status.success(), "{key}: {}", stderr(&reused));
+        assert!(
+            fs::read_to_string(root.child("node.log"))
+                .unwrap()
+                .contains("scripts/watch-node.mjs")
+        );
+        assert!(!repo.join("node_modules").exists());
+        assert!(!root.child("pnpm.log").exists());
+        assert!(get_environment("demo", &env, &cwd).unwrap().service_running);
+        fs::remove_file(root.child("node.log")).unwrap();
+        env.remove(key);
+    }
+
+    env.insert(
+        "PNPM_CONFIG_MODULES_DIR".to_string(),
+        "installed-modules".to_string(),
+    );
+    fs::remove_file(modules.join("chokidar/entry.mjs")).unwrap();
+    let before = serde_json::to_value(get_environment("demo", &env, &cwd).unwrap()).unwrap();
+    let broken = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--watch",
+            "--force",
+        ],
+    );
+    assert!(!broken.status.success());
+    assert!(stderr(&broken).contains("chokidar"));
+    assert_eq!(
+        serde_json::to_value(get_environment("demo", &env, &cwd).unwrap()).unwrap(),
+        before
+    );
+    assert!(!repo.join("node_modules").exists());
+    assert!(!root.child("node.log").exists());
+    assert!(!root.child("pnpm.log").exists());
+
+    fs::write(
+        modules.join("chokidar/entry.mjs"),
+        "throw new Error('Do not execute dependency code');\n",
+    )
+    .unwrap();
+    fs::rename(&modules, repo.join("node_modules")).unwrap();
+    // Match the source loader's local fallback when the configured tree is absent.
+    let fallback = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--watch",
+            "--force",
+        ],
+    );
+    assert!(fallback.status.success(), "{}", stderr(&fallback));
+    assert!(!modules.exists());
+    assert!(!root.child("pnpm.log").exists());
+
+    fs::create_dir(&modules).unwrap();
+    fs::rename(repo.join("node_modules/tsx"), modules.join("tsx")).unwrap();
+    // An existing root still owns watcher/build tools while TSX comes from the override.
+    let selected = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--watch",
+            "--force",
+        ],
+    );
+    assert!(selected.status.success(), "{}", stderr(&selected));
+    assert!(!repo.join("node_modules/tsx").exists());
+    assert!(!root.child("pnpm.log").exists());
+}
+
+#[test]
 fn dev_dependencies_bootstrap_with_a_frozen_lockfile_and_retry_after_failure() {
     let root = TestDir::new("dev-dependencies-frozen-install");
     let repo = init_openclaw_repo(&root);
@@ -782,6 +910,30 @@ fn dev_dependencies_bootstrap_with_a_frozen_lockfile_and_retry_after_failure() {
         fs::read_to_string(root.child("node.log"))
             .unwrap()
             .contains("gateway run")
+    );
+
+    fs::remove_dir_all(worktree.join("node_modules")).unwrap();
+    fs::remove_file(root.child("pnpm.log")).unwrap();
+    env.insert(
+        "PNPM_CONFIG_MODULES_DIR".to_string(),
+        "installed-modules".to_string(),
+    );
+    let configured = run_ocm(&cwd, &env, &["dev", "demo", "--watch"]);
+    assert!(configured.status.success(), "{}", stderr(&configured));
+    assert!(
+        worktree
+            .join("installed-modules/tsx/package.json")
+            .is_file()
+    );
+    assert!(!worktree.join("node_modules").exists());
+    assert!(
+        fs::read_to_string(root.child("pnpm.log"))
+            .unwrap()
+            .contains("|install --frozen-lockfile")
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("pnpm-lock.yaml")).unwrap(),
+        lockfile
     );
 }
 
@@ -904,7 +1056,7 @@ fn dev_dependencies_reject_unready_borrowed_source_before_service_changes() {
             ],
         );
         assert!(!failed.status.success(), "{key}: {}", stdout(&failed));
-        assert!(stderr(&failed).contains("different modules tree"));
+        assert!(stderr(&failed).contains("outside the selected checkout"));
         assert_eq!(
             serde_json::to_value(get_environment("demo", &env, &cwd).unwrap()).unwrap(),
             before
@@ -913,12 +1065,50 @@ fn dev_dependencies_reject_unready_borrowed_source_before_service_changes() {
         assert!(!root.child("node.log").exists());
         env.remove(key);
     }
+
+    #[cfg(unix)]
+    {
+        let foreign = root.child("foreign-checkout");
+        write_resolvable_source_tool(&foreign, "tsx");
+        let link = repo.join("configured-modules");
+        std::os::unix::fs::symlink(foreign.join("node_modules"), &link).unwrap();
+        env.insert(
+            "PNPM_CONFIG_MODULES_DIR".to_string(),
+            "configured-modules".to_string(),
+        );
+        let rejected = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--watch",
+                "--force",
+            ],
+        );
+        assert!(!rejected.status.success());
+        assert!(stderr(&rejected).contains("outside the selected checkout"));
+        assert_eq!(
+            serde_json::to_value(get_environment("demo", &env, &cwd).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), foreign.join("node_modules"));
+        assert!(!root.child("pnpm.log").exists());
+        assert!(!root.child("node.log").exists());
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn dev_dependencies_do_not_repair_through_linked_install_targets() {
-    for relative in ["node_modules", "node_modules/.pnpm"] {
+    for (relative, configured) in [
+        ("node_modules", false),
+        ("node_modules/.pnpm", false),
+        ("installed-modules", true),
+        ("installed-modules/.pnpm", true),
+    ] {
         let root = TestDir::new("dev-dependencies-linked-install");
         let repo = init_openclaw_repo(&root);
         let cwd = root.child("workspace");
@@ -935,6 +1125,12 @@ fn dev_dependencies_do_not_repair_through_linked_install_targets() {
                 .worktree_root,
         );
         declare_source_tooling(&worktree);
+        if configured {
+            env.insert(
+                "PNPM_CONFIG_MODULES_DIR".to_string(),
+                "installed-modules".to_string(),
+            );
+        }
         let link = worktree.join(relative);
         fs::create_dir_all(link.parent().unwrap()).unwrap();
         let target = worktree.join("borrowed-modules");

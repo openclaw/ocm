@@ -675,7 +675,7 @@ impl Cli {
         if inspect_source_dependencies(worktree_root, &process_env, watch)?.is_none() {
             return Ok(0);
         }
-        ensure_source_dependency_install_target(worktree_root)?;
+        ensure_source_dependency_install_target(worktree_root, &process_env)?;
 
         self.stderr_lines(render_dev_run_step(
             "Dependencies",
