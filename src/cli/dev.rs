@@ -95,6 +95,7 @@ struct DevStatusSummary {
     worktree_root: Option<String>,
     gateway_port: u32,
     gateway_url: String,
+    gateway_port_reachable: bool,
     config_path: String,
     workspace_dir: String,
     service_enabled: bool,
@@ -1052,6 +1053,7 @@ impl Cli {
             worktree_root: active_source.or_else(|| dev.map(|dev| dev.worktree_root.clone())),
             gateway_port,
             gateway_url: dev_gateway_url(gateway_port),
+            gateway_port_reachable: crate::service::inspect::tcp_port_reachable(gateway_port),
             config_path: display_path(&paths.config_path),
             workspace_dir: display_path(&paths.workspace_dir),
             service_enabled: meta.service_enabled,
@@ -1813,6 +1815,7 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
             ),
             format!("root={}", summary.root),
             format!("url={}", summary.gateway_url),
+            format!("gateway_port_reachable={}", summary.gateway_port_reachable),
             format!("watch={}", summary.source_watch.state),
             format!("service_running={}", summary.service_running),
             format!(
@@ -1843,6 +1846,14 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
         &[
             KeyValueRow::accent("Port", summary.gateway_port.to_string()),
             KeyValueRow::plain("URL", summary.gateway_url.clone()),
+            KeyValueRow::plain(
+                "Gateway port",
+                if summary.gateway_port_reachable {
+                    "reachable"
+                } else {
+                    "unreachable"
+                },
+            ),
             KeyValueRow::plain("Source watch", summary.source_watch.state),
             KeyValueRow::plain("Service", dev_service_state(summary)),
         ],
@@ -2443,13 +2454,26 @@ fn render_dev_status_list(summaries: &[DevStatusSummary], profile: RenderProfile
     }
 
     render_table(
-        &["Env", "Port", "Repo", "Worktree", "Watch", "Service"],
+        &[
+            "Env",
+            "Port",
+            "Reachable",
+            "Repo",
+            "Worktree",
+            "Watch",
+            "Service",
+        ],
         &summaries
             .iter()
             .map(|summary| {
                 vec![
                     Cell::accent(summary.env_name.clone()),
                     Cell::right(summary.gateway_port.to_string(), Tone::Accent),
+                    Cell::plain(if summary.gateway_port_reachable {
+                        "yes"
+                    } else {
+                        "no"
+                    }),
                     Cell::plain(summary.repo_root.as_deref().unwrap_or("unknown")),
                     Cell::plain(summary.worktree_root.as_deref().unwrap_or("unknown")),
                     Cell::plain(summary.source_watch.state),
@@ -2488,6 +2512,7 @@ mod tests {
             worktree_root: Some("/repo/openclaw/.worktrees/demo".to_string()),
             gateway_port: 18789,
             gateway_url: "http://127.0.0.1:18789".to_string(),
+            gateway_port_reachable: true,
             config_path: "/tmp/demo/.openclaw/openclaw.json".to_string(),
             workspace_dir: "/tmp/demo/.openclaw/workspace".to_string(),
             service_enabled: true,

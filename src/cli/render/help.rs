@@ -288,6 +288,7 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
                 "Includes dev envs and runtime or launcher envs with an active or starting source watch.",
                 "Source watch state distinguishes active, starting, restoring, inactive, and unknown ownership. Active ownership does not establish gateway readiness.",
                 "Service running reflects the live daemon runtime; service desired running records the saved policy.",
+                "Gateway port reachability is a bounded loopback TCP check, not proof of Gateway identity or readiness.",
                 "Use `ocm dev <env>` to create or reuse a dev env and start its gateway.",
             ],
         )),

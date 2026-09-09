@@ -1830,6 +1830,27 @@ fn dev_status_reports_dev_envs() {
             .contains("logs demo --follow")
     );
 
+    let config_path = PathBuf::from(summary["configPath"].as_str().unwrap());
+    let config_before = fs::read(&config_path).unwrap();
+    let mut config: Value = serde_json::from_slice(&config_before).unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    config["gateway"]["port"] = serde_json::json!(listener.local_addr().unwrap().port());
+    let listening_config = serde_json::to_vec(&config).unwrap();
+    fs::write(&config_path, &listening_config).unwrap();
+    let reachable = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    assert!(reachable.status.success(), "{}", stderr(&reachable));
+    let reachable: Value = serde_json::from_str(&stdout(&reachable)).unwrap();
+    assert_eq!(reachable["gatewayPortReachable"], true);
+    assert_eq!(reachable["serviceRunning"], false);
+    assert_eq!(reachable["sourceWatch"]["state"], "inactive");
+    drop(listener);
+    let closed = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    assert!(closed.status.success(), "{}", stderr(&closed));
+    let closed: Value = serde_json::from_str(&stdout(&closed)).unwrap();
+    assert_eq!(closed["gatewayPortReachable"], false);
+    assert_eq!(fs::read(&config_path).unwrap(), listening_config);
+    fs::write(&config_path, config_before).unwrap();
+
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let runtime = SupervisorRuntimeState {

@@ -486,7 +486,7 @@ fn reported_gateway_state(service: &SupervisorRuntimeService) -> String {
     }
 }
 
-fn tcp_port_reachable(port: u32) -> bool {
+pub(crate) fn tcp_port_reachable(port: u32) -> bool {
     if port == 0 || port > u16::MAX as u32 {
         return false;
     }
