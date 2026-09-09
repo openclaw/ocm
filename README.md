@@ -296,6 +296,8 @@ Use `ocm dev stop <env>` from another terminal to cancel an owned source-watch s
 
 After a watch controller crashes, `dev stop` verifies its recorded process start identity and ownership before recovering the session. It retains an unfinished session when cleanup or service restoration cannot be verified, and rejects a stale generation or a different boot/process namespace. Older watches without ownership records must be stopped from their original terminal. Windows uses the existing process job for owned child cleanup; a controller crash before child ownership is published cannot be verified automatically and requires operator recovery. Updating OCM does not add ownership records to a watch that is already running.
 
+`ocm env destroy <env> --yes` stops the recorded source-watch generation and verifies shutdown before removing the environment. It rechecks the binding after stopping and preserves state if another owner or binding appears. While a watch is running, previews defer the changing process-tree inspection until after shutdown (`processInspectionDeferred` in JSON). `env remove` and `env prune` refuse active or unfinished watches; stop those sessions first. A guarded destroy with `--if-state-token` also requires `dev stop` followed by a fresh preview, so its original state guarantee remains intact. Completed watch records are removed with the env; synchronization lock files remain reusable.
+
 ### Try beta or pin a specific release
 
 ```bash

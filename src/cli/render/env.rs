@@ -189,6 +189,14 @@ pub fn env_destroyed(
             KeyValueRow::plain("Root", summary.root.clone()),
             KeyValueRow::plain("Snapshots", summary.snapshots_removed.to_string()),
             KeyValueRow::plain("Processes", summary.processes_terminated.to_string()),
+            KeyValueRow::plain(
+                "Source watch",
+                if summary.source_watch_stopped {
+                    "stopped"
+                } else {
+                    "none"
+                },
+            ),
             KeyValueRow::new(
                 "Worktree",
                 if summary.dev_worktree.is_some() {
@@ -256,6 +264,9 @@ fn env_destroyed_raw(summary: &EnvDestroySummary, command_example: &str) -> Vec<
             "  snapshots removed: {}",
             summary.snapshots_removed
         ));
+    }
+    if summary.source_watch_stopped {
+        lines.push("  source watch stopped".to_string());
     }
     if summary.processes_terminated > 0 {
         lines.push(format!(
@@ -1756,7 +1767,11 @@ mod tests {
             service_loaded: true,
             service_running: false,
             service_label: "ocm".to_string(),
+            source_watch_pid: None,
+            source_watch_stopped: false,
+            source_watch_session: None,
             process_count: 0,
+            process_inspection_deferred: false,
             process_candidates: Vec::new(),
             state_token: "v1:test".to_string(),
             code: None,

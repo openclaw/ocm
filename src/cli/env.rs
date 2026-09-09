@@ -16,7 +16,7 @@ use super::{Cli, render};
 use crate::env::{
     CloneEnvironmentOptions, CreateEnvSnapshotOptions, CreateEnvironmentOptions, EnvMeta,
     EnvSnapshotSummary, EnvSummary, ExportEnvironmentOptions, ImportEnvironmentOptions,
-    RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions,
+    RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions, SourceWatchSession, SourceWatchState,
 };
 use crate::infra::process::{run_direct, run_shell};
 use crate::infra::process_identity::ProcessIdentity;
@@ -136,7 +136,12 @@ pub(crate) struct EnvDestroySummary {
     pub service_loaded: bool,
     pub service_running: bool,
     pub service_label: String,
+    pub source_watch_pid: Option<u32>,
+    pub source_watch_stopped: bool,
+    #[serde(skip)]
+    pub(crate) source_watch_session: Option<SourceWatchSession>,
     pub process_count: usize,
+    pub process_inspection_deferred: bool,
     #[serde(skip)]
     pub(crate) process_candidates: Vec<EnvDestroyProcessIdentity>,
     pub state_token: String,
@@ -161,6 +166,7 @@ struct EnvDestroyState<'a> {
     service: &'a ServiceSummary,
     process_candidates: &'a [EnvDestroyProcessIdentity],
     snapshots: &'a [EnvSnapshotSummary],
+    source_watch: Option<&'a SourceWatchSession>,
 }
 
 fn should_clear_skip_bootstrap_for_openclaw_args(args: &[String]) -> bool {
@@ -264,7 +270,7 @@ impl Cli {
 
         // Service and binding mutations use the same per-env lock. Keep it
         // through validation and teardown so a successful guard cannot go stale.
-        let _operation_lock = self.environment_service().lock_operation(name)?;
+        let mut operation_lock = Some(self.environment_service().lock_operation(name)?);
         let mut summary = self.build_env_destroy_summary(name, true, force)?;
         if expected_state_token
             .as_deref()
@@ -300,6 +306,78 @@ impl Cli {
             return Ok(1);
         }
 
+        let env_before = self.environment_service().get(name)?;
+        if let Some(session) = summary.source_watch_session.clone() {
+            if expected_state_token.is_some() {
+                summary.code = Some("source_watch_active".to_string());
+                summary.blockers.push("guarded destruction requires a stopped source watch; run dev stop, then request a fresh destroy preview".to_string());
+                if json_flag {
+                    self.print_json(&summary)?;
+                } else {
+                    self.stdout_lines(render::env::env_destroy_preview(
+                        &summary,
+                        profile,
+                        &self.command_example(),
+                    ));
+                }
+                return Ok(1);
+            }
+            // The controller may need the operation lock to restore its service.
+            // Stop only the generation accepted by this apply, then revalidate.
+            drop(operation_lock.take());
+            self.stop_source_watch_generation(name, Some(&session.lease_id))?;
+            operation_lock = Some(self.environment_service().lock_operation(name)?);
+            let current = self.environment_service().get(name)?;
+            if env_destroy_binding_state(&env_before)? != env_destroy_binding_state(&current)? {
+                return Err("environment binding or protected state changed while stopping source watch; no state was removed, request a fresh destroy preview".to_string());
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let completed = self.environment_service().source_watch_session(name)?;
+                if !completed
+                    .as_ref()
+                    .is_some_and(|current| current.closed && current.lease_id == session.lease_id)
+                {
+                    return Err("source watch generation changed before removal; the replacement session and environment were preserved".to_string());
+                }
+                if self
+                    .environment_service()
+                    .ensure_source_watch_stopped(name)
+                    .is_ok()
+                {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("source watch still holds its session after stop; no environment state was removed".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            summary = self.build_env_destroy_summary(name, true, force)?;
+            summary.source_watch_stopped = true;
+            summary.steps.insert(
+                0,
+                EnvDestroyStepSummary {
+                    kind: "source-watch".to_string(),
+                    description:
+                        "stopped the recorded source watch and verified its processes exited"
+                            .to_string(),
+                },
+            );
+            if !summary.blockers.is_empty() {
+                if json_flag {
+                    self.print_json(&summary)?;
+                } else {
+                    self.stdout_lines(render::env::env_destroy_preview(
+                        &summary,
+                        profile,
+                        &self.command_example(),
+                    ));
+                }
+                return Ok(1);
+            }
+        }
+        self.environment_service()
+            .ensure_source_watch_stopped(name)?;
         let env_meta = self.environment_service().get(name)?;
 
         let snapshot_ids = self
@@ -370,6 +448,7 @@ impl Cli {
         }
 
         self.environment_service().remove_locked(name, force)?;
+        let _ = &operation_lock;
         summary.removed = true;
         summary.worktree_removed = env_meta
             .dev
@@ -1160,21 +1239,57 @@ impl Cli {
         let mut snapshots = self.environment_service().list_snapshots(Some(name))?;
         snapshots.sort_by(|left, right| left.id.cmp(&right.id));
         let mut blockers = Vec::new();
-        let process_candidates = self.destroy_process_candidates(&env_meta)?;
-        let state_token =
-            env_destroy_state_token(&env_meta, &service, &process_candidates, &snapshots)?;
+        let source_watch_session = self
+            .environment_service()
+            .source_watch_session(name)?
+            .filter(|session| !session.closed);
+        let source_watch_active = !matches!(
+            self.environment_service().observe_source_watch(name)?,
+            SourceWatchState::Inactive
+        );
+        if source_watch_session.is_none() && source_watch_active {
+            blockers.push("an active source watch has no usable stop ownership; stop it from its original terminal before destroying the env".to_string());
+        }
+        // The recorded controller owns a changing process tree. Stop it through
+        // its generation-bound protocol before taking the ordinary stable
+        // process snapshot; a token-guarded apply refuses unfinished sessions.
+        let process_inspection_deferred = source_watch_session.is_some() || source_watch_active;
+        let process_candidates = if process_inspection_deferred {
+            Vec::new()
+        } else {
+            self.destroy_process_candidates(&env_meta)?
+        };
+        let state_token = env_destroy_state_token(
+            &env_meta,
+            &service,
+            &process_candidates,
+            &snapshots,
+            source_watch_session.as_ref(),
+        )?;
 
         if env_meta.protected && !force {
             blockers.push("env is protected; re-run with --force to destroy it".to_string());
         }
         let mut steps = Vec::new();
+        if source_watch_session.is_some() {
+            steps.push(EnvDestroyStepSummary {
+                kind: "source-watch".to_string(),
+                description: "stop the recorded source watch and verify its processes exited"
+                    .to_string(),
+            });
+        }
         if service.installed || service.loaded || service.running {
             steps.push(EnvDestroyStepSummary {
                 kind: "service".to_string(),
                 description: "disable env gateway in the OCM background service".to_string(),
             });
         }
-        if !process_candidates.is_empty() {
+        if process_inspection_deferred {
+            steps.push(EnvDestroyStepSummary {
+                kind: "processes".to_string(),
+                description: "inspect remaining environment processes after source watch stops, then terminate those owned by the env".to_string(),
+            });
+        } else if !process_candidates.is_empty() {
             steps.push(EnvDestroyStepSummary {
                 kind: "processes".to_string(),
                 description: "terminate live OpenClaw processes for the env".to_string(),
@@ -1209,7 +1324,13 @@ impl Cli {
             service_loaded: service.loaded,
             service_running: service.running,
             service_label: "ocm".to_string(),
+            source_watch_pid: source_watch_session
+                .as_ref()
+                .map(|session| session.controller.pid),
+            source_watch_stopped: false,
+            source_watch_session,
             process_count: process_candidates.len(),
+            process_inspection_deferred,
             process_candidates,
             state_token,
             code: None,
@@ -1619,11 +1740,23 @@ impl Cli {
     }
 }
 
+fn env_destroy_binding_state(meta: &EnvMeta) -> Result<serde_json::Value, String> {
+    let mut value = serde_json::to_value(meta).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "invalid environment metadata".to_string())?;
+    for key in ["serviceEnabled", "serviceRunning", "updatedAt"] {
+        object.remove(key);
+    }
+    Ok(value)
+}
+
 fn env_destroy_state_token(
     environment: &EnvMeta,
     service: &ServiceSummary,
     process_candidates: &[EnvDestroyProcessIdentity],
     snapshots: &[EnvSnapshotSummary],
+    source_watch: Option<&SourceWatchSession>,
 ) -> Result<String, String> {
     let state = EnvDestroyState {
         kind: "ocm-env-destroy-state-v1",
@@ -1631,6 +1764,7 @@ fn env_destroy_state_token(
         service,
         process_candidates,
         snapshots,
+        source_watch,
     };
     let encoded = serde_json::to_vec(&state)
         .map_err(|error| format!("failed to encode environment destroy state: {error}"))?;

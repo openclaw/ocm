@@ -1027,7 +1027,20 @@ pub fn remove_environment(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
+    let _operation = lock_environment_operation(name, env, cwd)?;
+    remove_environment_locked(name, force, env, cwd)
+}
+
+pub(crate) fn remove_environment_locked(
+    name: &str,
+    force: bool,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
     let safe_name = validate_name(name, "Environment name")?;
+    let source_service = crate::env::EnvironmentService::new(env, cwd);
+    let _admission = source_service.lock_gateway_admission(&safe_name)?;
+    source_service.ensure_source_watch_stopped(&safe_name)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     let meta = find_environment(&registry, &safe_name)
@@ -1049,6 +1062,7 @@ pub fn remove_environment(
         fs::remove_dir_all(&paths.root).map_err(|error| error.to_string())?;
     }
 
+    source_service.remove_stopped_source_watch_state_locked(&safe_name)?;
     registry.envs.retain(|entry| entry.name != meta.name);
     // Keep a monotonic tombstone so a stale rollback token cannot target a
     // later environment that reuses the same name.

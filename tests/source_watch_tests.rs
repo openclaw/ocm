@@ -205,6 +205,17 @@ fn dev_stop_refuses_legacy_ownership_and_leaves_an_inactive_env_unchanged() {
     assert_eq!(fs::read(path).unwrap(), before);
     assert!(!root.child("ocm-home/source-watch/demo.session").exists());
     assert!(!root.child("ocm-home/source-watch/demo.stop").exists());
+    let destroyed = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--yes", "--json"]);
+    assert!(!destroyed.status.success());
+    let destroyed: Value = serde_json::from_str(&stdout(&destroyed)).unwrap();
+    assert!(
+        destroyed["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().contains("original terminal"))
+    );
+    assert!(EnvironmentService::new(&env, &cwd).get("demo").is_ok());
 }
 
 #[test]

@@ -11,8 +11,9 @@ use crate::store::{
     EnvironmentOperationLock, clone_environment, clone_environment_for_simulation,
     create_environment_with_validated_runtime, export_environment, get_environment,
     get_runtime_verified, import_environment, list_environments, lock_environment_operation,
-    now_utc, remove_environment, resolve_config_gateway_port, resolve_effective_gateway_ports,
-    resolve_env_gateway_port, save_environment, set_environment_service_policy,
+    now_utc, remove_environment_locked, resolve_config_gateway_port,
+    resolve_effective_gateway_ports, resolve_env_gateway_port, save_environment,
+    set_environment_service_policy,
 };
 use crate::supervisor::{sync_supervisor_env_if_present, sync_supervisor_if_present};
 
@@ -367,13 +368,14 @@ impl<'a> EnvironmentService<'a> {
     }
 
     pub(crate) fn remove_locked(&self, name: &str, force: bool) -> Result<EnvMeta, String> {
-        let meta = remove_environment(name, force, self.env, self.cwd)?;
+        let meta = remove_environment_locked(name, force, self.env, self.cwd)?;
         sync_supervisor_env_if_present(self.env, self.cwd, name)?;
         Ok(meta)
     }
 
     pub(crate) fn remove_simulation(&self, name: &str) -> Result<EnvMeta, String> {
         let _lock = self.lock_operation(name)?;
+        self.ensure_source_watch_stopped(name)?;
         let meta = get_environment(name, self.env, self.cwd)?;
         if let Some(dev) = meta.dev.as_ref() {
             prepare_openclaw_simulation_worktree_cleanup(

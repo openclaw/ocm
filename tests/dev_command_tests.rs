@@ -2673,6 +2673,151 @@ fn dev_watch_rejects_service_activation_until_the_watch_exits() {
 
 #[cfg(unix)]
 #[test]
+fn dev_destroy_stops_the_recorded_watch_before_removing_state() {
+    for runtime_backed in [false, true] {
+        let root = TestDir::new("dev-destroy-watch");
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env(&root);
+        let (started, _, _) = install_blocking_fake_dev_runners(&root, &mut env);
+        if runtime_backed {
+            create_runtime_backed_env(&cwd, &env);
+            let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+            assert!(start.status.success(), "{}", stderr(&start));
+        }
+        let watch = DevWatchFixture::spawn(
+            &root,
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--watch",
+                "--force",
+            ],
+        );
+        assert!(wait_for_path(&started, Duration::from_secs(10)));
+        assert!(wait_for_path(
+            &source_watch_override_path(&root, "demo"),
+            Duration::from_secs(10)
+        ));
+        let mut before = get_environment("demo", &env, &cwd).unwrap();
+        before.last_used_at = Some(time::OffsetDateTime::UNIX_EPOCH);
+        save_environment(before.clone(), &env, &cwd).unwrap();
+        let session_path = source_watch_override_path(&root, "demo").with_extension("session");
+        let session_before = fs::read(&session_path).unwrap();
+        let preview = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--json"]);
+        assert!(preview.status.success(), "{}", stderr(&preview));
+        let preview: Value = serde_json::from_str(&stdout(&preview)).unwrap();
+        assert!(preview["sourceWatchPid"].is_number());
+        assert_eq!(preview["processInspectionDeferred"], true);
+        assert!(
+            preview["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["kind"] == "source-watch")
+        );
+        let guarded = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "destroy",
+                "demo",
+                "--yes",
+                "--if-state-token",
+                preview["stateToken"].as_str().unwrap(),
+                "--json",
+            ],
+        );
+        assert!(!guarded.status.success());
+        let guarded: Value = serde_json::from_str(&stdout(&guarded)).unwrap();
+        assert_eq!(guarded["code"], "source_watch_active");
+        assert_eq!(fs::read(&session_path).unwrap(), session_before);
+        for args in [
+            vec!["env", "remove", "demo", "--force"],
+            vec!["env", "prune", "--older-than", "1", "--yes"],
+        ] {
+            let refused = run_ocm(&cwd, &env, &args);
+            assert!(!refused.status.success());
+            assert!(
+                stderr(&refused).contains("unfinished ownership"),
+                "{}",
+                stderr(&refused)
+            );
+        }
+        let direct = ocm::store::remove_environment("demo", true, &env, &cwd);
+        assert!(direct.unwrap_err().contains("unfinished ownership"));
+        let destroyed = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--yes", "--json"]);
+        let watch = watch.finish();
+        assert!(destroyed.status.success(), "{}", stderr(&destroyed));
+        let destroyed: Value = serde_json::from_str(&stdout(&destroyed)).unwrap();
+        assert_eq!(destroyed["sourceWatchStopped"], true);
+        assert_eq!(destroyed["processInspectionDeferred"], false);
+        assert_eq!(destroyed["removed"], true);
+        assert_eq!(watch.status.code(), Some(130), "{}", stderr(&watch));
+        assert!(!Path::new(&before.root).exists());
+        assert!(!session_path.exists());
+        assert!(source_watch_lock_path(&root, "demo").exists());
+        assert!(repo.exists());
+        if let Some(dev) = before.dev {
+            assert!(!Path::new(&dev.worktree_root).exists());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_destroy_preserves_state_when_binding_changes_during_stop() {
+    let root = TestDir::new("dev-destroy-watch-binding-race");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = service_env(&root);
+    let (started, _) = install_stubborn_fake_dev_runners(&root, &mut env);
+    let watch = DevWatchFixture::spawn(
+        &root,
+        &cwd,
+        &env,
+        &["dev", "demo", "--repo", &path_string(&repo), "--watch"],
+    );
+    assert!(wait_for_path(&started, Duration::from_secs(10)));
+    let before = get_environment("demo", &env, &cwd).unwrap();
+    let destroy = Command::new(env!("CARGO_BIN_EXE_ocm"))
+        .current_dir(&cwd)
+        .args(["env", "destroy", "demo", "--yes", "--json"])
+        .env_clear()
+        .envs(&env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(wait_for_path(
+        &source_watch_override_path(&root, "demo").with_extension("stop"),
+        Duration::from_secs(5)
+    ));
+    ocm::env::EnvironmentService::new(&env, &cwd)
+        .set_protected("demo", true)
+        .unwrap();
+    let destroyed = destroy.wait_with_output().unwrap();
+    let watch = watch.finish();
+    assert!(!destroyed.status.success());
+    assert!(
+        stderr(&destroyed).contains("changed while stopping source watch"),
+        "{}",
+        stderr(&destroyed)
+    );
+    assert_eq!(watch.status.code(), Some(130));
+    assert!(Path::new(&before.root).exists());
+    assert!(get_environment("demo", &env, &cwd).unwrap().protected);
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_stop_restores_service_and_preserves_the_env_and_borrowed_source() {
     let root = TestDir::new("dev-stop-runtime");
     let repo = init_openclaw_repo(&root);

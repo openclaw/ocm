@@ -186,12 +186,28 @@ impl Cli {
     }
 
     pub(super) fn stop_source_watch(&self, env_name: &str) -> Result<DevStopSummary, String> {
+        self.stop_source_watch_generation(env_name, None)
+    }
+
+    pub(super) fn stop_source_watch_generation(
+        &self,
+        env_name: &str,
+        expected_generation: Option<&str>,
+    ) -> Result<DevStopSummary, String> {
         let env_service = self.environment_service();
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
         let mut requested_lease: Option<String> = None;
         loop {
             let operation = env_service.lock_operation(env_name)?;
             let session = env_service.source_watch_session(env_name)?;
+            if expected_generation.is_some_and(|expected| {
+                session.as_ref().map(|session| session.lease_id.as_str()) != Some(expected)
+            }) {
+                return Err(
+                    "source watch generation changed; the replacement session was not stopped"
+                        .to_string(),
+                );
+            }
             if let Some(lease_id) = &requested_lease
                 && let Some(completion) = env_service.source_watch_completion(env_name, lease_id)?
             {

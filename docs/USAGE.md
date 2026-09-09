@@ -583,6 +583,20 @@ ocm env destroy mira
 ocm env destroy mira --yes
 ```
 
+Destroy first stops the recorded source-watch session, including any required
+service restoration, and verifies that its owned processes exited. It then
+rechecks the environment binding and protection before removing state. A
+replacement session or changed binding prevents removal. While a watch is
+running, the preview reports deferred process inspection; the remaining process
+tree is inspected after the watch stops.
+
+`env remove` and `env prune` require active or unfinished source watches to be
+stopped first with `ocm dev stop <env>`. The same applies to a destroy guarded by
+`--if-state-token`: stop the watch, then request a fresh preview. A watch created
+by an older OCM without usable stop ownership must be stopped from its original
+terminal. Environment removal clears completed watch records and retains the
+reusable synchronization lock files.
+
 `destroy` is the stronger cleanup path.
 
 ## Updating `ocm` itself

@@ -1540,6 +1540,8 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Destroy removes env snapshots for that env and uninstalls its OCM-managed service when present.",
+                "An ordinary --yes apply first stops and verifies the recorded source-watch generation. Unverifiable ownership blocks removal.",
+                "Guarded --if-state-token apply requires a stopped watch: run dev stop, then request a fresh destroy preview.",
                 "Destroy does not remove shared runtimes or launchers.",
                 "If the separate machine-wide OpenClaw service is using the env, destroy refuses to apply.",
                 "TTY output uses cards by default. Piped output stays plain.",
@@ -1563,7 +1565,10 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} env remove mira"),
                 format!("{cmd} env remove mira --force"),
             ],
-            &["Protected environments require `--force`."],
+            &[
+                "Protected environments require `--force`.",
+                "Active or unfinished source watches must be stopped with dev stop before remove or prune can delete their state.",
+            ],
         ),
         "prune" => render_leaf(
             "Prune old environments",
@@ -1587,7 +1592,9 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} env prune"),
                 format!("{cmd} env prune --older-than 30 --yes"),
             ],
-            &[],
+            &[
+                "Active or unfinished source watches block removal; run dev stop for those envs first.",
+            ],
         ),
         "snapshot" => env_snapshot_help(cmd),
         _ => return None,

@@ -270,6 +270,40 @@ impl SourceWatchSession {
 }
 
 impl<'a> EnvironmentService<'a> {
+    pub(crate) fn ensure_source_watch_stopped(&self, env_name: &str) -> Result<(), String> {
+        if self
+            .source_watch_session(env_name)?
+            .is_some_and(|session| !session.closed)
+        {
+            return Err(format!(
+                "source watch for env {env_name} has unfinished ownership; run `ocm dev stop {env_name}` before removing its state"
+            ));
+        }
+        if !matches!(
+            self.observe_source_watch(env_name)?,
+            super::SourceWatchState::Inactive
+        ) {
+            return Err(format!(
+                "source watch for env {env_name} is still active or cannot be verified; stop it before removing its state"
+            ));
+        }
+        Ok(())
+    }
+
+    // The caller holds the operation and admission locks before the registry
+    // lock, matching environment creation and service-policy writes.
+    pub(crate) fn remove_stopped_source_watch_state_locked(
+        &self,
+        env_name: &str,
+    ) -> Result<(), String> {
+        self.ensure_source_watch_stopped(env_name)?;
+        let paths = self.source_watch_session_paths(env_name)?;
+        remove_file_if_present(&paths.session)?;
+        remove_file_if_present(&paths.request)?;
+        remove_file_if_present(&source_watch_override_path(env_name, self.env, self.cwd)?)
+        // Keep lock inodes stable for waiters and later reuse of this env name.
+    }
+
     pub(crate) fn source_watch_session(
         &self,
         env_name: &str,
