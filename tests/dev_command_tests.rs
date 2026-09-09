@@ -2679,7 +2679,7 @@ fn dev_destroy_stops_the_recorded_watch_before_removing_state() {
         let repo = init_openclaw_repo(&root);
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
-        let mut env = service_env(&root);
+        let mut env = service_env_with_gateway_admission(&root);
         let (started, _, _) = install_blocking_fake_dev_runners(&root, &mut env);
         if runtime_backed {
             create_runtime_backed_env(&cwd, &env);
