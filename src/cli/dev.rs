@@ -2034,11 +2034,15 @@ fn stop_orphaned_source_watch(session: &SourceWatchSession) -> Result<(), String
             }
             thread::sleep(Duration::from_millis(10));
         }
-        // Keep the recorded leader paused as the group identity anchor while
-        // its descendants receive the same bounded shutdown grace as live watch.
-        signal_unix_process_group(child.pid, libc::SIGTERM)?;
+        // Keep the recorded leader paused as the group identity anchor. A
+        // default fatal signal can terminate a stopped process on Darwin, so
+        // only descendants receive TERM before the final group cleanup.
         for process in process_group_members(child.pid)? {
-            if process.identity.pid != child.pid && process.stopped {
+            if process.identity.pid == child.pid {
+                continue;
+            }
+            signal_matching_source_watch_process(&process.identity, libc::SIGTERM)?;
+            if process.stopped {
                 signal_matching_source_watch_process(&process.identity, libc::SIGCONT)?;
             }
         }
@@ -2245,7 +2249,14 @@ fn poll_source_watch_child(
                 "failed observing source watch exit: {error}"
             )));
         }
-        if unsafe { info.si_pid() } == 0 {
+        // Darwin can report a stopped child despite WEXITED. Do not turn a
+        // job-control transition into process-group cleanup.
+        if unsafe { info.si_pid() } != child.id() as libc::pid_t
+            || !matches!(
+                info.si_code,
+                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+            )
+        {
             return Ok(None);
         }
         guard
