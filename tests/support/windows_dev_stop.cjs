@@ -37,10 +37,39 @@ function run(args, expectedSuccess = true) {
   if (expectedSuccess) assert.equal(result.status, 0, 'OCM failed: ' + args.slice(0,3).join(' ') + '\n' + result.stderr);
   return result;
 }
+let nextNativeRequest = 1;
+let pendingReply = Buffer.alloc(0);
+const replyChunk = Buffer.alloc(4096);
+const nativeIdentities = new Map();
+function native(op, fields = {}) {
+  const id = nextNativeRequest++;
+  const request = Buffer.from(JSON.stringify({nativeWindowsStopProof:1, id, op, ...fields}) + '\n');
+  assert.ok(request.length <= 4096, 'Native fixture request exceeded its bound');
+  for (let offset = 0; offset < request.length;) {
+    const written = fs.writeSync(1, request, offset, request.length - offset);
+    if (written === 0) throw new Error('Native fixture request pipe closed');
+    offset += written;
+  }
+  // The Rust wrapper owns the deadline and kills this entire private Job on
+  // timeout. Only one request is outstanding, so replies cannot accumulate.
+  while (!pendingReply.includes(10)) {
+    const count = fs.readSync(0, replyChunk, 0, replyChunk.length, null);
+    if (count === 0) throw new Error('Native fixture response pipe closed');
+    pendingReply = Buffer.concat([pendingReply, replyChunk.subarray(0, count)]);
+    if (pendingReply.length > 65536) throw new Error('Native fixture reply exceeded its bound');
+  }
+  const end = pendingReply.indexOf(10);
+  const reply = JSON.parse(pendingReply.subarray(0, end).toString('utf8'));
+  pendingReply = pendingReply.subarray(end + 1);
+  assert.equal(reply.id, id, 'Native fixture response was out of order');
+  if (!reply.ok) throw new Error('Native fixture ' + op + ' failed: ' + reply.error);
+  return reply.result;
+}
 function alive(pid) {
   assert.ok(Number.isInteger(pid) && pid > 0);
-  try { process.kill(pid, 0); return true; }
-  catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+  const startedAt = nativeIdentities.get(pid);
+  assert.ok(startedAt, 'Process must be captured before observation');
+  return native('running', {pid, startedAt}).running;
 }
 async function waitFor(predicate, message, timeout = 15000) {
   const until = Date.now() + timeout;
@@ -49,21 +78,17 @@ async function waitFor(predicate, message, timeout = 15000) {
     await new Promise(resolve => setTimeout(resolve, 40));
   }
 }
-function powershell(script) {
-  const result = cp.spawnSync('powershell.exe', ['-NoLogo','-NoProfile','-NonInteractive','-Command',script], {cwd:root, env, encoding:'utf8', timeout:15000});
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error('Windows process identity operation failed: ' + result.stderr);
-  return result.stdout.trim();
-}
 function startIdentity(pid) {
   assert.ok(Number.isInteger(pid) && pid > 0);
-  return powershell('$ownedProcess=Get-Process -Id ' + pid + ' -ErrorAction SilentlyContinue; if($null -ne $ownedProcess){try{$null=$ownedProcess.Handle;[Console]::Write($ownedProcess.StartTime.ToFileTimeUtc().ToString([Globalization.CultureInfo]::InvariantCulture))}finally{$ownedProcess.Dispose()}}');
+  const observed = native('capture', {pid});
+  assert.ok(observed.running, 'Fixture process exited before identity capture');
+  assert.match(observed.startedAt, /^\d+$/);
+  nativeIdentities.set(pid, observed.startedAt);
+  return observed.startedAt;
 }
 function killRecordedProcess(pid, startedAt) {
-  if (!alive(pid)) return false;
-  assert.match(String(startedAt), /^\d+$/);
-  const result = powershell('$ownedProcess=Get-Process -Id ' + pid + ' -ErrorAction SilentlyContinue; if($null -ne $ownedProcess){try{$null=$ownedProcess.Handle;$actualStart=$ownedProcess.StartTime.ToFileTimeUtc().ToString([Globalization.CultureInfo]::InvariantCulture);if($actualStart -eq "' + startedAt + '"){$ownedProcess.Kill();$null=$ownedProcess.WaitForExit(5000);[Console]::Write("stopped")}else{[Console]::Write("different")}}finally{$ownedProcess.Dispose()}}');
-  return result === 'stopped';
+  assert.equal(nativeIdentities.get(pid), startedAt, 'Refusing an uncaptured fixture identity');
+  return native('terminate', {pid, startedAt}).stopped;
 }
 function capture(child) {
   let text = '';
@@ -102,6 +127,9 @@ async function start(name) {
   const output = capture(controller);
   const record = {name, directory, repo, controller, output, identities:[]};
   tracked.push(record);
+  assert.ok(controller.pid, 'Controller did not spawn');
+  const controllerIdentity = {pid:controller.pid, startedAt:startIdentity(controller.pid)};
+  record.identities.push(controllerIdentity);
   await waitFor(() => fs.existsSync(ready), () => 'Watch did not start: ' + name + '\n' + output());
   const owner = session(name);
   const watcher = Number(fs.readFileSync(rootPid,'utf8'));
@@ -109,7 +137,10 @@ async function start(name) {
   assert.equal(owner.controller.pid, controller.pid);
   assert.equal(owner.child.pid, watcher);
   assert.equal(owner.childSpawnPending, false);
-  record.identities = [owner.controller, owner.child, {pid:descendant, startedAt:startIdentity(descendant)}];
+  assert.deepEqual(owner.controller, controllerIdentity);
+  const childIdentity = {pid:watcher, startedAt:startIdentity(watcher)};
+  assert.deepEqual(owner.child, childIdentity);
+  record.identities.push(childIdentity, {pid:descendant, startedAt:startIdentity(descendant)});
   assert.ok(record.identities.every(identity => /^\d+$/.test(identity.startedAt)));
   assert.ok(alive(watcher) && alive(descendant));
   record.original = fs.readFileSync(sessionPath(name));
@@ -126,7 +157,7 @@ async function stop(name) {
   assert.equal(session(name).closed, true);
 }
 async function crash(record) {
-  record.controller.kill('SIGKILL');
+  assert.ok(killRecordedProcess(record.controller.pid, record.identities[0].startedAt), 'Controller was not running before the crash');
   await waitFor(() => record.controller.exitCode !== null || record.controller.signalCode !== null, 'Controller did not exit');
   await waitFor(() => !alive(record.watcher) && !alive(record.descendant), 'Kill-on-close job did not stop both source processes');
 }
@@ -137,15 +168,16 @@ async function checkPreserved(record) {
 function cleanup() {
   if (cleanupPromise) return cleanupPromise;
   cleanupPromise = (async () => {
-  for (const record of tracked) {
-    if (record.controller && record.controller.exitCode === null && record.controller.signalCode === null) record.controller.kill('SIGKILL');
-  }
-  for (const record of tracked) for (const identity of record.identities) {
-    if (killRecordedProcess(identity.pid, identity.startedAt)) {
-      await waitFor(() => !alive(identity.pid) || startIdentity(identity.pid) !== identity.startedAt, 'Owned fixture process survived cleanup', 8000);
+    const errors = [];
+    for (const record of tracked) for (const identity of record.identities) {
+      try {
+        killRecordedProcess(identity.pid, identity.startedAt);
+        await waitFor(() => !alive(identity.pid), 'Owned fixture process survived cleanup', 8000);
+      } catch (error) { errors.push(error); }
     }
-  }
-  fs.rmSync(root, {recursive:true,force:true});
+    try { fs.rmSync(root, {recursive:true, force:true, maxRetries:20, retryDelay:50}); }
+    catch (error) { errors.push(error); }
+    if (errors.length) throw new AggregateError(errors, 'Native fixture cleanup was incomplete');
   })();
   return cleanupPromise;
 }
@@ -158,8 +190,13 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
 
 (async () => {
   try {
+    // The wrapper acknowledges only after assigning Node to its private Job.
+    // No subprocess may be created before this handshake completes.
+    assert.equal(native('ready').ready, true);
     run(['runtime','add','proof-node','--path',process.execPath]);
     const normal = await start('normal.stop');
+    const active = JSON.parse(run(['dev','status',normal.name,'--json']).stdout);
+    assert.equal(active.sourceWatch.state, 'active', 'Held watch lease was not readable by dev status');
     await stop(normal.name);
     await waitFor(() => !alive(normal.watcher) && !alive(normal.descendant), 'Named stop left its source tree running');
     await waitFor(() => normal.controller.exitCode !== null, 'Controller did not acknowledge named stop');

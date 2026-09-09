@@ -12,6 +12,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
+#[cfg(any(not(windows), test))]
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
@@ -31,6 +32,13 @@ use crate::supervisor::SupervisorService;
 const SOURCE_WATCH_OVERRIDE_KIND: &str = "ocm-source-watch-override";
 const SOURCE_WATCH_LOCK_RETRY_ATTEMPTS: usize = 20;
 const SOURCE_WATCH_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+#[cfg(windows)]
+const SOURCE_WATCH_GENERATION_MAX_BYTES: usize = 1024;
+#[cfg(windows)]
+const SOURCE_WATCH_LOCK_BYTE_OFFSET: u32 = 4096;
+#[cfg(windows)]
+const _: () =
+    assert!(SOURCE_WATCH_GENERATION_MAX_BYTES + 1 < SOURCE_WATCH_LOCK_BYTE_OFFSET as usize);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -256,15 +264,14 @@ impl<'a> EnvironmentService<'a> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(format!("failed reading source watch lease: {error}")),
         };
-        let held = match FileExt::try_lock_shared(&file) {
+        let held = match try_lock_source_watch_file(&file, false) {
             Ok(()) => false,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
             Err(error) => return Err(format!("failed inspecting source watch lease: {error}")),
         };
         #[cfg(windows)]
         let held = held || open_windows_source_watch_event(&lock_path)?.is_some();
-        let mut value = String::new();
-        file.read_to_string(&mut value)
+        let value = read_source_watch_lock(&mut file)
             .map_err(|error| format!("failed reading source watch lease: {error}"))?;
         let value = value.trim();
         Ok(Some(SourceWatchLeaseObservation {
@@ -296,9 +303,7 @@ impl<'a> EnvironmentService<'a> {
         try_lock_source_watch_exclusive(&lock_file).map_err(|error| {
             format!("source watch lease is still held; recovery was not completed: {error}")
         })?;
-        let mut value = String::new();
-        lock_file
-            .read_to_string(&mut value)
+        let value = read_source_watch_lock(&mut lock_file)
             .map_err(|error| format!("failed reading source watch recovery lease: {error}"))?;
         if value
             .trim()
@@ -596,7 +601,7 @@ impl<'a> EnvironmentService<'a> {
             return read_leased_source_watch_state(&path, &lock_path, &env_name, cleanup_stale);
         }
 
-        match FileExt::try_lock_shared(&lock_file) {
+        match try_lock_source_watch_file(&lock_file, false) {
             Ok(()) => {
                 // Shared readers prove no watcher owns the exclusive lease. They may clean the
                 // same stale metadata concurrently without impersonating an active watcher.
@@ -609,7 +614,7 @@ impl<'a> EnvironmentService<'a> {
                 if cleanup_stale && active_legacy.is_none() {
                     remove_file_if_present(&path)?;
                 }
-                FileExt::unlock(&lock_file).map_err(|error| {
+                unlock_source_watch_file(&lock_file).map_err(|error| {
                     format!(
                         "failed unlocking stale source watch lock {}: {error}",
                         display_path(&lock_path)
@@ -660,7 +665,8 @@ fn read_leased_source_watch_state(
     env_name: &str,
     cleanup_stale: bool,
 ) -> Result<SourceWatchState, String> {
-    let lock_lease_id = fs::read_to_string(lock_path)
+    let lock_lease_id = File::open(lock_path)
+        .and_then(|mut file| read_source_watch_lock(&mut file))
         .map_err(|error| {
             format!(
                 "failed reading active source watch lock {}: {error}",
@@ -695,6 +701,10 @@ fn read_leased_source_watch_state(
 }
 
 fn write_source_watch_lock(lock_file: &mut File, value: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    if value.len() >= SOURCE_WATCH_GENERATION_MAX_BYTES {
+        return Err("source watch generation exceeds its metadata limit".to_string());
+    }
     lock_file
         .set_len(0)
         .and_then(|()| lock_file.seek(SeekFrom::Start(0)).map(|_| ()))
@@ -702,9 +712,107 @@ fn write_source_watch_lock(lock_file: &mut File, value: &str) -> Result<(), Stri
         .map_err(|error| format!("failed recording source watch lock: {error}"))
 }
 
+fn read_source_watch_lock(lock_file: &mut File) -> io::Result<String> {
+    let mut value = String::new();
+    #[cfg(not(windows))]
+    lock_file.read_to_string(&mut value)?;
+    #[cfg(windows)]
+    {
+        // Bound the ReadFile request itself below the reserved lock byte, even
+        // when the file is malformed or the reader's buffer extends beyond EOF.
+        lock_file
+            .take((SOURCE_WATCH_GENERATION_MAX_BYTES + 1) as u64)
+            .read_to_string(&mut value)
+            .map_err(|error| {
+                if error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+                {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "an older source watch owner locks its generation metadata; stop it from its original terminal",
+                    )
+                } else {
+                    error
+                }
+            })?;
+        if value.len() > SOURCE_WATCH_GENERATION_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "source watch generation exceeds its metadata limit",
+            ));
+        }
+    }
+    Ok(value)
+}
+
+#[cfg(not(windows))]
+fn try_lock_source_watch_file(file: &File, exclusive: bool) -> io::Result<()> {
+    if exclusive {
+        FileExt::try_lock_exclusive(file)
+    } else {
+        FileExt::try_lock_shared(file)
+    }
+}
+
+#[cfg(not(windows))]
+fn unlock_source_watch_file(file: &File) -> io::Result<()> {
+    FileExt::unlock(file)
+}
+
+#[cfg(windows)]
+fn source_watch_lock_region() -> windows_sys::Win32::System::IO::OVERLAPPED {
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+    OVERLAPPED {
+        Anonymous: OVERLAPPED_0 {
+            Anonymous: OVERLAPPED_0_0 {
+                Offset: SOURCE_WATCH_LOCK_BYTE_OFFSET,
+                OffsetHigh: 0,
+            },
+        },
+        ..OVERLAPPED::default()
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_source_watch_file(file: &File, exclusive: bool) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    let mut region = source_watch_lock_region();
+    let flags = LOCKFILE_FAIL_IMMEDIATELY
+        | if exclusive {
+            LOCKFILE_EXCLUSIVE_LOCK
+        } else {
+            0
+        };
+    // The one-byte range overlaps legacy fs2 whole-file locks, but leaves the
+    // generation text readable from another handle during a live watch.
+    let locked = unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut region) };
+    if locked != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Err(io::Error::new(io::ErrorKind::WouldBlock, error))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn unlock_source_watch_file(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    let mut region = source_watch_lock_region();
+    if unsafe { UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut region) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn try_lock_source_watch_exclusive(lock_file: &File) -> io::Result<()> {
     for attempt in 0..=SOURCE_WATCH_LOCK_RETRY_ATTEMPTS {
-        match FileExt::try_lock_exclusive(lock_file) {
+        match try_lock_source_watch_file(lock_file, true) {
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
                     && attempt < SOURCE_WATCH_LOCK_RETRY_ATTEMPTS =>
@@ -1044,8 +1152,89 @@ mod tests {
         try_lock_source_watch_exclusive(&contender).unwrap();
 
         assert!(released.load(std::sync::atomic::Ordering::SeqCst));
-        FileExt::unlock(&contender).unwrap();
+        unlock_source_watch_file(&contender).unwrap();
         release.join().unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_watch_lock_keeps_generation_reads_outside_its_range() {
+        let mut owner = tempfile::NamedTempFile::new().unwrap();
+        let mut reader = File::open(owner.path()).unwrap();
+        try_lock_source_watch_file(owner.as_file(), true).unwrap();
+        let generation = "g".repeat(SOURCE_WATCH_GENERATION_MAX_BYTES - 1);
+        write_source_watch_lock(owner.as_file_mut(), &generation).unwrap();
+        assert_eq!(
+            read_source_watch_lock(&mut reader).unwrap().trim(),
+            generation
+        );
+        assert_eq!(
+            try_lock_source_watch_file(&reader, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        write_source_watch_lock(owner.as_file_mut(), "restoring:owned-generation").unwrap();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(
+            read_source_watch_lock(&mut reader).unwrap().trim(),
+            "restoring:owned-generation",
+        );
+        assert!(
+            write_source_watch_lock(
+                owner.as_file_mut(),
+                &"x".repeat(SOURCE_WATCH_GENERATION_MAX_BYTES),
+            )
+            .is_err()
+        );
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(
+            read_source_watch_lock(&mut reader).unwrap().trim(),
+            "restoring:owned-generation",
+        );
+        unlock_source_watch_file(owner.as_file()).unwrap();
+        try_lock_source_watch_file(&reader, true).unwrap();
+        unlock_source_watch_file(&reader).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_watch_lock_excludes_legacy_whole_file_owners() {
+        let owner = tempfile::NamedTempFile::new().unwrap();
+        fs::write(owner.path(), "legacy-generation\n").unwrap();
+        let mut contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(owner.path())
+            .unwrap();
+        FileExt::lock_exclusive(owner.as_file()).unwrap();
+        assert_eq!(
+            try_lock_source_watch_file(&contender, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        assert_eq!(
+            read_source_watch_lock(&mut contender).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        FileExt::unlock(owner.as_file()).unwrap();
+        try_lock_source_watch_file(&contender, true).unwrap();
+        assert_eq!(
+            FileExt::try_lock_shared(owner.as_file())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32),
+        );
+        assert_eq!(
+            FileExt::try_lock_exclusive(owner.as_file())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32),
+        );
+        unlock_source_watch_file(&contender).unwrap();
+        FileExt::try_lock_exclusive(owner.as_file()).unwrap();
+        FileExt::unlock(owner.as_file()).unwrap();
     }
 }

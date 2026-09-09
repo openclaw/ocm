@@ -991,7 +991,7 @@ fn set_systemd_service_enablement(
     Ok(())
 }
 
-fn gui_domain(env: &BTreeMap<String, String>) -> Result<String, String> {
+pub(crate) fn gui_domain(env: &BTreeMap<String, String>) -> Result<String, String> {
     let id_bin = env
         .get(ID_BIN_OVERRIDE)
         .map(String::as_str)

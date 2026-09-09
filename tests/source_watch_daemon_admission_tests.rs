@@ -14,8 +14,8 @@ use ocm::store::{env_registry_path, supervisor_runtime_path, supervisor_state_pa
 use serde_json::{Value, json};
 
 use support::{
-    TestDir, install_fake_service_manager, managed_service_definition_path, ocm_env,
-    ocm_test_binary_path, path_string, run_ocm, stderr, write_executable_script,
+    TestDir, install_fake_launchctl, install_fake_systemd_tools, managed_service_definition_path,
+    ocm_env, ocm_test_binary_path, path_string, run_ocm, stderr, write_executable_script,
     write_json_replacing_path,
 };
 
@@ -28,15 +28,28 @@ struct AdmissionFixture {
     runtime: PathBuf,
     query: PathBuf,
     daemon: Option<Child>,
+    launchd: bool,
 }
 
 impl AdmissionFixture {
     fn new(label: &str) -> Self {
+        Self::with_manager(label, cfg!(target_os = "macos"))
+    }
+
+    fn with_manager(label: &str, launchd: bool) -> Self {
         let root = TestDir::new(label);
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
         let mut env = ocm_env(&root);
-        install_fake_service_manager(&root, &mut env);
+        if launchd {
+            env.insert(
+                "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+                "launchd".to_string(),
+            );
+            install_fake_launchctl(&root, &mut env);
+        } else {
+            install_fake_systemd_tools(&root, &mut env);
+        }
         let runtime_binary = root.child("bin/openclaw");
         write_executable_script(&runtime_binary, "#!/bin/sh\nexit 0\n");
         let added = run_ocm(
@@ -98,7 +111,7 @@ impl AdmissionFixture {
             &format!("#!/bin/sh\n/bin/cat '{}'\n", path_string(&query_output),),
         );
         env.insert(
-            if cfg!(target_os = "macos") {
+            if launchd {
                 "OCM_INTERNAL_LAUNCHCTL_BIN"
             } else {
                 "OCM_INTERNAL_SYSTEMCTL_BIN"
@@ -115,6 +128,7 @@ impl AdmissionFixture {
             runtime,
             query,
             daemon: None,
+            launchd,
         }
     }
 
@@ -175,7 +189,7 @@ impl AdmissionFixture {
 
     fn set_manager_state(&self, state: &str, pid: u32) {
         let definition = path_string(&self.definition);
-        let output = if cfg!(target_os = "macos") {
+        let output = if self.launchd {
             format!("path = {definition}\nstate = {state}\npid = {pid}\n")
         } else {
             let (active, sub) = match state {
@@ -355,6 +369,24 @@ fn dev_watch_rejects_unknown_daemon_before_creating_an_environment() {
 
     write_executable_script(&fixture.query, "#!/bin/sh\nexit 69\n");
     fixture.assert_refused_without_mutation("manager unavailable");
+}
+
+#[test]
+fn dev_watch_checks_launchd_ownership_without_searching_path_for_id() {
+    let mut fixture = AdmissionFixture::with_manager("dev-daemon-launchd-path", true);
+    fixture.start_daemon();
+    let empty_bin = fixture.root.child("empty-bin");
+    fs::create_dir_all(&empty_bin).unwrap();
+    fixture
+        .env
+        .insert("PATH".to_string(), path_string(&empty_bin));
+    let failed_spawn = fixture.watch();
+    assert!(!failed_spawn.status.success());
+    assert!(
+        stderr(&failed_spawn).contains("failed to run \"node\""),
+        "{}",
+        stderr(&failed_spawn),
+    );
 }
 
 #[test]

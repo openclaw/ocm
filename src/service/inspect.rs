@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use super::platform::{ManagedServiceEnablement, ServiceManagerKind, service_manager_kind};
+use super::platform::{
+    ManagedServiceEnablement, ServiceManagerKind, gui_domain, service_manager_kind,
+};
 use crate::cli::render::format_rfc3339;
 use crate::env::GatewayProcessSpec;
 use crate::env::{EnvMeta, EnvironmentService};
@@ -582,10 +584,9 @@ pub(crate) fn observe_job_for_source_watch(
     let mut status = LaunchdJobStatus::default();
     let inactive = match service_manager_kind(env) {
         ServiceManagerKind::Launchd => {
-            let uid = current_uid()
-                .ok_or_else(|| "failed to inspect the managed service user".to_string())?;
+            let domain = gui_domain(env)?;
             let output = Command::new(launchctl_binary(env))
-                .args(["print", &format!("gui/{uid}/{label}")])
+                .args(["print", &format!("{domain}/{label}")])
                 .output()
                 .map_err(|error| format!("failed to inspect managed service {label}: {error}"))?;
             if !output.status.success() {

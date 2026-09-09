@@ -327,7 +327,7 @@ pub fn install_fake_launchctl(root: &TestDir, env: &mut BTreeMap<String, String>
     let log_path = root.child("launchctl.log");
     let print_path = root.child("launchctl-print.txt");
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$1\" in\n  bootstrap)\n    if [ -n \"$OCM_TEST_NATIVE_DAEMON_PID\" ]; then\n      printf 'state = running\\npid = %s\\npath = %s\\n' \"$OCM_TEST_NATIVE_DAEMON_PID\" \"$3\" > \"{}\"\n    else\n      printf 'state = running\\npid = 23613\\n' > \"{}\"\n    fi\n    exit 0\n    ;;\n  bootout|unload)\n    /bin/rm -f \"{}\"\n    exit 0\n    ;;\n  print)\n    if [ -f \"{}\" ]; then\n      /bin/cat \"{}\"\n      exit 0\n    fi\n    printf 'Could not find service \"%s\" in domain for user gui\\n' \"$2\" >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$1\" in\n  bootstrap)\n    if [ -n \"$OCM_TEST_NATIVE_DAEMON_PID\" ]; then\n      printf 'state = running\\npid = %s\\npath = %s\\n' \"$OCM_TEST_NATIVE_DAEMON_PID\" \"$3\" > \"{}\"\n    else\n      printf 'state = running\\npid = 23613\\n' > \"{}\"\n    fi\n    exit 0\n    ;;\n  bootout|unload)\n    /bin/rm -f \"{}\"\n    exit 0\n    ;;\n  print)\n    if [ -f \"{}\" ]; then\n      /bin/cat \"{}\"\n      exit 0\n    fi\n    printf 'Could not find service \"%s\" in domain for user gui\\n' \"${{2##*/}}\" >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
         path_string(&log_path),
         path_string(&print_path),
         path_string(&print_path),
@@ -356,7 +356,7 @@ pub fn install_fake_systemd_tools(root: &TestDir, env: &mut BTreeMap<String, Str
     let log_path = root.child("systemctl.log");
     let journal_log_path = root.child("journalctl.log");
     let systemctl_script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--user\" ] && [ \"$2\" = \"show\" ]; then\n  unit=\"$3\"\n  fixture_home=\"${{HOME:-$PWD}}\"\n  unit_path=\"$fixture_home/.config/systemd/user/$unit.service\"\n  if [ -f \"$unit_path\" ]; then\n    printf 'LoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\nSubState=running\\nMainPID=%s\\nFragmentPath=%s\\n' \"${{OCM_TEST_NATIVE_DAEMON_PID:-4242}}\" \"$unit_path\"\n    exit 0\n  fi\n  printf 'Unit %s could not be found\\n' \"$unit\" >&2\n  exit 1\nfi\nexit 0\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--user\" ] && [ \"$2\" = \"show\" ]; then\n  unit=\"$3\"\n  fixture_home=\"${{HOME:-$PWD}}\"\n  unit_path=\"$fixture_home/.config/systemd/user/$unit.service\"\n  if [ -f \"$unit_path\" ]; then\n    printf 'LoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\nSubState=running\\nMainPID=%s\\nFragmentPath=%s\\n' \"${{OCM_TEST_NATIVE_DAEMON_PID:-4242}}\" \"$unit_path\"\n    exit 0\n  fi\n  printf 'LoadState=not-found\\nUnitFileState=not-found\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\nFragmentPath=\\n'\n  exit 4\nfi\nexit 0\n",
         path_string(&log_path)
     );
     let journalctl_script = format!(
