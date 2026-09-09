@@ -1829,7 +1829,7 @@ fn contended_admission_preserves_sibling_supervision_and_desired_starts() {
     let runtime_path = root.child("ocm-home/supervisor/runtime.json");
     let supervisor = SupervisorService::new(&env, &cwd);
     supervisor.sync().unwrap();
-    let admission_path = root.child("ocm-home/source-watch/demo.admission.lock");
+    let admission_path = root.child("ocm-home/source-watch/demo.admission");
     fs::create_dir_all(admission_path.parent().unwrap()).unwrap();
     let hold_admission = || {
         let file = fs::OpenOptions::new()
@@ -1942,7 +1942,7 @@ fn daemon_publishes_a_started_child_before_a_sibling_probe_can_block() {
     let admission = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(root.child("ocm-home/source-watch/demo.admission.lock"))
+        .open(root.child("ocm-home/source-watch/demo.admission"))
         .unwrap();
     let admission_available = FileExt::try_lock_exclusive(&admission).is_ok();
     fs::write(&probe_release, "release\n").unwrap();

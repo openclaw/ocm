@@ -52,6 +52,10 @@ impl<'a> ServiceService<'a> {
 
     pub(crate) fn start_action(&self, name: &str) -> Result<ServiceActionSummary, String> {
         let _lock = crate::env::EnvironmentService::new(self.env, self.cwd).lock_operation(name)?;
+        self.start_action_locked(name)
+    }
+
+    pub(crate) fn start_action_locked(&self, name: &str) -> Result<ServiceActionSummary, String> {
         let mut summary = self.start_locked(name)?;
         self.apply_gateway_readiness(name, &mut summary)?;
         Ok(summary)

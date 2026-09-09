@@ -175,6 +175,39 @@ fn wait_for_path(path: &Path, timeout: Duration) -> bool {
 }
 
 #[test]
+fn dev_stop_refuses_legacy_ownership_and_leaves_an_inactive_env_unchanged() {
+    let root = TestDir::new("dev-stop-legacy-watch");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let source_repo = create_source_repo(&root);
+    let env = ocm_env(&root);
+    create_runtime_backed_env(&root, &cwd, &env);
+    let inactive = run_ocm(&cwd, &env, &["dev", "stop", "demo", "--json"]);
+    assert!(inactive.status.success(), "{}", stderr(&inactive));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&inactive)).unwrap(),
+        json!({
+            "envName": "demo", "stopped": false, "serviceRestored": false,
+        })
+    );
+
+    let _watch = lock_source_watch(&root);
+    write_active_source_watch_override(&root, &source_repo);
+    let path = root.child("ocm-home/source-watch/demo.json");
+    let before = fs::read(&path).unwrap();
+    let stopped = run_ocm(&cwd, &env, &["dev", "stop", "demo", "--json"]);
+    assert!(!stopped.status.success());
+    assert!(
+        stderr(&stopped).contains("does not record stop ownership"),
+        "{}",
+        stderr(&stopped)
+    );
+    assert_eq!(fs::read(path).unwrap(), before);
+    assert!(!root.child("ocm-home/source-watch/demo.session").exists());
+    assert!(!root.child("ocm-home/source-watch/demo.stop").exists());
+}
+
+#[test]
 fn dev_status_observes_active_and_transitional_source_watch() {
     let root = TestDir::new("dev-status-watch-lifecycle");
     let cwd = root.child("workspace");
@@ -464,7 +497,7 @@ fn service_policy_admission_rechecks_a_watch_claimed_while_waiting() {
     fs::create_dir_all(&cwd).unwrap();
     let env = ocm_env(&root);
     create_runtime_backed_env(&root, &cwd, &env);
-    let admission_path = root.child("ocm-home/source-watch/demo.admission.lock");
+    let admission_path = root.child("ocm-home/source-watch/demo.admission");
     fs::create_dir_all(admission_path.parent().unwrap()).unwrap();
     let admission = OpenOptions::new()
         .read(true)

@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use super::EnvironmentService;
+use super::source_watch_session::{SourceWatchSession, SourceWatchSessionPaths};
+use crate::infra::process_identity::{current_process_identity, observe_process, process_scope_id};
 use crate::store::{
     ExclusiveFileLock, display_path, ensure_dir, lock_file, now_utc, read_json,
     source_watch_override_path, try_lock_file, validate_name, write_json,
@@ -71,17 +73,15 @@ pub(crate) struct SourceWatchLease {
     lease_id: String,
     lock_file: File,
     service_was_running: bool,
+    session_paths: SourceWatchSessionPaths,
+    session: Option<SourceWatchSession>,
     #[cfg(windows)]
-    lease_event: windows_sys::Win32::Foundation::HANDLE,
+    lease_event: WindowsSourceWatchEvent,
 }
 
-#[cfg(windows)]
-impl Drop for SourceWatchLease {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.lease_event);
-        }
-    }
+pub(crate) struct SourceWatchLeaseObservation {
+    pub(crate) lease_id: String,
+    pub(crate) held: bool,
 }
 
 impl SourceWatchLease {
@@ -89,7 +89,86 @@ impl SourceWatchLease {
         self.service_was_running
     }
 
+    pub(crate) fn session(&self) -> Option<&SourceWatchSession> {
+        self.session.as_ref()
+    }
+
+    pub(crate) fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
+    pub(crate) fn stop_requested(&self) -> Result<bool, String> {
+        self.session
+            .as_ref()
+            .map(|session| self.session_paths.stop_requested(session))
+            .unwrap_or(Ok(false))
+    }
+
+    pub(crate) fn begin_child_spawn(&mut self) -> Result<(), String> {
+        if let Some(session) = &mut self.session {
+            session.child = None;
+            session.child_spawn_pending = true;
+            self.session_paths.save_session(session)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_child(&mut self, pid: u32) -> Result<(), String> {
+        if let Some(session) = &mut self.session {
+            let process = observe_process(pid)?.ok_or_else(|| {
+                format!("failed to inspect source watch child identity for pid {pid}")
+            })?;
+            session.child = Some(process.identity);
+            session.child_spawn_pending = false;
+            self.session_paths.save_session(session)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_child(&mut self) -> Result<(), String> {
+        if let Some(session) = &mut self.session {
+            session.child = None;
+            session.child_spawn_pending = false;
+            self.session_paths.save_session(session)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_service_takeover(&mut self) -> Result<(), String> {
+        if let Some(session) = &mut self.session {
+            session.restore_service = self.service_was_running;
+            self.session_paths.save_session(session)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn discard_service_restore(&mut self) -> Result<(), String> {
+        if let Some(session) = &mut self.session {
+            session.restore_service = false;
+            self.session_paths.save_session(session)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_session(
+        &mut self,
+        service_restored: bool,
+        error: Option<String>,
+        preserve_session: bool,
+    ) -> Result<(), String> {
+        let _admission = lock_file(&self.session_paths.admission, "gateway admission")?;
+        if let Some(session) = &self.session {
+            self.session_paths
+                .finish(session, service_restored, error, preserve_session)?;
+            if !preserve_session {
+                self.session = None;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn begin_service_restore(&mut self) -> Result<(), String> {
+        let _admission = lock_file(&self.session_paths.admission, "gateway admission")?;
         write_source_watch_lock(&mut self.lock_file, &format!("restoring:{}", self.lease_id))
     }
 
@@ -125,7 +204,7 @@ impl SourceWatchLease {
         let duplicated = unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
-                self.lease_event,
+                self.lease_event.handle,
                 child.as_raw_handle() as HANDLE,
                 &mut child_handle,
                 0,
@@ -163,6 +242,113 @@ impl SourceWatchOverride {
 }
 
 impl<'a> EnvironmentService<'a> {
+    pub(crate) fn observe_source_watch_lease(
+        &self,
+        env_name: &str,
+    ) -> Result<Option<SourceWatchLeaseObservation>, String> {
+        let env_name = validate_name(env_name, "Environment name")?;
+        let lock_path =
+            source_watch_override_path(&env_name, self.env, self.cwd)?.with_extension("lock");
+        let mut file = match OpenOptions::new().read(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("failed reading source watch lease: {error}")),
+        };
+        let held = match FileExt::try_lock_shared(&file) {
+            Ok(()) => false,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+            Err(error) => return Err(format!("failed inspecting source watch lease: {error}")),
+        };
+        #[cfg(windows)]
+        let held = held || open_windows_source_watch_event(&lock_path)?.is_some();
+        let mut value = String::new();
+        file.read_to_string(&mut value)
+            .map_err(|error| format!("failed reading source watch lease: {error}"))?;
+        let value = value.trim();
+        Ok(Some(SourceWatchLeaseObservation {
+            lease_id: value
+                .strip_prefix("restoring:")
+                .unwrap_or(value)
+                .to_string(),
+            held,
+        }))
+    }
+
+    // The caller holds the environment operation and admission locks, and has
+    // verified that the recorded controller and its owned process group stopped.
+    pub(crate) fn reclaim_source_watch_lease_locked(
+        &self,
+        mut session: SourceWatchSession,
+    ) -> Result<SourceWatchLease, String> {
+        let override_path = source_watch_override_path(&session.env_name, self.env, self.cwd)?;
+        let lock_path = override_path.with_extension("lock");
+        let mut lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("failed opening source watch recovery lease: {error}"))?;
+        #[cfg(windows)]
+        let lease_event = WindowsSourceWatchEvent {
+            handle: acquire_windows_source_watch_event(&lock_path, &session.env_name)?,
+        };
+        try_lock_source_watch_exclusive(&lock_file).map_err(|error| {
+            format!("source watch lease is still held; recovery was not completed: {error}")
+        })?;
+        let mut value = String::new();
+        lock_file
+            .read_to_string(&mut value)
+            .map_err(|error| format!("failed reading source watch recovery lease: {error}"))?;
+        if value
+            .trim()
+            .strip_prefix("restoring:")
+            .unwrap_or(value.trim())
+            != session.lease_id
+        {
+            return Err("source watch generation changed; refusing stale recovery".to_string());
+        }
+        let session_paths = SourceWatchSessionPaths::from_override(&override_path);
+        session.controller = current_process_identity()?;
+        session.process_scope = process_scope_id()?;
+        session.child = None;
+        session.child_spawn_pending = false;
+        session.closed = false;
+        session.completion = None;
+        session_paths.save_session(&session)?;
+        Ok(SourceWatchLease {
+            env_name: session.env_name.clone(),
+            lease_id: session.lease_id.clone(),
+            lock_file,
+            service_was_running: session.restore_service,
+            session_paths,
+            session: Some(session),
+            #[cfg(windows)]
+            lease_event,
+        })
+    }
+
+    pub(crate) fn clear_source_watch_override_for_lease(
+        &self,
+        env_name: &str,
+        lease_id: &str,
+    ) -> Result<(), String> {
+        let env_name = validate_name(env_name, "Environment name")?;
+        let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
+        if !path.try_exists().map_err(|error| {
+            format!(
+                "failed inspecting source watch override {}: {error}",
+                display_path(&path)
+            )
+        })? {
+            return Ok(());
+        }
+        let meta = read_json::<SourceWatchOverride>(&path)?;
+        if !source_watch_matches_lease(&meta, lease_id) {
+            return Err("source watch override changed; refusing stale cleanup".to_string());
+        }
+        self.clear_source_watch_override(&env_name, &meta.token)?;
+        Ok(())
+    }
+
     pub(crate) fn lock_gateway_admission(
         &self,
         env_name: &str,
@@ -179,8 +365,7 @@ impl<'a> EnvironmentService<'a> {
 
     fn gateway_admission_path(&self, env_name: &str) -> Result<PathBuf, String> {
         let env_name = validate_name(env_name, "Environment name")?;
-        Ok(source_watch_override_path(&env_name, self.env, self.cwd)?
-            .with_extension("admission.lock"))
+        Ok(source_watch_override_path(&env_name, self.env, self.cwd)?.with_extension("admission"))
     }
 
     pub(crate) fn ensure_source_watch_allows_service(&self, env_name: &str) -> Result<(), String> {
@@ -209,6 +394,7 @@ impl<'a> EnvironmentService<'a> {
             ));
         }
         let override_path = source_watch_override_path(&env_name, self.env, self.cwd)?;
+        let session_paths = SourceWatchSessionPaths::from_override(&override_path);
         let lock_path = override_path.with_extension("lock");
         if let Ok(meta) = read_json::<SourceWatchOverride>(&override_path)
             && !is_leased_source_watch(&meta)
@@ -236,28 +422,24 @@ impl<'a> EnvironmentService<'a> {
                 )
             })?;
         #[cfg(windows)]
-        let lease_event = acquire_windows_source_watch_event(&lock_path, &env_name)?;
+        let lease_event = WindowsSourceWatchEvent {
+            handle: acquire_windows_source_watch_event(&lock_path, &env_name)?,
+        };
         match try_lock_source_watch_exclusive(&lock_file) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                #[cfg(windows)]
-                unsafe {
-                    windows_sys::Win32::Foundation::CloseHandle(lease_event);
-                }
                 return Err(format!(
                     "source watch for env \"{env_name}\" is already active or starting"
                 ));
             }
             Err(error) => {
-                #[cfg(windows)]
-                unsafe {
-                    windows_sys::Win32::Foundation::CloseHandle(lease_event);
-                }
                 return Err(format!(
                     "failed locking source watch for env \"{env_name}\": {error}"
                 ));
             }
         }
+
+        session_paths.ensure_previous_session_finished(&env_name)?;
 
         let lease_id = format!(
             "{}-{}",
@@ -271,11 +453,17 @@ impl<'a> EnvironmentService<'a> {
         // Owning the OS lock proves any surviving metadata belongs to a dead
         // lease, even if its child PID has since been reused by another process.
         remove_file_if_present(&override_path)?;
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        let session = Some(session_paths.create_session(&meta, &lease_id)?);
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        let session = None;
         Ok(SourceWatchLease {
             env_name,
             lease_id,
             lock_file,
             service_was_running: meta.service_running,
+            session_paths,
+            session,
             #[cfg(windows)]
             lease_event,
         })
@@ -557,6 +745,7 @@ fn is_valid_source_watch_structure(meta: &SourceWatchOverride, env_name: &str) -
 }
 
 #[cfg(windows)]
+#[derive(Debug)]
 struct WindowsSourceWatchEvent {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }

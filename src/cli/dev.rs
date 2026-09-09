@@ -11,7 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
@@ -26,15 +26,19 @@ use super::Cli;
 use super::render::RenderProfile;
 use crate::env::{
     CreateEnvironmentOptions, CreateSourceWatchOverrideOptions, EnvDevMeta, EnvMeta,
-    SourceWatchEndpoint, SourceWatchLease, SourceWatchState,
+    SourceWatchCompletion, SourceWatchEndpoint, SourceWatchLease, SourceWatchSession,
+    SourceWatchState,
 };
 use crate::infra::process::run_direct;
+#[cfg(unix)]
+use crate::infra::process_identity::process_group_members;
+use crate::infra::process_identity::{ProcessIdentity, observe_process, process_scope_id};
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::infra::terminal::{Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table};
 use crate::openclaw_repo::{
     detect_openclaw_checkout, discover_enclosing_openclaw_checkout, ensure_openclaw_worktree,
     ensure_source_dependency_install_target, inspect_source_dependencies,
-    validate_openclaw_worktree,
+    inspect_source_dependencies_with_runner, validate_openclaw_worktree,
 };
 use crate::service::service_backend_support_error;
 use crate::store::{
@@ -52,6 +56,7 @@ delete process.env.OCM_SOURCE_WATCH_START_FD;
 if (Number.isInteger(startFd) && fs.readSync(startFd, Buffer.alloc(1), 0, 1, null) !== 1) {
   process.exit(1);
 }
+if (Number.isInteger(startFd)) fs.closeSync(startFd);
 const script = path.resolve("scripts/watch-node.mjs");
 process.argv = [process.execPath, script, ...process.argv.slice(1)];
 if (process.env.OCM_SOURCE_WATCH_FORCE_TTY === "1") {
@@ -59,6 +64,15 @@ if (process.env.OCM_SOURCE_WATCH_FORCE_TTY === "1") {
   Object.defineProperty(process.stdin, "isTTY", { value: true });
 }
 await import(pathToFileURL(script).href);"#;
+
+#[cfg(unix)]
+const SOURCE_WATCH_SETUP_SHIM: &str = r#"case "$OCM_SOURCE_WATCH_START_FD" in
+  ''|*[!0-9]*) exit 1 ;;
+esac
+IFS= read -r ocm_start <&"$OCM_SOURCE_WATCH_START_FD" || exit 1
+unset OCM_SOURCE_WATCH_START_FD
+exec "$@"
+"#;
 
 type SourceWatchResult<T> = Result<T, SourceWatchError>;
 
@@ -126,12 +140,173 @@ struct ExistingEnvSourceWatchOptions {
     onboard: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DevStopSummary {
+    pub(super) env_name: String,
+    pub(super) stopped: bool,
+    pub(super) service_restored: bool,
+}
+
 impl Cli {
     pub(super) fn handle_dev_command(&self, args: Vec<String>) -> Result<i32, String> {
         match args.first().map(String::as_str).unwrap_or("") {
             "" | "help" | "--help" | "-h" => self.dispatch_help_command(vec!["dev".to_string()]),
             "status" => self.handle_dev_status(args[1..].to_vec()),
+            "stop" => self.handle_dev_stop(args[1..].to_vec()),
             _ => self.handle_dev_run(args),
+        }
+    }
+
+    fn handle_dev_stop(&self, args: Vec<String>) -> Result<i32, String> {
+        let (args, json, _profile) = self.consume_human_output_flags(args, "dev stop")?;
+        let name = args
+            .first()
+            .ok_or_else(|| "dev stop requires an environment name".to_string())?;
+        let name = validate_name(name, "Environment name")?;
+        Self::assert_no_extra_args(&args[1..])?;
+        let summary = self.stop_source_watch(&name)?;
+        if json {
+            self.print_json(&summary)?;
+        } else if summary.stopped {
+            self.stdout_line(format!("Stopped source watch for {}.", summary.env_name));
+            if summary.service_restored {
+                self.stdout_line(format!(
+                    "Restored background service for {}.",
+                    summary.env_name
+                ));
+            }
+        } else {
+            self.stdout_line(format!(
+                "No active source-watch session for {}.",
+                summary.env_name
+            ));
+        }
+        Ok(0)
+    }
+
+    pub(super) fn stop_source_watch(&self, env_name: &str) -> Result<DevStopSummary, String> {
+        let env_service = self.environment_service();
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let mut requested_lease: Option<String> = None;
+        loop {
+            let operation = env_service.lock_operation(env_name)?;
+            let session = env_service.source_watch_session(env_name)?;
+            if let Some(lease_id) = &requested_lease
+                && let Some(completion) = env_service.source_watch_completion(env_name, lease_id)?
+            {
+                return dev_stop_completed(env_name, completion);
+            }
+            let Some(session) = session else {
+                if requested_lease.is_some() {
+                    return Err("source watch ownership disappeared before stop completion could be verified".to_string());
+                }
+                env_service.get(env_name)?;
+                if !matches!(
+                    env_service.observe_source_watch(env_name)?,
+                    SourceWatchState::Inactive
+                ) {
+                    return Err("this watch session does not record stop ownership; stop it from its original terminal".to_string());
+                }
+                return Ok(DevStopSummary {
+                    env_name: env_name.to_string(),
+                    stopped: false,
+                    service_restored: false,
+                });
+            };
+            if requested_lease.is_none() && session.closed {
+                if !matches!(
+                    env_service.observe_source_watch(env_name)?,
+                    SourceWatchState::Inactive
+                ) {
+                    return Err("the active watch is not owned by the completed stop session; stop it from its original terminal".to_string());
+                }
+                return Ok(DevStopSummary {
+                    env_name: env_name.to_string(),
+                    stopped: false,
+                    service_restored: false,
+                });
+            }
+            if session.process_scope != process_scope_id()? {
+                return Err("source watch belongs to another boot or process namespace; no processes were signaled and service policy was preserved".to_string());
+            }
+            if requested_lease
+                .as_ref()
+                .is_some_and(|lease| lease != &session.lease_id)
+            {
+                return Err(
+                    "source watch generation changed; the replacement session was not stopped"
+                        .to_string(),
+                );
+            }
+            if requested_lease.is_none() {
+                if let Some(completion) = env_service.request_source_watch_stop_locked(&session)? {
+                    return dev_stop_completed(env_name, completion);
+                }
+                requested_lease = Some(session.lease_id.clone());
+            }
+            if session.controller_is_running()? {
+                #[cfg(unix)]
+                if observe_process(session.controller.pid)?.is_some_and(|process| {
+                    process.stopped && process.identity == session.controller
+                }) {
+                    signal_matching_source_watch_process(&session.controller, libc::SIGCONT)?;
+                }
+                drop(operation);
+                if std::time::Instant::now() >= deadline {
+                    return Err("source watch has not acknowledged a complete stop; its ownership and service restoration state were retained".to_string());
+                }
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            let admission = env_service.lock_gateway_admission(env_name)?;
+            let session = env_service.source_watch_session(env_name)?.ok_or_else(|| {
+                "source watch ownership disappeared before crash recovery".to_string()
+            })?;
+            if requested_lease.as_deref() != Some(session.lease_id.as_str()) {
+                return Err(
+                    "source watch generation changed; refusing stale crash recovery".to_string(),
+                );
+            }
+            if let Some(completion) = session.completion.clone() {
+                return dev_stop_completed(env_name, completion);
+            }
+            if session.closed {
+                return Err("source watch closed without a verified completion record".to_string());
+            }
+            if session.controller_is_running()? {
+                return Err("source watch controller changed before crash recovery; retry stop for its current owner".to_string());
+            }
+            let observed = env_service
+                .observe_source_watch_lease(env_name)?
+                .ok_or_else(|| {
+                    "source watch lease disappeared; refusing unverified crash recovery".to_string()
+                })?;
+            if observed.lease_id != session.lease_id {
+                return Err(
+                    "source watch generation changed; refusing stale crash recovery".to_string(),
+                );
+            }
+            stop_orphaned_source_watch(&session)?;
+            let mut lease = env_service.reclaim_source_watch_lease_locked(session)?;
+            env_service.clear_source_watch_override_for_lease(env_name, lease.lease_id())?;
+            drop(admission);
+            drop(operation);
+            let should_restore = lease
+                .session()
+                .is_some_and(|session| session.restore_service);
+            let restore = if should_restore {
+                self.restore_source_watch_service(env_name, &mut lease)
+            } else {
+                Ok(())
+            };
+            let restored = should_restore && restore.is_ok();
+            finish_source_watch_session(env_name, &mut lease, Ok(0), restore, restored)?;
+            return Ok(DevStopSummary {
+                env_name: env_name.to_string(),
+                stopped: true,
+                service_restored: restored,
+            });
         }
     }
 
@@ -260,6 +435,9 @@ impl Cli {
                 meta.name
             ));
         }
+        let watch_stop = watch
+            .then(install_source_watch_signal_handler)
+            .transpose()?;
         let mut source_watch_lease = if watch {
             Some(
                 match self
@@ -305,11 +483,24 @@ impl Cli {
         let meta = match prepared {
             Ok(meta) => meta,
             Err(error) => {
+                let result = match source_watch_lease.as_mut() {
+                    Some(lease) => finish_source_watch_session(
+                        &meta.name,
+                        lease,
+                        Err(error.into()),
+                        Ok(()),
+                        false,
+                    ),
+                    None => Err(error),
+                };
+                let cleanup_ready = source_watch_lease
+                    .as_ref()
+                    .is_none_or(|lease| lease.session().is_none());
                 drop(source_watch_lease.take());
-                if created {
+                if created && cleanup_ready {
                     let _ = self.environment_service().remove(&meta.name, true);
                 }
-                return Err(error);
+                return result;
             }
         };
         let dev = meta
@@ -333,21 +524,19 @@ impl Cli {
             stderr_profile,
         ));
 
-        let install_code = self.ensure_dev_dependencies(&meta, watch)?;
-        if install_code != 0 {
-            return Ok(install_code);
-        }
-
-        if onboard {
-            self.stderr_lines(render_dev_run_step(
-                "Onboarding",
-                format!("Running local onboarding in {}", dev.worktree_root),
-                stderr_profile,
-            ));
-            let code = self.run_dev_onboard(&meta)?;
-            if code != 0 {
-                return Ok(code);
-            }
+        let preparation = self.prepare_dev_run(
+            &meta,
+            onboard,
+            source_watch_lease.as_mut(),
+            watch_stop.as_deref(),
+        );
+        if !matches!(&preparation, Ok(0)) {
+            return match source_watch_lease.as_mut() {
+                Some(lease) => {
+                    finish_source_watch_session(&meta.name, lease, preparation, Ok(()), false)
+                }
+                None => preparation.map_err(|error| error.message),
+            };
         }
 
         if service_requested {
@@ -379,13 +568,20 @@ impl Cli {
                     ),
                     stderr_profile,
                 ));
-                if let Err(stop_error) = self.stop_service_for_source_watch(&meta.name) {
-                    let lease = source_watch_lease
-                        .as_mut()
-                        .ok_or_else(|| "source watch lease is missing".to_string())?;
-                    return Err(self.restore_service_policy_after_failed_takeover(
+                let lease = source_watch_lease
+                    .as_mut()
+                    .ok_or_else(|| "source watch lease is missing".to_string())?;
+                if let Err(stop_error) = self.stop_service_for_source_watch(&meta.name, lease) {
+                    let (error, restored) = self.restore_service_policy_after_failed_takeover(
                         &meta.name, stop_error, lease,
-                    ));
+                    );
+                    return finish_source_watch_session(
+                        &meta.name,
+                        lease,
+                        Err(error.into()),
+                        Ok(()),
+                        restored,
+                    );
                 }
             }
             self.stderr_lines(render_dev_run_step(
@@ -400,40 +596,44 @@ impl Cli {
             let watch_result = self.run_dev_gateway_watch(
                 &meta,
                 source_watch_lease
-                    .as_ref()
-                    .ok_or_else(|| "source watch lease is missing".to_string())?,
-            );
-            let restore_result = if watch_takes_over_service
-                && source_watch_allows_service_restore(&watch_result)
-            {
-                let restore_state_result = source_watch_lease
                     .as_mut()
-                    .ok_or_else(|| "source watch lease is missing".to_string())?
-                    .begin_service_restore();
-                match restore_state_result {
+                    .ok_or_else(|| "source watch lease is missing".to_string())?,
+                watch_stop
+                    .as_deref()
+                    .ok_or_else(|| "source watch cancellation state is missing".to_string())?,
+            );
+            let should_restore =
+                watch_takes_over_service && source_watch_allows_service_restore(&watch_result);
+            let restore_result = if should_restore {
+                match self.restore_source_watch_service(
+                    &meta.name,
+                    source_watch_lease
+                        .as_mut()
+                        .ok_or_else(|| "source watch lease is missing".to_string())?,
+                ) {
                     Ok(()) => {
-                        self.stderr_lines(render_dev_run_step(
-                            "Restore",
-                            format!("Starting background service for {}", meta.name),
-                            stderr_profile,
+                        self.stdout_lines(render_dev_service_restored(
+                            &meta,
+                            &self.command_example(),
+                            self.dev_stdout_profile(),
                         ));
-                        self.service_service().start(&meta.name).map(|_| {
-                            self.stdout_lines(render_dev_service_restored(
-                                &meta,
-                                &self.command_example(),
-                                self.dev_stdout_profile(),
-                            ));
-                        })
+                        Ok(())
                     }
-                    Err(error) => Err(format!(
-                        "failed preparing background service restoration: {error}; the service remains stopped to preserve source-watch exclusivity"
-                    )),
+                    Err(error) => Err(error),
                 }
             } else {
                 Ok(())
             };
-            drop(source_watch_lease.take());
-            return combine_watch_and_restore_results(watch_result, restore_result, &meta.name);
+            let restored = should_restore && restore_result.is_ok();
+            return finish_source_watch_session(
+                &meta.name,
+                source_watch_lease
+                    .as_mut()
+                    .ok_or_else(|| "source watch lease is missing".to_string())?,
+                watch_result,
+                restore_result,
+                restored,
+            );
         }
 
         self.stderr_lines(render_dev_run_step(
@@ -493,14 +693,8 @@ impl Cli {
                 display_path(&repo_root)
             )
         })?;
-        if let Some(issue) = inspect_source_dependencies(
-            &repo_root,
-            &build_openclaw_env(&existing, &self.env),
-            true,
-        )? {
-            return Err(source_dependency_preparation_error(&repo_root, &issue));
-        }
         let meta = existing;
+        let watch_stop = install_source_watch_signal_handler()?;
         let mut source_watch_lease = Some(
             match self
                 .environment_service()
@@ -521,9 +715,50 @@ impl Cli {
                 }
             },
         );
-        let meta = self
+        let prepared = self
             .environment_service()
-            .apply_effective_gateway_port(self.environment_service().get(&meta.name)?)?;
+            .get(&meta.name)
+            .and_then(|current| {
+                self.environment_service()
+                    .apply_effective_gateway_port(current)
+            });
+        let meta = match prepared {
+            Ok(meta) => meta,
+            Err(error) => {
+                return finish_source_watch_session(
+                    &meta.name,
+                    source_watch_lease
+                        .as_mut()
+                        .ok_or_else(|| "source watch lease is missing".to_string())?,
+                    Err(error.into()),
+                    Ok(()),
+                    false,
+                );
+            }
+        };
+        let lease = source_watch_lease
+            .as_mut()
+            .ok_or_else(|| "source watch lease is missing".to_string())?;
+        let inspected = self.inspect_dev_source_dependencies(
+            &repo_root,
+            &build_openclaw_env(&meta, &self.env),
+            true,
+            Some(&mut *lease),
+            Some(&watch_stop),
+        );
+        let preparation = if source_watch_allows_service_restore(&inspected)
+            && source_watch_cancelled(lease, &watch_stop)?
+        {
+            Ok(130)
+        } else {
+            inspected.and_then(|issue| match issue {
+                Some(issue) => Err(source_dependency_preparation_error(&repo_root, &issue).into()),
+                None => Ok(0),
+            })
+        };
+        if !matches!(&preparation, Ok(0)) {
+            return finish_source_watch_session(&meta.name, lease, preparation, Ok(()), false);
+        }
         let stderr_profile = self.dev_stderr_profile();
         self.stderr_lines(render_source_watch_takeover_summary(
             &meta,
@@ -548,12 +783,19 @@ impl Cli {
                 ),
                 stderr_profile,
             ));
-            if let Err(stop_error) = self.stop_service_for_source_watch(&meta.name) {
-                let lease = source_watch_lease
-                    .as_mut()
-                    .ok_or_else(|| "source watch lease is missing".to_string())?;
-                return Err(self
-                    .restore_service_policy_after_failed_takeover(&meta.name, stop_error, lease));
+            let lease = source_watch_lease
+                .as_mut()
+                .ok_or_else(|| "source watch lease is missing".to_string())?;
+            if let Err(stop_error) = self.stop_service_for_source_watch(&meta.name, lease) {
+                let (error, restored) = self
+                    .restore_service_policy_after_failed_takeover(&meta.name, stop_error, lease);
+                return finish_source_watch_session(
+                    &meta.name,
+                    lease,
+                    Err(error.into()),
+                    Ok(()),
+                    restored,
+                );
             }
         }
 
@@ -572,47 +814,55 @@ impl Cli {
             &repo_root,
             true,
             source_watch_lease
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| "source watch lease is missing".to_string())?,
+            &watch_stop,
         );
 
-        let restore_result = if restore_service
-            && source_watch_allows_service_restore(&watch_result)
-        {
-            let restore_state_result = source_watch_lease
-                .as_mut()
-                .ok_or_else(|| "source watch lease is missing".to_string())?
-                .begin_service_restore();
-            match restore_state_result {
+        let should_restore = restore_service && source_watch_allows_service_restore(&watch_result);
+        let restore_result = if should_restore {
+            match self.restore_source_watch_service(
+                &meta.name,
+                source_watch_lease
+                    .as_mut()
+                    .ok_or_else(|| "source watch lease is missing".to_string())?,
+            ) {
                 Ok(()) => {
-                    self.stderr_lines(render_dev_run_step(
-                        "Restore",
-                        format!("Starting background service for {}", meta.name),
-                        stderr_profile,
+                    self.stdout_lines(render_source_watch_service_restored(
+                        &meta,
+                        &repo_root,
+                        &self.command_example(),
+                        self.dev_stdout_profile(),
                     ));
-                    self.service_service().start(&meta.name).map(|_| {
-                        self.stdout_lines(render_source_watch_service_restored(
-                            &meta,
-                            &repo_root,
-                            &self.command_example(),
-                            self.dev_stdout_profile(),
-                        ));
-                    })
+                    Ok(())
                 }
-                Err(error) => Err(format!(
-                    "failed preparing background service restoration: {error}; the service remains stopped to preserve source-watch exclusivity"
-                )),
+                Err(error) => Err(error),
             }
         } else {
             Ok(())
         };
-        drop(source_watch_lease.take());
-
-        combine_watch_and_restore_results(watch_result, restore_result, &meta.name)
+        let restored = should_restore && restore_result.is_ok();
+        finish_source_watch_session(
+            &meta.name,
+            source_watch_lease
+                .as_mut()
+                .ok_or_else(|| "source watch lease is missing".to_string())?,
+            watch_result,
+            restore_result,
+            restored,
+        )
     }
 
-    fn stop_service_for_source_watch(&self, env_name: &str) -> Result<(), String> {
-        let stop_result = self.service_service().stop(env_name);
+    fn stop_service_for_source_watch(
+        &self,
+        env_name: &str,
+        lease: &mut SourceWatchLease,
+    ) -> Result<(), String> {
+        let env_service = self.environment_service();
+        let _operation = env_service.lock_operation(env_name)?;
+        self.ensure_source_watch_env_matches(env_name, lease)?;
+        lease.begin_service_takeover()?;
+        let stop_result = self.service_service().stop_locked(env_name);
         match stop_result {
             Ok(summary) if !summary.running => Ok(()),
             Ok(summary) => Err(source_watch_stop_timeout_error(&summary)),
@@ -622,23 +872,65 @@ impl Cli {
         }
     }
 
+    fn ensure_source_watch_env_matches(
+        &self,
+        env_name: &str,
+        lease: &mut SourceWatchLease,
+    ) -> Result<(), String> {
+        let Some(current) = self.environment_service().find(env_name)? else {
+            lease.discard_service_restore()?;
+            return Err(
+                "the environment no longer exists; its previous service was not restored"
+                    .to_string(),
+            );
+        };
+        if lease
+            .session()
+            .is_some_and(|session| !session.restore_target_matches(&current))
+        {
+            lease.discard_service_restore()?;
+            return Err("the environment changed during source watch; its current service policy was preserved".to_string());
+        }
+        Ok(())
+    }
+
+    fn restore_source_watch_service(
+        &self,
+        env_name: &str,
+        lease: &mut SourceWatchLease,
+    ) -> Result<(), String> {
+        let env_service = self.environment_service();
+        let _operation = env_service.lock_operation(env_name)?;
+        self.ensure_source_watch_env_matches(env_name, lease)?;
+        lease.begin_service_restore()?;
+        self.stderr_lines(render_dev_run_step(
+            "Restore",
+            format!("Starting background service for {env_name}"),
+            self.dev_stderr_profile(),
+        ));
+        self.service_service()
+            .start_action_locked(env_name)?
+            .ensure_gateway_ready()
+    }
+
     fn restore_service_policy_after_failed_takeover(
         &self,
         env_name: &str,
         stop_error: String,
         source_watch_lease: &mut SourceWatchLease,
-    ) -> String {
-        if let Err(restore_state_error) = source_watch_lease.begin_service_restore() {
-            return format!(
-                "{stop_error}; also failed preparing background service restoration: {restore_state_error}"
-            );
-        }
-        match self.service_service().start(env_name) {
-            Ok(_) => format!(
-                "{stop_error}; restored the background service policy and did not start source watch"
+    ) -> (String, bool) {
+        match self.restore_source_watch_service(env_name, source_watch_lease) {
+            Ok(()) => (
+                format!(
+                    "{stop_error}; restored the background service policy and did not start source watch"
+                ),
+                true,
             ),
-            Err(restore_error) => format!(
-                "{stop_error}; also failed restoring the background service policy: {restore_error}"
+            Err(restore_error) => (
+                format!(
+                    "{stop_error}; also failed restoring the background service policy: {restore_error}"
+                ),
+                false,
             ),
         }
     }
@@ -891,14 +1183,222 @@ impl Cli {
         ensure_minimum_local_openclaw_config(&paths, gateway_port)
     }
 
-    fn ensure_dev_dependencies(&self, meta: &EnvMeta, watch: bool) -> Result<i32, String> {
+    fn prepare_dev_run(
+        &self,
+        meta: &EnvMeta,
+        onboard: bool,
+        mut lease: Option<&mut SourceWatchLease>,
+        stop: Option<&AtomicBool>,
+    ) -> SourceWatchResult<i32> {
+        if let (Some(lease), Some(stop)) = (lease.as_deref(), stop)
+            && source_watch_cancelled(lease, stop)?
+        {
+            return Ok(130);
+        }
+        let code = self.ensure_dev_dependencies(meta, lease.as_deref_mut(), stop)?;
+        if code != 0 {
+            return Ok(code);
+        }
+        if onboard {
+            let source = meta
+                .dev
+                .as_ref()
+                .ok_or_else(|| "dev binding is missing".to_string())?;
+            self.stderr_lines(render_dev_run_step(
+                "Onboarding",
+                format!("Running local onboarding in {}", source.worktree_root),
+                self.dev_stderr_profile(),
+            ));
+            return self.run_dev_onboard(meta, lease, stop);
+        }
+        if let (Some(lease), Some(stop)) = (lease, stop)
+            && source_watch_cancelled(lease, stop)?
+        {
+            return Ok(130);
+        }
+        Ok(0)
+    }
+
+    fn run_dev_setup(
+        &self,
+        program: &str,
+        args: &[String],
+        env: &std::collections::BTreeMap<String, String>,
+        cwd: &Path,
+        lease: Option<&mut SourceWatchLease>,
+        stop: Option<&AtomicBool>,
+    ) -> SourceWatchResult<i32> {
+        let Some(lease) = lease else {
+            return run_direct(program, args, env, cwd).map_err(SourceWatchError::from);
+        };
+        let stop = stop.ok_or_else(|| "source watch cancellation state is missing".to_string())?;
+        if source_watch_cancelled(lease, stop)? {
+            return Ok(130);
+        }
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", SOURCE_WATCH_SETUP_SHIM, "ocm-dev-setup", program]);
+            command.args(args);
+            command
+        };
+        #[cfg(not(unix))]
+        let mut command = {
+            let mut command = Command::new(program);
+            command.args(args);
+            command
+        };
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .env_clear()
+            .envs(env)
+            .current_dir(cwd);
+        let Some(output) = self.run_owned_source_watch_command(command, lease, stop, true)? else {
+            return Ok(130);
+        };
+        Ok(source_watch_status_code(
+            &output.status,
+            stop.load(Ordering::SeqCst),
+        ))
+    }
+
+    fn run_owned_source_watch_command(
+        &self,
+        mut command: Command,
+        lease: &mut SourceWatchLease,
+        stop: &AtomicBool,
+        terminal: bool,
+    ) -> SourceWatchResult<Option<std::process::Output>> {
+        if source_watch_cancelled(lease, stop)? {
+            return Ok(None);
+        }
+        lease.configure_child(&mut command);
+        let mut guard = SourceWatchProcessGuard::new_with_terminal(terminal)?;
+        guard.configure_command(&mut command)?;
+        lease.begin_child_spawn()?;
+        let mut child = command.spawn().map_err(|error| {
+            source_watch_spawn_error(
+                lease,
+                format!("failed starting source watch preparation: {error}"),
+            )
+        })?;
+        let setup = guard
+            .assign_child(&child)
+            .and_then(|()| lease.attach_to_child(&child))
+            .and_then(|()| lease.record_child(child.id()));
+        if let Err(error) = setup {
+            #[cfg(windows)]
+            return Err(stop_suspended_source_watch_after_error(
+                &mut child, &guard, error,
+            ));
+            #[cfg(not(windows))]
+            return Err(stop_source_watch_after_error(&mut child, &guard, error));
+        }
+        let stdout = child
+            .stdout
+            .take()
+            .map(|pipe| spawn_source_capture(pipe, "stdout"));
+        let stderr = child
+            .stderr
+            .take()
+            .map(|pipe| spawn_source_capture(pipe, "stderr"));
+        let start = source_watch_cancelled(lease, stop).and_then(|cancelled| {
+            if cancelled {
+                Ok(())
+            } else {
+                guard.start_child(&child)
+            }
+        });
+        if let Err(error) = start {
+            #[cfg(windows)]
+            return Err(stop_suspended_source_watch_after_error(
+                &mut child, &guard, error,
+            ));
+            #[cfg(not(windows))]
+            return Err(stop_source_watch_after_error(&mut child, &guard, error));
+        }
+        let result = match wait_for_source_watch_child(&mut child, stop, &guard, lease) {
+            Ok(status) => Ok(status),
+            Err(error) => Err(stop_source_watch_after_error(
+                &mut child,
+                &guard,
+                error.message,
+            )),
+        };
+        let result = match (result, guard.restore_terminal()) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(error)) => Err(error.into()),
+            (Err(error), Err(terminal_error)) => Err(SourceWatchError {
+                message: format!("{}; {terminal_error}", error.message),
+                cleanup_verified: error.cleanup_verified,
+            }),
+        };
+        if source_watch_allows_service_restore(&result) {
+            lease.clear_child()?;
+        }
+        let status = result?;
+        Ok(Some(std::process::Output {
+            status,
+            stdout: collect_source_capture(stdout)?,
+            stderr: collect_source_capture(stderr)?,
+        }))
+    }
+
+    fn inspect_dev_source_dependencies(
+        &self,
+        repo_root: &Path,
+        env: &std::collections::BTreeMap<String, String>,
+        watch: bool,
+        lease: Option<&mut SourceWatchLease>,
+        stop: Option<&AtomicBool>,
+    ) -> SourceWatchResult<Option<String>> {
+        match (lease, stop) {
+            (Some(lease), Some(stop)) => inspect_source_dependencies_with_runner(
+                repo_root,
+                env,
+                watch,
+                cfg!(unix),
+                |command| {
+                    self.run_owned_source_watch_command(command, lease, stop, false)?
+                        .ok_or_else(|| {
+                            SourceWatchError::from(
+                                "source watch preparation was cancelled".to_string(),
+                            )
+                        })
+                },
+            ),
+            _ => inspect_source_dependencies(repo_root, env, watch).map_err(SourceWatchError::from),
+        }
+    }
+
+    fn ensure_dev_dependencies(
+        &self,
+        meta: &EnvMeta,
+        mut lease: Option<&mut SourceWatchLease>,
+        stop: Option<&AtomicBool>,
+    ) -> SourceWatchResult<i32> {
+        let watch = lease.is_some();
         let dev = meta
             .dev
             .as_ref()
             .ok_or_else(|| format!("environment \"{}\" is missing its dev binding", meta.name))?;
         let worktree_root = Path::new(&dev.worktree_root);
         let process_env = build_openclaw_env(meta, &self.env);
-        if inspect_source_dependencies(worktree_root, &process_env, watch)?.is_none() {
+        let inspected = self.inspect_dev_source_dependencies(
+            worktree_root,
+            &process_env,
+            watch,
+            lease.as_deref_mut(),
+            stop,
+        );
+        if source_watch_allows_service_restore(&inspected)
+            && stop.is_some_and(|stop| stop.load(Ordering::SeqCst))
+        {
+            return Ok(130);
+        }
+        if inspected?.is_none() {
             return Ok(0);
         }
         ensure_source_dependency_install_target(worktree_root, &process_env)?;
@@ -908,17 +1408,26 @@ impl Cli {
             format!("Installing dependencies in {}", dev.worktree_root),
             self.dev_stderr_profile(),
         ));
-        let code = run_direct(
+        let code = self.run_dev_setup(
             "pnpm",
             &["install".to_string(), "--frozen-lockfile".to_string()],
             &process_env,
             worktree_root,
+            lease.as_deref_mut(),
+            stop,
         )?;
         if code != 0 {
             return Ok(code);
         }
-        if let Some(issue) = inspect_source_dependencies(worktree_root, &process_env, watch)? {
-            return Err(source_dependency_preparation_error(worktree_root, &issue));
+        let inspected =
+            self.inspect_dev_source_dependencies(worktree_root, &process_env, watch, lease, stop);
+        if source_watch_allows_service_restore(&inspected)
+            && stop.is_some_and(|stop| stop.load(Ordering::SeqCst))
+        {
+            return Ok(130);
+        }
+        if let Some(issue) = inspected? {
+            return Err(source_dependency_preparation_error(worktree_root, &issue).into());
         }
         Ok(0)
     }
@@ -949,7 +1458,12 @@ impl Cli {
         }
     }
 
-    fn run_dev_onboard(&self, meta: &EnvMeta) -> Result<i32, String> {
+    fn run_dev_onboard(
+        &self,
+        meta: &EnvMeta,
+        lease: Option<&mut SourceWatchLease>,
+        stop: Option<&AtomicBool>,
+    ) -> SourceWatchResult<i32> {
         let dev = meta
             .dev
             .as_ref()
@@ -961,11 +1475,13 @@ impl Cli {
             "local".to_string(),
             "--no-install-daemon".to_string(),
         ];
-        run_direct(
+        self.run_dev_setup(
             "pnpm",
             &args,
             &build_openclaw_dev_source_env(meta, &self.env, Path::new(&dev.worktree_root)),
             Path::new(&dev.worktree_root),
+            lease,
+            stop,
         )
     }
 
@@ -992,7 +1508,8 @@ impl Cli {
     fn run_dev_gateway_watch(
         &self,
         meta: &EnvMeta,
-        source_watch_lease: &SourceWatchLease,
+        source_watch_lease: &mut SourceWatchLease,
+        stop_requested: &AtomicBool,
     ) -> SourceWatchResult<i32> {
         let dev = meta
             .dev
@@ -1003,6 +1520,7 @@ impl Cli {
             Path::new(&dev.worktree_root),
             false,
             source_watch_lease,
+            stop_requested,
         )
     }
 
@@ -1011,7 +1529,8 @@ impl Cli {
         meta: &EnvMeta,
         repo_root: &Path,
         tee_to_env_logs: bool,
-        _source_watch_lease: &SourceWatchLease,
+        lease: &mut SourceWatchLease,
+        stop_requested: &AtomicBool,
     ) -> SourceWatchResult<i32> {
         let args = [
             "scripts/watch-node.mjs".to_string(),
@@ -1020,12 +1539,9 @@ impl Cli {
             "--port".to_string(),
             meta.gateway_port.unwrap_or_default().to_string(),
         ];
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let signal_flag = Arc::clone(&stop_requested);
-        ctrlc::set_handler(move || {
-            signal_flag.store(true, Ordering::SeqCst);
-        })
-        .map_err(|error| format!("failed to install dev watch signal handler: {error}"))?;
+        if source_watch_cancelled(lease, stop_requested)? {
+            return Ok(130);
+        }
 
         let mut command = Command::new("node");
         #[cfg(unix)]
@@ -1051,7 +1567,7 @@ impl Cli {
             // while preserving the real noninteractive stdin and EOF inherited by the runner.
             command.env("OCM_SOURCE_WATCH_FORCE_TTY", "1");
         }
-        _source_watch_lease.configure_child(&mut command);
+        lease.configure_child(&mut command);
 
         let mut log_files = if tee_to_env_logs {
             Some(open_source_watch_log_files(meta)?)
@@ -1067,12 +1583,17 @@ impl Cli {
 
         let mut process_guard = SourceWatchProcessGuard::new()?;
         process_guard.configure_command(&mut command)?;
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("failed to run \"node\": {error}"))?;
+        lease.begin_child_spawn()?;
+        let mut child = command.spawn().map_err(|error| {
+            source_watch_spawn_error(lease, format!("failed to run \"node\": {error}"))
+        })?;
         if let Err(error) = process_guard.assign_child(&child) {
             #[cfg(windows)]
-            return Err(stop_suspended_source_watch_after_error(&mut child, error));
+            return Err(stop_suspended_source_watch_after_error(
+                &mut child,
+                &process_guard,
+                error,
+            ));
             #[cfg(not(windows))]
             return Err(stop_source_watch_after_error(
                 &mut child,
@@ -1080,9 +1601,13 @@ impl Cli {
                 error,
             ));
         }
-        if let Err(error) = _source_watch_lease.attach_to_child(&child) {
+        if let Err(error) = lease.attach_to_child(&child) {
             #[cfg(windows)]
-            return Err(stop_suspended_source_watch_after_error(&mut child, error));
+            return Err(stop_suspended_source_watch_after_error(
+                &mut child,
+                &process_guard,
+                error,
+            ));
             #[cfg(not(windows))]
             return Err(stop_source_watch_after_error(
                 &mut child,
@@ -1090,9 +1615,13 @@ impl Cli {
                 error,
             ));
         }
-        if let Err(error) = process_guard.start_child(&child) {
+        if let Err(error) = lease.record_child(child.id()) {
             #[cfg(windows)]
-            return Err(stop_suspended_source_watch_after_error(&mut child, error));
+            return Err(stop_suspended_source_watch_after_error(
+                &mut child,
+                &process_guard,
+                error,
+            ));
             #[cfg(not(windows))]
             return Err(stop_source_watch_after_error(
                 &mut child,
@@ -1112,7 +1641,7 @@ impl Cli {
                     },
                     watch_pid: child.id(),
                 },
-                _source_watch_lease,
+                lease,
             ) {
             Ok(source_watch) => source_watch,
             Err(error) => {
@@ -1123,6 +1652,27 @@ impl Cli {
                 ));
             }
         };
+        let start_result = source_watch_cancelled(lease, stop_requested).and_then(|cancelled| {
+            if cancelled {
+                Ok(())
+            } else {
+                process_guard.start_child(&child)
+            }
+        });
+        if let Err(error) = start_result {
+            #[cfg(windows)]
+            return Err(stop_suspended_source_watch_after_error(
+                &mut child,
+                &process_guard,
+                error,
+            ));
+            #[cfg(not(windows))]
+            return Err(stop_source_watch_after_error(
+                &mut child,
+                &process_guard,
+                error,
+            ));
+        }
         let mut tee_threads = Vec::new();
         if let Some(log_files) = log_files.take() {
             let Some(stdout) = child.stdout.take() else {
@@ -1160,7 +1710,7 @@ impl Cli {
         }
 
         let status_result =
-            match wait_for_source_watch_child(&mut child, &stop_requested, &process_guard) {
+            match wait_for_source_watch_child(&mut child, stop_requested, &process_guard, lease) {
                 Ok(status) => Ok(status),
                 Err(error) => Err(stop_source_watch_after_error(
                     &mut child,
@@ -1190,14 +1740,13 @@ impl Cli {
             Ok(())
         };
 
-        let status = combine_source_watch_cleanup_results(status_result, tee_result, clear_result)?;
-        let mut status_code = status.code();
-        #[cfg(unix)]
-        if status_code.is_none() {
-            status_code = status.signal().map(|signal| 128 + signal);
+        let result = combine_source_watch_cleanup_results(status_result, tee_result, clear_result);
+        if source_watch_allows_service_restore(&result) {
+            lease.clear_child()?;
         }
-        Ok(source_watch_exit_code(
-            status_code,
+        let status = result?;
+        Ok(source_watch_status_code(
+            &status,
             stop_requested.load(Ordering::SeqCst),
         ))
     }
@@ -1304,6 +1853,283 @@ fn source_dependency_preparation_error(repo_root: &Path, issue: &str) -> String 
     )
 }
 
+fn install_source_watch_signal_handler() -> Result<Arc<AtomicBool>, String> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal_flag = Arc::clone(&stop);
+    ctrlc::set_handler(move || signal_flag.store(true, Ordering::SeqCst))
+        .map_err(|error| format!("failed to install dev watch signal handler: {error}"))?;
+    Ok(stop)
+}
+
+fn source_watch_status_code(status: &std::process::ExitStatus, cancelled: bool) -> i32 {
+    let mut code = status.code();
+    #[cfg(unix)]
+    if code.is_none() {
+        code = status.signal().map(|signal| 128 + signal);
+    }
+    source_watch_exit_code(code, cancelled)
+}
+
+fn source_watch_spawn_error(lease: &mut SourceWatchLease, error: String) -> SourceWatchError {
+    match lease.clear_child() {
+        Ok(()) => error.into(),
+        Err(cleanup) => {
+            format!("{error}; failed clearing unstarted child ownership: {cleanup}").into()
+        }
+    }
+}
+
+fn spawn_source_capture<R: Read + Send + 'static>(
+    mut pipe: R,
+    stream: &'static str,
+) -> JoinHandle<Result<Vec<u8>, String>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes)
+            .map_err(|error| format!("failed reading source prerequisite {stream}: {error}"))?;
+        Ok(bytes)
+    })
+}
+
+fn collect_source_capture(
+    capture: Option<JoinHandle<Result<Vec<u8>, String>>>,
+) -> Result<Vec<u8>, String> {
+    match capture {
+        Some(capture) => capture
+            .join()
+            .map_err(|_| "source prerequisite output reader panicked".to_string())?,
+        None => Ok(Vec::new()),
+    }
+}
+
+fn dev_stop_completed(
+    env_name: &str,
+    completion: SourceWatchCompletion,
+) -> Result<DevStopSummary, String> {
+    if let Some(error) = completion.error {
+        return Err(error);
+    }
+    Ok(DevStopSummary {
+        env_name: env_name.to_string(),
+        stopped: true,
+        service_restored: completion.service_restored,
+    })
+}
+
+#[cfg(unix)]
+fn signal_matching_source_watch_process(
+    expected: &ProcessIdentity,
+    signal: i32,
+) -> Result<bool, String> {
+    if expected.pid == 0 || expected.pid > i32::MAX as u32 {
+        return Err("invalid source watch process range; no signal was sent".to_string());
+    }
+    #[cfg(target_os = "linux")]
+    let pidfd = {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, expected.pid as libc::pid_t, 0) };
+        if fd == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(false);
+            }
+            return Err(format!(
+                "failed obtaining a PID-safe source watch handle: {error}"
+            ));
+        }
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) }
+    };
+    if !observe_process(expected.pid)?
+        .is_some_and(|process| process.running && process.identity == *expected)
+    {
+        return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = unsafe { libc::kill(expected.pid as libc::pid_t, signal) } as libc::c_long;
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "failed signaling the recorded source watch process: {error}"
+        ))
+    }
+}
+
+fn stop_orphaned_source_watch(session: &SourceWatchSession) -> Result<(), String> {
+    if session.process_scope != process_scope_id()? {
+        return Err("source watch process scope changed; no processes were signaled".to_string());
+    }
+    #[cfg(windows)]
+    if session.child_spawn_pending {
+        return Err("source watch controller exited before publishing child ownership; Windows crash cleanup cannot be verified, so the unfinished session was retained".to_string());
+    }
+    let Some(child) = &session.child else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        let process = observe_process(child.pid)?;
+        if !process
+            .as_ref()
+            .is_some_and(|process| process.running && process.identity == *child)
+        {
+            if process_group_members(child.pid)?.is_empty() {
+                return Ok(());
+            }
+            return Err("recorded source watch identity no longer matches a live group owner; no processes were signaled".to_string());
+        }
+        if process.as_ref().and_then(|process| process.process_group) != Some(child.pid) {
+            return Err(
+                "recorded source watch process changed groups; no processes were signaled"
+                    .to_string(),
+            );
+        }
+        struct ResumeOnError<'a> {
+            child: &'a ProcessIdentity,
+            armed: bool,
+        }
+        impl Drop for ResumeOnError<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = signal_matching_source_watch_process(self.child, libc::SIGCONT);
+                }
+            }
+        }
+        if !signal_matching_source_watch_process(child, libc::SIGSTOP)? {
+            return Err("source watch owner exited before its group could be stopped".to_string());
+        }
+        let mut paused = ResumeOnError { child, armed: true };
+        let owns_group = || -> Result<bool, String> {
+            Ok(observe_process(child.pid)?.is_some_and(|process| {
+                process.running
+                    && process.identity == *child
+                    && process.process_group == Some(child.pid)
+                    && process.stopped
+            }))
+        };
+        let pause_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !owns_group()? {
+            if std::time::Instant::now() >= pause_deadline {
+                return Err("source watch group owner did not acknowledge suspension".to_string());
+            }
+            if !observe_process(child.pid)?.is_some_and(|process| {
+                process.running
+                    && process.identity == *child
+                    && process.process_group == Some(child.pid)
+            }) {
+                return Err("source watch group ownership changed during shutdown".to_string());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Keep the recorded leader paused as the group identity anchor while
+        // its descendants receive the same bounded shutdown grace as live watch.
+        signal_unix_process_group(child.pid, libc::SIGTERM)?;
+        for process in process_group_members(child.pid)? {
+            if process.identity.pid != child.pid && process.stopped {
+                signal_matching_source_watch_process(&process.identity, libc::SIGCONT)?;
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(7);
+        while std::time::Instant::now() < deadline {
+            if !process_group_members(child.pid)?
+                .iter()
+                .any(|process| process.identity.pid != child.pid)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if !owns_group()? {
+            return Err("source watch group ownership changed before final cleanup".to_string());
+        }
+        signal_unix_process_group(child.pid, libc::SIGSTOP)?;
+        signal_unix_process_group(child.pid, libc::SIGKILL)?;
+        paused.armed = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !process_group_members(child.pid)?.is_empty() {
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "source watch process group remained active; service restoration was deferred"
+                        .to_string(),
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        // The existing kill-on-close job contains all children when its
+        // controller exits. Never replace that authority with a PID tree scan.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match observe_process(child.pid)? {
+                Some(process) if process.identity != *child => {
+                    return Err(
+                        "source watch PID was reused; no process was terminated".to_string()
+                    );
+                }
+                Some(process) if process.running => {}
+                _ => return Ok(()),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("source watch process job has not finished stopping".to_string());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err("source watch crash recovery is unsupported on this platform".to_string())
+}
+
+fn source_watch_cancelled(lease: &SourceWatchLease, stop: &AtomicBool) -> Result<bool, String> {
+    if stop.load(Ordering::SeqCst) || lease.stop_requested()? {
+        stop.store(true, Ordering::SeqCst);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn finish_source_watch_session(
+    env_name: &str,
+    lease: &mut SourceWatchLease,
+    watch_result: SourceWatchResult<i32>,
+    restore_result: Result<(), String>,
+    service_restored: bool,
+) -> Result<i32, String> {
+    let preserve_session = !source_watch_allows_service_restore(&watch_result)
+        || (lease
+            .session()
+            .is_some_and(|session| session.restore_service)
+            && !service_restored);
+    let result = combine_watch_and_restore_results(watch_result, restore_result, env_name);
+    match lease.finish_session(
+        service_restored,
+        result.as_ref().err().cloned(),
+        preserve_session,
+    ) {
+        Ok(()) => result,
+        Err(error) => Err(match result {
+            Ok(_) => format!("source watch ended, but its session cleanup failed: {error}"),
+            Err(primary) => format!("{primary}; source watch session cleanup also failed: {error}"),
+        }),
+    }
+}
+
 fn source_watch_stop_timeout_error(summary: &crate::service::ServiceActionSummary) -> String {
     let warnings = if summary.warnings.is_empty() {
         String::new()
@@ -1371,56 +2197,85 @@ fn wait_for_source_watch_child(
     child: &mut std::process::Child,
     stop_requested: &AtomicBool,
     process_guard: &SourceWatchProcessGuard,
+    lease: &SourceWatchLease,
 ) -> SourceWatchResult<std::process::ExitStatus> {
     loop {
-        if let Some(status) = child.try_wait().map_err(|error| {
-            SourceWatchError::unverified(format!("failed waiting for source watch: {error}"))
-        })? {
-            process_guard
-                .stop_remaining(child.id())
-                .map_err(SourceWatchError::unverified)?;
+        if let Some(status) = poll_source_watch_child(child, process_guard)? {
             return Ok(status);
         }
-        if stop_requested.load(Ordering::SeqCst) {
+        if source_watch_cancelled(lease, stop_requested).map_err(SourceWatchError::unverified)? {
             return stop_source_watch_child(child, process_guard);
         }
         #[cfg(unix)]
+        if observe_process(child.id())
+            .map_err(SourceWatchError::unverified)?
+            .is_some_and(|process| process.stopped)
         {
-            let mut status = 0;
-            let waited = unsafe {
-                libc::waitpid(
-                    child.id() as libc::pid_t,
-                    &mut status,
-                    libc::WNOHANG | libc::WUNTRACED,
-                )
-            };
-            if waited == -1 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(SourceWatchError::unverified(format!(
-                        "failed checking source watch job-control state: {error}"
-                    )));
-                }
-            } else if waited != 0 {
-                if libc::WIFSTOPPED(status) {
-                    process_guard
-                        .suspend_with_child(child.id())
-                        .map_err(SourceWatchError::unverified)?;
-                } else if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-                    process_guard
-                        .stop_remaining(child.id())
-                        .map_err(SourceWatchError::unverified)?;
-                    return Ok(std::process::ExitStatus::from_raw(status));
-                }
-            }
+            process_guard
+                .suspend_with_child(child.id(), lease, stop_requested)
+                .map_err(SourceWatchError::unverified)?;
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn poll_source_watch_child(
+    child: &mut std::process::Child,
+    guard: &SourceWatchProcessGuard,
+) -> SourceWatchResult<Option<std::process::ExitStatus>> {
+    #[cfg(unix)]
+    {
+        // Keep the exited leader waitable until group cleanup is complete, so
+        // its PID cannot be reused by an unrelated process group.
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if waited == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                return Ok(None);
+            }
+            return Err(SourceWatchError::unverified(format!(
+                "failed observing source watch exit: {error}"
+            )));
+        }
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(None);
+        }
+        guard
+            .stop_remaining(child.id())
+            .map_err(SourceWatchError::unverified)?;
+        child.wait().map(Some).map_err(|error| {
+            SourceWatchError::unverified(format!("failed reaping source watch: {error}"))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let status = child.try_wait().map_err(|error| {
+            SourceWatchError::unverified(format!("failed waiting for source watch: {error}"))
+        })?;
+        if status.is_some() {
+            guard
+                .stop_remaining(child.id())
+                .map_err(SourceWatchError::unverified)?;
+        }
+        Ok(status)
     }
 }
 
 struct SourceWatchProcessGuard {
     #[cfg(unix)]
     terminal: Option<SourceWatchTerminalGuard>,
+    #[cfg(unix)]
+    startup_reader: UnixStream,
+    #[cfg(unix)]
+    startup_writer: UnixStream,
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -1428,16 +2283,22 @@ struct SourceWatchProcessGuard {
 #[cfg(unix)]
 struct SourceWatchTerminalGuard {
     parent_process_group: libc::pid_t,
-    startup_reader: Option<UnixStream>,
-    startup_writer: Option<UnixStream>,
+    foreground_was_owned: bool,
     foreground_assigned: AtomicBool,
 }
 
 impl SourceWatchProcessGuard {
     fn new() -> Result<Self, String> {
+        Self::new_with_terminal(true)
+    }
+
+    fn new_with_terminal(terminal: bool) -> Result<Self, String> {
+        #[cfg(not(unix))]
+        let _ = terminal;
         #[cfg(unix)]
         {
-            let terminal = if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+            let (startup_reader, startup_writer) = source_watch_startup_pair()?;
+            let terminal = if terminal && unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
                 let foreground_process_group = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
                 if foreground_process_group == -1 {
                     return Err(format!(
@@ -1446,25 +2307,19 @@ impl SourceWatchProcessGuard {
                     ));
                 }
                 let parent_process_group = unsafe { libc::getpgrp() };
-                let (startup_reader, startup_writer) =
-                    if foreground_process_group == parent_process_group {
-                        let (reader, writer) = UnixStream::pair().map_err(|error| {
-                            format!("failed creating source watch startup gate: {error}")
-                        })?;
-                        (Some(reader), Some(writer))
-                    } else {
-                        (None, None)
-                    };
                 Some(SourceWatchTerminalGuard {
                     parent_process_group,
-                    startup_reader,
-                    startup_writer,
+                    foreground_was_owned: foreground_process_group == parent_process_group,
                     foreground_assigned: AtomicBool::new(false),
                 })
             } else {
                 None
             };
-            Ok(Self { terminal })
+            Ok(Self {
+                terminal,
+                startup_reader,
+                startup_writer,
+            })
         }
         #[cfg(windows)]
         {
@@ -1510,12 +2365,8 @@ impl SourceWatchProcessGuard {
 
     fn configure_command(&mut self, command: &mut Command) -> Result<(), String> {
         #[cfg(unix)]
-        if let Some(startup_reader) = self
-            .terminal
-            .as_ref()
-            .and_then(|terminal| terminal.startup_reader.as_ref())
         {
-            let startup_fd = startup_reader.as_raw_fd();
+            let startup_fd = self.startup_reader.as_raw_fd();
             command.env("OCM_SOURCE_WATCH_START_FD", startup_fd.to_string());
             unsafe {
                 command.pre_exec(move || {
@@ -1557,7 +2408,7 @@ impl SourceWatchProcessGuard {
         }
         #[cfg(unix)]
         if let Some(terminal) = &self.terminal
-            && terminal.startup_reader.is_some()
+            && terminal.foreground_was_owned
         {
             set_terminal_foreground_process_group(child.id() as libc::pid_t)?;
             terminal.foreground_assigned.store(true, Ordering::SeqCst);
@@ -1569,14 +2420,10 @@ impl SourceWatchProcessGuard {
 
     fn start_child(&self, _child: &std::process::Child) -> Result<(), String> {
         #[cfg(unix)]
-        if let Some(startup_writer) = self
-            .terminal
-            .as_ref()
-            .and_then(|terminal| terminal.startup_writer.as_ref())
         {
-            let mut writer = startup_writer;
+            let mut writer = &self.startup_writer;
             writer
-                .write_all(&[1])
+                .write_all(b"1\n")
                 .map_err(|error| format!("failed releasing source watch startup gate: {error}"))?;
         }
         #[cfg(windows)]
@@ -1595,14 +2442,25 @@ impl SourceWatchProcessGuard {
     }
 
     #[cfg(unix)]
-    fn suspend_with_child(&self, child_pid: u32) -> Result<(), String> {
+    fn suspend_with_child(
+        &self,
+        child_pid: u32,
+        lease: &SourceWatchLease,
+        stop: &AtomicBool,
+    ) -> Result<(), String> {
         self.restore_terminal()?;
         loop {
+            if source_watch_cancelled(lease, stop)? {
+                break;
+            }
             if unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) } == -1 {
                 return Err(format!(
                     "failed suspending OCM with source watch: {}",
                     io::Error::last_os_error()
                 ));
+            }
+            if source_watch_cancelled(lease, stop)? {
+                break;
             }
             let Some(terminal) = &self.terminal else {
                 break;
@@ -1688,6 +2546,26 @@ impl SourceWatchProcessGuard {
 }
 
 #[cfg(unix)]
+fn source_watch_startup_pair() -> Result<(UnixStream, UnixStream), String> {
+    fn above_stdio(stream: UnixStream) -> Result<UnixStream, String> {
+        if stream.as_raw_fd() > libc::STDERR_FILENO {
+            return Ok(stream);
+        }
+        let fd = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if fd == -1 {
+            return Err(format!(
+                "failed reserving source watch startup descriptor: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok(unsafe { UnixStream::from_raw_fd(fd) })
+    }
+    let (reader, writer) = UnixStream::pair()
+        .map_err(|error| format!("failed creating source watch startup gate: {error}"))?;
+    Ok((above_stdio(reader)?, above_stdio(writer)?))
+}
+
+#[cfg(unix)]
 impl Drop for SourceWatchProcessGuard {
     fn drop(&mut self) {
         let _ = self.restore_terminal();
@@ -1746,16 +2624,11 @@ fn stop_source_watch_child(
         // watch-node forwards TERM to its runner; allow that grace before
         // enforcing the process-group ownership boundary.
         if signal_unix_process(child.id(), libc::SIGTERM).map_err(SourceWatchError::unverified)? {
+            signal_unix_process_group_for_cleanup(child.id(), libc::SIGCONT)
+                .map_err(SourceWatchError::unverified)?;
             let deadline = std::time::Instant::now() + Duration::from_secs(7);
             while std::time::Instant::now() < deadline {
-                if let Some(status) = child.try_wait().map_err(|error| {
-                    SourceWatchError::unverified(format!(
-                        "failed waiting for source watch shutdown: {error}"
-                    ))
-                })? {
-                    process_guard
-                        .stop_remaining(child.id())
-                        .map_err(SourceWatchError::unverified)?;
+                if let Some(status) = poll_source_watch_child(child, process_guard)? {
                     return Ok(status);
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -1765,12 +2638,12 @@ fn stop_source_watch_child(
             .map_err(SourceWatchError::unverified)?;
         signal_unix_process_group_for_cleanup(child.id(), libc::SIGKILL)
             .map_err(SourceWatchError::unverified)?;
+        wait_for_unix_process_group_to_stop(child.id()).map_err(SourceWatchError::unverified)?;
         let status = child.wait().map_err(|error| {
             SourceWatchError::unverified(format!(
                 "failed waiting for stopped source watch: {error}"
             ))
         })?;
-        wait_for_unix_process_group_to_stop(child.id()).map_err(SourceWatchError::unverified)?;
         Ok(status)
     }
 
@@ -1997,6 +2870,7 @@ fn stop_source_watch_after_error(
 #[cfg(windows)]
 fn stop_suspended_source_watch_after_error(
     child: &mut std::process::Child,
+    guard: &SourceWatchProcessGuard,
     primary_error: String,
 ) -> SourceWatchError {
     if let Err(error) = child.kill() {
@@ -2004,8 +2878,12 @@ fn stop_suspended_source_watch_after_error(
             "{SOURCE_WATCH_TREE_ACTIVE_ERROR}; failed terminating a suspended watcher: {error}; setup also failed: {primary_error}"
         ));
     }
-    match child.wait() {
-        Ok(_) => SourceWatchError::from(primary_error),
+    match child
+        .wait()
+        .map_err(|error| error.to_string())
+        .and_then(|_| guard.stop_remaining(child.id()))
+    {
+        Ok(()) => SourceWatchError::from(primary_error),
         Err(error) => SourceWatchError::unverified(format!(
             "{SOURCE_WATCH_TREE_ACTIVE_ERROR}; failed reaping a suspended watcher: {error}; setup also failed: {primary_error}"
         )),

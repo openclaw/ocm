@@ -248,7 +248,13 @@ pub fn dev_help(cmd: &str) -> String {
         )],
         &[(
             "Commands",
-            &[("status", "Show dev envs and active source watches")],
+            &[
+                ("status", "Show dev envs and active source watches"),
+                (
+                    "stop",
+                    "Stop an owned source-watch session and restore its service",
+                ),
+            ],
         )],
         vec![
             format!("{cmd} dev shaks"),
@@ -260,9 +266,11 @@ pub fn dev_help(cmd: &str) -> String {
             format!("{cmd} dev shaks --onboard"),
             format!("{cmd} dev status"),
             format!("{cmd} dev status shaks --json"),
+            format!("{cmd} dev stop shaks"),
         ],
         vec![
             format!("{cmd} help dev status"),
+            format!("{cmd} help dev stop"),
             format!("{cmd} help service refresh-daemon"),
         ],
     )
@@ -270,6 +278,30 @@ pub fn dev_help(cmd: &str) -> String {
 
 pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
     match action {
+        "stop" => Some(render_leaf(
+            "Stop source watch",
+            "Ask the recorded source-watch controller to stop its setup or gateway processes, or recover its owned process group after a controller crash. Preserve the env, source checkout, dependencies, and configuration.",
+            vec![format!("{cmd} dev stop <env> [--raw] [--json]")],
+            &[
+                ("<env>", "Environment whose source watch should stop"),
+                ("--raw", "Print plain output"),
+                (
+                    "--json",
+                    "Print JSON with envName, stopped, and serviceRestored",
+                ),
+            ],
+            vec![
+                format!("{cmd} dev stop shaks"),
+                format!("{cmd} dev stop shaks --json"),
+            ],
+            &[
+                "Waits for the owned source processes to stop before restoring a background service taken over by --watch --force.",
+                "Does not stop an ordinary foreground run or an independently managed background service.",
+                "Older watches without recorded ownership must be stopped from their original terminal. Unverifiable process identity or cleanup retains the unfinished session and reports an error.",
+                "On Windows, recovery cannot verify a controller crash before child ownership is published; that unfinished session is retained for operator recovery.",
+                "After updating OCM, refresh an older running daemon from that installation with service refresh-daemon --acknowledge-gateway-restarts so it uses the same ownership locks.",
+            ],
+        )),
         "status" => Some(render_leaf(
             "Show dev env status",
             "Inspect source watch ownership, source paths, gateway ports, and observed service state for one env or all dev sessions.",

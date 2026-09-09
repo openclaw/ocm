@@ -119,6 +119,7 @@ ocm dev shaks
 ocm dev shaks --root /tmp/shaks
 ocm dev shaks --watch
 ocm dev shaks --watch --force
+ocm dev stop shaks
 ocm dev shaks --repo /path/to/openclaw --watch --force
 ocm dev shaks --service
 ocm dev shaks --onboard
@@ -278,7 +279,8 @@ After updating OCM, a background daemon still running the previous code needs an
 explicit refresh to enforce this watch exclusion. `ocm service status` reports
 CLI and daemon versions. During a maintenance window, run
 `ocm service refresh-daemon --acknowledge-gateway-restarts`; this restarts the
-managed gateways.
+managed gateways. Run the refresh from the updated OCM installation so the
+daemon and source-watch commands use the same ownership locks.
 
 An existing dev env resumes its recorded worktree, preserving its uncommitted changes. If that worktree is missing or has been replaced by an unrelated checkout, `dev` reports an error instead of recreating it; restore the recorded checkout before retrying. An explicit `--repo` must still identify the env's original repository, including equivalent path aliases, and cannot rebind the env to another checkout.
 
@@ -287,6 +289,10 @@ Before starting source, `dev` checks the installed entry points for the tooling 
 Repeating `ocm dev <env> --watch` for a matching active source returns its status and existing gateway link without preparing dependencies, onboarding, or restarting processes. Source/root/port mismatches and onboarding during a watch are errors. Startup and service restoration are reported as progress; an invocation during startup does not claim a source identity that has not yet been published. Temporary runtime or launcher takeovers retain the `--repo <path> --watch --force` form. Active status and routed source commands use the captured launch root and port even if config is edited; an explicit different port is refused. Watch sessions started by an older OCM without endpoint metadata need to be stopped from their original terminal and started again before they can be reused. Only the invocation that acquires the watch lease prepares configuration.
 
 Use `ocm dev status [env]` to inspect dev environments and temporary source watches on runtime or launcher environments. It reports the source path, gateway URL, and watch ownership (`starting`, `active`, `restoring`, `inactive`, or `unknown`). Active watch ownership can outlive the wrapper process and does not imply that the Gateway is ready. JSON keeps `serviceRunning` separate from the saved `serviceDesiredRunning` policy and includes the watch PID, start time, and any inspection issue. `gatewayPortReachable` uses a 100 ms loopback TCP check; an open port does not establish Gateway identity or readiness. Status leaves watch metadata unchanged and omits lease tokens.
+
+Use `ocm dev stop <env>` from another terminal to cancel an owned source-watch session, including dependency preparation and onboarding. It waits for the source processes to stop and restores a background service previously taken over with `--watch --force`. The environment, configuration, source checkout, and dependencies remain available for the next run. `--json` reports `envName`, `stopped`, and `serviceRestored`; repeated stops after completion are harmless. Ordinary foreground runs and independently managed background services keep their existing stop commands.
+
+After a watch controller crashes, `dev stop` verifies its recorded process start identity and ownership before recovering the session. It retains an unfinished session when cleanup or service restoration cannot be verified, and rejects a stale generation or a different boot/process namespace. Older watches without ownership records must be stopped from their original terminal. Windows uses the existing process job for owned child cleanup; a controller crash before child ownership is published cannot be verified automatically and requires operator recovery. Updating OCM does not add ownership records to a watch that is already running.
 
 ### Try beta or pin a specific release
 

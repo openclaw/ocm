@@ -19,6 +19,9 @@ use crate::env::{
     RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions,
 };
 use crate::infra::process::{run_direct, run_shell};
+use crate::infra::process_identity::ProcessIdentity;
+#[cfg(unix)]
+use crate::infra::process_identity::process_start_id;
 use crate::infra::shell::{
     build_openclaw_dev_source_env, build_openclaw_env, render_use_script, resolve_shell_name,
 };
@@ -56,14 +59,7 @@ pub(crate) struct EnvDestroyStepSummary {
     pub description: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct EnvDestroyProcessIdentity {
-    // Parent, cwd, and argv can change or contain credentials. PID plus a
-    // normalized start time detects reuse without exposing mutable details.
-    pid: u32,
-    started_at: String,
-}
+pub(crate) type EnvDestroyProcessIdentity = ProcessIdentity;
 
 fn managed_gateway_lifecycle_action(args: &[String]) -> Option<&str> {
     let mut command = None;
@@ -1972,106 +1968,6 @@ fn current_process_identity(pid: u32) -> Result<Option<EnvDestroyProcessIdentity
         return Ok(None);
     }
     Ok(process_start_id(pid)?.map(|started_at| EnvDestroyProcessIdentity { pid, started_at }))
-}
-
-#[cfg(target_os = "linux")]
-fn process_start_id(pid: u32) -> Result<Option<String>, String> {
-    let path = format!("/proc/{pid}/stat");
-    let stat = match fs::read_to_string(&path) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "failed to inspect process start identity for pid {pid}: {error}"
-            ));
-        }
-    };
-    let Some(fields) = stat.rsplit_once(')').map(|(_, fields)| fields) else {
-        return Err(format!(
-            "failed to parse process start identity for pid {pid}"
-        ));
-    };
-    let Some(start_ticks) = fields.split_whitespace().nth(19) else {
-        return Err(format!(
-            "failed to parse process start identity for pid {pid}"
-        ));
-    };
-    Ok(Some(start_ticks.to_string()))
-}
-
-#[cfg(target_os = "macos")]
-fn process_start_id(pid: u32) -> Result<Option<String>, String> {
-    const PROC_PIDTBSDINFO: i32 = 3;
-    let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
-    let size = std::mem::size_of::<ProcBsdInfo>() as i32;
-    // SAFETY: `info` is a correctly sized C-compatible buffer for
-    // `PROC_PIDTBSDINFO`; the return size is checked before initialization.
-    let bytes = unsafe {
-        proc_pidinfo(
-            pid as i32,
-            PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if bytes == 0 && !process_alive(pid) {
-        return Ok(None);
-    }
-    if bytes != size {
-        return Err(format!(
-            "failed to inspect process start identity for pid {pid}"
-        ));
-    }
-    // SAFETY: `proc_pidinfo` filled the complete buffer above.
-    let info = unsafe { info.assume_init() };
-    if info.pbi_pid != pid {
-        return Ok(None);
-    }
-    Ok(Some(format!(
-        "{}:{:06}",
-        info.pbi_start_tvsec, info.pbi_start_tvusec
-    )))
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn process_start_id(pid: u32) -> Result<Option<String>, String> {
-    Err(format!(
-        "process start identity inspection is unsupported for pid {pid} on this platform"
-    ))
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct ProcBsdInfo {
-    pbi_flags: u32,
-    pbi_status: u32,
-    pbi_xstatus: u32,
-    pbi_pid: u32,
-    pbi_ppid: u32,
-    pbi_uid: u32,
-    pbi_gid: u32,
-    pbi_ruid: u32,
-    pbi_rgid: u32,
-    pbi_svuid: u32,
-    pbi_svgid: u32,
-    rfu_1: u32,
-    pbi_comm: [i8; 16],
-    pbi_name: [i8; 32],
-    pbi_nfiles: u32,
-    pbi_pgid: u32,
-    pbi_pjobc: u32,
-    e_tdev: u32,
-    e_tpgid: u32,
-    pbi_nice: i32,
-    pbi_start_tvsec: u64,
-    pbi_start_tvusec: u64,
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "proc")]
-unsafe extern "C" {
-    fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, size: i32) -> i32;
 }
 
 #[cfg(unix)]

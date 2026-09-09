@@ -140,11 +140,31 @@ pub(crate) fn ensure_checkout_owned_dependencies(repo_root: &Path) -> Result<(),
     ))
 }
 
+const SOURCE_DEPENDENCY_STARTUP_GATE: &str = r#"const ocmGateFd = Number(process.env.OCM_SOURCE_WATCH_START_FD);
+const ocmGateFs = await import("node:fs");
+if (!Number.isInteger(ocmGateFd) || ocmGateFs.readSync(ocmGateFd, Buffer.alloc(1), 0, 1, null) !== 1) process.exit(1);
+ocmGateFs.closeSync(ocmGateFd);
+delete process.env.OCM_SOURCE_WATCH_START_FD;"#;
+
 pub(crate) fn inspect_source_dependencies(
     repo_root: &Path,
     env: &BTreeMap<String, String>,
     watch: bool,
 ) -> Result<Option<String>, String> {
+    inspect_source_dependencies_with_runner(repo_root, env, watch, false, |mut command| {
+        command.output().map_err(|error| {
+            format!("failed to run node for OpenClaw source prerequisite checks: {error}")
+        })
+    })
+}
+
+pub(crate) fn inspect_source_dependencies_with_runner<E: From<String>>(
+    repo_root: &Path,
+    env: &BTreeMap<String, String>,
+    watch: bool,
+    startup_gate: bool,
+    run_probe: impl FnOnce(Command) -> Result<std::process::Output, E>,
+) -> Result<Option<String>, E> {
     ensure_checkout_owned_dependencies(repo_root)?;
     for script in ["scripts/run-node.mjs"]
         .into_iter()
@@ -154,7 +174,8 @@ pub(crate) fn inspect_source_dependencies(
             return Err(format!(
                 "OpenClaw source entry is missing: {}",
                 display_path(&repo_root.join(script))
-            ));
+            )
+            .into());
         }
     }
     let manifest_path = repo_root.join("package.json");
@@ -175,9 +196,9 @@ pub(crate) fn inspect_source_dependencies(
             && !value.is_object()
             && !value.is_null()
         {
-            return Err(format!(
-                "invalid OpenClaw package metadata: {section} must be an object"
-            ));
+            return Err(
+                format!("invalid OpenClaw package metadata: {section} must be an object").into(),
+            );
         }
     }
     // These are the source runner's build tools and the watch runner's watcher,
@@ -213,12 +234,18 @@ pub(crate) fn inspect_source_dependencies(
         .map(display_path)
         .unwrap_or_default();
     let requirements = serde_json::to_string(&requirements).map_err(|error| error.to_string())?;
-    let output = Command::new("node")
+    let probe = if startup_gate {
+        format!("{SOURCE_DEPENDENCY_STARTUP_GATE}\n{SOURCE_DEPENDENCY_PROBE}")
+    } else {
+        SOURCE_DEPENDENCY_PROBE.to_string()
+    };
+    let mut command = Command::new("node");
+    command
         .args([
             "--input-type=module",
             "--experimental-import-meta-resolve",
             "--eval",
-            SOURCE_DEPENDENCY_PROBE,
+            &probe,
             "--",
             "ocm-source-dependencies",
             &requirements,
@@ -233,16 +260,14 @@ pub(crate) fn inspect_source_dependencies(
         .current_dir(repo_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| {
-            format!("failed to run node for OpenClaw source prerequisite checks: {error}")
-        })?;
+        .stderr(Stdio::piped());
+    let output = run_probe(command)?;
     if !output.status.success() {
         return Err(format!(
             "OpenClaw source prerequisite check failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        )
+        .into());
     }
     let issues: Vec<String> = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("invalid OpenClaw source prerequisite result: {error}"))?;

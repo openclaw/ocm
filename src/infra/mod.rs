@@ -3,6 +3,7 @@ pub(crate) mod command_output;
 pub mod download;
 pub(crate) mod install_owner;
 pub mod process;
+pub(crate) mod process_identity;
 pub mod shell;
 mod sqlite_snapshot;
 pub mod terminal;
