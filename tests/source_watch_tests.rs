@@ -213,6 +213,47 @@ fn dev_status_observes_active_and_transitional_source_watch() {
     assert!(stdout(&raw).contains("watch=active"));
     assert_eq!(fs::read(&override_path).unwrap(), metadata_before);
     assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+    let legacy_reuse = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&source_repo),
+            "--watch",
+            "--force",
+        ],
+    );
+    assert!(!legacy_reuse.status.success());
+    assert!(
+        stderr(&legacy_reuse).contains("no recorded launch endpoint"),
+        "{}",
+        stderr(&legacy_reuse)
+    );
+    assert_eq!(fs::read(&override_path).unwrap(), metadata_before);
+    let foreign_root = TestDir::new("dev-reuse-foreign-source");
+    let foreign_repo = create_source_repo(&foreign_root);
+    let mismatch = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&foreign_repo),
+            "--watch",
+            "--force",
+        ],
+    );
+    assert!(!mismatch.status.success());
+    assert!(
+        stderr(&mismatch).contains("already uses"),
+        "{}",
+        stderr(&mismatch)
+    );
+    assert_eq!(fs::read(&override_path).unwrap(), metadata_before);
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
 
     fs::remove_file(&override_path).unwrap();
     let starting = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
@@ -221,6 +262,23 @@ fn dev_status_observes_active_and_transitional_source_watch() {
     assert_eq!(starting["sourceWatch"]["state"], "starting");
     assert!(starting["repoRoot"].is_null());
     assert!(!override_path.exists());
+    let repeated = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&source_repo),
+            "--watch",
+            "--force",
+        ],
+    );
+    assert!(repeated.status.success(), "{}", stderr(&repeated));
+    assert!(stderr(&repeated).contains("is starting; keeping the existing session"));
+    assert!(!stdout(&repeated).contains("ready"));
+    assert!(!override_path.exists());
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
 
     drop(watch);
     let restoring = lock_source_watch_with_id(&root, "restoring:status-fixture");
@@ -640,9 +698,13 @@ fn restoring_source_watch_lease_allows_runtime_fallback() {
             "--force",
         ],
     );
-    assert!(!overlapping_watch.status.success());
     assert!(
-        stderr(&overlapping_watch).contains("already active or starting"),
+        overlapping_watch.status.success(),
+        "{}",
+        stderr(&overlapping_watch)
+    );
+    assert!(
+        stderr(&overlapping_watch).contains("is restoring; keeping the existing session"),
         "{}",
         stderr(&overlapping_watch)
     );
@@ -830,7 +892,34 @@ fn source_watch_override_flows_to_env_exec_and_status_surfaces() {
     create_runtime_backed_env(&root, &cwd, &env);
     let _source_watch = lock_source_watch(&root);
     write_active_source_watch_override(&root, &source_repo);
+    let meta = EnvironmentService::new(&env, &cwd).get("demo").unwrap();
+    let override_path = root.child("ocm-home/source-watch/demo.json");
+    let mut watch: Value = serde_json::from_slice(&fs::read(&override_path).unwrap()).unwrap();
+    watch["endpoint"] = json!({"envRoot": meta.root, "gatewayPort": 21901});
+    fs::write(&override_path, serde_json::to_vec(&watch).unwrap()).unwrap();
+    let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    fs::write(&config_path, r#"{"gateway":{"port":21902}}"#).unwrap();
 
+    let inherited_port = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "exec",
+            "demo",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s' \"$OPENCLAW_GATEWAY_PORT\"",
+        ],
+    );
+    assert!(
+        inherited_port.status.success(),
+        "{}",
+        stderr(&inherited_port)
+    );
+    assert_eq!(stdout(&inherited_port), "21901");
     let entry = source_repo.join("openclaw.mjs");
     let exec = run_ocm(
         &cwd,

@@ -29,10 +29,10 @@ pub use snapshots::{
     EnvSnapshotSummary, RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions,
     UpgradeCheckpointScope, select_snapshot_prune_candidates,
 };
-pub use source_watch::SourceWatchOverride;
 pub(crate) use source_watch::{
     CreateSourceWatchOverrideOptions, SourceWatchLease, SourceWatchState,
 };
+pub use source_watch::{SourceWatchEndpoint, SourceWatchOverride};
 
 pub struct EnvironmentService<'a> {
     env: &'a BTreeMap<String, String>,

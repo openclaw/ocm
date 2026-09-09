@@ -1271,9 +1271,7 @@ impl Cli {
             return Err("env exec requires a command after --".to_string());
         }
 
-        let meta = self
-            .environment_service()
-            .apply_effective_gateway_port(self.environment_service().touch(name)?)?;
+        let meta = self.environment_service().touch(name)?;
         if meta.service_enabled
             && meta.service_running
             && after.first().is_some_and(|command| command == "openclaw")
@@ -1289,6 +1287,9 @@ impl Cli {
             .environment_service()
             .active_source_watch_override(&meta.name)?
         {
+            let meta = self
+                .environment_service()
+                .source_watch_environment(meta, &source)?;
             let source_env =
                 build_openclaw_dev_source_env(&meta, &self.env, Path::new(&source.repo_root));
             if after[0] == "openclaw" {
@@ -1303,6 +1304,9 @@ impl Cli {
             }
             return run_direct(&after[0], &after[1..], &source_env, &self.cwd);
         }
+        let meta = self
+            .environment_service()
+            .apply_effective_gateway_port(meta)?;
         run_direct(
             &after[0],
             &after[1..],

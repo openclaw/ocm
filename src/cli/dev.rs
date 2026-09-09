@@ -26,7 +26,7 @@ use super::Cli;
 use super::render::RenderProfile;
 use crate::env::{
     CreateEnvironmentOptions, CreateSourceWatchOverrideOptions, EnvDevMeta, EnvMeta,
-    SourceWatchLease, SourceWatchState,
+    SourceWatchEndpoint, SourceWatchLease, SourceWatchState,
 };
 use crate::infra::process::run_direct;
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
@@ -219,27 +219,36 @@ impl Cli {
         }
         let name = validate_name(name, "Environment name")?;
 
-        if let Some(existing) = self.environment_service().find(&name)?
-            && existing.dev.is_none()
-        {
-            return self.handle_existing_env_source_watch(
-                existing,
-                ExistingEnvSourceWatchOptions {
-                    repo_root,
-                    root,
+        if let Some(existing) = self.environment_service().find(&name)? {
+            if watch
+                && (existing.dev.is_some() || force)
+                && self.try_reuse_dev_watch(
+                    &existing,
+                    repo_root.as_deref(),
+                    root.as_deref(),
                     gateway_port,
-                    watch,
-                    force,
                     onboard,
-                },
-            );
+                )?
+            {
+                return Ok(0);
+            }
+            if existing.dev.is_none() {
+                return self.handle_existing_env_source_watch(
+                    existing,
+                    ExistingEnvSourceWatchOptions {
+                        repo_root,
+                        root,
+                        gateway_port,
+                        watch,
+                        force,
+                        onboard,
+                    },
+                );
+            }
         }
 
-        let (meta, created) = self.ensure_dev_env(&name, repo_root, root, gateway_port)?;
-        let dev = meta
-            .dev
-            .as_ref()
-            .ok_or_else(|| format!("environment \"{}\" is missing its dev binding", meta.name))?;
+        let (meta, created) =
+            self.ensure_dev_env(&name, repo_root.clone(), root.clone(), gateway_port)?;
         let stderr_profile = self.dev_stderr_profile();
         if !watch && !service_requested && meta.service_running {
             return Err(format!(
@@ -253,12 +262,60 @@ impl Cli {
         }
         let mut source_watch_lease = if watch {
             Some(
-                self.environment_service()
-                    .acquire_source_watch_lease(&meta.name, force)?,
+                match self
+                    .environment_service()
+                    .acquire_source_watch_lease(&meta.name, force)
+                {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        // A competing invocation may have claimed the lease after the first lookup.
+                        let current = self.environment_service().get(&meta.name)?;
+                        if self.try_reuse_dev_watch(
+                            &current,
+                            repo_root.as_deref(),
+                            root.as_deref(),
+                            gateway_port,
+                            onboard,
+                        )? {
+                            return Ok(0);
+                        }
+                        return Err(error);
+                    }
+                },
             )
         } else {
             None
         };
+        // Watch preparation belongs to the lease owner, including a newly created env.
+        // A losing invocation must not rewrite config before returning the winner's status.
+        let prepared = (|| {
+            let current = self.environment_service().get(&meta.name)?;
+            self.validate_existing_dev_request(
+                &current,
+                repo_root.as_deref(),
+                root.as_deref(),
+                gateway_port,
+            )?;
+            let prepared = self
+                .environment_service()
+                .apply_effective_gateway_port(current)?;
+            self.bootstrap_dev_env(&prepared)?;
+            Ok::<_, String>(prepared)
+        })();
+        let meta = match prepared {
+            Ok(meta) => meta,
+            Err(error) => {
+                drop(source_watch_lease.take());
+                if created {
+                    let _ = self.environment_service().remove(&meta.name, true);
+                }
+                return Err(error);
+            }
+        };
+        let dev = meta
+            .dev
+            .as_ref()
+            .ok_or_else(|| format!("environment {} is missing its dev binding", meta.name))?;
         let watch_takes_over_service = source_watch_lease
             .as_ref()
             .is_some_and(SourceWatchLease::service_was_running);
@@ -443,13 +500,30 @@ impl Cli {
         )? {
             return Err(source_dependency_preparation_error(&repo_root, &issue));
         }
+        let meta = existing;
+        let mut source_watch_lease = Some(
+            match self
+                .environment_service()
+                .acquire_source_watch_lease(&meta.name, true)
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    if self.try_reuse_dev_watch(
+                        &meta,
+                        Some(&display_path(&repo_root)),
+                        None,
+                        None,
+                        false,
+                    )? {
+                        return Ok(0);
+                    }
+                    return Err(error);
+                }
+            },
+        );
         let meta = self
             .environment_service()
-            .apply_effective_gateway_port(existing)?;
-        let mut source_watch_lease = Some(
-            self.environment_service()
-                .acquire_source_watch_lease(&meta.name, true)?,
-        );
+            .apply_effective_gateway_port(self.environment_service().get(&meta.name)?)?;
         let stderr_profile = self.dev_stderr_profile();
         self.stderr_lines(render_source_watch_takeover_summary(
             &meta,
@@ -569,6 +643,184 @@ impl Cli {
         }
     }
 
+    fn validate_existing_dev_request(
+        &self,
+        existing: &EnvMeta,
+        repo_root: Option<&str>,
+        root: Option<&str>,
+        gateway_port: Option<u32>,
+    ) -> Result<(), String> {
+        let dev = existing.dev.as_ref().ok_or_else(|| {
+            format!(
+                "environment \"{}\" is not a dev env; use a new env name for `ocm dev`",
+                existing.name
+            )
+        })?;
+        let existing_repo = PathBuf::from(&dev.repo_root);
+        if let Some(repo_root) = repo_root {
+            let requested = resolve_absolute_path(repo_root, &self.env, &self.cwd)?;
+            let requested = fs::canonicalize(&requested).map_err(|error| {
+                format!(
+                    "failed to resolve OpenClaw repo {}: {error}",
+                    display_path(&requested)
+                )
+            })?;
+            let saved_repo = fs::canonicalize(&existing_repo).map_err(|error| {
+                format!(
+                    "failed to resolve saved OpenClaw repo {}: {error}",
+                    display_path(&existing_repo)
+                )
+            })?;
+            if requested != saved_repo {
+                return Err(format!(
+                    "dev cannot change the repo for existing env {}; current repo is {}",
+                    existing.name, dev.repo_root
+                ));
+            }
+        }
+        if let Some(root) = root {
+            let requested = resolve_absolute_path(root, &self.env, &self.cwd)?;
+            let current = PathBuf::from(&existing.root);
+            if requested != current {
+                return Err(format!(
+                    "dev cannot change the root for existing env {}; current root is {}",
+                    existing.name, existing.root
+                ));
+            }
+        }
+
+        let (current_port, _) = self
+            .environment_service()
+            .resolve_effective_gateway_port(existing)?;
+        if let Some(requested_port) = gateway_port
+            && requested_port != current_port
+        {
+            return Err(format!(
+                "dev cannot change the port for existing env {}; current port is {}",
+                existing.name, current_port
+            ));
+        }
+        validate_openclaw_worktree(&existing_repo, Path::new(&dev.worktree_root))?;
+        Ok(())
+    }
+
+    fn try_reuse_dev_watch(
+        &self,
+        meta: &EnvMeta,
+        repo_root: Option<&str>,
+        root: Option<&str>,
+        gateway_port: Option<u32>,
+        onboard: bool,
+    ) -> Result<bool, String> {
+        let observation = self
+            .environment_service()
+            .observe_source_watch(&meta.name)?;
+        let state = match &observation {
+            SourceWatchState::Inactive => return Ok(false),
+            SourceWatchState::Starting => "starting",
+            SourceWatchState::Active(_) => "active",
+            SourceWatchState::Restoring => "restoring",
+        };
+        if onboard {
+            return Err(format!(
+                "cannot onboard env {} while its source watch is {state}; stop the watch session first",
+                meta.name
+            ));
+        }
+        let expected_source = if let Some(dev) = &meta.dev {
+            self.validate_existing_dev_request(meta, repo_root, root, None)?;
+            PathBuf::from(&dev.worktree_root)
+        } else {
+            if root.is_some() {
+                return Err("dev takeover uses the existing env root; remove --root".to_string());
+            }
+            if gateway_port.is_some() {
+                return Err(
+                    "dev takeover uses the existing env gateway port; remove --port".to_string(),
+                );
+            }
+            let repo_root = repo_root.ok_or_else(|| {
+                "dev takeover of an existing non-dev env requires --repo <path>".to_string()
+            })?;
+            self.resolve_dev_repo_root(Some(repo_root.to_string()))?
+        };
+        if let SourceWatchState::Active(active) = &observation {
+            let requested = fs::canonicalize(&expected_source).map_err(|error| {
+                format!(
+                    "failed to resolve requested source {}: {error}",
+                    display_path(&expected_source)
+                )
+            })?;
+            let current = fs::canonicalize(&active.repo_root).map_err(|error| {
+                format!(
+                    "failed to resolve active source {}: {error}",
+                    active.repo_root
+                )
+            })?;
+            if requested != current {
+                return Err(format!(
+                    "source watch for env {} already uses {}; stop that session before selecting {}",
+                    meta.name,
+                    active.repo_root,
+                    display_path(&requested)
+                ));
+            }
+        }
+        let SourceWatchState::Active(active) = &observation else {
+            self.stderr_line(format!(
+                "Source watch for {} is {state}; keeping the existing session.",
+                meta.name
+            ));
+            self.stdout_line(format!(
+                "Inspect progress with {} dev status {}.",
+                self.command_example(),
+                meta.name
+            ));
+            return Ok(true);
+        };
+        let endpoint = active.endpoint.as_ref().ok_or_else(|| format!(
+            "source watch for env {} has no recorded launch endpoint; stop it from its original terminal and start it again before reusing it", meta.name
+        ))?;
+        if endpoint.env_root != meta.root {
+            return Err(format!(
+                "source watch for env {} was launched with root {}; the registered root changed, so the session cannot be reused",
+                meta.name, endpoint.env_root
+            ));
+        }
+        if let Some(requested_port) = gateway_port
+            && requested_port != endpoint.gateway_port
+        {
+            return Err(format!(
+                "source watch for env {} is using port {}; stop the session before selecting port {requested_port}",
+                meta.name, endpoint.gateway_port
+            ));
+        }
+        let service_pid = self
+            .supervisor_service()
+            .live_runtime_state()?
+            .and_then(|runtime| {
+                runtime
+                    .children
+                    .into_iter()
+                    .find(|child| child.env_name == meta.name)
+            })
+            .map(|child| child.pid);
+        let summary = self
+            .build_dev_status_summary_with_watch(meta.clone(), service_pid, Ok(observation))?
+            .ok_or_else(|| {
+                format!(
+                    "source watch for env {} disappeared during inspection",
+                    meta.name
+                )
+            })?;
+        self.stderr_line(format!(
+            "Source watch for {} is {state}; keeping the existing session.",
+            meta.name
+        ));
+        self.stdout_lines(render_dev_status(&summary, self.dev_stdout_profile()));
+        Ok(true)
+    }
+
     fn ensure_dev_env(
         &self,
         name: &str,
@@ -577,60 +829,13 @@ impl Cli {
         gateway_port: Option<u32>,
     ) -> Result<(EnvMeta, bool), String> {
         if let Some(existing) = self.environment_service().find(name)? {
-            let dev = existing.dev.as_ref().ok_or_else(|| {
-                format!(
-                    "environment \"{}\" is not a dev env; use a new env name for `ocm dev`",
-                    existing.name
-                )
-            })?;
-            let existing_repo = PathBuf::from(&dev.repo_root);
-            if let Some(repo_root) = repo_root {
-                let requested = resolve_absolute_path(&repo_root, &self.env, &self.cwd)?;
-                let requested = fs::canonicalize(&requested).map_err(|error| {
-                    format!(
-                        "failed to resolve OpenClaw repo {}: {error}",
-                        display_path(&requested)
-                    )
-                })?;
-                let saved_repo = fs::canonicalize(&existing_repo).map_err(|error| {
-                    format!(
-                        "failed to resolve saved OpenClaw repo {}: {error}",
-                        display_path(&existing_repo)
-                    )
-                })?;
-                if requested != saved_repo {
-                    return Err(format!(
-                        "dev cannot change the repo for existing env {}; current repo is {}",
-                        existing.name, dev.repo_root
-                    ));
-                }
-            }
-            if let Some(root) = root {
-                let requested = resolve_absolute_path(&root, &self.env, &self.cwd)?;
-                let current = PathBuf::from(&existing.root);
-                if requested != current {
-                    return Err(format!(
-                        "dev cannot change the root for existing env {}; current root is {}",
-                        existing.name, existing.root
-                    ));
-                }
-            }
-
-            validate_openclaw_worktree(&existing_repo, Path::new(&dev.worktree_root))?;
-            let meta = self
-                .environment_service()
-                .apply_effective_gateway_port(existing)?;
-            if let Some(requested_port) = gateway_port {
-                let current_port = meta.gateway_port.unwrap_or_default();
-                if requested_port != current_port {
-                    return Err(format!(
-                        "dev cannot change the port for existing env {}; current port is {}",
-                        meta.name, current_port
-                    ));
-                }
-            }
-            self.bootstrap_dev_env(&meta)?;
-            return Ok((meta, false));
+            self.validate_existing_dev_request(
+                &existing,
+                repo_root.as_deref(),
+                root.as_deref(),
+                gateway_port,
+            )?;
+            return Ok((existing, false));
         }
 
         let repo_root = self.resolve_dev_repo_root(repo_root)?;
@@ -657,14 +862,6 @@ impl Cli {
                 return Err(error);
             }
         };
-
-        let created = self
-            .environment_service()
-            .apply_effective_gateway_port(created)?;
-        if let Err(error) = self.bootstrap_dev_env(&created) {
-            let _ = self.environment_service().remove(&created.name, true);
-            return Err(error);
-        }
 
         Ok((created, true))
     }
@@ -909,6 +1106,10 @@ impl Cli {
                 CreateSourceWatchOverrideOptions {
                     env_name: meta.name.clone(),
                     repo_root: repo_root.to_path_buf(),
+                    endpoint: SourceWatchEndpoint {
+                        env_root: meta.root.clone(),
+                        gateway_port: meta.gateway_port.unwrap_or_default(),
+                    },
                     watch_pid: child.id(),
                 },
                 _source_watch_lease,
@@ -1007,6 +1208,15 @@ impl Cli {
         service_pid: Option<u32>,
     ) -> Result<Option<DevStatusSummary>, String> {
         let observation = self.environment_service().observe_source_watch(&meta.name);
+        self.build_dev_status_summary_with_watch(meta, service_pid, observation)
+    }
+
+    fn build_dev_status_summary_with_watch(
+        &self,
+        meta: EnvMeta,
+        service_pid: Option<u32>,
+        observation: Result<SourceWatchState, String>,
+    ) -> Result<Option<DevStatusSummary>, String> {
         if meta.dev.is_none() && matches!(observation, Ok(SourceWatchState::Inactive)) {
             return Ok(None);
         }
@@ -1016,6 +1226,7 @@ impl Cli {
             started_at: None,
             issue: None,
         };
+        let mut active_endpoint = None;
         let active_source = match observation {
             Ok(SourceWatchState::Inactive) => None,
             Ok(SourceWatchState::Starting) => {
@@ -1030,6 +1241,10 @@ impl Cli {
                 source_watch.state = "active";
                 source_watch.pid = Some(watch.watch_pid);
                 source_watch.started_at = Some(watch.started_at);
+                if watch.endpoint.is_none() {
+                    source_watch.issue = Some("This watch has no recorded launch endpoint; the displayed URL comes from current configuration.".to_string());
+                }
+                active_endpoint = watch.endpoint;
                 Some(watch.repo_root)
             }
             Err(error) => {
@@ -1039,14 +1254,29 @@ impl Cli {
             }
         };
         let dev = meta.dev.as_ref();
-        let (gateway_port, _) = self
-            .environment_service()
-            .resolve_effective_gateway_port(&meta)?;
-        let paths = derive_env_paths(Path::new(&meta.root));
+        let gateway_port = match &active_endpoint {
+            Some(endpoint) => endpoint.gateway_port,
+            None => {
+                self.environment_service()
+                    .resolve_effective_gateway_port(&meta)?
+                    .0
+            }
+        };
+        let active_root = active_endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.env_root.as_str())
+            .unwrap_or(&meta.root);
+        if active_root != meta.root {
+            source_watch.issue = Some(
+                "The registered env root differs from the active source watch root.".to_string(),
+            );
+        }
+        let paths = derive_env_paths(Path::new(active_root));
+        let root = active_root.to_string();
         let env_name = meta.name.clone();
         Ok(Some(DevStatusSummary {
             env_name: env_name.clone(),
-            root: meta.root,
+            root,
             repo_root: dev
                 .map(|dev| dev.repo_root.clone())
                 .or_else(|| active_source.clone()),

@@ -2494,6 +2494,20 @@ fn dev_watch_rejects_service_activation_until_the_watch_exits() {
             &source_watch_override_path(&root, "demo"),
             Duration::from_secs(30),
         );
+        let override_before = fs::read(source_watch_override_path(&root, "demo")).unwrap();
+        let reused = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--watch",
+                "--force",
+            ],
+        );
+        let override_after = fs::read(source_watch_override_path(&root, "demo")).unwrap();
         let attempts = [
             vec!["service", "install", "demo"],
             vec!["service", "start", "demo"],
@@ -2509,6 +2523,8 @@ fn dev_watch_rejects_service_activation_until_the_watch_exits() {
 
         assert!(did_start && did_publish, "{}", stderr(&watch));
         assert!(watch.status.success(), "{}", stderr(&watch));
+        assert!(reused.status.success(), "{}", stderr(&reused));
+        assert_eq!(override_after, override_before);
         for attempt in attempts {
             assert!(!attempt.status.success(), "{}", stdout(&attempt));
             assert!(
@@ -2526,12 +2542,12 @@ fn dev_watch_rejects_service_activation_until_the_watch_exits() {
 
 #[cfg(unix)]
 #[test]
-fn dev_watch_rejects_overlap_and_reclaims_the_released_lock() {
+fn dev_watch_reuses_active_session_and_reclaims_the_released_lock() {
     let root = TestDir::new("dev-command-watch-overlap");
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = ocm_env(&root);
+    let mut env = service_env(&root);
     let (started, release, watch_log) = install_blocking_fake_dev_runners(&root, &mut env);
 
     let mut first = Command::new(env!("CARGO_BIN_EXE_ocm"));
@@ -2548,7 +2564,60 @@ fn dev_watch_rejects_overlap_and_reclaims_the_released_lock() {
     let did_write_override = wait_for_path(&override_path, Duration::from_secs(30));
     let override_before_overlap = fs::read_to_string(&override_path).unwrap_or_default();
 
+    let meta = get_environment("demo", &env, &cwd).unwrap();
+    let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["gateway"].as_object_mut().unwrap().remove("mode");
+    config["gateway"].as_object_mut().unwrap().remove("bind");
+    let config_before = serde_json::to_vec(&config).unwrap();
+    fs::write(&config_path, &config_before).unwrap();
+    let worktree = Path::new(&meta.dev.as_ref().unwrap().worktree_root);
+    let manifest_before = fs::read(worktree.join("package.json")).unwrap();
+    declare_source_tooling(worktree);
+    let pnpm_before = fs::read(root.child("pnpm.log")).ok();
+
     let overlap = run_ocm(&cwd, &env, &["dev", "demo", "--watch"]);
+    let conflicting = [
+        vec!["dev", "demo", "--watch", "--repo", cwd.to_str().unwrap()],
+        vec!["dev", "demo", "--watch", "--root", cwd.to_str().unwrap()],
+        vec!["dev", "demo", "--watch", "--port", "1"],
+        vec!["dev", "demo", "--watch", "--onboard"],
+    ]
+    .map(|args| run_ocm(&cwd, &env, &args));
+    let first_port = meta.gateway_port.unwrap();
+    let next_port = first_port + 1;
+    config["gateway"]["port"] = serde_json::json!(next_port);
+    let changed_config = serde_json::to_vec(&config).unwrap();
+    fs::write(&config_path, &changed_config).unwrap();
+    let changed = run_ocm(&cwd, &env, &["dev", "demo", "--watch"]);
+    let same_port = run_ocm(
+        &cwd,
+        &env,
+        &["dev", "demo", "--watch", "--port", &first_port.to_string()],
+    );
+    let other_port = run_ocm(
+        &cwd,
+        &env,
+        &["dev", "demo", "--watch", "--port", &next_port.to_string()],
+    );
+    let status = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    let resolved = ocm::env::EnvironmentService::new(&env, &cwd)
+        .resolve_gateway_process("demo", false)
+        .unwrap();
+    let routed = ocm::env::EnvironmentService::new(&env, &cwd)
+        .resolve("demo", None, None, &["status".to_string()])
+        .unwrap();
+    let routed_port = match routed {
+        ocm::env::ResolvedExecution::SourceWatch { env, .. } => env.gateway_port,
+        _ => None,
+    };
+    let config_after_port_change = fs::read(&config_path).unwrap();
+    fs::write(&config_path, &config_before).unwrap();
+    let config_after = fs::read(&config_path).unwrap();
+    let pnpm_after = fs::read(root.child("pnpm.log")).ok();
+    let meta_after = get_environment("demo", &env, &cwd).unwrap();
+    fs::write(worktree.join("package.json"), manifest_before).unwrap();
+    fs::remove_file(worktree.join("scripts/tsx.mjs")).unwrap();
     let override_after_overlap = fs::read_to_string(&override_path).unwrap_or_default();
     fs::write(&release, "release\n").unwrap();
     let first_output = first.wait_with_output().unwrap();
@@ -2562,14 +2631,38 @@ fn dev_watch_rejects_overlap_and_reclaims_the_released_lock() {
         did_write_override,
         "first source watch did not publish its override"
     );
-    assert!(
-        !overlap.status.success(),
-        "overlapping source watch unexpectedly succeeded"
+    assert!(overlap.status.success(), "{}", stderr(&overlap));
+    assert!(stderr(&overlap).contains("is active; keeping the existing session"));
+    assert!(stdout(&overlap).contains(&meta.gateway_port.unwrap().to_string()));
+    for attempt in conflicting {
+        assert!(!attempt.status.success(), "{}", stdout(&attempt));
+    }
+    assert!(changed.status.success(), "{}", stderr(&changed));
+    assert!(same_port.status.success(), "{}", stderr(&same_port));
+    assert!(!other_port.status.success());
+    assert!(stderr(&other_port).contains(&format!("is using port {first_port}")));
+    assert!(stdout(&changed).contains(&format!("http://127.0.0.1:{first_port}")));
+    assert!(!stdout(&changed).contains(&format!("http://127.0.0.1:{next_port}")));
+    assert!(status.status.success(), "{}", stderr(&status));
+    let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(status["gatewayPort"], first_port);
+    assert_eq!(
+        resolved.process_env.get("OPENCLAW_GATEWAY_PORT"),
+        Some(&first_port.to_string())
     );
     assert!(
-        stderr(&overlap).contains("source watch for env \"demo\" is already active or starting"),
-        "{}",
-        stderr(&overlap)
+        resolved
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--port", &first_port.to_string()])
+    );
+    assert_eq!(routed_port, Some(first_port));
+    assert_eq!(config_after_port_change, changed_config);
+    assert_eq!(config_after, config_before);
+    assert_eq!(pnpm_after, pnpm_before);
+    assert_eq!(
+        serde_json::to_value(meta_after).unwrap(),
+        serde_json::to_value(&meta).unwrap()
     );
     assert_eq!(override_after_overlap, override_before_overlap);
     assert!(first_output.status.success(), "{}", stderr(&first_output));
@@ -2584,12 +2677,136 @@ fn dev_watch_rejects_overlap_and_reclaims_the_released_lock() {
 
 #[cfg(unix)]
 #[test]
+fn dev_watch_lost_claim_preserves_config_and_explicit_endpoint() {
+    for explicit_port in [false, true] {
+        let root = TestDir::new("dev-watch-lost-claim");
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env(&root);
+        install_fake_dev_runners(&root, &mut env);
+        let created = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let meta = get_environment("demo", &env, &cwd).unwrap();
+        let old_port = meta.gateway_port.unwrap();
+        let requested_port = old_port.to_string();
+        let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
+        let (started, release, watch_log) = install_blocking_fake_dev_runners(&root, &mut env);
+        let paused = root.child("validation.paused");
+        let resume = root.child("validation.resume");
+        let real_git = Command::new("/bin/sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        assert!(real_git.status.success());
+        let gate_bin = root.child("gated-git");
+        write_executable_script(
+            &gate_bin.join("git"),
+            r#"#!/bin/sh
+if [ "$3" = worktree ] && [ "$4" = list ]; then
+  printf 'paused\n' > "$OCM_TEST_GIT_PAUSED"
+  while [ ! -f "$OCM_TEST_GIT_RESUME" ]; do /bin/sleep 0.02; done
+fi
+exec "$OCM_TEST_REAL_GIT" "$@"
+"#,
+        );
+        let mut losing_env = env.clone();
+        prepend_fake_bin(&mut losing_env, &gate_bin);
+        losing_env.insert(
+            "OCM_TEST_REAL_GIT".to_string(),
+            stdout(&real_git).trim().to_string(),
+        );
+        losing_env.insert("OCM_TEST_GIT_PAUSED".to_string(), path_string(&paused));
+        losing_env.insert("OCM_TEST_GIT_RESUME".to_string(), path_string(&resume));
+        let mut args = vec!["dev", "demo", "--watch"];
+        if explicit_port {
+            args.extend(["--port", &requested_port]);
+        }
+        let mut loser = Command::new(env!("CARGO_BIN_EXE_ocm"))
+            .current_dir(&cwd)
+            .args(args)
+            .env_clear()
+            .envs(&losing_env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let did_pause = wait_for_path(&paused, Duration::from_secs(5));
+        if explicit_port {
+            let mut config: Value =
+                serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+            config["gateway"]["port"] = serde_json::json!(old_port + 1);
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        }
+        let winner = Command::new(env!("CARGO_BIN_EXE_ocm"))
+            .current_dir(&cwd)
+            .args(["dev", "demo", "--watch"])
+            .env_clear()
+            .envs(&env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let did_start = wait_for_path(&started, Duration::from_secs(5));
+        let override_path = source_watch_override_path(&root, "demo");
+        let did_publish = wait_for_path(&override_path, Duration::from_secs(5));
+        let override_before = fs::read(&override_path).unwrap_or_default();
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config["gateway"].as_object_mut().unwrap().remove("mode");
+        config["gateway"].as_object_mut().unwrap().remove("bind");
+        let config_before = serde_json::to_vec(&config).unwrap();
+        fs::write(&config_path, &config_before).unwrap();
+        fs::write(&resume, "resume\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let did_exit = loop {
+            if loser.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        if !did_exit {
+            let _ = loser.kill();
+        }
+        let loser = loser.wait_with_output().unwrap();
+        let config_after = fs::read(&config_path).unwrap();
+        let override_after = fs::read(&override_path).unwrap_or_default();
+        fs::write(&release, "release\n").unwrap();
+        let winner = winner.wait_with_output().unwrap();
+        assert!(
+            did_pause && did_start && did_publish && did_exit,
+            "loser: {}; winner: {}",
+            stderr(&loser),
+            stderr(&winner)
+        );
+        assert!(winner.status.success(), "{}", stderr(&winner));
+        if explicit_port {
+            assert!(!loser.status.success());
+            assert!(
+                stderr(&loser).contains(&format!("is using port {}", old_port + 1)),
+                "{}",
+                stderr(&loser)
+            );
+        } else {
+            assert!(loser.status.success(), "{}", stderr(&loser));
+            assert!(stderr(&loser).contains("keeping the existing session"));
+        }
+        assert_eq!(config_after, config_before);
+        assert_eq!(override_after, override_before);
+        assert_eq!(fs::read_to_string(watch_log).unwrap().lines().count(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_watch_lease_survives_parent_crash_until_the_watcher_exits() {
     let root = TestDir::new("dev-command-watch-parent-crash");
     let repo = init_openclaw_repo(&root);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let mut env = ocm_env(&root);
+    let mut env = service_env(&root);
     let (started, release, watch_log) = install_blocking_fake_dev_runners(&root, &mut env);
 
     let mut first = Command::new(env!("CARGO_BIN_EXE_ocm"));
@@ -2646,13 +2863,10 @@ fn dev_watch_lease_survives_parent_crash_until_the_watcher_exits() {
         let _ = overlap.kill();
     }
     let overlap = overlap.wait_with_output().unwrap();
+    assert!(overlap_exited, "reusing a surviving source watch blocked");
+    assert!(overlap.status.success(), "{}", stderr(&overlap));
     assert!(
-        overlap_exited,
-        "overlapping source watch blocked instead of rejecting the live lease"
-    );
-    assert!(!overlap.status.success());
-    assert!(
-        stderr(&overlap).contains("source watch for env \"demo\" is already active or starting"),
+        stderr(&overlap).contains("is active; keeping the existing session"),
         "{}",
         stderr(&overlap)
     );

@@ -34,10 +34,19 @@ pub struct SourceWatchOverride {
     pub kind: String,
     pub env_name: String,
     pub repo_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<SourceWatchEndpoint>,
     pub watch_pid: u32,
     pub token: String,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceWatchEndpoint {
+    pub env_root: String,
+    pub gateway_port: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +61,7 @@ pub(crate) enum SourceWatchState {
 pub(crate) struct CreateSourceWatchOverrideOptions {
     pub(crate) env_name: String,
     pub(crate) repo_root: PathBuf,
+    pub(crate) endpoint: SourceWatchEndpoint,
     pub(crate) watch_pid: u32,
 }
 
@@ -304,6 +314,7 @@ impl<'a> EnvironmentService<'a> {
             kind: SOURCE_WATCH_OVERRIDE_KIND.to_string(),
             env_name,
             repo_root: display_path(&options.repo_root),
+            endpoint: Some(options.endpoint),
             watch_pid: options.watch_pid,
             token,
             started_at: now_utc(),
@@ -537,6 +548,10 @@ fn is_valid_source_watch_structure(meta: &SourceWatchOverride, env_name: &str) -
         && !meta.repo_root.trim().is_empty()
         && !meta.token.trim().is_empty()
         && meta.watch_pid > 0
+        && meta.endpoint.as_ref().is_none_or(|endpoint| {
+            Path::new(&endpoint.env_root).is_absolute()
+                && (1..=u16::MAX as u32).contains(&endpoint.gateway_port)
+        })
         && Path::new(&meta.repo_root).join("openclaw.mjs").is_file()
         && Path::new(&meta.repo_root).join("extensions").is_dir()
 }
@@ -773,6 +788,7 @@ mod tests {
             kind: SOURCE_WATCH_OVERRIDE_KIND.to_string(),
             env_name: "demo".to_string(),
             repo_root: "/repo/openclaw".to_string(),
+            endpoint: None,
             watch_pid: 123,
             token: "123-token".to_string(),
             started_at: OffsetDateTime::UNIX_EPOCH,
