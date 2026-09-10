@@ -603,8 +603,17 @@ fn env_destroy_preserves_nested_registered_dev_source_and_worker() {
     fs::rename(init_openclaw_repo(&root), &repo).unwrap();
     let child = create_dev_source(&repo, "child", &env, cwd);
     let worktree = Path::new(&child.dev.as_ref().unwrap().worktree_root);
-    assert!(worktree.starts_with(Path::new(&parent.root)));
-    assert!(!Path::new(&child.root).starts_with(Path::new(&parent.root)));
+    let parent_root = fs::canonicalize(&parent.root).unwrap();
+    assert!(
+        fs::canonicalize(worktree)
+            .unwrap()
+            .starts_with(&parent_root)
+    );
+    assert!(
+        !fs::canonicalize(&child.root)
+            .unwrap()
+            .starts_with(&parent_root)
+    );
     let source = worktree.join("package.json");
     let source_before = fs::read(&source).unwrap();
     let mut aged = parent.clone();
@@ -861,9 +870,9 @@ fn env_remove_keeps_independent_owned_children_removable() {
 #[cfg(unix)]
 #[test]
 fn env_remove_preserves_missing_owned_worktree_recovery() {
-    for private_inside in [false, true] {
+    for (private_inside, dev_replacement) in [(false, false), (true, false), (true, true)] {
         let root = TestDir::new(&format!(
-            "env-remove-missing-owned-recovery-{private_inside}"
+            "env-remove-missing-owned-recovery-{private_inside}-{dev_replacement}"
         ));
         let mut env = ocm_launchd_env(&root);
         install_fake_launchctl(&root, &mut env);
@@ -913,18 +922,70 @@ fn env_remove_preserves_missing_owned_worktree_recovery() {
             !worktree.exists(),
             "cleanup must not recreate the missing worktree"
         );
-        let replacement = run_ocm(
-            root.path(),
-            &env,
-            &[
-                "env",
-                "create",
-                "replacement",
-                "--root",
-                &path_string(worktree),
-            ],
-        );
+        let replacement_root = if private_inside {
+            let alias = root.child("replacement-parent");
+            std::os::unix::fs::symlink(worktree.parent().unwrap(), &alias).unwrap();
+            alias.join(worktree.file_name().unwrap())
+        } else {
+            worktree.to_path_buf()
+        };
+        let replacement = if dev_replacement {
+            run_ocm(
+                root.path(),
+                &env,
+                &dev_plain(&[
+                    "replacement",
+                    "--repo",
+                    &path_string(&repo),
+                    "--root",
+                    &path_string(&replacement_root),
+                ]),
+            )
+        } else {
+            run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "create",
+                    "replacement",
+                    "--root",
+                    &path_string(&replacement_root),
+                ],
+            )
+        };
         assert!(replacement.status.success(), "{}", stderr(&replacement));
+        let replacement = get_environment("replacement", &env, root.path()).unwrap();
+        let replacement_before = serde_json::to_value(&replacement).unwrap();
+        let retained_state = Path::new(&replacement.root).join("retained-state.txt");
+        fs::write(&retained_state, "replacement state\n").unwrap();
+        let unrelated = run_ocm(root.path(), &env, &["env", "create", "unrelated"]);
+        assert!(unrelated.status.success(), "{}", stderr(&unrelated));
+        let removed = run_ocm(root.path(), &env, &["env", "remove", "unrelated"]);
+        assert!(
+            removed.status.success(),
+            "unrelated cleanup with replacement: {}",
+            stderr(&removed)
+        );
+        assert_eq!(
+            fs::read_to_string(&retained_state).unwrap(),
+            "replacement state\n"
+        );
+        assert_eq!(
+            serde_json::to_value(get_environment("replacement", &env, root.path()).unwrap())
+                .unwrap(),
+            replacement_before
+        );
+        assert!(
+            git(&repo, &["worktree", "list", "--porcelain"]).contains(&format!("HEAD {detached}"))
+        );
+        let refused = run_ocm(root.path(), &env, &["env", "remove", "parent"]);
+        assert!(!refused.status.success());
+        assert!(
+            stderr(&refused).contains("registered dev source"),
+            "{}",
+            stderr(&refused)
+        );
         for name in ["replacement", "child", "parent"] {
             let removed = run_ocm(root.path(), &env, &["env", "remove", name]);
             assert!(removed.status.success(), "{}: {}", name, stderr(&removed));

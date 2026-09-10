@@ -219,9 +219,46 @@ pub(crate) fn inspect_dev_source_footprint(dev: &EnvDevMeta) -> Result<SourceFoo
     Ok(footprint)
 }
 
+pub(crate) fn registered_dev_source_replaced(
+    meta: &EnvMeta,
+    envs: &[EnvMeta],
+) -> Result<bool, String> {
+    let Some(dev) = &meta.dev else {
+        return Ok(false);
+    };
+    if !fs::symlink_metadata(Path::new(&dev.worktree_root).join(".git"))
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(false);
+    }
+    let Some(source) = existing_cleanup_path(Path::new(&dev.worktree_root))? else {
+        return Ok(false);
+    };
+    // Creation can reuse a missing worktree path for another env's state,
+    // regardless of that env's binding or the current cleanup target.
+    let source_identity = path_identity(&source)?;
+    for owner in envs.iter().filter(|owner| owner.name != meta.name) {
+        if let Some(root) = existing_cleanup_path(Path::new(&owner.root))?
+            && path_identity(&root)? == source_identity
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn registered_dev_source_footprint(
-    dev: &EnvDevMeta,
+    meta: &EnvMeta,
+    envs: &[EnvMeta],
 ) -> Result<Option<SourceFootprint>, String> {
+    let Some(dev) = &meta.dev else {
+        return Ok(None);
+    };
+    if registered_dev_source_replaced(meta, envs)? {
+        // Keep the old source's recoverable Git data, not the new state.
+        let footprint = inspect_dev_source_metadata(dev)?;
+        return Ok((!footprint.entries.is_empty()).then_some(footprint));
+    }
     if existing_cleanup_path(Path::new(&dev.worktree_root))?.is_some()
         && !crate::openclaw_repo::has_expected_worktree_identity(
             Path::new(&dev.repo_root),
@@ -243,28 +280,7 @@ pub(crate) fn ensure_environment_removal_preserves_dev_sources(
 ) -> Result<(), String> {
     let mut footprints = Vec::new();
     for meta in envs.iter().filter(|meta| meta.name != target.name) {
-        let Some(dev) = &meta.dev else { continue };
-        // Creation can reuse a missing worktree path for new env state. That
-        // state belongs to the new env; retain only the old record's repo data.
-        let replaced = if fs::symlink_metadata(Path::new(&dev.worktree_root).join(".git"))
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        {
-            match (
-                existing_cleanup_path(Path::new(&dev.worktree_root))?,
-                existing_cleanup_path(Path::new(&target.root))?,
-            ) {
-                (Some(source), Some(root)) => path_identity(&source)? == path_identity(&root)?,
-                _ => false,
-            }
-        } else {
-            false
-        };
-        let footprint = if replaced {
-            Some(inspect_dev_source_metadata(dev)?)
-        } else {
-            registered_dev_source_footprint(dev)?
-        };
-        if let Some(footprint) = footprint {
+        if let Some(footprint) = registered_dev_source_footprint(meta, envs)? {
             footprints.push((meta.name.as_str(), footprint));
         }
     }
