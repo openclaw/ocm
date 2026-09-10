@@ -3,7 +3,6 @@ mod support;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::net::{Ipv4Addr, TcpListener};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
@@ -1260,10 +1259,6 @@ fn gateway_owned_upgrade_survives_its_source_process_group() {
     );
     install_fake_service_manager(&root, &mut env);
 
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let gateway_port = listener.local_addr().unwrap().port().to_string();
-    drop(listener);
-
     let old_started = root.child("old-started");
     let new_started = root.child("new-started");
     let upgrade_pid_path = root.child("upgrade-pid");
@@ -1301,18 +1296,11 @@ exec '{ocm}' "$@"
         );
         assert!(add.status.success(), "{}", stderr(&add));
     }
+    // Let creation select an available OpenClaw port family.
     let create = run_ocm(
         &cwd,
         &env,
-        &[
-            "env",
-            "create",
-            "self",
-            "--runtime",
-            "old-runtime",
-            "--port",
-            &gateway_port,
-        ],
+        &["env", "create", "self", "--runtime", "old-runtime"],
     );
     assert!(create.status.success(), "{}", stderr(&create));
     set_service_enabled(&cwd, &env, "self", true);
@@ -1419,10 +1407,6 @@ fn gateway_owned_daemon_refresh(npm: bool) {
         &replacement_daemon_pid_path,
     );
 
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let gateway_port = listener.local_addr().unwrap().port().to_string();
-    drop(listener);
-
     let started_path = root.child("gateway-started");
     let refresh_gate_path = root.child("refresh-gate");
     let refresh_pid_path = root.child("refresh-pid");
@@ -1461,18 +1445,11 @@ fn gateway_owned_daemon_refresh(npm: bool) {
         ],
     );
     assert!(add.status.success(), "{}", stderr(&add));
+    // Let creation select an available OpenClaw port family.
     let create = run_ocm(
         &cwd,
         &env,
-        &[
-            "env",
-            "create",
-            "self",
-            "--runtime",
-            "managed",
-            "--port",
-            &gateway_port,
-        ],
+        &["env", "create", "self", "--runtime", "managed"],
     );
     assert!(create.status.success(), "{}", stderr(&create));
     set_service_enabled(&cwd, &env, "self", true);
