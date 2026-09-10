@@ -1504,16 +1504,15 @@ impl Cli {
             }
         }
 
-        if should_clear_skip_bootstrap_for_openclaw_args(&after) {
-            clear_skip_bootstrap_for_openclaw_onboarding(&derive_env_paths(Path::new(&meta.root)))?;
-        }
-
         let resolved = self.environment_service().resolve_run(
             name,
             runtime_override,
             launcher_override,
             &after,
         )?;
+        if should_clear_skip_bootstrap_for_openclaw_args(&after) {
+            clear_skip_bootstrap_for_openclaw_onboarding(&derive_env_paths(Path::new(&meta.root)))?;
+        }
         match resolved {
             crate::env::ResolvedExecution::Launcher {
                 env,

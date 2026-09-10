@@ -1457,6 +1457,44 @@ fn dev_command_does_not_recreate_a_missing_saved_worktree() {
     let meta = get_environment("demo", &env, &cwd).unwrap();
     assert_eq!(meta.dev.unwrap().worktree_root, path_string(&worktree_root));
 
+    let resolve = run_ocm(&cwd, &env, &["env", "resolve", "demo", "--json"]);
+    assert!(!resolve.status.success());
+    assert!(stderr(&resolve).contains("saved dev worktree is missing"));
+    let gateway_error = ocm::env::EnvironmentService::new(&env, &cwd)
+        .resolve_gateway_process("demo", false)
+        .unwrap_err();
+    assert!(gateway_error.contains("saved dev worktree is missing"));
+    for command in ["env", "dev"] {
+        let status = run_ocm(&cwd, &env, &[command, "status", "demo", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+    }
+    for kind in ["runtime", "launcher"] {
+        let option = if kind == "runtime" {
+            "--path"
+        } else {
+            "--command"
+        };
+        let runner = path_string(&root.child("fake-dev-bin/pnpm"));
+        let add = run_ocm(&cwd, &env, &[kind, "add", "fallback", option, &runner]);
+        assert!(add.status.success(), "{}", stderr(&add));
+        for action in ["resolve", "run"] {
+            let overridden = run_ocm(
+                &cwd,
+                &env,
+                &[
+                    "env",
+                    action,
+                    "demo",
+                    &format!("--{kind}"),
+                    "fallback",
+                    "--",
+                    "--version",
+                ],
+            );
+            assert!(overridden.status.success(), "{}", stderr(&overridden));
+        }
+    }
+
     let replacement = run_ocm(
         &cwd,
         &env,
@@ -1527,6 +1565,19 @@ fn dev_command_resumes_the_recorded_worktree_without_recreating_the_default() {
 
     let resumed = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
     assert!(resumed.status.success(), "{}", stderr(&resumed));
+    let service = ocm::env::EnvironmentService::new(&env, &cwd);
+    let resolved = service
+        .resolve("demo", None, None, &[])
+        .unwrap()
+        .into_summary();
+    assert_eq!(resolved.run_dir, path_string(&recorded_worktree));
+    assert_eq!(
+        service
+            .resolve_gateway_process("demo", false)
+            .unwrap()
+            .run_dir,
+        recorded_worktree
+    );
     assert!(!original_worktree.exists());
     assert_eq!(
         fs::read_to_string(recorded_worktree.join("SENTINEL")).unwrap(),
@@ -1659,6 +1710,45 @@ fn dev_command_rejects_a_stale_registration_replaced_by_an_unrelated_clone() {
         fs::read_to_string(worktree_root.join("SENTINEL")).unwrap(),
         "preserve me\n"
     );
+    fs::remove_file(root.child("pnpm.log")).unwrap();
+    let config_path = PathBuf::from(show_json["configPath"].as_str().unwrap());
+    let config_before = b"{\"agents\":{\"defaults\":{\"skipBootstrap\":true}}}\n";
+    fs::write(&config_path, config_before).unwrap();
+    let mut admitted = Vec::new();
+    for args in [
+        vec!["env", "resolve", "demo", "--json", "--", "--version"],
+        vec!["env", "run", "demo", "--", "--version"],
+        vec!["@demo", "--", "--version"],
+        vec!["@demo", "--", "onboard"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        if output.status.success() {
+            admitted.push(args.join(" "));
+        } else {
+            assert!(
+                stderr(&output).contains("registered worktree is not a valid OpenClaw checkout"),
+                "{}",
+                stderr(&output)
+            );
+        }
+    }
+    let gateway = ocm::env::EnvironmentService::new(&env, &cwd)
+        .resolve_gateway_process("demo", false)
+        .err();
+    if gateway.is_none() {
+        admitted.push("gateway process resolution".to_string());
+    }
+    assert!(
+        admitted.is_empty(),
+        "accepted a replaced worktree: {admitted:?}"
+    );
+    assert!(
+        gateway
+            .unwrap()
+            .contains("registered worktree is not a valid OpenClaw checkout")
+    );
+    assert!(!root.child("pnpm.log").exists());
+    assert_eq!(fs::read(config_path).unwrap(), config_before);
 }
 
 #[cfg(unix)]
@@ -3898,12 +3988,48 @@ fn dev_watch_reuses_active_session_and_reclaims_the_released_lock() {
     let config_after = fs::read(&config_path).unwrap();
     let pnpm_after = fs::read(root.child("pnpm.log")).ok();
     let meta_after = get_environment("demo", &env, &cwd).unwrap();
+    let mut route_env = env.clone();
+    let route_bin = root.child("route-bin");
+    write_executable_script(&route_bin.join("node"), "#!/bin/sh\nexit 0\n");
+    prepend_fake_bin(&mut route_env, &route_bin);
+    let exec_args = ["env", "exec", "demo", "--", "openclaw", "--version"];
+    let valid_exec = run_ocm(&cwd, &route_env, &exec_args);
+    let git_path = worktree.join(".git");
+    let backlink = fs::read(&git_path).unwrap();
+    fs::remove_file(&git_path).unwrap();
+    init_nested_openclaw_repo(worktree);
+    let mut invalid_routes = Vec::new();
+    for with_endpoint in [true, false] {
+        if !with_endpoint {
+            let mut source: Value = serde_json::from_str(&override_before_overlap).unwrap();
+            source.as_object_mut().unwrap().remove("endpoint");
+            fs::write(&override_path, serde_json::to_vec(&source).unwrap()).unwrap();
+        }
+        let service = ocm::env::EnvironmentService::new(&env, &cwd);
+        invalid_routes.push(service.resolve("demo", None, None, &[]).err());
+        invalid_routes.push(service.resolve_gateway_process("demo", false).err());
+        let exec = run_ocm(&cwd, &route_env, &exec_args);
+        invalid_routes.push((!exec.status.success()).then(|| stderr(&exec)));
+    }
+    fs::remove_dir_all(&git_path).unwrap();
+    fs::write(&git_path, backlink).unwrap();
+    fs::remove_file(worktree.join("SENTINEL")).unwrap();
+    fs::write(&override_path, &override_before_overlap).unwrap();
     fs::write(worktree.join("package.json"), manifest_before).unwrap();
     fs::remove_file(worktree.join("scripts/tsx.mjs")).unwrap();
     let override_after_overlap = fs::read_to_string(&override_path).unwrap_or_default();
     fs::write(&release, "release\n").unwrap();
     let first_output = first.wait_with_output().unwrap();
 
+    assert!(valid_exec.status.success(), "{}", stderr(&valid_exec));
+    for error in invalid_routes {
+        assert!(
+            error.as_deref().is_some_and(
+                |error| error.contains("registered worktree is not a valid OpenClaw checkout")
+            ),
+            "active source route accepted the replacement: {error:?}"
+        );
+    }
     assert!(
         did_start,
         "first source watch did not start: {}",

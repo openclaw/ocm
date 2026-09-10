@@ -479,16 +479,37 @@ fn saved_dev_plan_revalidates_source_and_binding_before_launch() {
     let launched = fs::read_to_string(&command_log).unwrap();
     assert!(launched.starts_with(&format!("{worktree_path}\nopenclaw gateway run")));
     fs::remove_file(&command_log).unwrap();
+    let worktree_git = worktree.join(".git");
+    let git_link = fs::read(&worktree_git).unwrap();
 
-    for case in ["saved-source", "binding-name", "runtime", "launcher"] {
+    for case in [
+        "replaced-worktree",
+        "saved-source",
+        "binding-name",
+        "runtime",
+        "launcher",
+    ] {
         let mut stale = plan.clone();
         let mut changed = source.clone();
-        let expected = if case == "saved-source" {
+        let expected = if case == "replaced-worktree" {
+            "registered worktree is not a valid OpenClaw checkout"
+        } else if case == "saved-source" {
             "saved dev source no longer matches"
         } else {
             "saved dev plan no longer matches the registered binding"
         };
         match case {
+            "replaced-worktree" => {
+                fs::remove_file(&worktree_git).unwrap();
+                let git = Command::new("git")
+                    .args(["init", "--quiet"])
+                    .current_dir(&worktree)
+                    .env_clear()
+                    .envs(&fixture.env)
+                    .output()
+                    .unwrap();
+                assert!(git.status.success(), "{}", stderr(&git));
+            }
             "saved-source" => stale["children"][0]["runDir"] = json!(path_string(&fixture.repo)),
             "binding-name" => stale["children"][0]["bindingName"] = json!("old-dev"),
             "runtime" => changed.default_runtime = Some("stable".to_string()),
@@ -496,6 +517,13 @@ fn saved_dev_plan_revalidates_source_and_binding_before_launch() {
             _ => unreachable!(),
         }
         ocm::store::save_environment(changed, &fixture.env, &fixture.cwd).unwrap();
+        if case == "replaced-worktree" {
+            let error = EnvironmentService::new(&fixture.env, &fixture.cwd)
+                .resolve("source-env", None, None, &[])
+                .err()
+                .expect("fresh resolution accepted the replacement worktree");
+            assert!(error.contains(expected), "{error}");
+        }
         write_json_replacing_path(&state_path, &stale);
         let before = fs::read(&state_path).unwrap();
         let daemon = Command::new(ocm_test_binary_path())
@@ -539,6 +567,10 @@ fn saved_dev_plan_revalidates_source_and_binding_before_launch() {
         }
         fixture.stop_daemon();
         fixture.set_manager_state("stopped", 0);
+        if case == "replaced-worktree" {
+            fs::remove_dir_all(&worktree_git).unwrap();
+            fs::write(&worktree_git, &git_link).unwrap();
+        }
         assert_eq!(
             fs::read(&state_path).unwrap(),
             before,

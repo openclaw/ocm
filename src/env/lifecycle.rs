@@ -5,7 +5,9 @@ use time::Duration;
 use time::OffsetDateTime;
 
 use super::EnvironmentService;
-use crate::openclaw_repo::prepare_openclaw_simulation_worktree_cleanup;
+use crate::openclaw_repo::{
+    prepare_openclaw_simulation_worktree_cleanup, validate_openclaw_worktree,
+};
 use crate::runtime::RuntimeService;
 use crate::store::{
     EnvironmentOperationLock, clone_environment, clone_environment_for_simulation,
@@ -34,6 +36,14 @@ fn is_false(value: &bool) -> bool {
 pub struct EnvDevMeta {
     pub repo_root: String,
     pub worktree_root: String,
+}
+
+impl EnvDevMeta {
+    pub(crate) fn execution_source_root(&self) -> Result<&Path, String> {
+        let source_root = Path::new(&self.worktree_root);
+        validate_openclaw_worktree(Path::new(&self.repo_root), source_root)?;
+        Ok(source_root)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

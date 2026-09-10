@@ -36,7 +36,7 @@ use crate::infra::terminal::{Cell, KeyValueRow, Tone, paint, render_key_value_ca
 use crate::openclaw_repo::{
     detect_openclaw_checkout, discover_enclosing_openclaw_checkout, ensure_openclaw_worktree,
     ensure_source_dependency_install_target, inspect_source_dependencies,
-    inspect_source_dependencies_with_runner, validate_openclaw_worktree,
+    inspect_source_dependencies_with_runner,
 };
 use crate::service::service_backend_support_error;
 use crate::store::{
@@ -1068,7 +1068,7 @@ impl Cli {
                 existing.name, current_port
             ));
         }
-        validate_openclaw_worktree(&existing_repo, Path::new(&dev.worktree_root))?;
+        dev.execution_source_root()?;
         Ok(())
     }
 

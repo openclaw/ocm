@@ -397,6 +397,35 @@ fn env_snapshot_restore_preserves_the_current_complete_dev_binding() {
                 repo_root: path_string(&root.child("saved-repo")),
                 worktree_root: path_string(&root.child("saved-worktree")),
             });
+            if binding == "dev" {
+                let repo = Path::new(&current.dev.as_ref().unwrap().repo_root);
+                write_text(&repo.join("package.json"), r#"{"name":"openclaw"}"#);
+                write_text(&repo.join("scripts/run-node.mjs"), "");
+                for args in [
+                    vec!["init"],
+                    vec!["add", "."],
+                    vec![
+                        "-c",
+                        "user.name=OCM Tests",
+                        "-c",
+                        "user.email=tests@example.com",
+                        "commit",
+                        "-m",
+                        "fixture",
+                    ],
+                    vec!["worktree", "add", "--detach", "../saved-worktree"],
+                ] {
+                    let output = Command::new("git")
+                        .arg("-C")
+                        .arg(repo)
+                        .args(args)
+                        .env_clear()
+                        .envs(&env)
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "{}", stderr(&output));
+                }
+            }
         }
         current.default_runtime =
             matches!(binding, "runtime" | "ordinary").then(|| "current".to_string());

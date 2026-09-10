@@ -2369,6 +2369,7 @@ fn admit_supervisor_child_start(
                 source_root.display()
             ));
         }
+        dev.execution_source_root()?;
     }
     Ok(admission)
 }
