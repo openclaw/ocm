@@ -10,3 +10,5 @@ pub mod shell;
 mod sqlite_snapshot;
 pub mod terminal;
 pub(crate) mod tree_digest;
+#[cfg(windows)]
+pub(crate) mod windows_security;

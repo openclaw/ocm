@@ -743,10 +743,11 @@ Windows service support is not implemented yet.
 `ocm` keeps safety checks around destructive actions.
 
 On Unix, updating an already-private OpenClaw config preserves its file mode.
-Private replacements exclude inherited macOS access at creation, and protection
-is verified before any config data is written. Other authored access rules
-retain the existing writer. Config values, including auth and SecretRefs,
-follow the existing command's update rules.
+On Windows, this preserves a protected ACL owned by and granting access only to
+the current user. Private replacements exclude inherited macOS and Windows access
+at creation, and protection is verified before any config data is written. Other
+authored access rules retain the existing writer. Config values, including auth
+and SecretRefs, follow the existing command's update rules.
 
 Examples:
 
