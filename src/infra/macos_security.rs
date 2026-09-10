@@ -1,23 +1,43 @@
+use std::ffi::CString;
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::ptr;
 
-// Darwin's extended ACL functions are not exposed by the locked libc crate.
-// These signatures and constants come from the macOS SDK's sys/acl.h.
+// Darwin's extended security APIs are not exposed by the locked libc crate.
+// Signatures/constants come from the macOS SDK's sys/acl.h and sys/fcntl.h.
 const ACL_TYPE_EXTENDED: libc::c_int = 0x100;
 const ACL_FIRST_ENTRY: libc::c_int = 0;
+const ACL_FLAG_NO_INHERIT: libc::c_int = 1 << 17;
+const FILESEC_MODE: libc::c_int = 4;
+const FILESEC_ACL: libc::c_int = 5;
 
 unsafe extern "C" {
     fn acl_init(count: libc::c_int) -> *mut libc::c_void;
     fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
     fn acl_valid(acl: *mut libc::c_void) -> libc::c_int;
-    fn acl_set_fd_np(fd: libc::c_int, acl: *mut libc::c_void, kind: libc::c_int) -> libc::c_int;
+    fn acl_get_flagset_np(acl: *mut libc::c_void, flags: *mut *mut libc::c_void) -> libc::c_int;
+    fn acl_add_flag_np(flags: *mut libc::c_void, flag: libc::c_int) -> libc::c_int;
     fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
     fn acl_get_entry(
         acl: *mut libc::c_void,
         entry_id: libc::c_int,
         entry: *mut *mut libc::c_void,
+    ) -> libc::c_int;
+    fn filesec_init() -> *mut libc::c_void;
+    fn filesec_free(security: *mut libc::c_void);
+    fn filesec_set_property(
+        security: *mut libc::c_void,
+        property: libc::c_int,
+        value: *const libc::c_void,
+    ) -> libc::c_int;
+    fn openx_np(
+        path: *const libc::c_char,
+        flags: libc::c_int,
+        security: *mut libc::c_void,
     ) -> libc::c_int;
 }
 
@@ -39,20 +59,60 @@ impl Drop for Acl {
     }
 }
 
-// Only the fresh staging descriptor is modified. Its owner and POSIX mode are
-// established by the caller; inherited ACLs must be removed before any data write.
-pub(crate) fn set_private_file_access(file: &File) -> io::Result<()> {
+struct FileSecurity(*mut libc::c_void);
+
+impl Drop for FileSecurity {
+    fn drop(&mut self) {
+        unsafe { filesec_free(self.0) };
+    }
+}
+
+pub(crate) fn create_private_file_new(path: &Path) -> io::Result<File> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file path contains a NUL"))?;
     let empty = Acl::checked(unsafe { acl_init(0) })?;
-    if unsafe { acl_set_fd_np(file.as_raw_fd(), empty.0, ACL_TYPE_EXTENDED) } != 0 {
+    let mut flags = MaybeUninit::<*mut libc::c_void>::uninit();
+    if unsafe { acl_get_flagset_np(empty.0, flags.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    if !file_has_no_extended_acl(file)? {
+    // The successful getter returns flags borrowed from the live ACL.
+    let flags = unsafe { flags.assume_init() };
+    if flags.is_null() {
         return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "the private config still has an extended ACL",
+            io::ErrorKind::InvalidData,
+            "missing ACL flags",
         ));
     }
-    Ok(())
+    if unsafe { acl_add_flag_np(flags, ACL_FLAG_NO_INHERIT) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let security = unsafe { filesec_init() };
+    if security.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let security = FileSecurity(security);
+    let mode: libc::mode_t = 0o600;
+    // FILESEC_ACL copies an acl_t supplied by address, not the ACL object itself.
+    if unsafe { filesec_set_property(security.0, FILESEC_MODE, ptr::from_ref(&mode).cast()) } != 0
+        || unsafe { filesec_set_property(security.0, FILESEC_ACL, ptr::from_ref(&empty.0).cast()) }
+            != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // Inheritance must be disabled at creation. Clearing an ACL afterward
+    // cannot revoke another user's descriptor opened while the file was empty.
+    let fd = unsafe {
+        openx_np(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            security.0,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
 }
 
 pub(crate) fn file_has_no_extended_acl(file: &File) -> io::Result<bool> {

@@ -56,8 +56,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check Windows targets
         run: cargo check --workspace --all-targets --locked
-      - name: Prove private config replacement
-        run: cargo test --locked --lib private_config_
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: '22.15.0'
@@ -88,6 +86,11 @@ jobs:
         with:
           node-version: '22.15.0'
           package-manager-cache: false
+      - name: Prove macOS private config creation across users
+        if: runner.os == 'macOS'
+        run: |
+          private_config_test_binary=$(cargo test --locked --lib --no-run --message-format=json | python3 -c 'import json,sys; paths=[entry["executable"] for line in sys.stdin if (entry:=json.loads(line)).get("reason")=="compiler-artifact" and entry.get("profile",{}).get("test") and entry.get("executable")]; assert len(paths)==1,paths; print(paths[0])')
+          sudo -n -- "$private_config_test_binary" --ignored --exact store::openclaw_config::macos_privacy_tests::private_config_creation_excludes_other_users --nocapture
       - name: Run test suite
         run: cargo test --locked
       - name: Smoke test cargo install
