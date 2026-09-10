@@ -31,7 +31,7 @@ pub use snapshots::{
     UpgradeCheckpointScope, select_snapshot_prune_candidates,
 };
 pub(crate) use source_watch::{
-    CreateSourceWatchOverrideOptions, SourceWatchLease, SourceWatchState,
+    CreateSourceWatchOverrideOptions, SourceWatchLease, SourceWatchMode, SourceWatchState,
 };
 pub use source_watch::{SourceWatchEndpoint, SourceWatchOverride};
 pub(crate) use source_watch_session::{SourceWatchCompletion, SourceWatchSession};

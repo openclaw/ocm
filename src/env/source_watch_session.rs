@@ -15,6 +15,7 @@ use crate::store::{display_path, source_watch_override_path, validate_name, writ
 const LEGACY_SESSION_KIND: &str = "ocm-source-watch-session";
 const WATCH_V2_SESSION_KIND: &str = "ocm-source-watch-session-v2";
 const SESSION_KIND: &str = "ocm-source-foreground-session-v1";
+const SERVICE_PREPARATION_SESSION_KIND: &str = "ocm-source-service-preparation-session-v1";
 const STOP_KIND: &str = "ocm-source-watch-stop";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,6 +33,8 @@ pub(crate) struct SourceWatchSession {
     pub(crate) child_spawn_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) watching: Option<bool>,
+    #[serde(default)]
+    pub(crate) service_preparation: bool,
     pub(crate) restore_service: bool,
     #[serde(default)]
     pub(crate) closed: bool,
@@ -87,10 +90,15 @@ impl SourceWatchSessionPaths {
         &self,
         meta: &EnvMeta,
         lease_id: &str,
-        watching: bool,
+        mode: super::SourceWatchMode,
     ) -> Result<SourceWatchSession, String> {
         let session = SourceWatchSession {
-            kind: SESSION_KIND.to_string(),
+            kind: if mode.is_service_preparation() {
+                SERVICE_PREPARATION_SESSION_KIND
+            } else {
+                SESSION_KIND
+            }
+            .to_string(),
             env_name: meta.name.clone(),
             lease_id: lease_id.to_string(),
             env_root: meta.root.clone(),
@@ -99,7 +107,8 @@ impl SourceWatchSessionPaths {
             controller: current_process_identity()?,
             child: None,
             child_spawn_pending: false,
-            watching: Some(watching),
+            watching: Some(mode.is_watching()),
+            service_preparation: mode.is_service_preparation(),
             restore_service: false,
             closed: false,
             completion: None,
@@ -118,8 +127,16 @@ impl SourceWatchSessionPaths {
         };
         if !matches!(
             session.kind.as_str(),
-            SESSION_KIND | WATCH_V2_SESSION_KIND | LEGACY_SESSION_KIND
+            SESSION_KIND
+                | SERVICE_PREPARATION_SESSION_KIND
+                | WATCH_V2_SESSION_KIND
+                | LEGACY_SESSION_KIND
         ) || (session.kind == SESSION_KIND && session.watching.is_none())
+            || (session.kind == SERVICE_PREPARATION_SESSION_KIND
+                && (!session.service_preparation
+                    || session.watching != Some(false)
+                    || session.restore_service))
+            || (session.service_preparation && session.kind != SERVICE_PREPARATION_SESSION_KIND)
             || session.env_name != env_name
             || session.lease_id.trim().is_empty()
             || session.controller.pid == 0
@@ -255,11 +272,30 @@ impl SourceWatchSessionPaths {
 
 impl SourceWatchSession {
     pub(crate) fn is_watching(&self) -> bool {
-        self.kind != SESSION_KIND || self.watching.unwrap_or(true)
+        matches!(
+            self.kind.as_str(),
+            LEGACY_SESSION_KIND | WATCH_V2_SESSION_KIND
+        ) || self.watching.unwrap_or(true)
     }
 
     pub(crate) fn is_legacy_watch(&self) -> bool {
         self.kind == LEGACY_SESSION_KIND
+    }
+
+    pub(crate) fn service_preparation_is_active(
+        &self,
+        env_service: &EnvironmentService<'_>,
+    ) -> Result<bool, String> {
+        if !self.service_preparation {
+            return Ok(false);
+        }
+        // Completion is published before the controller releases its lease.
+        // Keep the running plan through that handoff, when ordinary admission
+        // still observes a starting owner without a foreground override.
+        Ok(!self.closed
+            || env_service
+                .observe_source_watch_lease(&self.env_name)?
+                .is_some_and(|lease| lease.held && lease.lease_id == self.lease_id))
     }
 
     #[cfg(unix)]
@@ -498,6 +534,7 @@ mod tests {
             child: None,
             child_spawn_pending: false,
             watching: Some(false),
+            service_preparation: false,
             restore_service: false,
             closed: false,
             completion: None,
@@ -554,25 +591,34 @@ mod tests {
             restored_only.unsafe_cleanup_error().is_none(),
             "verified child cleanup permits restoration retry"
         );
-        for (kind, watching, valid) in [
-            (SESSION_KIND, Some(false), true),
-            (WATCH_V2_SESSION_KIND, None, true),
-            (LEGACY_SESSION_KIND, None, true),
-            (SESSION_KIND, None, false),
-            ("ocm-dev-source-session", Some(false), false),
-            ("ocm-dev-source-session-v2", Some(false), false),
-            ("ocm-dev-foreground-session", Some(false), false),
-            ("ocm-dev-foreground-session-v2", Some(false), false),
+        for (kind, watching, preparation, valid) in [
+            (SESSION_KIND, Some(false), false, true),
+            (WATCH_V2_SESSION_KIND, None, false, true),
+            (LEGACY_SESSION_KIND, None, false, true),
+            (SESSION_KIND, None, false, false),
+            (SERVICE_PREPARATION_SESSION_KIND, Some(false), true, true),
+            (SERVICE_PREPARATION_SESSION_KIND, Some(false), false, false),
+            (SERVICE_PREPARATION_SESSION_KIND, Some(true), true, false),
+            (SERVICE_PREPARATION_SESSION_KIND, None, true, false),
+            (SESSION_KIND, Some(false), true, false),
+            ("ocm-dev-source-session", Some(false), false, false),
+            ("ocm-dev-source-session-v2", Some(false), false, false),
+            ("ocm-dev-foreground-session", Some(false), false, false),
+            ("ocm-dev-foreground-session-v2", Some(false), false, false),
         ] {
             let mut candidate = legacy.clone();
             candidate.kind = kind.to_string();
             candidate.watching = watching;
+            candidate.service_preparation = preparation;
             write_json(&paths.session, &candidate).unwrap();
             let loaded = paths.load_session("demo");
             assert_eq!(loaded.is_ok(), valid, "{kind}");
             if valid {
                 let loaded = loaded.unwrap().unwrap();
-                assert_eq!(loaded.is_watching(), kind != SESSION_KIND);
+                assert_eq!(
+                    loaded.is_watching(),
+                    matches!(kind, LEGACY_SESSION_KIND | WATCH_V2_SESSION_KIND)
+                );
                 #[cfg(unix)]
                 assert_eq!(
                     loaded.requires_controller_completion(),
@@ -600,6 +646,7 @@ mod tests {
             child: None,
             child_spawn_pending: false,
             watching: Some(false),
+            service_preparation: false,
             restore_service: false,
             closed: false,
             completion: None,

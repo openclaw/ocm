@@ -26,8 +26,8 @@ use super::Cli;
 use super::render::RenderProfile;
 use crate::env::{
     CreateEnvironmentOptions, CreateSourceWatchOverrideOptions, EnvDevMeta, EnvMeta,
-    SourceWatchCompletion, SourceWatchEndpoint, SourceWatchLease, SourceWatchSession,
-    SourceWatchState,
+    SourceWatchCompletion, SourceWatchEndpoint, SourceWatchLease, SourceWatchMode,
+    SourceWatchSession, SourceWatchState,
 };
 use crate::infra::process::run_direct;
 #[cfg(unix)]
@@ -507,9 +507,7 @@ impl Cli {
 
         // Reject an already incompatible daemon before creating a new env or
         // worktree. Lease admission rechecks after any concurrent daemon change.
-        if !service_requested {
-            self.supervisor_service().preflight_source_watch_daemon()?;
-        }
+        self.supervisor_service().preflight_source_watch_daemon()?;
         let (meta, created) =
             self.ensure_dev_env(&name, repo_root.clone(), root.clone(), gateway_port)?;
         let stderr_profile = self.dev_stderr_profile();
@@ -523,37 +521,38 @@ impl Cli {
                 meta.name
             ));
         }
-        let watch_stop = (!service_requested)
-            .then(install_source_watch_signal_handler)
-            .transpose()?;
-        let mut source_watch_lease = if !service_requested {
-            Some(
-                match self
-                    .environment_service()
-                    .acquire_source_watch_lease(&meta.name, force, watch)
-                {
-                    Ok(lease) => lease,
-                    Err(error) => {
-                        // A competing invocation may have claimed the lease after the first lookup.
-                        let current = self.environment_service().get(&meta.name)?;
-                        if self.try_reuse_dev_watch(
+        let watch_stop = Some(install_source_watch_signal_handler()?);
+        let mode = if service_requested {
+            SourceWatchMode::ServicePreparation
+        } else {
+            SourceWatchMode::Foreground { watching: watch }
+        };
+        let mut source_watch_lease = Some(
+            match self
+                .environment_service()
+                .acquire_source_watch_lease(&meta.name, force, mode)
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    // A competing invocation may have claimed the lease after the first lookup.
+                    let current = self.environment_service().get(&meta.name)?;
+                    if !service_requested
+                        && self.try_reuse_dev_watch(
                             &current,
                             repo_root.as_deref(),
                             root.as_deref(),
                             gateway_port,
                             onboard,
                             watch,
-                        )? {
-                            return Ok(0);
-                        }
-                        return Err(error);
+                        )?
+                    {
+                        return Ok(0);
                     }
-                },
-            )
-        } else {
-            None
-        };
-        // Foreground preparation belongs to the lease owner, including a newly created env.
+                    return Err(error);
+                }
+            },
+        );
+        // Preparation belongs to the lease owner, including a newly created env.
         // A losing invocation must not rewrite config before returning the winner's status.
         let prepared = (|| {
             let current = self.environment_service().get(&meta.name)?;
@@ -629,6 +628,51 @@ impl Cli {
         }
 
         if service_requested {
+            let env_service = self.environment_service();
+            let _operation = env_service.lock_operation(&meta.name)?;
+            let lease = source_watch_lease
+                .as_mut()
+                .ok_or_else(|| "service preparation ownership is missing".to_string())?;
+            let service_policy_revision = lease.service_preparation_revision();
+            let cancelled = source_watch_cancelled(lease, watch_stop.as_deref().unwrap())?;
+            let code = finish_source_watch_session(
+                &meta.name,
+                lease,
+                Ok(if cancelled { 130 } else { 0 }),
+                Ok(()),
+                false,
+            )?;
+            drop(source_watch_lease.take());
+            if code != 0 {
+                return Ok(code);
+            }
+            // Keep replacement and service policy changes out of the handoff.
+            let current = env_service.get(&meta.name)?;
+            if current.root != meta.root
+                || current.created_at != meta.created_at
+                || current
+                    .dev
+                    .as_ref()
+                    .map(|dev| (&dev.repo_root, &dev.worktree_root))
+                    != meta
+                        .dev
+                        .as_ref()
+                        .map(|dev| (&dev.repo_root, &dev.worktree_root))
+                || current.default_runtime != meta.default_runtime
+                || current.default_launcher != meta.default_launcher
+                || Some(crate::store::environment_service_policy_revision(
+                    &meta.name, &self.env, &self.cwd,
+                )?) != service_policy_revision
+            {
+                return Err("the environment, source binding, or service policy changed during service preparation; its current service policy was preserved".to_string());
+            }
+            self.validate_existing_dev_request(
+                &current,
+                repo_root.as_deref(),
+                root.as_deref(),
+                gateway_port,
+            )?;
+            let current = env_service.apply_effective_gateway_port(current)?;
             self.stderr_lines(render_dev_run_step(
                 "Service",
                 format!(
@@ -637,10 +681,12 @@ impl Cli {
                 ),
                 stderr_profile,
             ));
-            self.service_service().install(&meta.name)?;
-            self.service_service().start(&meta.name)?;
+            // Start installs an absent daemon without install's running=false transition.
+            self.service_service()
+                .start_action_locked(&meta.name)?
+                .ensure_gateway_ready()?;
             self.stdout_lines(render_dev_service_started(
-                &meta,
+                &current,
                 &self.command_example(),
                 self.dev_stdout_profile(),
             ));
@@ -795,10 +841,11 @@ impl Cli {
         let meta = existing;
         let watch_stop = install_source_watch_signal_handler()?;
         let mut source_watch_lease = Some(
-            match self
-                .environment_service()
-                .acquire_source_watch_lease(&meta.name, true, true)
-            {
+            match self.environment_service().acquire_source_watch_lease(
+                &meta.name,
+                true,
+                SourceWatchMode::Foreground { watching: true },
+            ) {
                 Ok(lease) => lease,
                 Err(error) => {
                     if self.try_reuse_dev_watch(
@@ -1120,15 +1167,24 @@ impl Cli {
             SourceWatchState::Active(active) => Some(active.watching.unwrap_or(true)),
             _ => {
                 let lease = env_service.observe_source_watch_lease(&meta.name)?;
-                env_service
+                let session = env_service
                     .source_watch_session(&meta.name)?
                     .filter(|session| {
                         !session.closed
                             && lease.as_ref().is_some_and(|lease| {
                                 lease.held && lease.lease_id == session.lease_id
                             })
-                    })
-                    .map(|session| session.is_watching())
+                    });
+                if session
+                    .as_ref()
+                    .is_some_and(|session| session.service_preparation)
+                {
+                    return Err(format!(
+                        "dev env {} has active service preparation; finish or stop it before starting a foreground session",
+                        meta.name
+                    ));
+                }
+                session.map(|session| session.is_watching())
             }
         };
         // Legacy starting watches may lack mode metadata. Keep their progress
