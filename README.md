@@ -127,6 +127,12 @@ ocm dev shaks --onboard
 
 `dev` creates or reuses an isolated env, provisions an OpenClaw worktree under the repo's own `.worktrees/`, bootstraps the minimum local config so the gateway can run immediately, and then starts the gateway in the foreground. `--root` lets you choose the environment location. `--watch` keeps a source-run gateway rebuilding in place. While watch is active, `ocm @<env> -- ...`, `ocm env run <env> -- ...`, `ocm env resolve <env> -- ...`, service resolution, and `ocm env exec <env> -- openclaw ...` use the same watched checkout and run `node <checkout>/openclaw.mjs` directly instead of rebuilding through the package script. `--service` installs and starts the dev env in the OCM background service instead of keeping the process in the current terminal. If a dev env is already running in the background, `--watch --force` temporarily takes it over for the watch session and restores the background service when watch exits. For an existing runtime or launcher env, `--repo <path> --watch --force` temporarily runs that source checkout against the env's real root, config, state, and port without changing its binding, tees foreground output to the env gateway logs, then restores a running background service when watch exits. `--onboard` runs local onboarding first and then starts the dev gateway. For a new env, `dev` uses the explicit `--repo` checkout or the checkout enclosing the current directory. Outside an OpenClaw checkout, pass `--repo`; `dev` does not select a neighboring or previously remembered repository. Existing dev envs continue to use their recorded source.
 
+New dev environments receive a private Gateway token in their initial config before
+the environment is registered. The token remains stable through restarts and
+source rebuilds, so paired clients can reconnect. Initialization never replaces an
+existing config or its auth/SecretRefs. Repeating minimum setup leaves an unchanged
+config untouched.
+
 If you already have a plain `~/.openclaw` home you care about, use `ocm migrate <env>` instead of starting fresh. `setup` and `start` now point that out when they detect an existing plain OpenClaw home.
 
 ## Common paths

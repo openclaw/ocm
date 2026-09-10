@@ -556,6 +556,7 @@ dependencies = [
  "filetime",
  "flate2",
  "fs2",
+ "getrandom 0.4.3",
  "indicatif",
  "json5",
  "libc",

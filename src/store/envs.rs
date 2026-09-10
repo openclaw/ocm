@@ -473,6 +473,18 @@ fn create_environment_with_runtime_validation(
         updated_at: created_at,
         last_used_at: None,
     };
+    if meta.dev.is_some()
+        && !super::openclaw_config::initialize_new_dev_openclaw_config(
+            &paths,
+            gateway_port.expect("new environments have a selected Gateway port"),
+        )?
+    {
+        return Err(format!(
+            "OpenClaw config appeared while creating dev env {}; preserving it without registering the env: {}",
+            meta.name,
+            display_path(&paths.config_path)
+        ));
+    }
     let meta = upsert_environment(&mut registry, meta)?;
     write_env_registry(&mut registry, env, cwd)?;
     Ok(meta)
@@ -1099,7 +1111,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use crate::env::CreateEnvironmentOptions;
+    use crate::env::{CreateEnvironmentOptions, EnvDevMeta};
     use serde_json::{Value, json};
 
     use super::{
@@ -1109,6 +1121,59 @@ mod tests {
         get_environment, remove_environment, restore_environment_service_policy, save_environment,
         set_environment_service_policy,
     };
+
+    #[test]
+    fn private_config_dev_is_published_with_new_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([
+            (
+                "HOME".to_string(),
+                root.path().join("home").display().to_string(),
+            ),
+            (
+                "OCM_HOME".to_string(),
+                root.path().join("ocm-home").display().to_string(),
+            ),
+        ]);
+        for (name, dev) in [
+            (
+                "dev",
+                Some(EnvDevMeta {
+                    repo_root: root.path().join("repo").display().to_string(),
+                    worktree_root: root.path().join("worktree").display().to_string(),
+                }),
+            ),
+            ("ordinary", None),
+        ] {
+            let meta = create_environment(
+                CreateEnvironmentOptions {
+                    name: name.to_string(),
+                    root: None,
+                    gateway_port: Some(if dev.is_some() { 19789 } else { 19821 }),
+                    service_enabled: false,
+                    service_running: false,
+                    default_runtime: None,
+                    default_launcher: None,
+                    dev,
+                    protected: false,
+                },
+                &env,
+                root.path(),
+            )
+            .unwrap();
+            let published = get_environment(name, &env, root.path()).unwrap();
+            assert_eq!(published.root, meta.root);
+            let paths = derive_env_paths(Path::new(&meta.root));
+            assert_eq!(paths.config_path.is_file(), meta.dev.is_some());
+            if meta.dev.is_some() {
+                let config: Value =
+                    serde_json::from_slice(&fs::read(&paths.config_path).unwrap()).unwrap();
+                let token = config["gateway"]["auth"]["token"].as_str().unwrap();
+                assert_eq!(token.len(), 64);
+                assert!(!serde_json::to_string(&published).unwrap().contains(token));
+            }
+        }
+    }
 
     #[test]
     fn service_policy_rollback_requires_the_applied_snapshot_to_still_be_current() {

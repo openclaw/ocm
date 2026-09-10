@@ -883,13 +883,27 @@ fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
         path_string(&worktree_root.join("extensions"))
     )));
     assert!(pnpm_log.contains(&format!("|devroot={}", path_string(&worktree_root))));
+    let token = config["gateway"]["auth"]["token"].as_str().unwrap();
+    assert_eq!(config["gateway"]["auth"]["mode"], "token");
+    assert_eq!(token.len(), 64);
+    assert!(!stdout(&run).contains(token) && !stderr(&run).contains(token));
+    assert!(!stdout(&show).contains(token));
+    let original = fs::read(&config_path).unwrap();
+    let resumed = run_ocm(&cwd, &env, &["dev", "demo"]);
+    assert!(resumed.status.success(), "{}", stderr(&resumed));
+    assert!(fs::read(&config_path).unwrap() == original);
+    assert!(!stdout(&resumed).contains(token) && !stderr(&resumed).contains(token));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let auth = serde_json::json!({"mode": "token", "token": {"source": "env", "provider": "default", "id": "AUTHORED_TOKEN"}});
         let mut authored = config.clone();
         authored["gateway"]["auth"] = auth.clone();
-        fs::write(&config_path, serde_json::to_vec(&authored).unwrap()).unwrap();
+        let raw = format!(
+            "// authored after creation\n{}\n",
+            serde_json::to_string_pretty(&authored).unwrap()
+        );
+        fs::write(&config_path, &raw).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
         let resumed = run_ocm(&cwd, &env, &["dev", "demo"]);
         assert!(resumed.status.success(), "{}", stderr(&resumed));
@@ -898,7 +912,8 @@ fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
             0o600,
             "private config lost owner-only access on dev restart"
         );
-        let updated: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert!(fs::read(&config_path).unwrap() == raw.as_bytes());
+        let updated: Value = json5::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(updated["gateway"]["auth"], auth);
     }
 }

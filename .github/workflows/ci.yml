@@ -56,7 +56,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check Windows targets
         run: cargo check --workspace --all-targets --locked
-      - name: Prove private config replacement
+      - name: Prove private config writes
         run: cargo test --locked --lib private_config_
       - name: Prove canonical owned worktree paths
         run: cargo test --locked --lib openclaw_repo::tests::owned_worktree_uses_canonical_repository_paths -- --exact --nocapture
