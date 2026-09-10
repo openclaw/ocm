@@ -22,6 +22,7 @@ use std::os::unix::fs::DirBuilderExt;
 use super::common::{
     copy_dir_recursive, copy_path, ensure_dir, path_exists, read_json, write_json,
 };
+use super::dev_sources::ensure_root_outside_dev_sources;
 use super::gateway_ports::{
     DEFAULT_GATEWAY_PORT, choose_available_gateway_port, resolve_effective_gateway_ports,
     resolve_env_gateway_port,
@@ -430,6 +431,7 @@ fn create_environment_with_runtime_validation(
         default_env_root(&name, env, cwd)?
     };
 
+    ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
     let paths = derive_env_paths(&root);
     if path_exists(&paths.root) {
         let mut entries = fs::read_dir(&paths.root).map_err(|error| error.to_string())?;
@@ -542,6 +544,7 @@ fn clone_environment_with_policy(
     } else {
         default_env_root(&name, env, cwd)?
     };
+    ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
     let target_paths = derive_env_paths(&root);
     if path_exists(&target_paths.root) {
         let mut entries = fs::read_dir(&target_paths.root).map_err(|error| error.to_string())?;
@@ -918,6 +921,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
         } else {
             default_env_root(&name, env, cwd)?
         };
+        ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
         let target_paths = derive_env_paths(&root);
         if path_exists(&target_paths.root) {
             let mut entries =

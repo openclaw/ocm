@@ -1162,6 +1162,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Environments are the main isolation unit in OCM.",
+                "The root must not overlap an existing registered dev worktree, including source and destination path aliases.",
                 "Computed gateway ports reserve the full local OpenClaw port family and skip the machine-wide OpenClaw config when present.",
                 "Use exactly one of `--runtime`, `--version`, or `--channel`.",
             ],
@@ -1190,6 +1191,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             vec![format!("{cmd} env clone mira rowan")],
             &[
                 "Clone resets environment identity while preserving the copied workspace and env config.",
+                "The destination root must not overlap an existing registered dev worktree, including source and destination path aliases.",
                 "Clone assigns a fresh gateway port to the new env to avoid collisions.",
                 "Computed gateway ports reserve the full local OpenClaw port family and skip the machine-wide OpenClaw config when present.",
                 "Clone rewrites env-scoped OpenClaw config paths inside the copied env root.",
@@ -1242,6 +1244,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             )],
             &[
                 "Imported environments get a fresh identity in the central env registry.",
+                "The destination root must not overlap an existing registered dev worktree, including source and destination path aliases.",
                 "Import rewrites env-scoped OpenClaw config paths for the new root.",
                 "Import removes a copied public MCP app sandbox origin unless --sandbox-origin supplies a dedicated origin for the imported env.",
                 "If the config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin is owned by $include, flatten that section before importing so OCM can reset the origin without changing include ownership.",

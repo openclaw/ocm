@@ -1441,6 +1441,35 @@ fn dev_command_does_not_recreate_a_missing_saved_worktree() {
     assert!(!root.child("pnpm.log").exists());
     let meta = get_environment("demo", &env, &cwd).unwrap();
     assert_eq!(meta.dev.unwrap().worktree_root, path_string(&worktree_root));
+
+    let replacement = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "replacement",
+            "--root",
+            &path_string(&worktree_root),
+        ],
+    );
+    assert!(replacement.status.success(), "{}", stderr(&replacement));
+    let notes = worktree_root.join(".openclaw/workspace/notes");
+    fs::write(&notes, "preserve replacement state\n").unwrap();
+    let registry = ocm::store::env_registry_path(&env, &cwd).unwrap();
+    let registry_before = fs::read(&registry).unwrap();
+    let remove = run_ocm(&cwd, &env, &["env", "remove", "demo", "--force"]);
+    assert!(!remove.status.success());
+    assert!(
+        stderr(&remove).contains("checkout identity does not match"),
+        "{}",
+        stderr(&remove)
+    );
+    assert_eq!(
+        fs::read_to_string(notes).unwrap(),
+        "preserve replacement state\n"
+    );
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
 }
 
 #[test]
