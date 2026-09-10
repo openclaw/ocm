@@ -23,6 +23,7 @@ fn sample_env(default_runtime: Option<&str>, default_launcher: Option<&str>) -> 
         default_runtime: default_runtime.map(str::to_string),
         default_launcher: default_launcher.map(str::to_string),
         dev: None,
+        dev_ui_port: None,
         protected: false,
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,

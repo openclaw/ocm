@@ -877,7 +877,13 @@ fn prepare_initial_ui_repo(
         &format!(
             r#"#!/bin/sh
 case "${{3:-}}" in
-  *uiRequire*) exec '{node}' "$@";;
+  *uiRequire*)
+    : > "$OCM_TEST_DEV_UI_DIR/ui-probe-ready"
+    while [ -f "$OCM_TEST_DEV_UI_DIR/ui-probe-hold" ] &&
+          [ ! -f "$OCM_TEST_DEV_UI_DIR/source-watch.release" ]; do
+      sleep 0.02
+    done
+    exec '{node}' "$@";;
   *createRequire*|*ocm-source-dependencies*)
     if [ -n "$OCM_SOURCE_WATCH_START_FD" ]; then
       IFS= read -r start < "/dev/fd/$OCM_SOURCE_WATCH_START_FD" || exit 1
@@ -1292,7 +1298,8 @@ fn dev_ui_claims_an_address_before_the_listener_starts() {
     );
     let second_gateway = initial_ui_process(&second_root, "gateway", &mut second);
     let second_ui = initial_ui_process(&second_root, "ui", &mut second);
-    assert_ne!(second_ui["port"].as_u64().unwrap(), u64::from(port));
+    let second_port = second_ui["port"].as_u64().unwrap() as u16;
+    assert_ne!(second_port, port);
     fs::remove_file(root.child("ui-start-hold")).unwrap();
     let first_ui = initial_ui_process(&root, "ui", &mut first);
     for name in ["first", "second"] {
@@ -1302,6 +1309,172 @@ fn dev_ui_claims_an_address_before_the_listener_starts() {
     assert_eq!(first.wait_without_release().status.code(), Some(130));
     assert_eq!(second.wait_without_release().status.code(), Some(130));
     for process in [first_gateway, first_ui, second_gateway, second_ui] {
+        assert!(wait_for_process_exit(
+            process["pid"].as_u64().unwrap() as u32,
+            Duration::from_secs(3)
+        ));
+    }
+    for (name, expected_port) in [("first", port), ("second", second_port)] {
+        assert_eq!(
+            get_environment(name, &env, &repo).unwrap().dev_ui_port,
+            Some(u32::from(expected_port))
+        );
+    }
+
+    let saved = get_environment("second", &env, &repo).unwrap();
+    let config_path = Path::new(&saved.root).join(".openclaw/openclaw.json");
+    let config_before = fs::read(&config_path).unwrap();
+    for name in ["gateway.json", "ui.json"] {
+        fs::remove_file(second_root.child(name)).unwrap();
+    }
+    let occupied = std::net::TcpListener::bind(("127.0.0.1", second_port)).unwrap();
+    let mut busy = DevWatchFixture::spawn(
+        &second_root,
+        &second_repo,
+        &second_env,
+        &["dev", "second", "--ui"],
+    );
+    let rejected = busy.wait_without_release();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("occupied or reserved"));
+    assert_eq!(fs::read(&config_path).unwrap(), config_before);
+    assert_eq!(
+        get_environment("second", &env, &repo).unwrap().dev_ui_port,
+        saved.dev_ui_port
+    );
+    assert!(!second_root.child("gateway.json").exists());
+    assert!(!second_root.child("ui.json").exists());
+    assert!(!second_root.child("ui-listen-error").exists());
+    assert!(!second_root.child("dashboard-attempts").exists());
+    let rejected_session: Value =
+        serde_json::from_slice(&fs::read(&busy.session).unwrap()).unwrap();
+    assert_eq!(rejected_session["closed"], true);
+    assert!(
+        rejected_session["ui"]["children"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(rejected_session["ui"]["pending"].is_null());
+    drop(occupied);
+
+    // Both original sessions are closed. A new generation must use the same
+    // environment's reservation even when its backend watch mode changes.
+    let mut restarted = DevWatchFixture::spawn(
+        &second_root,
+        &second_repo,
+        &second_env,
+        &["dev", "second", "--watch", "--ui"],
+    );
+    let gateway = initial_ui_process(&second_root, "gateway", &mut restarted);
+    let ui = initial_ui_process(&second_root, "ui", &mut restarted);
+    assert_eq!(ui["port"].as_u64().unwrap(), u64::from(second_port));
+    let current = get_environment("second", &env, &repo).unwrap();
+    assert_eq!(current.created_at, saved.created_at);
+    assert_eq!(current.root, saved.root);
+    assert_eq!(current.dev_ui_port, saved.dev_ui_port);
+    assert_eq!(fs::read(&config_path).unwrap(), config_before);
+    let stopped = run_named_dev_stop(&second_repo, &second_env, "second");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert_eq!(restarted.wait_without_release().status.code(), Some(130));
+    for process in [gateway, ui] {
+        assert!(wait_for_process_exit(
+            process["pid"].as_u64().unwrap() as u32,
+            Duration::from_secs(3)
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_ui_port_reservation_waits_for_metadata_mutations() {
+    use fs2::FileExt;
+
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = TestDir::new("dev-ui-port-operation-lock");
+    let mut env = ocm_env(&root);
+    let repo = prepare_initial_ui_repo(&root, &mut env);
+    fs::write(root.child("ui-probe-hold"), "hold").unwrap();
+    let mut controller = DevWatchFixture::spawn(
+        &root,
+        &repo,
+        &env,
+        &["dev", "demo", "--repo", &path_string(&repo), "--ui"],
+    );
+    assert!(wait_for_path(
+        &root.child("ui-probe-ready"),
+        Duration::from_secs(10)
+    ));
+    assert!(read_source_watch_session(&root)["ui"]["children"]["command"]["pid"].is_number());
+    let operation = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.child("ocm-home/locks/environments/demo.lock"))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match operation.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => panic!("UI prerequisite probe retained the operation lock: {error}"),
+        }
+    }
+    let mut stale = get_environment("demo", &env, &repo).unwrap();
+    let identity = (stale.root.clone(), stale.created_at);
+    fs::remove_file(root.child("ui-probe-hold")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while read_source_watch_session(&root)["ui"]["children"]
+        .get("command")
+        .is_some()
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        read_source_watch_session(&root)["ui"]["children"]
+            .get("command")
+            .is_none()
+    );
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        !root.child("gateway.json").exists() && !root.child("ui.json").exists(),
+        "UI reservation bypassed the held operation boundary"
+    );
+    assert!(read_source_watch_session(&root)["ui"]["target"].is_null());
+    assert_eq!(
+        get_environment("demo", &env, &repo).unwrap().dev_ui_port,
+        None
+    );
+    stale.last_used_at = Some(now_utc());
+    let touched_at = stale.last_used_at;
+    save_environment(stale, &env, &repo).unwrap();
+    FileExt::unlock(&operation).unwrap();
+
+    let gateway = initial_ui_process(&root, "gateway", &mut controller);
+    let ui = initial_ui_process(&root, "ui", &mut controller);
+    let saved = get_environment("demo", &env, &repo).unwrap();
+    assert_eq!(saved.last_used_at, touched_at);
+    assert_eq!((saved.root, saved.created_at), identity);
+    assert_eq!(
+        saved.dev_ui_port,
+        ui["port"].as_u64().map(|port| port as u32)
+    );
+    assert_eq!(
+        read_source_watch_session(&root)["ui"]["target"]["port"],
+        ui["port"]
+    );
+    let stopped = run_dev_stop(&repo, &env);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert_eq!(controller.wait_without_release().status.code(), Some(130));
+    for process in [gateway, ui] {
         assert!(wait_for_process_exit(
             process["pid"].as_u64().unwrap() as u32,
             Duration::from_secs(3)

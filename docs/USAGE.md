@@ -120,8 +120,12 @@ and SecretRefs. Repeating minimum setup preserves unchanged config bytes.
 For live Control UI edits, run `ocm dev luna --watch --ui` (or `--ui` with a plain
 foreground Gateway). OCM owns the native Vite process and prints its initial
 native browser handoff once both documents are ready. The UI uses a captured
-loopback address for that session. `ocm dev status luna` and matching repeated
-starts report the address; repeated starts do not issue another browser grant.
+loopback address retained across stop/start for that environment. A busy retained
+port is an error; OCM does not silently choose another address. Clone and import
+select new addresses, while snapshot restore keeps the current environment's
+reservation. Removing the environment releases it. `ocm dev status luna` and
+matching repeated starts report the address; repeated starts do not issue
+another browser grant.
 `ocm dev stop luna` stops the components together. A pending initial request gets
 30 seconds and retains its helper until completion; late grant bytes are discarded.
 An unfinished or interrupted cleanup keeps its recorded ownership.

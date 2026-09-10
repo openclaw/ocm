@@ -36,6 +36,7 @@ pub(crate) fn resolve_effective_gateway_ports(
 
     let mut claimed = BTreeSet::new();
     reserve_foreign_openclaw_port_family(env, &mut claimed);
+    reserve_dev_ui_ports(envs, &mut claimed);
 
     let mut effective = BTreeMap::new();
     for meta in &sorted {
@@ -66,6 +67,7 @@ pub(crate) fn choose_available_gateway_port(
     let effective = resolve_effective_gateway_ports(envs, env);
     let mut claimed = BTreeSet::new();
     reserve_foreign_openclaw_port_family(env, &mut claimed);
+    reserve_dev_ui_ports(envs, &mut claimed);
     for port in effective.values().copied() {
         reserve_openclaw_port_family(port, &mut claimed);
     }
@@ -85,7 +87,12 @@ fn reserve_foreign_openclaw_port_family(
     }
 }
 
-pub(crate) fn choose_source_ui_port(
+fn reserve_dev_ui_ports(envs: &[EnvMeta], claimed: &mut BTreeSet<u32>) {
+    claimed.extend(envs.iter().filter_map(|meta| meta.dev_ui_port));
+}
+
+pub(super) fn choose_source_ui_port(
+    meta: &EnvMeta,
     envs: &[EnvMeta],
     active_ui_ports: &[u32],
     env: &BTreeMap<String, String>,
@@ -96,10 +103,28 @@ pub(crate) fn choose_source_ui_port(
         reserve_openclaw_port_family(port, &mut claimed);
     }
     claimed.extend(active_ui_ports);
+    claimed.extend(
+        envs.iter()
+            .filter(|other| other.name != meta.name)
+            .filter_map(|other| other.dev_ui_port),
+    );
+    let available = |port: u32| {
+        !claimed.contains(&port) && TcpListener::bind(("127.0.0.1", port as u16)).is_ok()
+    };
+    if let Some(port) = meta.dev_ui_port {
+        if !(1..=u16::MAX as u32).contains(&port) {
+            return Err(format!("env {} has an invalid retained UI port", meta.name));
+        }
+        if !available(port) {
+            return Err(format!(
+                "retained UI port {port} for env {} is occupied or reserved; release that port before retrying",
+                meta.name,
+            ));
+        }
+        return Ok(port);
+    }
     (5173..=u16::MAX as u32)
-        .find(|port| {
-            !claimed.contains(port) && TcpListener::bind(("127.0.0.1", *port as u16)).is_ok()
-        })
+        .find(|port| available(*port))
         .ok_or_else(|| "no unreserved loopback port is available for the dev UI".to_string())
 }
 

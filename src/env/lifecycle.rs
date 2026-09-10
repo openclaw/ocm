@@ -180,6 +180,9 @@ pub struct EnvMeta {
     pub default_launcher: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev: Option<EnvDevMeta>,
+    /// Hydrated from identity-bound reservations when reading the environment store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_ui_port: Option<u32>,
     pub protected: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -206,6 +209,8 @@ pub struct EnvSummary {
     pub default_launcher: Option<String>,
     pub dev_repo_root: Option<String>,
     pub dev_worktree_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev_ui_port: Option<u32>,
     pub protected: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,

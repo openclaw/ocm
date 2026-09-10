@@ -154,8 +154,11 @@ The controller owns Gateway, Vite and the initial dashboard helper. A component
 exit stops its sibling; `dev stop` stops both and gives a running helper only the
 remainder of its original 30-second budget. A late link is discarded, and uncertain
 cleanup retains ownership. Repeating the matching command reports the current
-address without starting another helper. The address belongs to this session;
-stop the session before changing UI mode or requesting a new initial owner link.
+address without starting another helper. The UI address is retained across
+stop/start for the same environment. If that address is occupied or reserved,
+startup fails until it is free. Cloned and imported environments select their own
+addresses; restore keeps the current environment's address. Stop the session
+before changing UI mode or requesting a new initial owner link.
 
 If you already have a plain `~/.openclaw` home you care about, use `ocm migrate <env>` instead of starting fresh. `setup` and `start` now point that out when they detect an existing plain OpenClaw home.
 

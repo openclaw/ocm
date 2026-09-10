@@ -597,19 +597,20 @@ for (const name of ['vite', 'dompurify']) {
         }
         let service = self.environment_service();
         let _operation = service.lock_operation(&meta.name)?;
-        // Only startup reads other live session claims. The registry lock joins
-        // simultaneous selections until this lease publishes its chosen address.
+        // Serialize selection, persistent reservation, and the session claim
+        // with other environments and registry writers.
         crate::store::with_locked_environments(&self.env, &self.cwd, |metas| {
             if source_watch_cancelled(lease, stop)? {
                 return Err("dev UI setup was cancelled".to_string());
             }
-            if !metas.iter().any(|current| {
-                lease
-                    .session()
-                    .is_some_and(|session| session.restore_target_matches(current))
-            }) {
-                return Err("dev environment changed before UI startup".to_string());
-            }
+            let current = metas
+                .iter()
+                .find(|current| {
+                    lease
+                        .session()
+                        .is_some_and(|session| session.restore_target_matches(current))
+                })
+                .ok_or_else(|| "dev environment changed before UI startup".to_string())?;
             let mut claimed = Vec::new();
             for other in metas {
                 if other.name == meta.name {
@@ -622,7 +623,8 @@ for (const name of ['vite', 'dompurify']) {
                     claimed.push(target.port);
                 }
             }
-            let port = crate::store::choose_source_ui_port(metas, &claimed, &self.env)?;
+            let port =
+                crate::store::reserve_dev_ui_port(current, metas, &claimed, &self.env, &self.cwd)?;
             let target = DevUiTarget {
                 port,
                 gateway_url: gateway_url.clone(),

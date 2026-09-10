@@ -70,11 +70,12 @@ fn empty_env_registry() -> EnvRegistry {
 
 fn load_env_registry(env: &BTreeMap<String, String>, cwd: &Path) -> Result<EnvRegistry, String> {
     let path = env_registry_path(env, cwd)?;
-    if !path_exists(&path) {
-        return Ok(empty_env_registry());
-    }
-
-    let mut registry: EnvRegistry = read_json(&path)?;
+    let mut registry: EnvRegistry = if path_exists(&path) {
+        read_json(&path)?
+    } else {
+        empty_env_registry()
+    };
+    super::dev_ui_ports::hydrate(&mut registry.envs, env, cwd)?;
     registry.kind = "ocm-env-registry".to_string();
     registry
         .envs
@@ -519,6 +520,7 @@ fn create_environment_with_runtime_validation(
         default_runtime,
         default_launcher,
         dev: options.dev,
+        dev_ui_port: None,
         protected: options.protected,
         created_at,
         updated_at: created_at,
@@ -731,6 +733,7 @@ fn clone_environment_with_policy(
             default_runtime: source.default_runtime,
             default_launcher: source.default_launcher,
             dev: None,
+            dev_ui_port: None,
             protected: source.protected,
             created_at,
             updated_at: created_at,
@@ -1053,6 +1056,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 default_runtime: extracted.metadata.env.default_runtime.clone(),
                 default_launcher: extracted.metadata.env.default_launcher.clone(),
                 dev: None,
+                dev_ui_port: None,
                 protected: extracted.metadata.env.protected,
                 created_at,
                 updated_at: created_at,
@@ -1142,6 +1146,7 @@ pub(crate) fn remove_environment_locked(
     // later environment that reuses the same name.
     bump_service_policy_revision(&mut registry, &meta.name);
     write_env_registry(&mut registry, env, cwd)?;
+    super::dev_ui_ports::remove(&meta, env, cwd)?;
 
     Ok(meta)
 }
