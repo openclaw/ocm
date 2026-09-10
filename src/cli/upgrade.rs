@@ -776,11 +776,16 @@ impl Cli {
         self.save_upgrade_batch_journal(&journal_path, &summary)?;
 
         let checkpoint_label = format!("fast-batch-{batch_id}");
+        let rollback_enabled = options.failure_policy == UpgradeFleetFailurePolicy::Rollback;
         let checkpoint_results = self.run_parallel_batch_work(
             &options.env_names,
             options.parallel,
             move |cli, env_name| {
-                cli.create_upgrade_batch_checkpoint_locked(env_name, &checkpoint_label)
+                cli.create_upgrade_batch_checkpoint_locked(
+                    env_name,
+                    &checkpoint_label,
+                    rollback_enabled,
+                )
             },
         );
         for (env_name, result) in checkpoint_results {
@@ -957,8 +962,15 @@ impl Cli {
         &self,
         env_name: &str,
         label: &str,
+        rollback_enabled: bool,
     ) -> Result<EnvSnapshotSummary, String> {
         let interrupt_fence = UpgradeInterruptFence::enter()?;
+        if rollback_enabled {
+            self.environment_service()
+                .ensure_upgrade_rollback_preserves_dev_sources_locked(
+                    &self.environment_service().get(env_name)?,
+                )?;
+        }
         let prepared = self
             .environment_service()
             .prepare_upgrade_checkpoint_locked(env_name)?;
@@ -1198,7 +1210,8 @@ impl Cli {
                 record.id
             ));
         }
-        self.environment_service()
+        let snapshot = self
+            .environment_service()
             .get_snapshot(env_name, &record.snapshot_id)
             .map_err(|error| {
                 format!(
@@ -1206,6 +1219,10 @@ impl Cli {
                     record.id
                 )
             })?;
+        self.environment_service()
+            .ensure_snapshot_restore_preserves_dev_sources_locked(&snapshot)?;
+        self.environment_service()
+            .ensure_upgrade_rollback_preserves_dev_sources_locked(&current)?;
         self.verify_rollback_target_version(env_name, &record)?;
         let recovery = self.verify_rollback_source(env_name, &record)?;
         Ok(UpgradeRollbackPlan { record, recovery })
@@ -4353,6 +4370,10 @@ impl Cli {
         let interrupt_fence = UpgradeInterruptFence::enter()?;
         let snapshot_preparation_started = timings.start();
         let env_meta = self.environment_service().get(env_name)?;
+        if rollback_enabled {
+            self.environment_service()
+                .ensure_upgrade_rollback_preserves_dev_sources_locked(&env_meta)?;
+        }
         let prepared = self
             .environment_service()
             .prepare_upgrade_checkpoint_locked(env_name)?;

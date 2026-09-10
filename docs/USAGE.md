@@ -508,7 +508,18 @@ not add crash recovery for an uncatchable process or machine failure.
 
 This policy belongs to the environment registration. Clone and import start with
 an empty list. A separately requested full snapshot, export, or clone still
-includes independent content. Full snapshot restore still rewinds that content.
+includes independent content. Full snapshot restore still rewinds unregistered
+independent content and the selected environment's own source.
+
+Restores and required rollbacks refuse checkpoints whose recorded scope would
+replace another named environment's registered dev source or required Git
+metadata, before service quiescence or restore staging. Explicit rollback checks
+both the selected checkpoint and its failure-recovery checkpoint. `--no-rollback`
+keeps its existing behavior. The check reads only known registered source paths
+and Git identity metadata, including surviving history for a missing worktree.
+Checkpoint traversal still leaves independent content opaque; post-copy updates
+and residue cleanup leave directory links untouched. Excluding only a worktree
+is insufficient when its required Git metadata remains in scope.
 
 ### Snapshots
 

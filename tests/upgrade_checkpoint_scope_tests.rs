@@ -476,3 +476,360 @@ fn full_backup_still_rewinds_declared_independent_content() {
     assert!(fixture.project.join("deleted").exists());
     assert!(!fixture.project.join("created").exists());
 }
+
+fn source_test_git(path: &std::path::Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    output.stdout
+}
+
+impl Fixture {
+    fn with_dev_repo() -> Self {
+        let mut fixture = Self::new();
+        support::install_fake_service_manager(&fixture.root, &mut fixture.env);
+        for (path, contents) in [
+            (
+                "package.json",
+                r#"{"name":"openclaw","version":"2026.4.19"}"#,
+            ),
+            ("scripts/run-node.mjs", "// fixture\n"),
+            ("openclaw.mjs", "// fixture\n"),
+            ("extensions/codex/openclaw.plugin.json", r#"{"id":"codex"}"#),
+            (".gitignore", "node_modules/\n.env\n"),
+        ] {
+            write_text(&fixture.project.join(path), contents);
+        }
+        source_test_git(&fixture.project, &["init", "--quiet"]);
+        source_test_git(&fixture.project, &["add", "."]);
+        for (key, value) in [
+            ("user.name", "OCM Tests"),
+            ("user.email", "tests@example.com"),
+        ] {
+            source_test_git(&fixture.project, &["config", key, value]);
+        }
+        source_test_git(&fixture.project, &["commit", "--quiet", "-m", "fixture"]);
+        let bin = fixture.root.child("fake-dev-bin");
+        for name in ["pnpm", "node"] {
+            write_executable_script(&bin.join(name), "#!/bin/sh\nexit 0\n");
+        }
+        let path = fixture.env.get("PATH").cloned().unwrap_or_default();
+        fixture
+            .env
+            .insert("PATH".to_string(), format!("{}:{path}", bin.display()));
+        for (name, path) in [
+            ("OCM_PROOF_READY", "ready"),
+            ("OCM_PROOF_RELEASE", "release"),
+        ] {
+            fixture.env.insert(
+                name.to_string(),
+                fixture.root.child(path).display().to_string(),
+            );
+        }
+        write_text(&fixture.root.child("release"), "continue");
+        fixture
+    }
+
+    fn run_ok(&self, args: &[&str]) -> std::process::Output {
+        let output = self.run(args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        output
+    }
+
+    fn source_scope(&self, include_git: bool) {
+        let mut args = vec![
+            "env",
+            "set-independent-paths",
+            "demo",
+            ".openclaw/workspace/projects/example/.worktrees",
+        ];
+        if include_git {
+            args.push(".openclaw/workspace/projects/example/.git");
+        }
+        self.run_ok(&args);
+    }
+
+    fn register_child(&self) {
+        self.run_ok(&["dev", "child", "--repo", self.project.to_str().unwrap()]);
+        write_text(
+            &self.project.join(".worktrees/child/authored"),
+            "current child work\n",
+        );
+        let child = ocm::store::get_environment("child", &self.env, self.root.path()).unwrap();
+        assert!(!PathBuf::from(child.root).starts_with(self.state.parent().unwrap()));
+    }
+
+    fn child_witness(&self) -> (Value, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let source = self.project.join(".worktrees/child");
+        let identity = source_test_git(
+            &source,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+                "--show-toplevel",
+                "HEAD",
+            ],
+        );
+        let private = PathBuf::from(String::from_utf8_lossy(&identity).lines().next().unwrap());
+        let child = ocm::store::get_environment("child", &self.env, self.root.path()).unwrap();
+        (
+            serde_json::to_value(child).unwrap(),
+            fs::read(source.join("authored")).unwrap(),
+            identity,
+            fs::read(private.join("gitdir")).unwrap(),
+        )
+    }
+}
+
+#[test]
+fn restore_and_explicit_rollback_preserve_registered_source_and_git_identity() {
+    // capture_git is irrelevant for the separately requested full snapshot.
+    for (action, capture_git, current_git, allowed) in [
+        ("full", false, true, false),
+        ("restore", false, true, false),
+        ("restore", true, false, true),
+        ("rollback", false, true, false),
+        ("rollback", true, false, false),
+        ("rollback", true, true, true),
+    ] {
+        let fixture = Fixture::with_dev_repo();
+        fixture.source_scope(capture_git);
+        let capture = if action == "full" {
+            fixture.run_ok(&["env", "snapshot", "create", "demo", "--json"])
+        } else {
+            fixture.run_ok(&["upgrade", "demo", "--runtime", "new", "--json"])
+        };
+        let capture: Value = serde_json::from_str(&stdout(&capture)).unwrap();
+        let id = capture[if action == "full" { "id" } else { "snapshotId" }]
+            .as_str()
+            .unwrap();
+        fixture.register_child();
+        fixture.source_scope(current_git);
+        if action == "full" {
+            let mut meta =
+                ocm::store::get_environment("demo", &fixture.env, fixture.root.path()).unwrap();
+            meta.service_enabled = true;
+            meta.service_running = true;
+            ocm::store::save_environment(meta, &fixture.env, fixture.root.path()).unwrap();
+        }
+        let child_before = fixture.child_witness();
+        let registry = ocm::store::env_registry_path(&fixture.env, fixture.root.path()).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let snapshots = ["env", "snapshot", "list", "demo", "--json"];
+        let snapshots_before = stdout(&fixture.run_ok(&snapshots));
+        let result = if action == "rollback" {
+            fixture.run(&["upgrade", "rollback", "demo", "--json"])
+        } else {
+            fixture.run(&["env", "snapshot", "restore", "demo", id])
+        };
+        assert_eq!(
+            result.status.success(),
+            allowed,
+            "{action}, captured Git={capture_git}, current Git={current_git}: {} {}",
+            stdout(&result),
+            stderr(&result)
+        );
+        if !allowed {
+            assert!(
+                stderr(&result).contains("registered dev source")
+                    && stderr(&result).contains("child"),
+                "{}",
+                stderr(&result)
+            );
+            if action != "rollback" {
+                let direct = ocm::store::restore_env_snapshot(
+                    ocm::env::RestoreEnvSnapshotOptions {
+                        env_name: "demo".to_string(),
+                        snapshot_id: id.to_string(),
+                    },
+                    &fixture.env,
+                    fixture.root.path(),
+                )
+                .unwrap_err();
+                assert!(
+                    direct.contains("registered dev source") && direct.contains("child"),
+                    "{direct}"
+                );
+            }
+            assert_eq!(fs::read(&registry).unwrap(), registry_before);
+            assert_eq!(stdout(&fixture.run_ok(&snapshots)), snapshots_before);
+        }
+        assert_eq!(fixture.child_witness(), child_before);
+        fixture.run_ok(&["dev", "child"]);
+    }
+}
+
+#[test]
+fn upgrade_requires_safe_rollback_but_respects_no_rollback() {
+    let mut fixture = Fixture::with_dev_repo();
+    fixture
+        .env
+        .insert("OCM_PROOF_FAIL".to_string(), "1".to_string());
+    fixture.register_child();
+    fixture.source_scope(false);
+    let child_before = fixture.child_witness();
+    let registry = ocm::store::env_registry_path(&fixture.env, fixture.root.path()).unwrap();
+    let registry_before = fs::read(&registry).unwrap();
+    let snapshots = ["env", "snapshot", "list", "demo", "--json"];
+    let snapshots_before = stdout(&fixture.run_ok(&snapshots));
+    let refused = fixture.run(&["upgrade", "demo", "--runtime", "new", "--json"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("child"), "{}", stderr(&refused));
+    assert!(
+        !fixture.root.child("ready").exists(),
+        "unsafe upgrade reached finalizer"
+    );
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
+    assert_eq!(stdout(&fixture.run_ok(&snapshots)), snapshots_before);
+    assert_eq!(fixture.child_witness(), child_before);
+
+    let failed = fixture.run(&[
+        "upgrade",
+        "demo",
+        "--runtime",
+        "new",
+        "--no-rollback",
+        "--json",
+    ]);
+    assert!(!failed.status.success());
+    let receipt: Value = serde_json::from_str(&stdout(&failed)).unwrap();
+    assert_eq!(receipt["outcome"], "failed", "{receipt}");
+    assert_eq!(receipt["rollback"], "disabled");
+    assert!(
+        receipt["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("openclaw update finalize failed")),
+        "{receipt}"
+    );
+    assert!(
+        fixture.root.child("ready").exists(),
+        "no-rollback did not reach finalizer"
+    );
+    let current = ocm::store::get_environment("demo", &fixture.env, fixture.root.path()).unwrap();
+    // The failed finalizer runs before the replacement binding is published.
+    assert_eq!(current.default_runtime.as_deref(), Some("old"));
+    assert_eq!(fixture.child_witness(), child_before);
+}
+
+fn check_snapshot_residue_preserves_source(root_link: bool) {
+    let fixture = Fixture::with_dev_repo();
+    fixture.register_child();
+    fixture.run_ok(&["env", "create", "linked"]);
+    let source = fixture.project.join(".worktrees/child");
+    let linked = fixture.root.child("ocm-home/envs/linked");
+    let link = if root_link {
+        linked
+    } else {
+        linked.join(".openclaw")
+    };
+    fs::remove_dir_all(&link).unwrap();
+    symlink(&source, &link).unwrap();
+    let residue = if root_link {
+        source.join(".openclaw")
+    } else {
+        source
+    };
+    write_text(&residue.join("Cargo.lock"), "authored source lock\n");
+    write_text(&residue.join("run/keep"), "authored source data\n");
+    let child_before = fixture.child_witness();
+    let snapshot = fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]);
+    let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    fixture.run_ok(&[
+        "env",
+        "snapshot",
+        "restore",
+        "linked",
+        snapshot["id"].as_str().unwrap(),
+    ]);
+    let lock_preserved = fs::read(residue.join("Cargo.lock")).ok().as_deref()
+        == Some(b"authored source lock\n".as_slice());
+    let run_preserved = fs::read(residue.join("run/keep")).ok().as_deref()
+        == Some(b"authored source data\n".as_slice());
+    assert!(
+        lock_preserved && run_preserved,
+        "restore followed directory link (root={root_link}): source lock preserved={lock_preserved}, run data preserved={run_preserved}"
+    );
+    assert_eq!(fixture.child_witness(), child_before);
+}
+
+#[test]
+fn snapshot_residue_cleanup_preserves_state_directory_links() {
+    check_snapshot_residue_preserves_source(false);
+}
+
+#[test]
+fn snapshot_residue_cleanup_preserves_root_directory_links() {
+    check_snapshot_residue_preserves_source(true);
+}
+
+#[test]
+fn legacy_snapshot_restore_preserves_linked_registered_source() {
+    use ocm::infra::archive::{ArchivedEnvMeta, EnvArchiveMetadata, write_env_archive};
+    use ocm::store::{
+        get_env_snapshot, get_environment, snapshot_archive_path, snapshot_meta_path,
+    };
+
+    let fixture = Fixture::with_dev_repo();
+    fixture.register_child();
+    fixture.run_ok(&["env", "create", "linked"]);
+    let source = fixture.project.join(".worktrees/child");
+    let linked = fixture.root.child("ocm-home/envs/linked");
+    let state_link = linked.join(".openclaw");
+    fs::remove_dir_all(&state_link).unwrap();
+    symlink(&source, &state_link).unwrap();
+    let captured = fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]);
+    let captured: Value = serde_json::from_str(&stdout(&captured)).unwrap();
+    let id = captured["id"].as_str().unwrap();
+    let cwd = fixture.root.path();
+    let meta = get_environment("linked", &fixture.env, cwd).unwrap();
+    let mut archived: ArchivedEnvMeta =
+        serde_json::from_value(serde_json::to_value(&meta).unwrap()).unwrap();
+    archived.source_root = Some(meta.root.clone());
+    let archive = snapshot_archive_path("linked", id, &fixture.env, cwd).unwrap();
+    // Historical snapshots retained this link. Current export validates
+    // workspace containment, so use the original archive shape directly.
+    write_env_archive(
+        &EnvArchiveMetadata {
+            kind: "ocm-env-archive".to_string(),
+            format_version: 1,
+            exported_at: meta.updated_at,
+            env: archived,
+        },
+        &linked,
+        &archive,
+    )
+    .unwrap();
+    let mut snapshot = get_env_snapshot("linked", id, &fixture.env, cwd).unwrap();
+    snapshot.storage_kind = "tar-archive-v1".to_string();
+    snapshot.archive_path = archive.to_str().unwrap().to_string();
+    fs::write(
+        snapshot_meta_path("linked", id, &fixture.env, cwd).unwrap(),
+        serde_json::to_vec(&snapshot).unwrap(),
+    )
+    .unwrap();
+    let config = serde_json::to_vec(&serde_json::json!({
+        "gateway": {"port": meta.gateway_port.unwrap() + 100}
+    }))
+    .unwrap();
+    fs::write(source.join("openclaw.json"), &config).unwrap();
+    write_text(&source.join("browser/keep"), "authored source data\n");
+    let child_before = fixture.child_witness();
+    let restored = fixture.run(&["env", "snapshot", "restore", "linked", id]);
+    let config_unchanged = fs::read(source.join("openclaw.json")).ok().as_ref() == Some(&config);
+    let browser_preserved = fs::read(source.join("browser/keep")).ok().as_deref()
+        == Some(b"authored source data\n".as_slice());
+    assert!(
+        restored.status.success() && config_unchanged && browser_preserved,
+        "legacy restore followed state directory link: accepted={}, config unchanged={config_unchanged}, browser preserved={browser_preserved}; {}",
+        restored.status.success(),
+        stderr(&restored)
+    );
+    assert_eq!(fs::read_link(&state_link).unwrap(), source);
+    assert_eq!(fixture.child_witness(), child_before);
+}

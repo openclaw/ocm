@@ -990,6 +990,8 @@ impl Cli {
                     .environment_service()
                     .get_snapshot(name, snapshot_id)?;
                 self.environment_service().ensure_source_watch_allows_state_mutation_locked(name)?;
+                self.environment_service()
+                    .ensure_snapshot_restore_preserves_dev_sources_locked(&selected_snapshot)?;
                 let service_state = self
                     .service_service()
                     .quiesce_for_snapshot_locked(name)?;

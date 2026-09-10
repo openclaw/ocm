@@ -18,9 +18,8 @@ use super::checkpoints::{
     create_tree_checkpoint_from_preparation, default_snapshot_storage_kind,
     prepare_scoped_tree_checkpoint_in, remove_tree_if_present,
 };
-use super::common::{
-    copy_dir_recursive, copy_path_recursive, load_json_files, path_exists, read_json, write_json,
-};
+use super::common::{copy_path_recursive, load_json_files, path_exists, read_json, write_json};
+use super::dev_sources::{contains_existing, path_identity, registered_dev_source_footprint};
 use super::layout::{
     derive_env_paths, display_path, snapshot_archive_path, snapshot_checkpoint_path,
     snapshot_env_dir, snapshot_meta_path, validate_name,
@@ -439,6 +438,94 @@ pub fn summarize_snapshot(meta: &EnvSnapshotMeta) -> EnvSnapshotSummary {
     }
 }
 
+pub(crate) fn ensure_restore_preserves_dev_sources(
+    target: &EnvMeta,
+    independent: &[PathBuf],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(), String> {
+    super::with_locked_environments(env, cwd, |envs| {
+        if !envs
+            .iter()
+            .any(|meta| meta.name != target.name && meta.dev.is_some())
+        {
+            return Ok(());
+        }
+        let target_root = Path::new(&target.root);
+        if !independent.is_empty() {
+            super::checkpoint_scope::validate_ancestors(target_root, independent)?;
+        }
+        // A full restore renames the root entry itself, including a final
+        // symlink. Resolve its parent without following that final entry.
+        let parent = fs::canonicalize(target_root.parent().unwrap_or(target_root))
+            .map_err(|error| error.to_string())?;
+        let root = parent.join(target_root.file_name().unwrap_or_default());
+        let root_identity = match fs::symlink_metadata(&root) {
+            Ok(_) => Some(path_identity(&root)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        let relative_to_root = |path: &Path| -> Result<Option<PathBuf>, String> {
+            if let Ok(relative) = path.strip_prefix(&root) {
+                return Ok(Some(relative.to_path_buf()));
+            }
+            // Compare known path ancestors for filesystem aliases, including
+            // macOS firmlinks. Never resolve or inspect an exclusion's contents.
+            if let Some(identity) = root_identity {
+                for ancestor in path.ancestors() {
+                    if path_identity(ancestor)? == identity {
+                        return Ok(Some(path.strip_prefix(ancestor).unwrap().to_path_buf()));
+                    }
+                }
+            }
+            Ok(None)
+        };
+        for meta in envs
+            .iter()
+            .filter(|meta| meta.name != target.name && meta.dev.is_some())
+        {
+            let Some(footprint) = registered_dev_source_footprint(meta, envs).map_err(|error| {
+                format!("cannot protect dev source for env {}: {error}", meta.name)
+            })?
+            else {
+                continue;
+            };
+            for (path, contents) in footprint
+                .entries
+                .iter()
+                .map(|path| (path, false))
+                .chain(footprint.content_roots.iter().map(|path| (path, true)))
+            {
+                let affected = if let Some(relative) = relative_to_root(path)? {
+                    !independent.iter().any(|excluded| {
+                        relative.starts_with(excluded)
+                            || (!contents && excluded.starts_with(&relative))
+                    })
+                } else {
+                    contents
+                        && contains_existing(
+                            path,
+                            if root_identity.is_some() {
+                                &root
+                            } else {
+                                &parent
+                            },
+                        )?
+                };
+                if affected {
+                    return Err(format!(
+                        "restoring env {} would replace registered dev source or Git metadata for env {} at {}; choose a checkpoint that preserves the complete source and Git metadata",
+                        target.name,
+                        meta.name,
+                        display_path(path)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 pub fn restore_env_snapshot(
     options: RestoreEnvSnapshotOptions,
     env: &BTreeMap<String, String>,
@@ -483,6 +570,7 @@ fn prepare_env_snapshot_restore_with_binding(
         .as_ref()
         .map(|scope| scope.independent_paths.clone())
         .unwrap_or_default();
+    ensure_restore_preserves_dev_sources(&current, &independent, env, cwd)?;
     if !independent.is_empty() {
         super::checkpoint_scope::validate_ancestors(&current_paths.root, &independent)?;
         super::checkpoint_scope::validate_scoped_artifact(
@@ -514,7 +602,7 @@ fn prepare_env_snapshot_restore_with_binding(
                     extracted.metadata.format_version
                 ));
             }
-            copy_dir_recursive(&extracted.root_dir, &candidate_root)?;
+            copy_path_recursive(&extracted.root_dir, &candidate_root)?;
             let archived = extracted.metadata.env;
             (
                 EnvMeta {
@@ -585,7 +673,7 @@ fn prepare_env_snapshot_restore_with_binding(
                 fs::rename(&candidate_root, &current_paths.root)
                     .map_err(|error| error.to_string())?;
             }
-            if legacy_archive {
+            if legacy_archive && !restore_uses_directory_link(&current_paths.root)? {
                 rewrite_openclaw_config_for_target(
                     &current_paths,
                     Some(Path::new(&snapshot.source_root)),
@@ -852,9 +940,22 @@ fn should_discard_current_openclaw_restore_entry(name: &OsStr, is_dir: bool) -> 
     )
 }
 
+fn restore_uses_directory_link(root: &Path) -> Result<bool, String> {
+    // Captured links do not grant ownership of their live destinations.
+    for path in [root.to_path_buf(), root.join(".openclaw")] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(false)
+}
+
 fn clear_snapshot_runtime_residue(root: &Path) -> Result<(), String> {
     let openclaw_root = root.join(".openclaw");
-    if !path_exists(&openclaw_root) {
+    if restore_uses_directory_link(root)? || !path_exists(&openclaw_root) {
         return Ok(());
     }
     let entries = match fs::read_dir(&openclaw_root) {
