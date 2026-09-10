@@ -280,7 +280,7 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
     match action {
         "stop" => Some(render_leaf(
             "Stop source watch",
-            "Ask the recorded source-watch controller to stop its setup or gateway processes, or recover its owned process group after a controller crash. Preserve the env, source checkout, dependencies, and configuration.",
+            "Ask the recorded source-watch controller to stop its setup or gateway processes. Preserve the env, source checkout, dependencies, and configuration; report unverified completion without discarding ownership.",
             vec![format!("{cmd} dev stop <env> [--raw] [--json]")],
             &[
                 ("<env>", "Environment whose source watch should stop"),
@@ -297,9 +297,10 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
             &[
                 "Waits for the owned source processes to stop before restoring a background service taken over by --watch --force.",
                 "Does not stop an ordinary foreground run or an independently managed background service.",
-                "Older watches without recorded ownership must be stopped from their original terminal. Unverifiable process identity or cleanup retains the unfinished session and reports an error.",
+                "For new Unix watch generations, a lost controller, raw termination signal, or incomplete output retains unfinished ownership even if the recorded process group stops. Stop/reuse/service-start/destroy cannot erase that uncertainty. Released legacy records keep their recovery rules.",
+                "Ordinary acknowledged errors remain retryable after output completes. Interactive setup keeps real terminal output; cancellation or failure without observed output retains ownership, while successful setup remains supported.",
                 "On Windows, recovery cannot verify a controller crash before child ownership is published; that unfinished session is retained for operator recovery.",
-                "After updating OCM, refresh an older running daemon from that installation with service refresh-daemon --acknowledge-gateway-restarts so it uses the same ownership locks.",
+                "After updating OCM, refresh an older running daemon from that installation with service refresh-daemon --acknowledge-gateway-restarts so it understands the current watch ownership and completion records.",
             ],
         )),
         "status" => Some(render_leaf(

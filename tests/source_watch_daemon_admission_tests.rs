@@ -155,7 +155,7 @@ impl AdmissionFixture {
                 && runtime["gatewayAdmission"]["process"]["pid"] == pid
             {
                 assert_eq!(runtime["children"], json!([]));
-                assert_eq!(runtime["gatewayAdmission"]["version"], 1);
+                assert_eq!(runtime["gatewayAdmission"]["version"], 7);
                 assert!(
                     runtime["gatewayAdmission"]["process"]["startedAt"]
                         .as_str()

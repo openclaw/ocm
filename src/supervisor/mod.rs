@@ -45,7 +45,9 @@ use openclaw_handoff::{
 const SUPERVISOR_STATE_KIND: &str = "ocm-supervisor-state";
 const SUPERVISOR_RUNTIME_KIND: &str = "ocm-supervisor-runtime";
 // This capability covers the current admission filename through child publication.
-const GATEWAY_ADMISSION_VERSION: u32 = 1;
+// Version 7 covers watch-session-v2 completion and retained ownership.
+// Values 2 through 6 were used by incompatible development snapshots.
+const GATEWAY_ADMISSION_VERSION: u32 = 7;
 const SUPERVISOR_POLL_INTERVAL_MS: u64 = 200;
 const SUPERVISOR_RESTART_DELAY_MS: u64 = 1_000;
 const SUPERVISOR_MAX_RESTART_DELAY_MS: u64 = 30_000;

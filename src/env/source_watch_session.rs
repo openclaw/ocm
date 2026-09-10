@@ -12,7 +12,8 @@ use crate::infra::process_identity::{
 };
 use crate::store::{display_path, source_watch_override_path, validate_name, write_json};
 
-const SESSION_KIND: &str = "ocm-source-watch-session";
+const LEGACY_SESSION_KIND: &str = "ocm-source-watch-session";
+const SESSION_KIND: &str = "ocm-source-watch-session-v2";
 const STOP_KIND: &str = "ocm-source-watch-stop";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,7 +111,7 @@ impl SourceWatchSessionPaths {
         let Some(session) = read_optional_json::<SourceWatchSession>(&self.session)? else {
             return Ok(None);
         };
-        if session.kind != SESSION_KIND
+        if (session.kind != SESSION_KIND && session.kind != LEGACY_SESSION_KIND)
             || session.env_name != env_name
             || session.lease_id.trim().is_empty()
             || session.controller.pid == 0
@@ -160,6 +161,9 @@ impl SourceWatchSessionPaths {
         })?;
         if current.lease_id != session.lease_id || current.closed {
             return Err("source watch session changed before requesting stop".to_string());
+        }
+        if let Some(error) = current.unsafe_cleanup_error() {
+            return Err(error.to_string());
         }
         if current.completion.take().is_some() {
             self.save_session(&current)?;
@@ -214,23 +218,61 @@ impl SourceWatchSessionPaths {
                 session.env_name
             ));
         }
-        if self.stop_requested(session)? {
-            remove_file_if_present(&self.request)?;
-        }
         let mut completed = session.clone();
         completed.closed = !preserve_session;
         completed.completion = Some(SourceWatchCompletion {
             service_restored,
             error,
         });
-        // Completion and ownership closure are one atomic metadata publication.
-        self.save_session(&completed)
+        let clear_request = || -> Result<(), String> {
+            if self.stop_requested(session)? {
+                remove_file_if_present(&self.request)?;
+            }
+            Ok(())
+        };
+        if preserve_session {
+            // A malformed or inaccessible stop request must not hide an
+            // unverified cleanup result. Retain the ownership/error first;
+            // request cleanup still checks this generation and reports failure.
+            self.save_session(&completed)?;
+            clear_request()
+        } else {
+            clear_request()?;
+            // Completion and ownership closure are one atomic publication,
+            // after the matching request has been removed successfully.
+            self.save_session(&completed)
+        }
     }
 }
 
 impl SourceWatchSession {
+    pub(crate) fn is_legacy_watch(&self) -> bool {
+        self.kind == LEGACY_SESSION_KIND
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn requires_controller_completion(&self) -> bool {
+        !self.is_legacy_watch()
+            && !self.closed
+            && (self.child.is_some() || self.child_spawn_pending)
+    }
+
+    pub(crate) fn unsafe_cleanup_error(&self) -> Option<&str> {
+        if !self.is_legacy_watch()
+            && !self.closed
+            && (self.child.is_some() || self.child_spawn_pending)
+        {
+            self.completion
+                .as_ref()
+                .and_then(|completion| completion.error.as_deref())
+        } else {
+            None
+        }
+    }
+
     fn can_reclaim_without_restoration(&self) -> Result<bool, String> {
-        if self.restore_service
+        if self.unsafe_cleanup_error().is_some()
+            || self.restore_service
             || self.process_scope != process_scope_id()?
             || self.controller_is_running()?
         {
@@ -238,6 +280,13 @@ impl SourceWatchSession {
         }
         #[cfg(windows)]
         if self.child_spawn_pending {
+            return Ok(false);
+        }
+        // A current Unix source session can own native descendants outside its
+        // original group. Only its controller can verify their output EOF; an
+        // absent leader alone must not erase unfinished ownership after a crash.
+        #[cfg(unix)]
+        if self.requires_controller_completion() {
             return Ok(false);
         }
         if let Some(child) = &self.child {
@@ -270,6 +319,21 @@ impl SourceWatchSession {
 }
 
 impl<'a> EnvironmentService<'a> {
+    // Caller holds operation/admission and has verified controller loss.
+    #[cfg(unix)]
+    pub(crate) fn retain_unverified_source_watch_cleanup_locked(
+        &self,
+        session: &SourceWatchSession,
+        error: &str,
+    ) -> Result<(), String> {
+        self.source_watch_session_paths(&session.env_name)?.finish(
+            session,
+            false,
+            Some(error.to_string()),
+            true,
+        )
+    }
+
     pub(crate) fn ensure_source_watch_stopped(&self, env_name: &str) -> Result<(), String> {
         if self
             .source_watch_session(env_name)?
@@ -325,6 +389,9 @@ impl<'a> EnvironmentService<'a> {
             return Err(
                 "source watch generation changed; refusing a stale stop request".to_string(),
             );
+        }
+        if let Some(error) = current.unsafe_cleanup_error() {
+            return Err(error.to_string());
         }
         if current.closed {
             return current.completion.map(Some).ok_or_else(|| {
@@ -397,6 +464,84 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn unverified_completion_survives_bad_stop_metadata_and_reclaim() {
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([("OCM_HOME".to_string(), display_path(root.path()))]);
+        let service = EnvironmentService::new(&env, root.path());
+        let paths = service.source_watch_session_paths("demo").unwrap();
+        fs::create_dir_all(paths.session.parent().unwrap()).unwrap();
+        let mut session = SourceWatchSession {
+            kind: SESSION_KIND.to_string(),
+            env_name: "demo".to_string(),
+            lease_id: "retained-fixture".to_string(),
+            env_root: display_path(&root.path().join("env")),
+            env_created_at: crate::store::now_utc(),
+            process_scope: process_scope_id().unwrap(),
+            controller: ProcessIdentity {
+                pid: std::process::id(),
+                started_at: "earlier-controller".to_string(),
+            },
+            child: None,
+            child_spawn_pending: false,
+            restore_service: false,
+            closed: false,
+            completion: None,
+        };
+        assert!(
+            session.can_reclaim_without_restoration().unwrap(),
+            "empty current generation can recover"
+        );
+        session.child_spawn_pending = true;
+        assert!(
+            !session.can_reclaim_without_restoration().unwrap(),
+            "uncertain spawn cannot recover"
+        );
+        write_json(&paths.session, &session).unwrap();
+        fs::write(&paths.request, b"incomplete request").unwrap();
+        assert!(
+            paths
+                .finish(
+                    &session,
+                    false,
+                    Some("unverified output EOF".to_string()),
+                    true
+                )
+                .is_err()
+        );
+        let retained = paths.load_session("demo").unwrap().unwrap();
+        assert!(!retained.closed);
+        assert_eq!(
+            retained.unsafe_cleanup_error(),
+            Some("unverified output EOF")
+        );
+        assert!(!retained.can_reclaim_without_restoration().unwrap());
+        let before = fs::read(&paths.session).unwrap();
+        assert!(
+            paths
+                .request_stop(&retained)
+                .unwrap_err()
+                .contains("unverified output EOF")
+        );
+        assert_eq!(fs::read(&paths.session).unwrap(), before);
+        let mut legacy = retained;
+        legacy.kind = LEGACY_SESSION_KIND.to_string();
+        assert!(
+            legacy.unsafe_cleanup_error().is_none(),
+            "legacy retry policy remains distinct"
+        );
+        let mut restored_only = session;
+        restored_only.child_spawn_pending = false;
+        restored_only.completion = Some(SourceWatchCompletion {
+            service_restored: false,
+            error: Some("restore failed".to_string()),
+        });
+        assert!(
+            restored_only.unsafe_cleanup_error().is_none(),
+            "verified child cleanup permits restoration retry"
+        );
+    }
 
     #[test]
     fn stop_acknowledges_completed_generation_without_replacing_it() {

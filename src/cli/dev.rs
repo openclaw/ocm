@@ -108,7 +108,7 @@ fn source_watch_node_command(args: &[String]) -> Command {
 
 type SourceWatchResult<T> = Result<T, SourceWatchError>;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SourceWatchError {
     message: String,
     cleanup_verified: bool,
@@ -119,6 +119,13 @@ impl SourceWatchError {
         Self {
             message: message.into(),
             cleanup_verified: false,
+        }
+    }
+
+    fn combine(self, other: Self) -> Self {
+        Self {
+            message: format!("{}; {}", self.message, other.message),
+            cleanup_verified: self.cleanup_verified && other.cleanup_verified,
         }
     }
 }
@@ -335,7 +342,23 @@ impl Cli {
                     "source watch generation changed; refusing stale crash recovery".to_string(),
                 );
             }
-            stop_orphaned_source_watch(&session)?;
+            let group_cleanup = stop_orphaned_source_watch(&session);
+            #[cfg(unix)]
+            if session.requires_controller_completion() {
+                let mut error = "source controller exited before output completion could be verified; remaining source shutdown is unverified and its unfinished ownership was retained".to_string();
+                if let Err(group_error) = group_cleanup {
+                    error.push_str(&format!("; recorded-group cleanup: {group_error}"));
+                }
+                if let Err(record_error) =
+                    env_service.retain_unverified_source_watch_cleanup_locked(&session, &error)
+                {
+                    error.push_str(&format!(
+                        "; failed recording unfinished cleanup: {record_error}"
+                    ));
+                }
+                return Err(error);
+            }
+            group_cleanup?;
             let mut lease = env_service.reclaim_source_watch_lease_locked(session)?;
             env_service.clear_source_watch_override_for_lease(env_name, lease.lease_id())?;
             drop(admission);
@@ -1308,6 +1331,9 @@ impl Cli {
             .env_clear()
             .envs(env)
             .current_dir(cwd);
+        if !self.stdin_is_terminal() {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
         let Some(output) = self.run_owned_source_watch_command(command, lease, stop, true)? else {
             return Ok(130);
         };
@@ -1329,6 +1355,11 @@ impl Cli {
         }
         lease.configure_child(&mut command);
         let mut guard = SourceWatchProcessGuard::new_with_terminal(terminal)?;
+        #[cfg(unix)]
+        {
+            // The resolution probe does not execute source or preload hooks.
+            guard.source_execution = terminal;
+        }
         guard.configure_command(&mut command)?;
         lease.begin_child_spawn()?;
         let mut child = command.spawn().map_err(|error| {
@@ -1352,11 +1383,12 @@ impl Cli {
         let stdout = child
             .stdout
             .take()
-            .map(|pipe| spawn_source_capture(pipe, "stdout"));
+            .map(|pipe| spawn_source_capture(pipe, "stdout", terminal));
         let stderr = child
             .stderr
             .take()
-            .map(|pipe| spawn_source_capture(pipe, "stderr"));
+            .map(|pipe| spawn_source_capture(pipe, "stderr", terminal));
+        let observed_output = stdout.is_some() && stderr.is_some();
         let start = source_watch_cancelled(lease, stop).and_then(|cancelled| {
             if cancelled {
                 Ok(())
@@ -1380,6 +1412,8 @@ impl Cli {
                 error.message,
             )),
         };
+        let result =
+            guard.classify_completion(result, observed_output, stop.load(Ordering::SeqCst));
         let result = match (result, guard.restore_terminal()) {
             (result, Ok(())) => result,
             (Ok(_), Err(error)) => Err(error.into()),
@@ -1388,14 +1422,18 @@ impl Cli {
                 cleanup_verified: error.cleanup_verified,
             }),
         };
+        let output = collect_source_captures(stdout, stderr);
+        let output_result = output.as_ref().map(|_| ()).map_err(Clone::clone);
+        let result = combine_source_watch_cleanup_results(result, output_result, Ok(()));
         if source_watch_allows_service_restore(&result) {
             lease.clear_child()?;
         }
         let status = result?;
+        let (stdout, stderr) = output?;
         Ok(Some(std::process::Output {
             status,
-            stdout: collect_source_capture(stdout)?,
-            stderr: collect_source_capture(stderr)?,
+            stdout,
+            stderr,
         }))
     }
 
@@ -1571,7 +1609,7 @@ impl Cli {
         self.run_source_gateway_watch(
             meta,
             Path::new(&dev.worktree_root),
-            false,
+            true,
             source_watch_lease,
             stop_requested,
         )
@@ -1761,6 +1799,11 @@ impl Cli {
                     error.message,
                 )),
             };
+        let status_result = process_guard.classify_completion(
+            status_result,
+            tee_threads.len() == 2,
+            stop_requested.load(Ordering::SeqCst),
+        );
         let status_result = match (status_result, process_guard.restore_terminal()) {
             (result, Ok(())) => result,
             (Ok(_), Err(error)) => Err(SourceWatchError::from(error)),
@@ -1769,12 +1812,8 @@ impl Cli {
                 cleanup_verified: error.cleanup_verified,
             }),
         };
-        let tee_result = if !source_watch_allows_service_restore(&status_result) {
-            drop(tee_threads);
-            Ok(())
-        } else {
-            wait_for_tee_threads(tee_threads)
-        };
+        let tee_result = wait_for_tee_threads(tee_threads);
+        let status_result = combine_source_watch_cleanup_results(status_result, tee_result, Ok(()));
         let clear_result = if source_watch_allows_override_clear(&status_result) {
             self.environment_service()
                 .clear_source_watch_override(&meta.name, &source_watch.token)
@@ -1783,7 +1822,7 @@ impl Cli {
             Ok(())
         };
 
-        let result = combine_source_watch_cleanup_results(status_result, tee_result, clear_result);
+        let result = combine_source_watch_cleanup_results(status_result, Ok(()), clear_result);
         if source_watch_allows_service_restore(&result) {
             lease.clear_child()?;
         }
@@ -1925,23 +1964,97 @@ fn source_watch_spawn_error(lease: &mut SourceWatchLease, error: String) -> Sour
 fn spawn_source_capture<R: Read + Send + 'static>(
     mut pipe: R,
     stream: &'static str,
-) -> JoinHandle<Result<Vec<u8>, String>> {
+    forward: bool,
+) -> JoinHandle<SourceWatchResult<Vec<u8>>> {
     thread::spawn(move || {
         let mut bytes = Vec::new();
-        pipe.read_to_end(&mut bytes)
-            .map_err(|error| format!("failed reading source prerequisite {stream}: {error}"))?;
-        Ok(bytes)
+        let mut issue = None;
+        let mut forwarding = forward;
+        // Forwarded setup output is not retained for parsing.
+        let mut capturing = !forward;
+        let mut buffer = [0u8; 8192];
+        loop {
+            let count = match pipe.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(SourceWatchError::unverified(format!(
+                        "failed reading source {stream}: {error}"
+                    )));
+                }
+            };
+            if count == 0 {
+                return issue.map_or(Ok(bytes), |error| Err(SourceWatchError::from(error)));
+            }
+            if forwarding {
+                let forwarded = if stream == "stdout" {
+                    io::stdout()
+                        .write_all(&buffer[..count])
+                        .and_then(|()| io::stdout().flush())
+                } else {
+                    io::stderr()
+                        .write_all(&buffer[..count])
+                        .and_then(|()| io::stderr().flush())
+                };
+                if let Err(error) = forwarded {
+                    issue.get_or_insert_with(|| {
+                        format!("failed forwarding source {stream}: {error}")
+                    });
+                    forwarding = false;
+                }
+            }
+            if capturing {
+                if bytes.len() + count > 4 * 1024 * 1024 {
+                    issue.get_or_insert_with(|| {
+                        format!("source {stream} capture exceeded its limit")
+                    });
+                    capturing = false;
+                } else {
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+            }
+        }
     })
 }
 
+fn join_source_output<T>(
+    reader: JoinHandle<SourceWatchResult<T>>,
+    deadline: std::time::Instant,
+) -> SourceWatchResult<T> {
+    while !reader.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return Err(SourceWatchError::unverified(
+                "source output did not reach EOF; cleanup is unverified and ownership was retained",
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    reader.join().map_err(|_| {
+        SourceWatchError::unverified("source output reader panicked before EOF could be verified")
+    })?
+}
+
 fn collect_source_capture(
-    capture: Option<JoinHandle<Result<Vec<u8>, String>>>,
-) -> Result<Vec<u8>, String> {
+    capture: Option<JoinHandle<SourceWatchResult<Vec<u8>>>>,
+    deadline: std::time::Instant,
+) -> SourceWatchResult<Vec<u8>> {
     match capture {
-        Some(capture) => capture
-            .join()
-            .map_err(|_| "source prerequisite output reader panicked".to_string())?,
+        Some(capture) => join_source_output(capture, deadline),
         None => Ok(Vec::new()),
+    }
+}
+
+fn collect_source_captures(
+    stdout: Option<JoinHandle<SourceWatchResult<Vec<u8>>>>,
+    stderr: Option<JoinHandle<SourceWatchResult<Vec<u8>>>>,
+) -> SourceWatchResult<(Vec<u8>, Vec<u8>)> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let stdout = collect_source_capture(stdout, deadline);
+    let stderr = collect_source_capture(stderr, deadline);
+    match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => Ok((stdout, stderr)),
+        (Err(stdout), Err(stderr)) => Err(stdout.combine(stderr)),
+        (Err(error), _) | (_, Err(error)) => Err(error),
     }
 }
 
@@ -2029,10 +2142,10 @@ fn stop_orphaned_source_watch(session: &SourceWatchSession) -> Result<(), String
             .as_ref()
             .is_some_and(|process| process.running && process.identity == *child)
         {
-            if process_group_members(child.pid)?.is_empty() {
+            if session.is_legacy_watch() && process_group_members(child.pid)?.is_empty() {
                 return Ok(());
             }
-            return Err("recorded source watch identity no longer matches a live group owner; no processes were signaled".to_string());
+            return Err("recorded source child no longer matches a live group owner; cleanup cannot be verified from an empty process group, so its session was retained and no processes were signaled".to_string());
         }
         if process.as_ref().and_then(|process| process.process_group) != Some(child.pid) {
             return Err(
@@ -2209,7 +2322,7 @@ fn combine_watch_and_restore_results(
 
 fn combine_source_watch_cleanup_results(
     status_result: SourceWatchResult<std::process::ExitStatus>,
-    tee_result: Result<(), String>,
+    tee_result: SourceWatchResult<()>,
     clear_result: Result<(), String>,
 ) -> SourceWatchResult<std::process::ExitStatus> {
     let mut errors = Vec::new();
@@ -2223,7 +2336,8 @@ fn combine_source_watch_cleanup_results(
         }
     };
     if let Err(error) = tee_result {
-        errors.push(error);
+        cleanup_verified &= error.cleanup_verified;
+        errors.push(error.message);
     }
     if let Err(error) = clear_result {
         errors.push(error);
@@ -2237,6 +2351,50 @@ fn combine_source_watch_cleanup_results(
             message: errors.join("; "),
             cleanup_verified,
         })
+    }
+}
+
+#[cfg(unix)]
+fn classify_source_watch_completion(
+    result: SourceWatchResult<std::process::ExitStatus>,
+    source_execution_started: bool,
+    observed_output: bool,
+    cancelled: bool,
+) -> SourceWatchResult<std::process::ExitStatus> {
+    if !source_execution_started {
+        // A gated command or resolution-only probe cannot have executed source
+        // or spawned its descendants. Verified process cleanup is sufficient.
+        return result;
+    }
+    let status = result.as_ref().ok();
+    let reason = if let Some(signal) = status.and_then(|status| status.signal()) {
+        // A native intermediary can own private pipes. Its death can close our
+        // outer pipes without stopping the detached workers behind those pipes.
+        Some(format!(
+            "source command terminated by signal {signal}; descendant cleanup is unverified and session ownership was retained"
+        ))
+    } else if !observed_output
+        && (cancelled || result.is_err() || status.is_some_and(|status| !status.success()))
+    {
+        // A real terminal must remain a terminal for interactive setup. A zero
+        // exit from its TERM handler is not an independent output-EOF witness;
+        // raw prompt cancellation can also return an ordinary error code.
+        Some(
+            "interactive source preparation stopped without an output EOF witness; descendant cleanup is unverified and session ownership was retained"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => {
+            let error = SourceWatchError::unverified(reason);
+            Err(match result {
+                Ok(_) => error,
+                Err(primary) => primary.combine(error),
+            })
+        }
+        None => result,
     }
 }
 
@@ -2330,6 +2488,10 @@ struct SourceWatchProcessGuard {
     startup_reader: io::PipeReader,
     #[cfg(unix)]
     startup_writer: io::PipeWriter,
+    #[cfg(unix)]
+    startup_released: AtomicBool,
+    #[cfg(unix)]
+    source_execution: bool,
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -2373,6 +2535,8 @@ impl SourceWatchProcessGuard {
                 terminal,
                 startup_reader,
                 startup_writer,
+                startup_released: AtomicBool::new(false),
+                source_execution: true,
             })
         }
         #[cfg(windows)]
@@ -2475,6 +2639,8 @@ impl SourceWatchProcessGuard {
     fn start_child(&self, _child: &std::process::Child) -> Result<(), String> {
         #[cfg(unix)]
         {
+            // A partially successful write can release source before reporting an error.
+            self.startup_released.store(true, Ordering::SeqCst);
             let mut writer = &self.startup_writer;
             writer
                 .write_all(b"1\n")
@@ -2483,6 +2649,29 @@ impl SourceWatchProcessGuard {
         #[cfg(windows)]
         resume_windows_process(_child.id())?;
         Ok(())
+    }
+
+    fn classify_completion(
+        &self,
+        result: SourceWatchResult<std::process::ExitStatus>,
+        observed_output: bool,
+        cancelled: bool,
+    ) -> SourceWatchResult<std::process::ExitStatus> {
+        #[cfg(unix)]
+        {
+            classify_source_watch_completion(
+                result,
+                self.source_execution && self.startup_released.load(Ordering::SeqCst),
+                observed_output,
+                cancelled,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows cleanup is independently verified by the owned Job.
+            let _ = (observed_output, cancelled);
+            result
+        }
     }
 
     fn restore_terminal(&self) -> Result<(), String> {
@@ -2913,7 +3102,8 @@ fn stop_source_watch_after_error(
     process_guard: &SourceWatchProcessGuard,
     primary_error: String,
 ) -> SourceWatchError {
-    match stop_source_watch_child(child, process_guard) {
+    let result = stop_source_watch_child(child, process_guard);
+    match process_guard.classify_completion(result, true, false) {
         Ok(_) => SourceWatchError::from(primary_error),
         Err(cleanup_error) => SourceWatchError::unverified(format!(
             "{}; setup also failed: {primary_error}",
@@ -3563,18 +3753,20 @@ fn spawn_tee_thread<R, W>(
     terminal: W,
     log_file: File,
     stream: &'static str,
-) -> JoinHandle<Result<(), String>>
+) -> JoinHandle<SourceWatchResult<()>>
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
     thread::spawn(move || {
-        tee_stream(input, terminal, log_file)
-            .map_err(|error| format!("failed writing source watch {stream} log: {error}"))
+        tee_stream(input, terminal, log_file).map_err(|error| SourceWatchError {
+            message: format!("source {stream} output failed: {}", error.message),
+            cleanup_verified: error.cleanup_verified,
+        })
     })
 }
 
-fn tee_stream<R, W>(mut input: R, mut terminal: W, mut log_file: File) -> io::Result<()>
+fn tee_stream<R, W>(mut input: R, mut terminal: W, mut log_file: File) -> SourceWatchResult<()>
 where
     R: Read,
     W: Write,
@@ -3587,10 +3779,16 @@ where
         let count = match input.read(&mut buffer) {
             Ok(count) => count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(SourceWatchError::unverified(format!(
+                    "failed reading source output: {error}"
+                )));
+            }
         };
         if count == 0 {
-            return issue.map_or(Ok(()), Err);
+            return issue.map_or(Ok(()), |error: io::Error| {
+                Err(SourceWatchError::from(error.to_string()))
+            });
         }
         let chunk = &buffer[..count];
         // A failed destination must not close the source pipe or discard the
@@ -3610,14 +3808,18 @@ where
     }
 }
 
-fn wait_for_tee_threads(threads: Vec<JoinHandle<Result<(), String>>>) -> Result<(), String> {
-    for thread in threads {
-        let result = thread
-            .join()
-            .map_err(|_| "source watch log tee thread panicked".to_string())?;
-        result?;
+fn wait_for_tee_threads(threads: Vec<JoinHandle<SourceWatchResult<()>>>) -> SourceWatchResult<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut issue: Option<SourceWatchError> = None;
+    for reader in threads {
+        if let Err(error) = join_source_output(reader, deadline) {
+            issue = Some(match issue {
+                Some(prior) => prior.combine(error),
+                None => error,
+            });
+        }
     }
-    Ok(())
+    issue.map_or(Ok(()), Err)
 }
 
 fn render_dev_status_list(summaries: &[DevStatusSummary], profile: RenderProfile) -> Vec<String> {
@@ -3865,8 +4067,11 @@ fs.writeFileSync('source-ran', JSON.stringify({
                 let result = super::tee_stream(&mut input, &mut terminal, log_file);
                 assert_eq!(input.position(), payload.len() as u64);
                 assert_eq!(result.is_err(), terminal_failure != 0 || log_failure);
+                if let Err(error) = &result {
+                    assert!(error.cleanup_verified, "the source was drained to EOF");
+                }
                 if terminal_failure != 0 {
-                    assert_eq!(result.unwrap_err().to_string(), "terminal closed");
+                    assert_eq!(result.unwrap_err().message, "terminal closed");
                 } else {
                     assert_eq!(terminal.bytes, payload);
                 }
@@ -3875,6 +4080,94 @@ fs.writeFileSync('source-ran', JSON.stringify({
                 }
             }
         }
+    }
+
+    #[test]
+    fn source_output_requires_both_streams_and_verified_eof() {
+        use std::thread;
+        use std::time::{Duration, Instant};
+        for second_verified in [true, false] {
+            let first = thread::spawn(|| {
+                Err::<(), _>(SourceWatchError::from("stdout sink after EOF".to_string()))
+            });
+            let second = thread::spawn(move || {
+                Err::<(), _>(SourceWatchError {
+                    message: "stderr completion".to_string(),
+                    cleanup_verified: second_verified,
+                })
+            });
+            let error = super::wait_for_tee_threads(vec![first, second]).unwrap_err();
+            assert_eq!(error.cleanup_verified, second_verified);
+            assert!(
+                error.message.contains("stdout sink")
+                    && error.message.contains("stderr completion")
+            );
+        }
+        struct FailedRead;
+        impl std::io::Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("read failed"))
+            }
+        }
+        let reader = super::spawn_source_capture(FailedRead, "stdout", false);
+        assert!(
+            !super::collect_source_capture(Some(reader), Instant::now() + Duration::from_secs(2))
+                .unwrap_err()
+                .cleanup_verified
+        );
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (done, ended) = std::sync::mpsc::channel();
+        let held = thread::spawn(move || {
+            let _ = wait.recv();
+            let _ = done.send(());
+            Ok(())
+        });
+        assert!(
+            !super::join_source_output(held, Instant::now())
+                .unwrap_err()
+                .cleanup_verified
+        );
+        release.send(()).unwrap();
+        ended.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_completion_preserves_acknowledged_errors_and_prestart_cancellation() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let classify = |status, started, observed, cancelled| {
+            super::classify_source_watch_completion(
+                Ok(std::process::ExitStatus::from_raw(status)),
+                started,
+                observed,
+                cancelled,
+            )
+        };
+        for code in [0, 1, 23] {
+            assert!(classify(code << 8, true, true, false).is_ok());
+        }
+        assert!(!classify(9, true, true, false).unwrap_err().cleanup_verified);
+        assert!(classify(9, false, false, true).is_ok());
+        assert!(classify(0, true, false, false).is_ok());
+        for (code, cancelled) in [(0, true), (1, false), (23, false)] {
+            assert!(
+                !classify(code << 8, true, false, cancelled)
+                    .unwrap_err()
+                    .cleanup_verified
+            );
+        }
+        let error = super::classify_source_watch_completion(
+            Err(SourceWatchError::from("wait failed".to_string())),
+            true,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            !error.cleanup_verified
+                && error.message.contains("wait failed")
+                && error.message.contains("EOF")
+        );
     }
 
     fn sample_summary() -> DevStatusSummary {

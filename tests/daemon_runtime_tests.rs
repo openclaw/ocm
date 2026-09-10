@@ -2002,7 +2002,7 @@ fn daemon_run_persists_live_runtime_children() {
     let cleared = wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5))
         .expect("daemon runtime state did not clear after shutdown");
     assert!(cleared["updatedAt"].as_str().is_some());
-    assert_eq!(gateway_admission["version"], 1);
+    assert_eq!(gateway_admission["version"], 7);
     assert_eq!(gateway_admission["process"]["pid"], daemon_pid);
     assert!(
         gateway_admission["process"]["startedAt"]

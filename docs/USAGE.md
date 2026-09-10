@@ -590,6 +590,13 @@ replacement session or changed binding prevents removal. While a watch is
 running, the preview reports deferred process inspection; the remaining process
 tree is inspected after the watch stops.
 
+For new Unix watch generations, unverified output or process completion keeps
+ownership recorded. A controller crash, raw signal, or missing output EOF cannot
+be cleared by repeating stop, starting another watch/service, or destroying the
+env. Normal acknowledged errors remain retryable; released legacy watch records
+and Windows process-job recovery retain their existing rules. Use a compatible
+OCM CLI and refresh an older running daemon before creating a new generation.
+
 `env remove` and `env prune` require active or unfinished source watches to be
 stopped first with `ocm dev stop <env>`. The same applies to a destroy guarded by
 `--if-state-token`: stop the watch, then request a fresh preview. A watch created

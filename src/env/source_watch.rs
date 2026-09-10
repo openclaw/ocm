@@ -376,6 +376,19 @@ impl<'a> EnvironmentService<'a> {
     }
 
     pub(crate) fn ensure_source_watch_allows_service(&self, env_name: &str) -> Result<(), String> {
+        if let Some(session) = self.source_watch_session(env_name)? {
+            if let Some(error) = session.unsafe_cleanup_error() {
+                return Err(error.to_string());
+            }
+            if !session.closed
+                && (session.child.is_some() || session.child_spawn_pending)
+                && !session.controller_is_running()?
+            {
+                return Err(format!(
+                    "source watch ownership for env {env_name} is unfinished; run `ocm dev stop {env_name}` before starting its service"
+                ));
+            }
+        }
         if self.active_source_watch_override(env_name)?.is_some() {
             return Err(format!(
                 "background service for env \"{env_name}\" cannot start while source watch is active; stop the watch session first"
@@ -568,6 +581,17 @@ impl<'a> EnvironmentService<'a> {
         cleanup_stale: bool,
     ) -> Result<SourceWatchState, String> {
         let env_name = validate_name(env_name, "Environment name")?;
+        if let Some(session) = self.source_watch_session(&env_name)? {
+            if let Some(error) = session.unsafe_cleanup_error() {
+                return Err(error.to_string());
+            }
+            #[cfg(unix)]
+            if session.requires_controller_completion() && !session.controller_is_running()? {
+                return Err(format!(
+                    "source controller for env {env_name} exited before cleanup completion; source shutdown is unverified and its unfinished ownership was retained"
+                ));
+            }
+        }
         let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
         let lock_path = path.with_extension("lock");
         let lock_file = match OpenOptions::new().read(true).open(&lock_path) {
