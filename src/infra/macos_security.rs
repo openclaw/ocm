@@ -56,7 +56,17 @@ pub(crate) fn set_private_file_access(file: &File) -> io::Result<()> {
 }
 
 pub(crate) fn file_has_no_extended_acl(file: &File) -> io::Result<bool> {
-    let acl = Acl::checked(unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) })?;
+    let pointer = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if pointer.is_null() {
+        let error = io::Error::last_os_error();
+        // Darwin reports an absent extended ACL as ENOENT on an opened file.
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(true)
+        } else {
+            Err(error)
+        };
+    }
+    let acl = Acl::checked(pointer)?;
     if unsafe { acl_valid(acl.0) } != 0 {
         return Err(io::Error::last_os_error());
     }
