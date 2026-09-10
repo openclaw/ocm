@@ -275,6 +275,8 @@ ocm dev existing-env --repo ~/src/openclaw --watch --force
 
 Use `ocm dev` when you want an isolated source-run checkout with its own env root and gateway port, or when you want to temporarily run source against an existing env in watch mode without rebinding it. While watch mode is running, OCM's OpenClaw-running commands for that env resolve to the watched checkout, so one-shot checks use the same built `openclaw.mjs` that the watcher is maintaining. OCM refuses background service installation, start, and restart for that env until watch exits; a running service taken over with `--watch --force` is restored by the watch session after its source processes stop. Existing-env watch output is saved under that env's `.openclaw/logs/` directory, so `ocm logs <env>` remains useful while the foreground watcher is running. If you are already inside an OpenClaw checkout, `ocm setup` can detect that and suggest a local path automatically.
 
+On Unix, watched Node commands wait until OCM records their process ownership before executing source or `NODE_OPTIONS` preload hooks. The gate preserves the command arguments, terminal input, and configured Node options after release.
+
 Before starting a new watch, OCM checks that a running background daemon uses
 compatible ownership locks and that its runtime record identifies the current
 process. A daemon whose compatibility cannot be verified must finish starting

@@ -298,7 +298,7 @@ fn write_fake_dev_node(root: &TestDir, script: &str) {
     // exit before the controller records their identity.
     let gate = r#"#!/bin/sh
 if [ -n "$OCM_SOURCE_WATCH_START_FD" ]; then
-  IFS= read -r ocm_start <&"$OCM_SOURCE_WATCH_START_FD" || exit 1
+  IFS= read -r ocm_start < "/dev/fd/$OCM_SOURCE_WATCH_START_FD" || exit 1
   unset OCM_SOURCE_WATCH_START_FD
 fi
 "#;
@@ -2577,6 +2577,16 @@ fn dev_watch_force_restores_runtime_service_when_source_watch_cannot_spawn() {
         ],
     );
     assert!(!watch.status.success());
+    #[cfg(unix)]
+    {
+        assert_eq!(watch.status.code(), Some(127));
+        assert!(
+            stderr(&watch).contains("node") && stderr(&watch).contains("not found"),
+            "{}",
+            stderr(&watch)
+        );
+    }
+    #[cfg(not(unix))]
     assert!(
         stderr(&watch).contains("failed to run \"node\""),
         "{}",

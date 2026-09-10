@@ -13,8 +13,6 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
-use std::os::unix::net::UnixStream;
-#[cfg(unix)]
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 #[cfg(windows)]
 use std::os::windows::{io::AsRawHandle, process::CommandExt as _};
@@ -51,11 +49,8 @@ const SOURCE_WATCH_TREE_ACTIVE_ERROR: &str = "source watch process tree is still
 const SOURCE_WATCH_NODE_SHIM: &str = r#"import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-const startFd = Number(process.env.OCM_SOURCE_WATCH_START_FD);
-delete process.env.OCM_SOURCE_WATCH_START_FD;
-if (Number.isInteger(startFd) && fs.readSync(startFd, Buffer.alloc(1), 0, 1, null) !== 1) {
-  process.exit(1);
-}
+const startFd = Number(process.env.OCM_SOURCE_WATCH_RELEASED_FD);
+delete process.env.OCM_SOURCE_WATCH_RELEASED_FD;
 if (Number.isInteger(startFd)) fs.closeSync(startFd);
 const script = path.resolve("scripts/watch-node.mjs");
 process.argv = [process.execPath, script, ...process.argv.slice(1)];
@@ -69,10 +64,47 @@ await import(pathToFileURL(script).href);"#;
 const SOURCE_WATCH_SETUP_SHIM: &str = r#"case "$OCM_SOURCE_WATCH_START_FD" in
   ''|*[!0-9]*) exit 1 ;;
 esac
-IFS= read -r ocm_start <&"$OCM_SOURCE_WATCH_START_FD" || exit 1
+IFS= read -r ocm_start < "/dev/fd/$OCM_SOURCE_WATCH_START_FD" || exit 1
 unset OCM_SOURCE_WATCH_START_FD
 exec "$@"
 "#;
+
+#[cfg(unix)]
+const SOURCE_WATCH_NODE_GATE: &str = r#"case "$OCM_SOURCE_WATCH_START_FD" in
+  ''|*[!0-9]*) exit 1 ;;
+esac
+IFS= read -r ocm_start < "/dev/fd/$OCM_SOURCE_WATCH_START_FD" || exit 1
+export OCM_SOURCE_WATCH_RELEASED_FD="$OCM_SOURCE_WATCH_START_FD"
+unset OCM_SOURCE_WATCH_START_FD
+exec "$@"
+"#;
+
+fn source_watch_node_command(args: &[String]) -> Command {
+    #[cfg(unix)]
+    let mut command = {
+        // Node preload hooks run before --eval, so gate the executable itself.
+        // The watch shim closes the consumed descriptor before importing source.
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            SOURCE_WATCH_NODE_GATE,
+            "ocm-source-watch",
+            "node",
+            "--input-type=module",
+            "--eval",
+            SOURCE_WATCH_NODE_SHIM,
+        ]);
+        command
+    };
+    #[cfg(not(unix))]
+    let mut command = {
+        let mut command = Command::new("node");
+        command.arg("scripts/watch-node.mjs");
+        command
+    };
+    command.args(args);
+    command
+}
 
 type SourceWatchResult<T> = Result<T, SourceWatchError>;
 
@@ -1564,19 +1596,9 @@ impl Cli {
             return Ok(130);
         }
 
-        let mut command = Command::new("node");
-        #[cfg(unix)]
-        {
-            command.args(["--input-type=module", "--eval", SOURCE_WATCH_NODE_SHIM]);
-            command.args(&args[1..]);
-        }
+        let mut command = source_watch_node_command(&args[1..]);
         #[cfg(unix)]
         let source_watch_force_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } != 1;
-        #[cfg(windows)]
-        // watch-node never detaches runners on win32; the Job Object owns the full tree.
-        command.args(&args);
-        #[cfg(not(any(unix, windows)))]
-        command.args(&args);
         command
             .stdin(Stdio::inherit())
             .env_clear()
@@ -2305,9 +2327,9 @@ struct SourceWatchProcessGuard {
     #[cfg(unix)]
     terminal: Option<SourceWatchTerminalGuard>,
     #[cfg(unix)]
-    startup_reader: UnixStream,
+    startup_reader: io::PipeReader,
     #[cfg(unix)]
-    startup_writer: UnixStream,
+    startup_writer: io::PipeWriter,
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -2578,8 +2600,8 @@ impl SourceWatchProcessGuard {
 }
 
 #[cfg(unix)]
-fn source_watch_startup_pair() -> Result<(UnixStream, UnixStream), String> {
-    fn above_stdio(stream: UnixStream) -> Result<UnixStream, String> {
+fn source_watch_startup_pair() -> Result<(io::PipeReader, io::PipeWriter), String> {
+    fn above_stdio<T: AsRawFd + FromRawFd>(stream: T) -> Result<T, String> {
         if stream.as_raw_fd() > libc::STDERR_FILENO {
             return Ok(stream);
         }
@@ -2590,9 +2612,10 @@ fn source_watch_startup_pair() -> Result<(UnixStream, UnixStream), String> {
                 io::Error::last_os_error()
             ));
         }
-        Ok(unsafe { UnixStream::from_raw_fd(fd) })
+        Ok(unsafe { T::from_raw_fd(fd) })
     }
-    let (reader, writer) = UnixStream::pair()
+    // Shells can reopen a pipe through /dev/fd even when its number exceeds 9.
+    let (reader, writer) = io::pipe()
         .map_err(|error| format!("failed creating source watch startup gate: {error}"))?;
     Ok((above_stdio(reader)?, above_stdio(writer)?))
 }
@@ -3643,6 +3666,146 @@ mod tests {
         source_watch_exit_code, source_watch_stop_timeout_error,
     };
     use crate::service::ServiceActionSummary;
+
+    #[cfg(unix)]
+    #[test]
+    fn source_startup_gate_precedes_native_node_preloads() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for (option, release) in [
+            ("--require", true),
+            ("--import", true),
+            ("--require", false),
+        ] {
+            let root = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir(root.path().join("scripts")).unwrap();
+            let preload = root.path().join(if option == "--require" {
+                "preload file.cjs"
+            } else {
+                "preload file.mjs"
+            });
+            let preload_marker = root.path().join("preloaded");
+            let entry_marker = root.path().join("source-ran");
+            let stderr_path = root.path().join("stderr.log");
+            std::fs::write(
+                &preload,
+                if option == "--require" {
+                    "require('node:fs').writeFileSync('preloaded', 'loaded');\n"
+                } else {
+                    "import fs from 'node:fs'; fs.writeFileSync('preloaded', 'loaded');\n"
+                },
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("scripts/watch-node.mjs"),
+                r#"
+import fs from 'node:fs';
+fs.writeFileSync('source-ran', JSON.stringify({
+  args: process.argv.slice(2), stdin: fs.readFileSync(0, 'utf8'),
+  pendingGate: process.env.OCM_SOURCE_WATCH_START_FD,
+  consumedGate: process.env.OCM_SOURCE_WATCH_RELEASED_FD,
+}));
+"#,
+            )
+            .unwrap();
+            // POSIX shells do not all accept numeric <& duplication above fd9.
+            let _held: Vec<_> = (0..12)
+                .map(|_| std::fs::File::open(&preload).unwrap())
+                .collect();
+            let args = vec!["gateway".to_string(), "value with spaces".to_string()];
+            let mut command = super::source_watch_node_command(&args);
+            command
+                .current_dir(root.path())
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", root.path())
+                .env(
+                    "NODE_OPTIONS",
+                    format!(
+                        "{option} {}",
+                        serde_json::to_string(&preload.to_string_lossy()).unwrap()
+                    ),
+                )
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::from(
+                    std::fs::File::create(&stderr_path).unwrap(),
+                ))
+                .process_group(0);
+            let mut guard = super::SourceWatchProcessGuard::new_with_terminal(false).unwrap();
+            assert!(guard.startup_reader.as_raw_fd() > 9);
+            guard.configure_command(&mut command).unwrap();
+            let mut child = OwnedChild(command.spawn().unwrap());
+            child
+                .0
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"original stdin")
+                .unwrap();
+            let before_release = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < before_release && !preload_marker.exists() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "{}",
+                    std::fs::read_to_string(&stderr_path).unwrap()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if preload_marker.exists() {
+                child.0.kill().unwrap();
+                child.0.wait().unwrap();
+                panic!("Node preload executed before startup release; owned child reaped");
+            }
+            assert!(!entry_marker.exists());
+            if release {
+                guard.start_child(&child.0).unwrap();
+            }
+            drop(guard);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "gated child did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            assert_eq!(
+                status.success(),
+                release,
+                "{}",
+                std::fs::read_to_string(&stderr_path).unwrap()
+            );
+            assert_eq!(
+                preload_marker.exists(),
+                release,
+                "preload release/EOF behavior"
+            );
+            assert_eq!(
+                entry_marker.exists(),
+                release,
+                "source release/EOF behavior"
+            );
+            if release {
+                let entry: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&entry_marker).unwrap()).unwrap();
+                assert_eq!(entry["args"], serde_json::json!(args));
+                assert_eq!(entry["stdin"], "original stdin");
+                assert!(entry["pendingGate"].is_null() && entry["consumedGate"].is_null());
+            }
+        }
+    }
 
     fn sample_summary() -> DevStatusSummary {
         DevStatusSummary {

@@ -98,7 +98,7 @@ impl AdmissionFixture {
         write_executable_script(
             &node,
             &format!(
-                "#!/bin/bash\nif [ -n \"$OCM_SOURCE_WATCH_START_FD\" ]; then\n  IFS= read -r ocm_start <&\"$OCM_SOURCE_WATCH_START_FD\" || exit 1\nfi\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                "#!/bin/bash\nif [ -n \"$OCM_SOURCE_WATCH_START_FD\" ]; then\n  IFS= read -r ocm_start < \"/dev/fd/$OCM_SOURCE_WATCH_START_FD\" || exit 1\nfi\nprintf '%s\\n' \"$*\" >> '{}'\n",
                 path_string(&root.child("node.log")),
             ),
         );
@@ -382,10 +382,11 @@ fn dev_watch_checks_launchd_ownership_without_searching_path_for_id() {
         .insert("PATH".to_string(), path_string(&empty_bin));
     let failed_spawn = fixture.watch();
     assert!(!failed_spawn.status.success());
+    assert_eq!(failed_spawn.status.code(), Some(127));
     assert!(
-        stderr(&failed_spawn).contains("failed to run \"node\""),
+        stderr(&failed_spawn).contains("node") && stderr(&failed_spawn).contains("not found"),
         "{}",
-        stderr(&failed_spawn),
+        stderr(&failed_spawn)
     );
 }
 
