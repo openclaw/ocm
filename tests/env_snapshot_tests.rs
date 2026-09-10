@@ -15,6 +15,7 @@ use std::{
 };
 
 use fs2::FileExt;
+use ocm::env::{EnvDevMeta, EnvironmentService};
 use ocm::store::{
     env_registry_path, get_environment, now_utc, save_environment, source_watch_override_path,
     supervisor_runtime_path,
@@ -347,6 +348,123 @@ fn env_snapshot_restore_reverts_state_from_the_selected_snapshot() {
             .unwrap(),
         "before restore"
     );
+}
+
+#[test]
+fn env_snapshot_restore_preserves_the_current_complete_dev_binding() {
+    for binding in ["runtime", "launcher", "dev", "ordinary"] {
+        let root = TestDir::new("env-snapshot-dev-binding");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let created = run_ocm(&cwd, &env, &["env", "create", "source"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        for name in ["captured", "current"] {
+            let binary = root.child(format!("{name}-openclaw"));
+            write_executable_script(&binary, "#!/bin/sh\nexit 0\n");
+            let runtime = run_ocm(
+                &cwd,
+                &env,
+                &["runtime", "add", name, "--path", &path_string(&binary)],
+            );
+            assert!(runtime.status.success(), "{}", stderr(&runtime));
+            let launcher = run_ocm(
+                &cwd,
+                &env,
+                &["launcher", "add", name, "--command", "printf retained"],
+            );
+            assert!(launcher.status.success(), "{}", stderr(&launcher));
+        }
+        let mut meta = get_environment("source", &env, &cwd).unwrap();
+        meta.service_enabled = false;
+        meta.service_running = false;
+        meta.default_runtime = Some("captured".to_string());
+        meta.default_launcher = Some("captured".to_string());
+        save_environment(meta, &env, &cwd).unwrap();
+        let notes = root.child("ocm-home/envs/source/.openclaw/workspace/notes.txt");
+        write_text(&notes, "snapshot state\n");
+        let snapshot = run_ocm(
+            &cwd,
+            &env,
+            &["env", "snapshot", "create", "source", "--json"],
+        );
+        assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+        let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+
+        let mut current = get_environment("source", &env, &cwd).unwrap();
+        if binding != "ordinary" {
+            current.dev = Some(EnvDevMeta {
+                repo_root: path_string(&root.child("saved-repo")),
+                worktree_root: path_string(&root.child("saved-worktree")),
+            });
+        }
+        current.default_runtime =
+            matches!(binding, "runtime" | "ordinary").then(|| "current".to_string());
+        current.default_launcher = (binding != "dev").then(|| "current".to_string());
+        save_environment(current.clone(), &env, &cwd).unwrap();
+        write_text(&notes, "current state\n");
+        let restored = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "snapshot",
+                "restore",
+                "source",
+                snapshot["id"].as_str().unwrap(),
+            ],
+        );
+        assert!(
+            restored.status.success(),
+            "{binding}: {}",
+            stderr(&restored)
+        );
+        let restored = get_environment("source", &env, &cwd).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.dev).unwrap(),
+            serde_json::to_value(&current.dev).unwrap()
+        );
+        let expected = if binding == "ordinary" {
+            "captured"
+        } else {
+            "current"
+        };
+        assert_eq!(
+            restored.default_runtime.as_deref(),
+            if matches!(binding, "runtime" | "ordinary") {
+                Some(expected)
+            } else {
+                None
+            }
+        );
+        assert_eq!(
+            restored.default_launcher.as_deref(),
+            (binding != "dev").then_some(expected)
+        );
+        assert_eq!(fs::read_to_string(&notes).unwrap(), "snapshot state\n");
+        let resolved = EnvironmentService::new(&env, &cwd)
+            .resolve("source", None, None, &["status".to_string()])
+            .unwrap()
+            .into_summary();
+        assert_eq!(
+            resolved.binding_kind,
+            if binding == "ordinary" {
+                "runtime"
+            } else {
+                binding
+            }
+        );
+        assert_eq!(
+            resolved.binding_name,
+            if binding == "dev" { "dev" } else { expected }
+        );
+        if binding == "dev" {
+            assert_eq!(
+                resolved.run_dir,
+                current.dev.as_ref().unwrap().worktree_root
+            );
+        }
+    }
 }
 
 #[test]
@@ -982,6 +1100,26 @@ fn env_snapshot_restore_remains_compatible_with_legacy_tar_metadata() {
     );
     assert!(restore.status.success(), "{}", stderr(&restore));
     assert_eq!(fs::read_to_string(&notes).unwrap(), "legacy-snapshot\n");
+
+    let mut current = get_environment("source", &env, &cwd).unwrap();
+    current.dev = Some(EnvDevMeta {
+        repo_root: path_string(&root.child("saved-repo")),
+        worktree_root: path_string(&root.child("saved-worktree")),
+    });
+    let saved_dev = serde_json::to_value(&current.dev).unwrap();
+    save_environment(current, &env, &cwd).unwrap();
+    write_text(&notes, "current dev state\n");
+    let restore = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "restore", "source", snapshot_id],
+    );
+    assert!(restore.status.success(), "{}", stderr(&restore));
+    assert_eq!(fs::read_to_string(&notes).unwrap(), "legacy-snapshot\n");
+    assert_eq!(
+        serde_json::to_value(get_environment("source", &env, &cwd).unwrap().dev).unwrap(),
+        saved_dev
+    );
 }
 
 #[test]

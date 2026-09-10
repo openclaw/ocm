@@ -92,7 +92,8 @@ pub(crate) use snapshots::{
     EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
     create_env_snapshot_from_preparation, prepare_env_snapshot_capture,
     prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
-    rollback_env_snapshot_restore, validate_upgrade_independent_paths,
+    prepare_upgrade_snapshot_restore, rollback_env_snapshot_restore,
+    validate_upgrade_independent_paths,
 };
 pub use snapshots::{
     create_env_snapshot, get_env_snapshot, list_all_env_snapshots, list_env_snapshots,

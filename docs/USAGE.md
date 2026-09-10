@@ -515,6 +515,11 @@ operator recovery: preserve the environment
 and check the watch processes and service policy before recovering its ownership
 record. Refusal preserves the current state and service policy.
 
+Manual restore of a dev environment keeps its current source binding and
+runtime/launcher binding while restoring saved state. Upgrade rollback keeps
+that dev identity but restores the recorded runtime/launcher. Ordinary runtime
+and launcher environments still restore their captured bindings.
+
 Snapshot create and restore stop a running OCM-managed gateway before copying or
 replacing its root, then restore the recorded service policy. New snapshots are
 verified whole-root checkpoints: they include secrets, browser state, SQLite

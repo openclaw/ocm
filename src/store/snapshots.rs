@@ -454,6 +454,23 @@ pub(crate) fn prepare_env_snapshot_restore(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvSnapshotRestoreTransaction, String> {
+    prepare_env_snapshot_restore_with_binding(options, true, env, cwd)
+}
+
+pub(crate) fn prepare_upgrade_snapshot_restore(
+    options: RestoreEnvSnapshotOptions,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvSnapshotRestoreTransaction, String> {
+    prepare_env_snapshot_restore_with_binding(options, false, env, cwd)
+}
+
+fn prepare_env_snapshot_restore_with_binding(
+    options: RestoreEnvSnapshotOptions,
+    preserve_current_dev_execution: bool,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvSnapshotRestoreTransaction, String> {
     let env_name = validate_name(&options.env_name, "Environment name")?;
     let snapshot = get_env_snapshot(&env_name, &options.snapshot_id, env, cwd)?;
     crate::env::EnvironmentService::new(env, cwd)
@@ -511,7 +528,7 @@ pub(crate) fn prepare_env_snapshot_restore(
                     service_running: archived.service_running,
                     default_runtime: archived.default_runtime,
                     default_launcher: archived.default_launcher,
-                    dev: None,
+                    dev: current.dev.clone(),
                     protected: archived.protected,
                     created_at: current.created_at,
                     updated_at: current.updated_at,
@@ -534,7 +551,7 @@ pub(crate) fn prepare_env_snapshot_restore(
                     service_running: snapshot.service_running,
                     default_runtime: snapshot.default_runtime.clone(),
                     default_launcher: snapshot.default_launcher.clone(),
-                    dev: None,
+                    dev: current.dev.clone(),
                     protected: snapshot.protected,
                     created_at: current.created_at,
                     updated_at: current.updated_at,
@@ -543,6 +560,11 @@ pub(crate) fn prepare_env_snapshot_restore(
                 false,
             )
         };
+
+        if preserve_current_dev_execution && current.dev.is_some() {
+            restored.default_runtime = current.default_runtime.clone();
+            restored.default_launcher = current.default_launcher.clone();
+        }
 
         let mut renamed = false;
         if !independent.is_empty() {

@@ -8,8 +8,9 @@ use crate::store::{
     EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
     create_env_snapshot, create_env_snapshot_from_preparation, get_env_snapshot,
     list_all_env_snapshots, list_env_snapshots, now_utc, prepare_env_snapshot_capture,
-    prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture, remove_env_snapshot,
-    rollback_env_snapshot_restore, summarize_snapshot,
+    prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
+    prepare_upgrade_snapshot_restore, remove_env_snapshot, rollback_env_snapshot_restore,
+    summarize_snapshot,
 };
 use crate::supervisor::sync_supervisor_env_if_present;
 
@@ -224,6 +225,16 @@ impl<'a> EnvironmentService<'a> {
     ) -> Result<EnvSnapshotRestoreTransaction, String> {
         let env_name = options.env_name.clone();
         let transaction = prepare_env_snapshot_restore(options, self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &env_name)?;
+        Ok(transaction)
+    }
+
+    pub(crate) fn prepare_upgrade_snapshot_restore_locked(
+        &self,
+        options: RestoreEnvSnapshotOptions,
+    ) -> Result<EnvSnapshotRestoreTransaction, String> {
+        let env_name = options.env_name.clone();
+        let transaction = prepare_upgrade_snapshot_restore(options, self.env, self.cwd)?;
         sync_supervisor_env_if_present(self.env, self.cwd, &env_name)?;
         Ok(transaction)
     }
