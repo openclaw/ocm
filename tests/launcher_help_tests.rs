@@ -138,7 +138,9 @@ fn dev_status_help_is_available_from_help_and_flag() {
     assert_eq!(output, stdout(&via_flag));
     assert!(output.contains("Show dev env status"));
     assert!(output.contains("ocm dev status [env] [--raw] [--json]"));
-    assert!(output.contains("Only envs created through `ocm dev` appear here."));
+    assert!(output.contains(
+        "Includes dev envs and runtime or launcher envs with an active or starting source watch."
+    ));
 }
 
 #[test]

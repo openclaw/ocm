@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -12,6 +12,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
+#[cfg(any(not(windows), test))]
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
@@ -19,14 +20,25 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use super::EnvironmentService;
+use super::source_watch_session::{SourceWatchSession, SourceWatchSessionPaths};
+use crate::infra::process_identity::{current_process_identity, observe_process, process_scope_id};
+use crate::service::platform::{ServiceManagerKind, service_manager_kind};
 use crate::store::{
-    display_path, ensure_dir, now_utc, read_json, source_watch_override_path, validate_name,
-    write_json,
+    ExclusiveFileLock, display_path, ensure_dir, lock_file, now_utc, read_json,
+    source_watch_override_path, try_lock_file, validate_name, write_json,
 };
+use crate::supervisor::SupervisorService;
 
 const SOURCE_WATCH_OVERRIDE_KIND: &str = "ocm-source-watch-override";
 const SOURCE_WATCH_LOCK_RETRY_ATTEMPTS: usize = 20;
 const SOURCE_WATCH_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+#[cfg(windows)]
+const SOURCE_WATCH_GENERATION_MAX_BYTES: usize = 1024;
+#[cfg(windows)]
+const SOURCE_WATCH_LOCK_BYTE_OFFSET: u32 = 4096;
+#[cfg(windows)]
+const _: () =
+    assert!(SOURCE_WATCH_GENERATION_MAX_BYTES + 1 < SOURCE_WATCH_LOCK_BYTE_OFFSET as usize);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,16 +46,52 @@ pub struct SourceWatchOverride {
     pub kind: String,
     pub env_name: String,
     pub repo_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<SourceWatchEndpoint>,
     pub watch_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watching: Option<bool>,
     pub token: String,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceWatchEndpoint {
+    pub env_root: String,
+    pub gateway_port: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SourceWatchState {
+    Inactive,
+    Starting,
+    Active(SourceWatchOverride),
+    Restoring,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SourceWatchMode {
+    Foreground { watching: bool },
+    ServicePreparation,
+}
+
+impl SourceWatchMode {
+    pub(super) fn is_watching(self) -> bool {
+        matches!(self, Self::Foreground { watching: true })
+    }
+
+    pub(super) fn is_service_preparation(self) -> bool {
+        matches!(self, Self::ServicePreparation)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct CreateSourceWatchOverrideOptions {
     pub(crate) env_name: String,
     pub(crate) repo_root: PathBuf,
+    pub(crate) endpoint: SourceWatchEndpoint,
     pub(crate) watch_pid: u32,
 }
 
@@ -52,21 +100,113 @@ pub(crate) struct SourceWatchLease {
     env_name: String,
     lease_id: String,
     lock_file: File,
+    service_was_running: bool,
+    service_preparation_revision: Option<u64>,
+    watching: bool,
+    session_paths: SourceWatchSessionPaths,
+    session: Option<SourceWatchSession>,
     #[cfg(windows)]
-    lease_event: windows_sys::Win32::Foundation::HANDLE,
+    lease_event: WindowsSourceWatchEvent,
 }
 
-#[cfg(windows)]
-impl Drop for SourceWatchLease {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.lease_event);
-        }
-    }
+pub(crate) struct SourceWatchLeaseObservation {
+    pub(crate) lease_id: String,
+    pub(crate) held: bool,
 }
 
 impl SourceWatchLease {
+    pub(crate) fn is_watching(&self) -> bool {
+        self.watching
+    }
+
+    pub(crate) fn service_was_running(&self) -> bool {
+        self.service_was_running
+    }
+
+    pub(crate) fn service_preparation_revision(&self) -> Option<u64> {
+        self.service_preparation_revision
+    }
+
+    pub(crate) fn session(&self) -> Option<&SourceWatchSession> {
+        self.session.as_ref()
+    }
+
+    pub(crate) fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
+    pub(crate) fn stop_requested(&self) -> Result<bool, String> {
+        self.session
+            .as_ref()
+            .map(|session| self.session_paths.stop_requested(session))
+            .unwrap_or(Ok(false))
+    }
+
+    pub(crate) fn begin_child_spawn(&mut self) -> Result<(), String> {
+        if let Some(session) = &mut self.session {
+            session.child = None;
+            session.child_spawn_pending = true;
+            self.session_paths.save_session(session)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_child(&mut self, pid: u32) -> Result<(), String> {
+        if let Some(session) = &mut self.session {
+            let process = observe_process(pid)?.ok_or_else(|| {
+                format!("failed to inspect source watch child identity for pid {pid}")
+            })?;
+            session.child = Some(process.identity);
+            session.child_spawn_pending = false;
+            self.session_paths.save_session(session)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_child(&mut self) -> Result<(), String> {
+        if let Some(session) = &mut self.session {
+            session.child = None;
+            session.child_spawn_pending = false;
+            self.session_paths.save_session(session)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_service_takeover(&mut self) -> Result<(), String> {
+        if let Some(session) = &mut self.session {
+            session.restore_service = self.service_was_running;
+            self.session_paths.save_session(session)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn discard_service_restore(&mut self) -> Result<(), String> {
+        if let Some(session) = &mut self.session {
+            session.restore_service = false;
+            self.session_paths.save_session(session)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_session(
+        &mut self,
+        service_restored: bool,
+        error: Option<String>,
+        preserve_session: bool,
+    ) -> Result<(), String> {
+        let _admission = lock_file(&self.session_paths.admission, "gateway admission")?;
+        if let Some(session) = &self.session {
+            self.session_paths
+                .finish(session, service_restored, error, preserve_session)?;
+            if !preserve_session {
+                self.session = None;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn begin_service_restore(&mut self) -> Result<(), String> {
+        let _admission = lock_file(&self.session_paths.admission, "gateway admission")?;
         write_source_watch_lock(&mut self.lock_file, &format!("restoring:{}", self.lease_id))
     }
 
@@ -102,7 +242,7 @@ impl SourceWatchLease {
         let duplicated = unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
-                self.lease_event,
+                self.lease_event.handle,
                 child.as_raw_handle() as HANDLE,
                 &mut child_handle,
                 0,
@@ -140,12 +280,228 @@ impl SourceWatchOverride {
 }
 
 impl<'a> EnvironmentService<'a> {
+    pub(crate) fn observe_source_watch_lease(
+        &self,
+        env_name: &str,
+    ) -> Result<Option<SourceWatchLeaseObservation>, String> {
+        let env_name = validate_name(env_name, "Environment name")?;
+        let lock_path =
+            source_watch_override_path(&env_name, self.env, self.cwd)?.with_extension("lock");
+        let mut file = match OpenOptions::new().read(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("failed reading source watch lease: {error}")),
+        };
+        let held = match try_lock_source_watch_file(&file, false) {
+            Ok(()) => false,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+            Err(error) => return Err(format!("failed inspecting source watch lease: {error}")),
+        };
+        #[cfg(windows)]
+        let held = held || open_windows_source_watch_event(&lock_path)?.is_some();
+        let value = read_source_watch_lock(&mut file)
+            .map_err(|error| format!("failed reading source watch lease: {error}"))?;
+        let value = value.trim();
+        Ok(Some(SourceWatchLeaseObservation {
+            lease_id: value
+                .strip_prefix("restoring:")
+                .unwrap_or(value)
+                .to_string(),
+            held,
+        }))
+    }
+
+    // The caller holds the environment operation and admission locks, and has
+    // verified that the recorded controller and its owned process group stopped.
+    pub(crate) fn reclaim_source_watch_lease_locked(
+        &self,
+        mut session: SourceWatchSession,
+    ) -> Result<SourceWatchLease, String> {
+        let override_path = source_watch_override_path(&session.env_name, self.env, self.cwd)?;
+        let lock_path = override_path.with_extension("lock");
+        let mut lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("failed opening source watch recovery lease: {error}"))?;
+        #[cfg(windows)]
+        let lease_event = WindowsSourceWatchEvent {
+            handle: acquire_windows_source_watch_event(&lock_path, &session.env_name)?,
+        };
+        try_lock_source_watch_exclusive(&lock_file).map_err(|error| {
+            format!("source watch lease is still held; recovery was not completed: {error}")
+        })?;
+        let value = read_source_watch_lock(&mut lock_file)
+            .map_err(|error| format!("failed reading source watch recovery lease: {error}"))?;
+        if value
+            .trim()
+            .strip_prefix("restoring:")
+            .unwrap_or(value.trim())
+            != session.lease_id
+        {
+            return Err("source watch generation changed; refusing stale recovery".to_string());
+        }
+        let session_paths = SourceWatchSessionPaths::from_override(&override_path);
+        session.controller = current_process_identity()?;
+        session.process_scope = process_scope_id()?;
+        session.child = None;
+        session.child_spawn_pending = false;
+        session.closed = false;
+        session.completion = None;
+        session_paths.save_session(&session)?;
+        Ok(SourceWatchLease {
+            env_name: session.env_name.clone(),
+            lease_id: session.lease_id.clone(),
+            lock_file,
+            service_was_running: session.restore_service,
+            service_preparation_revision: None,
+            watching: session.is_watching(),
+            session_paths,
+            session: Some(session),
+            #[cfg(windows)]
+            lease_event,
+        })
+    }
+
+    pub(crate) fn clear_source_watch_override_for_lease(
+        &self,
+        env_name: &str,
+        lease_id: &str,
+    ) -> Result<(), String> {
+        let env_name = validate_name(env_name, "Environment name")?;
+        let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
+        if !path.try_exists().map_err(|error| {
+            format!(
+                "failed inspecting source watch override {}: {error}",
+                display_path(&path)
+            )
+        })? {
+            return Ok(());
+        }
+        let meta = read_json::<SourceWatchOverride>(&path)?;
+        if !source_watch_matches_lease(&meta, lease_id) {
+            return Err("source watch override changed; refusing stale cleanup".to_string());
+        }
+        self.clear_source_watch_override(&env_name, &meta.token)?;
+        Ok(())
+    }
+
+    pub(crate) fn lock_gateway_admission(
+        &self,
+        env_name: &str,
+    ) -> Result<ExclusiveFileLock, String> {
+        lock_file(&self.gateway_admission_path(env_name)?, "gateway admission")
+    }
+
+    pub(crate) fn try_lock_gateway_admission(
+        &self,
+        env_name: &str,
+    ) -> Result<Option<ExclusiveFileLock>, String> {
+        try_lock_file(&self.gateway_admission_path(env_name)?, "gateway admission")
+    }
+
+    fn gateway_admission_path(&self, env_name: &str) -> Result<PathBuf, String> {
+        let env_name = validate_name(env_name, "Environment name")?;
+        Ok(source_watch_override_path(&env_name, self.env, self.cwd)?.with_extension("admission"))
+    }
+
+    pub(crate) fn ensure_source_watch_allows_state_mutation_locked(
+        &self,
+        name: &str,
+    ) -> Result<(), String> {
+        let unverified = |error: String| {
+            format!(
+                "cannot verify dev ownership for env {name}: {error}; verified operator recovery is required before changing env state; preserve the environment and verify the watch processes and service policy before retrying"
+            )
+        };
+        let session = self.source_watch_session(name).map_err(&unverified)?;
+        let unfinished = session.is_some_and(|session| !session.closed);
+        let state = match self.observe_source_watch(name).map_err(&unverified)? {
+            SourceWatchState::Inactive => None,
+            SourceWatchState::Starting => Some("starting"),
+            SourceWatchState::Active(_) => Some("active"),
+            SourceWatchState::Restoring => Some("restoring"),
+        };
+        if let Some(state) = state {
+            let recovery = if unfinished {
+                format!(
+                    "request shutdown with ocm dev stop {name}; if ownership cannot be verified, verified operator recovery is required"
+                )
+            } else {
+                "stop it from its original dev terminal; if that is unavailable, verified operator recovery is required".to_string()
+            };
+            return Err(format!(
+                "cannot change env {name} while its dev session is {state}; {recovery}"
+            ));
+        }
+        if unfinished {
+            return Err(format!(
+                "cannot change env {name} while its dev session is unfinished; request shutdown with ocm dev stop {name}; if ownership cannot be verified, verified operator recovery is required"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_source_watch_allows_service(&self, env_name: &str) -> Result<(), String> {
+        if let Some(session) = self.source_watch_session(env_name)? {
+            if let Some(error) = session.unsafe_cleanup_error() {
+                return Err(error.to_string());
+            }
+            if !session.closed
+                && (session.child.is_some() || session.child_spawn_pending)
+                && !session.controller_is_running()?
+            {
+                return Err(format!(
+                    "source watch ownership for env {env_name} is unfinished; run `ocm dev stop {env_name}` before starting its service"
+                ));
+            }
+        }
+        if self.active_source_watch_override(env_name)?.is_some() {
+            return Err(format!(
+                "background service for env \"{env_name}\" cannot start while source watch is active; stop the watch session first"
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn acquire_source_watch_lease(
         &self,
         env_name: &str,
+        allow_service_takeover: bool,
+        mode: SourceWatchMode,
     ) -> Result<SourceWatchLease, String> {
         let env_name = validate_name(env_name, "Environment name")?;
+        // Match service updates: operation, daemon lifecycle, then Gateway
+        // admission. Keep the daemon generation stable through lease publication.
+        let _operation_lock = self.lock_operation(&env_name)?;
+        let supervisor = SupervisorService::new(self.env, self.cwd);
+        let _lifecycle_lock = if service_manager_kind(self.env) == ServiceManagerKind::Unsupported {
+            None
+        } else {
+            Some(supervisor.lock_daemon_lifecycle()?)
+        };
+        // A planner must not publish a pre-admission view after preparation
+        // claims the environment. Take its existing state lock before admission.
+        let _state_lock = mode
+            .is_service_preparation()
+            .then(|| supervisor.lock_state_publication())
+            .transpose()?;
+        let _admission_lock = self.lock_gateway_admission(&env_name)?;
+        supervisor.ensure_source_watch_daemon_compatible()?;
+        let meta = self.get(&env_name)?;
+        let service_preparation_revision = mode
+            .is_service_preparation()
+            .then(|| {
+                crate::store::environment_service_policy_revision(&env_name, self.env, self.cwd)
+            })
+            .transpose()?;
+        if meta.service_running && !allow_service_takeover && !mode.is_service_preparation() {
+            return Err(format!(
+                "dev env {env_name} is already running in the background; stop it first or rerun with --watch --force to take it over temporarily"
+            ));
+        }
         let override_path = source_watch_override_path(&env_name, self.env, self.cwd)?;
+        let session_paths = SourceWatchSessionPaths::from_override(&override_path);
         let lock_path = override_path.with_extension("lock");
         if let Ok(meta) = read_json::<SourceWatchOverride>(&override_path)
             && !is_leased_source_watch(&meta)
@@ -173,28 +529,24 @@ impl<'a> EnvironmentService<'a> {
                 )
             })?;
         #[cfg(windows)]
-        let lease_event = acquire_windows_source_watch_event(&lock_path, &env_name)?;
+        let lease_event = WindowsSourceWatchEvent {
+            handle: acquire_windows_source_watch_event(&lock_path, &env_name)?,
+        };
         match try_lock_source_watch_exclusive(&lock_file) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                #[cfg(windows)]
-                unsafe {
-                    windows_sys::Win32::Foundation::CloseHandle(lease_event);
-                }
                 return Err(format!(
                     "source watch for env \"{env_name}\" is already active or starting"
                 ));
             }
             Err(error) => {
-                #[cfg(windows)]
-                unsafe {
-                    windows_sys::Win32::Foundation::CloseHandle(lease_event);
-                }
                 return Err(format!(
                     "failed locking source watch for env \"{env_name}\": {error}"
                 ));
             }
         }
+
+        session_paths.ensure_previous_session_finished(&env_name)?;
 
         let lease_id = format!(
             "{}-{}",
@@ -208,10 +560,19 @@ impl<'a> EnvironmentService<'a> {
         // Owning the OS lock proves any surviving metadata belongs to a dead
         // lease, even if its child PID has since been reused by another process.
         remove_file_if_present(&override_path)?;
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        let session = Some(session_paths.create_session(&meta, &lease_id, mode)?);
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        let session = None;
         Ok(SourceWatchLease {
             env_name,
             lease_id,
             lock_file,
+            service_was_running: meta.service_running && !mode.is_service_preparation(),
+            service_preparation_revision,
+            watching: mode.is_watching(),
+            session_paths,
+            session,
             #[cfg(windows)]
             lease_event,
         })
@@ -228,13 +589,14 @@ impl<'a> EnvironmentService<'a> {
                 lease.env_name, options.env_name
             ));
         }
-        self.write_source_watch_override(options, &lease.lease_id)
+        self.write_source_watch_override(options, &lease.lease_id, lease.watching)
     }
 
     fn write_source_watch_override(
         &self,
         options: CreateSourceWatchOverrideOptions,
         lease_id: &str,
+        watching: bool,
     ) -> Result<SourceWatchOverride, String> {
         let env_name = validate_name(&options.env_name, "Environment name")?;
         let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
@@ -250,7 +612,9 @@ impl<'a> EnvironmentService<'a> {
             kind: SOURCE_WATCH_OVERRIDE_KIND.to_string(),
             env_name,
             repo_root: display_path(&options.repo_root),
+            endpoint: Some(options.endpoint),
             watch_pid: options.watch_pid,
+            watching: Some(watching),
             token,
             started_at: now_utc(),
         };
@@ -282,7 +646,36 @@ impl<'a> EnvironmentService<'a> {
         &self,
         env_name: &str,
     ) -> Result<Option<SourceWatchOverride>, String> {
+        match self.inspect_source_watch_state(env_name, true)? {
+            SourceWatchState::Active(meta) => Ok(Some(meta)),
+            SourceWatchState::Inactive | SourceWatchState::Restoring => Ok(None),
+            SourceWatchState::Starting => Err(format!(
+                "source watch for env \"{env_name}\" is active or starting, but its metadata is unavailable"
+            )),
+        }
+    }
+
+    pub(crate) fn observe_source_watch(&self, env_name: &str) -> Result<SourceWatchState, String> {
+        self.inspect_source_watch_state(env_name, false)
+    }
+
+    fn inspect_source_watch_state(
+        &self,
+        env_name: &str,
+        cleanup_stale: bool,
+    ) -> Result<SourceWatchState, String> {
         let env_name = validate_name(env_name, "Environment name")?;
+        if let Some(session) = self.source_watch_session(&env_name)? {
+            if let Some(error) = session.unsafe_cleanup_error() {
+                return Err(error.to_string());
+            }
+            #[cfg(unix)]
+            if session.requires_controller_completion() && !session.controller_is_running()? {
+                return Err(format!(
+                    "source controller for env {env_name} exited before cleanup completion; source shutdown is unverified and its unfinished ownership was retained"
+                ));
+            }
+        }
         let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
         let lock_path = path.with_extension("lock");
         let lock_file = match OpenOptions::new().read(true).open(&lock_path) {
@@ -290,8 +683,13 @@ impl<'a> EnvironmentService<'a> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 // A lookup with no watch state remains read-only. If an override exists,
                 // create the lock before cleanup so lease creation cannot interleave.
-                if !path.exists() {
-                    return Ok(None);
+                if !source_watch_metadata_exists(&path)? {
+                    return Ok(SourceWatchState::Inactive);
+                }
+                if !cleanup_stale {
+                    return Ok(read_active_legacy_source_watch(&path, &env_name)?
+                        .map(SourceWatchState::Active)
+                        .unwrap_or(SourceWatchState::Inactive));
                 }
                 if let Some(parent) = lock_path.parent() {
                     ensure_dir(parent)?;
@@ -308,82 +706,34 @@ impl<'a> EnvironmentService<'a> {
 
         #[cfg(windows)]
         if let Some(_lease_event) = open_windows_source_watch_event(&lock_path)? {
-            let lock_lease_id = fs::read_to_string(&lock_path)
-                .map_err(|error| {
-                    format!(
-                        "failed reading active source watch lock {}: {error}",
-                        display_path(&lock_path)
-                    )
-                })?
-                .trim()
-                .to_string();
-            if source_watch_lock_is_restoring(&lock_lease_id) {
-                remove_file_if_present(&path)?;
-                return Ok(None);
-            }
-            let meta = read_json::<SourceWatchOverride>(&path).map_err(|error| {
-                format!(
-                    "source watch for env \"{env_name}\" is active or starting, but its metadata is unavailable: {error}"
-                )
-            })?;
-            if source_watch_matches_lease(&meta, &lock_lease_id)
-                && is_valid_source_watch_structure(&meta, &env_name)
-            {
-                return Ok(Some(meta));
-            }
-            return Err(format!(
-                "source watch for env \"{env_name}\" is active or starting, but its metadata does not match the active lease"
-            ));
+            return read_leased_source_watch_state(&path, &lock_path, &env_name, cleanup_stale);
         }
 
-        match FileExt::try_lock_shared(&lock_file) {
+        match try_lock_source_watch_file(&lock_file, false) {
             Ok(()) => {
                 // Shared readers prove no watcher owns the exclusive lease. They may clean the
                 // same stale metadata concurrently without impersonating an active watcher.
-                let active_legacy = read_json::<SourceWatchOverride>(&path).ok().filter(|meta| {
-                    !is_leased_source_watch(meta)
-                        && is_valid_source_watch_metadata(meta, &env_name)
-                        && is_legacy_source_watch_process(meta)
-                });
-                if active_legacy.is_none() {
+                let legacy = read_active_legacy_source_watch(&path, &env_name);
+                let active_legacy = if cleanup_stale {
+                    legacy.unwrap_or(None)
+                } else {
+                    legacy?
+                };
+                if cleanup_stale && active_legacy.is_none() {
                     remove_file_if_present(&path)?;
                 }
-                FileExt::unlock(&lock_file).map_err(|error| {
+                unlock_source_watch_file(&lock_file).map_err(|error| {
                     format!(
                         "failed unlocking stale source watch lock {}: {error}",
                         display_path(&lock_path)
                     )
                 })?;
-                Ok(active_legacy)
+                Ok(active_legacy
+                    .map(SourceWatchState::Active)
+                    .unwrap_or(SourceWatchState::Inactive))
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                let lock_lease_id = fs::read_to_string(&lock_path)
-                    .map_err(|error| {
-                        format!(
-                            "failed reading active source watch lock {}: {error}",
-                            display_path(&lock_path)
-                        )
-                    })?
-                    .trim()
-                    .to_string();
-                if source_watch_lock_is_restoring(&lock_lease_id) {
-                    remove_file_if_present(&path)?;
-                    return Ok(None);
-                }
-                let meta = read_json::<SourceWatchOverride>(&path).map_err(|error| {
-                    format!(
-                        "source watch for env \"{env_name}\" is active or starting, but its metadata is unavailable: {error}"
-                    )
-                })?;
-                let metadata_valid = source_watch_matches_lease(&meta, &lock_lease_id)
-                    && is_valid_source_watch_structure(&meta, &env_name);
-                if metadata_valid {
-                    Ok(Some(meta))
-                } else {
-                    Err(format!(
-                        "source watch for env \"{env_name}\" is active or starting, but its metadata does not match the active lease"
-                    ))
-                }
+                read_leased_source_watch_state(&path, &lock_path, &env_name, cleanup_stale)
             }
             Err(error) => Err(format!(
                 "failed checking source watch lock {}: {error}",
@@ -393,7 +743,76 @@ impl<'a> EnvironmentService<'a> {
     }
 }
 
+fn read_active_legacy_source_watch(
+    path: &Path,
+    env_name: &str,
+) -> Result<Option<SourceWatchOverride>, String> {
+    if !source_watch_metadata_exists(path)? {
+        return Ok(None);
+    }
+    let meta = read_json::<SourceWatchOverride>(path)?;
+    Ok(Some(meta).filter(|meta| {
+        !is_leased_source_watch(meta)
+            && is_valid_source_watch_metadata(meta, env_name)
+            && is_legacy_source_watch_process(meta)
+    }))
+}
+
+fn source_watch_metadata_exists(path: &Path) -> Result<bool, String> {
+    path.try_exists().map_err(|error| {
+        format!(
+            "failed inspecting source watch metadata {}: {error}",
+            display_path(path)
+        )
+    })
+}
+
+fn read_leased_source_watch_state(
+    path: &Path,
+    lock_path: &Path,
+    env_name: &str,
+    cleanup_stale: bool,
+) -> Result<SourceWatchState, String> {
+    let lock_lease_id = File::open(lock_path)
+        .and_then(|mut file| read_source_watch_lock(&mut file))
+        .map_err(|error| {
+            format!(
+                "failed reading active source watch lock {}: {error}",
+                display_path(lock_path)
+            )
+        })?
+        .trim()
+        .to_string();
+    if source_watch_lock_is_restoring(&lock_lease_id) {
+        if cleanup_stale {
+            remove_file_if_present(path)?;
+        }
+        return Ok(SourceWatchState::Restoring);
+    }
+    if !source_watch_metadata_exists(path)? {
+        return Ok(SourceWatchState::Starting);
+    }
+    let meta = read_json::<SourceWatchOverride>(path).map_err(|error| {
+        format!(
+            "source watch for env \"{env_name}\" is active or starting, but its metadata is unavailable: {error}"
+        )
+    })?;
+    if source_watch_matches_lease(&meta, &lock_lease_id)
+        && is_valid_source_watch_structure(&meta, env_name)
+    {
+        Ok(SourceWatchState::Active(meta))
+    } else {
+        Err(format!(
+            "source watch for env \"{env_name}\" is active or starting, but its metadata does not match the active lease"
+        ))
+    }
+}
+
 fn write_source_watch_lock(lock_file: &mut File, value: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    if value.len() >= SOURCE_WATCH_GENERATION_MAX_BYTES {
+        return Err("source watch generation exceeds its metadata limit".to_string());
+    }
     lock_file
         .set_len(0)
         .and_then(|()| lock_file.seek(SeekFrom::Start(0)).map(|_| ()))
@@ -401,9 +820,107 @@ fn write_source_watch_lock(lock_file: &mut File, value: &str) -> Result<(), Stri
         .map_err(|error| format!("failed recording source watch lock: {error}"))
 }
 
+fn read_source_watch_lock(lock_file: &mut File) -> io::Result<String> {
+    let mut value = String::new();
+    #[cfg(not(windows))]
+    lock_file.read_to_string(&mut value)?;
+    #[cfg(windows)]
+    {
+        // Bound the ReadFile request itself below the reserved lock byte, even
+        // when the file is malformed or the reader's buffer extends beyond EOF.
+        lock_file
+            .take((SOURCE_WATCH_GENERATION_MAX_BYTES + 1) as u64)
+            .read_to_string(&mut value)
+            .map_err(|error| {
+                if error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+                {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "an older source watch owner locks its generation metadata; stop it from its original terminal",
+                    )
+                } else {
+                    error
+                }
+            })?;
+        if value.len() > SOURCE_WATCH_GENERATION_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "source watch generation exceeds its metadata limit",
+            ));
+        }
+    }
+    Ok(value)
+}
+
+#[cfg(not(windows))]
+fn try_lock_source_watch_file(file: &File, exclusive: bool) -> io::Result<()> {
+    if exclusive {
+        FileExt::try_lock_exclusive(file)
+    } else {
+        FileExt::try_lock_shared(file)
+    }
+}
+
+#[cfg(not(windows))]
+fn unlock_source_watch_file(file: &File) -> io::Result<()> {
+    FileExt::unlock(file)
+}
+
+#[cfg(windows)]
+fn source_watch_lock_region() -> windows_sys::Win32::System::IO::OVERLAPPED {
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+    OVERLAPPED {
+        Anonymous: OVERLAPPED_0 {
+            Anonymous: OVERLAPPED_0_0 {
+                Offset: SOURCE_WATCH_LOCK_BYTE_OFFSET,
+                OffsetHigh: 0,
+            },
+        },
+        ..OVERLAPPED::default()
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_source_watch_file(file: &File, exclusive: bool) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    let mut region = source_watch_lock_region();
+    let flags = LOCKFILE_FAIL_IMMEDIATELY
+        | if exclusive {
+            LOCKFILE_EXCLUSIVE_LOCK
+        } else {
+            0
+        };
+    // The one-byte range overlaps legacy fs2 whole-file locks, but leaves the
+    // generation text readable from another handle during a live watch.
+    let locked = unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut region) };
+    if locked != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Err(io::Error::new(io::ErrorKind::WouldBlock, error))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn unlock_source_watch_file(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    let mut region = source_watch_lock_region();
+    if unsafe { UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut region) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn try_lock_source_watch_exclusive(lock_file: &File) -> io::Result<()> {
     for attempt in 0..=SOURCE_WATCH_LOCK_RETRY_ATTEMPTS {
-        match FileExt::try_lock_exclusive(lock_file) {
+        match try_lock_source_watch_file(lock_file, true) {
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
                     && attempt < SOURCE_WATCH_LOCK_RETRY_ATTEMPTS =>
@@ -444,11 +961,16 @@ fn is_valid_source_watch_structure(meta: &SourceWatchOverride, env_name: &str) -
         && !meta.repo_root.trim().is_empty()
         && !meta.token.trim().is_empty()
         && meta.watch_pid > 0
+        && meta.endpoint.as_ref().is_none_or(|endpoint| {
+            Path::new(&endpoint.env_root).is_absolute()
+                && (1..=u16::MAX as u32).contains(&endpoint.gateway_port)
+        })
         && Path::new(&meta.repo_root).join("openclaw.mjs").is_file()
         && Path::new(&meta.repo_root).join("extensions").is_dir()
 }
 
 #[cfg(windows)]
+#[derive(Debug)]
 struct WindowsSourceWatchEvent {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -680,7 +1202,9 @@ mod tests {
             kind: SOURCE_WATCH_OVERRIDE_KIND.to_string(),
             env_name: "demo".to_string(),
             repo_root: "/repo/openclaw".to_string(),
+            endpoint: None,
             watch_pid: 123,
+            watching: None,
             token: "123-token".to_string(),
             started_at: OffsetDateTime::UNIX_EPOCH,
         };
@@ -737,8 +1261,89 @@ mod tests {
         try_lock_source_watch_exclusive(&contender).unwrap();
 
         assert!(released.load(std::sync::atomic::Ordering::SeqCst));
-        FileExt::unlock(&contender).unwrap();
+        unlock_source_watch_file(&contender).unwrap();
         release.join().unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_watch_lock_keeps_generation_reads_outside_its_range() {
+        let mut owner = tempfile::NamedTempFile::new().unwrap();
+        let mut reader = File::open(owner.path()).unwrap();
+        try_lock_source_watch_file(owner.as_file(), true).unwrap();
+        let generation = "g".repeat(SOURCE_WATCH_GENERATION_MAX_BYTES - 1);
+        write_source_watch_lock(owner.as_file_mut(), &generation).unwrap();
+        assert_eq!(
+            read_source_watch_lock(&mut reader).unwrap().trim(),
+            generation
+        );
+        assert_eq!(
+            try_lock_source_watch_file(&reader, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        write_source_watch_lock(owner.as_file_mut(), "restoring:owned-generation").unwrap();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(
+            read_source_watch_lock(&mut reader).unwrap().trim(),
+            "restoring:owned-generation",
+        );
+        assert!(
+            write_source_watch_lock(
+                owner.as_file_mut(),
+                &"x".repeat(SOURCE_WATCH_GENERATION_MAX_BYTES),
+            )
+            .is_err()
+        );
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(
+            read_source_watch_lock(&mut reader).unwrap().trim(),
+            "restoring:owned-generation",
+        );
+        unlock_source_watch_file(owner.as_file()).unwrap();
+        try_lock_source_watch_file(&reader, true).unwrap();
+        unlock_source_watch_file(&reader).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_watch_lock_excludes_legacy_whole_file_owners() {
+        let owner = tempfile::NamedTempFile::new().unwrap();
+        fs::write(owner.path(), "legacy-generation\n").unwrap();
+        let mut contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(owner.path())
+            .unwrap();
+        FileExt::lock_exclusive(owner.as_file()).unwrap();
+        assert_eq!(
+            try_lock_source_watch_file(&contender, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        assert_eq!(
+            read_source_watch_lock(&mut contender).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        FileExt::unlock(owner.as_file()).unwrap();
+        try_lock_source_watch_file(&contender, true).unwrap();
+        assert_eq!(
+            FileExt::try_lock_shared(owner.as_file())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32),
+        );
+        assert_eq!(
+            FileExt::try_lock_exclusive(owner.as_file())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32),
+        );
+        unlock_source_watch_file(&contender).unwrap();
+        FileExt::try_lock_exclusive(owner.as_file()).unwrap();
+        FileExt::unlock(owner.as_file()).unwrap();
     }
 }

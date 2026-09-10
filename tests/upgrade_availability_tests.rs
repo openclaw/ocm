@@ -248,6 +248,7 @@ fn write_running_supervisor_runtime(
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -284,6 +285,7 @@ fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: Vec::new(),
         children: Vec::new(),

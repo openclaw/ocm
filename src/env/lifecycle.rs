@@ -5,14 +5,17 @@ use time::Duration;
 use time::OffsetDateTime;
 
 use super::EnvironmentService;
-use crate::openclaw_repo::prepare_openclaw_simulation_worktree_cleanup;
+use crate::openclaw_repo::{
+    prepare_openclaw_simulation_worktree_cleanup, validate_openclaw_worktree,
+};
 use crate::runtime::RuntimeService;
 use crate::store::{
     EnvironmentOperationLock, clone_environment, clone_environment_for_simulation,
-    create_environment_with_validated_runtime, export_environment, get_environment,
-    get_runtime_verified, import_environment, list_environments, lock_environment_operation,
-    now_utc, remove_environment, resolve_config_gateway_port, resolve_effective_gateway_ports,
-    resolve_env_gateway_port, save_environment, set_environment_service_policy,
+    create_environment_with_dev_registration, create_environment_with_validated_runtime,
+    export_environment, get_environment, get_runtime_verified, import_environment,
+    list_environments, lock_environment_operation, now_utc, remove_environment_locked,
+    resolve_config_gateway_port, resolve_effective_gateway_ports, resolve_env_gateway_port,
+    save_environment, set_environment_service_policy, with_prepared_dev_source,
 };
 use crate::supervisor::{sync_supervisor_env_if_present, sync_supervisor_if_present};
 
@@ -33,6 +36,14 @@ fn is_false(value: &bool) -> bool {
 pub struct EnvDevMeta {
     pub repo_root: String,
     pub worktree_root: String,
+}
+
+impl EnvDevMeta {
+    pub(crate) fn execution_source_root(&self) -> Result<&Path, String> {
+        let source_root = Path::new(&self.worktree_root);
+        validate_openclaw_worktree(Path::new(&self.repo_root), source_root)?;
+        Ok(source_root)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -238,6 +249,22 @@ impl<'a> EnvironmentService<'a> {
         Ok(meta)
     }
 
+    pub(crate) fn create_dev(
+        &self,
+        repo: &Path,
+        mut options: CreateEnvironmentOptions,
+    ) -> Result<EnvMeta, String> {
+        let name = options.name.clone();
+        let meta =
+            with_prepared_dev_source(repo, &name, self.env, self.cwd, |dev, registration| {
+                options.dev = Some(dev);
+                create_environment_with_dev_registration(options, registration, self.env, self.cwd)
+            })?;
+        // A sync error must preserve source whose binding was already published.
+        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
+        Ok(meta)
+    }
+
     pub fn clone(&self, options: CloneEnvironmentOptions) -> Result<EnvMeta, String> {
         let meta = clone_environment(options, self.env, self.cwd)?;
         sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
@@ -367,22 +394,32 @@ impl<'a> EnvironmentService<'a> {
     }
 
     pub(crate) fn remove_locked(&self, name: &str, force: bool) -> Result<EnvMeta, String> {
-        let meta = remove_environment(name, force, self.env, self.cwd)?;
+        self.remove_with_cleanup_locked(name, force, |_| Ok(()))
+    }
+
+    pub(crate) fn remove_with_cleanup_locked(
+        &self,
+        name: &str,
+        force: bool,
+        before_remove: impl FnOnce(&EnvMeta) -> Result<(), String>,
+    ) -> Result<EnvMeta, String> {
+        let meta = remove_environment_locked(name, force, self.env, self.cwd, before_remove)?;
         sync_supervisor_env_if_present(self.env, self.cwd, name)?;
         Ok(meta)
     }
 
     pub(crate) fn remove_simulation(&self, name: &str) -> Result<EnvMeta, String> {
         let _lock = self.lock_operation(name)?;
-        let meta = get_environment(name, self.env, self.cwd)?;
-        if let Some(dev) = meta.dev.as_ref() {
-            prepare_openclaw_simulation_worktree_cleanup(
-                Path::new(&dev.repo_root),
-                Path::new(&dev.worktree_root),
-                &meta.name,
-            )?;
-        }
-        self.remove_locked(name, true)
+        self.remove_with_cleanup_locked(name, true, |meta| {
+            if let Some(dev) = meta.dev.as_ref() {
+                prepare_openclaw_simulation_worktree_cleanup(
+                    Path::new(&dev.repo_root),
+                    Path::new(&dev.worktree_root),
+                    &meta.name,
+                )?;
+            }
+            Ok(())
+        })
     }
 
     pub fn prune_candidates(&self, older_than_days: i64) -> Result<Vec<EnvMeta>, String> {

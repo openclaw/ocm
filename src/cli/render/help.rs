@@ -242,13 +242,19 @@ pub fn logs_help(cmd: &str) -> String {
 pub fn dev_help(cmd: &str) -> String {
     render_group(
         "Development envs",
-        "Provision OpenClaw dev envs from a checkout worktree, bootstrap the minimum local config, and run the gateway in the foreground with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. If OCM cannot infer the repo on the first run, it asks once and reuses that repo for later dev envs.",
+        "Provision OpenClaw dev envs from a checkout worktree, bootstrap the minimum local config, and run the gateway in the foreground with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. Background service installation, start, and restart are refused while source watch is active. New foreground sessions and service preparation require a compatible running daemon with verified process ownership; wait for startup or run service refresh-daemon --acknowledge-gateway-restarts from the updated OCM installation during a maintenance window. Confirmed stopped or unloaded daemons do not require refresh. New envs use the explicit --repo checkout or the checkout enclosing the current directory. Outside a checkout, pass --repo; neighboring and remembered repositories are not selected. Existing dev envs use their recorded source. Repeating a matching plain or --watch invocation returns the existing session status and link without setup or restart. Starting and restoring sessions report progress; they are not reported as ready. Stop the session before onboarding or changing --watch, source, root, or port. Reuse keeps the captured launch endpoint; an older watch without endpoint metadata must be stopped from its original terminal first.",
         vec![format!(
             "{cmd} dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch] [--force] [--service] [--onboard]"
         )],
         &[(
             "Commands",
-            &[("status", "Show one dev env or all dev envs")],
+            &[
+                ("status", "Show dev envs and active foreground sessions"),
+                (
+                    "stop",
+                    "Stop owned dev processes, including service preparation, and restore any taken-over service",
+                ),
+            ],
         )],
         vec![
             format!("{cmd} dev shaks"),
@@ -260,16 +266,50 @@ pub fn dev_help(cmd: &str) -> String {
             format!("{cmd} dev shaks --onboard"),
             format!("{cmd} dev status"),
             format!("{cmd} dev status shaks --json"),
+            format!("{cmd} dev stop shaks"),
         ],
-        vec![format!("{cmd} help dev status")],
+        vec![
+            format!("{cmd} help dev status"),
+            format!("{cmd} help dev stop"),
+            format!("{cmd} help service refresh-daemon"),
+        ],
     )
 }
 
 pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
     match action {
+        "stop" => Some(render_leaf(
+            "Stop foreground dev session",
+            "Ask the recorded dev controller to stop its setup or gateway processes, including --service preparation. Preserve the env, source checkout, dependencies, and configuration; report unverified completion without discarding ownership.",
+            vec![format!("{cmd} dev stop <env> [--raw] [--json]")],
+            &[
+                (
+                    "<env>",
+                    "Environment whose foreground dev session should stop",
+                ),
+                ("--raw", "Print plain output"),
+                (
+                    "--json",
+                    "Print JSON with envName, stopped, and serviceRestored",
+                ),
+            ],
+            vec![
+                format!("{cmd} dev stop shaks"),
+                format!("{cmd} dev stop shaks --json"),
+            ],
+            &[
+                "Waits for the owned source processes to stop before restoring a background service taken over by --watch --force.",
+                "Stops plain and watched foreground dev sessions, including setup. Also cancels --service preparation while preserving an already-running managed Gateway; explicit service stop or uninstall still takes effect.",
+                "For new Unix foreground generations, a lost controller, raw termination signal, or incomplete output retains unfinished ownership even if the recorded process group stops. Stop/reuse/service-start/destroy cannot erase that uncertainty. Released legacy records keep their recovery rules.",
+                "Ordinary acknowledged errors remain retryable after output completes. Onboarding keeps real terminal output; cancellation or failure without observed output retains ownership, while successful onboarding remains supported.",
+                "During Unix foreground preparation, pnpm lifecycle reports distinguish completed install errors from interrupted or unfinished build scripts; uncertain script cleanup retains ownership even if pnpm returns an ordinary error or succeeds after an optional build. Installer stdin stays interactive when run from a terminal; human output is streamed.",
+                "On Windows, recovery cannot verify a controller crash before child ownership is published; that unfinished session is retained for operator recovery.",
+                "After updating OCM, refresh an older running daemon from that installation with service refresh-daemon --acknowledge-gateway-restarts so it understands the current foreground ownership and completion records.",
+            ],
+        )),
         "status" => Some(render_leaf(
             "Show dev env status",
-            "List dev envs or inspect one dev env, including the repo checkout, worktree path, and effective gateway port.",
+            "Inspect foreground dev ownership, source paths, gateway ports, and observed service state for one env or all dev sessions.",
             vec![format!("{cmd} dev status [env] [--raw] [--json]")],
             &[
                 ("[env]", "Optional env name"),
@@ -282,7 +322,10 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} dev status shaks --json"),
             ],
             &[
-                "Only envs created through `ocm dev` appear here.",
+                "Includes dev envs and runtime or launcher envs with an active or starting source watch.",
+                "Session state distinguishes active, starting, restoring, inactive, and unknown ownership. sourceWatch.watching reports actual backend watching separately; active ownership does not establish gateway readiness.",
+                "Service running reflects the live daemon runtime; service desired running records the saved policy.",
+                "Gateway port reachability is a bounded loopback TCP check, not proof of Gateway identity or readiness.",
                 "Use `ocm dev <env>` to create or reuse a dev env and start its gateway.",
             ],
         )),
@@ -605,6 +648,7 @@ pub fn upgrade_help(cmd: &str) -> String {
         &[
             "Simulations clone the source env, leave the real env untouched, and clean temporary envs and runtimes by default.",
             "Upgrade history lists completed transaction records newest first without reading config contents or credentials.",
+            "Request shutdown of recorded ownership with dev stop <env> before upgrading or rolling back. Older watches without an unfinished ownership record require their original dev terminal; unreadable or unverified ownership requires verified operator recovery before mutation.",
             "Upgrade rollback restores the latest completed transition by default; use --transaction to select a specific unconsumed transaction.",
             "Rollback refuses before mutation when the current binding, OpenClaw version, service policy, source binding, snapshot, or retained runtime recovery no longer matches the selected transaction.",
             "Rollback creates a pre-rollback safety snapshot and linked history transaction. Rolling back that linked transaction safely reverses the rollback.",
@@ -656,6 +700,7 @@ pub fn upgrade_rollback_help(cmd: &str) -> String {
         &[
             "Without --transaction, OCM selects the newest completed upgrade or rollback transition that has not already been reversed.",
             "Preflight requires the current binding, OpenClaw version, and service policy to match the selected transaction target.",
+            "Live rollback requires a completed source-watch session. Request shutdown of recorded ownership with dev stop. Older watches without an unfinished ownership record require their original dev terminal; unreadable or unverified ownership requires verified operator recovery.",
             "The recorded pre-upgrade snapshot and source runtime or launcher must still be available. Same-name runtime updates also require healthy retained runtime recovery.",
             "Rollback creates a pre-rollback safety snapshot and linked history transaction before stopping a managed service or replacing runtime bytes.",
             "If restore or verification fails, OCM restores the pre-rollback runtime and environment state.",
@@ -1149,6 +1194,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Environments are the main isolation unit in OCM.",
+                "The root must not overlap an existing registered dev worktree, including source and destination path aliases.",
                 "Computed gateway ports reserve the full local OpenClaw port family and skip the machine-wide OpenClaw config when present.",
                 "Use exactly one of `--runtime`, `--version`, or `--channel`.",
             ],
@@ -1177,6 +1223,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             vec![format!("{cmd} env clone mira rowan")],
             &[
                 "Clone resets environment identity while preserving the copied workspace and env config.",
+                "The destination root must not overlap an existing registered dev worktree, including source and destination path aliases.",
                 "Clone assigns a fresh gateway port to the new env to avoid collisions.",
                 "Computed gateway ports reserve the full local OpenClaw port family and skip the machine-wide OpenClaw config when present.",
                 "Clone rewrites env-scoped OpenClaw config paths inside the copied env root.",
@@ -1229,6 +1276,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             )],
             &[
                 "Imported environments get a fresh identity in the central env registry.",
+                "The destination root must not overlap an existing registered dev worktree, including source and destination path aliases.",
                 "Import rewrites env-scoped OpenClaw config paths for the new root.",
                 "Import removes a copied public MCP app sandbox origin unless --sandbox-origin supplies a dedicated origin for the imported env.",
                 "If the config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin is owned by $include, flatten that section before importing so OCM can reset the origin without changing include ownership.",
@@ -1351,7 +1399,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "`--` is required before the command to execute.",
-                "When source watch is active for this env, commands inherit source checkout variables; literal `openclaw` runs through the watched checkout's built openclaw.mjs.",
+                "When a foreground dev session is active for this env, commands inherit source checkout variables; literal `openclaw` runs through the watched checkout's built openclaw.mjs.",
             ],
         ),
         "resolve" => render_leaf(
@@ -1383,7 +1431,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             &[
                 "TTY output uses grouped cards by default. Piped output stays plain.",
                 "Arguments after `--` are treated as OpenClaw arguments.",
-                "An active source watch for the env takes precedence unless --runtime or --launcher is passed.",
+                "An active foreground dev session for the env takes precedence unless --runtime or --launcher is passed.",
             ],
         ),
         "run" => render_leaf(
@@ -1411,7 +1459,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "`--` is required before OpenClaw arguments.",
-                "When source watch is active for this env, OCM runs node <checkout>/openclaw.mjs directly instead of rebuilding through the package script.",
+                "When a foreground dev session is active for this env, OCM runs node <checkout>/openclaw.mjs directly instead of rebuilding through the package script.",
                 "If an environment is active, you can also use the root-level `--` shortcut.",
                 "For one-shot explicit env runs, use the root-level `@<env>` shortcut.",
             ],
@@ -1530,7 +1578,10 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Destroy removes env snapshots for that env and uninstalls its OCM-managed service when present.",
+                "An ordinary --yes apply first stops and verifies the recorded source-watch generation. Unverifiable ownership blocks removal.",
+                "Guarded --if-state-token apply requires a stopped watch: run dev stop, then request a fresh destroy preview.",
                 "Destroy does not remove shared runtimes or launchers.",
+                "Other registered dev sources and their required Git metadata block containing cleanup, even with --force.",
                 "If the separate machine-wide OpenClaw service is using the env, destroy refuses to apply.",
                 "TTY output uses cards by default. Piped output stays plain.",
             ],
@@ -1553,7 +1604,11 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} env remove mira"),
                 format!("{cmd} env remove mira --force"),
             ],
-            &["Protected environments require `--force`."],
+            &[
+                "Protected environments require `--force`.",
+                "Cleanup preserves other registered dev sources and their required Git metadata.",
+                "Active or unfinished source watches must be stopped with dev stop before remove or prune can delete their state.",
+            ],
         ),
         "prune" => render_leaf(
             "Prune old environments",
@@ -1577,7 +1632,10 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} env prune"),
                 format!("{cmd} env prune --older-than 30 --yes"),
             ],
-            &[],
+            &[
+                "Active or unfinished source watches block removal; run dev stop for those envs first.",
+                "Cleanup preserves other registered dev sources and their required Git metadata.",
+            ],
         ),
         "snapshot" => env_snapshot_help(cmd),
         _ => return None,
@@ -1761,6 +1819,8 @@ pub fn env_snapshot_command_help(cmd: &str, action: &str) -> Option<String> {
             )],
             &[
                 "Restore uses an exclusive same-filesystem namespace and retains the displaced root through service acceptance.",
+                "Restore requires a completed source-watch session. Request shutdown of recorded ownership with dev stop. Older watches without an unfinished ownership record require their original dev terminal; unreadable or unverified ownership requires verified operator recovery.",
+                "Manual restore keeps a dev environment's current source binding and runtime/launcher binding. Upgrade rollback retains its dev identity while restoring the recorded runtime/launcher.",
             ],
         ),
         "remove" => render_leaf(

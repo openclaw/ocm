@@ -25,9 +25,9 @@ use sha2::{Digest, Sha512};
 use tar::{Builder, Header};
 
 use crate::support::{
-    TestDir, TestHttpServer, install_fake_launchctl, install_fake_node_and_npm, ocm_env,
-    path_string, run_ocm, stderr, stdout, write_executable_script, write_json_replacing_path,
-    write_text,
+    TestDir, TestHttpServer, hold_environment_operation, install_fake_launchctl,
+    install_fake_node_and_npm, ocm_env, path_string, run_ocm, stderr, stdout,
+    write_executable_script, write_json_replacing_path, write_text,
 };
 
 fn append_tar_file(
@@ -81,6 +81,7 @@ fn write_running_supervisor_runtime(
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -117,6 +118,7 @@ fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: Vec::new(),
         children: Vec::new(),
@@ -135,6 +137,7 @@ fn write_backoff_supervisor_runtime(
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -3228,6 +3231,128 @@ fn upgrade_simulate_reports_local_repo_doctor_failures() {
 
 #[cfg(unix)]
 #[test]
+fn upgrade_simulate_cleanup_preserves_registered_dev_source() {
+    for nested in [true, false] {
+        let root = TestDir::new(&format!("upgrade-simulate-registered-source-{nested}"));
+        let cwd = root.path();
+        let repo = init_openclaw_repo(&root);
+        let mut env = ocm_env(&root);
+        install_fake_node_and_npm(&root, &mut env, "22.22.3");
+        install_fake_simulation_pnpm(&root, &mut env);
+        env.insert("OCM_TEST_SIMULATION_DOCTOR_OK".to_string(), "1".to_string());
+        let protected_source = if nested {
+            env.insert("OCM_TEST_SOURCE_REPO".to_string(), path_string(&repo));
+            env.insert(
+                "OCM_TEST_SOURCE_CLI".to_string(),
+                path_string(&support::ocm_test_binary_path()),
+            );
+            env.insert(
+                "OCM_TEST_SOURCE_LOG".to_string(),
+                path_string(&root.child("child.log")),
+            );
+            let pnpm = root.child("fake-sim-bin/pnpm");
+            let original = fs::read_to_string(&pnpm).unwrap();
+            write_executable_script(
+                &pnpm,
+                &format!(
+                    r#"#!/bin/sh
+if [ "$1" = build ]; then
+  mkdir -p .artifacts
+  git clone --quiet --no-local "$OCM_TEST_SOURCE_REPO" .artifacts/project || exit 1
+  "$OCM_TEST_SOURCE_CLI" dev dependency --repo "$PWD/.artifacts/project" > "$OCM_TEST_SOURCE_LOG" 2>&1 || exit 1
+fi
+{}"#,
+                    original
+                ),
+            );
+            None
+        } else {
+            let created = run_ocm(
+                cwd,
+                &env,
+                &support::dev_plain(&["dependency", "--repo", &path_string(&repo)]),
+            );
+            assert!(created.status.success(), "{}", stderr(&created));
+            let peer = ocm::store::get_environment("dependency", &env, cwd).unwrap();
+            let source = PathBuf::from(peer.dev.unwrap().worktree_root);
+            fs::create_dir_all(source.join("dist")).unwrap();
+            fs::write(source.join("dist/sentinel"), "retained peer output\n").unwrap();
+            Some(source)
+        };
+        let started = run_ocm(
+            cwd,
+            &env,
+            &[
+                "start",
+                "demo",
+                "--command",
+                "pnpm openclaw",
+                "--cwd",
+                &path_string(&repo),
+                "--no-service",
+            ],
+        );
+        assert!(started.status.success(), "{}", stderr(&started));
+        if let Some(source) = &protected_source {
+            env.insert("GIT_DIR".to_string(), path_string(&repo.join(".git")));
+            env.insert(
+                "GIT_COMMON_DIR".to_string(),
+                path_string(&repo.join(".git")),
+            );
+            env.insert("GIT_WORK_TREE".to_string(), path_string(source));
+            env.insert(
+                "GIT_INDEX_FILE".to_string(),
+                path_string(&repo.join(".git/index")),
+            );
+        }
+        let simulated = run_ocm(
+            cwd,
+            &env,
+            &[
+                "upgrade",
+                "simulate",
+                "demo",
+                "--to",
+                &path_string(&repo),
+                "--json",
+            ],
+        );
+        let result: Value = serde_json::from_str(&stdout(&simulated)).unwrap();
+        assert_eq!(result["outcome"], "passed", "{result:#}");
+        let simulation_name = result["simulationEnv"].as_str().unwrap();
+        if let Some(source) = protected_source {
+            assert!(simulated.status.success(), "{result:#}");
+            assert_eq!(result["cleanup"], "cleaned", "{result:#}");
+            assert_eq!(
+                fs::read_to_string(source.join("dist/sentinel")).unwrap(),
+                "retained peer output\n"
+            );
+            assert!(!repo.join(".worktrees").join(simulation_name).exists());
+            assert!(ocm::store::get_environment(simulation_name, &env, cwd).is_err());
+        } else {
+            assert_eq!(result["cleanup"], "failed", "{result:#}");
+            assert!(
+                stdout(&simulated).contains("registered dev source"),
+                "{result:#}"
+            );
+            let child = ocm::store::get_environment("dependency", &env, cwd).unwrap();
+            assert!(
+                Path::new(&child.dev.unwrap().worktree_root)
+                    .join("package.json")
+                    .is_file()
+            );
+            let simulation = ocm::store::get_environment(simulation_name, &env, cwd).unwrap();
+            assert!(
+                Path::new(&simulation.dev.unwrap().worktree_root)
+                    .join(".artifacts/build.json")
+                    .is_file()
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
     let root = TestDir::new("upgrade-simulate-cleanup-outcome");
     let cwd = root.child("workspace");
@@ -3237,6 +3362,13 @@ fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
     let mut env = ocm_env(&root);
     install_fake_node_and_npm(&root, &mut env, "22.22.3");
     install_fake_simulation_pnpm(&root, &mut env);
+
+    let parent = run_ocm(&cwd, &env, &["env", "create", "parent"]);
+    assert!(parent.status.success(), "{}", stderr(&parent));
+    let parent = ocm::store::get_environment("parent", &env, &cwd).unwrap();
+    let source = Path::new(&parent.root).join(".openclaw/workspace/openclaw");
+    fs::rename(repo, &source).unwrap();
+    let repo = source;
 
     let start = run_ocm(
         &cwd,
@@ -3252,6 +3384,28 @@ fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
         ],
     );
     assert!(start.status.success(), "{}", stderr(&start));
+
+    let lock = hold_environment_operation(&root, "parent");
+    let blocked = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "simulate",
+            "demo",
+            "--to",
+            &path_string(&repo),
+            "--raw",
+        ],
+    );
+    assert!(!blocked.status.success());
+    assert!(
+        stdout(&blocked).contains("environment parent has an operation in progress"),
+        "{}",
+        stdout(&blocked)
+    );
+    assert!(!repo.join(".worktrees").exists());
+    drop(lock);
 
     env.insert("OCM_TEST_SIMULATION_DOCTOR_OK".to_string(), "1".to_string());
     env.insert(
@@ -3853,6 +4007,24 @@ fn upgrade_rollback_refuses_a_broken_source_launcher_before_mutation() {
     assert!(history.status.success(), "{}", stderr(&history));
     let history_json: Value = serde_json::from_str(&stdout(&history)).unwrap();
     assert_eq!(history_json.as_array().unwrap().len(), 1);
+
+    fs::create_dir_all(&project_dir).unwrap();
+    let mut current = ocm::store::get_environment("hacking", &env, &cwd).unwrap();
+    current.dev = Some(ocm::env::EnvDevMeta {
+        repo_root: path_string(&project_dir),
+        worktree_root: path_string(&root.child("saved-worktree")),
+    });
+    let saved_dev = serde_json::to_value(&current.dev).unwrap();
+    ocm::store::save_environment(current, &env, &cwd).unwrap();
+    let rollback = run_ocm(&cwd, &env, &["upgrade", "rollback", "hacking", "--json"]);
+    assert!(rollback.status.success(), "{}", stderr(&rollback));
+    let restored = ocm::store::get_environment("hacking", &env, &cwd).unwrap();
+    assert!(restored.default_runtime.is_none());
+    assert_eq!(restored.default_launcher.as_deref(), Some("hacking.local"));
+    assert_eq!(serde_json::to_value(restored.dev).unwrap(), saved_dev);
+    let version = run_ocm(&cwd, &env, &["@hacking", "--", "--version"]);
+    assert!(version.status.success(), "{}", stderr(&version));
+    assert_eq!(stdout(&version).trim(), "2026.3.23");
 }
 
 #[test]
@@ -4391,6 +4563,14 @@ fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
     assert!(stdout(&upgrade).contains("outcome=switched"));
     fs::write(&marker, "after-upgrade").unwrap();
 
+    let mut current = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    current.dev = Some(ocm::env::EnvDevMeta {
+        repo_root: path_string(&root.child("saved-repo")),
+        worktree_root: path_string(&root.child("saved-worktree")),
+    });
+    let saved_dev = serde_json::to_value(&current.dev).unwrap();
+    ocm::store::save_environment(current, &env, &cwd).unwrap();
+
     let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(history.status.success(), "{}", stderr(&history));
     let history_json: Value = serde_json::from_str(&stdout(&history)).unwrap();
@@ -4435,6 +4615,10 @@ fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
     let version = run_ocm(&cwd, &env, &["@demo", "--", "--version"]);
     assert!(version.status.success(), "{}", stderr(&version));
     assert_eq!(stdout(&version).trim(), "2026.6.11");
+    assert_eq!(
+        serde_json::to_value(ocm::store::get_environment("demo", &env, &cwd).unwrap().dev).unwrap(),
+        saved_dev
+    );
 
     let rollback_history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(
@@ -4458,6 +4642,10 @@ fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
     let version = run_ocm(&cwd, &env, &["@demo", "--", "--version"]);
     assert!(version.status.success(), "{}", stderr(&version));
     assert_eq!(stdout(&version).trim(), "2026.6.33");
+    assert_eq!(
+        serde_json::to_value(ocm::store::get_environment("demo", &env, &cwd).unwrap().dev).unwrap(),
+        saved_dev
+    );
 
     let final_history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(final_history.status.success(), "{}", stderr(&final_history));
@@ -4467,6 +4655,118 @@ fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
         final_history_json[0]["rollbackOf"],
         rollback_json["rollbackTransactionId"]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_refuses_a_live_watch_before_state_or_runtime_mutation() {
+    use fs2::FileExt;
+
+    fn inventory(path: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut entries = BTreeMap::new();
+        if path.is_dir() {
+            entries.insert(path.to_path_buf(), None);
+            for entry in fs::read_dir(path).unwrap() {
+                entries.extend(inventory(&entry.unwrap().path()));
+            }
+        } else if path.exists() {
+            entries.insert(path.to_path_buf(), Some(fs::read(path).unwrap()));
+        }
+        entries
+    }
+
+    let root = TestDir::new("upgrade-live-watch-refusal");
+    let mut fixture = seed_in_place_rollback(&root, "2026.6.11");
+    let next = root.child("next-openclaw");
+    write_executable_script(&next, &recording_openclaw_script("2026.6.44"));
+    let added = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["runtime", "add", "next", "--path", &path_string(&next)],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let sibling = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["env", "create", "sibling", "--runtime", "next"],
+    );
+    assert!(sibling.status.success(), "{}", stderr(&sibling));
+    let command_log = root.child("refused-commands.log");
+    fixture.env.insert(
+        "OCM_TEST_COMMAND_LOG".to_string(),
+        path_string(&command_log),
+    );
+    let home = PathBuf::from(fixture.env.get("OCM_HOME").unwrap());
+    write_text(
+        &home.join("envs/demo/.openclaw/openclaw.json"),
+        "{\"gateway\":{\"port\":19001}}\n",
+    );
+    let checkout = root.child("watched-source");
+    fs::create_dir_all(checkout.join("extensions")).unwrap();
+    write_text(
+        &checkout.join("openclaw.mjs"),
+        "console.log('2026.6.33');\n",
+    );
+    let watch = ocm::store::source_watch_override_path("demo", &fixture.env, &fixture.cwd).unwrap();
+    fs::create_dir_all(watch.parent().unwrap()).unwrap();
+    let mut lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(watch.with_extension("lock"))
+        .unwrap();
+    lease.lock_exclusive().unwrap();
+    writeln!(lease, "upgrade-refusal").unwrap();
+    let watch_bytes = serde_json::to_vec(&serde_json::json!({
+        "kind": "ocm-source-watch-override", "envName": "demo", "repoRoot": checkout,
+        "watchPid": std::process::id(), "token": "lease:upgrade-refusal:fixture",
+        "startedAt": "2026-06-17T00:00:00Z"
+    }))
+    .unwrap();
+    fs::write(&watch, &watch_bytes).unwrap();
+    let registry_path = env_registry_path(&fixture.env, &fixture.cwd).unwrap();
+    let registry_before = fs::read(&registry_path).unwrap();
+    let next_before = fs::read(&next).unwrap();
+    let owned_paths = [
+        "envs",
+        "runtimes",
+        "snapshots",
+        "upgrade-history",
+        "upgrade-batches",
+    ];
+    let before = owned_paths.map(|path| inventory(&home.join(path)));
+    for args in [
+        vec!["upgrade", "demo", "--runtime", "next"],
+        vec!["upgrade", "rollback", "demo"],
+        vec![
+            "upgrade",
+            "batch",
+            "--envs",
+            "demo,sibling",
+            "--runtime",
+            "next",
+            "--accept-fleet-outage",
+        ],
+    ] {
+        let refused = run_ocm(&fixture.cwd, &fixture.env, &args);
+        assert!(!refused.status.success(), "accepted {args:?}");
+        assert!(
+            stderr(&refused).contains("dev session is active")
+                && stderr(&refused).contains("original dev terminal"),
+            "{args:?}: {}",
+            stderr(&refused)
+        );
+        assert!(!stderr(&refused).contains("dev stop"));
+        assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+        assert_eq!(fs::read(&next).unwrap(), next_before);
+        assert_eq!(
+            owned_paths.map(|path| inventory(&home.join(path))),
+            before,
+            "mutated state for {args:?}"
+        );
+        assert_eq!(fs::read(&watch).unwrap(), watch_bytes);
+        assert!(!command_log.exists(), "invoked OpenClaw for {args:?}");
+    }
 }
 
 #[test]
@@ -5599,6 +5899,14 @@ fn upgrade_rolls_back_runtime_binding_when_update_finalization_fails() {
     fs::create_dir_all(secondary_skill.parent().unwrap()).unwrap();
     fs::write(&secondary_skill, "skill before upgrade\n").unwrap();
 
+    let mut current = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    current.dev = Some(ocm::env::EnvDevMeta {
+        repo_root: path_string(&root.child("saved-repo")),
+        worktree_root: path_string(&root.child("saved-worktree")),
+    });
+    let saved_dev = serde_json::to_value(&current.dev).unwrap();
+    ocm::store::save_environment(current, &env, &cwd).unwrap();
+
     env.insert("OCM_TEST_FAIL_UPDATE_FINALIZE".to_string(), "1".to_string());
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new-local"]);
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
@@ -5614,6 +5922,10 @@ fn upgrade_rolls_back_runtime_binding_when_update_finalization_fails() {
     assert!(show.status.success(), "{}", stderr(&show));
     let env_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
     assert_eq!(env_json["defaultRuntime"], "old-local");
+    assert_eq!(
+        serde_json::to_value(ocm::store::get_environment("demo", &env, &cwd).unwrap().dev).unwrap(),
+        saved_dev
+    );
     assert_eq!(
         fs::read_to_string(secondary_skill).unwrap(),
         "skill before upgrade\n"

@@ -6,6 +6,7 @@ mod inspect;
 mod lifecycle;
 mod snapshots;
 mod source_watch;
+mod source_watch_session;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -30,8 +31,11 @@ pub use snapshots::{
     EnvSnapshotSummary, RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions,
     UpgradeCheckpointScope, select_snapshot_prune_candidates,
 };
-pub use source_watch::SourceWatchOverride;
-pub(crate) use source_watch::{CreateSourceWatchOverrideOptions, SourceWatchLease};
+pub(crate) use source_watch::{
+    CreateSourceWatchOverrideOptions, SourceWatchLease, SourceWatchMode, SourceWatchState,
+};
+pub use source_watch::{SourceWatchEndpoint, SourceWatchOverride};
+pub(crate) use source_watch_session::{SourceWatchCompletion, SourceWatchSession};
 
 pub struct EnvironmentService<'a> {
     env: &'a BTreeMap<String, String>,

@@ -175,6 +175,7 @@ pub fn resolve_gateway_process_spec(
                     env_meta.name
                 )
             })?;
+            let source_root = dev.execution_source_root()?;
             let mut args = vec!["openclaw".to_string()];
             args.extend(gateway_args);
             Ok(GatewayProcessSpec {
@@ -187,12 +188,8 @@ pub fn resolve_gateway_process_spec(
                 runtime_release_version: None,
                 runtime_release_channel: None,
                 args,
-                run_dir: PathBuf::from(&dev.worktree_root),
-                process_env: build_openclaw_dev_source_env(
-                    env_meta,
-                    process_env,
-                    Path::new(&dev.worktree_root),
-                ),
+                run_dir: source_root.to_path_buf(),
+                process_env: build_openclaw_dev_source_env(env_meta, process_env, source_root),
             })
         }
     }
@@ -312,8 +309,7 @@ impl<'a> EnvironmentService<'a> {
         launcher_override: Option<String>,
         args: &[String],
     ) -> Result<ResolvedExecution, String> {
-        let env = self.apply_effective_gateway_port(self.get(name)?)?;
-        self.resolve_execution(env, runtime_override, launcher_override, args)
+        self.resolve_execution(self.get(name)?, runtime_override, launcher_override, args)
     }
 
     pub fn resolve_run(
@@ -323,8 +319,7 @@ impl<'a> EnvironmentService<'a> {
         launcher_override: Option<String>,
         args: &[String],
     ) -> Result<ResolvedExecution, String> {
-        let env = self.apply_effective_gateway_port(self.touch(name)?)?;
-        self.resolve_execution(env, runtime_override, launcher_override, args)
+        self.resolve_execution(self.touch(name)?, runtime_override, launcher_override, args)
     }
 
     pub fn resolve_gateway_process(
@@ -332,11 +327,34 @@ impl<'a> EnvironmentService<'a> {
         name: &str,
         bootstrap_managed_node: bool,
     ) -> Result<GatewayProcessSpec, String> {
-        let env = self.apply_effective_gateway_port(self.get(name)?)?;
+        let env = self.get(name)?;
         if let Some(source) = self.active_source_watch_override(&env.name)? {
+            let env = self.source_watch_environment(env, &source)?;
             return source_watch_gateway_process_spec(&env, self.env, source);
         }
+        let env = self.apply_effective_gateway_port(env)?;
         resolve_gateway_process_spec(&env, self.env, self.cwd, bootstrap_managed_node)
+    }
+
+    pub(crate) fn source_watch_environment(
+        &self,
+        mut env: EnvMeta,
+        source: &SourceWatchOverride,
+    ) -> Result<EnvMeta, String> {
+        if let Some(dev) = &env.dev {
+            dev.execution_source_root()?;
+        }
+        let Some(endpoint) = &source.endpoint else {
+            return self.apply_effective_gateway_port(env);
+        };
+        if env.root != endpoint.env_root {
+            return Err(format!(
+                "source watch for env {} was launched with root {}; refusing to route commands through the changed env root",
+                env.name, endpoint.env_root
+            ));
+        }
+        env.gateway_port = Some(endpoint.gateway_port);
+        Ok(env)
     }
 
     fn resolve_execution(
@@ -364,6 +382,7 @@ impl<'a> EnvironmentService<'a> {
             && !has_launcher_override
             && let Some(source) = self.active_source_watch_override(&env.name)?
         {
+            let env = self.source_watch_environment(env, &source)?;
             let program_args = source_watch_openclaw_program_args(&source, &args);
             let run_dir = PathBuf::from(&source.repo_root);
             return Ok(ResolvedExecution::SourceWatch {
@@ -376,6 +395,7 @@ impl<'a> EnvironmentService<'a> {
             });
         }
 
+        let env = self.apply_effective_gateway_port(env)?;
         match resolve_execution_binding(&env, runtime_override, launcher_override)? {
             ExecutionBinding::Launcher(launcher_name) => {
                 let launcher = get_launcher(&launcher_name, self.env, self.cwd)?;
@@ -407,16 +427,17 @@ impl<'a> EnvironmentService<'a> {
                 let dev = env.dev.clone().ok_or_else(|| {
                     format!("environment \"{}\" is missing its dev binding", env.name)
                 })?;
+                let run_dir = dev.execution_source_root()?.to_path_buf();
                 let mut program_args = vec!["openclaw".to_string()];
                 program_args.extend(args.clone());
                 Ok(ResolvedExecution::Dev {
                     env,
                     repo_root: dev.repo_root,
-                    worktree_root: dev.worktree_root.clone(),
+                    worktree_root: dev.worktree_root,
                     forwarded_args: args,
                     program: "pnpm".to_string(),
                     program_args,
-                    run_dir: PathBuf::from(dev.worktree_root),
+                    run_dir,
                 })
             }
         }

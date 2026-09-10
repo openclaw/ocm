@@ -54,6 +54,12 @@ also need isolated state and must not disturb an operator's running services.
 Keep credentials, private configuration, and checkpoint data out of fixtures
 and public logs.
 
+macOS CI also runs the ignored `private_config_creation_excludes_other_users`
+case through passwordless `sudo` after compiling as the normal runner. Only that
+case uses privilege, to launch a reader as the existing `nobody` user against a
+temporary fixture. The CI command in `.github/workflows/ci.yml` selects the exact
+test; it does not run the rest of the suite or any environment service as root.
+
 For automatic-release script changes, the additional Python test command and
 its prerequisites are in [docs/AUTOMATIC_RELEASES.md](docs/AUTOMATIC_RELEASES.md).
 

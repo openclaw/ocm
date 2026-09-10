@@ -107,6 +107,7 @@ fn setup_gateway_aware_restart_fixture(
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: env.get("OCM_HOME").unwrap().clone(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -1245,6 +1246,7 @@ fn service_status_ignores_stale_runtime_children_when_the_daemon_is_down() {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: Vec::new(),
         children: vec![SupervisorRuntimeChild {
@@ -1292,6 +1294,7 @@ fn service_status_reports_clean_backoff_as_restarting_without_issue() {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -1340,6 +1343,7 @@ fn service_status_keeps_failed_backoff_as_issue() {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),

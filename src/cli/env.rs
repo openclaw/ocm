@@ -16,9 +16,12 @@ use super::{Cli, render};
 use crate::env::{
     CloneEnvironmentOptions, CreateEnvSnapshotOptions, CreateEnvironmentOptions, EnvMeta,
     EnvSnapshotSummary, EnvSummary, ExportEnvironmentOptions, ImportEnvironmentOptions,
-    RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions,
+    RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions, SourceWatchSession, SourceWatchState,
 };
 use crate::infra::process::{run_direct, run_shell};
+use crate::infra::process_identity::ProcessIdentity;
+#[cfg(unix)]
+use crate::infra::process_identity::process_start_id;
 use crate::infra::shell::{
     build_openclaw_dev_source_env, build_openclaw_env, render_use_script, resolve_shell_name,
 };
@@ -56,14 +59,7 @@ pub(crate) struct EnvDestroyStepSummary {
     pub description: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct EnvDestroyProcessIdentity {
-    // Parent, cwd, and argv can change or contain credentials. PID plus a
-    // normalized start time detects reuse without exposing mutable details.
-    pid: u32,
-    started_at: String,
-}
+pub(crate) type EnvDestroyProcessIdentity = ProcessIdentity;
 
 fn managed_gateway_lifecycle_action(args: &[String]) -> Option<&str> {
     let mut command = None;
@@ -140,7 +136,12 @@ pub(crate) struct EnvDestroySummary {
     pub service_loaded: bool,
     pub service_running: bool,
     pub service_label: String,
+    pub source_watch_pid: Option<u32>,
+    pub source_watch_stopped: bool,
+    #[serde(skip)]
+    pub(crate) source_watch_session: Option<SourceWatchSession>,
     pub process_count: usize,
+    pub process_inspection_deferred: bool,
     #[serde(skip)]
     pub(crate) process_candidates: Vec<EnvDestroyProcessIdentity>,
     pub state_token: String,
@@ -165,6 +166,7 @@ struct EnvDestroyState<'a> {
     service: &'a ServiceSummary,
     process_candidates: &'a [EnvDestroyProcessIdentity],
     snapshots: &'a [EnvSnapshotSummary],
+    source_watch: Option<&'a SourceWatchSession>,
 }
 
 fn should_clear_skip_bootstrap_for_openclaw_args(args: &[String]) -> bool {
@@ -268,7 +270,7 @@ impl Cli {
 
         // Service and binding mutations use the same per-env lock. Keep it
         // through validation and teardown so a successful guard cannot go stale.
-        let _operation_lock = self.environment_service().lock_operation(name)?;
+        let mut operation_lock = Some(self.environment_service().lock_operation(name)?);
         let mut summary = self.build_env_destroy_summary(name, true, force)?;
         if expected_state_token
             .as_deref()
@@ -304,6 +306,78 @@ impl Cli {
             return Ok(1);
         }
 
+        let env_before = self.environment_service().get(name)?;
+        if let Some(session) = summary.source_watch_session.clone() {
+            if expected_state_token.is_some() {
+                summary.code = Some("source_watch_active".to_string());
+                summary.blockers.push("guarded destruction requires a stopped source watch; run dev stop, then request a fresh destroy preview".to_string());
+                if json_flag {
+                    self.print_json(&summary)?;
+                } else {
+                    self.stdout_lines(render::env::env_destroy_preview(
+                        &summary,
+                        profile,
+                        &self.command_example(),
+                    ));
+                }
+                return Ok(1);
+            }
+            // The controller may need the operation lock to restore its service.
+            // Stop only the generation accepted by this apply, then revalidate.
+            drop(operation_lock.take());
+            self.stop_source_watch_generation(name, Some(&session.lease_id))?;
+            operation_lock = Some(self.environment_service().lock_operation(name)?);
+            let current = self.environment_service().get(name)?;
+            if env_destroy_binding_state(&env_before)? != env_destroy_binding_state(&current)? {
+                return Err("environment binding or protected state changed while stopping source watch; no state was removed, request a fresh destroy preview".to_string());
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let completed = self.environment_service().source_watch_session(name)?;
+                if !completed
+                    .as_ref()
+                    .is_some_and(|current| current.closed && current.lease_id == session.lease_id)
+                {
+                    return Err("source watch generation changed before removal; the replacement session and environment were preserved".to_string());
+                }
+                if self
+                    .environment_service()
+                    .ensure_source_watch_stopped(name)
+                    .is_ok()
+                {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("source watch still holds its session after stop; no environment state was removed".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            summary = self.build_env_destroy_summary(name, true, force)?;
+            summary.source_watch_stopped = true;
+            summary.steps.insert(
+                0,
+                EnvDestroyStepSummary {
+                    kind: "source-watch".to_string(),
+                    description:
+                        "stopped the recorded source watch and verified its processes exited"
+                            .to_string(),
+                },
+            );
+            if !summary.blockers.is_empty() {
+                if json_flag {
+                    self.print_json(&summary)?;
+                } else {
+                    self.stdout_lines(render::env::env_destroy_preview(
+                        &summary,
+                        profile,
+                        &self.command_example(),
+                    ));
+                }
+                return Ok(1);
+            }
+        }
+        self.environment_service()
+            .ensure_source_watch_stopped(name)?;
         let env_meta = self.environment_service().get(name)?;
 
         let snapshot_ids = self
@@ -318,49 +392,49 @@ impl Cli {
             summary.service_uninstalled = true;
         }
 
-        if expected_state_token.is_some() {
-            summary.processes_terminated =
-                match self.terminate_env_processes_exact(&summary.process_candidates) {
-                    Ok(count) => count,
-                    Err(error) => {
-                        summary.processes_terminated = error.terminated;
-                        summary.code = Some("partial_apply".to_string());
-                        summary.blockers.push(format!(
-                            "process teardown failed after environment teardown began: {}",
-                            error.message
-                        ));
-                        if json_flag {
-                            self.print_json(&summary)?;
-                        } else {
-                            self.stdout_lines(render::env::env_destroy_preview(
-                                &summary,
-                                profile,
-                                &self.command_example(),
+        let removal = self.environment_service().remove_with_cleanup_locked(name, force, |meta| {
+            if expected_state_token.is_some() {
+                summary.processes_terminated =
+                    match self.terminate_env_processes_exact(&summary.process_candidates) {
+                        Ok(count) => count,
+                        Err(error) => {
+                            summary.processes_terminated = error.terminated;
+                            summary.code = Some("partial_apply".to_string());
+                            summary.blockers.push(format!(
+                                "process teardown failed after environment teardown began: {}",
+                                error.message
                             ));
+                            return Err(error.message);
                         }
-                        return Ok(1);
-                    }
-                };
-        } else {
-            summary.processes_terminated = self.terminate_env_processes(&env_meta)?;
-        }
-        let process_change = if expected_state_token.is_some() {
-            match self.destroy_process_candidates(&env_meta) {
-                Ok(candidates) if candidates.is_empty() => None,
-                Ok(_) => Some(
-                    "environment process state changed after teardown began; preview again to finish cleanup"
-                        .to_string(),
-                ),
-                Err(error) => Some(format!(
-                    "process state could not be verified after teardown began: {error}"
-                )),
+                    };
+            } else {
+                summary.processes_terminated = self.terminate_env_processes(meta)?;
             }
-        } else {
-            None
-        };
-        if let Some(blocker) = process_change {
-            summary.code = Some("partial_apply".to_string());
-            summary.blockers.push(blocker);
+            let process_change = if expected_state_token.is_some() {
+                match self.destroy_process_candidates(meta) {
+                    Ok(candidates) if candidates.is_empty() => None,
+                    Ok(_) => Some(
+                        "environment process state changed after teardown began; preview again to finish cleanup"
+                            .to_string(),
+                    ),
+                    Err(error) => Some(format!(
+                        "process state could not be verified after teardown began: {error}"
+                    )),
+                }
+            } else {
+                None
+            };
+            if let Some(blocker) = process_change {
+                summary.code = Some("partial_apply".to_string());
+                summary.blockers.push(blocker.clone());
+                return Err(blocker);
+            }
+            Ok(())
+        });
+        if let Err(error) = removal {
+            if summary.code.as_deref() != Some("partial_apply") {
+                return Err(error);
+            }
             if json_flag {
                 self.print_json(&summary)?;
             } else {
@@ -373,7 +447,7 @@ impl Cli {
             return Ok(1);
         }
 
-        self.environment_service().remove_locked(name, force)?;
+        let _ = &operation_lock;
         summary.removed = true;
         summary.worktree_removed = env_meta
             .dev
@@ -915,6 +989,9 @@ impl Cli {
                 let selected_snapshot = self
                     .environment_service()
                     .get_snapshot(name, snapshot_id)?;
+                self.environment_service().ensure_source_watch_allows_state_mutation_locked(name)?;
+                self.environment_service()
+                    .ensure_snapshot_restore_preserves_dev_sources_locked(&selected_snapshot)?;
                 let service_state = self
                     .service_service()
                     .quiesce_for_snapshot_locked(name)?;
@@ -1165,21 +1242,66 @@ impl Cli {
         let mut snapshots = self.environment_service().list_snapshots(Some(name))?;
         snapshots.sort_by(|left, right| left.id.cmp(&right.id));
         let mut blockers = Vec::new();
-        let process_candidates = self.destroy_process_candidates(&env_meta)?;
-        let state_token =
-            env_destroy_state_token(&env_meta, &service, &process_candidates, &snapshots)?;
+        let source_blocked = if let Err(error) =
+            crate::store::with_locked_environments(&self.env, &self.cwd, |envs| {
+                crate::store::ensure_environment_removal_preserves_dev_sources(&env_meta, envs)
+            }) {
+            blockers.push(error);
+            true
+        } else {
+            false
+        };
+        let source_watch_session = self
+            .environment_service()
+            .source_watch_session(name)?
+            .filter(|session| !session.closed);
+        let source_watch_active = !matches!(
+            self.environment_service().observe_source_watch(name)?,
+            SourceWatchState::Inactive
+        );
+        if source_watch_session.is_none() && source_watch_active {
+            blockers.push("an active source watch has no usable stop ownership; stop it from its original terminal before destroying the env".to_string());
+        }
+        // The recorded controller owns a changing process tree. Stop it through
+        // its generation-bound protocol before taking the ordinary stable
+        // process snapshot; a token-guarded apply refuses unfinished sessions.
+        let process_inspection_deferred = source_watch_session.is_some() || source_watch_active;
+        let process_candidates = if process_inspection_deferred || source_blocked {
+            Vec::new()
+        } else {
+            self.destroy_process_candidates(&env_meta)?
+        };
+        let state_token = env_destroy_state_token(
+            &env_meta,
+            &service,
+            &process_candidates,
+            &snapshots,
+            source_watch_session.as_ref(),
+        )?;
 
         if env_meta.protected && !force {
             blockers.push("env is protected; re-run with --force to destroy it".to_string());
         }
         let mut steps = Vec::new();
+        if source_watch_session.is_some() {
+            steps.push(EnvDestroyStepSummary {
+                kind: "source-watch".to_string(),
+                description: "stop the recorded source watch and verify its processes exited"
+                    .to_string(),
+            });
+        }
         if service.installed || service.loaded || service.running {
             steps.push(EnvDestroyStepSummary {
                 kind: "service".to_string(),
                 description: "disable env gateway in the OCM background service".to_string(),
             });
         }
-        if !process_candidates.is_empty() {
+        if process_inspection_deferred {
+            steps.push(EnvDestroyStepSummary {
+                kind: "processes".to_string(),
+                description: "inspect remaining environment processes after source watch stops, then terminate those owned by the env".to_string(),
+            });
+        } else if !process_candidates.is_empty() {
             steps.push(EnvDestroyStepSummary {
                 kind: "processes".to_string(),
                 description: "terminate live OpenClaw processes for the env".to_string(),
@@ -1214,7 +1336,13 @@ impl Cli {
             service_loaded: service.loaded,
             service_running: service.running,
             service_label: "ocm".to_string(),
+            source_watch_pid: source_watch_session
+                .as_ref()
+                .map(|session| session.controller.pid),
+            source_watch_stopped: false,
+            source_watch_session,
             process_count: process_candidates.len(),
+            process_inspection_deferred,
             process_candidates,
             state_token,
             code: None,
@@ -1272,9 +1400,7 @@ impl Cli {
             return Err("env exec requires a command after --".to_string());
         }
 
-        let meta = self
-            .environment_service()
-            .apply_effective_gateway_port(self.environment_service().touch(name)?)?;
+        let meta = self.environment_service().touch(name)?;
         if meta.service_enabled
             && meta.service_running
             && after.first().is_some_and(|command| command == "openclaw")
@@ -1290,6 +1416,9 @@ impl Cli {
             .environment_service()
             .active_source_watch_override(&meta.name)?
         {
+            let meta = self
+                .environment_service()
+                .source_watch_environment(meta, &source)?;
             let source_env =
                 build_openclaw_dev_source_env(&meta, &self.env, Path::new(&source.repo_root));
             if after[0] == "openclaw" {
@@ -1304,6 +1433,9 @@ impl Cli {
             }
             return run_direct(&after[0], &after[1..], &source_env, &self.cwd);
         }
+        let meta = self
+            .environment_service()
+            .apply_effective_gateway_port(meta)?;
         run_direct(
             &after[0],
             &after[1..],
@@ -1383,16 +1515,15 @@ impl Cli {
             }
         }
 
-        if should_clear_skip_bootstrap_for_openclaw_args(&after) {
-            clear_skip_bootstrap_for_openclaw_onboarding(&derive_env_paths(Path::new(&meta.root)))?;
-        }
-
         let resolved = self.environment_service().resolve_run(
             name,
             runtime_override,
             launcher_override,
             &after,
         )?;
+        if should_clear_skip_bootstrap_for_openclaw_args(&after) {
+            clear_skip_bootstrap_for_openclaw_onboarding(&derive_env_paths(Path::new(&meta.root)))?;
+        }
         match resolved {
             crate::env::ResolvedExecution::Launcher {
                 env,
@@ -1620,11 +1751,23 @@ impl Cli {
     }
 }
 
+fn env_destroy_binding_state(meta: &EnvMeta) -> Result<serde_json::Value, String> {
+    let mut value = serde_json::to_value(meta).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "invalid environment metadata".to_string())?;
+    for key in ["serviceEnabled", "serviceRunning", "updatedAt"] {
+        object.remove(key);
+    }
+    Ok(value)
+}
+
 fn env_destroy_state_token(
     environment: &EnvMeta,
     service: &ServiceSummary,
     process_candidates: &[EnvDestroyProcessIdentity],
     snapshots: &[EnvSnapshotSummary],
+    source_watch: Option<&SourceWatchSession>,
 ) -> Result<String, String> {
     let state = EnvDestroyState {
         kind: "ocm-env-destroy-state-v1",
@@ -1632,6 +1775,7 @@ fn env_destroy_state_token(
         service,
         process_candidates,
         snapshots,
+        source_watch,
     };
     let encoded = serde_json::to_vec(&state)
         .map_err(|error| format!("failed to encode environment destroy state: {error}"))?;
@@ -1969,106 +2113,6 @@ fn current_process_identity(pid: u32) -> Result<Option<EnvDestroyProcessIdentity
         return Ok(None);
     }
     Ok(process_start_id(pid)?.map(|started_at| EnvDestroyProcessIdentity { pid, started_at }))
-}
-
-#[cfg(target_os = "linux")]
-fn process_start_id(pid: u32) -> Result<Option<String>, String> {
-    let path = format!("/proc/{pid}/stat");
-    let stat = match fs::read_to_string(&path) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "failed to inspect process start identity for pid {pid}: {error}"
-            ));
-        }
-    };
-    let Some(fields) = stat.rsplit_once(')').map(|(_, fields)| fields) else {
-        return Err(format!(
-            "failed to parse process start identity for pid {pid}"
-        ));
-    };
-    let Some(start_ticks) = fields.split_whitespace().nth(19) else {
-        return Err(format!(
-            "failed to parse process start identity for pid {pid}"
-        ));
-    };
-    Ok(Some(start_ticks.to_string()))
-}
-
-#[cfg(target_os = "macos")]
-fn process_start_id(pid: u32) -> Result<Option<String>, String> {
-    const PROC_PIDTBSDINFO: i32 = 3;
-    let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
-    let size = std::mem::size_of::<ProcBsdInfo>() as i32;
-    // SAFETY: `info` is a correctly sized C-compatible buffer for
-    // `PROC_PIDTBSDINFO`; the return size is checked before initialization.
-    let bytes = unsafe {
-        proc_pidinfo(
-            pid as i32,
-            PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if bytes == 0 && !process_alive(pid) {
-        return Ok(None);
-    }
-    if bytes != size {
-        return Err(format!(
-            "failed to inspect process start identity for pid {pid}"
-        ));
-    }
-    // SAFETY: `proc_pidinfo` filled the complete buffer above.
-    let info = unsafe { info.assume_init() };
-    if info.pbi_pid != pid {
-        return Ok(None);
-    }
-    Ok(Some(format!(
-        "{}:{:06}",
-        info.pbi_start_tvsec, info.pbi_start_tvusec
-    )))
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn process_start_id(pid: u32) -> Result<Option<String>, String> {
-    Err(format!(
-        "process start identity inspection is unsupported for pid {pid} on this platform"
-    ))
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct ProcBsdInfo {
-    pbi_flags: u32,
-    pbi_status: u32,
-    pbi_xstatus: u32,
-    pbi_pid: u32,
-    pbi_ppid: u32,
-    pbi_uid: u32,
-    pbi_gid: u32,
-    pbi_ruid: u32,
-    pbi_rgid: u32,
-    pbi_svuid: u32,
-    pbi_svgid: u32,
-    rfu_1: u32,
-    pbi_comm: [i8; 16],
-    pbi_name: [i8; 32],
-    pbi_nfiles: u32,
-    pbi_pgid: u32,
-    pbi_pjobc: u32,
-    e_tdev: u32,
-    e_tpgid: u32,
-    pbi_nice: i32,
-    pbi_start_tvsec: u64,
-    pbi_start_tvusec: u64,
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "proc")]
-unsafe extern "C" {
-    fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, size: i32) -> i32;
 }
 
 #[cfg(unix)]

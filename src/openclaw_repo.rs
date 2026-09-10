@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -9,6 +11,59 @@ use std::os::unix::ffi::OsStringExt;
 use serde_json::Value;
 
 use crate::store::{clean_path, display_path};
+
+const SOURCE_DEPENDENCY_PROBE: &str = r#"import fs from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+if (typeof import.meta.resolve !== "function") {
+  throw new Error("Use the Node version supported by the selected OpenClaw checkout.");
+}
+const requirements = JSON.parse(process.argv[2]);
+const localModules = path.join(process.cwd(), "node_modules");
+const configuredModules = process.argv[3];
+// Match OpenClaw's source loader without creating its startup node_modules link.
+const tsxModules = configuredModules && fs.existsSync(path.join(configuredModules, "tsx", "package.json"))
+  ? configuredModules : localModules;
+const runtimeModules = fs.existsSync(localModules) ? localModules : tsxModules;
+const issues = [];
+for (const [name, specifier] of requirements) {
+  const modules = name === "tsx" ? tsxModules : runtimeModules;
+  const manifest = path.join(modules, name, "package.json");
+  if (!fs.existsSync(manifest)) {
+    issues.push(`${name}: not installed in this checkout`);
+    continue;
+  }
+  try {
+    const metadata = JSON.parse(fs.readFileSync(manifest, "utf8"));
+    const require = createRequire(manifest);
+    let entry;
+    if (specifier === "tsx/esm") {
+      entry = require.resolve(specifier);
+    } else if (modules === localModules) {
+      entry = fileURLToPath(import.meta.resolve(specifier));
+    } else if (metadata.exports != null) {
+      entry = fileURLToPath(import.meta.resolve(specifier, pathToFileURL(manifest)));
+    } else {
+      // Node's legacy package-main resolver handles packages without exports.
+      entry = require.resolve(specifier === name ? "./" : `./${specifier.slice(name.length + 1)}`);
+    }
+    if (!fs.statSync(entry).isFile()) {
+      issues.push(`${specifier}: resolved entry is not a file`);
+    }
+    if (name === "tsdown") {
+      const bin = typeof metadata.bin === "string" ? metadata.bin : metadata.bin?.tsdown;
+      if (typeof bin !== "string" || !fs.statSync(path.resolve(path.dirname(manifest), bin)).isFile()) {
+        issues.push("tsdown: declared executable is missing");
+      }
+      const shim = path.join(runtimeModules, ".bin", process.platform === "win32" ? "tsdown.cmd" : "tsdown");
+      fs.accessSync(shim, process.platform === "win32" ? fs.constants.F_OK : fs.constants.X_OK);
+    }
+  } catch (error) {
+    issues.push(`${specifier}: ${error.code || "cannot resolve installed entry"}`);
+  }
+}
+process.stdout.write(JSON.stringify(issues));"#;
 
 pub(crate) fn detect_openclaw_checkout(path: &Path) -> Option<PathBuf> {
     let package_json = path.join("package.json");
@@ -39,6 +94,10 @@ pub(crate) fn discover_openclaw_checkout(cwd: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+pub(crate) fn discover_enclosing_openclaw_checkout(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors().find_map(detect_openclaw_checkout)
 }
 
 /// Rejects checkout dependencies that resolve through another checkout.
@@ -82,14 +141,256 @@ pub(crate) fn ensure_checkout_owned_dependencies(repo_root: &Path) -> Result<(),
     ))
 }
 
+const SOURCE_DEPENDENCY_STARTUP_GATE: &str = r#"const ocmGateFd = Number(process.env.OCM_SOURCE_WATCH_START_FD);
+const ocmGateFs = await import("node:fs");
+if (!Number.isInteger(ocmGateFd) || ocmGateFs.readSync(ocmGateFd, Buffer.alloc(1), 0, 1, null) !== 1) process.exit(1);
+ocmGateFs.closeSync(ocmGateFd);
+delete process.env.OCM_SOURCE_WATCH_START_FD;"#;
+
+pub(crate) fn inspect_source_dependencies(
+    repo_root: &Path,
+    env: &BTreeMap<String, String>,
+    watch: bool,
+) -> Result<Option<String>, String> {
+    inspect_source_dependencies_with_runner(repo_root, env, watch, false, |mut command| {
+        command.output().map_err(|error| {
+            format!("failed to run node for OpenClaw source prerequisite checks: {error}")
+        })
+    })
+}
+
+pub(crate) fn inspect_source_dependencies_with_runner<E: From<String>>(
+    repo_root: &Path,
+    env: &BTreeMap<String, String>,
+    watch: bool,
+    startup_gate: bool,
+    run_probe: impl FnOnce(Command) -> Result<std::process::Output, E>,
+) -> Result<Option<String>, E> {
+    ensure_checkout_owned_dependencies(repo_root)?;
+    for script in ["scripts/run-node.mjs"]
+        .into_iter()
+        .chain(watch.then_some("scripts/watch-node.mjs"))
+    {
+        if !repo_root.join(script).is_file() {
+            return Err(format!(
+                "OpenClaw source entry is missing: {}",
+                display_path(&repo_root.join(script))
+            )
+            .into());
+        }
+    }
+    let manifest_path = repo_root.join("package.json");
+    let contents = fs::read_to_string(&manifest_path).map_err(|error| {
+        format!(
+            "failed reading OpenClaw package metadata {}: {error}",
+            display_path(&manifest_path)
+        )
+    })?;
+    let manifest: Value = serde_json::from_str(&contents).map_err(|error| {
+        format!(
+            "invalid OpenClaw package metadata {}: {error}",
+            display_path(&manifest_path)
+        )
+    })?;
+    for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+        if let Some(value) = manifest.get(section)
+            && !value.is_object()
+            && !value.is_null()
+        {
+            return Err(
+                format!("invalid OpenClaw package metadata: {section} must be an object").into(),
+            );
+        }
+    }
+    // These are the source runner's build tools and the watch runner's watcher,
+    // not a completeness check for the application's runtime dependency graph.
+    let declares = |name: &str| {
+        ["dependencies", "devDependencies", "optionalDependencies"]
+            .into_iter()
+            .any(|section| {
+                manifest
+                    .get(section)
+                    .and_then(Value::as_object)
+                    .is_some_and(|dependencies| dependencies.contains_key(name))
+            })
+    };
+    let mut requirements = Vec::new();
+    if declares("tsx") {
+        requirements.push(("tsx", "tsx"));
+        if repo_root.join("scripts/tsx.mjs").is_file() {
+            requirements.push(("tsx", "tsx/esm"));
+        }
+    }
+    if declares("tsdown") {
+        requirements.push(("tsdown", "tsdown"));
+    }
+    if watch && declares("chokidar") {
+        requirements.push(("chokidar", "chokidar"));
+    }
+    if requirements.is_empty() {
+        return Ok(None);
+    }
+    let modules_override = source_modules_override(repo_root, env)?
+        .as_deref()
+        .map(display_path)
+        .unwrap_or_default();
+    let requirements = serde_json::to_string(&requirements).map_err(|error| error.to_string())?;
+    let probe = if startup_gate {
+        format!("{SOURCE_DEPENDENCY_STARTUP_GATE}\n{SOURCE_DEPENDENCY_PROBE}")
+    } else {
+        SOURCE_DEPENDENCY_PROBE.to_string()
+    };
+    let mut command = Command::new("node");
+    command
+        .args([
+            "--input-type=module",
+            "--experimental-import-meta-resolve",
+            "--eval",
+            &probe,
+            "--",
+            "ocm-source-dependencies",
+            &requirements,
+            &modules_override,
+        ])
+        .env_clear()
+        .envs(env)
+        // Validation resolves installed files without running user preload hooks.
+        .env_remove("NODE_OPTIONS")
+        .env_remove("NODE_PATH")
+        .env_remove("NODE_COMPILE_CACHE")
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = run_probe(command)?;
+    if !output.status.success() {
+        return Err(format!(
+            "OpenClaw source prerequisite check failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let issues: Vec<String> = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("invalid OpenClaw source prerequisite result: {error}"))?;
+    Ok((!issues.is_empty()).then(|| issues.join("; ")))
+}
+
+fn source_modules_override(
+    repo_root: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<Option<PathBuf>, String> {
+    let configured = env
+        .get_key_value("PNPM_CONFIG_MODULES_DIR")
+        .or_else(|| env.get_key_value("pnpm_config_modules_dir"))
+        .filter(|(_, value)| !value.is_empty())
+        .or_else(|| {
+            env.get_key_value("npm_config_modules_dir")
+                .filter(|(_, value)| !value.is_empty())
+        });
+    let Some((key, value)) = configured else {
+        return Ok(None);
+    };
+    let configured = clean_path(&repo_root.join(value));
+    let resolved_repo = fs::canonicalize(repo_root).map_err(|error| error.to_string())?;
+    // An absent install target is safe only when its nearest existing ancestor
+    // belongs to this checkout. Do not skip broken links while finding it.
+    let mut existing = configured.as_path();
+    loop {
+        match fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or_else(|| error.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let resolved = fs::canonicalize(existing).map_err(|error| {
+        format!("failed resolving OpenClaw source dependency override {key}: {error}")
+    })?;
+    if !resolved.starts_with(&resolved_repo) {
+        return Err(format!(
+            "OpenClaw source dependency override {key} resolves outside the selected checkout: {}; unset it or select dependencies inside {}",
+            display_path(&configured),
+            display_path(repo_root)
+        ));
+    }
+    Ok(Some(configured))
+}
+
+pub(crate) fn ensure_source_dependency_install_target(
+    repo_root: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    ensure_checkout_owned_dependencies(repo_root)?;
+    let mut modules = vec![repo_root.join("node_modules")];
+    if let Some(configured) = source_modules_override(repo_root, env)?
+        && !modules.contains(&configured)
+    {
+        modules.push(configured);
+    }
+    for directory in modules
+        .into_iter()
+        .flat_map(|root| [root.clone(), root.join(".pnpm")])
+    {
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(format!(
+                    "refusing to install OpenClaw source dependencies through {}; preserve the linked or invalid dependency tree and prepare it explicitly",
+                    display_path(&directory)
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed inspecting OpenClaw dependency install target {}: {error}",
+                    display_path(&directory)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn default_worktree_root(repo_root: &Path, env_name: &str) -> PathBuf {
     clean_path(&repo_root.join(".worktrees").join(env_name))
+}
+
+pub(crate) fn validate_openclaw_worktree(
+    repo_root: &Path,
+    worktree_root: &Path,
+) -> Result<(), String> {
+    if !worktree_root.exists() {
+        return Err(format!(
+            "saved dev worktree is missing: {}; restore that checkout before resuming the env",
+            display_path(worktree_root)
+        ));
+    }
+    let registered = registered_worktree_paths(repo_root)?;
+    if !contains_worktree_path(&registered, worktree_root) {
+        return Err(format!(
+            "saved dev worktree is not registered to this OpenClaw checkout: {}",
+            display_path(worktree_root)
+        ));
+    }
+    if !is_existing_openclaw_worktree(repo_root, worktree_root) {
+        return Err(format!(
+            "registered worktree is not a valid OpenClaw checkout: {}",
+            display_path(worktree_root)
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) struct OpenClawWorktree {
+    pub(crate) root: PathBuf,
+    pub(crate) created: bool,
 }
 
 pub(crate) fn ensure_openclaw_worktree(
     repo_root: &Path,
     env_name: &str,
-) -> Result<PathBuf, String> {
+) -> Result<OpenClawWorktree, String> {
     let repo_root = detect_openclaw_checkout(repo_root)
         .ok_or_else(|| format!("OpenClaw checkout not found at {}", display_path(repo_root)))?;
     let worktree_root = default_worktree_root(&repo_root, env_name);
@@ -100,7 +401,10 @@ pub(crate) fn ensure_openclaw_worktree(
         if !worktree_root.exists() {
             remove_registered_worktree(&repo_root, &worktree_root)?;
         } else if is_existing_openclaw_worktree(&repo_root, &worktree_root) {
-            return Ok(worktree_root);
+            return Ok(OpenClawWorktree {
+                root: worktree_root,
+                created: false,
+            });
         } else {
             return Err(format!(
                 "registered worktree is not a valid OpenClaw checkout: {}",
@@ -120,11 +424,17 @@ pub(crate) fn ensure_openclaw_worktree(
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
 
-    let output = Command::new("git")
+    // Git accepts the canonical Windows repository for -C, but not a verbatim
+    // Windows path as its new worktree destination. Keep this owned path
+    // relative to that repository without changing the stored source identity.
+    let worktree_argument = worktree_root
+        .strip_prefix(&repo_root)
+        .map_err(|_| "OCM-owned worktree destination is outside its repository".to_string())?;
+    let output = git_command()
         .arg("-C")
         .arg(&repo_root)
         .args(["worktree", "add", "--detach"])
-        .arg(&worktree_root)
+        .arg(worktree_argument)
         .output()
         .map_err(|error| format!("failed to run git worktree add: {error}"))?;
     if !output.status.success() {
@@ -144,7 +454,10 @@ pub(crate) fn ensure_openclaw_worktree(
         ));
     }
 
-    Ok(worktree_root)
+    Ok(OpenClawWorktree {
+        root: worktree_root,
+        created: true,
+    })
 }
 
 pub(crate) fn remove_openclaw_worktree(
@@ -213,7 +526,7 @@ fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), Strin
         return Ok(());
     }
 
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(worktree_root)
         .args([
@@ -248,7 +561,7 @@ fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), Strin
 fn remove_registered_worktree(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
     ensure_worktree_clean(worktree_root)?;
 
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_root)
         .args(["worktree", "remove", "--force"])
@@ -270,7 +583,7 @@ fn ensure_worktree_clean(worktree_root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let output = Command::new("git")
+    let output = git_command()
         .args(["-c", "status.showUntrackedFiles=all"])
         .arg("-C")
         .arg(worktree_root)
@@ -300,7 +613,7 @@ fn ensure_worktree_clean(worktree_root: &Path) -> Result<(), String> {
 }
 
 fn ensure_no_ignored_local_files(worktree_root: &Path) -> Result<(), String> {
-    let worktree_output = Command::new("git")
+    let worktree_output = git_command()
         .arg("-C")
         .arg(worktree_root)
         .args([
@@ -323,7 +636,7 @@ fn ensure_no_ignored_local_files(worktree_root: &Path) -> Result<(), String> {
         return Err(format!("git ignored-file inspection failed: {detail}"));
     }
 
-    let submodule_output = Command::new("git")
+    let submodule_output = git_command()
         .arg("-C")
         .arg(worktree_root)
         .args([
@@ -373,7 +686,7 @@ fn is_disposable_ignored_path(path: &Path) -> bool {
 }
 
 fn registered_worktree_paths(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_root)
         .args(["worktree", "list", "--porcelain", "-z"])
@@ -383,7 +696,7 @@ fn registered_worktree_paths(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
         return parse_registered_worktree_paths(&output.stdout);
     }
 
-    let fallback = Command::new("git")
+    let fallback = git_command()
         .arg("-C")
         .arg(repo_root)
         .args([
@@ -478,7 +791,7 @@ fn is_existing_openclaw_worktree(repo_root: &Path, path: &Path) -> bool {
     detect_openclaw_checkout(path).is_some() && has_expected_worktree_identity(repo_root, path)
 }
 
-fn has_expected_worktree_identity(repo_root: &Path, path: &Path) -> bool {
+pub(crate) fn has_expected_worktree_identity(repo_root: &Path, path: &Path) -> bool {
     path.exists()
         && path.join(".git").exists()
         && git_top_level(path).is_some_and(|top_level| {
@@ -492,8 +805,139 @@ fn has_expected_worktree_identity(repo_root: &Path, path: &Path) -> bool {
         })
 }
 
-fn git_common_dir(path: &Path) -> Option<PathBuf> {
+pub(crate) fn git_common_dir(path: &Path) -> Option<PathBuf> {
     git_rev_parse_path(path, "--git-common-dir")
+}
+
+pub(crate) struct GitIdentityPaths {
+    pub(crate) entries: Vec<PathBuf>,
+    pub(crate) private_dir: PathBuf,
+    pub(crate) common_dir: PathBuf,
+    pub(crate) worktree_entry: Option<PathBuf>,
+}
+
+// Keep raw pointer paths: Git's resolved query output can erase an intermediate
+// symlink whose removal would break the recorded entry point.
+pub(crate) fn git_identity_paths(root: &Path) -> Result<Option<GitIdentityPaths>, String> {
+    match fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    }
+    let mut git_entry = None;
+    for ancestor in root.ancestors() {
+        let candidate = ancestor.join(".git");
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => {
+                git_entry = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let Some(git_entry) = git_entry.or_else(|| git_rev_parse_path(root, "--git-dir")) else {
+        return Ok(None); // Missing/non-Git tuples remain valid store inputs.
+    };
+    let private_dir = if fs::metadata(&git_entry)
+        .map_err(|error| error.to_string())?
+        .is_dir()
+    {
+        git_entry.clone()
+    } else {
+        read_git_pointer(&git_entry, git_entry.parent().unwrap(), b"gitdir: ")?
+            .ok_or_else(|| format!("Git entry disappeared: {}", display_path(&git_entry)))?
+    };
+    let mut identity = git_registration_paths(&private_dir)?;
+    identity.entries.push(git_entry);
+    Ok(Some(identity))
+}
+
+pub(crate) fn git_registration_paths(private_dir: &Path) -> Result<GitIdentityPaths, String> {
+    let mut entries = Vec::new();
+    let common_pointer = private_dir.join("commondir");
+    let common_dir = if let Some(common) = read_git_pointer(&common_pointer, &private_dir, b"")? {
+        entries.push(common_pointer);
+        common
+    } else {
+        private_dir.to_path_buf()
+    };
+    let backlink = private_dir.join("gitdir");
+    let worktree_entry = read_git_pointer(&backlink, private_dir, b"")?;
+    if worktree_entry.is_some() {
+        entries.push(backlink);
+    }
+    Ok(GitIdentityPaths {
+        entries,
+        private_dir: private_dir.to_path_buf(),
+        common_dir,
+        worktree_entry,
+    })
+}
+
+pub(crate) fn worktree_registration_entries(
+    repo: &Path,
+    root: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let Some(identity) = git_identity_paths(repo)? else {
+        return Ok(Vec::new());
+    };
+    git_registration_entries(&identity.common_dir, root)
+}
+
+pub(crate) fn git_registration_entries(common: &Path, root: &Path) -> Result<Vec<PathBuf>, String> {
+    let common = fs::canonicalize(common).map_err(|error| error.to_string())?;
+    let expected = normalize_worktree_path(root);
+    let mut entries = Vec::new();
+    let slots = match fs::read_dir(common.join("worktrees")) {
+        Ok(slots) => slots,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in slots {
+        let entry = entry.map_err(|error| error.to_string())?.path();
+        if let Some(backlink) = read_git_pointer(&entry.join("gitdir"), &entry, b"")?
+            && backlink.file_name().is_some_and(|name| name == ".git")
+            && backlink
+                .parent()
+                .is_some_and(|parent| normalize_worktree_path(parent) == expected)
+        {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn read_git_pointer(path: &Path, base: &Path, prefix: &[u8]) -> Result<Option<PathBuf>, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !metadata.is_file() || metadata.len() > 65536 {
+        return Err(format!(
+            "invalid Git identity pointer: {}",
+            display_path(path)
+        ));
+    }
+    let mut contents = Vec::new();
+    fs::File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(65537)
+        .read_to_end(&mut contents)
+        .map_err(|error| error.to_string())?;
+    let value = trim_git_line(&contents)
+        .strip_prefix(prefix)
+        .filter(|value| !value.is_empty() && contents.len() <= 65536)
+        .ok_or_else(|| format!("invalid Git identity pointer: {}", display_path(path)))?;
+    let target = PathBuf::from(git_path_from_bytes(value)?);
+    // Do not collapse '..' before preceding symlinks have been followed.
+    Ok(Some(if target.is_absolute() {
+        target
+    } else {
+        base.join(target)
+    }))
 }
 
 fn git_top_level(path: &Path) -> Option<PathBuf> {
@@ -512,8 +956,19 @@ fn git_worktree_backlink(path: &Path) -> Option<PathBuf> {
     }
 }
 
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    // Inspection and mutation must use the checkout and index selected by -C.
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    command
+}
+
 fn git_rev_parse_path(path: &Path, selector: &str) -> Option<PathBuf> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", selector])
@@ -621,9 +1076,29 @@ mod tests {
     }
 
     #[test]
+    fn owned_worktree_uses_canonical_repository_paths() {
+        let (temp, repo) = init_openclaw_repo();
+        let spaced = temp.path().join("OpenClaw source");
+        fs::rename(repo, &spaced).unwrap();
+        let repo = fs::canonicalize(spaced).unwrap();
+        let original = fs::read(repo.join("package.json")).unwrap();
+        let worktree = ensure_openclaw_worktree(&repo, "plain.stop").unwrap();
+        assert!(worktree.created);
+        let worktree = worktree.root;
+        assert!(worktree.is_absolute() && worktree.join(".git").is_file());
+        assert_eq!(fs::read(worktree.join("package.json")).unwrap(), original);
+        let reused = ensure_openclaw_worktree(&repo, "plain.stop").unwrap();
+        assert!(!reused.created);
+        assert_eq!(reused.root, worktree);
+        remove_openclaw_worktree(&repo, &worktree).unwrap();
+        assert!(!worktree.exists());
+        assert_eq!(fs::read(repo.join("package.json")).unwrap(), original);
+    }
+
+    #[test]
     fn simulation_cleanup_discards_ignored_outputs_only_for_owned_worktree() {
         let (_temp, repo) = init_openclaw_repo();
-        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
         for relative in [
             "node_modules/pkg/index.js",
             "extensions/demo/node_modules/pkg/index.js",
@@ -660,7 +1135,7 @@ mod tests {
     #[test]
     fn simulation_cleanup_preserves_untracked_files() {
         let (_temp, repo) = init_openclaw_repo();
-        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
         fs::write(worktree.join("operator-notes.txt"), "preserve\n").unwrap();
 
         prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "demo-sim").unwrap();
@@ -675,7 +1150,7 @@ mod tests {
     #[test]
     fn simulation_cleanup_preserves_non_build_ignored_files() {
         let (_temp, repo) = init_openclaw_repo();
-        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
         fs::write(worktree.join(".env"), "PRIVATE_VALUE=preserve\n").unwrap();
         let generated = worktree.join("dist/index.js");
         fs::create_dir_all(generated.parent().unwrap()).unwrap();
@@ -695,7 +1170,7 @@ mod tests {
     #[test]
     fn simulation_cleanup_does_not_touch_replaced_unregistered_checkout() {
         let (_temp, repo) = init_openclaw_repo();
-        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
         run_git(
             &repo,
             &[

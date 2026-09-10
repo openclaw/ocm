@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use super::platform::{ManagedServiceEnablement, ServiceManagerKind, service_manager_kind};
+use super::platform::{
+    ManagedServiceEnablement, ServiceManagerKind, gui_domain, service_manager_kind,
+};
 use crate::cli::render::format_rfc3339;
 use crate::env::GatewayProcessSpec;
 use crate::env::{EnvMeta, EnvironmentService};
@@ -37,6 +39,12 @@ pub(crate) struct LaunchdJobStatus {
     pub(crate) pid: Option<u32>,
     pub(crate) state: Option<String>,
     pub(crate) definition_path: Option<String>,
+}
+
+pub(crate) enum ManagedJobObservation {
+    Absent,
+    Stopped,
+    Running(u32),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -486,7 +494,7 @@ fn reported_gateway_state(service: &SupervisorRuntimeService) -> String {
     }
 }
 
-fn tcp_port_reachable(port: u32) -> bool {
+pub(crate) fn tcp_port_reachable(port: u32) -> bool {
     if port == 0 || port > u16::MAX as u32 {
         return false;
     }
@@ -564,6 +572,94 @@ pub(crate) fn inspect_job(
     }
 
     status
+}
+
+/// New foreground ownership needs a confirmed manager observation. The public
+/// status path remains best-effort; an unavailable manager cannot prove absence.
+pub(crate) fn observe_job_for_source_watch(
+    label: &str,
+    service_path: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<ManagedJobObservation, String> {
+    let mut status = LaunchdJobStatus::default();
+    let inactive = match service_manager_kind(env) {
+        ServiceManagerKind::Launchd => {
+            let domain = gui_domain(env)?;
+            let output = Command::new(launchctl_binary(env))
+                .args(["print", &format!("{domain}/{label}")])
+                .output()
+                .map_err(|error| format!("failed to inspect managed service {label}: {error}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains(&format!("Could not find service \"{label}\""))
+                    && stderr.contains("in domain")
+                {
+                    return Ok(ManagedJobObservation::Absent);
+                }
+                return Err(format!(
+                    "failed to inspect managed service {label}: launchctl exited with {}",
+                    output.status
+                ));
+            }
+            status.loaded = true;
+            parse_launchctl_print(&String::from_utf8_lossy(&output.stdout), &mut status);
+            matches!(status.state.as_deref(), Some("not running" | "stopped"))
+        }
+        ServiceManagerKind::SystemdUser => {
+            let output = Command::new(systemctl_binary(env))
+                .args([
+                    "--user",
+                    "show",
+                    label,
+                    "--property=LoadState,UnitFileState,ActiveState,SubState,MainPID,FragmentPath,ExecStart,WorkingDirectory,Environment",
+                ])
+                .output()
+                .map_err(|error| format!("failed to inspect managed service {label}: {error}"))?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            parse_systemctl_show(&text, &mut status);
+            let property = |name: &str| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .map(str::trim)
+            };
+            if property("LoadState=") == Some("not-found") && status.pid.is_none() {
+                return Ok(ManagedJobObservation::Absent);
+            }
+            if !output.status.success() {
+                return Err(format!(
+                    "failed to inspect managed service {label}: systemctl exited with {}",
+                    output.status
+                ));
+            }
+            if property("LoadState=") != Some("loaded") {
+                return Err(format!("managed service {label} has an unknown load state"));
+            }
+            property("ActiveState=") == Some("inactive")
+                && matches!(property("SubState="), Some("dead" | "exited"))
+        }
+        ServiceManagerKind::Unsupported => return Ok(ManagedJobObservation::Absent),
+    };
+    if !status
+        .definition_path
+        .as_deref()
+        .is_some_and(|path| service_paths_match(path, service_path))
+    {
+        return Err(format!(
+            "managed service {label} has an unverified definition path"
+        ));
+    }
+    status.pid = status.pid.filter(|pid| *pid > 0);
+    if status.running
+        && let Some(pid) = status.pid
+    {
+        return Ok(ManagedJobObservation::Running(pid));
+    }
+    if inactive && status.pid.is_none() {
+        return Ok(ManagedJobObservation::Stopped);
+    }
+    Err(format!(
+        "managed service {label} is starting or its process state is unknown"
+    ))
 }
 
 pub(crate) fn current_uid() -> Option<u32> {

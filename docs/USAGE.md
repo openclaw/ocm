@@ -96,6 +96,14 @@ ocm start luna --command 'pnpm openclaw' --cwd /path/to/openclaw --no-service
 
 Use this when you are developing OpenClaw locally or want a custom run command.
 
+For an isolated development worktree, use `ocm dev luna --repo /path/to/openclaw`.
+If an environment containing or owning the source or its required Git metadata is
+busy, retry dev creation or local upgrade simulation after its operation finishes.
+New dev environments publish a private config with a persistent Gateway token
+before registration, so paired clients can reconnect after a restart or source
+rebuild. Initialization preserves existing config files, including authored auth
+and SecretRefs. Repeating minimum setup preserves unchanged config bytes.
+
 If you run `ocm setup` from inside an OpenClaw checkout, local mode can detect that and fill in sensible defaults.
 
 ### 5. Test a local checkout as a release-shaped runtime
@@ -368,6 +376,12 @@ ocm service status mira
 
 Use `service install` when you want a background service for an environment that was created with `--no-service`, or when you want to bring an older env under background management later.
 
+On Unix, OCM waits for Gateway PID publication before moving a matching caller
+out of the Gateway process group during daemon refresh, snapshot, or upgrade
+maintenance. This protects the caller from the supervisor's signals to that
+group. A systemd unit stop or restart can still terminate the caller through its
+service cgroup.
+
 ### Read logs
 
 ```bash
@@ -383,6 +397,9 @@ ocm service start mira
 ocm service stop mira
 ocm service restart mira
 ```
+
+Saved dev service plans must still match the env's current binding and recorded
+worktree. If OCM refuses a stale plan, use `ocm service restart <env>` to refresh it.
 
 Normal restart is gateway-aware when `ocm service status mira` reports restart
 handoff `protocol v1`: OpenClaw records eligible active sessions and subagents,
@@ -455,6 +472,17 @@ ocm self update --check
 
 ## Environment lifecycle
 
+Environment creation, including `start` and migration, and `env clone` and
+`env import` require a root outside every registered dev worktree that exists
+on disk. The root must neither contain an existing registered source nor be
+inside it. OCM resolves source and destination aliases and also protects source
+symlinks that failed clone or import cleanup would remove. Choose a separate
+environment root.
+
+When OCM reports that it cannot resolve or inspect a registered source, it stops
+before writing the destination. Check the recorded source with `ocm env show
+<env>`, restore that checkout's path or access permissions, then retry.
+
 ### Clone an environment
 
 ```bash
@@ -510,9 +538,33 @@ not add crash recovery for an uncatchable process or machine failure.
 
 This policy belongs to the environment registration. Clone and import start with
 an empty list. A separately requested full snapshot, export, or clone still
-includes independent content. Full snapshot restore still rewinds that content.
+includes independent content. Full snapshot restore still rewinds unregistered
+independent content and the selected environment's own source.
+
+Restores and required rollbacks refuse checkpoints whose recorded scope would
+replace another named environment's registered dev source or required Git
+metadata, before service quiescence or restore staging. Explicit rollback checks
+both the selected checkpoint and its failure-recovery checkpoint. `--no-rollback`
+keeps its existing behavior. The check reads only known registered source paths
+and Git identity metadata, including surviving history for a missing worktree.
+Checkpoint traversal still leaves independent content opaque; post-copy updates
+and residue cleanup leave directory links untouched. Excluding only a worktree
+is insufficient when its required Git metadata remains in scope.
 
 ### Snapshots
+
+Snapshot restore and live upgrade or rollback require a completed dev session.
+Request shutdown of recorded ownership with `ocm dev stop <env>` before retrying.
+Older watches without an unfinished ownership record must be stopped from their
+original dev terminal. Unreadable or unverified ownership requires verified
+operator recovery: preserve the environment
+and check the watch processes and service policy before recovering its ownership
+record. Refusal preserves the current state and service policy.
+
+Manual restore of a dev environment keeps its current source binding and
+runtime/launcher binding while restoring saved state. Upgrade rollback keeps
+that dev identity but restores the recorded runtime/launcher. Ordinary runtime
+and launcher environments still restore their captured bindings.
 
 Snapshot create and restore stop a running OCM-managed gateway before copying or
 replacing its root, then restore the recorded service policy. New snapshots are
@@ -612,6 +664,53 @@ Destroy the environment, its OCM-managed service, and its snapshots:
 ocm env destroy mira
 ocm env destroy mira --yes
 ```
+
+Destroy first stops the recorded foreground dev session, including any required
+service restoration, and verifies that its owned processes exited. It then
+rechecks the environment binding and protection before removing state. A
+replacement session or changed binding prevents removal. While a watch is
+running, the preview reports deferred process inspection; the remaining process
+tree is inspected after the watch stops.
+
+For new Unix foreground generations, unverified output or process completion keeps
+ownership recorded. A controller crash, raw signal, or missing output EOF cannot
+be cleared by repeating stop, starting another watch/service, or destroying the
+env. Normal acknowledged errors remain retryable; released legacy watch records
+and Windows process-job recovery retain their existing rules. Use a compatible
+OCM CLI and refresh an older running daemon before creating a new generation.
+
+Both plain `dev <env>` and `dev <env> --watch` own setup and the native Gateway.
+Plain mode runs `scripts/run-node.mjs`; watch mode runs `scripts/watch-node.mjs`.
+`dev stop <env>` stops either recorded session without removing its environment
+or source. Repeating the same mode and launch endpoint reuses the session;
+changing mode requires stopping it first. `dev status --json` reports active
+ownership separately from `sourceWatch.watching`. Plain runs still refuse a
+running background service; temporary takeover remains `--watch --force`.
+
+`dev <env> --service` records its preparation children until verified completion.
+Use `dev stop <env>` to cancel setup; a managed Gateway already running keeps its
+launch plan, and deferred restart requests remain pending. Explicit service stop
+or uninstall still wins. After setup, OCM closes preparation and rechecks the
+same environment, source binding, and service policy under one operation lock
+before starting the managed service. An unchanged rerun keeps the running service.
+
+During foreground dependency installation, pnpm lifecycle reports distinguish a
+completed installation error from interrupted or unfinished build scripts. On
+Unix, uncertain script cleanup retains ownership even when pnpm returns a normal
+error or allows an optional build to fail. Completed errors remain retryable.
+When run from a terminal, installation keeps interactive stdin while streaming
+build output and diagnostics. Onboarding keeps its real terminal output.
+
+`env remove` and `env prune` require active or unfinished source watches to be
+stopped first with `ocm dev stop <env>`. The same applies to a destroy guarded by
+`--if-state-token`: stop the watch, then request a fresh preview. A watch created
+by an older OCM without usable stop ownership must be stopped from its original
+terminal. Environment removal clears completed watch records and retains the
+reusable synchronization lock files.
+
+Cleanup refuses to remove another registered dev source or its required Git
+metadata, including sources reached through path aliases. Destroy checks before
+signalling source workers; simulation checks before discarding generated files.
 
 `destroy` is the stronger cleanup path.
 
@@ -742,6 +841,13 @@ Windows service support is not implemented yet.
 ## Safety notes
 
 `ocm` keeps safety checks around destructive actions.
+
+On Unix, updating an already-private OpenClaw config preserves its file mode.
+On Windows, this preserves a protected ACL owned by and granting access only to
+the current user. Private replacements exclude inherited macOS and Windows access
+at creation, and protection is verified before any config data is written. Other
+authored access rules retain the existing writer. Config values, including auth
+and SecretRefs, follow the existing command's update rules.
 
 Examples:
 

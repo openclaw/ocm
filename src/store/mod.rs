@@ -1,6 +1,8 @@
 mod checkpoint_scope;
 mod checkpoints;
 mod common;
+mod dev_registration;
+pub(crate) mod dev_sources;
 mod envs;
 mod gateway_ports;
 mod launchers;
@@ -21,12 +23,18 @@ use crate::env::EnvMeta;
 use crate::env::EnvSummary;
 pub(crate) use checkpoints::CheckpointCleanup;
 pub(crate) use common::{
-    ExclusiveFileLock, copy_dir_recursive, ensure_dir, lock_file, read_json, write_json,
+    ExclusiveFileLock, copy_dir_recursive, ensure_dir, lock_file, read_json, try_lock_file,
+    write_json,
 };
-pub(crate) use envs::{EnvironmentOperationLock, lock_env_registry, lock_environment_operation};
+pub(crate) use dev_registration::{DevSourceRegistration, with_prepared_dev_source};
+pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
 pub(crate) use envs::{
-    EnvironmentServicePolicyChange, restore_environment_service_policy,
-    set_environment_service_policy,
+    EnvironmentOperationLock, lock_env_registry, lock_environment_operation,
+    remove_environment_locked,
+};
+pub(crate) use envs::{
+    EnvironmentServicePolicyChange, environment_service_policy_revision,
+    restore_environment_service_policy, set_environment_service_policy,
 };
 pub use envs::{
     clone_environment, create_environment, export_environment, get_environment, import_environment,
@@ -34,11 +42,12 @@ pub use envs::{
 };
 pub(crate) use envs::{
     clone_environment_for_simulation, clone_environment_with_sandbox_origin,
-    create_environment_with_validated_runtime, import_environment_with_sandbox_origin,
+    create_environment_with_dev_registration, create_environment_with_validated_runtime,
+    import_environment_with_sandbox_origin,
 };
 pub(crate) use envs::{
-    save_environment_with_validated_launcher, save_environment_with_validated_runtime,
-    with_locked_environments,
+    save_environment_with_dev_registration, save_environment_with_validated_launcher,
+    save_environment_with_validated_runtime, with_locked_environments,
 };
 pub(crate) use gateway_ports::{
     openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,
@@ -85,9 +94,10 @@ pub use runtimes::{
 };
 pub(crate) use snapshots::{
     EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
-    create_env_snapshot_from_preparation, prepare_env_snapshot_capture,
-    prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
-    rollback_env_snapshot_restore, validate_upgrade_independent_paths,
+    create_env_snapshot_from_preparation, ensure_restore_preserves_dev_sources,
+    prepare_env_snapshot_capture, prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
+    prepare_upgrade_snapshot_restore, rollback_env_snapshot_restore,
+    validate_upgrade_independent_paths,
 };
 pub use snapshots::{
     create_env_snapshot, get_env_snapshot, list_all_env_snapshots, list_env_snapshots,
