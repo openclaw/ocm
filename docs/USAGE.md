@@ -485,8 +485,10 @@ includes independent content. Full snapshot restore still rewinds that content.
 ### Snapshots
 
 Snapshot restore and live upgrade or rollback require a completed dev session.
-Stop a known owned watch with `ocm dev stop <env>` before retrying. Unreadable or
-unverified ownership requires verified operator recovery: preserve the environment
+Request shutdown of recorded ownership with `ocm dev stop <env>` before retrying.
+Older watches without an unfinished ownership record must be stopped from their
+original dev terminal. Unreadable or unverified ownership requires verified
+operator recovery: preserve the environment
 and check the watch processes and service policy before recovering its ownership
 record. Refusal preserves the current state and service policy.
 

@@ -377,6 +377,25 @@ fn env_snapshot_restore_refuses_active_transitional_and_unknown_dev_ownership() 
     fs::write(checkout.join("openclaw.mjs"), "fixture\n").unwrap();
     let override_path = source_watch_override_path("source", &env, &cwd).unwrap();
     fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+    let session_path = override_path.with_extension("session");
+    let unfinished = serde_json::json!({
+        "kind": "ocm-source-watch-session", "envName": "source",
+        "leaseId": "snapshot-fixture", "envRoot": meta.root,
+        "envCreatedAt": serde_json::to_value(&meta).unwrap()["createdAt"],
+        "processScope": null, "controller": {"pid": std::process::id(), "startedAt": "fixture"},
+        "child": null, "childSpawnPending": false, "restoreService": false, "closed": false
+    });
+    let unfinished_record = serde_json::to_string(&unfinished).unwrap();
+    let mut closed = unfinished.clone();
+    closed["closed"] = serde_json::json!(true);
+    let closed_record = serde_json::to_string(&closed).unwrap();
+    let mut unverified = unfinished.clone();
+    unverified["kind"] = serde_json::json!("ocm-source-watch-session-v2");
+    unverified["childSpawnPending"] = serde_json::json!(true);
+    unverified["completion"] = serde_json::json!({
+        "serviceRestored": false, "error": "source shutdown is unverified"
+    });
+    let unverified_record = serde_json::to_string(&unverified).unwrap();
     let mut lease = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -385,7 +404,45 @@ fn env_snapshot_restore_refuses_active_transitional_and_unknown_dev_ownership() 
         .open(override_path.with_extension("lock"))
         .unwrap();
     lease.lock_exclusive().unwrap();
-    for state in ["starting", "active", "restoring", "unknown"] {
+    for (state, record, advice) in [
+        (
+            "starting",
+            Some(unfinished_record.as_str()),
+            "dev stop source",
+        ),
+        (
+            "active",
+            Some(unfinished_record.as_str()),
+            "dev stop source",
+        ),
+        (
+            "restoring",
+            Some(unfinished_record.as_str()),
+            "dev stop source",
+        ),
+        (
+            "unknown",
+            Some(unfinished_record.as_str()),
+            "operator recovery",
+        ),
+        ("active", None, "original dev terminal"),
+        (
+            "active",
+            Some(closed_record.as_str()),
+            "original dev terminal",
+        ),
+        ("active", Some("{"), "operator recovery"),
+        (
+            "active",
+            Some(unverified_record.as_str()),
+            "operator recovery",
+        ),
+    ] {
+        if let Some(record) = record {
+            fs::write(&session_path, record).unwrap();
+        } else {
+            fs::remove_file(&session_path).unwrap();
+        }
         lease.set_len(0).unwrap();
         lease.seek(SeekFrom::Start(0)).unwrap();
         writeln!(
@@ -426,17 +483,12 @@ fn env_snapshot_restore_refuses_active_transitional_and_unknown_dev_ownership() 
             ],
         );
         assert!(!restored.status.success(), "accepted {state}");
-        let advice = if state == "unknown" {
-            "operator recovery"
-        } else {
-            "dev stop source"
-        };
         assert!(
             stderr(&restored).contains(advice),
             "{state}: {}",
             stderr(&restored)
         );
-        if state == "unknown" {
+        if advice != "dev stop source" {
             assert!(!stderr(&restored).contains("dev stop"));
         }
         assert_eq!(fs::read_to_string(&notes).unwrap(), "current state\n");
@@ -447,15 +499,7 @@ fn env_snapshot_restore_refuses_active_transitional_and_unknown_dev_ownership() 
     }
     fs::remove_file(&override_path).unwrap();
     drop(lease);
-    let session_path = override_path.with_extension("session");
-    let unfinished = serde_json::json!({
-        "kind": "ocm-source-watch-session", "envName": "source",
-        "leaseId": "snapshot-fixture", "envRoot": meta.root,
-        "envCreatedAt": serde_json::to_value(&meta).unwrap()["createdAt"],
-        "processScope": null, "controller": {"pid": std::process::id(), "startedAt": "fixture"},
-        "child": null, "childSpawnPending": false, "restoreService": false, "closed": false
-    });
-    for record in [serde_json::to_string(&unfinished).unwrap(), "{".to_string()] {
+    for record in [unfinished_record, "{".to_string()] {
         fs::write(&session_path, &record).unwrap();
         let refused = run_ocm(
             &cwd,

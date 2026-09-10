@@ -644,7 +644,7 @@ pub fn upgrade_help(cmd: &str) -> String {
         &[
             "Simulations clone the source env, leave the real env untouched, and clean temporary envs and runtimes by default.",
             "Upgrade history lists completed transaction records newest first without reading config contents or credentials.",
-            "Stop a known owned watch with dev stop <env> before upgrading or rolling back. Unreadable or unverified ownership requires verified operator recovery before mutation.",
+            "Request shutdown of recorded ownership with dev stop <env> before upgrading or rolling back. Older watches without an unfinished ownership record require their original dev terminal; unreadable or unverified ownership requires verified operator recovery before mutation.",
             "Upgrade rollback restores the latest completed transition by default; use --transaction to select a specific unconsumed transaction.",
             "Rollback refuses before mutation when the current binding, OpenClaw version, service policy, source binding, snapshot, or retained runtime recovery no longer matches the selected transaction.",
             "Rollback creates a pre-rollback safety snapshot and linked history transaction. Rolling back that linked transaction safely reverses the rollback.",
@@ -696,7 +696,7 @@ pub fn upgrade_rollback_help(cmd: &str) -> String {
         &[
             "Without --transaction, OCM selects the newest completed upgrade or rollback transition that has not already been reversed.",
             "Preflight requires the current binding, OpenClaw version, and service policy to match the selected transaction target.",
-            "Live rollback requires a completed source-watch session. Stop known ownership with dev stop; unreadable or unverified ownership requires verified operator recovery.",
+            "Live rollback requires a completed source-watch session. Request shutdown of recorded ownership with dev stop. Older watches without an unfinished ownership record require their original dev terminal; unreadable or unverified ownership requires verified operator recovery.",
             "The recorded pre-upgrade snapshot and source runtime or launcher must still be available. Same-name runtime updates also require healthy retained runtime recovery.",
             "Rollback creates a pre-rollback safety snapshot and linked history transaction before stopping a managed service or replacing runtime bytes.",
             "If restore or verification fails, OCM restores the pre-rollback runtime and environment state.",
@@ -1781,7 +1781,7 @@ pub fn env_snapshot_command_help(cmd: &str, action: &str) -> Option<String> {
             )],
             &[
                 "Restore uses an exclusive same-filesystem namespace and retains the displaced root through service acceptance.",
-                "Restore requires a completed source-watch session. Stop known ownership with dev stop; unreadable or unverified ownership requires verified operator recovery.",
+                "Restore requires a completed source-watch session. Request shutdown of recorded ownership with dev stop. Older watches without an unfinished ownership record require their original dev terminal; unreadable or unverified ownership requires verified operator recovery.",
             ],
         ),
         "remove" => render_leaf(

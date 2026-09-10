@@ -384,6 +384,8 @@ impl<'a> EnvironmentService<'a> {
                 "cannot verify dev ownership for env {name}: {error}; verified operator recovery is required before changing env state; preserve the environment and verify the watch processes and service policy before retrying"
             )
         };
+        let session = self.source_watch_session(name).map_err(&unverified)?;
+        let unfinished = session.is_some_and(|session| !session.closed);
         let state = match self.observe_source_watch(name).map_err(&unverified)? {
             SourceWatchState::Inactive => None,
             SourceWatchState::Starting => Some("starting"),
@@ -391,14 +393,20 @@ impl<'a> EnvironmentService<'a> {
             SourceWatchState::Restoring => Some("restoring"),
         };
         if let Some(state) = state {
+            let recovery = if unfinished {
+                format!(
+                    "request shutdown with ocm dev stop {name}; if ownership cannot be verified, verified operator recovery is required"
+                )
+            } else {
+                "stop it from its original dev terminal; if that is unavailable, verified operator recovery is required".to_string()
+            };
             return Err(format!(
-                "cannot change env {name} while its dev session is {state}; stop it with ocm dev stop {name} first"
+                "cannot change env {name} while its dev session is {state}; {recovery}"
             ));
         }
-        let session = self.source_watch_session(name).map_err(unverified)?;
-        if session.is_some_and(|session| !session.closed) {
+        if unfinished {
             return Err(format!(
-                "cannot change env {name} while its dev session is unfinished; stop it with ocm dev stop {name} first"
+                "cannot change env {name} while its dev session is unfinished; request shutdown with ocm dev stop {name}; if ownership cannot be verified, verified operator recovery is required"
             ));
         }
         Ok(())

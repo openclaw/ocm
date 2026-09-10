@@ -4567,10 +4567,11 @@ fn upgrade_refuses_a_live_watch_before_state_or_runtime_mutation() {
         assert!(!refused.status.success(), "accepted {args:?}");
         assert!(
             stderr(&refused).contains("dev session is active")
-                && stderr(&refused).contains("dev stop demo"),
+                && stderr(&refused).contains("original dev terminal"),
             "{args:?}: {}",
             stderr(&refused)
         );
+        assert!(!stderr(&refused).contains("dev stop"));
         assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
         assert_eq!(fs::read(&next).unwrap(), next_before);
         assert_eq!(

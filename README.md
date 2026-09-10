@@ -155,8 +155,10 @@ ocm upgrade simulate mira --to beta --scenario all
 ocm upgrade simulate mira --to ./openclaw
 ```
 
-Live upgrades and rollbacks require a completed source-watch session. Stop a
-known owned watch with `ocm dev stop <env>`. Unreadable or unverified ownership
+Live upgrades and rollbacks require a completed source-watch session. Request
+shutdown of recorded ownership with `ocm dev stop <env>`. Older watches without
+an unfinished ownership record must be stopped from their original dev terminal.
+Unreadable or unverified ownership
 requires verified operator recovery, including checking the watch processes and
 service policy. OCM preserves environment state, runtime files, and upgrade
 history while refusing those operations.
