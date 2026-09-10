@@ -4,13 +4,18 @@ use std::fs;
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -696,6 +701,68 @@ fn spawn_ocm_with_controlling_pty(
         });
     }
     (command.spawn().unwrap(), master)
+}
+
+#[cfg(unix)]
+struct PtyOutputDrain {
+    stop: Arc<AtomicBool>,
+    reader: Option<thread::JoinHandle<std::io::Result<()>>>,
+}
+
+#[cfg(unix)]
+impl PtyOutputDrain {
+    fn start(mut terminal: File) -> Self {
+        let flags = unsafe { libc::fcntl(terminal.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    terminal.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                )
+            },
+            0
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+        let reader = thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            while !reader_stop.load(Ordering::Acquire) {
+                match terminal.read(&mut buffer) {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    // Linux PTYs report EIO after the last slave closes.
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        });
+        Self {
+            stop,
+            reader: Some(reader),
+        }
+    }
+
+    fn finish(mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.reader.take().unwrap().join().unwrap().unwrap();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PtyOutputDrain {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
 }
 
 fn wait_for_path(path: &Path, timeout: Duration) -> bool {
@@ -2934,7 +3001,16 @@ fn dev_destroy_preserves_state_when_binding_changes_during_stop() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = service_env(&root);
-    let (started, _) = install_stubborn_fake_dev_runners(&root, &mut env);
+    let (started, release, _) = install_blocking_fake_dev_runners(&root, &mut env);
+    let stopping = root.child("source-watch.stopping");
+    let node = format!(
+        "#!/bin/sh\ntrap 'printf stopping > \"{}\"; while [ ! -f \"{}\" ]; do /bin/sleep 0.05; done; exit 143' TERM\nprintf 'ready\\n' > \"{}\"\nwhile [ ! -f \"{}\" ]; do /bin/sleep 0.05; done\n",
+        path_string(&stopping),
+        path_string(&release),
+        path_string(&started),
+        path_string(&release),
+    );
+    write_fake_dev_node(&root, &node);
     let watch = DevWatchFixture::spawn(
         &root,
         &cwd,
@@ -2956,9 +3032,11 @@ fn dev_destroy_preserves_state_when_binding_changes_during_stop() {
         &source_watch_override_path(&root, "demo").with_extension("stop"),
         Duration::from_secs(5)
     ));
+    assert!(wait_for_path(&stopping, Duration::from_secs(5)));
     ocm::env::EnvironmentService::new(&env, &cwd)
         .set_protected("demo", true)
         .unwrap();
+    fs::write(&release, "release\n").unwrap();
     let destroyed = destroy.wait_with_output().unwrap();
     let watch = watch.finish();
     assert!(!destroyed.status.success());
@@ -3361,12 +3439,14 @@ setInterval(() => { if (fs.existsSync(path.join(root,'source-watch.release'))) p
                 quote(&path_string(&script))
             ),
         );
-        let (child, _terminal) = spawn_ocm_with_controlling_pty(
+        let (child, terminal) = spawn_ocm_with_controlling_pty(
             &cwd,
             &env,
             &["dev", "demo", "--watch", "--onboard"],
             true,
         );
+        // Keep draining until after the watch guard cleans up, including on panic.
+        let terminal_drain = PtyOutputDrain::start(terminal);
         let mut watch = DevWatchFixture {
             child: Some(child),
             release: root.child("source-watch.release"),
@@ -3375,6 +3455,7 @@ setInterval(() => { if (fs.existsSync(path.join(root,'source-watch.release'))) p
         if success {
             assert!(watch.wait_without_release().status.success());
             assert_eq!(read_source_watch_session(&root)["closed"], true);
+            drop(watch);
         } else {
             let pid_path = root.child("source-watch-descendant.pid");
             assert!(wait_for_path(&pid_path, Duration::from_secs(20)));
@@ -3408,6 +3489,7 @@ setInterval(() => { if (fs.existsSync(path.join(root,'source-watch.release'))) p
             drop(watch);
             assert!(wait_for_process_exit(worker, Duration::from_secs(3)));
         }
+        terminal_drain.finish();
         assert_eq!(
             fs::read_to_string(root.child("setup-tty")).unwrap(),
             "[true,true,true]"
