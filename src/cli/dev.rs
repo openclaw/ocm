@@ -54,10 +54,11 @@ import { pathToFileURL } from "node:url";
 const startFd = Number(process.env.OCM_SOURCE_WATCH_RELEASED_FD);
 delete process.env.OCM_SOURCE_WATCH_RELEASED_FD;
 if (Number.isInteger(startFd)) fs.closeSync(startFd);
-const script = path.resolve("scripts/watch-node.mjs");
-process.argv = [process.execPath, script, ...process.argv.slice(1)];
-if (process.env.OCM_SOURCE_WATCH_FORCE_TTY === "1") {
-  delete process.env.OCM_SOURCE_WATCH_FORCE_TTY;
+const script = path.resolve(process.argv[1]);
+process.argv = [process.execPath, script, ...process.argv.slice(2)];
+// Keep the first native implementation in the recorded process group. The
+// child still inherits the real stdin descriptor, including noninteractive EOF.
+if (!process.stdin.isTTY) {
   Object.defineProperty(process.stdin, "isTTY", { value: true });
 }
 await import(pathToFileURL(script).href);"#;
@@ -81,11 +82,11 @@ unset OCM_SOURCE_WATCH_START_FD
 exec "$@"
 "#;
 
-fn source_watch_node_command(args: &[String]) -> Command {
+fn source_watch_node_command(script: &str, args: &[String]) -> Command {
     #[cfg(unix)]
     let mut command = {
         // Node preload hooks run before --eval, so gate the executable itself.
-        // The watch shim closes the consumed descriptor before importing source.
+        // The source shim closes the consumed descriptor before importing source.
         let mut command = Command::new("/bin/sh");
         command.args([
             "-c",
@@ -99,12 +100,8 @@ fn source_watch_node_command(args: &[String]) -> Command {
         command
     };
     #[cfg(not(unix))]
-    let mut command = {
-        let mut command = Command::new("node");
-        command.arg("scripts/watch-node.mjs");
-        command
-    };
-    command.args(args);
+    let mut command = Command::new("node");
+    command.arg(script).args(args);
     command
 }
 
@@ -172,6 +169,7 @@ struct DevStatusSummary {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DevSourceWatchSummary {
+    watching: bool,
     state: &'static str,
     pid: Option<u32>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -475,14 +473,19 @@ impl Cli {
         let name = validate_name(name, "Environment name")?;
 
         if let Some(existing) = self.environment_service().find(&name)? {
-            if watch
-                && (existing.dev.is_some() || force)
+            if service_requested {
+                self.environment_service()
+                    .ensure_source_watch_allows_service(&name)?;
+            }
+            if !service_requested
+                && (existing.dev.is_some() || (watch && force))
                 && self.try_reuse_dev_watch(
                     &existing,
                     repo_root.as_deref(),
                     root.as_deref(),
                     gateway_port,
                     onboard,
+                    watch,
                 )?
             {
                 return Ok(0);
@@ -504,7 +507,7 @@ impl Cli {
 
         // Reject an already incompatible daemon before creating a new env or
         // worktree. Lease admission rechecks after any concurrent daemon change.
-        if watch {
+        if !service_requested {
             self.supervisor_service().preflight_source_watch_daemon()?;
         }
         let (meta, created) =
@@ -520,14 +523,14 @@ impl Cli {
                 meta.name
             ));
         }
-        let watch_stop = watch
+        let watch_stop = (!service_requested)
             .then(install_source_watch_signal_handler)
             .transpose()?;
-        let mut source_watch_lease = if watch {
+        let mut source_watch_lease = if !service_requested {
             Some(
                 match self
                     .environment_service()
-                    .acquire_source_watch_lease(&meta.name, force)
+                    .acquire_source_watch_lease(&meta.name, force, watch)
                 {
                     Ok(lease) => lease,
                     Err(error) => {
@@ -539,6 +542,7 @@ impl Cli {
                             root.as_deref(),
                             gateway_port,
                             onboard,
+                            watch,
                         )? {
                             return Ok(0);
                         }
@@ -549,7 +553,7 @@ impl Cli {
         } else {
             None
         };
-        // Watch preparation belongs to the lease owner, including a newly created env.
+        // Foreground preparation belongs to the lease owner, including a newly created env.
         // A losing invocation must not rewrite config before returning the winner's status.
         let prepared = (|| {
             let current = self.environment_service().get(&meta.name)?;
@@ -678,7 +682,7 @@ impl Cli {
                 ),
                 stderr_profile,
             ));
-            let watch_result = self.run_dev_gateway_watch(
+            let watch_result = self.run_dev_gateway(
                 &meta,
                 source_watch_lease
                     .as_mut()
@@ -731,7 +735,17 @@ impl Cli {
             ),
             stderr_profile,
         ));
-        self.run_dev_gateway(&meta)
+        let lease = source_watch_lease
+            .as_mut()
+            .ok_or_else(|| "foreground dev lease is missing".to_string())?;
+        let result = self.run_dev_gateway(
+            &meta,
+            lease,
+            watch_stop
+                .as_deref()
+                .ok_or_else(|| "foreground dev cancellation state is missing".to_string())?,
+        );
+        finish_source_watch_session(&meta.name, lease, result, Ok(()), false)
     }
 
     fn handle_existing_env_source_watch(
@@ -783,7 +797,7 @@ impl Cli {
         let mut source_watch_lease = Some(
             match self
                 .environment_service()
-                .acquire_source_watch_lease(&meta.name, true)
+                .acquire_source_watch_lease(&meta.name, true, true)
             {
                 Ok(lease) => lease,
                 Err(error) => {
@@ -793,6 +807,7 @@ impl Cli {
                         None,
                         None,
                         false,
+                        true,
                     )? {
                         return Ok(0);
                     }
@@ -1088,7 +1103,10 @@ impl Cli {
         root: Option<&str>,
         gateway_port: Option<u32>,
         onboard: bool,
+        watching: bool,
     ) -> Result<bool, String> {
+        let env_service = self.environment_service();
+        let _operation = env_service.lock_operation(&meta.name)?;
         let observation = self
             .environment_service()
             .observe_source_watch(&meta.name)?;
@@ -1098,6 +1116,29 @@ impl Cli {
             SourceWatchState::Active(_) => "active",
             SourceWatchState::Restoring => "restoring",
         };
+        let actual_watching = match &observation {
+            SourceWatchState::Active(active) => Some(active.watching.unwrap_or(true)),
+            _ => {
+                let lease = env_service.observe_source_watch_lease(&meta.name)?;
+                env_service
+                    .source_watch_session(&meta.name)?
+                    .filter(|session| {
+                        !session.closed
+                            && lease.as_ref().is_some_and(|lease| {
+                                lease.held && lease.lease_id == session.lease_id
+                            })
+                    })
+                    .map(|session| session.is_watching())
+            }
+        };
+        // Legacy starting watches may lack mode metadata. Keep their progress
+        // response, but never treat an unknown mode as a matching plain session.
+        if actual_watching != Some(watching) && (actual_watching.is_some() || !watching) {
+            return Err(format!(
+                "dev env {} is running in a different foreground mode or its mode is not yet recorded; stop it before changing --watch",
+                meta.name
+            ));
+        }
         if onboard {
             return Err(format!(
                 "cannot onboard env {} while its source watch is {state}; stop the watch session first",
@@ -1328,18 +1369,26 @@ impl Cli {
                 "--loglevel=debug".to_string(),
             ]);
         }
-        #[cfg(unix)]
-        let mut command = {
-            let mut command = Command::new("/bin/sh");
-            command.args(["-c", SOURCE_WATCH_SETUP_SHIM, "ocm-dev-setup", program]);
-            command.args(&args);
-            command
-        };
-        #[cfg(not(unix))]
-        let mut command = {
-            let mut command = Command::new(program);
-            command.args(&args);
-            command
+        let mut command = if program == "node"
+            && args
+                .first()
+                .is_some_and(|arg| arg == "scripts/run-node.mjs")
+        {
+            source_watch_node_command("scripts/run-node.mjs", &args[1..])
+        } else {
+            #[cfg(unix)]
+            {
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", SOURCE_WATCH_SETUP_SHIM, "ocm-dev-setup", program]);
+                command.args(&args);
+                command
+            }
+            #[cfg(not(unix))]
+            {
+                let mut command = Command::new(program);
+                command.args(&args);
+                command
+            }
         };
         command
             .stdin(Stdio::inherit())
@@ -1512,7 +1561,7 @@ impl Cli {
         mut lease: Option<&mut SourceWatchLease>,
         stop: Option<&AtomicBool>,
     ) -> SourceWatchResult<i32> {
-        let watch = lease.is_some();
+        let watch = lease.as_deref().is_some_and(SourceWatchLease::is_watching);
         let dev = meta
             .dev
             .as_ref()
@@ -1602,15 +1651,20 @@ impl Cli {
             .dev
             .as_ref()
             .ok_or_else(|| format!("environment \"{}\" is missing its dev binding", meta.name))?;
+        let (program, entry) = if lease.is_some() {
+            ("node", "scripts/run-node.mjs")
+        } else {
+            ("pnpm", "openclaw")
+        };
         let args = vec![
-            "openclaw".to_string(),
+            entry.to_string(),
             "onboard".to_string(),
             "--mode".to_string(),
             "local".to_string(),
             "--no-install-daemon".to_string(),
         ];
         self.run_dev_setup(
-            "pnpm",
+            program,
             &args,
             SourcePreparationCommand::Source,
             &build_openclaw_dev_source_env(meta, &self.env, Path::new(&dev.worktree_root)),
@@ -1620,27 +1674,7 @@ impl Cli {
         )
     }
 
-    fn run_dev_gateway(&self, meta: &EnvMeta) -> Result<i32, String> {
-        let dev = meta
-            .dev
-            .as_ref()
-            .ok_or_else(|| format!("environment \"{}\" is missing its dev binding", meta.name))?;
-        let args = vec![
-            "openclaw".to_string(),
-            "gateway".to_string(),
-            "run".to_string(),
-            "--port".to_string(),
-            meta.gateway_port.unwrap_or_default().to_string(),
-        ];
-        run_direct(
-            "pnpm",
-            &args,
-            &build_openclaw_dev_source_env(meta, &self.env, Path::new(&dev.worktree_root)),
-            Path::new(&dev.worktree_root),
-        )
-    }
-
-    fn run_dev_gateway_watch(
+    fn run_dev_gateway(
         &self,
         meta: &EnvMeta,
         source_watch_lease: &mut SourceWatchLease,
@@ -1668,7 +1702,12 @@ impl Cli {
         stop_requested: &AtomicBool,
     ) -> SourceWatchResult<i32> {
         let args = [
-            "scripts/watch-node.mjs".to_string(),
+            if lease.is_watching() {
+                "scripts/watch-node.mjs"
+            } else {
+                "scripts/run-node.mjs"
+            }
+            .to_string(),
             "gateway".to_string(),
             "run".to_string(),
             "--port".to_string(),
@@ -1678,20 +1717,12 @@ impl Cli {
             return Ok(130);
         }
 
-        let mut command = source_watch_node_command(&args[1..]);
-        #[cfg(unix)]
-        let source_watch_force_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } != 1;
+        let mut command = source_watch_node_command(&args[0], &args[1..]);
         command
             .stdin(Stdio::inherit())
             .env_clear()
             .envs(build_openclaw_dev_source_env(meta, &self.env, repo_root))
             .current_dir(repo_root);
-        #[cfg(unix)]
-        if source_watch_force_tty {
-            // watch-node detaches its runner solely from stdin.isTTY. Override that decision
-            // while preserving the real noninteractive stdin and EOF inherited by the runner.
-            command.env("OCM_SOURCE_WATCH_FORCE_TTY", "1");
-        }
         lease.configure_child(&mut command);
 
         let mut log_files = if tee_to_env_logs {
@@ -1896,6 +1927,7 @@ impl Cli {
             return Ok(None);
         }
         let mut source_watch = DevSourceWatchSummary {
+            watching: false,
             state: "inactive",
             pid: None,
             started_at: None,
@@ -1914,6 +1946,7 @@ impl Cli {
             }
             Ok(SourceWatchState::Active(watch)) => {
                 source_watch.state = "active";
+                source_watch.watching = watch.watching.unwrap_or(true);
                 source_watch.pid = Some(watch.watch_pid);
                 source_watch.started_at = Some(watch.started_at);
                 if watch.endpoint.is_none() {
@@ -3225,6 +3258,7 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
             format!("url={}", summary.gateway_url),
             format!("gateway_port_reachable={}", summary.gateway_port_reachable),
             format!("watch={}", summary.source_watch.state),
+            format!("watching={}", summary.source_watch.watching),
             format!("service_running={}", summary.service_running),
             format!(
                 "service_desired_running={}",
@@ -3262,7 +3296,8 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
                     "unreachable"
                 },
             ),
-            KeyValueRow::plain("Source watch", summary.source_watch.state),
+            KeyValueRow::plain("Dev session", summary.source_watch.state),
+            KeyValueRow::plain("Watching", summary.source_watch.watching.to_string()),
             KeyValueRow::plain("Service", dev_service_state(summary)),
         ],
         profile.color,
@@ -3896,7 +3931,8 @@ fn render_dev_status_list(summaries: &[DevStatusSummary], profile: RenderProfile
             "Reachable",
             "Repo",
             "Worktree",
-            "Watch",
+            "Session",
+            "Watching",
             "Service",
         ],
         &summaries
@@ -3913,6 +3949,7 @@ fn render_dev_status_list(summaries: &[DevStatusSummary], profile: RenderProfile
                     Cell::plain(summary.repo_root.as_deref().unwrap_or("unknown")),
                     Cell::plain(summary.worktree_root.as_deref().unwrap_or("unknown")),
                     Cell::plain(summary.source_watch.state),
+                    Cell::plain(summary.source_watch.watching.to_string()),
                     Cell::new(
                         dev_service_state(summary),
                         crate::infra::terminal::Align::Left,
@@ -3953,10 +3990,13 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        for (option, release) in [
-            ("--require", true),
-            ("--import", true),
-            ("--require", false),
+        for (script, option, release) in [
+            ("watch-node.mjs", "--require", true),
+            ("watch-node.mjs", "--import", true),
+            ("watch-node.mjs", "--require", false),
+            ("run-node.mjs", "--require", true),
+            ("run-node.mjs", "--import", true),
+            ("run-node.mjs", "--require", false),
         ] {
             let root = tempfile::TempDir::new().unwrap();
             std::fs::create_dir(root.path().join("scripts")).unwrap();
@@ -3978,7 +4018,7 @@ mod tests {
             )
             .unwrap();
             std::fs::write(
-                root.path().join("scripts/watch-node.mjs"),
+                root.path().join("scripts").join(script),
                 r#"
 import fs from 'node:fs';
 fs.writeFileSync('source-ran', JSON.stringify({
@@ -3990,7 +4030,7 @@ fs.writeFileSync('source-ran', JSON.stringify({
             )
             .unwrap();
             let args = vec!["gateway".to_string(), "value with spaces".to_string()];
-            let mut command = super::source_watch_node_command(&args);
+            let mut command = super::source_watch_node_command(&format!("scripts/{script}"), &args);
             command
                 .current_dir(root.path())
                 .env_clear()
@@ -4243,6 +4283,7 @@ fs.writeFileSync('source-ran', JSON.stringify({
             service_desired_running: true,
             service_pid: Some(123),
             source_watch: DevSourceWatchSummary {
+                watching: false,
                 state: "inactive",
                 pid: None,
                 started_at: None,

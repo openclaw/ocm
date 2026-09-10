@@ -291,7 +291,7 @@ fn install_fake_dev_runners(root: &TestDir, env: &mut std::collections::BTreeMap
         path_string(&pnpm_log)
     );
     let node = format!(
-        "#!/bin/sh\nprintf '%s|%s|%s|%s|bundled=%s|devroot=%s\\n' \"$PWD\" \"$OPENCLAW_CONFIG_PATH\" \"$OPENCLAW_GATEWAY_PORT\" \"$*\" \"$OPENCLAW_BUNDLED_PLUGINS_DIR\" \"$OPENCLAW_DEV_SOURCE_ROOT\" >> \"{}\"\nif [ -n \"$OCM_TEST_NODE_STDOUT\" ]; then printf '%s\\n' \"$OCM_TEST_NODE_STDOUT\"; fi\nif [ -n \"$OCM_TEST_NODE_STDERR\" ]; then printf '%s\\n' \"$OCM_TEST_NODE_STDERR\" >&2; fi\n",
+        "#!/bin/sh\nlogged_args=$(printf '%s' \"$*\" | tr '\\n' ' ')\nprintf '%s|%s|%s|%s|bundled=%s|devroot=%s\\n' \"$PWD\" \"$OPENCLAW_CONFIG_PATH\" \"$OPENCLAW_GATEWAY_PORT\" \"$logged_args\" \"$OPENCLAW_BUNDLED_PLUGINS_DIR\" \"$OPENCLAW_DEV_SOURCE_ROOT\" >> \"{}\"\nif [ -n \"$OCM_TEST_NODE_STDOUT\" ]; then printf '%s\\n' \"$OCM_TEST_NODE_STDOUT\"; fi\nif [ -n \"$OCM_TEST_NODE_STDERR\" ]; then printf '%s\\n' \"$OCM_TEST_NODE_STDERR\" >&2; fi\n",
         path_string(&node_log)
     );
     write_executable_script(&bin_dir.join("pnpm"), &pnpm);
@@ -873,16 +873,16 @@ fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
     assert!(config["agents"].get("list").is_none());
     assert!(workspace_dir.exists());
 
-    let pnpm_log = fs::read_to_string(root.child("pnpm.log")).unwrap();
-    assert!(!pnpm_log.contains("|install"));
-    assert!(pnpm_log.contains("openclaw gateway run --port"));
-    assert!(pnpm_log.contains(&path_string(&worktree_root)));
-    assert!(pnpm_log.contains(&path_string(&config_path)));
-    assert!(pnpm_log.contains(&format!(
+    let node_log = fs::read_to_string(root.child("node.log")).unwrap();
+    assert!(!root.child("pnpm.log").exists());
+    assert!(node_log.contains("scripts/run-node.mjs gateway run --port"));
+    assert!(node_log.contains(&path_string(&worktree_root)));
+    assert!(node_log.contains(&path_string(&config_path)));
+    assert!(node_log.contains(&format!(
         "|bundled={}",
         path_string(&worktree_root.join("extensions"))
     )));
-    assert!(pnpm_log.contains(&format!("|devroot={}", path_string(&worktree_root))));
+    assert!(node_log.contains(&format!("|devroot={}", path_string(&worktree_root))));
     let token = config["gateway"]["auth"]["token"].as_str().unwrap();
     assert_eq!(config["gateway"]["auth"]["mode"], "token");
     assert_eq!(token.len(), 64);
@@ -971,13 +971,13 @@ fn dev_dependencies_reuse_flat_source_tooling_without_running_it() {
         "PNPM_CONFIG_MODULES_DIR".to_string(),
         path_string(&worktree.join("node_modules")),
     );
-    fs::remove_file(root.child("pnpm.log")).unwrap();
+    fs::remove_file(root.child("node.log")).unwrap();
 
     let resumed = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
     assert!(resumed.status.success(), "{}", stderr(&resumed));
-    let log = fs::read_to_string(root.child("pnpm.log")).unwrap();
-    assert!(log.contains("openclaw gateway run"));
-    assert!(!log.contains("|install"));
+    let log = fs::read_to_string(root.child("node.log")).unwrap();
+    assert!(log.contains("scripts/run-node.mjs gateway run"));
+    assert!(!root.child("pnpm.log").exists());
 
     #[cfg(unix)]
     {
@@ -985,11 +985,10 @@ fn dev_dependencies_reuse_flat_source_tooling_without_running_it() {
         let linked_modules = worktree.join("installed-modules");
         fs::rename(&modules, &linked_modules).unwrap();
         std::os::unix::fs::symlink(&linked_modules, &modules).unwrap();
-        fs::remove_file(root.child("pnpm.log")).unwrap();
+        fs::remove_file(root.child("node.log")).unwrap();
         let resumed = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
         assert!(resumed.status.success(), "{}", stderr(&resumed));
-        let log = fs::read_to_string(root.child("pnpm.log")).unwrap();
-        assert!(!log.contains("|install"));
+        assert!(!root.child("pnpm.log").exists());
         assert_eq!(fs::read_link(&modules).unwrap(), linked_modules);
     }
 }
@@ -1236,6 +1235,7 @@ fn dev_dependencies_preserve_reported_lifecycle_uncertainty() {
             &dev_plain(&["demo", "--repo", &path_string(&repo)]),
         );
         assert!(created.status.success(), "{label}: {}", stderr(&created));
+        fs::remove_file(root.child("node.log")).unwrap();
         let meta = get_environment("demo", &env, &cwd).unwrap();
         let source = Path::new(&meta.dev.as_ref().unwrap().worktree_root);
         declare_source_tooling(source);
@@ -1527,13 +1527,14 @@ fn dev_dependencies_do_not_repair_through_linked_install_targets() {
         let target = worktree.join("borrowed-modules");
         fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        fs::remove_file(root.child("pnpm.log")).unwrap();
+        fs::remove_file(root.child("node.log")).unwrap();
 
         let failed = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
         assert!(!failed.status.success());
         assert!(stderr(&failed).contains("refusing to install"));
         assert_eq!(fs::read_link(&link).unwrap(), target);
         assert!(!root.child("pnpm.log").exists());
+        assert!(!root.child("node.log").exists());
     }
 }
 
@@ -1557,14 +1558,14 @@ fn dev_command_does_not_recreate_a_missing_saved_worktree() {
     let worktree_root = PathBuf::from(show_json["devWorktreeRoot"].as_str().unwrap());
     let registered = git_worktree_paths(&repo);
     fs::remove_dir_all(&worktree_root).unwrap();
-    fs::remove_file(root.child("pnpm.log")).unwrap();
+    fs::remove_file(root.child("node.log")).unwrap();
 
     let second = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
     assert!(!second.status.success());
     assert!(stderr(&second).contains("saved dev worktree is missing"));
     assert!(!worktree_root.exists());
     assert_eq!(git_worktree_paths(&repo), registered);
-    assert!(!root.child("pnpm.log").exists());
+    assert!(!root.child("node.log").exists());
     let meta = get_environment("demo", &env, &cwd).unwrap();
     assert_eq!(meta.dev.unwrap().worktree_root, path_string(&worktree_root));
 
@@ -1634,7 +1635,7 @@ fn dev_command_resumes_the_recorded_worktree_without_recreating_the_default() {
         "console.log('edited');\n",
     )
     .unwrap();
-    fs::remove_file(root.child("pnpm.log")).unwrap();
+    fs::remove_file(root.child("node.log")).unwrap();
 
     let resumed = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
     assert!(resumed.status.success(), "{}", stderr(&resumed));
@@ -1647,14 +1648,14 @@ fn dev_command_resumes_the_recorded_worktree_without_recreating_the_default() {
         fs::read_to_string(recorded_worktree.join("scripts/run-node.mjs")).unwrap(),
         "console.log('edited');\n"
     );
-    let pnpm_log = fs::read_to_string(root.child("pnpm.log")).unwrap();
-    assert!(pnpm_log.contains("openclaw gateway run --port"));
+    let node_log = fs::read_to_string(root.child("node.log")).unwrap();
+    assert!(node_log.contains("scripts/run-node.mjs gateway run --port"));
     let source_prefix = format!(
         "{}|",
         path_string(&fs::canonicalize(&recorded_worktree).unwrap())
     );
     assert!(
-        pnpm_log
+        node_log
             .lines()
             .all(|line| line.starts_with(&source_prefix))
     );
@@ -1680,12 +1681,12 @@ fn dev_command_rejects_an_unrelated_recorded_worktree_before_running_source() {
     let mut meta = get_environment("demo", &env, &cwd).unwrap();
     meta.dev.as_mut().unwrap().worktree_root = path_string(&unrelated_worktree);
     save_environment(meta, &env, &cwd).unwrap();
-    fs::remove_file(root.child("pnpm.log")).unwrap();
+    fs::remove_file(root.child("node.log")).unwrap();
 
     let resumed = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
     assert!(!resumed.status.success());
     assert!(stderr(&resumed).contains("saved dev worktree is not registered"));
-    assert!(!root.child("pnpm.log").exists());
+    assert!(!root.child("node.log").exists());
     assert_eq!(
         fs::read_to_string(unrelated_worktree.join("SENTINEL")).unwrap(),
         "preserve me\n"
@@ -2264,10 +2265,8 @@ fn dev_command_can_onboard_then_watch() {
     );
     assert!(run.status.success(), "{}", stderr(&run));
 
-    let pnpm_log = fs::read_to_string(root.child("pnpm.log")).unwrap();
-    assert!(pnpm_log.contains("openclaw onboard --mode local --no-install-daemon"));
-
     let node_log = fs::read_to_string(root.child("node.log")).unwrap();
+    assert!(node_log.contains("scripts/run-node.mjs onboard --mode local --no-install-daemon"));
     assert!(node_log.contains("scripts/watch-node.mjs"));
     assert!(node_log.contains("gateway run --port"));
     assert!(!source_watch_override_path(&root, "demo").exists());
@@ -3400,6 +3399,72 @@ fn dev_stop_keeps_dotted_environment_watch_ownership_separate() {
 
 #[cfg(unix)]
 #[test]
+fn dev_foreground_reuses_plain_mode_and_named_stop_preserves_source() {
+    let root = TestDir::new("dev-plain-owned-reuse");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = service_env(&root);
+    let (started, _, starts) = install_blocking_fake_dev_runners(&root, &mut env);
+    let mut foreground = DevWatchFixture::spawn(
+        &root,
+        &cwd,
+        &env,
+        &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+    );
+    assert!(wait_for_path(&started, Duration::from_secs(30)));
+    let session_path = source_watch_override_path(&root, "demo").with_extension("session");
+    let owner_before = fs::read(&session_path).unwrap();
+    let session: Value = serde_json::from_slice(&owner_before).unwrap();
+    assert_eq!(session["kind"], "ocm-source-foreground-session-v1");
+    assert_eq!(session["watching"], false);
+    let meta = get_environment("demo", &env, &cwd).unwrap();
+    let source = Path::new(&meta.dev.as_ref().unwrap().worktree_root);
+    let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["gateway"].as_object_mut().unwrap().remove("mode");
+    config["gateway"].as_object_mut().unwrap().remove("bind");
+    let config_before = serde_json::to_vec(&config).unwrap();
+    fs::write(&config_path, &config_before).unwrap();
+    fs::write(source.join("SENTINEL"), "managed source edits\n").unwrap();
+
+    let reused = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
+    assert!(reused.status.success(), "{}", stderr(&reused));
+    assert!(stdout(&reused).contains("watching=false"));
+    assert!(stdout(&reused).contains(&format!("http://127.0.0.1:{}", meta.gateway_port.unwrap())));
+    let changed_mode = run_ocm(&cwd, &env, &dev_watch(&["demo", "--watch"]));
+    assert!(!changed_mode.status.success());
+    assert!(stderr(&changed_mode).contains("different foreground mode"));
+    let service = run_ocm(&cwd, &env, &["dev", "demo", "--service"]);
+    assert!(!service.status.success());
+    let status = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&status)).unwrap()["sourceWatch"]["watching"],
+        false
+    );
+    assert_eq!(fs::read(&session_path).unwrap(), owner_before);
+    assert_eq!(fs::read(&config_path).unwrap(), config_before);
+    assert_eq!(fs::read_to_string(&starts).unwrap().lines().count(), 1);
+
+    let stopped = run_dev_stop(&cwd, &env);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let output = foreground.wait_without_release();
+    assert_eq!(output.status.code(), Some(130), "{}", stderr(&output));
+    assert_eq!(read_source_watch_session(&root)["closed"], true);
+    assert!(Path::new(&meta.root).is_dir());
+    assert_eq!(
+        fs::read_to_string(source.join("SENTINEL")).unwrap(),
+        "managed source edits\n"
+    );
+    assert_eq!(
+        serde_json::to_value(get_environment("demo", &env, &cwd).unwrap().dev).unwrap(),
+        serde_json::to_value(&meta.dev).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_watch_retains_unverified_worker_ownership_across_retries() {
     struct OwnedProcess(std::process::Child);
     impl Drop for OwnedProcess {
@@ -3408,24 +3473,55 @@ fn dev_watch_retains_unverified_worker_ownership_across_retries() {
             let _ = self.0.wait();
         }
     }
-    for failure in ["eof", "signal", "controller"] {
-        let root = TestDir::new(&format!("dev-watch-unverified-{failure}"));
+    for (failure, watching) in [
+        ("eof", true),
+        ("signal", true),
+        ("controller", true),
+        ("eof", false),
+        ("signal", false),
+        ("controller", false),
+    ] {
+        let root = TestDir::new(&format!("dev-unverified-{failure}-{watching}"));
         let repo = init_openclaw_repo(&root);
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
         let mut env = service_env_with_gateway_admission(&root);
         env.insert("OCM_TEST_FOREGROUND_ROOT".into(), path_string(root.path()));
         env.insert("OCM_TEST_WATCH_FAILURE".into(), failure.into());
-        create_runtime_backed_env(&cwd, &env);
-        let started_service = run_ocm(&cwd, &env, &["service", "start", "demo"]);
-        assert!(
-            started_service.status.success(),
-            "{}",
-            stderr(&started_service)
-        );
+        let source = if watching {
+            create_runtime_backed_env(&cwd, &env);
+            let started_service = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+            assert!(
+                started_service.status.success(),
+                "{}",
+                stderr(&started_service)
+            );
+            repo.clone()
+        } else {
+            let mut setup_env = env.clone();
+            install_fake_dev_runners(&root, &mut setup_env);
+            let created = run_ocm(
+                &cwd,
+                &setup_env,
+                &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+            );
+            assert!(created.status.success(), "{}", stderr(&created));
+            PathBuf::from(
+                get_environment("demo", &env, &cwd)
+                    .unwrap()
+                    .dev
+                    .unwrap()
+                    .worktree_root,
+            )
+        };
+        let entry = source.join(if watching {
+            "scripts/watch-node.mjs"
+        } else {
+            "scripts/run-node.mjs"
+        });
         // Each worker has a separate group and no inherited lease descriptor.
         // EOF holds the outer stderr pipe; the other rows use private pipes.
-        fs::write(repo.join("scripts/watch-node.mjs"), r#"
+        fs::write(&entry, r#"
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -3454,7 +3550,10 @@ if (failure === 'eof') process.exit(23);
 setInterval(() => { if (fs.existsSync(path.join(root, 'source-watch.release'))) process.exit(0); }, 25);
 "#).unwrap();
         let repo_arg = path_string(&repo);
-        let args = ["dev", "demo", "--repo", &repo_arg, "--watch", "--force"];
+        let mut args = vec!["dev", "demo", "--repo", &repo_arg];
+        if watching {
+            args.extend(["--watch", "--force"]);
+        }
         let mut watch = DevWatchFixture::spawn(&root, &cwd, &env, &args);
         assert!(wait_for_path(
             &root.child("source-watch.started"),
@@ -3467,15 +3566,12 @@ setInterval(() => { if (fs.existsSync(path.join(root, 'source-watch.release'))) 
             .unwrap();
         let session = read_source_watch_session(&root);
         let leader = session["child"]["pid"].as_u64().unwrap() as u32;
-        assert_eq!(session["kind"], "ocm-source-watch-session-v2");
+        assert_eq!(session["kind"], "ocm-source-foreground-session-v1");
+        assert_eq!(session["watching"], watching);
         assert!(process_is_alive(descendant));
         // The existing module and worker are loaded. Any broken future admission
         // now runs a finite entry instead of spawning another detached worker.
-        fs::write(
-            repo.join("scripts/watch-node.mjs"),
-            "console.log('unexpected restart');\n",
-        )
-        .unwrap();
+        fs::write(&entry, "console.log('unexpected restart');\n").unwrap();
         let mut unrelated = OwnedProcess(
             Command::new("/bin/sleep")
                 .arg("300")
@@ -3586,6 +3682,7 @@ fn dev_watch_interactive_setup_requires_completion_evidence() {
         install_fake_dev_runners(&root, &mut env);
         let created = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
         assert!(created.status.success(), "{}", stderr(&created));
+        fs::remove_file(root.child("node.log")).unwrap();
         env.insert("OCM_TEST_FOREGROUND_ROOT".into(), path_string(root.path()));
         env.insert(
             "OCM_TEST_SETUP_SUCCESS".into(),
@@ -3604,13 +3701,16 @@ spawn(process.execPath,['-e',worker],{detached:true,stdio:'ignore',env:process.e
 setInterval(() => { if (fs.existsSync(path.join(root,'source-watch.release'))) process.exit(0); },25);
 "#).unwrap();
         let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+        let node_path = root.child("fake-dev-bin/node");
+        let gateway_runner = fs::read_to_string(&node_path).unwrap();
+        let onboard = format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *' onboard '*) exec {} {} ;;\nesac\n",
+            quote(&node),
+            quote(&path_string(&script))
+        );
         write_executable_script(
-            &root.child("fake-dev-bin/pnpm"),
-            &format!(
-                "#!/bin/sh\nexec {} {}\n",
-                quote(&node),
-                quote(&path_string(&script))
-            ),
+            &node_path,
+            &gateway_runner.replacen("#!/bin/sh\n", &onboard, 1),
         );
         let (child, terminal) = spawn_ocm_with_controlling_pty(
             &cwd,
@@ -3673,8 +3773,15 @@ setInterval(() => { if (fs.existsSync(path.join(root,'source-watch.release'))) p
 #[cfg(unix)]
 #[test]
 fn dev_stop_cancels_owned_preparation_before_gateway_start() {
-    for phase in ["dependencies", "probe", "onboard"] {
-        let root = TestDir::new(&format!("dev-stop-{phase}"));
+    for (phase, watching) in [
+        ("dependencies", true),
+        ("probe", true),
+        ("onboard", true),
+        ("dependencies", false),
+        ("probe", false),
+        ("onboard", false),
+    ] {
+        let root = TestDir::new(&format!("dev-stop-{phase}-{watching}"));
         let repo = init_openclaw_repo(&root);
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
@@ -3705,12 +3812,16 @@ fn dev_stop_cancels_owned_preparation_before_gateway_start() {
             path_string(&started),
             path_string(&release),
         );
-        if phase == "probe" {
+        if phase != "dependencies" {
             write_fake_dev_node(&root, &script);
         } else {
             write_executable_script(&root.child("fake-dev-bin/pnpm"), &script);
         }
-        let mut args = dev_watch(&["demo", "--watch"]);
+        let mut args = if watching {
+            dev_watch(&["demo", "--watch"])
+        } else {
+            dev_plain(&["demo"])
+        };
         if phase == "onboard" {
             args.push("--onboard");
         }
@@ -3726,6 +3837,7 @@ fn dev_stop_cancels_owned_preparation_before_gateway_start() {
             .unwrap();
         let session = read_source_watch_session(&root);
         assert_eq!(session["child"]["pid"], pid);
+        assert_eq!(session["watching"], watching);
         let status = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
         let stopped = run_dev_stop(&cwd, &env);
         let watched = watch.finish();
@@ -3971,6 +4083,8 @@ fn dev_watch_reuses_active_session_and_reclaims_the_released_lock() {
 
     let overlap = run_ocm(&cwd, &env, &dev_watch(&["demo", "--watch"]));
     let conflicting = [
+        vec!["dev", "demo"],
+        vec!["dev", "demo", "--service"],
         vec!["dev", "demo", "--watch", "--repo", cwd.to_str().unwrap()],
         vec!["dev", "demo", "--watch", "--root", cwd.to_str().unwrap()],
         vec!["dev", "demo", "--watch", "--port", "1"],
@@ -4039,6 +4153,7 @@ fn dev_watch_reuses_active_session_and_reclaims_the_released_lock() {
     assert!(status.status.success(), "{}", stderr(&status));
     let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
     assert_eq!(status["gatewayPort"], first_port);
+    assert_eq!(status["sourceWatch"]["watching"], true);
     assert_eq!(
         resolved.process_env.get("OPENCLAW_GATEWAY_PORT"),
         Some(&first_port.to_string())

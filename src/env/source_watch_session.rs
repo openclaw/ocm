@@ -13,7 +13,8 @@ use crate::infra::process_identity::{
 use crate::store::{display_path, source_watch_override_path, validate_name, write_json};
 
 const LEGACY_SESSION_KIND: &str = "ocm-source-watch-session";
-const SESSION_KIND: &str = "ocm-source-watch-session-v2";
+const WATCH_V2_SESSION_KIND: &str = "ocm-source-watch-session-v2";
+const SESSION_KIND: &str = "ocm-source-foreground-session-v1";
 const STOP_KIND: &str = "ocm-source-watch-stop";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,6 +30,8 @@ pub(crate) struct SourceWatchSession {
     pub(crate) controller: ProcessIdentity,
     pub(crate) child: Option<ProcessIdentity>,
     pub(crate) child_spawn_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) watching: Option<bool>,
     pub(crate) restore_service: bool,
     #[serde(default)]
     pub(crate) closed: bool,
@@ -84,6 +87,7 @@ impl SourceWatchSessionPaths {
         &self,
         meta: &EnvMeta,
         lease_id: &str,
+        watching: bool,
     ) -> Result<SourceWatchSession, String> {
         let session = SourceWatchSession {
             kind: SESSION_KIND.to_string(),
@@ -95,6 +99,7 @@ impl SourceWatchSessionPaths {
             controller: current_process_identity()?,
             child: None,
             child_spawn_pending: false,
+            watching: Some(watching),
             restore_service: false,
             closed: false,
             completion: None,
@@ -111,7 +116,10 @@ impl SourceWatchSessionPaths {
         let Some(session) = read_optional_json::<SourceWatchSession>(&self.session)? else {
             return Ok(None);
         };
-        if (session.kind != SESSION_KIND && session.kind != LEGACY_SESSION_KIND)
+        if !matches!(
+            session.kind.as_str(),
+            SESSION_KIND | WATCH_V2_SESSION_KIND | LEGACY_SESSION_KIND
+        ) || (session.kind == SESSION_KIND && session.watching.is_none())
             || session.env_name != env_name
             || session.lease_id.trim().is_empty()
             || session.controller.pid == 0
@@ -246,6 +254,10 @@ impl SourceWatchSessionPaths {
 }
 
 impl SourceWatchSession {
+    pub(crate) fn is_watching(&self) -> bool {
+        self.kind != SESSION_KIND || self.watching.unwrap_or(true)
+    }
+
     pub(crate) fn is_legacy_watch(&self) -> bool {
         self.kind == LEGACY_SESSION_KIND
     }
@@ -485,6 +497,7 @@ mod tests {
             },
             child: None,
             child_spawn_pending: false,
+            watching: Some(false),
             restore_service: false,
             closed: false,
             completion: None,
@@ -541,6 +554,32 @@ mod tests {
             restored_only.unsafe_cleanup_error().is_none(),
             "verified child cleanup permits restoration retry"
         );
+        for (kind, watching, valid) in [
+            (SESSION_KIND, Some(false), true),
+            (WATCH_V2_SESSION_KIND, None, true),
+            (LEGACY_SESSION_KIND, None, true),
+            (SESSION_KIND, None, false),
+            ("ocm-dev-source-session", Some(false), false),
+            ("ocm-dev-source-session-v2", Some(false), false),
+            ("ocm-dev-foreground-session", Some(false), false),
+            ("ocm-dev-foreground-session-v2", Some(false), false),
+        ] {
+            let mut candidate = legacy.clone();
+            candidate.kind = kind.to_string();
+            candidate.watching = watching;
+            write_json(&paths.session, &candidate).unwrap();
+            let loaded = paths.load_session("demo");
+            assert_eq!(loaded.is_ok(), valid, "{kind}");
+            if valid {
+                let loaded = loaded.unwrap().unwrap();
+                assert_eq!(loaded.is_watching(), kind != SESSION_KIND);
+                #[cfg(unix)]
+                assert_eq!(
+                    loaded.requires_controller_completion(),
+                    kind != LEGACY_SESSION_KIND
+                );
+            }
+        }
     }
 
     #[test]
@@ -560,6 +599,7 @@ mod tests {
             controller: current_process_identity().unwrap(),
             child: None,
             child_spawn_pending: false,
+            watching: Some(false),
             restore_service: false,
             closed: false,
             completion: None,
