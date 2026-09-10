@@ -1535,7 +1535,11 @@ fn dev_ui_reuse_discards_disconnected_callers_and_closes_pending_requests_on_sto
                 let completed = completed.clone();
                 scope.spawn(move || {
                     ready.wait();
-                    let connection = std::os::unix::net::UnixStream::connect(endpoint);
+                    let connection =
+                        std::os::unix::net::UnixStream::connect(endpoint).and_then(|stream| {
+                            stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+                            Ok(stream)
+                        });
                     let _ = completed.send(connection.as_ref().map(|_| ()).map_err(|e| e.kind()));
                     connection
                 })
@@ -1570,9 +1574,6 @@ fn dev_ui_reuse_discards_disconnected_callers_and_closes_pending_requests_on_sto
                 "queued connection survived listener closure"
             );
             if let Ok(mut stream) = client.join().unwrap() {
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(250)))
-                    .unwrap();
                 assert!(match stream.read(&mut [0; 1]) {
                     Ok(0) => true,
                     Err(error) => error.kind() == std::io::ErrorKind::ConnectionReset,
