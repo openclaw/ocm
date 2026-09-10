@@ -116,11 +116,13 @@ EOF
 
 printf '%s\n' \
   HOME \
+  USERPROFILE \
   OCM_HOME \
   OPENCLAW_HOME \
   OPENCLAW_STATE_DIR \
   OPENCLAW_CONFIG_PATH \
   OCM_ACTIVE_ENV \
+  OCM_ACTIVE_ENV_ROOT \
   OPENCLAW_PROFILE \
   > "$evidence_root/environment-variable-names.txt"
 
@@ -201,7 +203,8 @@ fi
 run_lane() {
   lane_name=$1
   ocm_binary=$2
-  expected_change=$3
+  environment_mode=$3
+  expected_change=$4
   lane_root="$evidence_root/$lane_name"
   lane_home="$lane_root/home"
   lane_state="$lane_home/.openclaw"
@@ -223,7 +226,7 @@ run_lane() {
     exit 1
   fi
 
-  if [ "$expected_change" = "source" ]; then
+  if [ "$environment_mode" = "caller" ]; then
     printf 'env -i HOME=<FIXTURE_ROOT>/%s/home OCM_HOME=<FIXTURE_ROOT>/%s/ocm PATH=<NODE_AND_OCM_PATH> ocm runtime install --version 2026.8.1-beta.2 --json\n' \
       "$lane_name" "$lane_name" > "$lane_root/command.txt"
     env -i \
@@ -233,7 +236,7 @@ run_lane() {
       PATH="$PATH" \
       "$ocm_binary" runtime install --version 2026.8.1-beta.2 --json \
       > "$lane_root/ocm.stdout.json" 2> "$lane_root/ocm.stderr.txt"
-  else
+  elif [ "$environment_mode" = "explicit" ]; then
     postinstall_state="$lane_root/postinstall-state"
     mkdir -p "$postinstall_state"
     printf 'env -i HOME=<FIXTURE_ROOT>/%s/home OCM_HOME=<FIXTURE_ROOT>/%s/ocm PATH=<NODE_AND_OCM_PATH> OPENCLAW_HOME=<FIXTURE_ROOT>/%s/postinstall-state OPENCLAW_STATE_DIR=<FIXTURE_ROOT>/%s/postinstall-state OPENCLAW_CONFIG_PATH=<FIXTURE_ROOT>/%s/postinstall-state/openclaw.json ocm runtime install --version 2026.8.1-beta.2 --json\n' \
@@ -249,6 +252,9 @@ run_lane() {
       OPENCLAW_CONFIG_PATH="$postinstall_state/openclaw.json" \
       "$ocm_binary" runtime install --version 2026.8.1-beta.2 --json \
       > "$lane_root/ocm.stdout.json" 2> "$lane_root/ocm.stderr.txt"
+  else
+    echo "$lane_name has unknown environment mode: $environment_mode" >&2
+    exit 1
   fi
 
   node "$db_meta_script" "$lane_database" > "$lane_root/after.json"
@@ -273,8 +279,10 @@ run_lane() {
     result="source-unchanged"
   fi
 
-  printf '{\n  "lane": "%s",\n  "result": "%s",\n  "beforeVersion": %s,\n  "afterVersion": %s,\n  "sourceHashChanged": %s,\n  "sourceConfigHashChanged": %s\n}\n' \
+  printf '{\n  "lane": "%s",\n  "environmentMode": "%s",\n  "expectedChange": "%s",\n  "result": "%s",\n  "beforeVersion": %s,\n  "afterVersion": %s,\n  "sourceHashChanged": %s,\n  "sourceConfigHashChanged": %s\n}\n' \
     "$lane_name" \
+    "$environment_mode" \
+    "$expected_change" \
     "$result" \
     "$before_version" \
     "$after_version" \
@@ -283,8 +291,8 @@ run_lane() {
     > "$lane_root/result.json"
 }
 
-run_lane v0.2.32 "$legacy_ocm" source
-run_lane current-main "$current_ocm" control
-run_lane explicit-path-control "$current_ocm" control
+run_lane v0.2.32 "$legacy_ocm" caller source
+run_lane current-main "$current_ocm" caller unchanged
+run_lane explicit-path-control "$current_ocm" explicit unchanged
 
 printf 'OCM #98 clean-room reproduction completed.\n' > "$evidence_root/complete.txt"
