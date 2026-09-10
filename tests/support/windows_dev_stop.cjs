@@ -98,7 +98,7 @@ function capture(child) {
 }
 function sessionPath(name) { return path.join(env.OCM_HOME, 'source-watch', name + '.session'); }
 function session(name) { return JSON.parse(fs.readFileSync(sessionPath(name), 'utf8')); }
-async function start(name, watching = true) {
+async function start(name, watching = true, withUi = false) {
   const directory = path.join(root, name);
   const repo = path.join(directory, 'repo');
   fs.mkdirSync(path.join(repo, 'scripts'), {recursive:true});
@@ -119,6 +119,24 @@ async function start(name, watching = true) {
   ].join('\n');
   fs.writeFileSync(path.join(repo, 'scripts', 'watch-node.mjs'), watch);
   fs.writeFileSync(path.join(repo, 'scripts', 'run-node.mjs'), watch);
+  if (withUi) {
+    fs.mkdirSync(path.join(repo, 'ui'), {recursive:true});
+    fs.writeFileSync(path.join(repo, 'ui', 'package.json'), '{"name":"ui-fixture"}');
+    fs.writeFileSync(path.join(repo, 'ui', 'index.html'), '<!doctype html><title>UI fixture</title>');
+    fs.copyFileSync(path.join(__dirname, 'dev_ui.cjs'), path.join(repo, 'scripts', 'dev-ui-fixture.cjs'));
+    fs.writeFileSync(path.join(repo, 'scripts', 'ui.js'), "require('./dev-ui-fixture.cjs');\n");
+    for (const entry of ['watch-node.mjs', 'run-node.mjs']) {
+      fs.writeFileSync(path.join(repo, 'scripts', entry), "import './dev-ui-fixture.cjs';\n");
+    }
+    fs.writeFileSync(path.join(repo, 'openclaw.mjs'), "import './scripts/dev-ui-fixture.cjs';\n");
+    for (const name of ['vite', 'dompurify']) {
+      const module = path.join(repo, 'node_modules', name);
+      fs.mkdirSync(module, {recursive:true});
+      fs.writeFileSync(path.join(module, 'package.json'), JSON.stringify({name, main:'index.js'}));
+      fs.writeFileSync(path.join(module, 'index.js'), "throw new Error('UI inspection must not execute package code');\n");
+    }
+    fs.writeFileSync(path.join(directory, 'dashboard-hold'), 'hold');
+  }
   fs.writeFileSync(path.join(repo, 'SENTINEL'), 'preserve source');
   const init = cp.spawnSync('git', ['init','--quiet',repo], {env, encoding:'utf8', timeout:15000});
   if (init.error) throw init.error;
@@ -134,30 +152,64 @@ async function start(name, watching = true) {
       assert.equal(saved.status, 0, saved.stderr);
     }
   }
-  const args = ['dev',name,'--repo',repo,...(watching ? ['--watch','--force'] : ['--root',envRoot,'--port',port])];
-  const controller = cp.spawn(binary, args, {cwd:root, env, stdio:['ignore','pipe','pipe'], windowsHide:true});
+  if (withUi) {
+    fs.mkdirSync(path.join(envRoot, '.openclaw'), {recursive:true});
+    fs.writeFileSync(path.join(envRoot, '.openclaw', 'openclaw.json'), JSON.stringify({
+      gateway:{controlUi:{basePath:'/console'}, auth:{mode:'token', token:'synthetic-fixture-auth'}},
+    }));
+  }
+  const args = ['dev',name,'--repo',repo,...(watching ? ['--watch','--force'] : ['--root',envRoot,'--port',port]), ...(withUi ? ['--ui'] : [])];
+  const sourceEnv = withUi ? {...env, OCM_TEST_DEV_UI_DIR:directory, OCM_TEST_DEV_UI_DESCENDANTS:'1'} : env;
+  const controller = cp.spawn(binary, args, {cwd:root, env:sourceEnv, stdio:['ignore','pipe','pipe'], windowsHide:true});
   const output = capture(controller);
   const record = {name, directory, repo, controller, output, identities:[]};
   tracked.push(record);
   assert.ok(controller.pid, 'Controller did not spawn');
   const controllerIdentity = {pid:controller.pid, startedAt:startIdentity(controller.pid)};
   record.identities.push(controllerIdentity);
-  await waitFor(() => fs.existsSync(ready), () => 'Source process did not start: ' + name + '\n' + output());
-  assert.equal(path.basename(fs.readFileSync(ready, 'utf8')), watching ? 'watch-node.mjs' : 'run-node.mjs');
+  const gatewayFile = path.join(directory, 'gateway.json');
+  const uiFile = path.join(directory, 'ui.json');
+  await waitFor(() => withUi ? fs.existsSync(gatewayFile) && fs.existsSync(uiFile) : fs.existsSync(ready),
+    () => 'Source process did not start: ' + name + '\n' + output());
   const owner = session(name);
-  const watcher = Number(fs.readFileSync(rootPid,'utf8'));
-  const descendant = Number(fs.readFileSync(descendantPid,'utf8'));
+  const gateway = withUi ? JSON.parse(fs.readFileSync(gatewayFile)) : {
+    pid:Number(fs.readFileSync(rootPid,'utf8')), descendantPid:Number(fs.readFileSync(descendantPid,'utf8')),
+  };
+  if (!withUi) assert.equal(path.basename(fs.readFileSync(ready, 'utf8')), watching ? 'watch-node.mjs' : 'run-node.mjs');
+  const watcher = gateway.pid;
+  const descendant = gateway.descendantPid;
   assert.equal(owner.controller.pid, controller.pid);
-  assert.equal(owner.child.pid, watcher);
-  assert.equal(owner.childSpawnPending, false);
-  assert.equal(owner.kind, 'ocm-source-foreground-session-v1');
+  assert.equal(owner.kind, withUi ? 'ocm-source-ui-session-v1' : 'ocm-source-foreground-session-v1');
   assert.equal(owner.watching, watching);
   assert.deepEqual(owner.controller, controllerIdentity);
   const childIdentity = {pid:watcher, startedAt:startIdentity(watcher)};
-  assert.deepEqual(owner.child, childIdentity);
+  assert.deepEqual(withUi ? owner.ui.children.gateway : owner.child, childIdentity);
+  assert.equal(owner.childSpawnPending, false);
   record.identities.push(childIdentity, {pid:descendant, startedAt:startIdentity(descendant)});
+  record.sourcePids = [watcher, descendant];
+  if (withUi) {
+    const ui = JSON.parse(fs.readFileSync(uiFile));
+    const uiIdentity = {pid:ui.pid, startedAt:startIdentity(ui.pid)};
+    assert.deepEqual(owner.ui.children.ui, uiIdentity);
+    assert.equal(owner.ui.pending, null);
+    assert.equal(owner.ui.target.port, ui.port);
+    assert.equal(gateway.cwd, ui.cwd);
+    assert.ok(ui.args.includes('--strictPort'));
+    record.identities.push(uiIdentity, {pid:ui.descendantPid, startedAt:startIdentity(ui.descendantPid)});
+    record.sourcePids.push(ui.pid, ui.descendantPid);
+    assert.ok(!fs.existsSync(path.join(directory, 'dashboard-attempts')), 'Gateway document readiness was bypassed');
+    fs.writeFileSync(path.join(directory, 'gateway-document-ready'), 'ready');
+    const helperFile = path.join(directory, 'dashboard-attempt-1');
+    await waitFor(() => fs.existsSync(helperFile), () => 'Native handoff did not start\n' + output());
+    const pid = Number(fs.readFileSync(helperFile));
+    const helperIdentity = {pid, startedAt:startIdentity(pid)};
+    assert.deepEqual(session(name).ui.children.command, helperIdentity);
+    record.identities.push(helperIdentity);
+    record.sourcePids.push(pid);
+    record.helperPid = pid;
+  }
   assert.ok(record.identities.every(identity => /^\d+$/.test(identity.startedAt)));
-  assert.ok(alive(watcher) && alive(descendant));
+  assert.ok(record.sourcePids.every(alive));
   record.original = fs.readFileSync(sessionPath(name));
   record.watcher = watcher;
   record.descendant = descendant;
@@ -176,7 +228,7 @@ async function stop(name) {
 async function crash(record) {
   assert.ok(killRecordedProcess(record.controller.pid, record.identities[0].startedAt), 'Controller was not running before the crash');
   await waitFor(() => record.controller.exitCode !== null || record.controller.signalCode !== null, 'Controller did not exit');
-  await waitFor(() => !alive(record.watcher) && !alive(record.descendant), 'Kill-on-close job did not stop both source processes');
+  await waitFor(() => record.sourcePids.every(pid => !alive(pid)), 'Kill-on-close jobs left an owned source process running');
 }
 async function checkPreserved(record) {
   assert.equal(fs.readFileSync(path.join(record.directory,'env','SENTINEL'),'utf8'), 'preserve environment');
@@ -212,17 +264,22 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     // No subprocess may be created before this handshake completes.
     assert.equal(native('ready').ready, true);
     run(['runtime','add','proof-node','--path',process.execPath]);
-    const normal = await start('normal.stop');
+    const normal = await start('normal.stop', true, true);
+    fs.rmSync(path.join(normal.directory, 'dashboard-hold'));
+    await waitFor(() => !alive(normal.helperPid) && !session(normal.name).ui.children.command && normal.output().includes('UI: '),
+      'Completed initial handoff was not acknowledged');
+    assert.match(normal.output(), /UI: http:\/\/127\.0\.0\.1:\d+\/#bootstrapToken=synthetic-owner-grant-1/);
+    assert.ok(!normal.output().includes('synthetic-legacy'));
     const active = JSON.parse(run(['dev','status',normal.name,'--json']).stdout);
     assert.equal(active.sourceWatch.state, 'active', 'Held watch lease was not readable by dev status');
     assert.equal(active.sourceWatch.watching, true);
     await stop(normal.name);
-    await waitFor(() => !alive(normal.watcher) && !alive(normal.descendant), 'Named stop left its source tree running');
+    await waitFor(() => normal.sourcePids.every(pid => !alive(pid)), 'Named stop left a Gateway/UI tree running');
     await waitFor(() => normal.controller.exitCode !== null, 'Controller did not acknowledge named stop');
     await checkPreserved(normal);
     const again = JSON.parse(run(['dev','stop',normal.name,'--json']).stdout);
     assert.equal(again.stopped, false);
-    results.push('native named stop, descendant cleanup, repeat stop, env/source preservation');
+    results.push('native initial UI handoff, both component trees stopped, repeat stop, env/source preservation');
 
     const plain = await start('plain.stop', false);
     const plainStatus = JSON.parse(run(['dev','status',plain.name,'--json']).stdout);
@@ -234,11 +291,11 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     await checkPreserved(plain);
     results.push('native plain named stop, descendant cleanup, env/source preservation');
 
-    const crashed = await start('crashed');
+    const crashed = await start('crashed', true, true);
     await crash(crashed);
     await stop(crashed.name);
     await checkPreserved(crashed);
-    results.push('controller crash, kill-on-close job cleanup, closed recovery');
+    results.push('controller crash, Gateway/UI/helper job cleanup, closed recovery');
 
     const reused = await start('reused');
     await crash(reused);

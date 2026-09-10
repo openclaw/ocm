@@ -85,6 +85,24 @@ fn reserve_foreign_openclaw_port_family(
     }
 }
 
+pub(crate) fn choose_source_ui_port(
+    envs: &[EnvMeta],
+    active_ui_ports: &[u32],
+    env: &BTreeMap<String, String>,
+) -> Result<u32, String> {
+    let mut claimed = BTreeSet::new();
+    reserve_foreign_openclaw_port_family(env, &mut claimed);
+    for port in resolve_effective_gateway_ports(envs, env).values().copied() {
+        reserve_openclaw_port_family(port, &mut claimed);
+    }
+    claimed.extend(active_ui_ports);
+    (5173..=u16::MAX as u32)
+        .find(|port| {
+            !claimed.contains(port) && TcpListener::bind(("127.0.0.1", *port as u16)).is_ok()
+        })
+        .ok_or_else(|| "no unreserved loopback port is available for the dev UI".to_string())
+}
+
 fn next_available_gateway_port(start: u32, claimed: &BTreeSet<u32>) -> u32 {
     let mut port = start.max(DEFAULT_GATEWAY_PORT);
     while openclaw_port_family_conflicts(port, claimed) || !openclaw_port_family_available(port) {

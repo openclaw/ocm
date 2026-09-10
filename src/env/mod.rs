@@ -33,8 +33,10 @@ pub use snapshots::{
 pub(crate) use source_watch::{
     CreateSourceWatchOverrideOptions, SourceWatchLease, SourceWatchMode, SourceWatchState,
 };
-pub use source_watch::{SourceWatchEndpoint, SourceWatchOverride};
-pub(crate) use source_watch_session::{SourceWatchCompletion, SourceWatchSession};
+pub use source_watch::{SourceWatchEndpoint, SourceWatchOverride, SourceWatchUiEndpoint};
+pub(crate) use source_watch_session::{
+    DevUiChildRole, SourceUiTarget, SourceWatchCompletion, SourceWatchSession,
+};
 
 pub struct EnvironmentService<'a> {
     env: &'a BTreeMap<String, String>,

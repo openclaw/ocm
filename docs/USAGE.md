@@ -104,6 +104,17 @@ before registration, so paired clients can reconnect after a restart or source
 rebuild. Initialization preserves existing config files, including authored auth
 and SecretRefs. Repeating minimum setup preserves unchanged config bytes.
 
+For live Control UI edits, run `ocm dev luna --watch --ui` (or `--ui` with a plain
+foreground Gateway). OCM owns the native Vite process and prints its initial
+native browser handoff once both documents are ready. The UI uses a captured
+loopback address for that session. `ocm dev status luna` and matching repeated
+starts report the address; repeated starts do not issue another browser grant.
+`ocm dev stop luna` stops the components together. A pending initial request gets
+30 seconds and retains its helper until completion; late grant bytes are discarded.
+An unfinished or interrupted cleanup keeps its recorded ownership.
+UI requires HTTP, enabled Control UI and installed source UI dependencies, and
+cannot run with `--service`. Existing authentication settings remain in effect.
+
 If you run `ocm setup` from inside an OpenClaw checkout, local mode can detect that and fill in sensible defaults.
 
 ### 5. Test a local checkout as a release-shaped runtime

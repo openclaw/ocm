@@ -118,6 +118,7 @@ If you are developing OpenClaw itself, use the dev path:
 ocm dev shaks
 ocm dev shaks --root /tmp/shaks
 ocm dev shaks --watch
+ocm dev shaks --watch --ui
 ocm dev shaks --watch --force
 ocm dev stop shaks
 ocm dev shaks --repo /path/to/openclaw --watch --force
@@ -141,6 +142,20 @@ the environment is registered. The token remains stable through restarts and
 source rebuilds, so paired clients can reconnect. Initialization never replaces an
 existing config or its auth/SecretRefs. Repeating minimum setup leaves an unchanged
 config untouched.
+
+Add `--ui` to run OpenClaw's native Vite server beside either foreground mode.
+OCM prints the session's UI address, then its initial native owner link after
+both Vite and the Gateway Control UI document are ready. The native handoff keeps
+the Gateway identity and credentials; only the browser document moves to Vite.
+UI requires a local HTTP Gateway with Control UI enabled and installed UI dependencies.
+It cannot be combined with `--service`.
+
+The controller owns Gateway, Vite and the initial dashboard helper. A component
+exit stops its sibling; `dev stop` stops both and gives a running helper only the
+remainder of its original 30-second budget. A late link is discarded, and uncertain
+cleanup retains ownership. Repeating the matching command reports the current
+address without starting another helper. The address belongs to this session;
+stop the session before changing UI mode or requesting a new initial owner link.
 
 If you already have a plain `~/.openclaw` home you care about, use `ocm migrate <env>` instead of starting fresh. `setup` and `start` now point that out when they detect an existing plain OpenClaw home.
 

@@ -155,7 +155,7 @@ impl AdmissionFixture {
                 && runtime["gatewayAdmission"]["process"]["pid"] == pid
             {
                 assert_eq!(runtime["children"], json!([]));
-                assert_eq!(runtime["gatewayAdmission"]["version"], 9);
+                assert_eq!(runtime["gatewayAdmission"]["version"], 10);
                 assert!(
                     runtime["gatewayAdmission"]["process"]["startedAt"]
                         .as_str()
@@ -340,7 +340,7 @@ fn dev_watch_requires_the_current_managed_daemon_capability() {
 fn dev_foreground_rejects_unknown_daemon_before_creating_an_environment() {
     let mut fixture = AdmissionFixture::new("dev-daemon-preflight");
     let mut old_runtime = fixture.start_daemon();
-    old_runtime["gatewayAdmission"]["version"] = json!(8);
+    old_runtime["gatewayAdmission"]["version"] = json!(9);
     write_json_replacing_path(&fixture.runtime, &old_runtime);
     let registry = env_registry_path(&fixture.env, &fixture.cwd).unwrap();
     let before = fs::read(&registry).unwrap();
@@ -353,12 +353,17 @@ fn dev_foreground_rejects_unknown_daemon_before_creating_an_environment() {
         ("plain", "running"),
         ("service", "starting"),
         ("service", "running"),
+        ("ui", "starting"),
+        ("ui", "running"),
+        ("ui-watch", "running"),
     ] {
         fixture.set_manager_state(state, fixture.daemon.as_ref().unwrap().id());
         let mut args = vec!["dev", "fresh", "--repo", &repo_arg, "--root", &root_arg];
         match mode {
             "watch" => args.push("--watch"),
             "service" => args.push("--service"),
+            "ui" => args.push("--ui"),
+            "ui-watch" => args.extend(["--watch", "--ui"]),
             _ => {}
         }
         let rejected = run_ocm(&fixture.cwd, &fixture.env, &args);

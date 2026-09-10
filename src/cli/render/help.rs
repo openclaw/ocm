@@ -151,6 +151,7 @@ pub fn root_help(cmd: &str) -> String {
         format_examples(&[
             format!("{cmd} dev shaks"),
             format!("{cmd} dev shaks --watch"),
+            format!("{cmd} dev shaks --watch --ui"),
             format!("{cmd} start mira"),
             format!("{cmd} migrate mira"),
             format!("{cmd} adopt inspect"),
@@ -242,9 +243,9 @@ pub fn logs_help(cmd: &str) -> String {
 pub fn dev_help(cmd: &str) -> String {
     render_group(
         "Development envs",
-        "Provision OpenClaw dev envs from a checkout worktree, bootstrap the minimum local config, and run the gateway in the foreground with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. Background service installation, start, and restart are refused while source watch is active. New foreground sessions and service preparation require a compatible running daemon with verified process ownership; wait for startup or run service refresh-daemon --acknowledge-gateway-restarts from the updated OCM installation during a maintenance window. Confirmed stopped or unloaded daemons do not require refresh. New envs use the explicit --repo checkout or the checkout enclosing the current directory. Outside a checkout, pass --repo; neighboring and remembered repositories are not selected. Existing dev envs use their recorded source. Repeating a matching plain or --watch invocation returns the existing session status and link without setup or restart. Starting and restoring sessions report progress; they are not reported as ready. Stop the session before onboarding or changing --watch, source, root, or port. Reuse keeps the captured launch endpoint; an older watch without endpoint metadata must be stopped from its original terminal first.",
+        "Provision OpenClaw dev envs from a checkout worktree, bootstrap the minimum local config, and run the gateway in the foreground with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. Background service installation, start, and restart are refused while source watch is active. New foreground sessions and service preparation require a compatible running daemon with verified process ownership; wait for startup or run service refresh-daemon --acknowledge-gateway-restarts from the updated OCM installation during a maintenance window. Confirmed stopped or unloaded daemons do not require refresh. New envs use the explicit --repo checkout or the checkout enclosing the current directory. Outside a checkout, pass --repo; neighboring and remembered repositories are not selected. Existing dev envs use their recorded source. Repeating a matching plain or --watch invocation returns the existing session status and link without setup or restart. Starting and restoring sessions report progress; they are not reported as ready. Stop the session before onboarding or changing --watch, source, root, or port. Reuse keeps the captured launch endpoint; an older watch without endpoint metadata must be stopped from its original terminal first. Add --ui to run native Vite beside a plain or watched Gateway. The controller owns both components and their initial native browser handoff. UI requires HTTP, enabled Control UI and installed UI dependencies; it cannot be combined with --service. The initial owner link is printed after both documents are ready. A pending request keeps its one helper owned, discards late grant bytes after 30 seconds, and leaves Gateway and Vite running. Matching reuse reports the captured UI address without requesting another grant. Stop before changing --ui; the address is scoped to the session.",
         vec![format!(
-            "{cmd} dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch] [--force] [--service] [--onboard]"
+            "{cmd} dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch] [--ui] [--force] [--service] [--onboard]"
         )],
         &[(
             "Commands",
@@ -260,6 +261,7 @@ pub fn dev_help(cmd: &str) -> String {
             format!("{cmd} dev shaks"),
             format!("{cmd} dev shaks --root /tmp/shaks"),
             format!("{cmd} dev shaks --watch"),
+            format!("{cmd} dev shaks --watch --ui"),
             format!("{cmd} dev shaks --watch --force"),
             format!("{cmd} dev shaks --repo /path/to/openclaw --watch --force"),
             format!("{cmd} dev shaks --service"),
@@ -280,7 +282,7 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
     match action {
         "stop" => Some(render_leaf(
             "Stop foreground dev session",
-            "Ask the recorded dev controller to stop its setup or gateway processes, including --service preparation. Preserve the env, source checkout, dependencies, and configuration; report unverified completion without discarding ownership.",
+            "Ask the recorded dev controller to stop its setup, Gateway and optional UI processes, including --service preparation. Preserve the env, source checkout, dependencies, and configuration; report unverified completion without discarding ownership.",
             vec![format!("{cmd} dev stop <env> [--raw] [--json]")],
             &[
                 (
@@ -299,7 +301,8 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Waits for the owned source processes to stop before restoring a background service taken over by --watch --force.",
-                "Stops plain and watched foreground dev sessions, including setup. Also cancels --service preparation while preserving an already-running managed Gateway; explicit service stop or uninstall still takes effect.",
+                "Stops plain and watched foreground dev sessions, including setup and optional UI. Also cancels --service preparation while preserving an already-running managed Gateway; explicit service stop or uninstall still takes effect.",
+                "For UI sessions, persistent components stop first; an initial dashboard helper can use only the remaining original 30-second request budget. Unverified cleanup keeps ownership.",
                 "For new Unix foreground generations, a lost controller, raw termination signal, or incomplete output retains unfinished ownership even if the recorded process group stops. Stop/reuse/service-start/destroy cannot erase that uncertainty. Released legacy records keep their recovery rules.",
                 "Ordinary acknowledged errors remain retryable after output completes. Onboarding keeps real terminal output; cancellation or failure without observed output retains ownership, while successful onboarding remains supported.",
                 "During Unix foreground preparation, pnpm lifecycle reports distinguish completed install errors from interrupted or unfinished build scripts; uncertain script cleanup retains ownership even if pnpm returns an ordinary error or succeeds after an optional build. Installer stdin stays interactive when run from a terminal; human output is streamed.",

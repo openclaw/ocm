@@ -50,8 +50,8 @@ pub(crate) use envs::{
     save_environment_with_validated_runtime, with_locked_environments,
 };
 pub(crate) use gateway_ports::{
-    openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,
-    resolve_effective_gateway_ports, resolve_env_gateway_port,
+    choose_source_ui_port, openclaw_port_family_available, openclaw_port_family_range,
+    resolve_config_gateway_port, resolve_effective_gateway_ports, resolve_env_gateway_port,
 };
 pub use launchers::{add_launcher, get_launcher, list_launchers, remove_launcher};
 pub use layout::{
@@ -65,10 +65,11 @@ pub use layout::{
 };
 pub(crate) use openclaw_config::{
     OpenClawConfigAudit, audit_openclaw_config, clear_skip_bootstrap_for_openclaw_onboarding,
-    ensure_minimum_local_openclaw_config, normalize_new_environment_sandbox_origin,
-    openclaw_config_include_paths, openclaw_config_uses_includes,
-    reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
-    repair_openclaw_config, rewrite_external_workspace_paths_for_migration,
+    dev_ui_gateway_url, ensure_minimum_local_openclaw_config,
+    normalize_new_environment_sandbox_origin, openclaw_config_include_paths,
+    openclaw_config_uses_includes, reject_include_owned_agent_workspaces,
+    reject_include_owned_sandbox_origin, repair_openclaw_config,
+    rewrite_external_workspace_paths_for_migration,
     rewrite_identity_bound_workspace_paths_for_target, rewrite_openclaw_config_for_migration,
     rewrite_openclaw_config_for_new_environment, rewrite_openclaw_config_for_simulation,
     rewrite_openclaw_config_for_target, rewrite_openclaw_config_includes_for_target,

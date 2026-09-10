@@ -445,7 +445,9 @@ impl DevWatchFixture {
         Self {
             child: Some(child),
             release: root.child("source-watch.release"),
-            session: source_watch_override_path(root, args[1]).with_extension("session"),
+            session: PathBuf::from(&env["OCM_HOME"])
+                .join("source-watch")
+                .join(format!("{}.session", args[1])),
         }
     }
 
@@ -500,6 +502,17 @@ impl Drop for DevWatchFixture {
             .and_then(|session| session["child"]["pid"].as_u64())
         {
             let _ = wait_for_process_exit(pid as u32, Duration::from_secs(2));
+        }
+        if let Some(children) = fs::read(&self.session)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|session| session["ui"]["children"].as_object().cloned())
+        {
+            for child in children.values() {
+                if let Some(pid) = child["pid"].as_u64() {
+                    let _ = wait_for_process_exit(pid as u32, Duration::from_secs(3));
+                }
+            }
         }
     }
 }
@@ -835,6 +848,339 @@ fn service_env_with_gateway_admission(
     let mut env = service_env(root);
     enable_fake_daemon_gateway_admission(root, &mut env);
     env
+}
+
+#[cfg(unix)]
+static INITIAL_UI_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+fn prepare_initial_ui_repo(
+    root: &TestDir,
+    env: &mut std::collections::BTreeMap<String, String>,
+) -> PathBuf {
+    let repo = init_openclaw_repo(root);
+    let node = Command::new("node")
+        .args(["-p", "process.execPath"])
+        .env_clear()
+        .envs(&*env)
+        .output()
+        .unwrap();
+    assert!(node.status.success(), "{}", stderr(&node));
+    let node = stdout(&node).trim().replace('\'', "'\\''");
+    let bin = root.child("initial-ui-bin");
+    fs::create_dir_all(&bin).unwrap();
+    // Root dependency inspection is covered by its own owner. The UI probe
+    // executes real resolution against these deliberately nonexecutable stubs.
+    write_executable_script(
+        &bin.join("node"),
+        &format!(
+            r#"#!/bin/sh
+case "${{3:-}}" in
+  *uiRequire*) exec '{node}' "$@";;
+  *createRequire*|*ocm-source-dependencies*)
+    if [ -n "$OCM_SOURCE_WATCH_START_FD" ]; then
+      IFS= read -r start < "/dev/fd/$OCM_SOURCE_WATCH_START_FD" || exit 1
+      unset OCM_SOURCE_WATCH_START_FD
+    fi
+    exit 0;;
+esac
+exec '{node}' "$@"
+"#
+        ),
+    );
+    prepend_fake_bin(env, &bin);
+    env.insert("OCM_TEST_DEV_UI_DIR".to_string(), path_string(root.path()));
+    fs::create_dir_all(repo.join("ui")).unwrap();
+    fs::write(
+        repo.join("ui/index.html"),
+        "<!doctype html><title>UI fixture</title>",
+    )
+    .unwrap();
+    fs::write(repo.join("ui/package.json"), r#"{"name":"ui-fixture"}"#).unwrap();
+    fs::write(
+        repo.join("scripts/dev-ui-fixture.cjs"),
+        include_str!("support/dev_ui.cjs"),
+    )
+    .unwrap();
+    fs::write(
+        repo.join("scripts/ui.js"),
+        "require('./dev-ui-fixture.cjs');\n",
+    )
+    .unwrap();
+    for entry in ["watch-node.mjs", "run-node.mjs"] {
+        fs::write(
+            repo.join("scripts").join(entry),
+            "import './dev-ui-fixture.cjs';\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        repo.join("openclaw.mjs"),
+        "import './scripts/dev-ui-fixture.cjs';\n",
+    )
+    .unwrap();
+    for name in ["vite", "dompurify"] {
+        let directory = repo.join("node_modules").join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("package.json"),
+            format!(r#"{{"name":"{name}","main":"index.js"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("index.js"),
+            "throw new Error('UI inspection must not execute package code');\n",
+        )
+        .unwrap();
+    }
+    // These are tiny synthetic resolution fixtures, not copied dependencies.
+    let added = Command::new("git")
+        .args(["-C", &path_string(&repo), "add", "-f", "node_modules"])
+        .output()
+        .unwrap();
+    assert!(added.status.success(), "{}", stderr(&added));
+    commit_nested_openclaw_repo(&repo);
+    repo
+}
+
+#[cfg(unix)]
+fn initial_ui_process(root: &TestDir, role: &str) -> Value {
+    let file = root.child(format!("{role}.json"));
+    assert!(
+        wait_for_path(&file, Duration::from_secs(10)),
+        "{role} did not start"
+    );
+    serde_json::from_slice(&fs::read(file).unwrap()).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_ui_initial_handoff_and_owned_lifecycle() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (watch, outcome) in [
+        (false, "stop"),
+        (true, "sibling"),
+        (false, "deadline"),
+        (true, "raw"),
+        (true, "crash"),
+    ] {
+        let root = TestDir::new("initial-ui-owner");
+        let mut env = ocm_env(&root);
+        let repo = prepare_initial_ui_repo(&root, &mut env);
+        let repo_arg = path_string(&repo);
+        let mut args = if watch {
+            dev_watch(&["demo", "--repo", &repo_arg, "--watch"])
+        } else {
+            dev_plain(&["demo", "--repo", &repo_arg])
+        };
+        args.push("--ui");
+        if outcome == "deadline" {
+            fs::write(root.child("dashboard-hold"), "hold").unwrap();
+        }
+        let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &args);
+        let gateway = initial_ui_process(&root, "gateway");
+        let ui = initial_ui_process(&root, "ui");
+        let gateway_pid = gateway["pid"].as_u64().unwrap() as u32;
+        let ui_pid = ui["pid"].as_u64().unwrap() as u32;
+        let session = read_source_watch_session(&root);
+        assert_eq!(session["watching"], watch);
+        assert_eq!(session["ui"]["children"]["gateway"]["pid"], gateway_pid);
+        assert_eq!(session["ui"]["children"]["ui"]["pid"], ui_pid);
+        assert_eq!(session["ui"]["target"]["port"], ui["port"]);
+        assert_eq!(gateway["cwd"], ui["cwd"]);
+        assert!(
+            ui["args"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("--strictPort".to_string()))
+        );
+        let until = Instant::now() + Duration::from_secs(3);
+        while !root.child("gateway-requests").exists() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !root.child("dashboard-attempts").exists(),
+            "Gateway health alone started a handoff"
+        );
+        fs::write(root.child("gateway-document-ready"), "ready").unwrap();
+        assert!(wait_for_path(
+            &root.child("dashboard-attempt-1"),
+            Duration::from_secs(5)
+        ));
+        if outcome == "deadline" {
+            let helper = fs::read_to_string(root.child("dashboard-attempt-1"))
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap();
+            thread::sleep(Duration::from_secs(31));
+            assert!(
+                process_is_alive(helper)
+                    && process_is_alive(gateway_pid)
+                    && process_is_alive(ui_pid)
+            );
+            let reused = run_ocm(&repo, &env, &args);
+            assert!(reused.status.success(), "{}", stderr(&reused));
+            assert!(stdout(&reused).contains("ui_url="));
+            assert!(!stdout(&reused).contains("bootstrapToken"));
+            assert_eq!(
+                fs::read_to_string(root.child("dashboard-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            fs::remove_file(root.child("dashboard-hold")).unwrap();
+            assert!(wait_for_process_exit(helper, Duration::from_secs(3)));
+        }
+        let until = Instant::now() + Duration::from_secs(3);
+        while read_source_watch_session(&root)["ui"]["children"]
+            .get("command")
+            .is_some()
+            && Instant::now() < until
+        {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            read_source_watch_session(&root)["ui"]["children"]
+                .get("command")
+                .is_none()
+        );
+        let mismatch = run_ocm(
+            &repo,
+            &env,
+            &if watch {
+                dev_watch(&["demo", "--watch"])
+            } else {
+                dev_plain(&["demo"])
+            },
+        );
+        assert!(!mismatch.status.success());
+        assert!(stderr(&mismatch).contains("different UI mode"));
+        if outcome == "raw" || outcome == "crash" {
+            if outcome == "crash" {
+                controller.crash_controller();
+            } else {
+                assert_eq!(
+                    unsafe { libc::kill(ui_pid as libc::pid_t, libc::SIGKILL) },
+                    0
+                );
+                let output = controller.wait_without_release();
+                assert!(!output.status.success());
+                assert!(stderr(&output).contains("terminated by signal"));
+                let retained = read_source_watch_session(&root);
+                assert_eq!(retained["ui"]["children"]["ui"]["pid"], ui_pid);
+                assert!(retained["ui"]["children"].get("gateway").is_none());
+            }
+            let stopped = run_dev_stop(&repo, &env);
+            assert!(!stopped.status.success());
+            assert!(stderr(&stopped).contains(if outcome == "crash" {
+                "source controller exited"
+            } else {
+                "terminated by signal"
+            }));
+            assert_eq!(read_source_watch_session(&root)["closed"], false);
+            let session_path = source_watch_override_path(&root, "demo").with_extension("session");
+            let retained = fs::read(&session_path).unwrap();
+            let removed = run_ocm(&repo, &env, &["env", "destroy", "demo", "--yes"]);
+            assert!(!removed.status.success());
+            assert!(stderr(&removed).contains("unverified"));
+            assert!(fs::read(session_path).unwrap() == retained);
+        } else if outcome == "sibling" {
+            fs::write(root.child("ui.exit"), "exit").unwrap();
+            let output = controller.wait_without_release();
+            assert_eq!(output.status.code(), Some(17));
+            assert!(stdout(&output).contains("UI: http://127.0.0.1:"));
+        } else {
+            let stopped = run_dev_stop(&repo, &env);
+            assert!(stopped.status.success(), "{}", stderr(&stopped));
+            let output = controller.wait_without_release();
+            assert_eq!(output.status.code(), Some(130));
+            assert_eq!(
+                stdout(&output).contains("UI: http://127.0.0.1:"),
+                outcome != "deadline"
+            );
+            assert!(!stdout(&output).contains("synthetic-legacy"));
+        }
+        assert!(wait_for_process_exit(gateway_pid, Duration::from_secs(3)));
+        assert!(wait_for_process_exit(ui_pid, Duration::from_secs(3)));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_ui_claims_an_address_before_the_listener_starts() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = TestDir::new("initial-ui-first-claim");
+    let mut env = ocm_env(&root);
+    let repo = prepare_initial_ui_repo(&root, &mut env);
+    fs::write(root.child("ui-start-hold"), "hold").unwrap();
+    let mut first = DevWatchFixture::spawn(
+        &root,
+        &repo,
+        &env,
+        &["dev", "first", "--repo", &path_string(&repo), "--ui"],
+    );
+    let first_gateway = initial_ui_process(&root, "gateway");
+    let session_file = source_watch_override_path(&root, "first").with_extension("session");
+    let session: Value = serde_json::from_slice(&fs::read(&session_file).unwrap()).unwrap();
+    let port = session["ui"]["target"]["port"].as_u64().unwrap() as u16;
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "held UI already listened"
+    );
+    let second_root = TestDir::new("initial-ui-second-claim");
+    let mut second_env = ocm_env(&second_root);
+    let second_repo = prepare_initial_ui_repo(&second_root, &mut second_env);
+    second_env.insert("OCM_HOME".to_string(), env["OCM_HOME"].clone());
+    let mut second = DevWatchFixture::spawn(
+        &second_root,
+        &second_repo,
+        &second_env,
+        &[
+            "dev",
+            "second",
+            "--repo",
+            &path_string(&second_repo),
+            "--ui",
+        ],
+    );
+    let second_gateway = initial_ui_process(&second_root, "gateway");
+    let second_ui = initial_ui_process(&second_root, "ui");
+    assert_ne!(second_ui["port"].as_u64().unwrap(), u64::from(port));
+    fs::remove_file(root.child("ui-start-hold")).unwrap();
+    let first_ui = initial_ui_process(&root, "ui");
+    for name in ["first", "second"] {
+        let stopped = run_named_dev_stop(&repo, &env, name);
+        assert!(stopped.status.success(), "{}", stderr(&stopped));
+    }
+    assert_eq!(first.wait_without_release().status.code(), Some(130));
+    assert_eq!(second.wait_without_release().status.code(), Some(130));
+    for process in [first_gateway, first_ui, second_gateway, second_ui] {
+        assert!(wait_for_process_exit(
+            process["pid"].as_u64().unwrap() as u32,
+            Duration::from_secs(3)
+        ));
+    }
+}
+
+#[test]
+fn dev_ui_rejects_service_mode_before_creating_environment() {
+    let root = TestDir::new("initial-ui-service-conflict");
+    let env = ocm_env(&root);
+    let result = run_ocm(root.path(), &env, &["dev", "demo", "--ui", "--service"]);
+    assert!(!result.status.success());
+    assert!(stderr(&result).contains("cannot combine --ui with --service"));
+    let listed = run_ocm(root.path(), &env, &["env", "list", "--json"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&listed)).unwrap(),
+        serde_json::json!([])
+    );
 }
 
 #[test]
