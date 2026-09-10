@@ -485,10 +485,10 @@ includes independent content. Full snapshot restore still rewinds that content.
 ### Snapshots
 
 Snapshot restore and live upgrade or rollback require a completed dev session.
-If a watch is active, starting,
-restoring its service, or has unfinished or unreadable ownership, run
-`ocm dev stop <env>` before retrying. Refusal preserves the current state and
-service policy.
+Stop a known owned watch with `ocm dev stop <env>` before retrying. Unreadable or
+unverified ownership requires verified operator recovery: preserve the environment
+and check the watch processes and service policy before recovering its ownership
+record. Refusal preserves the current state and service policy.
 
 Snapshot create and restore stop a running OCM-managed gateway before copying or
 replacing its root, then restore the recorded service policy. New snapshots are

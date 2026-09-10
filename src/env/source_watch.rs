@@ -379,21 +379,23 @@ impl<'a> EnvironmentService<'a> {
         &self,
         name: &str,
     ) -> Result<(), String> {
-        let state = match self.observe_source_watch(name) {
-            Ok(SourceWatchState::Inactive) => None,
-            Ok(SourceWatchState::Starting) => Some("starting".to_string()),
-            Ok(SourceWatchState::Active(_)) => Some("active".to_string()),
-            Ok(SourceWatchState::Restoring) => Some("restoring".to_string()),
-            Err(error) => Some(format!("unknown ({error})")),
+        let unverified = |error: String| {
+            format!(
+                "cannot verify dev ownership for env {name}: {error}; verified operator recovery is required before changing env state; preserve the environment and verify the watch processes and service policy before retrying"
+            )
+        };
+        let state = match self.observe_source_watch(name).map_err(&unverified)? {
+            SourceWatchState::Inactive => None,
+            SourceWatchState::Starting => Some("starting"),
+            SourceWatchState::Active(_) => Some("active"),
+            SourceWatchState::Restoring => Some("restoring"),
         };
         if let Some(state) = state {
             return Err(format!(
                 "cannot change env {name} while its dev session is {state}; stop it with ocm dev stop {name} first"
             ));
         }
-        let session = self.source_watch_session(name).map_err(|error| {
-            format!("cannot verify the dev session for env {name}: {error}; stop it with ocm dev stop {name} before changing env state")
-        })?;
+        let session = self.source_watch_session(name).map_err(unverified)?;
         if session.is_some_and(|session| !session.closed) {
             return Err(format!(
                 "cannot change env {name} while its dev session is unfinished; stop it with ocm dev stop {name} first"

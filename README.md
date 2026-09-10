@@ -155,9 +155,11 @@ ocm upgrade simulate mira --to beta --scenario all
 ocm upgrade simulate mira --to ./openclaw
 ```
 
-Live upgrades and rollbacks require a completed source-watch session. Run
-`ocm dev stop <env>` first; OCM refuses active or unfinished ownership before
-changing environment state, runtime files, or upgrade history.
+Live upgrades and rollbacks require a completed source-watch session. Stop a
+known owned watch with `ocm dev stop <env>`. Unreadable or unverified ownership
+requires verified operator recovery, including checking the watch processes and
+service policy. OCM preserves environment state, runtime files, and upgrade
+history while refusing those operations.
 
 `upgrade` stages the target runtime, validates the checkpoint source, and
 prepares runtime recovery while the current managed gateway remains available.

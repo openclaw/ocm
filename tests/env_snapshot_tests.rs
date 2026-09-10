@@ -426,11 +426,19 @@ fn env_snapshot_restore_refuses_active_transitional_and_unknown_dev_ownership() 
             ],
         );
         assert!(!restored.status.success(), "accepted {state}");
+        let advice = if state == "unknown" {
+            "operator recovery"
+        } else {
+            "dev stop source"
+        };
         assert!(
-            stderr(&restored).contains("dev stop source"),
+            stderr(&restored).contains(advice),
             "{state}: {}",
             stderr(&restored)
         );
+        if state == "unknown" {
+            assert!(!stderr(&restored).contains("dev stop"));
+        }
         assert_eq!(fs::read_to_string(&notes).unwrap(), "current state\n");
         assert_eq!(
             fs::read(env_registry_path(&env, &cwd).unwrap()).unwrap(),
@@ -448,7 +456,7 @@ fn env_snapshot_restore_refuses_active_transitional_and_unknown_dev_ownership() 
         "child": null, "childSpawnPending": false, "restoreService": false, "closed": false
     });
     for record in [serde_json::to_string(&unfinished).unwrap(), "{".to_string()] {
-        fs::write(&session_path, record).unwrap();
+        fs::write(&session_path, &record).unwrap();
         let refused = run_ocm(
             &cwd,
             &env,
@@ -461,11 +469,15 @@ fn env_snapshot_restore_refuses_active_transitional_and_unknown_dev_ownership() 
             ],
         );
         assert!(!refused.status.success());
-        assert!(
-            stderr(&refused).contains("dev stop source"),
-            "{}",
-            stderr(&refused)
-        );
+        let advice = if record == "{" {
+            "operator recovery"
+        } else {
+            "dev stop source"
+        };
+        assert!(stderr(&refused).contains(advice), "{}", stderr(&refused));
+        if record == "{" {
+            assert!(!stderr(&refused).contains("dev stop"));
+        }
         assert_eq!(fs::read_to_string(&notes).unwrap(), "current state\n");
         assert_eq!(
             fs::read(env_registry_path(&env, &cwd).unwrap()).unwrap(),
