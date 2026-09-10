@@ -3259,7 +3259,7 @@ fn upgrade_simulate_cleanup_preserves_registered_dev_source() {
 if [ "$1" = build ]; then
   mkdir -p .artifacts
   git clone --quiet --no-local "$OCM_TEST_SOURCE_REPO" .artifacts/project || exit 1
-  "$OCM_TEST_SOURCE_CLI" dev dependency --repo "$PWD/.artifacts/project" > "$OCM_TEST_SOURCE_LOG" 2>&1 || exit 1
+  "$OCM_TEST_SOURCE_CLI" dev dependency --repo "$PWD/.artifacts/project" --no-watch --no-ui > "$OCM_TEST_SOURCE_LOG" 2>&1 || exit 1
 fi
 {}"#,
                     original
