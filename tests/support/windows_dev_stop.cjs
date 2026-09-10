@@ -103,6 +103,8 @@ async function start(name, watching = true) {
   const repo = path.join(directory, 'repo');
   fs.mkdirSync(path.join(repo, 'scripts'), {recursive:true});
   fs.mkdirSync(path.join(repo, 'extensions'), {recursive:true});
+  // Preserve this required source directory in the plain-mode Git worktree.
+  fs.writeFileSync(path.join(repo, 'extensions', '.gitkeep'), '');
   fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({name:'openclaw', version:'2026.9.9'}));
   fs.writeFileSync(path.join(repo, 'openclaw.mjs'), '// Isolated built-entry fixture.\n');
   const ready = path.join(directory, 'ready');
