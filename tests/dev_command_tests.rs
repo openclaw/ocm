@@ -3595,6 +3595,8 @@ fn dev_stop_refuses_unverified_orphan_identity_without_signaling_the_tree() {
             "watch did not start"
         );
         let session_path = source_watch_override_path(&root, "demo").with_extension("session");
+        // This control preserves the released legacy recovery contract.
+        encode_legacy_watch_session(&root);
         let before = fs::read(&session_path).unwrap();
         let mut session: Value = serde_json::from_slice(&before).unwrap();
         let pid = session["child"]["pid"].as_u64().unwrap() as u32;
