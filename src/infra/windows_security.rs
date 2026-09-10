@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::mem::size_of;
+use std::mem::{MaybeUninit, size_of};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -264,21 +264,37 @@ pub(crate) fn has_user_only_access(file: &File) -> io::Result<bool> {
     }
     let mut present = 0;
     let mut defaulted = 0;
-    let mut dacl = ptr::null_mut();
-    if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
-        == 0
+    let mut dacl = MaybeUninit::<*mut ACL>::uninit();
+    if unsafe {
+        GetSecurityDescriptorDacl(descriptor, &mut present, dacl.as_mut_ptr(), &mut defaulted)
+    } == 0
     {
         return Err(io::Error::last_os_error());
     }
-    if control & SE_DACL_PROTECTED == 0 || present == 0 || defaulted != 0 || dacl.is_null() {
+    if control & SE_DACL_PROTECTED == 0 || present == 0 || defaulted != 0 {
+        return Ok(false);
+    }
+    // SAFETY: success with a present DACL initializes this output, including
+    // a possible null DACL. A nonnull pointer borrows the still-owned `storage`.
+    let dacl = unsafe { dacl.assume_init() };
+    if dacl.is_null() {
         return Ok(false);
     }
     if unsafe { (*dacl).AceCount } != 1 {
         return Ok(false);
     }
-    let mut ace = ptr::null_mut();
-    if unsafe { GetAce(dacl, 0, &mut ace) } == 0 {
+    let mut ace = MaybeUninit::<*mut std::ffi::c_void>::uninit();
+    if unsafe { GetAce(dacl, 0, ace.as_mut_ptr()) } == 0 {
         return Err(io::Error::last_os_error());
+    }
+    // SAFETY: GetAce initializes the entry pointer on success. The entry stays
+    // inside the descriptor buffer, which is neither resized nor freed here.
+    let ace = unsafe { ace.assume_init() };
+    if ace.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing file access entry",
+        ));
     }
     let header = unsafe { &*ace.cast::<ACE_HEADER>() };
     if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE
