@@ -1285,6 +1285,68 @@ fn ui_handoff_directory(session: &Value) -> PathBuf {
 
 #[cfg(unix)]
 #[test]
+fn dev_ui_reuse_keeps_a_healthy_session_when_its_handoff_endpoint_is_absent() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = TestDir::new("ui-reuse-without-handoff-endpoint");
+    let mut env = ocm_env(&root);
+    let repo = prepare_initial_ui_repo(&root, &mut env);
+    let repo_arg = path_string(&repo);
+    let args = dev_watch(&["demo", "--repo", &repo_arg, "--watch", "--ui"]);
+    fs::write(root.child("gateway-document-ready"), "ready").unwrap();
+    let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &args);
+    let gateway = initial_ui_process(&root, "gateway", &mut controller);
+    let ui = initial_ui_process(&root, "ui", &mut controller);
+    ui_dashboard_pid(&root, 1);
+    wait_for_ui_command_cleanup(&root);
+    let session = read_source_watch_session(&root);
+    let socket_dir = ui_handoff_directory(&session);
+    // Model the transport absent from pre-handoff controllers without changing
+    // their shared session schema or ownership. The fixture still runs current
+    // OCM for both processes.
+    fs::remove_file(socket_dir.join("socket")).unwrap();
+    fs::remove_dir(&socket_dir).unwrap();
+    let mut caller = DevWatchFixture::spawn_caller(&root, &repo, &env, &args);
+    let reused = caller.wait_without_release_for(Duration::from_secs(5));
+    assert!(reused.status.success(), "{}", stderr(&reused));
+    assert!(stdout(&reused).contains(&format!(
+        "ui_url=http://127.0.0.1:{}/",
+        ui["port"].as_u64().unwrap()
+    )));
+    assert!(stderr(&reused).contains("UI link unavailable"));
+    assert!(!stdout(&reused).contains("bootstrapToken"));
+    assert!(!stdout(&reused).contains("UI: "));
+    assert_eq!(read_source_watch_session(&root), session);
+    assert_eq!(
+        fs::read_to_string(root.child("dashboard-attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    for process in [&gateway, &ui] {
+        assert!(process_is_alive(process["pid"].as_u64().unwrap() as u32));
+        let address = format!("127.0.0.1:{}", process["port"].as_u64().unwrap())
+            .parse()
+            .unwrap();
+        assert!(std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_ok());
+    }
+    let stopped = run_dev_stop(&repo, &env);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert_eq!(controller.wait_without_release().status.code(), Some(130));
+    for process in [&gateway, &ui] {
+        assert!(wait_for_process_exit(
+            process["pid"].as_u64().unwrap() as u32,
+            Duration::from_secs(3)
+        ));
+    }
+    assert_eq!(read_source_watch_session(&root)["closed"], true);
+    assert!(!socket_dir.exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_ui_reuse_gets_fresh_grants_without_restarting_components() {
     let _serial = INITIAL_UI_TEST_LOCK
         .lock()

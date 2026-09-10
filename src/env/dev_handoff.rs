@@ -12,6 +12,12 @@ const ACK: &[u8] = b"\x06";
 const MAX_REPLY: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+pub(crate) enum HandoffOutcome<T> {
+    Link(T),
+    Pending,
+    Unavailable,
+}
+
 fn scope(session: &SourceWatchSession) -> String {
     let identity = serde_json::to_vec(&(&session.env_name, &session.env_root, &session.lease_id))
         .expect("the session identity is serializable");
@@ -150,14 +156,25 @@ impl HandoffRequest {
 pub(crate) fn request(
     session: &SourceWatchSession,
     stop: &AtomicBool,
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<HandoffOutcome<Vec<u8>>, String> {
     let deadline = Instant::now() + REQUEST_TIMEOUT;
     if stop.load(Ordering::SeqCst) {
         return Err("dev dashboard request was cancelled".to_string());
     }
     let mut stream = match platform::connect(&scope(session), &session.controller) {
         Ok(stream) => stream,
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        // Older controllers record the same UI session without a handoff endpoint.
+        // The caller verifies that session and its processes before and after us.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(HandoffOutcome::Unavailable);
+        }
+        Err(error)
+            if error.kind() == io::ErrorKind::WouldBlock
+                || (cfg!(target_os = "macos")
+                    && error.kind() == io::ErrorKind::ConnectionRefused) =>
+        {
+            return Ok(HandoffOutcome::Pending);
+        }
         Err(error) => {
             return Err(format!(
                 "the dev UI owner could not accept a browser-link request: {error}"
@@ -179,7 +196,7 @@ pub(crate) fn request(
             return Err("dev dashboard request was cancelled".to_string());
         }
         if Instant::now() >= deadline {
-            return Ok(None);
+            return Ok(HandoffOutcome::Pending);
         }
         match stream.read(&mut buffer) {
             Ok(0) => {
@@ -199,7 +216,7 @@ pub(crate) fn request(
                     let handoff = if let Some(error) = reply.get("error").and_then(Value::as_str) {
                         Err(error.to_string())
                     } else if reply.get("pending").and_then(Value::as_bool) == Some(true) {
-                        Ok(None)
+                        Ok(HandoffOutcome::Pending)
                     } else {
                         reply
                             .get("handoff")
@@ -208,7 +225,7 @@ pub(crate) fn request(
                             })
                             .and_then(|handoff| {
                                 serde_json::to_vec(handoff)
-                                    .map(Some)
+                                    .map(HandoffOutcome::Link)
                                     .map_err(|error| error.to_string())
                             })
                     };
@@ -319,7 +336,9 @@ mod tests {
         pending
             .deliver(&serde_json::to_vec(&native).unwrap())
             .unwrap();
-        let received = client.join().unwrap().unwrap().unwrap();
+        let HandoffOutcome::Link(received) = client.join().unwrap().unwrap() else {
+            panic!("expected the native browser handoff");
+        };
         assert!(!String::from_utf8_lossy(&received).contains("synthetic-shared"));
         let received: Value = serde_json::from_slice(&received).unwrap();
         assert_eq!(received["browserUrl"], native["browserUrl"]);
@@ -328,6 +347,41 @@ mod tests {
         server.close().unwrap();
         cleanup_session(&session).unwrap();
         assert!(platform::connect(&scope(&session), &session.controller).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dev_handoff_reports_saturated_admission_as_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path());
+        let mut server = HandoffServer::bind(&session).unwrap();
+        let mut queued = Vec::new();
+        let mut saturated = false;
+        for _ in 0..8 {
+            match platform::connect(&scope(&session), &session.controller) {
+                Ok(stream) => queued.push(stream),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    saturated = true;
+                    break;
+                }
+                Err(error) => panic!("could not fill the handoff queue: {error}"),
+            }
+        }
+        assert!(saturated, "the bounded handoff queue did not fill");
+        let began = Instant::now();
+        assert!(matches!(
+            request(&session, &AtomicBool::new(false)).unwrap(),
+            HandoffOutcome::Pending
+        ));
+        assert!(began.elapsed() < Duration::from_secs(3));
+        drop(queued);
+        server.close().unwrap();
+        cleanup_session(&session).unwrap();
     }
 
     #[test]

@@ -3,7 +3,7 @@ use url::Url;
 
 use super::*;
 #[cfg(unix)]
-use crate::env::dev_handoff::{self, HandoffRequest, HandoffServer};
+use crate::env::dev_handoff::{self, HandoffOutcome, HandoffRequest, HandoffServer};
 use crate::env::{DevUiChildRole, SourceUiTarget};
 
 #[derive(Clone, Debug)]
@@ -547,7 +547,7 @@ impl Cli {
         meta: &EnvMeta,
         active: &crate::env::SourceWatchOverride,
         stop: &AtomicBool,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<HandoffOutcome<String>, String> {
         let ui = active
             .ui
             .as_ref()
@@ -567,7 +567,11 @@ impl Cli {
         if stop.load(Ordering::SeqCst) {
             return Err("dev dashboard request was cancelled".to_string());
         }
-        output.map(|output| target.handoff_url(&output)).transpose()
+        match output {
+            HandoffOutcome::Link(output) => target.handoff_url(&output).map(HandoffOutcome::Link),
+            HandoffOutcome::Pending => Ok(HandoffOutcome::Pending),
+            HandoffOutcome::Unavailable => Ok(HandoffOutcome::Unavailable),
+        }
     }
 
     #[cfg(unix)]

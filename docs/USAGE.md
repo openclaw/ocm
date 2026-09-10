@@ -127,7 +127,9 @@ reservation. Removing the environment releases it. `ocm dev status luna` and
 matching repeated starts report the address.
 On Linux and macOS, a matching repeated start requests a fresh native browser
 grant from the existing controller without restarting Gateway or Vite. Busy or
-unready requests report a pending link; Windows repeats still report the address.
+unready requests report a pending link. Older OCM controllers retain address-only
+reuse and report fresh links as unavailable until that dev session is restarted.
+Windows repeats still report the address.
 `ocm dev stop luna` stops the components together. A pending initial request gets
 30 seconds and retains its helper until completion. Repeated requests have the
 same deadline; late or disconnected callers' grant bytes are discarded.

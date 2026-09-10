@@ -1386,6 +1386,8 @@ impl Cli {
         self.stdout_lines(render_dev_status(&summary, self.dev_stdout_profile()));
         #[cfg(unix)]
         if let Some(active) = ui_active {
+            use crate::env::dev_handoff::HandoffOutcome;
+
             let installed_stop;
             let stop = match _stop {
                 Some(stop) => stop,
@@ -1395,8 +1397,9 @@ impl Cli {
                 }
             };
             match self.reused_dev_ui_link(meta, &active, stop)? {
-                Some(link) => self.stdout_line(format!("UI: {link}")),
-                None => self.stderr_line("UI link pending; the existing dev processes remain running. Retry the matching command when ready."),
+                HandoffOutcome::Link(link) => self.stdout_line(format!("UI: {link}")),
+                HandoffOutcome::Pending => self.stderr_line("UI link pending; the existing dev processes remain running. Retry the matching command when ready."),
+                HandoffOutcome::Unavailable => self.stderr_line("UI link unavailable; this controller cannot provide fresh browser links. Keep using the existing UI address, or stop and restart the dev session to enable them."),
             }
         }
         Ok(true)

@@ -158,6 +158,8 @@ requests a fresh native owner link from that controller while keeping Gateway,
 Vite and their address unchanged. One helper runs at a time; busy or unready
 requests report a pending link. Requests have a 30-second deadline, and a caller
 that exits or times out cannot redirect its eventual grant to another terminal.
+Older OCM controllers retain address-only reuse and report fresh links as
+unavailable until that dev session is restarted.
 Windows repeated commands continue to report the address. The UI address is
 retained across stop/start for the same environment. If that address is occupied
 or reserved, startup fails until it is free. Cloned and imported environments
