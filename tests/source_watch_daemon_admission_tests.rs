@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ocm::env::EnvironmentService;
+use ocm::env::{CreateEnvironmentOptions, EnvDevMeta, EnvironmentService};
 use ocm::store::{env_registry_path, supervisor_runtime_path, supervisor_state_path};
 use serde_json::{Value, json};
 
@@ -406,4 +406,145 @@ fn dev_watch_allows_confirmed_stopped_and_unloaded_daemons() {
     let unloaded = fixture.watch();
     assert!(unloaded.status.success(), "{}", stderr(&unloaded));
     assert!(fixture.definition.exists());
+}
+
+#[test]
+fn saved_dev_plan_revalidates_source_and_binding_before_launch() {
+    let mut fixture = AdmissionFixture::new("dev-daemon-saved-plan");
+    fixture.set_manager_state("stopped", 0);
+    fixture.repo = fs::canonicalize(&fixture.repo).unwrap();
+    let worktree = fixture.repo.join(".worktrees/source-env");
+    let worktree_path = path_string(&worktree);
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=OCM Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+        vec!["worktree", "add", "--detach", "--quiet", &worktree_path],
+    ] {
+        let git = Command::new("git")
+            .args(args)
+            .current_dir(&fixture.repo)
+            .output()
+            .unwrap();
+        assert!(git.status.success(), "{}", stderr(&git));
+    }
+    let command_log = fixture.root.child("pnpm.log");
+    write_executable_script(
+        &fixture.root.child("fake-bin/pnpm"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$*\" >> '{}'\n",
+            path_string(&command_log)
+        ),
+    );
+    let launcher = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["launcher", "add", "custom", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let source = EnvironmentService::new(&fixture.env, &fixture.cwd)
+        .create(CreateEnvironmentOptions {
+            name: "source-env".to_string(),
+            root: Some(path_string(&fixture.root.child("source-env"))),
+            gateway_port: None,
+            service_enabled: true,
+            service_running: true,
+            default_runtime: None,
+            default_launcher: None,
+            dev: Some(EnvDevMeta {
+                repo_root: path_string(&fixture.repo),
+                worktree_root: worktree_path.clone(),
+            }),
+            protected: false,
+        })
+        .unwrap();
+    let state_path = supervisor_state_path(&fixture.env, &fixture.cwd).unwrap();
+    let saved = fs::read(&state_path).unwrap();
+    let plan: Value = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(plan["children"].as_array().unwrap().len(), 1);
+    assert_eq!(plan["children"][0]["bindingKind"], "dev");
+    assert_eq!(plan["children"][0]["bindingName"], "dev");
+    assert_eq!(plan["children"][0]["runDir"], worktree_path);
+    let control = run_ocm(&fixture.cwd, &fixture.env, &["__daemon", "run", "--once"]);
+    assert!(control.status.success(), "{}", stderr(&control));
+    let launched = fs::read_to_string(&command_log).unwrap();
+    assert!(launched.starts_with(&format!("{worktree_path}\nopenclaw gateway run")));
+    fs::remove_file(&command_log).unwrap();
+
+    for case in ["saved-source", "binding-name", "runtime", "launcher"] {
+        let mut stale = plan.clone();
+        let mut changed = source.clone();
+        let expected = if case == "saved-source" {
+            "saved dev source no longer matches"
+        } else {
+            "saved dev plan no longer matches the registered binding"
+        };
+        match case {
+            "saved-source" => stale["children"][0]["runDir"] = json!(path_string(&fixture.repo)),
+            "binding-name" => stale["children"][0]["bindingName"] = json!("old-dev"),
+            "runtime" => changed.default_runtime = Some("stable".to_string()),
+            "launcher" => changed.default_launcher = Some("custom".to_string()),
+            _ => unreachable!(),
+        }
+        ocm::store::save_environment(changed, &fixture.env, &fixture.cwd).unwrap();
+        write_json_replacing_path(&state_path, &stale);
+        let before = fs::read(&state_path).unwrap();
+        let daemon = Command::new(ocm_test_binary_path())
+            .args(["__daemon", "run"])
+            .current_dir(&fixture.cwd)
+            .env_clear()
+            .envs(&fixture.env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = daemon.id();
+        fixture.daemon = Some(daemon);
+        fixture.set_manager_state("running", pid);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(!command_log.exists(), "{case} launched the stale command");
+            if let Ok(raw) = fs::read(&fixture.runtime)
+                && let Ok(runtime) = serde_json::from_slice::<Value>(&raw)
+                && runtime["gatewayAdmission"]["process"]["pid"] == pid
+                && runtime["services"].as_array().is_some_and(|services| {
+                    services.iter().any(|service| {
+                        service["envName"] == source.name
+                            && service["lastError"]
+                                .as_str()
+                                .is_some_and(|error| error.contains(expected))
+                    })
+                })
+            {
+                assert_eq!(runtime["children"], json!([]), "{case}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{case} did not record its admission refusal"
+            );
+            let daemon = fixture.daemon.as_mut().unwrap();
+            assert!(daemon.try_wait().unwrap().is_none());
+            thread::sleep(Duration::from_millis(20));
+        }
+        fixture.stop_daemon();
+        fixture.set_manager_state("stopped", 0);
+        assert_eq!(
+            fs::read(&state_path).unwrap(),
+            before,
+            "{case} rewrote its saved plan"
+        );
+        assert!(!command_log.exists(), "{case} launched the stale command");
+        assert!(!fixture.root.child("node.log").exists(), "{case}");
+    }
 }

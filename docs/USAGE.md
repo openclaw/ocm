@@ -366,6 +366,9 @@ ocm service stop mira
 ocm service restart mira
 ```
 
+Saved dev service plans must still match the env's current binding and recorded
+worktree. If OCM refuses a stale plan, use `ocm service restart <env>` to refresh it.
+
 Normal restart is gateway-aware when `ocm service status mira` reports restart
 handoff `protocol v1`: OpenClaw records eligible active sessions and subagents,
 hands the fresh-process restart back to OCM immediately, and resumes recoverable

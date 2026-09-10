@@ -2345,6 +2345,31 @@ fn admit_supervisor_child_start(
             spec.env_name
         ));
     }
+    if spec.binding_kind == "dev" {
+        if spec.binding_name != "dev"
+            || !matches!(
+                crate::env::resolve_execution_binding(&meta, None, None)?,
+                crate::env::ExecutionBinding::Dev
+            )
+        {
+            return Err(format!(
+                "refusing to start env \"{}\": its saved dev plan no longer matches the registered binding; restart the service to refresh its plan",
+                spec.env_name
+            ));
+        }
+        let dev = meta
+            .dev
+            .as_ref()
+            .ok_or_else(|| format!("dev binding is missing for env {}", meta.name))?;
+        let source_root = Path::new(&dev.worktree_root);
+        if source_root != Path::new(&spec.run_dir) {
+            return Err(format!(
+                "refusing to start env \"{}\": its saved dev source no longer matches {}; restart the service to refresh its plan",
+                spec.env_name,
+                source_root.display()
+            ));
+        }
+    }
     Ok(admission)
 }
 
