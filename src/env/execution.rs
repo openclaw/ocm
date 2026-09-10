@@ -175,6 +175,7 @@ pub fn resolve_gateway_process_spec(
                     env_meta.name
                 )
             })?;
+            let source_root = dev.execution_source_root()?;
             let mut args = vec!["openclaw".to_string()];
             args.extend(gateway_args);
             Ok(GatewayProcessSpec {
@@ -187,12 +188,8 @@ pub fn resolve_gateway_process_spec(
                 runtime_release_version: None,
                 runtime_release_channel: None,
                 args,
-                run_dir: PathBuf::from(&dev.worktree_root),
-                process_env: build_openclaw_dev_source_env(
-                    env_meta,
-                    process_env,
-                    Path::new(&dev.worktree_root),
-                ),
+                run_dir: source_root.to_path_buf(),
+                process_env: build_openclaw_dev_source_env(env_meta, process_env, source_root),
             })
         }
     }
@@ -344,6 +341,9 @@ impl<'a> EnvironmentService<'a> {
         mut env: EnvMeta,
         source: &SourceWatchOverride,
     ) -> Result<EnvMeta, String> {
+        if let Some(dev) = &env.dev {
+            dev.execution_source_root()?;
+        }
         let Some(endpoint) = &source.endpoint else {
             return self.apply_effective_gateway_port(env);
         };
@@ -427,16 +427,17 @@ impl<'a> EnvironmentService<'a> {
                 let dev = env.dev.clone().ok_or_else(|| {
                     format!("environment \"{}\" is missing its dev binding", env.name)
                 })?;
+                let run_dir = dev.execution_source_root()?.to_path_buf();
                 let mut program_args = vec!["openclaw".to_string()];
                 program_args.extend(args.clone());
                 Ok(ResolvedExecution::Dev {
                     env,
                     repo_root: dev.repo_root,
-                    worktree_root: dev.worktree_root.clone(),
+                    worktree_root: dev.worktree_root,
                     forwarded_args: args,
                     program: "pnpm".to_string(),
                     program_args,
-                    run_dir: PathBuf::from(dev.worktree_root),
+                    run_dir,
                 })
             }
         }
