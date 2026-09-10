@@ -91,7 +91,7 @@ fn assert_publishers_preserve_busy_source(borrowed: bool) {
     let (temp, env, owned) = fixture();
     let dev = if borrowed {
         EnvDevMeta::Borrowed {
-            source_root: owned.source_root().to_string(),
+            source_root: display_path(&fs::canonicalize(owned.source_root()).unwrap()),
         }
     } else {
         owned.clone()
@@ -102,7 +102,7 @@ fn assert_publishers_preserve_busy_source(borrowed: bool) {
         ensure_openclaw_worktree(Path::new(owned.repo_root()), "replacement").unwrap();
     changed.dev = Some(if borrowed {
         EnvDevMeta::Borrowed {
-            source_root: display_path(&replacement.root),
+            source_root: display_path(&fs::canonicalize(&replacement.root).unwrap()),
         }
     } else {
         EnvDevMeta::Owned {
