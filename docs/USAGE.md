@@ -112,13 +112,19 @@ new binding records. Refresh an incompatible running daemon with
 `ocm service refresh-daemon --acknowledge-gateway-restarts` before registration.
 If an environment containing or owning the source or its required Git metadata is
 busy, retry dev creation or local upgrade simulation after its operation finishes.
+
+Foreground dev starts the native Gateway watcher and live UI by default.
+`--no-ui` runs the Gateway watcher alone; `--no-watch` keeps the live UI with a
+Gateway that does not rebuild automatically. Combine both for a plain foreground
+Gateway. `--watch` and `--ui` remain explicit aliases for the defaults; each
+conflicts with its negative counterpart.
+
 New dev environments publish a private config with a persistent Gateway token
 before registration, so paired clients can reconnect after a restart or source
 rebuild. Initialization preserves existing config files, including authored auth
 and SecretRefs. Repeating minimum setup preserves unchanged config bytes.
 
-For live Control UI edits, run `ocm dev luna --watch --ui` (or `--ui` with a plain
-foreground Gateway). OCM owns the native Vite process and prints its initial
+OCM owns the native Vite process and prints its initial
 native browser handoff once both documents are ready. The UI uses a captured
 loopback address retained across stop/start for that environment. A busy retained
 port is an error; OCM does not silently choose another address. Clone and import
@@ -133,8 +139,10 @@ unavailable until that dev session is restarted.
 30 seconds and retains its helper until completion. Repeated requests have the
 same deadline; late or disconnected callers' grant bytes are discarded.
 An unfinished or interrupted cleanup keeps its recorded ownership.
-UI requires HTTP, enabled Control UI and installed source UI dependencies, and
-cannot run with `--service`. Existing authentication settings remain in effect.
+UI requires HTTP, enabled Control UI and installed source UI dependencies; use
+`--no-ui` for TLS or disabled-UI environments. `--service` uses the background
+workflow without foreground watching or UI and rejects explicit `--watch` or
+`--ui`. Existing authentication settings remain in effect.
 
 If you run `ocm setup` from inside an OpenClaw checkout, local mode can detect that and fill in sensible defaults.
 
@@ -688,13 +696,15 @@ env. Normal acknowledged errors remain retryable; released legacy watch records
 and Windows process-job recovery retain their existing rules. Use a compatible
 OCM CLI and refresh an older running daemon before creating a new generation.
 
-Both plain `dev <env>` and `dev <env> --watch` own setup and the native Gateway.
-Plain mode runs `scripts/run-node.mjs`; watch mode runs `scripts/watch-node.mjs`.
-`dev stop <env>` stops either recorded session without removing its environment
-or source. Repeating the same mode and launch endpoint reuses the session;
-changing mode requires stopping it first. `dev status --json` reports active
-ownership separately from `sourceWatch.watching`. Plain runs still refuse a
-running background service; temporary takeover remains `--watch --force`.
+`dev <env>` owns setup, the native Gateway watcher and Vite UI by default.
+`--no-watch` uses `scripts/run-node.mjs` instead of `scripts/watch-node.mjs` for
+the Gateway; `--no-ui` disables Vite. `dev stop <env>` stops the recorded session
+without removing its environment or source. Repeating the same source, launch
+endpoint and effective backend watching/UI choices reuses the session; changing
+those choices requires stopping it first. `dev status --json` reports active
+ownership separately from `sourceWatch.watching`. `--force` temporarily takes
+over a running background service while backend watching is enabled and restores
+it on exit; it rejects `--no-watch` or `--service`.
 
 Named `dev status` and JSON/raw output also report Gateway `/health` responses
 and the captured UI process and HTML document separately. JSON includes

@@ -386,6 +386,8 @@ fn dev_foreground_rejects_unknown_daemon_before_creating_an_environment() {
     let repo_arg = path_string(&fixture.repo);
     let root_arg = path_string(&root);
     for (mode, state) in [
+        ("default", "starting"),
+        ("default", "running"),
         ("watch", "starting"),
         ("plain", "starting"),
         ("plain", "running"),
@@ -398,9 +400,10 @@ fn dev_foreground_rejects_unknown_daemon_before_creating_an_environment() {
         fixture.set_manager_state(state, fixture.daemon.as_ref().unwrap().id());
         let mut args = vec!["dev", "fresh", "--repo", &repo_arg, "--root", &root_arg];
         match mode {
-            "watch" => args.push("--watch"),
+            "watch" => args.extend(["--watch", "--no-ui"]),
+            "plain" => args.extend(["--no-watch", "--no-ui"]),
             "service" => args.push("--service"),
-            "ui" => args.push("--ui"),
+            "ui" => args.extend(["--ui", "--no-watch"]),
             "ui-watch" => args.extend(["--watch", "--ui"]),
             _ => {}
         }
@@ -685,8 +688,10 @@ fn borrowed_dev_requires_decoder_capability_before_plain_watch_or_service_creati
         let root = fixture.root.child(format!("{name}-env"));
         let root_arg = path_string(&root);
         let mut args = vec!["dev", name, "--repo", &repo, "--root", &root_arg];
-        if let Some(mode) = mode {
-            args.push(mode);
+        match mode {
+            None => args.extend(["--no-watch", "--no-ui"]),
+            Some("--watch") => args.extend(["--watch", "--no-ui"]),
+            Some(mode) => args.push(mode),
         }
         let rejected = run_ocm(&fixture.cwd, &fixture.env, &args);
         assert!(!rejected.status.success(), "{name}");

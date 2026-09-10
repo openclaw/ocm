@@ -79,12 +79,24 @@ of release packaging.
 ```sh
 ocm dev <env> --repo /path/to/openclaw
 ocm dev <env> --repo /path/to/openclaw --service
-ocm dev <env> --watch
-ocm dev <env> --watch --force
+ocm dev <env> --no-ui
+ocm dev <env> --no-watch
+ocm dev <env> --no-watch --no-ui
+ocm dev <env> --force
 ocm dev <env> --onboard
 ocm dev status
 ocm dev status <env>
+ocm dev stop <env>
 ```
+
+Foreground dev starts the native Gateway watcher and live UI by default.
+`--no-watch` disables automatic backend rebuilds; `--no-ui` disables Vite.
+Combine both for a plain foreground Gateway. `--watch` and `--ui` remain accepted
+and conflict with their negative counterparts. `--service` keeps the background
+workflow without foreground watching or UI and rejects explicit `--watch` or
+`--ui`. `--force` requires backend watching and rejects `--no-watch` or `--service`.
+Repeat the same source, endpoint and effective component choices to reuse a
+session. `dev stop` stops the owned session and keeps environment state and source.
 
 New dev envs use the exact explicit or enclosing checkout with separate state;
 they create no Git worktree. Existing envs keep their recorded source, including

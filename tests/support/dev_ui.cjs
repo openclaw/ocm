@@ -86,6 +86,7 @@ if (role === "dashboard") {
         descendantPid: descendant?.pid,
         port,
         cwd: fs.realpathSync(process.cwd()),
+        entrypoint: path.basename(process.argv[1]),
         gatewayUrl: process.env.OPENCLAW_UI_DEV_GATEWAY_URL,
         uiBasePath: process.env.OPENCLAW_CONTROL_UI_BASE_PATH,
         args: process.argv.slice(2),

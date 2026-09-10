@@ -117,20 +117,27 @@ If you are developing OpenClaw itself, use the dev path:
 ```bash
 ocm dev shaks
 ocm dev shaks --root /tmp/shaks
-ocm dev shaks --watch
-ocm dev shaks --watch --ui
-ocm dev shaks --watch --force
+ocm dev shaks --no-ui
+ocm dev shaks --no-watch
+ocm dev shaks --no-watch --no-ui
+ocm dev shaks --force
 ocm dev stop shaks
 ocm dev shaks --repo /path/to/openclaw --watch --force
 ocm dev shaks --service
 ocm dev shaks --onboard
 ```
 
-`dev` creates or reuses an isolated env, uses the selected OpenClaw checkout directly, bootstraps the minimum local config so the gateway can run immediately, and then starts the gateway in the foreground. `--root` lets you choose the environment location. `--watch` keeps a source-run gateway rebuilding in place. While a foreground dev session is active, `ocm @<env> -- ...`, `ocm env run <env> -- ...`, `ocm env resolve <env> -- ...`, service resolution, and `ocm env exec <env> -- openclaw ...` use the same source checkout and run `node <checkout>/openclaw.mjs` directly instead of rebuilding through the package script. `--service` installs and starts the dev env in the OCM background service instead of keeping the process in the current terminal. If a dev env is already running in the background, `--watch --force` temporarily takes it over for the watch session and restores the background service when watch exits. For an existing runtime or launcher env, `--repo <path> --watch --force` temporarily runs that source checkout against the env's real root, config, state, and port without changing its binding, tees foreground output to the env gateway logs, then restores a running background service when watch exits. `--onboard` runs local onboarding first and then starts the dev gateway. For a new env, `dev` uses the explicit `--repo` checkout or the checkout enclosing the current directory. Outside an OpenClaw checkout, pass `--repo`; `dev` does not select a neighboring or previously remembered repository. Existing dev envs continue to use their recorded source.
+`dev` creates or reuses an isolated env, uses the selected OpenClaw checkout directly, bootstraps the minimum local config so the gateway can run immediately, and then starts the native Gateway watcher and live UI in the foreground by default. `--root` lets you choose the environment location. While a foreground dev session is active, `ocm @<env> -- ...`, `ocm env run <env> -- ...`, `ocm env resolve <env> -- ...`, service resolution, and `ocm env exec <env> -- openclaw ...` use the same source checkout and run `node <checkout>/openclaw.mjs` directly instead of rebuilding through the package script. `--service` installs and starts the dev env in the OCM background service instead of keeping the process in the current terminal. If a dev env is already running in the background, `--watch --force` temporarily takes it over for the watch session and restores the background service when watch exits. For an existing runtime or launcher env, `--repo <path> --watch --force` temporarily runs that source checkout against the env's real root, config, state, and port without changing its binding, tees foreground output to the env gateway logs, then restores a running background service when watch exits. `--onboard` runs local onboarding first and then starts the dev gateway. For a new env, `dev` uses the explicit `--repo` checkout or the checkout enclosing the current directory. Outside an OpenClaw checkout, pass `--repo`; `dev` does not select a neighboring or previously remembered repository. Existing dev envs continue to use their recorded source.
 
-Plain and watched foreground sessions support `ocm dev stop <env>` and reuse a
-matching active session. `dev status` reports backend watching separately from
-session ownership.
+`--no-ui` runs the Gateway watcher alone. `--no-watch` keeps the live UI with a
+Gateway that does not rebuild automatically. Combine both for a plain foreground
+Gateway. `--watch` and `--ui` remain accepted; each conflicts with its negative
+counterpart. `--force` requires backend watching and rejects `--no-watch` or
+`--service`.
+
+All foreground combinations support `ocm dev stop <env>` and reuse a matching
+active session. `dev status` reports backend watching separately from session
+ownership.
 
 Creating or changing a dev binding is refused while an environment containing or
 owning its source, worktree path, or required Git metadata is busy with another operation.
@@ -143,12 +150,14 @@ source rebuilds, so paired clients can reconnect. Initialization never replaces 
 existing config or its auth/SecretRefs. Repeating minimum setup leaves an unchanged
 config untouched.
 
-Add `--ui` to run OpenClaw's native Vite server beside either foreground mode.
+Foreground `dev` runs OpenClaw's native Vite server beside the Gateway by default;
+use `--no-ui` to disable it.
 OCM prints the session's UI address, then its initial native owner link after
 both Vite and the Gateway Control UI document are ready. The native handoff keeps
 the Gateway identity and credentials; only the browser document moves to Vite.
 UI requires a local HTTP Gateway with Control UI enabled and installed UI dependencies.
-It cannot be combined with `--service`.
+`--service` uses the background workflow without foreground watching or UI and
+rejects explicit `--watch` or `--ui`.
 
 The controller owns Gateway, Vite and each dashboard helper. A component
 exit stops its sibling; `dev stop` stops both and gives a running helper only the
@@ -318,7 +327,7 @@ runtimes for debugging.
 ```bash
 ocm dev luna
 ocm dev luna --root ~/scratch/luna
-ocm dev luna --watch
+ocm dev luna --no-ui
 ocm dev existing-env --repo ~/src/openclaw --watch --force
 ```
 
@@ -360,7 +369,7 @@ continue to own rebuilds and auto-doctor.
 
 Foreground dependency installation keeps build output and pnpm diagnostics readable while using lifecycle reports to check script completion. When run from a terminal, installation keeps interactive stdin while streaming that output. On Unix, interrupted or unfinished build scripts retain foreground ownership even if pnpm returns an ordinary error or an optional build lets it succeed. Completed installation errors remain retryable.
 
-Repeating plain `ocm dev <env>` or `ocm dev <env> --watch` for the same active mode and source returns its status and existing gateway link without preparing dependencies, onboarding, or restarting processes. Mode/source/root/port mismatches and onboarding during a foreground session are errors. Startup and service restoration are reported as progress; an invocation during startup does not claim a source identity that has not yet been published. Temporary runtime or launcher takeovers retain the `--repo <path> --watch --force` form. Active status and routed source commands use the captured launch root and port even if config is edited; an explicit different port is refused. Watch sessions started by an older OCM without endpoint metadata need to be stopped from their original terminal and started again before they can be reused. Only the foreground invocation that acquires the lease prepares configuration.
+Repeating `ocm dev <env>` with the same effective backend watching/UI choices and source returns its status and existing gateway link without preparing dependencies, onboarding, or restarting processes. Mode/source/root/port mismatches and onboarding during a foreground session are errors. Startup and service restoration are reported as progress; an invocation during startup does not claim a source identity that has not yet been published. Temporary runtime or launcher takeovers retain the `--repo <path> --watch --force` form. Active status and routed source commands use the captured launch root and port even if config is edited; an explicit different port is refused. Watch sessions started by an older OCM without endpoint metadata need to be stopped from their original terminal and started again before they can be reused. Only the foreground invocation that acquires the lease prepares configuration.
 
 Use `ocm dev status [env]` to inspect dev environments and temporary source watches on runtime or launcher environments. It reports the source path, gateway URL, and session ownership (`starting`, `active`, `restoring`, `inactive`, or `unknown`). Active foreground ownership can outlive the wrapper process and does not imply that the Gateway is ready. JSON reports backend watching as `sourceWatch.watching`, keeps `serviceRunning` separate from the saved `serviceDesiredRunning` policy and includes the watch PID, start time, and any inspection issue. `gatewayPortReachable` uses a 100 ms loopback TCP check; an open port does not establish Gateway identity or readiness. Status leaves watch metadata unchanged and omits lease tokens.
 

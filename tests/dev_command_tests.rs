@@ -1023,6 +1023,213 @@ fn initial_ui_process(root: &TestDir, role: &str, owner: &mut DevWatchFixture) -
 
 #[cfg(unix)]
 #[test]
+fn dev_defaults_start_live_components_and_opt_outs_select_the_owned_mode() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (label, args, watching, ui) in [
+        ("default", vec!["dev", "demo"], true, true),
+        ("no-ui", vec!["dev", "demo", "--no-ui"], true, false),
+        ("no-watch", vec!["dev", "demo", "--no-watch"], false, true),
+        (
+            "plain",
+            vec!["dev", "demo", "--no-watch", "--no-ui"],
+            false,
+            false,
+        ),
+        ("watch-alias", vec!["dev", "demo", "--watch"], true, true),
+        ("ui-alias", vec!["dev", "demo", "--ui"], true, true),
+        (
+            "both-aliases",
+            vec!["dev", "demo", "--watch", "--ui"],
+            true,
+            true,
+        ),
+    ] {
+        let root = TestDir::new(&format!("dev-default-mode-{label}"));
+        let mut env = ocm_env(&root);
+        let repo = prepare_initial_ui_repo(&root, &mut env);
+        fs::write(root.child("gateway-document-ready"), "ready").unwrap();
+        let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &args);
+        let controller_pid = controller.child.as_ref().unwrap().id();
+        let gateway = initial_ui_process(&root, "gateway", &mut controller);
+        assert_eq!(
+            gateway["entrypoint"],
+            if watching {
+                "watch-node.mjs"
+            } else {
+                "run-node.mjs"
+            },
+            "{label}"
+        );
+        let gateway_pid = gateway["pid"].as_u64().unwrap() as u32;
+        let ui_process = ui.then(|| initial_ui_process(&root, "ui", &mut controller));
+        if let Some(ui_process) = &ui_process {
+            assert_eq!(gateway["cwd"], ui_process["cwd"]);
+        } else {
+            assert!(!root.child("ui.json").exists(), "{label}");
+        }
+        let status = run_ocm(&repo, &env, &["dev", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{label}: {}", stderr(&status));
+        let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+        assert_eq!(status["sourceWatch"]["watching"], watching, "{label}");
+
+        // Reuse compares effective components, including implicit and explicit defaults.
+        let mut repeat = vec!["dev", "demo"];
+        if !watching {
+            repeat.push("--no-watch");
+        }
+        if !ui {
+            repeat.push("--no-ui");
+        }
+        if label == "default" {
+            repeat.extend(["--watch", "--ui"]);
+        }
+        let reused = run_ocm(&repo, &env, &repeat);
+        assert!(reused.status.success(), "{label}: {}", stderr(&reused));
+        let session = read_source_watch_session(&root);
+        assert_eq!(session["controller"]["pid"], controller_pid, "{label}");
+        assert_eq!(session["watching"], watching, "{label}");
+        if let Some(ui_process) = &ui_process {
+            assert_eq!(session["ui"]["children"]["gateway"]["pid"], gateway_pid);
+            assert_eq!(session["ui"]["children"]["ui"]["pid"], ui_process["pid"]);
+            assert_eq!(session["ui"]["target"]["port"], ui_process["port"]);
+        } else {
+            assert_eq!(session["child"]["pid"], gateway_pid);
+            assert!(session["ui"].is_null());
+        }
+
+        let stopped = run_dev_stop(&repo, &env);
+        assert!(stopped.status.success(), "{label}: {}", stderr(&stopped));
+        let finished = controller.wait_without_release();
+        assert_eq!(
+            finished.status.code(),
+            Some(130),
+            "{label}: {}",
+            stderr(&finished)
+        );
+        assert!(wait_for_process_exit(gateway_pid, Duration::from_secs(3)));
+        if let Some(ui_process) = ui_process {
+            assert!(wait_for_process_exit(
+                ui_process["pid"].as_u64().unwrap() as u32,
+                Duration::from_secs(3)
+            ));
+        } else {
+            assert!(!root.child("ui.json").exists(), "{label}");
+        }
+        assert_eq!(read_source_watch_session(&root)["closed"], true);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_defaults_preserve_incompatible_existing_envs_and_allow_ui_opt_out() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (variant, expected) in [
+        ("tls", "requires a local HTTP Gateway"),
+        ("disabled-ui", "disables the Control UI"),
+        ("missing-ui", "Control UI dependencies are not ready"),
+    ] {
+        let root = TestDir::new(&format!("dev-default-existing-{variant}"));
+        let mut env = ocm_env(&root);
+        let repo = prepare_initial_ui_repo(&root, &mut env);
+        let mut initial = DevWatchFixture::spawn(&root, &repo, &env, &["dev", "demo", "--no-ui"]);
+        let gateway = initial_ui_process(&root, "gateway", &mut initial);
+        let selected = PathBuf::from(gateway["cwd"].as_str().unwrap());
+        let stopped = run_dev_stop(&repo, &env);
+        assert!(stopped.status.success(), "{variant}: {}", stderr(&stopped));
+        assert_eq!(initial.wait_without_release().status.code(), Some(130));
+        drop(initial);
+        fs::remove_file(root.child("source-watch.release")).unwrap();
+        fs::remove_file(root.child("gateway.json")).unwrap();
+
+        let original = get_environment("demo", &env, &repo).unwrap();
+        let config_path = Path::new(&original.root).join(".openclaw/openclaw.json");
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        match variant {
+            "tls" => config["gateway"]["tls"] = serde_json::json!({"enabled": true}),
+            "disabled-ui" => config["gateway"]["controlUi"] = serde_json::json!({"enabled": false}),
+            "missing-ui" => {
+                assert!(selected.join("node_modules/vite").is_dir());
+                // An owned worktree can also resolve a package from its parent repo.
+                for source in [&selected, &repo] {
+                    let dependency = source.join("node_modules/vite");
+                    if dependency.is_dir() {
+                        fs::remove_dir_all(dependency).unwrap();
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        let config_bytes = serde_json::to_vec(&config).unwrap();
+        fs::write(&config_path, &config_bytes).unwrap();
+        let source_bytes = [
+            "package.json",
+            "scripts/watch-node.mjs",
+            "scripts/run-node.mjs",
+        ]
+        .map(|path| (selected.join(path), fs::read(selected.join(path)).unwrap()));
+        let assert_preserved = || {
+            assert!(
+                fs::read(&config_path).unwrap() == config_bytes,
+                "{variant}: config changed"
+            );
+            let current = get_environment("demo", &env, &repo).unwrap();
+            assert_eq!(current.root, original.root);
+            assert_eq!(current.created_at, original.created_at);
+            assert_eq!(
+                serde_json::to_value(&current.dev).unwrap(),
+                serde_json::to_value(&original.dev).unwrap()
+            );
+            for (path, bytes) in &source_bytes {
+                assert!(
+                    fs::read(path).unwrap() == *bytes,
+                    "{variant}: source changed"
+                );
+            }
+            if variant == "missing-ui" {
+                assert!(!selected.join("node_modules/vite").exists());
+                assert!(!repo.join("node_modules/vite").exists());
+            }
+        };
+
+        let rejected = run_ocm(&repo, &env, &["dev", "demo"]);
+        assert!(!rejected.status.success(), "{variant}");
+        assert!(
+            stderr(&rejected).contains(expected),
+            "{variant}: {}",
+            stderr(&rejected)
+        );
+        assert!(stderr(&rejected).contains("--no-ui"));
+        for path in ["gateway.json", "ui.json", "dashboard-attempts"] {
+            assert!(!root.child(path).exists(), "{variant}: {path} started");
+        }
+        assert_eq!(read_source_watch_session(&root)["closed"], true);
+        assert_preserved();
+
+        let mut recovered = DevWatchFixture::spawn(&root, &repo, &env, &["dev", "demo", "--no-ui"]);
+        let running = initial_ui_process(&root, "gateway", &mut recovered);
+        assert_eq!(running["entrypoint"], "watch-node.mjs");
+        assert_eq!(running["cwd"], gateway["cwd"]);
+        assert!(read_source_watch_session(&root)["ui"].is_null());
+        assert_preserved();
+        let stopped = run_dev_stop(&repo, &env);
+        assert!(stopped.status.success(), "{variant}: {}", stderr(&stopped));
+        assert_eq!(recovered.wait_without_release().status.code(), Some(130));
+        assert!(wait_for_process_exit(
+            running["pid"].as_u64().unwrap() as u32,
+            Duration::from_secs(3)
+        ));
+        assert!(!root.child("ui.json").exists());
+        assert!(!root.child("dashboard-attempts").exists());
+        assert_preserved();
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_ui_initial_handoff_and_owned_lifecycle() {
     let _serial = INITIAL_UI_TEST_LOCK
         .lock()
@@ -1604,7 +1811,14 @@ fn dev_ui_claims_an_address_before_the_listener_starts() {
         &root,
         &repo,
         &env,
-        &["dev", "first", "--repo", &path_string(&repo), "--ui"],
+        &[
+            "dev",
+            "first",
+            "--repo",
+            &path_string(&repo),
+            "--ui",
+            "--no-watch",
+        ],
     );
     assert!(wait_for_path(
         &source_watch_override_path(&root, "first"),
@@ -1661,6 +1875,7 @@ fn dev_ui_claims_an_address_before_the_listener_starts() {
             "--repo",
             &path_string(&second_repo),
             "--ui",
+            "--no-watch",
         ],
     );
     let second_gateway = initial_ui_process(&second_root, "gateway", &mut second);
@@ -1699,7 +1914,7 @@ fn dev_ui_claims_an_address_before_the_listener_starts() {
         &second_root,
         &second_repo,
         &second_env,
-        &["dev", "second", "--ui"],
+        &["dev", "second", "--ui", "--no-watch"],
     );
     let rejected = busy.wait_without_release();
     assert!(!rejected.status.success());
@@ -1768,7 +1983,14 @@ fn dev_ui_port_reservation_waits_for_metadata_mutations() {
         &root,
         &repo,
         &env,
-        &["dev", "demo", "--repo", &path_string(&repo), "--ui"],
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--ui",
+            "--no-watch",
+        ],
     );
     assert!(wait_for_path(
         &root.child("ui-probe-ready"),
@@ -1850,12 +2072,32 @@ fn dev_ui_port_reservation_waits_for_metadata_mutations() {
 }
 
 #[test]
-fn dev_ui_rejects_service_mode_before_creating_environment() {
-    let root = TestDir::new("initial-ui-service-conflict");
+fn dev_rejects_conflicting_modes_before_creating_environment_state() {
+    let root = TestDir::new("dev-conflicting-modes");
     let env = ocm_env(&root);
-    let result = run_ocm(root.path(), &env, &["dev", "demo", "--ui", "--service"]);
-    assert!(!result.status.success());
-    assert!(stderr(&result).contains("cannot combine --ui with --service"));
+    let repo = init_openclaw_repo(&root);
+    let repo_arg = path_string(&repo);
+    for (flags, expected) in [
+        (vec!["--watch", "--no-watch"], "--watch with --no-watch"),
+        (vec!["--ui", "--no-ui"], "--ui with --no-ui"),
+        (vec!["--watch", "--service"], "--watch with --service"),
+        (vec!["--ui", "--service"], "--ui with --service"),
+        (vec!["--force", "--no-watch"], "backend watching enabled"),
+        (vec!["--force", "--service"], "backend watching enabled"),
+    ] {
+        let mut args = vec!["dev", "demo", "--repo", &repo_arg];
+        args.extend(flags);
+        let result = run_ocm(root.path(), &env, &args);
+        assert!(!result.status.success());
+        assert!(stderr(&result).contains(expected), "{}", stderr(&result));
+        assert!(!source_watch_override_path(&root, "demo").exists());
+        assert!(
+            !source_watch_override_path(&root, "demo")
+                .with_extension("session")
+                .exists()
+        );
+        assert!(!repo.join(".worktrees/demo").exists());
+    }
     let listed = run_ocm(root.path(), &env, &["env", "list", "--json"]);
     assert!(listed.status.success(), "{}", stderr(&listed));
     assert_eq!(
@@ -1875,7 +2117,18 @@ fn dev_command_borrows_checkout_bootstraps_config_and_runs_gateway() {
     install_fake_dev_runners(&root, &mut env);
     let registered = git_worktree_paths(&repo);
 
-    let run = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
+    let run = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--no-watch",
+            "--no-ui",
+        ],
+    );
     assert!(run.status.success(), "{}", stderr(&run));
 
     let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
@@ -1923,7 +2176,7 @@ fn dev_command_borrows_checkout_bootstraps_config_and_runs_gateway() {
     assert!(!stdout(&run).contains(token) && !stderr(&run).contains(token));
     assert!(!stdout(&show).contains(token));
     let original = fs::read(&config_path).unwrap();
-    let resumed = run_ocm(&cwd, &env, &["dev", "demo"]);
+    let resumed = run_ocm(&cwd, &env, &["dev", "demo", "--no-watch", "--no-ui"]);
     assert!(resumed.status.success(), "{}", stderr(&resumed));
     assert!(fs::read(&config_path).unwrap() == original);
     assert!(!stdout(&resumed).contains(token) && !stderr(&resumed).contains(token));
@@ -1939,7 +2192,7 @@ fn dev_command_borrows_checkout_bootstraps_config_and_runs_gateway() {
         );
         fs::write(&config_path, &raw).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
-        let resumed = run_ocm(&cwd, &env, &["dev", "demo"]);
+        let resumed = run_ocm(&cwd, &env, &["dev", "demo", "--no-watch", "--no-ui"]);
         assert!(resumed.status.success(), "{}", stderr(&resumed));
         assert_eq!(
             fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
@@ -2339,7 +2592,11 @@ fn dev_borrowed_dependencies_are_prepared_only_on_first_creation() {
         install_frozen_source_dependency_runner(&root);
         let repo_arg = path_string(&repo);
         let mut args = vec!["dev", "demo", "--repo", &repo_arg];
-        args.extend(mode);
+        match mode {
+            None => args.extend(["--no-watch", "--no-ui"]),
+            Some("--watch") => args.extend(["--watch", "--no-ui"]),
+            Some(mode) => args.push(mode),
+        }
         let created = run_ocm(&cwd, &env, &args);
         assert!(created.status.success(), "{mode:?}: {}", stderr(&created));
         let install_log = fs::read(root.child("pnpm.log")).unwrap();
@@ -2357,7 +2614,7 @@ fn dev_borrowed_dependencies_are_prepared_only_on_first_creation() {
         let mut attempts = vec![args.clone()];
         if mode.is_none() {
             attempts.extend([
-                vec!["dev", "demo", "--ui"],
+                vec!["dev", "demo", "--ui", "--no-watch"],
                 vec!["dev", "demo", "--watch", "--ui"],
             ]);
         }
@@ -2473,6 +2730,7 @@ fn dev_dependencies_reuse_configured_modules_before_native_linking() {
                 &path_string(&repo),
                 "--watch",
                 "--force",
+                "--no-ui",
             ],
         );
         assert!(reused.status.success(), "{key}: {}", stderr(&reused));
@@ -2504,6 +2762,7 @@ fn dev_dependencies_reuse_configured_modules_before_native_linking() {
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ],
     );
     assert!(!broken.status.success());
@@ -2533,6 +2792,7 @@ fn dev_dependencies_reuse_configured_modules_before_native_linking() {
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ],
     );
     assert!(fallback.status.success(), "{}", stderr(&fallback));
@@ -2552,6 +2812,7 @@ fn dev_dependencies_reuse_configured_modules_before_native_linking() {
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ],
     );
     assert!(selected.status.success(), "{}", stderr(&selected));
@@ -2828,6 +3089,7 @@ fn dev_dependencies_reject_unready_borrowed_source_before_service_changes() {
                 &path_string(&repo),
                 "--watch",
                 "--force",
+                "--no-ui",
             ],
         );
         assert!(!failed.status.success(), "{case}: {}", stdout(&failed));
@@ -2881,6 +3143,7 @@ fn dev_dependencies_reject_unready_borrowed_source_before_service_changes() {
                 &path_string(&repo),
                 "--watch",
                 "--force",
+                "--no-ui",
             ],
         );
         assert!(!failed.status.success(), "{key}: {}", stdout(&failed));
@@ -2914,6 +3177,7 @@ fn dev_dependencies_reject_unready_borrowed_source_before_service_changes() {
                 &path_string(&repo),
                 "--watch",
                 "--force",
+                "--no-ui",
             ],
         );
         assert!(!rejected.status.success());
@@ -3814,6 +4078,7 @@ fn dev_command_can_onboard_then_watch() {
             &path_string(&repo),
             "--onboard",
             "--watch",
+            "--no-ui",
         ],
     );
     assert!(run.status.success(), "{}", stderr(&run));
@@ -4046,6 +4311,8 @@ fn dev_command_accepts_a_custom_env_root() {
             &path_string(&repo),
             "--root",
             "./env-roots/demo",
+            "--no-watch",
+            "--no-ui",
         ],
     );
     assert!(run.status.success(), "{}", stderr(&run));
@@ -4081,6 +4348,8 @@ fn dev_command_allows_reusing_the_same_explicit_port() {
             &path_string(&repo),
             "--port",
             "21901",
+            "--no-watch",
+            "--no-ui",
         ],
     );
     assert!(first.status.success(), "{}", stderr(&first));
@@ -4249,6 +4518,8 @@ fn dev_command_can_start_a_background_service() {
     {
         let preparation = read_source_watch_session(&root);
         assert_eq!(preparation["servicePreparation"], true);
+        assert_eq!(preparation["watching"], false);
+        assert!(preparation["ui"].is_null());
         assert_eq!(preparation["closed"], true);
         assert_eq!(preparation["restoreService"], false);
     }
@@ -4261,18 +4532,6 @@ fn dev_command_can_start_a_background_service() {
     assert_eq!(status_json["desiredRunning"], true);
 
     assert!(stdout(&run).contains("http://127.0.0.1:"));
-}
-
-#[test]
-fn dev_command_rejects_watch_plus_service() {
-    let root = TestDir::new("dev-command-watch-service");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let run = run_ocm(&cwd, &env, &["dev", "demo", "--watch", "--service"]);
-    assert!(!run.status.success());
-    assert!(stderr(&run).contains("dev cannot combine --watch with --service"));
 }
 
 fn create_runtime_backed_env(cwd: &Path, env: &std::collections::BTreeMap<String, String>) {
@@ -4324,6 +4583,7 @@ fn dev_watch_force_takes_over_runtime_env_without_rebinding() {
     let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
     assert!(start.status.success(), "{}", stderr(&start));
 
+    // Force uses the default watcher without requiring its positive alias.
     let watch = run_ocm(
         &cwd,
         &env,
@@ -4332,8 +4592,8 @@ fn dev_watch_force_takes_over_runtime_env_without_rebinding() {
             "demo",
             "--repo",
             &path_string(&repo),
-            "--watch",
             "--force",
+            "--no-ui",
         ],
     );
     assert!(watch.status.success(), "{}", stderr(&watch));
@@ -4409,6 +4669,7 @@ fn dev_watch_force_rejects_dependencies_from_another_checkout_before_takeover() 
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ],
     );
 
@@ -4455,6 +4716,7 @@ fn dev_watch_force_rejects_dangling_dependency_link_before_takeover() {
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ],
     );
 
@@ -4498,6 +4760,7 @@ fn dev_watch_force_warns_for_installed_plugins_missing_from_source() {
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ],
     );
     assert!(watch.status.success(), "{}", stderr(&watch));
@@ -4533,6 +4796,7 @@ fn dev_watch_force_restores_runtime_service_when_source_watch_cannot_spawn() {
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ],
     );
     assert!(!watch.status.success());
@@ -4583,6 +4847,7 @@ fn dev_watch_rejects_service_activation_until_the_watch_exits() {
                 &path_string(&repo),
                 "--watch",
                 "--force",
+                "--no-ui",
             ])
             .env_clear()
             .envs(&env)
@@ -4605,6 +4870,7 @@ fn dev_watch_rejects_service_activation_until_the_watch_exits() {
                 &path_string(&repo),
                 "--watch",
                 "--force",
+                "--no-ui",
             ],
         );
         let override_after = fs::read(source_watch_override_path(&root, "demo")).unwrap();
@@ -4666,6 +4932,7 @@ fn dev_destroy_stops_the_recorded_watch_before_removing_state() {
                 &path_string(&repo),
                 "--watch",
                 "--force",
+                "--no-ui",
             ],
         );
         assert!(wait_for_path(&started, Duration::from_secs(10)));
@@ -4824,6 +5091,7 @@ fn dev_stop_restores_service_and_preserves_the_env_and_borrowed_source() {
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ],
     );
     assert!(
@@ -4918,6 +5186,7 @@ fn dev_stop_keeps_dotted_environment_watch_ownership_separate() {
                 &path_string(&repo),
                 "--watch",
                 "--force",
+                "--no-ui",
             ],
         );
         let other_override = source_watch_override_path(&root, &other_name);
@@ -4937,6 +5206,7 @@ fn dev_stop_keeps_dotted_environment_watch_ownership_separate() {
                 &path_string(&repo),
                 "--watch",
                 "--force",
+                "--no-ui",
             ],
         );
         assert!(
@@ -5124,9 +5394,11 @@ if (failure === 'eof') process.exit(23);
 setInterval(() => { if (fs.existsSync(path.join(root, 'source-watch.release'))) process.exit(0); }, 25);
 "#).unwrap();
         let repo_arg = path_string(&repo);
-        let mut args = vec!["dev", "demo", "--repo", &repo_arg];
+        let mut args = vec!["dev", "demo", "--repo", &repo_arg, "--no-ui"];
         if watching {
             args.extend(["--watch", "--force"]);
+        } else {
+            args.push("--no-watch");
         }
         let mut watch = DevWatchFixture::spawn(&root, &cwd, &env, &args);
         assert!(wait_for_path(
@@ -5254,7 +5526,18 @@ fn dev_watch_interactive_setup_requires_completion_evidence() {
         let node = stdout(&node).trim().to_string();
         let mut env = ocm_env(&root);
         install_fake_dev_runners(&root, &mut env);
-        let created = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
+        let created = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--no-watch",
+                "--no-ui",
+            ],
+        );
         assert!(created.status.success(), "{}", stderr(&created));
         fs::remove_file(root.child("node.log")).unwrap();
         env.insert("OCM_TEST_FOREGROUND_ROOT".into(), path_string(root.path()));
@@ -5289,7 +5572,7 @@ setInterval(() => { if (fs.existsSync(path.join(root,'source-watch.release'))) p
         let (child, terminal) = spawn_ocm_with_controlling_pty(
             &cwd,
             &env,
-            &["dev", "demo", "--watch", "--onboard"],
+            &["dev", "demo", "--watch", "--onboard", "--no-ui"],
             true,
         );
         // Keep draining until after the watch guard cleans up, including on panic.
@@ -5592,6 +5875,7 @@ fn dev_stop_recovers_a_crashed_controller_and_its_stubborn_tree_before_restorati
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ],
     );
     assert!(
@@ -5774,12 +6058,26 @@ fn dev_watch_reuses_active_session_and_reclaims_the_released_lock() {
 
     let overlap = run_ocm(&cwd, &env, &dev_watch(&["demo", "--watch"]));
     let conflicting = [
-        vec!["dev", "demo"],
+        vec!["dev", "demo", "--no-watch", "--no-ui"],
         vec!["dev", "demo", "--service"],
-        vec!["dev", "demo", "--watch", "--repo", cwd.to_str().unwrap()],
-        vec!["dev", "demo", "--watch", "--root", cwd.to_str().unwrap()],
-        vec!["dev", "demo", "--watch", "--port", "1"],
-        vec!["dev", "demo", "--watch", "--onboard"],
+        vec![
+            "dev",
+            "demo",
+            "--watch",
+            "--repo",
+            cwd.to_str().unwrap(),
+            "--no-ui",
+        ],
+        vec![
+            "dev",
+            "demo",
+            "--watch",
+            "--root",
+            cwd.to_str().unwrap(),
+            "--no-ui",
+        ],
+        vec!["dev", "demo", "--watch", "--port", "1", "--no-ui"],
+        vec!["dev", "demo", "--watch", "--onboard", "--no-ui"],
     ]
     .map(|args| run_ocm(&cwd, &env, &args));
     let first_port = meta.gateway_port.unwrap();
@@ -6341,6 +6639,7 @@ try:
             "--repo",
             os.environ["OCM_TEST_REPO"],
             "--watch",
+            "--no-ui",
         ],
         cwd=os.environ["OCM_TEST_CWD"],
         stdin=slave,
@@ -6473,6 +6772,7 @@ fn dev_watch_aborts_and_restores_policy_when_service_stop_times_out() {
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ],
     );
     assert!(!watch.status.success());
@@ -6520,6 +6820,7 @@ fn assert_dev_watch_signal_restores_service(test_name: &str, signal_name: &str) 
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ])
         .env_clear()
         .envs(&env)
@@ -6592,6 +6893,7 @@ fn dev_watch_nonzero_child_exit_restores_the_service() {
             &path_string(&repo),
             "--watch",
             "--force",
+            "--no-ui",
         ],
     );
     assert!(started.exists());

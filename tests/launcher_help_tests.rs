@@ -35,7 +35,7 @@ fn top_level_help_is_clean_and_points_to_topics() {
     assert!(output.contains("upgrade"));
     assert!(output.contains("setup"));
     assert!(output.contains("ocm dev shaks"));
-    assert!(output.contains("ocm dev shaks --watch"));
+    assert!(output.contains("ocm dev shaks --no-ui"));
     assert!(output.contains("ocm start"));
     assert!(output.contains("ocm migrate mira"));
     assert!(output.contains("ocm adopt inspect"));
@@ -112,12 +112,20 @@ fn dev_help_is_available_from_help_and_bare_group() {
     assert_eq!(output, stdout(&bare));
     assert!(output.contains("Development envs"));
     assert!(output.contains(
-        "ocm dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch] [--ui] [--force] [--service] [--onboard]"
+        "ocm dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch | --no-watch] [--ui | --no-ui] [--force] [--service] [--onboard]"
     ));
     assert!(output.contains("ocm dev shaks --root /tmp/shaks"));
-    assert!(output.contains("ocm dev shaks --watch"));
-    assert!(output.contains("ocm dev shaks --watch --force"));
-    assert!(output.contains("ocm dev shaks --watch --ui"));
+    assert!(output.contains("ocm dev shaks --no-ui"));
+    assert!(output.contains("ocm dev shaks --no-watch"));
+    assert!(output.contains("ocm dev shaks --no-watch --no-ui"));
+    assert!(output.contains("ocm dev shaks --force"));
+    assert!(output.contains("Backend watching and native Vite UI are enabled by default."));
+    assert!(output.contains(
+        "Explicit --watch and --ui remain accepted; each conflicts with its negative counterpart."
+    ));
+    assert!(output.contains(
+        "--service uses the background workflow without foreground watching or UI and rejects explicit --watch or --ui."
+    ));
     assert!(output.contains("each native browser handoff"));
     assert!(output.contains("ocm dev shaks --repo /path/to/openclaw --watch --force"));
     assert!(output.contains("ocm dev shaks --service"));

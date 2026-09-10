@@ -614,7 +614,7 @@ pub(crate) fn dev_ui_gateway_url(paths: &EnvPaths, port: u32) -> Result<String, 
         == Some(true)
     {
         return Err(
-            "--ui currently requires a local HTTP Gateway; this environment enables Gateway TLS. Omit --ui to keep using its configured Gateway"
+            "dev UI currently requires a local HTTP Gateway; this environment enables Gateway TLS. Use --no-ui to keep using its configured Gateway"
                 .to_string(),
         );
     }
@@ -625,7 +625,7 @@ pub(crate) fn dev_ui_gateway_url(paths: &EnvPaths, port: u32) -> Result<String, 
         == Some(false)
     {
         return Err(
-            "the environment disables the Control UI; omit --ui to keep using its configured Gateway"
+            "the environment disables the Control UI; use --no-ui to keep using its configured Gateway"
                 .to_string(),
         );
     }

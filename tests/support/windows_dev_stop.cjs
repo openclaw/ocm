@@ -98,7 +98,9 @@ function capture(child) {
 }
 function sessionPath(name) { return path.join(env.OCM_HOME, 'source-watch', name + '.session'); }
 function session(name) { return JSON.parse(fs.readFileSync(sessionPath(name), 'utf8')); }
-async function start(name, watching = true, withUi = false) {
+async function start(name, watching = true, withUi = false, defaults = false) {
+  assert.ok(!defaults || (watching && withUi));
+  const takeover = watching && !defaults;
   const directory = path.join(root, name);
   const repo = path.join(directory, 'repo');
   fs.mkdirSync(path.join(repo, 'scripts'), {recursive:true});
@@ -145,7 +147,7 @@ async function start(name, watching = true, withUi = false) {
   assert.equal(init.status, 0, init.stderr);
   const envRoot = path.join(directory, 'env');
   const port = String(21901 + 32 * tracked.length);
-  if (watching) {
+  if (takeover) {
     run(['env','create',name,'--runtime','proof-node','--root',envRoot,'--port',port]);
   } else {
     for (const args of [['add','.'], ['-c','user.name=OCM Tests','-c','user.email=tests@example.com','-c','commit.gpgsign=false','commit','--quiet','-m','fixture']]) {
@@ -154,13 +156,14 @@ async function start(name, watching = true, withUi = false) {
       assert.equal(saved.status, 0, saved.stderr);
     }
   }
-  if (withUi) {
+  if (withUi && takeover) {
     fs.mkdirSync(path.join(envRoot, '.openclaw'), {recursive:true});
     fs.writeFileSync(path.join(envRoot, '.openclaw', 'openclaw.json'), JSON.stringify({
       gateway:{controlUi:{basePath:'/console'}, auth:{mode:'token', token:'synthetic-fixture-auth'}},
     }));
   }
-  const args = ['dev',name,'--repo',repo,...(watching ? ['--watch','--force'] : ['--root',envRoot,'--port',port]), ...(withUi ? ['--ui'] : [])];
+  const modes = defaults ? [] : [watching ? '--watch' : '--no-watch', withUi ? '--ui' : '--no-ui'];
+  const args = ['dev',name,...(defaults ? [] : ['--repo',repo]),...(takeover ? ['--force'] : ['--root',envRoot,'--port',port]),...modes];
   const sourceEnv = {
     ...env,
     ...(withUi ? {OCM_TEST_DEV_UI_DIR:directory, OCM_TEST_DEV_UI_DESCENDANTS:'1'} : {}),
@@ -168,7 +171,7 @@ async function start(name, watching = true, withUi = false) {
     nOdE_dIsAbLe_CoMpIlE_cAcHe: '0',
     NODE_OPTIONS: '--no-warnings'
   };
-  const controller = cp.spawn(binary, args, {cwd:root, env:sourceEnv, stdio:['ignore','pipe','pipe'], windowsHide:true});
+  const controller = cp.spawn(binary, args, {cwd:defaults ? repo : root, env:sourceEnv, stdio:['ignore','pipe','pipe'], windowsHide:true});
   const output = capture(controller);
   const record = {name, directory, repo, controller, output, identities:[]};
   tracked.push(record);
@@ -183,7 +186,7 @@ async function start(name, watching = true, withUi = false) {
   const gateway = withUi ? JSON.parse(fs.readFileSync(gatewayFile)) : {
     pid:Number(fs.readFileSync(rootPid,'utf8')), descendantPid:Number(fs.readFileSync(descendantPid,'utf8')),
   };
-  if (!withUi) assert.equal(path.basename(fs.readFileSync(ready, 'utf8')), watching ? 'watch-node.mjs' : 'run-node.mjs');
+  assert.equal(withUi ? gateway.entrypoint : path.basename(fs.readFileSync(ready, 'utf8')), watching ? 'watch-node.mjs' : 'run-node.mjs');
   const watcher = gateway.pid;
   const descendant = gateway.descendantPid;
   assert.equal(owner.controller.pid, controller.pid);
@@ -228,7 +231,7 @@ async function start(name, watching = true, withUi = false) {
   record.original = fs.readFileSync(sessionPath(name));
   record.watcher = watcher;
   record.descendant = descendant;
-  record.source = watching ? repo : JSON.parse(run(['env','show',name,'--json']).stdout).devWorktreeRoot;
+  record.source = withUi ? gateway.cwd : takeover ? repo : JSON.parse(run(['env','show',name,'--json']).stdout).devWorktreeRoot;
   fs.writeFileSync(path.join(envRoot, 'SENTINEL'), 'preserve environment');
   return record;
 }
@@ -279,7 +282,7 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     // No subprocess may be created before this handshake completes.
     assert.equal(native('ready').ready, true);
     run(['runtime','add','proof-node','--path',process.execPath]);
-    const normal = await start('normal.stop', true, true);
+    const normal = await start('normal.stop', true, true, true);
     fs.rmSync(path.join(normal.directory, 'dashboard-hold'));
     await waitFor(() => !alive(normal.helperPid) && !session(normal.name).ui.children.command && normal.output().includes('UI: '),
       'Completed initial handoff was not acknowledged');
@@ -422,7 +425,7 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     await checkPreserved(normal);
     const again = JSON.parse(run(['dev','stop',normal.name,'--json']).stdout);
     assert.equal(again.stopped, false);
-    results.push('native fresh UI reuse, abandoned grant discarded, original helper/component ownership, named stop, env/source preservation');
+    results.push('native bare dev defaults, fresh UI reuse, abandoned grant discarded, original helper/component ownership, named stop, env/source preservation');
 
     const plain = await start('plain.stop', false);
     const plainStatus = JSON.parse(run(['dev','status',plain.name,'--json']).stdout);

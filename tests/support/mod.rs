@@ -971,8 +971,14 @@ fn dev_mode_args<'a>(args: &[&'a str], watch: bool) -> Vec<&'a str> {
         watch,
         "dev fixture mode does not match its arguments"
     );
-    // Keep the explicit watch flag and every other argument in their original order.
-    std::iter::once("dev").chain(args.iter().copied()).collect()
+    let mut fixed: Vec<_> = std::iter::once("dev").chain(args.iter().copied()).collect();
+    if !watch {
+        fixed.push("--no-watch");
+    }
+    if !args.contains(&"--ui") {
+        fixed.push("--no-ui");
+    }
+    fixed
 }
 
 pub fn run_ocm(cwd: &Path, env: &BTreeMap<String, String>, args: &[&str]) -> Output {

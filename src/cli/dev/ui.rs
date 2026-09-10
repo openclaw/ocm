@@ -691,7 +691,7 @@ for (const name of ['vite', 'dompurify']) {
             )?
             .ok_or_else(|| SourceWatchError::from("dev UI setup was cancelled".to_string()))?;
         if !output.status.success() {
-            return Err("Control UI dependencies are not ready; run pnpm install --frozen-lockfile in the selected checkout before retrying --ui".to_string().into());
+            return Err("Control UI dependencies are not ready; run pnpm install --frozen-lockfile in the selected checkout before retrying dev, or use --no-ui for Gateway-only development".to_string().into());
         }
         let service = self.environment_service();
         let _operation = service.lock_operation(&meta.name)?;

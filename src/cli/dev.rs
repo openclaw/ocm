@@ -483,8 +483,10 @@ impl Cli {
     fn handle_dev_run(&self, args: Vec<String>) -> Result<i32, String> {
         let (args, force) = Self::consume_flag(args, "--force");
         let (args, service_requested) = Self::consume_flag(args, "--service");
-        let (args, watch) = Self::consume_flag(args, "--watch");
-        let (args, ui) = Self::consume_flag(args, "--ui");
+        let (args, watch_requested) = Self::consume_flag(args, "--watch");
+        let (args, no_watch) = Self::consume_flag(args, "--no-watch");
+        let (args, ui_requested) = Self::consume_flag(args, "--ui");
+        let (args, no_ui) = Self::consume_flag(args, "--no-ui");
         let (args, onboard) = Self::consume_flag(args, "--onboard");
         let (args, repo_root) = Self::consume_option(args, "--repo")?;
         let repo_root = Self::require_option_value(repo_root, "--repo")?;
@@ -499,14 +501,22 @@ impl Cli {
             return Err("environment name is required".to_string());
         };
         Self::assert_no_extra_args(&args[1..])?;
-        if force && !watch {
-            return Err("dev accepts --force only with --watch".to_string());
+        if watch_requested && no_watch {
+            return Err("dev cannot combine --watch with --no-watch".to_string());
         }
-        if watch && service_requested {
+        if ui_requested && no_ui {
+            return Err("dev cannot combine --ui with --no-ui".to_string());
+        }
+        if watch_requested && service_requested {
             return Err("dev cannot combine --watch with --service".to_string());
         }
-        if ui && service_requested {
+        if ui_requested && service_requested {
             return Err("dev cannot combine --ui with --service".to_string());
+        }
+        let watch = !service_requested && !no_watch;
+        let ui = !service_requested && !no_ui;
+        if force && !watch {
+            return Err("dev accepts --force only with backend watching enabled".to_string());
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         if ui {
