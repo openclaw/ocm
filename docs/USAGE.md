@@ -432,6 +432,10 @@ inside it. OCM resolves source and destination aliases and also protects source
 symlinks that failed clone or import cleanup would remove. Choose a separate
 environment root.
 
+When OCM reports that it cannot resolve or inspect a registered source, it stops
+before writing the destination. Check the recorded source with `ocm env show
+<env>`, restore that checkout's path or access permissions, then retry.
+
 ### Clone an environment
 
 ```bash
