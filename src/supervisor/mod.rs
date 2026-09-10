@@ -1195,6 +1195,12 @@ fn lock_supervisor_state(state_path: &Path) -> Result<crate::store::ExclusiveFil
     lock_file(&lock_path, "supervisor state")
 }
 
+fn try_lock_supervisor_state(
+    state_path: &Path,
+) -> Result<Option<crate::store::ExclusiveFileLock>, String> {
+    crate::store::try_lock_file(&state_path.with_extension("lock"), "supervisor state")
+}
+
 struct RunningSupervisorChild {
     spec: SupervisorChildSpec,
     child: Child,
@@ -1574,28 +1580,37 @@ fn refresh_active_state(
     pending: &mut BTreeMap<String, PendingSupervisorChild>,
     inactive: &mut BTreeMap<String, InactiveSupervisorChild>,
 ) -> bool {
+    if read_updated_supervisor_state(state_path, active_state).is_none() {
+        return false;
+    }
+    // Preparation publishes ownership under this lock. Re-read the plan under
+    // it and keep it through reconciliation; Gateway admission gates starts.
+    let state_lock = match try_lock_supervisor_state(state_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return false,
+        Err(error) => {
+            eprintln!("ocm service: failed locking updated state for reconciliation: {error}");
+            return false;
+        }
+    };
     let Some(mut next_state) = read_updated_supervisor_state(state_path, active_state) else {
         return false;
     };
     let restart_requests = new_supervisor_restart_requests(active_state, &next_state);
-    let admission_locks = match retain_running_services_during_preparation(
+    if let Err(error) = retain_running_services_during_preparation(
         env_service,
         running,
         &restart_requests,
         &mut next_state,
     ) {
-        Ok(Some(locks)) => locks,
-        Ok(None) => return false,
-        Err(error) => {
-            eprintln!("ocm service: service preparation deferred state reconciliation: {error}");
-            return false;
-        }
-    };
+        eprintln!("ocm service: service preparation deferred state reconciliation: {error}");
+        return false;
+    }
     let restart_requests = new_supervisor_restart_requests(active_state, &next_state);
     let mut runtime_dirty = reconcile_running_children(running, pending, inactive, &next_state);
     runtime_dirty |=
         reconcile_restart_requests(&restart_requests, running, pending, inactive, &next_state);
-    drop(admission_locks);
+    drop(state_lock);
     *managed_child_count = next_state.children.len();
     *active_state = next_state;
     clear_processed_restart_requests(state_path, &restart_requests);
@@ -1605,14 +1620,14 @@ fn refresh_active_state(
 // Only updates that would change a live child need preparation inspection.
 // Keep the actual owner's spec rather than trusting a stale saved plan. Deferred
 // restart requests stay on disk and are omitted only from this in-memory view,
-// so they are observed again after preparation ends. Return the admission locks
-// through reconciliation so preparation cannot begin between inspection and stop.
+// so they are observed again after preparation ends. The caller holds the state
+// publication lock through reconciliation to exclude new preparation ownership.
 fn retain_running_services_during_preparation(
     env_service: &EnvironmentService<'_>,
     running: &BTreeMap<String, RunningSupervisorChild>,
     restart_requests: &[SupervisorRestartRequest],
     next_state: &mut SupervisorState,
-) -> Result<Option<Vec<crate::store::ExclusiveFileLock>>, String> {
+) -> Result<(), String> {
     let desired = child_map(&next_state.children);
     let restarting: BTreeSet<_> = restart_requests
         .iter()
@@ -1627,14 +1642,7 @@ fn retain_running_services_during_preparation(
         })
         .collect();
     if affected.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-    let mut admission_locks = Vec::with_capacity(affected.len());
-    for name in &affected {
-        let Some(admission) = env_service.try_lock_gateway_admission(name)? else {
-            return Ok(None);
-        };
-        admission_locks.push(admission);
+        return Ok(());
     }
     let metas: BTreeMap<_, _> = env_service
         .list()?
@@ -1676,7 +1684,7 @@ fn retain_running_services_during_preparation(
     next_state
         .children
         .sort_by(|left, right| left.env_name.cmp(&right.env_name));
-    Ok(Some(admission_locks))
+    Ok(())
 }
 
 fn reconcile_running_children(
@@ -3698,7 +3706,7 @@ mod tests {
             let mut count = 1;
             let mut pending = BTreeMap::new();
             let mut inactive = BTreeMap::new();
-            let admission = service.lock_gateway_admission("demo").unwrap();
+            let state_lock = supervisor.lock_state_publication().unwrap();
             assert!(!refresh_active_state(
                 &state_path,
                 &service,
@@ -3713,7 +3721,7 @@ mod tests {
             assert!(owner.child.try_wait().unwrap().is_none());
             let saved: SupervisorState = read_json(&state_path).unwrap();
             assert!(supervisor_state_equivalent(&saved, &next));
-            drop(admission);
+            drop(state_lock);
 
             let mut preparation = std::thread::scope(|scope| {
                 let state_lock = supervisor.lock_state_publication().unwrap();
