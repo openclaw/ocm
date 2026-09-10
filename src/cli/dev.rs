@@ -3580,18 +3580,34 @@ where
     W: Write,
 {
     let mut buffer = [0_u8; 8 * 1024];
+    let mut issue = None;
+    let mut terminal_writable = true;
+    let mut log_writable = true;
     loop {
-        let count = input.read(&mut buffer)?;
+        let count = match input.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         if count == 0 {
-            break;
+            return issue.map_or(Ok(()), Err);
         }
         let chunk = &buffer[..count];
-        terminal.write_all(chunk)?;
-        terminal.flush()?;
-        log_file.write_all(chunk)?;
-        log_file.flush()?;
+        // A failed destination must not close the source pipe or discard the
+        // other destination's output. Drain to EOF before reporting the error.
+        if terminal_writable
+            && let Err(error) = terminal.write_all(chunk).and_then(|()| terminal.flush())
+        {
+            issue.get_or_insert(error);
+            terminal_writable = false;
+        }
+        if log_writable
+            && let Err(error) = log_file.write_all(chunk).and_then(|()| log_file.flush())
+        {
+            issue.get_or_insert(error);
+            log_writable = false;
+        }
     }
-    Ok(())
 }
 
 fn wait_for_tee_threads(threads: Vec<JoinHandle<Result<(), String>>>) -> Result<(), String> {
@@ -3804,6 +3820,59 @@ fs.writeFileSync('source-ran', JSON.stringify({
                 assert_eq!(entry["args"], serde_json::json!(args));
                 assert_eq!(entry["stdin"], "original stdin");
                 assert!(entry["pendingGate"].is_null() && entry["consumedGate"].is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn source_output_keeps_draining_when_a_sink_fails() {
+        use std::io::{self, Cursor, Write};
+
+        struct Terminal {
+            bytes: Vec<u8>,
+            failure: u8,
+        }
+        impl Write for Terminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.failure == 1 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "terminal closed"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.failure == 2 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "terminal closed"));
+                }
+                Ok(())
+            }
+        }
+
+        let payload = vec![b'x'; 24 * 1024 + 1];
+        for terminal_failure in 0..=2 {
+            for log_failure in [false, true] {
+                let log = tempfile::NamedTempFile::new().unwrap();
+                let log_file = if log_failure {
+                    std::fs::File::open(log.path()).unwrap()
+                } else {
+                    log.as_file().try_clone().unwrap()
+                };
+                let mut input = Cursor::new(&payload);
+                let mut terminal = Terminal {
+                    bytes: Vec::new(),
+                    failure: terminal_failure,
+                };
+                let result = super::tee_stream(&mut input, &mut terminal, log_file);
+                assert_eq!(input.position(), payload.len() as u64);
+                assert_eq!(result.is_err(), terminal_failure != 0 || log_failure);
+                if terminal_failure != 0 {
+                    assert_eq!(result.unwrap_err().to_string(), "terminal closed");
+                } else {
+                    assert_eq!(terminal.bytes, payload);
+                }
+                if !log_failure {
+                    assert_eq!(std::fs::read(log.path()).unwrap(), payload);
+                }
             }
         }
     }
