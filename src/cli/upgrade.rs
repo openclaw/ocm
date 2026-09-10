@@ -15,11 +15,11 @@ use serde_json::{Value, json};
 
 use super::{Cli, render};
 use crate::env::{
-    CloneEnvironmentOptions, CreateEnvSnapshotOptions, EnvDevMeta, EnvSnapshotSummary,
+    CloneEnvironmentOptions, CreateEnvSnapshotOptions, EnvSnapshotSummary,
     RestoreEnvSnapshotOptions, resolve_runtime_run_dir,
 };
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
-use crate::openclaw_repo::{detect_openclaw_checkout, ensure_openclaw_worktree};
+use crate::openclaw_repo::detect_openclaw_checkout;
 use crate::runtime::releases::{
     OpenClawRelease, compare_runtime_release_versions, is_official_openclaw_releases_url,
     normalize_openclaw_channel_selector, official_openclaw_releases_url,
@@ -38,8 +38,9 @@ use crate::store::{
     install_runtime_from_selected_official_openclaw_release, list_upgrade_history,
     lock_env_registry, lock_upgrade_batch, lock_upgrade_participant, lock_upgrade_transaction,
     remove_runtime, remove_upgrade_recovery, resolve_absolute_path, runtime_install_root,
-    runtime_integrity_issue, runtime_meta_path, save_environment, save_upgrade_history_record,
-    upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir, write_json,
+    runtime_integrity_issue, runtime_meta_path, save_environment_with_dev_registration,
+    save_upgrade_history_record, upgrade_history_recovery_dir,
+    upgrade_history_runtime_recovery_dir, with_prepared_dev_source, write_json,
 };
 
 const UPGRADE_INTERRUPT_REQUESTED: usize = 1 << (usize::BITS - 1);
@@ -1970,15 +1971,24 @@ impl Cli {
                 ))
             }
             UpgradeSimulationTarget::LocalRepo { repo_root, .. } => {
-                let worktree_root = ensure_openclaw_worktree(repo_root, simulation_name)?;
                 let mut meta = self.environment_service().get(simulation_name)?;
                 meta.default_runtime = None;
                 meta.default_launcher = None;
-                meta.dev = Some(EnvDevMeta {
-                    repo_root: display_path(repo_root),
-                    worktree_root: display_path(&worktree_root),
-                });
-                let mut meta = save_environment(meta, &self.env, &self.cwd)?;
+                let mut meta = with_prepared_dev_source(
+                    repo_root,
+                    simulation_name,
+                    &self.env,
+                    &self.cwd,
+                    |dev, registration| {
+                        meta.dev = Some(dev);
+                        save_environment_with_dev_registration(
+                            meta,
+                            registration,
+                            &self.env,
+                            &self.cwd,
+                        )
+                    },
+                )?;
                 meta = self
                     .environment_service()
                     .apply_effective_gateway_port(meta)?;

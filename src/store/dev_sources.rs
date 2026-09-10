@@ -287,92 +287,138 @@ pub(crate) fn ensure_environment_removal_preserves_dev_sources(
     if footprints.is_empty() {
         return Ok(());
     }
-    let root_path = Path::new(&target.root);
-    let root = existing_cleanup_path(root_path)?;
-    let worktree = target
-        .dev
-        .as_ref()
-        .map(|dev| existing_cleanup_path(Path::new(&dev.worktree_root)))
-        .transpose()?
-        .flatten();
-    // Removing a final symlink also changes its containing source, even when
-    // the link resolves outside that source (or its destination is missing).
-    let entry_parent = if fs::symlink_metadata(root_path).is_ok_and(|meta| meta.is_symlink()) {
-        root_path
-            .parent()
-            .map(existing_cleanup_path)
-            .transpose()?
-            .flatten()
-    } else {
-        None
-    };
-    let mut registrations = Vec::new();
-    let mut registration_links = Vec::new();
-    if let Some(dev) = &target.dev {
-        for path in crate::openclaw_repo::worktree_registration_entries(
-            Path::new(&dev.repo_root),
-            Path::new(&dev.worktree_root),
-        )? {
-            if fs::symlink_metadata(&path)
-                .map_err(|error| error.to_string())?
-                .is_symlink()
-            {
-                // Git unlinks the administrative slot itself, not its referent.
-                let parent =
-                    fs::canonicalize(path.parent().unwrap()).map_err(|error| error.to_string())?;
-                registration_links.push(parent.join(path.file_name().unwrap()));
-            } else {
-                registrations.push(fs::canonicalize(path).map_err(|error| error.to_string())?);
-            }
-        }
-    }
-    if root.is_none()
-        && worktree.is_none()
-        && entry_parent.is_none()
-        && registrations.is_empty()
-        && registration_links.is_empty()
-    {
-        return Ok(());
-    }
-    let preserve = |path: &Path, owner: &str, contents: bool| -> Result<(), String> {
-        let mut affected = false;
-        // An owned child worktree may be removed from inside another source.
-        // Refuse only when that worktree itself contains a protected path.
-        for (root, symmetric) in [(root.as_ref(), true), (worktree.as_ref(), false)] {
-            if let Some(root) = root {
-                affected |= contains_existing(root, path)?
-                    || (symmetric && contents && contains_existing(path, root)?);
-            }
-        }
-        if let Some(parent) = &entry_parent
-            && contents
-        {
-            affected |= contains_existing(path, parent)?;
-        }
-        for root in &registrations {
-            affected |= contains_existing(root, path)?;
-        }
-        for entry in &registration_links {
-            affected |= path_identity(entry)? == path_identity(path)?;
-        }
-        if affected {
-            return Err(format!(
-                "cleanup for env {} would affect registered dev source for env {owner} at {}; remove the dependent dev env first",
-                target.name,
-                display_path(path)
-            ));
-        }
-        Ok(())
-    };
+    let removal = DevSourceRemoval::environment(target)?;
     for (owner, footprint) in footprints {
-        for path in &footprint.entries {
-            preserve(path, owner, false)?;
-        }
-        for path in &footprint.content_roots {
-            preserve(path, owner, true)?;
+        if let Some(path) = removal.affected_path(&footprint)? {
+            return Err(source_removal_error(&target.name, owner, path));
         }
     }
     Ok(())
+}
+
+pub(crate) fn ensure_dev_worktree_removal_preserves_dev_sources(
+    name: &str,
+    dev: &EnvDevMeta,
+    envs: &[EnvMeta],
+) -> Result<(), String> {
+    let removal = DevSourceRemoval::worktree(dev)?;
+    for meta in envs {
+        if let Some(footprint) = registered_dev_source_footprint(meta, envs)?
+            && let Some(path) = removal.affected_path(&footprint)?
+        {
+            return Err(source_removal_error(name, &meta.name, path));
+        }
+    }
+    Ok(())
+}
+
+fn source_removal_error(name: &str, owner: &str, path: &Path) -> String {
+    format!(
+        "cleanup for env {name} would affect registered dev source for env {owner} at {}; remove the dependent dev env first",
+        display_path(path)
+    )
+}
+
+// Both removal and registration use the actual deletion boundaries. In
+// particular, an owned child worktree does not own its shared common directory.
+pub(crate) struct DevSourceRemoval {
+    root: Option<PathBuf>,
+    worktree: Option<PathBuf>,
+    entry_parent: Option<PathBuf>,
+    registrations: Vec<PathBuf>,
+    registration_links: Vec<PathBuf>,
+}
+
+impl DevSourceRemoval {
+    pub(crate) fn environment(target: &EnvMeta) -> Result<Self, String> {
+        Self::new(Some(Path::new(&target.root)), target.dev.as_ref())
+    }
+
+    fn worktree(dev: &EnvDevMeta) -> Result<Self, String> {
+        Self::new(None, Some(dev))
+    }
+
+    fn new(root_path: Option<&Path>, dev: Option<&EnvDevMeta>) -> Result<Self, String> {
+        let root = root_path.map(existing_cleanup_path).transpose()?.flatten();
+        let worktree = dev
+            .map(|dev| existing_cleanup_path(Path::new(&dev.worktree_root)))
+            .transpose()?
+            .flatten();
+        // Removing a final symlink also changes its containing source, even when
+        // the link resolves outside that source (or its destination is missing).
+        let entry_parent = match root_path {
+            Some(path) if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) => path
+                .parent()
+                .map(existing_cleanup_path)
+                .transpose()?
+                .flatten(),
+            _ => None,
+        };
+        let mut registrations = Vec::new();
+        let mut registration_links = Vec::new();
+        if let Some(dev) = dev {
+            for path in crate::openclaw_repo::worktree_registration_entries(
+                Path::new(&dev.repo_root),
+                Path::new(&dev.worktree_root),
+            )? {
+                if fs::symlink_metadata(&path)
+                    .map_err(|error| error.to_string())?
+                    .is_symlink()
+                {
+                    // Git unlinks the administrative slot itself, not its referent.
+                    let parent = fs::canonicalize(path.parent().unwrap())
+                        .map_err(|error| error.to_string())?;
+                    registration_links.push(parent.join(path.file_name().unwrap()));
+                } else {
+                    registrations.push(fs::canonicalize(path).map_err(|error| error.to_string())?);
+                }
+            }
+        }
+        Ok(Self {
+            root,
+            worktree,
+            entry_parent,
+            registrations,
+            registration_links,
+        })
+    }
+
+    pub(crate) fn affected_path<'a>(
+        &self,
+        footprint: &'a SourceFootprint,
+    ) -> Result<Option<&'a Path>, String> {
+        for (path, contents) in footprint
+            .entries
+            .iter()
+            .map(|path| (path, false))
+            .chain(footprint.content_roots.iter().map(|path| (path, true)))
+        {
+            let mut affected = false;
+            // An owned child worktree may be removed from inside another source.
+            // Refuse only when that worktree itself contains a protected path.
+            for (root, symmetric) in [(self.root.as_ref(), true), (self.worktree.as_ref(), false)] {
+                if let Some(root) = root {
+                    affected |= contains_existing(root, path)?
+                        || (symmetric && contents && contains_existing(path, root)?);
+                }
+            }
+            if let Some(parent) = &self.entry_parent
+                && contents
+            {
+                affected |= contains_existing(path, parent)?;
+            }
+            for root in &self.registrations {
+                affected |= contains_existing(root, path)?;
+            }
+            for entry in &self.registration_links {
+                affected |= path_identity(entry)? == path_identity(path)?;
+            }
+            if affected {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
 }
 
 pub(crate) fn ensure_root_outside_dev_sources(

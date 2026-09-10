@@ -227,6 +227,20 @@ pub fn base_env(home: &Path) -> BTreeMap<String, String> {
     env
 }
 
+pub fn hold_environment_operation(root: &TestDir, name: &str) -> fs::File {
+    let path = root.child(format!("ocm-home/locks/environments/{name}.lock"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    lock
+}
+
 pub fn ocm_env(root: &TestDir) -> BTreeMap<String, String> {
     let home = root.child("home");
     let ocm_home = root.child("ocm-home");

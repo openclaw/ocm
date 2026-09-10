@@ -97,6 +97,8 @@ ocm start luna --command 'pnpm openclaw' --cwd /path/to/openclaw --no-service
 Use this when you are developing OpenClaw locally or want a custom run command.
 
 For an isolated development worktree, use `ocm dev luna --repo /path/to/openclaw`.
+If an environment containing or owning the source or its required Git metadata is
+busy, retry dev creation or local upgrade simulation after its operation finishes.
 New dev environments publish a private config with a persistent Gateway token
 before registration, so paired clients can reconnect after a restart or source
 rebuild. Initialization preserves existing config files, including authored auth

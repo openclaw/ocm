@@ -131,6 +131,11 @@ Plain and watched foreground sessions support `ocm dev stop <env>` and reuse a
 matching active session. `dev status` reports backend watching separately from
 session ownership.
 
+Creating or changing a dev binding is refused while an environment containing or
+owning its source, worktree path, or required Git metadata is busy with another operation.
+This also applies to local upgrade simulations; retry after that operation finishes.
+Unchanged source bindings remain writable during restore and recovery.
+
 New dev environments receive a private Gateway token in their initial config before
 the environment is registered. The token remains stable through restarts and
 source rebuilds, so paired clients can reconnect. Initialization never replaces an

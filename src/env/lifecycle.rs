@@ -11,11 +11,11 @@ use crate::openclaw_repo::{
 use crate::runtime::RuntimeService;
 use crate::store::{
     EnvironmentOperationLock, clone_environment, clone_environment_for_simulation,
-    create_environment_with_validated_runtime, export_environment, get_environment,
-    get_runtime_verified, import_environment, list_environments, lock_environment_operation,
-    now_utc, remove_environment_locked, resolve_config_gateway_port,
-    resolve_effective_gateway_ports, resolve_env_gateway_port, save_environment,
-    set_environment_service_policy,
+    create_environment_with_dev_registration, create_environment_with_validated_runtime,
+    export_environment, get_environment, get_runtime_verified, import_environment,
+    list_environments, lock_environment_operation, now_utc, remove_environment_locked,
+    resolve_config_gateway_port, resolve_effective_gateway_ports, resolve_env_gateway_port,
+    save_environment, set_environment_service_policy, with_prepared_dev_source,
 };
 use crate::supervisor::{sync_supervisor_env_if_present, sync_supervisor_if_present};
 
@@ -245,6 +245,22 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn create(&self, options: CreateEnvironmentOptions) -> Result<EnvMeta, String> {
         let meta = create_environment_with_validated_runtime(options, self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
+        Ok(meta)
+    }
+
+    pub(crate) fn create_dev(
+        &self,
+        repo: &Path,
+        mut options: CreateEnvironmentOptions,
+    ) -> Result<EnvMeta, String> {
+        let name = options.name.clone();
+        let meta =
+            with_prepared_dev_source(repo, &name, self.env, self.cwd, |dev, registration| {
+                options.dev = Some(dev);
+                create_environment_with_dev_registration(options, registration, self.env, self.cwd)
+            })?;
+        // A sync error must preserve source whose binding was already published.
         sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
         Ok(meta)
     }

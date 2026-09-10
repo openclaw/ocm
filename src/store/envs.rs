@@ -33,7 +33,7 @@ use super::layout::{
 };
 use super::now_utc;
 use super::{
-    OpenClawWorkspaceRuntime, clear_nonportable_runtime_state,
+    DevSourceRegistration, OpenClawWorkspaceRuntime, clear_nonportable_runtime_state,
     normalize_new_environment_sandbox_origin, openclaw_config_include_paths,
     openclaw_config_uses_includes, openclaw_env_archive_options,
     reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
@@ -99,9 +99,7 @@ pub(crate) struct EnvRegistryLock {
     file: File,
 }
 
-pub(crate) struct EnvironmentOperationLock {
-    file: File,
-}
+pub(crate) type EnvironmentOperationLock = super::common::ExclusiveFileLock;
 
 impl Drop for EnvRegistryLock {
     fn drop(&mut self) {
@@ -109,10 +107,19 @@ impl Drop for EnvRegistryLock {
     }
 }
 
-impl Drop for EnvironmentOperationLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
+pub(super) fn environment_operation_lock_path(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
+    // Every env binding, service, snapshot, and guarded-destroy mutation shares
+    // this lock. Bypassing it can make an accepted destroy token stale.
+    let safe_name = validate_name(name, "Environment name")?;
+    Ok(resolve_store_paths(env, cwd)?
+        .home
+        .join("locks")
+        .join("environments")
+        .join(format!("{safe_name}.lock")))
 }
 
 pub(crate) fn lock_environment_operation(
@@ -120,34 +127,21 @@ pub(crate) fn lock_environment_operation(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvironmentOperationLock, String> {
-    // Every env binding, service, snapshot, and guarded-destroy mutation shares
-    // this lock. Bypassing it can make an accepted destroy token stale.
-    let safe_name = validate_name(name, "Environment name")?;
-    let lock_dir = resolve_store_paths(env, cwd)?
-        .home
-        .join("locks")
-        .join("environments");
-    ensure_dir(&lock_dir)?;
-    let lock_path = lock_dir.join(format!("{safe_name}.lock"));
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| {
-            format!(
-                "failed to open environment operation lock {}: {error}",
-                display_path(&lock_path)
-            )
-        })?;
-    file.lock_exclusive().map_err(|error| {
-        format!(
-            "failed to lock environment operation {}: {error}",
-            display_path(&lock_path)
-        )
-    })?;
-    Ok(EnvironmentOperationLock { file })
+    super::lock_file(
+        &environment_operation_lock_path(name, env, cwd)?,
+        "environment operation",
+    )
+}
+
+pub(super) fn try_lock_environment_operation(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<Option<EnvironmentOperationLock>, String> {
+    super::try_lock_file(
+        &environment_operation_lock_path(name, env, cwd)?,
+        "environment operation",
+    )
 }
 
 pub(crate) fn lock_env_registry(
@@ -257,7 +251,17 @@ pub fn get_environment(
 }
 
 pub fn save_environment(
+    meta: EnvMeta,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
+    let registration = DevSourceRegistration::acquire(&meta.name, meta.dev.as_ref(), env, cwd)?;
+    save_environment_with_dev_registration(meta, &registration, env, cwd)
+}
+
+pub(crate) fn save_environment_with_dev_registration(
     mut meta: EnvMeta,
+    registration: &DevSourceRegistration,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
@@ -265,6 +269,7 @@ pub fn save_environment(
     let _admission_lock = service.lock_gateway_admission(&meta.name)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
+    registration.recheck(&meta.name, meta.dev.as_ref(), &registry.envs)?;
     let policy_changed = find_environment(&registry, &meta.name).is_some_and(|current| {
         current.service_enabled != meta.service_enabled
             || current.service_running != meta.service_running
@@ -286,8 +291,10 @@ pub(crate) fn save_environment_with_validated_launcher(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
+    let registration = DevSourceRegistration::acquire(&meta.name, meta.dev.as_ref(), env, cwd)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
+    registration.recheck(&meta.name, meta.dev.as_ref(), &registry.envs)?;
     meta = canonicalize_launcher_binding(meta, env, cwd)?;
     meta = upsert_environment(&mut registry, meta)?;
     write_env_registry(&mut registry, env, cwd)?;
@@ -300,8 +307,10 @@ pub(crate) fn save_environment_with_validated_runtime(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
+    let registration = DevSourceRegistration::acquire(&meta.name, meta.dev.as_ref(), env, cwd)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
+    registration.recheck(&meta.name, meta.dev.as_ref(), &registry.envs)?;
     if let Some(runtime_name) = meta.default_runtime.as_deref() {
         meta.default_runtime =
             Some(super::runtimes::get_runtime_verified(runtime_name, env, cwd)?.name);
@@ -393,7 +402,7 @@ pub fn create_environment(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
-    create_environment_with_runtime_validation(options, false, env, cwd)
+    create_environment_with_runtime_validation(options, false, None, env, cwd)
 }
 
 pub(crate) fn create_environment_with_validated_runtime(
@@ -401,16 +410,34 @@ pub(crate) fn create_environment_with_validated_runtime(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
-    create_environment_with_runtime_validation(options, true, env, cwd)
+    create_environment_with_runtime_validation(options, true, None, env, cwd)
+}
+
+pub(crate) fn create_environment_with_dev_registration(
+    options: CreateEnvironmentOptions,
+    registration: &DevSourceRegistration,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
+    create_environment_with_runtime_validation(options, true, Some(registration), env, cwd)
 }
 
 fn create_environment_with_runtime_validation(
     options: CreateEnvironmentOptions,
     validate_runtime: bool,
+    registration: Option<&DevSourceRegistration>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
     let name = validate_name(&options.name, "Environment name")?;
+    let acquired;
+    let registration = match registration {
+        Some(registration) => registration,
+        None => {
+            acquired = DevSourceRegistration::acquire(&name, options.dev.as_ref(), env, cwd)?;
+            &acquired
+        }
+    };
     let service = crate::env::EnvironmentService::new(env, cwd);
     let _admission_lock = service.lock_gateway_admission(&name)?;
     if options.service_enabled && options.service_running {
@@ -421,6 +448,7 @@ fn create_environment_with_runtime_validation(
     if find_environment(&registry, &name).is_some() {
         return Err(format!("environment \"{name}\" already exists"));
     }
+    registration.recheck(&name, options.dev.as_ref(), &registry.envs)?;
     let default_runtime = if validate_runtime {
         options
             .default_runtime

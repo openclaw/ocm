@@ -1,6 +1,7 @@
 mod checkpoint_scope;
 mod checkpoints;
 mod common;
+mod dev_registration;
 pub(crate) mod dev_sources;
 mod envs;
 mod gateway_ports;
@@ -25,6 +26,7 @@ pub(crate) use common::{
     ExclusiveFileLock, copy_dir_recursive, ensure_dir, lock_file, read_json, try_lock_file,
     write_json,
 };
+pub(crate) use dev_registration::{DevSourceRegistration, with_prepared_dev_source};
 pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
 pub(crate) use envs::{
     EnvironmentOperationLock, lock_env_registry, lock_environment_operation,
@@ -40,11 +42,12 @@ pub use envs::{
 };
 pub(crate) use envs::{
     clone_environment_for_simulation, clone_environment_with_sandbox_origin,
-    create_environment_with_validated_runtime, import_environment_with_sandbox_origin,
+    create_environment_with_dev_registration, create_environment_with_validated_runtime,
+    import_environment_with_sandbox_origin,
 };
 pub(crate) use envs::{
-    save_environment_with_validated_launcher, save_environment_with_validated_runtime,
-    with_locked_environments,
+    save_environment_with_dev_registration, save_environment_with_validated_launcher,
+    save_environment_with_validated_runtime, with_locked_environments,
 };
 pub(crate) use gateway_ports::{
     openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,

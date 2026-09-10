@@ -382,10 +382,15 @@ pub(crate) fn validate_openclaw_worktree(
     Ok(())
 }
 
+pub(crate) struct OpenClawWorktree {
+    pub(crate) root: PathBuf,
+    pub(crate) created: bool,
+}
+
 pub(crate) fn ensure_openclaw_worktree(
     repo_root: &Path,
     env_name: &str,
-) -> Result<PathBuf, String> {
+) -> Result<OpenClawWorktree, String> {
     let repo_root = detect_openclaw_checkout(repo_root)
         .ok_or_else(|| format!("OpenClaw checkout not found at {}", display_path(repo_root)))?;
     let worktree_root = default_worktree_root(&repo_root, env_name);
@@ -396,7 +401,10 @@ pub(crate) fn ensure_openclaw_worktree(
         if !worktree_root.exists() {
             remove_registered_worktree(&repo_root, &worktree_root)?;
         } else if is_existing_openclaw_worktree(&repo_root, &worktree_root) {
-            return Ok(worktree_root);
+            return Ok(OpenClawWorktree {
+                root: worktree_root,
+                created: false,
+            });
         } else {
             return Err(format!(
                 "registered worktree is not a valid OpenClaw checkout: {}",
@@ -446,7 +454,10 @@ pub(crate) fn ensure_openclaw_worktree(
         ));
     }
 
-    Ok(worktree_root)
+    Ok(OpenClawWorktree {
+        root: worktree_root,
+        created: true,
+    })
 }
 
 pub(crate) fn remove_openclaw_worktree(
@@ -1072,12 +1083,13 @@ mod tests {
         let repo = fs::canonicalize(spaced).unwrap();
         let original = fs::read(repo.join("package.json")).unwrap();
         let worktree = ensure_openclaw_worktree(&repo, "plain.stop").unwrap();
+        assert!(worktree.created);
+        let worktree = worktree.root;
         assert!(worktree.is_absolute() && worktree.join(".git").is_file());
         assert_eq!(fs::read(worktree.join("package.json")).unwrap(), original);
-        assert_eq!(
-            ensure_openclaw_worktree(&repo, "plain.stop").unwrap(),
-            worktree
-        );
+        let reused = ensure_openclaw_worktree(&repo, "plain.stop").unwrap();
+        assert!(!reused.created);
+        assert_eq!(reused.root, worktree);
         remove_openclaw_worktree(&repo, &worktree).unwrap();
         assert!(!worktree.exists());
         assert_eq!(fs::read(repo.join("package.json")).unwrap(), original);
@@ -1086,7 +1098,7 @@ mod tests {
     #[test]
     fn simulation_cleanup_discards_ignored_outputs_only_for_owned_worktree() {
         let (_temp, repo) = init_openclaw_repo();
-        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
         for relative in [
             "node_modules/pkg/index.js",
             "extensions/demo/node_modules/pkg/index.js",
@@ -1123,7 +1135,7 @@ mod tests {
     #[test]
     fn simulation_cleanup_preserves_untracked_files() {
         let (_temp, repo) = init_openclaw_repo();
-        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
         fs::write(worktree.join("operator-notes.txt"), "preserve\n").unwrap();
 
         prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "demo-sim").unwrap();
@@ -1138,7 +1150,7 @@ mod tests {
     #[test]
     fn simulation_cleanup_preserves_non_build_ignored_files() {
         let (_temp, repo) = init_openclaw_repo();
-        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
         fs::write(worktree.join(".env"), "PRIVATE_VALUE=preserve\n").unwrap();
         let generated = worktree.join("dist/index.js");
         fs::create_dir_all(generated.parent().unwrap()).unwrap();
@@ -1158,7 +1170,7 @@ mod tests {
     #[test]
     fn simulation_cleanup_does_not_touch_replaced_unregistered_checkout() {
         let (_temp, repo) = init_openclaw_repo();
-        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
         run_git(
             &repo,
             &[

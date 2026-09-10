@@ -25,9 +25,8 @@ use serde_json::Value;
 use super::Cli;
 use super::render::RenderProfile;
 use crate::env::{
-    CreateEnvironmentOptions, CreateSourceWatchOverrideOptions, EnvDevMeta, EnvMeta,
-    SourceWatchCompletion, SourceWatchEndpoint, SourceWatchLease, SourceWatchMode,
-    SourceWatchSession, SourceWatchState,
+    CreateEnvironmentOptions, CreateSourceWatchOverrideOptions, EnvMeta, SourceWatchCompletion,
+    SourceWatchEndpoint, SourceWatchLease, SourceWatchMode, SourceWatchSession, SourceWatchState,
 };
 use crate::infra::process::run_direct;
 #[cfg(unix)]
@@ -36,7 +35,7 @@ use crate::infra::process_identity::{ProcessIdentity, observe_process, process_s
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::infra::terminal::{Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table};
 use crate::openclaw_repo::{
-    detect_openclaw_checkout, discover_enclosing_openclaw_checkout, ensure_openclaw_worktree,
+    detect_openclaw_checkout, discover_enclosing_openclaw_checkout,
     ensure_source_dependency_install_target, inspect_source_dependencies,
     inspect_source_dependencies_with_runner,
 };
@@ -1313,29 +1312,20 @@ impl Cli {
         }
 
         let repo_root = self.resolve_dev_repo_root(repo_root)?;
-        let worktree_root = ensure_openclaw_worktree(&repo_root, name)?;
-
-        let created = self.environment_service().create(CreateEnvironmentOptions {
-            name: name.to_string(),
-            root,
-            gateway_port,
-            service_enabled: false,
-            service_running: false,
-            default_runtime: None,
-            default_launcher: None,
-            dev: Some(EnvDevMeta {
-                repo_root: display_path(&repo_root),
-                worktree_root: display_path(&worktree_root),
-            }),
-            protected: false,
-        });
-        let created = match created {
-            Ok(meta) => meta,
-            Err(error) => {
-                let _ = crate::openclaw_repo::remove_openclaw_worktree(&repo_root, &worktree_root);
-                return Err(error);
-            }
-        };
+        let created = self.environment_service().create_dev(
+            &repo_root,
+            CreateEnvironmentOptions {
+                name: name.to_string(),
+                root,
+                gateway_port,
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: None,
+                dev: None,
+                protected: false,
+            },
+        )?;
 
         Ok((created, true))
     }

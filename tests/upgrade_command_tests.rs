@@ -25,9 +25,9 @@ use sha2::{Digest, Sha512};
 use tar::{Builder, Header};
 
 use crate::support::{
-    TestDir, TestHttpServer, install_fake_launchctl, install_fake_node_and_npm, ocm_env,
-    path_string, run_ocm, stderr, stdout, write_executable_script, write_json_replacing_path,
-    write_text,
+    TestDir, TestHttpServer, hold_environment_operation, install_fake_launchctl,
+    install_fake_node_and_npm, ocm_env, path_string, run_ocm, stderr, stdout,
+    write_executable_script, write_json_replacing_path, write_text,
 };
 
 fn append_tar_file(
@@ -3363,6 +3363,13 @@ fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
     install_fake_node_and_npm(&root, &mut env, "22.22.3");
     install_fake_simulation_pnpm(&root, &mut env);
 
+    let parent = run_ocm(&cwd, &env, &["env", "create", "parent"]);
+    assert!(parent.status.success(), "{}", stderr(&parent));
+    let parent = ocm::store::get_environment("parent", &env, &cwd).unwrap();
+    let source = Path::new(&parent.root).join(".openclaw/workspace/openclaw");
+    fs::rename(repo, &source).unwrap();
+    let repo = source;
+
     let start = run_ocm(
         &cwd,
         &env,
@@ -3377,6 +3384,28 @@ fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
         ],
     );
     assert!(start.status.success(), "{}", stderr(&start));
+
+    let lock = hold_environment_operation(&root, "parent");
+    let blocked = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "simulate",
+            "demo",
+            "--to",
+            &path_string(&repo),
+            "--raw",
+        ],
+    );
+    assert!(!blocked.status.success());
+    assert!(
+        stdout(&blocked).contains("environment parent has an operation in progress"),
+        "{}",
+        stdout(&blocked)
+    );
+    assert!(!repo.join(".worktrees").exists());
+    drop(lock);
 
     env.insert("OCM_TEST_SIMULATION_DOCTOR_OK".to_string(), "1".to_string());
     env.insert(

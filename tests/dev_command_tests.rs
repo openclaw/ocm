@@ -25,8 +25,8 @@ use serde_json::Value;
 
 use crate::support::{
     TestDir, dev_plain, dev_watch, enable_fake_daemon_gateway_admission,
-    install_fake_service_manager, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script,
+    hold_environment_operation, install_fake_service_manager, ocm_env, path_string, run_ocm,
+    stderr, stdout, write_executable_script,
 };
 
 fn init_openclaw_repo(root: &TestDir) -> PathBuf {
@@ -916,6 +916,167 @@ fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
         let updated: Value = json5::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(updated["gateway"]["auth"], auth);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_registration_rejects_a_busy_containing_environment_before_preparing_source() {
+    let root = TestDir::new("dev-registration-operation-lock");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+    let parent = run_ocm(&cwd, &env, &["env", "create", "parent"]);
+    assert!(parent.status.success(), "{}", stderr(&parent));
+    let parent = get_environment("parent", &env, &cwd).unwrap();
+    let source = Path::new(&parent.root).join(".openclaw/workspace/openclaw");
+    fs::rename(init_openclaw_repo(&root), &source).unwrap();
+
+    let lock = hold_environment_operation(&root, "parent");
+    let registry = ocm::store::env_registry_path(&env, &cwd).unwrap();
+    let before = fs::read(&registry).unwrap();
+    let mut child = DevWatchFixture::spawn(
+        &root,
+        &cwd,
+        &env,
+        &dev_plain(&["child", "--repo", &path_string(&source)]),
+    );
+    let rejected = child.wait_without_release();
+    assert!(
+        !rejected.status.success(),
+        "dev published a child while its containing environment operation was locked"
+    );
+    assert!(
+        stderr(&rejected).contains("parent"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(fs::read(&registry).unwrap(), before);
+    assert!(!source.join(".worktrees/child").exists());
+    assert!(!source.join(".git/worktrees/child").exists());
+    assert!(!root.child("pnpm.log").exists());
+
+    let independent = init_openclaw_repo(&root);
+    let allowed = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["independent", "--repo", &path_string(&independent)]),
+    );
+    assert!(allowed.status.success(), "{}", stderr(&allowed));
+    drop(lock);
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["child", "--repo", &path_string(&source)]),
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let dev = get_environment("child", &env, &cwd).unwrap().dev.unwrap();
+    assert_eq!(
+        dev.repo_root,
+        path_string(&fs::canonicalize(&source).unwrap())
+    );
+    assert!(Path::new(&dev.worktree_root).join(".git").exists());
+    let _child_operation = hold_environment_operation(&root, "child");
+    let before_nested = fs::read(&registry).unwrap();
+    let mut nested = DevWatchFixture::spawn(
+        &root,
+        &cwd,
+        &env,
+        &dev_plain(&["grandchild", "--repo", &dev.worktree_root]),
+    );
+    let rejected = nested.wait_without_release();
+    assert!(!rejected.status.success());
+    assert!(
+        stderr(&rejected).contains("environment child has an operation in progress"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(fs::read(&registry).unwrap(), before_nested);
+    assert!(
+        !Path::new(&dev.worktree_root)
+            .join(".worktrees/grandchild")
+            .exists()
+    );
+    // A sibling uses the common repository without depending on child's assets.
+    let sibling = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["sibling", "--repo", &path_string(&source)]),
+    );
+    assert!(sibling.status.success(), "{}", stderr(&sibling));
+}
+
+#[test]
+fn dev_registration_cleanup_preserves_reused_and_published_worktrees() {
+    let root = TestDir::new("dev-registration-cleanup");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let occupied = root.child("occupied");
+    fs::create_dir_all(&occupied).unwrap();
+    fs::write(occupied.join("sentinel"), "keep").unwrap();
+    for name in ["fresh", "reused"] {
+        let worktree = repo.join(".worktrees").join(name);
+        if name == "reused" {
+            let added = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "add", "--detach"])
+                .arg(&worktree)
+                .output()
+                .unwrap();
+            assert!(added.status.success(), "{}", stderr(&added));
+        }
+        let rejected = run_ocm(
+            &cwd,
+            &env,
+            &dev_plain(&[
+                name,
+                "--repo",
+                &path_string(&repo),
+                "--root",
+                &path_string(&occupied),
+            ]),
+        );
+        assert!(!rejected.status.success());
+        assert!(
+            stderr(&rejected).contains("root already exists and is not empty"),
+            "{}",
+            stderr(&rejected)
+        );
+        assert_eq!(worktree.exists(), name == "reused");
+        assert_eq!(
+            repo.join(".git/worktrees").join(name).exists(),
+            name == "reused"
+        );
+        assert!(get_environment(name, &env, &cwd).is_err());
+    }
+    // Let daemon preflight pass so the corrupt state fails after publication.
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "unsupported".to_string(),
+    );
+    let state = ocm::store::supervisor_state_path(&env, &cwd).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let sync_failed = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["published", "--repo", &path_string(&repo)]),
+    );
+    assert!(!sync_failed.status.success());
+    let published = get_environment("published", &env, &cwd)
+        .unwrap()
+        .dev
+        .unwrap();
+    assert!(Path::new(&published.worktree_root).join(".git").is_file());
+    assert!(state.is_dir());
+    #[cfg(unix)]
+    assert!(
+        stderr(&sync_failed).contains("directory"),
+        "{}",
+        stderr(&sync_failed)
+    );
 }
 
 #[test]
