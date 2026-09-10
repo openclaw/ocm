@@ -49,6 +49,8 @@ pub struct SourceWatchOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<SourceWatchEndpoint>,
     pub watch_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watching: Option<bool>,
     pub token: String,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
@@ -83,6 +85,7 @@ pub(crate) struct SourceWatchLease {
     lease_id: String,
     lock_file: File,
     service_was_running: bool,
+    watching: bool,
     session_paths: SourceWatchSessionPaths,
     session: Option<SourceWatchSession>,
     #[cfg(windows)]
@@ -95,6 +98,10 @@ pub(crate) struct SourceWatchLeaseObservation {
 }
 
 impl SourceWatchLease {
+    pub(crate) fn is_watching(&self) -> bool {
+        self.watching
+    }
+
     pub(crate) fn service_was_running(&self) -> bool {
         self.service_was_running
     }
@@ -326,6 +333,7 @@ impl<'a> EnvironmentService<'a> {
             lease_id: session.lease_id.clone(),
             lock_file,
             service_was_running: session.restore_service,
+            watching: session.is_watching(),
             session_paths,
             session: Some(session),
             #[cfg(windows)]
@@ -438,6 +446,7 @@ impl<'a> EnvironmentService<'a> {
         &self,
         env_name: &str,
         allow_service_takeover: bool,
+        watching: bool,
     ) -> Result<SourceWatchLease, String> {
         let env_name = validate_name(env_name, "Environment name")?;
         // Match service updates: operation, daemon lifecycle, then Gateway
@@ -518,7 +527,7 @@ impl<'a> EnvironmentService<'a> {
         // lease, even if its child PID has since been reused by another process.
         remove_file_if_present(&override_path)?;
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-        let session = Some(session_paths.create_session(&meta, &lease_id)?);
+        let session = Some(session_paths.create_session(&meta, &lease_id, watching)?);
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let session = None;
         Ok(SourceWatchLease {
@@ -526,6 +535,7 @@ impl<'a> EnvironmentService<'a> {
             lease_id,
             lock_file,
             service_was_running: meta.service_running,
+            watching,
             session_paths,
             session,
             #[cfg(windows)]
@@ -544,13 +554,14 @@ impl<'a> EnvironmentService<'a> {
                 lease.env_name, options.env_name
             ));
         }
-        self.write_source_watch_override(options, &lease.lease_id)
+        self.write_source_watch_override(options, &lease.lease_id, lease.watching)
     }
 
     fn write_source_watch_override(
         &self,
         options: CreateSourceWatchOverrideOptions,
         lease_id: &str,
+        watching: bool,
     ) -> Result<SourceWatchOverride, String> {
         let env_name = validate_name(&options.env_name, "Environment name")?;
         let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
@@ -568,6 +579,7 @@ impl<'a> EnvironmentService<'a> {
             repo_root: display_path(&options.repo_root),
             endpoint: Some(options.endpoint),
             watch_pid: options.watch_pid,
+            watching: Some(watching),
             token,
             started_at: now_utc(),
         };
@@ -1157,6 +1169,7 @@ mod tests {
             repo_root: "/repo/openclaw".to_string(),
             endpoint: None,
             watch_pid: 123,
+            watching: None,
             token: "123-token".to_string(),
             started_at: OffsetDateTime::UNIX_EPOCH,
         };

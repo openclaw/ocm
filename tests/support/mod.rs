@@ -409,7 +409,7 @@ pub fn enable_fake_daemon_gateway_admission(
     let (started_at, process_scope) = fixture_process_ownership();
     let capability =
         serde_json::from_value::<ocm::supervisor::SupervisorGatewayAdmission>(serde_json::json!({
-            "version": 7,
+            "version": 8,
             "process": { "pid": std::process::id(), "startedAt": started_at },
             "processScope": process_scope,
         }))

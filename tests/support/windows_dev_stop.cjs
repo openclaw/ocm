@@ -98,13 +98,12 @@ function capture(child) {
 }
 function sessionPath(name) { return path.join(env.OCM_HOME, 'source-watch', name + '.session'); }
 function session(name) { return JSON.parse(fs.readFileSync(sessionPath(name), 'utf8')); }
-async function start(name) {
+async function start(name, watching = true) {
   const directory = path.join(root, name);
   const repo = path.join(directory, 'repo');
   fs.mkdirSync(path.join(repo, 'scripts'), {recursive:true});
   fs.mkdirSync(path.join(repo, 'extensions'), {recursive:true});
   fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({name:'openclaw', version:'2026.9.9'}));
-  fs.writeFileSync(path.join(repo, 'scripts', 'run-node.mjs'), '// Isolated source fixture.\n');
   fs.writeFileSync(path.join(repo, 'openclaw.mjs'), '// Isolated built-entry fixture.\n');
   const ready = path.join(directory, 'ready');
   const rootPid = path.join(directory, 'root.pid');
@@ -113,30 +112,44 @@ async function start(name) {
     'import fs from "node:fs";',
     'import {spawn} from "node:child_process";',
     'const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore",windowsHide:true});',
-    'child.once("spawn",()=>{fs.writeFileSync(' + JSON.stringify(rootPid) + ',String(process.pid));fs.writeFileSync(' + JSON.stringify(descendantPid) + ',String(child.pid));fs.writeFileSync(' + JSON.stringify(ready) + ',"ready");});',
+    'child.once("spawn",()=>{fs.writeFileSync(' + JSON.stringify(rootPid) + ',String(process.pid));fs.writeFileSync(' + JSON.stringify(descendantPid) + ',String(child.pid));fs.writeFileSync(' + JSON.stringify(ready) + ',process.argv[1]);});',
     'setInterval(()=>{},1000);'
   ].join('\n');
   fs.writeFileSync(path.join(repo, 'scripts', 'watch-node.mjs'), watch);
+  fs.writeFileSync(path.join(repo, 'scripts', 'run-node.mjs'), watch);
+  fs.writeFileSync(path.join(repo, 'SENTINEL'), 'preserve source');
   const init = cp.spawnSync('git', ['init','--quiet',repo], {env, encoding:'utf8', timeout:15000});
   if (init.error) throw init.error;
   assert.equal(init.status, 0, init.stderr);
-  run(['env','create',name,'--runtime','proof-node','--root',path.join(directory,'env'),'--port',String(21901 + 32 * tracked.length)]);
-  fs.writeFileSync(path.join(directory, 'env', 'SENTINEL'), 'preserve environment');
-  fs.writeFileSync(path.join(repo, 'SENTINEL'), 'preserve source');
-  const controller = cp.spawn(binary, ['dev',name,'--repo',repo,'--watch','--force'], {cwd:root, env, stdio:['ignore','pipe','pipe'], windowsHide:true});
+  const envRoot = path.join(directory, 'env');
+  const port = String(21901 + 32 * tracked.length);
+  if (watching) {
+    run(['env','create',name,'--runtime','proof-node','--root',envRoot,'--port',port]);
+  } else {
+    for (const args of [['add','.'], ['-c','user.name=OCM Tests','-c','user.email=tests@example.com','-c','commit.gpgsign=false','commit','--quiet','-m','fixture']]) {
+      const saved = cp.spawnSync('git', ['-C',repo,...args], {env, encoding:'utf8', timeout:15000});
+      if (saved.error) throw saved.error;
+      assert.equal(saved.status, 0, saved.stderr);
+    }
+  }
+  const args = ['dev',name,'--repo',repo,...(watching ? ['--watch','--force'] : ['--root',envRoot,'--port',port])];
+  const controller = cp.spawn(binary, args, {cwd:root, env, stdio:['ignore','pipe','pipe'], windowsHide:true});
   const output = capture(controller);
   const record = {name, directory, repo, controller, output, identities:[]};
   tracked.push(record);
   assert.ok(controller.pid, 'Controller did not spawn');
   const controllerIdentity = {pid:controller.pid, startedAt:startIdentity(controller.pid)};
   record.identities.push(controllerIdentity);
-  await waitFor(() => fs.existsSync(ready), () => 'Watch did not start: ' + name + '\n' + output());
+  await waitFor(() => fs.existsSync(ready), () => 'Source process did not start: ' + name + '\n' + output());
+  assert.equal(path.basename(fs.readFileSync(ready, 'utf8')), watching ? 'watch-node.mjs' : 'run-node.mjs');
   const owner = session(name);
   const watcher = Number(fs.readFileSync(rootPid,'utf8'));
   const descendant = Number(fs.readFileSync(descendantPid,'utf8'));
   assert.equal(owner.controller.pid, controller.pid);
   assert.equal(owner.child.pid, watcher);
   assert.equal(owner.childSpawnPending, false);
+  assert.equal(owner.kind, 'ocm-source-foreground-session-v1');
+  assert.equal(owner.watching, watching);
   assert.deepEqual(owner.controller, controllerIdentity);
   const childIdentity = {pid:watcher, startedAt:startIdentity(watcher)};
   assert.deepEqual(owner.child, childIdentity);
@@ -146,6 +159,8 @@ async function start(name) {
   record.original = fs.readFileSync(sessionPath(name));
   record.watcher = watcher;
   record.descendant = descendant;
+  record.source = watching ? repo : JSON.parse(run(['env','show',name,'--json']).stdout).devWorktreeRoot;
+  fs.writeFileSync(path.join(envRoot, 'SENTINEL'), 'preserve environment');
   return record;
 }
 async function stop(name) {
@@ -164,6 +179,7 @@ async function crash(record) {
 async function checkPreserved(record) {
   assert.equal(fs.readFileSync(path.join(record.directory,'env','SENTINEL'),'utf8'), 'preserve environment');
   assert.equal(fs.readFileSync(path.join(record.repo,'SENTINEL'),'utf8'), 'preserve source');
+  assert.equal(fs.readFileSync(path.join(record.source,'SENTINEL'),'utf8'), 'preserve source');
 }
 function cleanup() {
   if (cleanupPromise) return cleanupPromise;
@@ -197,6 +213,7 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     const normal = await start('normal.stop');
     const active = JSON.parse(run(['dev','status',normal.name,'--json']).stdout);
     assert.equal(active.sourceWatch.state, 'active', 'Held watch lease was not readable by dev status');
+    assert.equal(active.sourceWatch.watching, true);
     await stop(normal.name);
     await waitFor(() => !alive(normal.watcher) && !alive(normal.descendant), 'Named stop left its source tree running');
     await waitFor(() => normal.controller.exitCode !== null, 'Controller did not acknowledge named stop');
@@ -204,6 +221,16 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     const again = JSON.parse(run(['dev','stop',normal.name,'--json']).stdout);
     assert.equal(again.stopped, false);
     results.push('native named stop, descendant cleanup, repeat stop, env/source preservation');
+
+    const plain = await start('plain.stop', false);
+    const plainStatus = JSON.parse(run(['dev','status',plain.name,'--json']).stdout);
+    assert.equal(plainStatus.sourceWatch.state, 'active');
+    assert.equal(plainStatus.sourceWatch.watching, false);
+    await stop(plain.name);
+    await waitFor(() => !alive(plain.watcher) && !alive(plain.descendant), 'Plain named stop left its source tree running');
+    await waitFor(() => plain.controller.exitCode !== null, 'Plain controller did not acknowledge named stop');
+    await checkPreserved(plain);
+    results.push('native plain named stop, descendant cleanup, env/source preservation');
 
     const crashed = await start('crashed');
     await crash(crashed);

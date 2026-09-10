@@ -622,21 +622,29 @@ ocm env destroy mira
 ocm env destroy mira --yes
 ```
 
-Destroy first stops the recorded source-watch session, including any required
+Destroy first stops the recorded foreground dev session, including any required
 service restoration, and verifies that its owned processes exited. It then
 rechecks the environment binding and protection before removing state. A
 replacement session or changed binding prevents removal. While a watch is
 running, the preview reports deferred process inspection; the remaining process
 tree is inspected after the watch stops.
 
-For new Unix watch generations, unverified output or process completion keeps
+For new Unix foreground generations, unverified output or process completion keeps
 ownership recorded. A controller crash, raw signal, or missing output EOF cannot
 be cleared by repeating stop, starting another watch/service, or destroying the
 env. Normal acknowledged errors remain retryable; released legacy watch records
 and Windows process-job recovery retain their existing rules. Use a compatible
 OCM CLI and refresh an older running daemon before creating a new generation.
 
-During watched dependency installation, pnpm lifecycle reports distinguish a
+Both plain `dev <env>` and `dev <env> --watch` own setup and the native Gateway.
+Plain mode runs `scripts/run-node.mjs`; watch mode runs `scripts/watch-node.mjs`.
+`dev stop <env>` stops either recorded session without removing its environment
+or source. Repeating the same mode and launch endpoint reuses the session;
+changing mode requires stopping it first. `dev status --json` reports active
+ownership separately from `sourceWatch.watching`. Plain runs still refuse a
+running background service; temporary takeover remains `--watch --force`.
+
+During foreground dependency installation, pnpm lifecycle reports distinguish a
 completed installation error from interrupted or unfinished build scripts. On
 Unix, uncertain script cleanup retains ownership even when pnpm returns a normal
 error or allows an optional build to fail. Completed errors remain retryable.

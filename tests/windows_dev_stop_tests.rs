@@ -420,7 +420,7 @@ fn native_windows_dev_stop_lifecycle() {
     assert_eq!(result["platform"], "win32");
     assert_eq!(
         result["results"].as_array().map(Vec::len),
-        Some(4),
+        Some(5),
         "not all native Windows dev-stop cases completed: {result}"
     );
     assert_eq!(result["passed"], true);
