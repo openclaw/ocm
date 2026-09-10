@@ -1,5 +1,7 @@
 mod support;
 
+use std::io::{Seek, SeekFrom, Write};
+
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
@@ -12,7 +14,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ocm::store::{env_registry_path, now_utc, supervisor_runtime_path};
+use fs2::FileExt;
+use ocm::store::{
+    env_registry_path, get_environment, now_utc, save_environment, source_watch_override_path,
+    supervisor_runtime_path,
+};
 use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
@@ -341,6 +347,151 @@ fn env_snapshot_restore_reverts_state_from_the_selected_snapshot() {
             .unwrap(),
         "before restore"
     );
+}
+
+#[test]
+fn env_snapshot_restore_refuses_active_transitional_and_unknown_dev_ownership() {
+    let root = TestDir::new("env-snapshot-watch-ownership");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let created = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let mut meta = get_environment("source", &env, &cwd).unwrap();
+    meta.service_enabled = false;
+    meta.service_running = false;
+    save_environment(meta.clone(), &env, &cwd).unwrap();
+    let notes = root.child("ocm-home/envs/source/.openclaw/workspace/notes.txt");
+    write_text(&notes, "snapshot state\n");
+    let snapshot = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "create", "source", "--json"],
+    );
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+    let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    write_text(&notes, "current state\n");
+    let registry_before = fs::read(env_registry_path(&env, &cwd).unwrap()).unwrap();
+    let checkout = root.child("watched-source");
+    fs::create_dir_all(checkout.join("extensions")).unwrap();
+    fs::write(checkout.join("openclaw.mjs"), "fixture\n").unwrap();
+    let override_path = source_watch_override_path("source", &env, &cwd).unwrap();
+    fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+    let mut lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(override_path.with_extension("lock"))
+        .unwrap();
+    lease.lock_exclusive().unwrap();
+    for state in ["starting", "active", "restoring", "unknown"] {
+        lease.set_len(0).unwrap();
+        lease.seek(SeekFrom::Start(0)).unwrap();
+        writeln!(
+            lease,
+            "{}snapshot-fixture",
+            if state == "restoring" {
+                "restoring:"
+            } else {
+                ""
+            }
+        )
+        .unwrap();
+        match state {
+            "active" => fs::write(
+                &override_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "kind": "ocm-source-watch-override", "envName": "source", "repoRoot": checkout,
+                    "watchPid": std::process::id(), "token": "lease:snapshot-fixture:fixture",
+                    "startedAt": "2026-06-17T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+            "unknown" => fs::write(&override_path, "{").unwrap(),
+            _ => {
+                let _ = fs::remove_file(&override_path);
+            }
+        }
+        let restored = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "snapshot",
+                "restore",
+                "source",
+                snapshot["id"].as_str().unwrap(),
+            ],
+        );
+        assert!(!restored.status.success(), "accepted {state}");
+        assert!(
+            stderr(&restored).contains("dev stop source"),
+            "{state}: {}",
+            stderr(&restored)
+        );
+        assert_eq!(fs::read_to_string(&notes).unwrap(), "current state\n");
+        assert_eq!(
+            fs::read(env_registry_path(&env, &cwd).unwrap()).unwrap(),
+            registry_before
+        );
+    }
+    fs::remove_file(&override_path).unwrap();
+    drop(lease);
+    let session_path = override_path.with_extension("session");
+    let unfinished = serde_json::json!({
+        "kind": "ocm-source-watch-session", "envName": "source",
+        "leaseId": "snapshot-fixture", "envRoot": meta.root,
+        "envCreatedAt": serde_json::to_value(&meta).unwrap()["createdAt"],
+        "processScope": null, "controller": {"pid": std::process::id(), "startedAt": "fixture"},
+        "child": null, "childSpawnPending": false, "restoreService": false, "closed": false
+    });
+    for record in [serde_json::to_string(&unfinished).unwrap(), "{".to_string()] {
+        fs::write(&session_path, record).unwrap();
+        let refused = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "snapshot",
+                "restore",
+                "source",
+                snapshot["id"].as_str().unwrap(),
+            ],
+        );
+        assert!(!refused.status.success());
+        assert!(
+            stderr(&refused).contains("dev stop source"),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(fs::read_to_string(&notes).unwrap(), "current state\n");
+        assert_eq!(
+            fs::read(env_registry_path(&env, &cwd).unwrap()).unwrap(),
+            registry_before
+        );
+    }
+    fs::remove_file(&session_path).unwrap();
+    let restored = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "snapshot",
+            "restore",
+            "source",
+            snapshot["id"].as_str().unwrap(),
+        ],
+    );
+    assert!(restored.status.success(), "{}", stderr(&restored));
+    assert_eq!(fs::read_to_string(notes).unwrap(), "snapshot state\n");
+    ocm::env::EnvironmentService::new(&env, &cwd)
+        .restore_snapshot(ocm::env::RestoreEnvSnapshotOptions {
+            env_name: "source".to_string(),
+            snapshot_id: snapshot["id"].as_str().unwrap().to_string(),
+        })
+        .unwrap();
 }
 
 #[cfg(target_os = "macos")]

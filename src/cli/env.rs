@@ -990,6 +990,7 @@ impl Cli {
                 let selected_snapshot = self
                     .environment_service()
                     .get_snapshot(name, snapshot_id)?;
+                self.environment_service().ensure_snapshot_restore_allowed_locked(name)?;
                 let service_state = self
                     .service_service()
                     .quiesce_for_snapshot_locked(name)?;

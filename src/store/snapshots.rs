@@ -444,6 +444,7 @@ pub fn restore_env_snapshot(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvSnapshotRestoreSummary, String> {
+    let _operation_lock = super::lock_environment_operation(&options.env_name, env, cwd)?;
     let transaction = prepare_env_snapshot_restore(options, env, cwd)?;
     Ok(commit_env_snapshot_restore(transaction))
 }
@@ -455,6 +456,8 @@ pub(crate) fn prepare_env_snapshot_restore(
 ) -> Result<EnvSnapshotRestoreTransaction, String> {
     let env_name = validate_name(&options.env_name, "Environment name")?;
     let snapshot = get_env_snapshot(&env_name, &options.snapshot_id, env, cwd)?;
+    crate::env::EnvironmentService::new(env, cwd)
+        .ensure_snapshot_restore_allowed_locked(&env_name)?;
     let current = get_environment(&env_name, env, cwd)?;
     let current_paths = derive_env_paths(Path::new(&current.root));
     let root_exists = path_exists(&current_paths.root);

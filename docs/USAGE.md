@@ -484,6 +484,11 @@ includes independent content. Full snapshot restore still rewinds that content.
 
 ### Snapshots
 
+Snapshot restore requires a completed dev session. If a watch is active, starting,
+restoring its service, or has unfinished or unreadable ownership, run
+`ocm dev stop <env>` before retrying. Refusal preserves the current state and
+service policy.
+
 Snapshot create and restore stop a running OCM-managed gateway before copying or
 replacing its root, then restore the recorded service policy. New snapshots are
 verified whole-root checkpoints: they include secrets, browser state, SQLite
