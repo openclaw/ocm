@@ -3388,6 +3388,17 @@ fn dev_status_reports_dev_envs() {
     assert_eq!(stale["serviceRunning"], false);
     assert_eq!(fs::read(&runtime_path).unwrap(), runtime_bytes);
 
+    // Seed the foreign store before the status-only fake daemon is loaded.
+    let mut other_env = env.clone();
+    let other_home = root.child("other-ocm-home");
+    other_env.insert("OCM_HOME".to_string(), path_string(&other_home));
+    save_environment(
+        get_environment("demo", &env, &cwd).unwrap(),
+        &other_env,
+        &cwd,
+    )
+    .unwrap();
+
     let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
     assert!(started.status.success(), "{}", stderr(&started));
     let live = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
@@ -3410,15 +3421,6 @@ fn dev_status_reports_dev_envs() {
         assert_eq!(fs::read(&runtime_path).unwrap(), runtime_bytes);
     }
 
-    let mut other_env = env.clone();
-    let other_home = root.child("other-ocm-home");
-    other_env.insert("OCM_HOME".to_string(), path_string(&other_home));
-    save_environment(
-        get_environment("demo", &env, &cwd).unwrap(),
-        &other_env,
-        &cwd,
-    )
-    .unwrap();
     let mut other_runtime = runtime.clone();
     other_runtime.ocm_home = path_string(&other_home);
     let other_runtime_path = supervisor_runtime_path(&other_env, &cwd).unwrap();
