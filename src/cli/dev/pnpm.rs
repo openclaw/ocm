@@ -232,6 +232,10 @@ struct InstallStream<W> {
     prefix: usize,
     line_start: bool,
     in_record: bool,
+    depth: usize,
+    quoted: bool,
+    escaped: bool,
+    framed: bool,
     discard: bool,
     record: Vec<u8>,
     human: Vec<u8>,
@@ -247,6 +251,10 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
             prefix: 0,
             line_start: true,
             in_record: false,
+            depth: 0,
+            quoted: false,
+            escaped: false,
+            framed: false,
             discard: false,
             record: Vec::new(),
             human: Vec::new(),
@@ -274,6 +282,58 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
         self.human = bytes;
     }
 
+    fn begin_record(&mut self, prefix: &[u8]) {
+        self.in_record = true;
+        self.depth = 0;
+        self.quoted = false;
+        self.escaped = false;
+        self.framed = false;
+        for &byte in prefix {
+            self.push_record_byte(byte);
+        }
+    }
+
+    fn push_record_byte(&mut self, byte: u8) {
+        self.record.push(byte);
+        if self.framed {
+            return;
+        }
+        if self.quoted {
+            if self.escaped {
+                self.escaped = false;
+            } else if byte == b'\\' {
+                self.escaped = true;
+            } else if byte == b'"' {
+                self.quoted = false;
+            }
+            return;
+        }
+        match byte {
+            b'"' => self.quoted = true,
+            b'{' | b'[' => self.depth += 1,
+            b'}' | b']' => {
+                self.depth = self.depth.saturating_sub(1);
+                if self.depth != 0 {
+                    return;
+                }
+                self.framed = true;
+                // Only find a structural boundary here; Serde still validates
+                // JSON. Genuine reports wait for their NDJSON delimiter.
+                let reporter = match serde_json::from_slice::<Value>(&self.record) {
+                    Ok(value) => is_reporter_record(&value),
+                    Err(_) => looks_like_envelope(&self.record),
+                };
+                if !reporter {
+                    self.emit_plain_record(false);
+                    self.record.clear();
+                    self.in_record = false;
+                    self.line_start = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn consume(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             if self.in_record {
@@ -285,51 +345,49 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
                     self.in_record = false;
                     self.discard = false;
                     self.line_start = true;
-                } else if !self.discard {
-                    if self.record.len() == MAX_RECORD_BYTES {
-                        if looks_like_envelope(&self.record) {
-                            self.observer
-                                .fail("pnpm reporter record exceeded its memory bound");
-                            self.record.clear();
-                            self.discard = true;
-                        } else {
-                            // Native pnpm and its Bole reporter emit the
-                            // namespace before variable payload. A large script
-                            // line without that header is ordinary output.
-                            let pending = if self.record.ends_with(RECORD_PREFIX) {
-                                RECORD_PREFIX.len()
-                            } else {
-                                usize::from(self.record.ends_with(&RECORD_PREFIX[..1]))
-                            };
-                            self.record.truncate(self.record.len() - pending);
-                            self.emit_plain_record(false);
-                            self.record.clear();
-                            self.line_start = false;
-                            if pending == RECORD_PREFIX.len() {
-                                self.record.extend_from_slice(RECORD_PREFIX);
-                                self.record.push(byte);
-                                continue;
-                            }
-                            self.in_record = false;
-                            self.prefix = pending;
-                            // Process the overflow byte normally, including a
-                            // new reporter prefix after unterminated output.
-                        }
-                    } else {
-                        self.record.push(byte);
-                    }
-                }
-                if self.in_record || byte == b'\n' {
                     continue;
                 }
+                if self.discard {
+                    continue;
+                }
+                if self.record.len() < MAX_RECORD_BYTES {
+                    self.push_record_byte(byte);
+                    continue;
+                }
+                if looks_like_envelope(&self.record) {
+                    self.observer
+                        .fail("pnpm reporter record exceeded its memory bound");
+                    self.record.clear();
+                    self.discard = true;
+                    continue;
+                }
+                // Native pnpm and the JS Bole reporter emit the namespace
+                // before variable payload. A large script line without that
+                // header is ordinary output.
+                let pending = if self.record.ends_with(RECORD_PREFIX) {
+                    RECORD_PREFIX.len()
+                } else {
+                    usize::from(self.record.ends_with(&RECORD_PREFIX[..1]))
+                };
+                self.record.truncate(self.record.len() - pending);
+                self.emit_plain_record(false);
+                self.record.clear();
+                self.line_start = false;
+                if pending == RECORD_PREFIX.len() {
+                    self.begin_record(RECORD_PREFIX);
+                    self.push_record_byte(byte);
+                    continue;
+                }
+                self.in_record = false;
+                self.prefix = pending;
+                // Process the overflow byte normally, including a new reporter
+                // prefix after unterminated output.
             }
-            // NDJSON object field order is not part of its interface. At a
-            // line boundary accept any object; the compact native prefix also
-            // recognizes records emitted after an unterminated human prompt.
+            // Within the record bound, accept any object field order. The
+            // compact prefix also recognizes reports after a human prompt.
             if self.line_start && byte == b'{' {
                 self.flush_human();
-                self.record.push(byte);
-                self.in_record = true;
+                self.begin_record(&[byte]);
                 self.line_start = false;
                 continue;
             }
@@ -337,9 +395,8 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
                 self.prefix += 1;
                 if self.prefix == RECORD_PREFIX.len() {
                     self.flush_human();
-                    self.record.extend_from_slice(RECORD_PREFIX);
                     self.prefix = 0;
-                    self.in_record = true;
+                    self.begin_record(RECORD_PREFIX);
                 }
             } else {
                 self.human.extend_from_slice(&RECORD_PREFIX[..self.prefix]);
@@ -377,11 +434,7 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
         let name = record.get("name").and_then(Value::as_str);
         // Lifecycle scripts can write ordinary JSON on the reporter's channel.
         // A valid object needs pnpm's namespace before it is treated as telemetry.
-        let reporter = name.is_some_and(|name| {
-            name.starts_with("pnpm:")
-                || (name == "pnpm" && record.get("time").is_some() && record.get("pid").is_some())
-        });
-        if !reporter {
+        if !is_reporter_record(&record) {
             self.emit_plain_record(terminated);
             return;
         }
@@ -446,6 +499,16 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
         }
         self.flush_human();
     }
+}
+
+fn is_reporter_record(record: &Value) -> bool {
+    record
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| {
+            name.starts_with("pnpm:")
+                || (name == "pnpm" && record.get("time").is_some() && record.get("pid").is_some())
+        })
 }
 
 fn skip_whitespace(mut bytes: &[u8]) -> &[u8] {
@@ -614,6 +677,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pnpm_reporter_separates_adjacent_ordinary_json_and_reports() {
+        for human in [
+            r#"{"state":"done"}"#,
+            r#"{"nested":[{"brace":"} ] {","quote":"\\\""}],"done":true}"#,
+        ] {
+            let observer = InstallObserver::default();
+            let output = Rc::new(RefCell::new(Vec::new()));
+            let captured = Rc::clone(&output);
+            let mut decoder = InstallStream::new(
+                observer.clone(),
+                OutputChannel::Stderr,
+                move |_, bytes: &[u8]| {
+                    captured.borrow_mut().extend_from_slice(bytes);
+                    Ok(())
+                },
+            );
+            let mut input = human.as_bytes().to_vec();
+            input.extend_from_slice(b"{\"time\":1,\"pid\":42,\"name\":\"pnpm:context\"}\n");
+            input.extend(lifecycle("script", "build".into()));
+            input.extend(lifecycle("exitCode", 0.into()));
+            for chunk in input.chunks(2) {
+                decoder.consume(chunk);
+            }
+            decoder.finish();
+            assert!(observer.finish().is_ok(), "{human}");
+            let expected = format!("{human}postinstall: build\n");
+            assert_eq!(output.borrow().as_slice(), expected.as_bytes());
+        }
+    }
+
     trait OutputBytes {
         fn concat_bytes(&self) -> Vec<u8>;
     }
@@ -640,6 +734,8 @@ mod tests {
                 b"{ \"name\" : \"pnpm:lifecycle\", \"time\" : 1, \"pid\" : 42, broken }\n".to_vec(),
             ],
             vec![b"{ \"name\" : \"pnpm:lifecycle\", \"time\" : 1, \"pid\" : 42".to_vec()],
+            vec![b"{\"name\":\"pnpm:context\",\"time\":1,\"pid\":42}".to_vec()],
+            vec![b"{\"name\":\"pnpm:context\"}{\"name\":\"pnpm:context\"}\n".to_vec()],
         ];
         for code in [-1, 137, 143] {
             if code < 0 || reserved_signal_exit(code) {
