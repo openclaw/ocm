@@ -1487,11 +1487,16 @@ fn gateway_owned_daemon_refresh(npm: bool) {
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut contract_met = false;
+    let mut daemon_status = None;
     while Instant::now() < deadline {
+        // This test owns the old daemon. Reap it so fake launchctl's kill -0
+        // observes its exit instead of polling a zombie through every retry.
+        daemon_status = daemon.try_wait().unwrap();
         let calls = fs::read_to_string(root.child("refresh-launchctl.log")).unwrap_or_default();
         let output = fs::read_to_string(&refresh_output_path).unwrap_or_default();
         let starts = fs::read_to_string(&started_path).unwrap_or_default();
-        contract_met = calls.lines().any(|line| line.starts_with("bootstrap "))
+        contract_met = daemon_status.is_some_and(|status| status.success())
+            && calls.lines().any(|line| line.starts_with("bootstrap "))
             && output.contains("\"action\": \"refresh\"")
             && starts.lines().count() >= 2;
         if contract_met {
@@ -1506,11 +1511,13 @@ fn gateway_owned_daemon_refresh(npm: bool) {
     if let Ok(pid) = fs::read_to_string(&replacement_daemon_pid_path) {
         let _ = Command::new("kill").args(["-INT", pid.trim()]).status();
     }
-    stop_process(&mut daemon);
+    if daemon_status.is_none() {
+        stop_process(&mut daemon);
+    }
 
     assert!(
         contract_met,
-        "gateway-owned daemon refresh did not complete and restart the Gateway\nprocess-groups={process_groups}\nlaunchctl-calls={calls}\nrefresh-output={output}\ngateway-starts={starts}"
+        "gateway-owned daemon refresh did not complete and restart the Gateway\nold-daemon-exit={daemon_status:?}\nprocess-groups={process_groups}\nlaunchctl-calls={calls}\nrefresh-output={output}\ngateway-starts={starts}"
     );
 }
 
