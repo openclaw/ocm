@@ -154,6 +154,11 @@ impl SourceWatchSessionPaths {
                     "source watch for env \"{env_name}\" has an unfinished session; run `ocm dev stop {env_name}` to recover it before starting again"
                 ))
             }
+            Some(_session) => {
+                #[cfg(unix)]
+                super::dev_handoff::cleanup_session(&_session)?;
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -404,6 +409,8 @@ impl SourceWatchSessionPaths {
             clear_request()
         } else {
             clear_request()?;
+            #[cfg(unix)]
+            super::dev_handoff::cleanup_session(session)?;
             // Completion and ownership closure are one atomic publication,
             // after the matching request has been removed successfully.
             self.save_session(&completed)

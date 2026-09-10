@@ -483,8 +483,10 @@ impl Cli {
     fn handle_dev_run(&self, args: Vec<String>) -> Result<i32, String> {
         let (args, force) = Self::consume_flag(args, "--force");
         let (args, service_requested) = Self::consume_flag(args, "--service");
-        let (args, watch) = Self::consume_flag(args, "--watch");
-        let (args, ui) = Self::consume_flag(args, "--ui");
+        let (args, watch_requested) = Self::consume_flag(args, "--watch");
+        let (args, no_watch) = Self::consume_flag(args, "--no-watch");
+        let (args, ui_requested) = Self::consume_flag(args, "--ui");
+        let (args, no_ui) = Self::consume_flag(args, "--no-ui");
         let (args, onboard) = Self::consume_flag(args, "--onboard");
         let (args, repo_root) = Self::consume_option(args, "--repo")?;
         let repo_root = Self::require_option_value(repo_root, "--repo")?;
@@ -499,14 +501,22 @@ impl Cli {
             return Err("environment name is required".to_string());
         };
         Self::assert_no_extra_args(&args[1..])?;
-        if force && !watch {
-            return Err("dev accepts --force only with --watch".to_string());
+        if watch_requested && no_watch {
+            return Err("dev cannot combine --watch with --no-watch".to_string());
         }
-        if watch && service_requested {
+        if ui_requested && no_ui {
+            return Err("dev cannot combine --ui with --no-ui".to_string());
+        }
+        if watch_requested && service_requested {
             return Err("dev cannot combine --watch with --service".to_string());
         }
-        if ui && service_requested {
+        if ui_requested && service_requested {
             return Err("dev cannot combine --ui with --service".to_string());
+        }
+        let watch = !service_requested && !no_watch;
+        let ui = !service_requested && !no_ui;
+        if force && !watch {
+            return Err("dev accepts --force only with backend watching enabled".to_string());
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         if ui {
@@ -532,6 +542,7 @@ impl Cli {
                     onboard,
                     watch,
                     ui,
+                    None,
                 )?
             {
                 return Ok(0);
@@ -589,6 +600,7 @@ impl Cli {
                             onboard,
                             watch,
                             ui,
+                            watch_stop.as_deref(),
                         )?
                     {
                         return Ok(0);
@@ -918,6 +930,7 @@ impl Cli {
                         false,
                         true,
                         ui,
+                        Some(&watch_stop),
                     )? {
                         return Ok(0);
                     }
@@ -1225,6 +1238,7 @@ impl Cli {
         onboard: bool,
         watching: bool,
         ui: bool,
+        _stop: Option<&AtomicBool>,
     ) -> Result<bool, String> {
         let env_service = self.environment_service();
         let _operation = env_service.lock_operation(&meta.name)?;
@@ -1240,12 +1254,6 @@ impl Cli {
         let actual_ui = env_service
             .source_watch_session(&meta.name)?
             .is_some_and(|session| !session.closed && session.ui.is_some());
-        if actual_ui != ui {
-            return Err(format!(
-                "dev env {} is running in a different UI mode; stop it before changing --ui",
-                meta.name
-            ));
-        }
         let actual_watching = match &observation {
             SourceWatchState::Active(active) => Some(active.watching.unwrap_or(true)),
             _ => {
@@ -1270,6 +1278,12 @@ impl Cli {
                 session.map(|session| session.is_watching())
             }
         };
+        if actual_ui != ui {
+            return Err(format!(
+                "dev env {} is running in a different UI mode; stop it before changing --ui",
+                meta.name
+            ));
+        }
         // Legacy starting watches may lack mode metadata. Keep their progress
         // response, but never treat an unknown mode as a matching plain session.
         if actual_watching != Some(watching) && (actual_watching.is_some() || !watching) {
@@ -1362,6 +1376,8 @@ impl Cli {
                     .find(|child| child.env_name == meta.name)
             })
             .map(|child| child.pid);
+        #[cfg(unix)]
+        let ui_active = ui.then(|| active.clone());
         let summary = self
             .build_dev_status_summary_with_watch(meta.clone(), service_pid, Ok(observation))?
             .ok_or_else(|| {
@@ -1370,11 +1386,29 @@ impl Cli {
                     meta.name
                 )
             })?;
+        // A requester must never hold the operation lock while the controller
+        // makes a native handoff: stop and recovery need that same lock.
+        drop(_operation);
         self.stderr_line(format!(
             "Source watch for {} is {state}; keeping the existing session.",
             meta.name
         ));
         self.stdout_lines(render_dev_status(&summary, self.dev_stdout_profile()));
+        #[cfg(unix)]
+        if let Some(active) = ui_active {
+            let installed_stop;
+            let stop = match _stop {
+                Some(stop) => stop,
+                None => {
+                    installed_stop = install_source_watch_signal_handler()?;
+                    &installed_stop
+                }
+            };
+            match self.reused_dev_ui_link(meta, &active, stop)? {
+                Some(link) => self.stdout_line(format!("UI: {link}")),
+                None => self.stderr_line("UI link pending; the existing dev processes remain running. Retry the matching command when ready."),
+            }
+        }
         Ok(true)
     }
 
