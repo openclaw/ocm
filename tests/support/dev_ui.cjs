@@ -68,22 +68,49 @@ if (role === "dashboard") {
     response.end(health ? '{"ok":true}' : ready ? "<!doctype html><title>OCM UI fixture</title>" : '{"pending":true}');
   });
   // Ordinary native owners acknowledge a handled stop after their resources close.
-  process.once("SIGTERM", () => server.close(() => process.exit(143)));
-  const listen = () => server.listen(port, "127.0.0.1", () => {
-    const temporary = file(`${role}.${process.pid}.tmp`);
-    fs.writeFileSync(temporary, JSON.stringify({
-      pid: process.pid,
-      descendantPid: descendant?.pid,
-      port,
-      cwd: fs.realpathSync(process.cwd()),
-      gatewayUrl: process.env.OPENCLAW_UI_DEV_GATEWAY_URL,
-      uiBasePath: process.env.OPENCLAW_CONTROL_UI_BASE_PATH,
-      args: process.argv.slice(2),
-    }));
-    fs.renameSync(temporary, file(`${role}.json`));
+  let stopping = false;
+  process.once("SIGTERM", () => {
+    stopping = true;
+    server.close(() => process.exit(143));
   });
+  let listenDeadline;
+  const listen = () => {
+    if (stopping) return;
+    listenDeadline ??= Date.now() + 5000;
+    const onListening = () => {
+      server.off("error", onError);
+      const temporary = file(`${role}.${process.pid}.tmp`);
+      fs.writeFileSync(temporary, JSON.stringify({
+        pid: process.pid,
+        descendantPid: descendant?.pid,
+        port,
+        cwd: fs.realpathSync(process.cwd()),
+        gatewayUrl: process.env.OPENCLAW_UI_DEV_GATEWAY_URL,
+        uiBasePath: process.env.OPENCLAW_CONTROL_UI_BASE_PATH,
+        args: process.argv.slice(2),
+      }));
+      fs.renameSync(temporary, file(`${role}.json`));
+    };
+    const onError = (error) => {
+      server.off("listening", onListening);
+      const temporary = file(`${role}.error.${process.pid}.tmp`);
+      fs.writeFileSync(temporary, error.code ?? "UNKNOWN");
+      fs.renameSync(temporary, file(`${role}-listen-error`));
+      // The native Gateway retries transient EADDRINUSE from other processes'
+      // availability probes. Keep this fake's retry inside its 10s startup
+      // budget; Vite's --strictPort behavior and other errors remain immediate.
+      if (role === "gateway" && error.code === "EADDRINUSE" && Date.now() < listenDeadline) {
+        server.close(() => setTimeout(listen, 20));
+        return;
+      }
+      throw error;
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, "127.0.0.1");
+  };
   const start = setInterval(() => {
-    if (role !== "ui" || !exists("ui-start-hold")) {
+    if (!exists(`${role}-start-hold`)) {
       clearInterval(start);
       listen();
     }

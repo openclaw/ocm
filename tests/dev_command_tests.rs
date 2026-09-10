@@ -944,12 +944,51 @@ exec '{node}' "$@"
 }
 
 #[cfg(unix)]
-fn initial_ui_process(root: &TestDir, role: &str) -> Value {
+fn initial_ui_process(root: &TestDir, role: &str, owner: &mut DevWatchFixture) -> Value {
     let file = root.child(format!("{role}.json"));
-    assert!(
-        wait_for_path(&file, Duration::from_secs(10)),
-        "{role} did not start"
-    );
+    if !wait_for_path(&file, Duration::from_secs(10)) {
+        // Read only bytes already in this fixture's stderr pipe; diagnosing a
+        // failed startup must not block on EOF or release/stop its processes.
+        let mut diagnostic = String::new();
+        let mut controller = None;
+        let mut status = None;
+        if let Some(child) = owner.child.as_mut() {
+            controller = Some(child.id());
+            status = Some(child.try_wait());
+            if let Some(stderr) = child.stderr.as_mut() {
+                let mut available: libc::c_int = 0;
+                if unsafe { libc::ioctl(stderr.as_raw_fd(), libc::FIONREAD, &mut available) } == 0
+                    && available > 0
+                {
+                    let mut bytes = vec![0; (available as usize).min(64 * 1024)];
+                    if stderr.read_exact(&mut bytes).is_ok() {
+                        diagnostic = String::from_utf8_lossy(&bytes).into_owned();
+                    }
+                }
+            }
+        }
+        let recorded = fs::read_to_string(&owner.session).unwrap_or_default();
+        let source = owner
+            .session
+            .parent()
+            .and_then(Path::parent)
+            .and_then(|store| fs::read(store.join("envs.json")).ok())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|registry| {
+                registry["envs"].as_array().and_then(|envs| {
+                    envs.iter()
+                        .find(|meta| {
+                            meta["name"].as_str()
+                                == owner.session.file_stem().and_then(|name| name.to_str())
+                        })
+                        .map(|meta| meta["dev"].clone())
+                })
+            });
+        panic!(
+            "{role} did not start at {}; controller={controller:?}, status={status:?}, source={source:?}, session={recorded}, stderr={diagnostic}",
+            file.display()
+        );
+    }
     serde_json::from_slice(&fs::read(file).unwrap()).unwrap()
 }
 
@@ -980,8 +1019,8 @@ fn dev_ui_initial_handoff_and_owned_lifecycle() {
             fs::write(root.child("dashboard-hold"), "hold").unwrap();
         }
         let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &args);
-        let gateway = initial_ui_process(&root, "gateway");
-        let ui = initial_ui_process(&root, "ui");
+        let gateway = initial_ui_process(&root, "gateway", &mut controller);
+        let ui = initial_ui_process(&root, "ui", &mut controller);
         let gateway_pid = gateway["pid"].as_u64().unwrap() as u32;
         let ui_pid = ui["pid"].as_u64().unwrap() as u32;
         let session = read_source_watch_session(&root);
@@ -1119,15 +1158,49 @@ fn dev_ui_claims_an_address_before_the_listener_starts() {
     let mut env = ocm_env(&root);
     let repo = prepare_initial_ui_repo(&root, &mut env);
     fs::write(root.child("ui-start-hold"), "hold").unwrap();
+    fs::write(root.child("gateway-start-hold"), "hold").unwrap();
     let mut first = DevWatchFixture::spawn(
         &root,
         &repo,
         &env,
         &["dev", "first", "--repo", &path_string(&repo), "--ui"],
     );
-    let first_gateway = initial_ui_process(&root, "gateway");
+    assert!(wait_for_path(
+        &source_watch_override_path(&root, "first"),
+        Duration::from_secs(10)
+    ));
     let session_file = source_watch_override_path(&root, "first").with_extension("session");
     let session: Value = serde_json::from_slice(&fs::read(&session_file).unwrap()).unwrap();
+    let gateway_port = url::Url::parse(session["ui"]["target"]["gatewayUrl"].as_str().unwrap())
+        .unwrap()
+        .port()
+        .unwrap();
+    // Other tests' isolated stores probe this same OS port after selection.
+    // Hold one such transient conflict until the fake actually observes it.
+    let until = Instant::now() + Duration::from_secs(5);
+    let probe = loop {
+        match std::net::TcpListener::bind(("127.0.0.1", gateway_port)) {
+            Ok(probe) => break probe,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < until =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("failed to hold the selected Gateway port: {error}"),
+        }
+    };
+    fs::remove_file(root.child("gateway-start-hold")).unwrap();
+    assert!(wait_for_path(
+        &root.child("gateway-listen-error"),
+        Duration::from_secs(5)
+    ));
+    assert_eq!(
+        fs::read_to_string(root.child("gateway-listen-error")).unwrap(),
+        "EADDRINUSE"
+    );
+    assert!(!root.child("gateway.json").exists());
+    drop(probe);
+    let first_gateway = initial_ui_process(&root, "gateway", &mut first);
     let port = session["ui"]["target"]["port"].as_u64().unwrap() as u16;
     assert!(
         std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
@@ -1149,11 +1222,11 @@ fn dev_ui_claims_an_address_before_the_listener_starts() {
             "--ui",
         ],
     );
-    let second_gateway = initial_ui_process(&second_root, "gateway");
-    let second_ui = initial_ui_process(&second_root, "ui");
+    let second_gateway = initial_ui_process(&second_root, "gateway", &mut second);
+    let second_ui = initial_ui_process(&second_root, "ui", &mut second);
     assert_ne!(second_ui["port"].as_u64().unwrap(), u64::from(port));
     fs::remove_file(root.child("ui-start-hold")).unwrap();
-    let first_ui = initial_ui_process(&root, "ui");
+    let first_ui = initial_ui_process(&root, "ui", &mut first);
     for name in ["first", "second"] {
         let stopped = run_named_dev_stop(&repo, &env, name);
         assert!(stopped.status.success(), "{}", stderr(&stopped));
