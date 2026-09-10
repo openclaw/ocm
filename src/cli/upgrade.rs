@@ -712,6 +712,10 @@ impl Cli {
         for env_name in &lock_names {
             transaction_locks.push(lock_upgrade_transaction(env_name, &self.env, &self.cwd)?);
             operation_locks.push(self.environment_service().lock_operation(env_name)?);
+            if !options.dry_run {
+                self.environment_service()
+                    .ensure_source_watch_allows_state_mutation_locked(env_name)?;
+            }
         }
         let target = UpgradeTarget {
             version: None,
@@ -1099,6 +1103,20 @@ impl Cli {
         transaction_id: Option<&str>,
         dry_run: bool,
     ) -> Result<UpgradeRollbackSummary, String> {
+        let _transaction_lock = if dry_run {
+            None
+        } else {
+            Some(lock_upgrade_transaction(env_name, &self.env, &self.cwd)?)
+        };
+        let _operation_lock = if dry_run {
+            None
+        } else {
+            Some(self.environment_service().lock_operation(env_name)?)
+        };
+        if !dry_run {
+            self.environment_service()
+                .ensure_source_watch_allows_state_mutation_locked(env_name)?;
+        }
         let plan = self.prepare_upgrade_rollback(env_name, transaction_id)?;
         if dry_run {
             return Ok(UpgradeRollbackSummary {
@@ -1120,9 +1138,6 @@ impl Cli {
             });
         }
 
-        let _transaction_lock = lock_upgrade_transaction(env_name, &self.env, &self.cwd)?;
-        let _operation_lock = self.environment_service().lock_operation(env_name)?;
-        let plan = self.prepare_upgrade_rollback(env_name, Some(&plan.record.id))?;
         self.execute_upgrade_rollback_locked(env_name, plan)
     }
 
@@ -2344,6 +2359,10 @@ impl Cli {
         target: &UpgradeTarget,
         options: UpgradeOptions,
     ) -> Result<UpgradeEnvSummary, String> {
+        if !options.dry_run {
+            self.environment_service()
+                .ensure_source_watch_allows_state_mutation_locked(name)?;
+        }
         let env = self.environment_service().get(name)?;
 
         if let Some(runtime_name) = env.default_runtime.as_deref() {

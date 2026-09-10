@@ -375,6 +375,33 @@ impl<'a> EnvironmentService<'a> {
         Ok(source_watch_override_path(&env_name, self.env, self.cwd)?.with_extension("admission"))
     }
 
+    pub(crate) fn ensure_source_watch_allows_state_mutation_locked(
+        &self,
+        name: &str,
+    ) -> Result<(), String> {
+        let state = match self.observe_source_watch(name) {
+            Ok(SourceWatchState::Inactive) => None,
+            Ok(SourceWatchState::Starting) => Some("starting".to_string()),
+            Ok(SourceWatchState::Active(_)) => Some("active".to_string()),
+            Ok(SourceWatchState::Restoring) => Some("restoring".to_string()),
+            Err(error) => Some(format!("unknown ({error})")),
+        };
+        if let Some(state) = state {
+            return Err(format!(
+                "cannot change env {name} while its dev session is {state}; stop it with ocm dev stop {name} first"
+            ));
+        }
+        let session = self.source_watch_session(name).map_err(|error| {
+            format!("cannot verify the dev session for env {name}: {error}; stop it with ocm dev stop {name} before changing env state")
+        })?;
+        if session.is_some_and(|session| !session.closed) {
+            return Err(format!(
+                "cannot change env {name} while its dev session is unfinished; stop it with ocm dev stop {name} first"
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_source_watch_allows_service(&self, env_name: &str) -> Result<(), String> {
         if let Some(session) = self.source_watch_session(env_name)? {
             if let Some(error) = session.unsafe_cleanup_error() {

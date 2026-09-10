@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
-use super::{EnvironmentService, SourceWatchState};
+use super::EnvironmentService;
 use crate::store::{
     EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
     create_env_snapshot, create_env_snapshot_from_preparation, get_env_snapshot,
@@ -216,30 +216,6 @@ impl<'a> EnvironmentService<'a> {
         let summary = commit_env_snapshot_restore(transaction);
         sync_supervisor_env_if_present(self.env, self.cwd, &env_name)?;
         Ok(summary)
-    }
-
-    pub(crate) fn ensure_snapshot_restore_allowed_locked(&self, name: &str) -> Result<(), String> {
-        let state = match self.observe_source_watch(name) {
-            Ok(SourceWatchState::Inactive) => None,
-            Ok(SourceWatchState::Starting) => Some("starting".to_string()),
-            Ok(SourceWatchState::Active(_)) => Some("active".to_string()),
-            Ok(SourceWatchState::Restoring) => Some("restoring".to_string()),
-            Err(error) => Some(format!("unknown ({error})")),
-        };
-        if let Some(state) = state {
-            return Err(format!(
-                "cannot restore env {name} while its dev session is {state}; stop it with ocm dev stop {name} first"
-            ));
-        }
-        let session = self.source_watch_session(name).map_err(|error| {
-            format!("cannot verify the dev session for env {name}: {error}; stop it with ocm dev stop {name} before restoring")
-        })?;
-        if session.is_some_and(|session| !session.closed) {
-            return Err(format!(
-                "cannot restore env {name} while its dev session is unfinished; stop it with ocm dev stop {name} first"
-            ));
-        }
-        Ok(())
     }
 
     pub(crate) fn prepare_snapshot_restore_locked(

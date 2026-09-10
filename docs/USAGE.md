@@ -484,7 +484,8 @@ includes independent content. Full snapshot restore still rewinds that content.
 
 ### Snapshots
 
-Snapshot restore requires a completed dev session. If a watch is active, starting,
+Snapshot restore and live upgrade or rollback require a completed dev session.
+If a watch is active, starting,
 restoring its service, or has unfinished or unreadable ownership, run
 `ocm dev stop <env>` before retrying. Refusal preserves the current state and
 service policy.

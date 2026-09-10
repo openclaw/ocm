@@ -457,7 +457,7 @@ pub(crate) fn prepare_env_snapshot_restore(
     let env_name = validate_name(&options.env_name, "Environment name")?;
     let snapshot = get_env_snapshot(&env_name, &options.snapshot_id, env, cwd)?;
     crate::env::EnvironmentService::new(env, cwd)
-        .ensure_snapshot_restore_allowed_locked(&env_name)?;
+        .ensure_source_watch_allows_state_mutation_locked(&env_name)?;
     let current = get_environment(&env_name, env, cwd)?;
     let current_paths = derive_env_paths(Path::new(&current.root));
     let root_exists = path_exists(&current_paths.root);

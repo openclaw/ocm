@@ -4472,6 +4472,117 @@ fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn upgrade_refuses_a_live_watch_before_state_or_runtime_mutation() {
+    use fs2::FileExt;
+
+    fn inventory(path: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut entries = BTreeMap::new();
+        if path.is_dir() {
+            entries.insert(path.to_path_buf(), None);
+            for entry in fs::read_dir(path).unwrap() {
+                entries.extend(inventory(&entry.unwrap().path()));
+            }
+        } else if path.exists() {
+            entries.insert(path.to_path_buf(), Some(fs::read(path).unwrap()));
+        }
+        entries
+    }
+
+    let root = TestDir::new("upgrade-live-watch-refusal");
+    let mut fixture = seed_in_place_rollback(&root, "2026.6.11");
+    let next = root.child("next-openclaw");
+    write_executable_script(&next, &recording_openclaw_script("2026.6.44"));
+    let added = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["runtime", "add", "next", "--path", &path_string(&next)],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let sibling = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["env", "create", "sibling", "--runtime", "next"],
+    );
+    assert!(sibling.status.success(), "{}", stderr(&sibling));
+    let command_log = root.child("refused-commands.log");
+    fixture.env.insert(
+        "OCM_TEST_COMMAND_LOG".to_string(),
+        path_string(&command_log),
+    );
+    let home = PathBuf::from(fixture.env.get("OCM_HOME").unwrap());
+    write_text(
+        &home.join("envs/demo/.openclaw/openclaw.json"),
+        "{\"gateway\":{\"port\":19001}}\n",
+    );
+    let checkout = root.child("watched-source");
+    fs::create_dir_all(checkout.join("extensions")).unwrap();
+    write_text(
+        &checkout.join("openclaw.mjs"),
+        "console.log('2026.6.33');\n",
+    );
+    let watch = ocm::store::source_watch_override_path("demo", &fixture.env, &fixture.cwd).unwrap();
+    fs::create_dir_all(watch.parent().unwrap()).unwrap();
+    let mut lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(watch.with_extension("lock"))
+        .unwrap();
+    lease.lock_exclusive().unwrap();
+    writeln!(lease, "upgrade-refusal").unwrap();
+    let watch_bytes = serde_json::to_vec(&serde_json::json!({
+        "kind": "ocm-source-watch-override", "envName": "demo", "repoRoot": checkout,
+        "watchPid": std::process::id(), "token": "lease:upgrade-refusal:fixture",
+        "startedAt": "2026-06-17T00:00:00Z"
+    }))
+    .unwrap();
+    fs::write(&watch, &watch_bytes).unwrap();
+    let registry_path = env_registry_path(&fixture.env, &fixture.cwd).unwrap();
+    let registry_before = fs::read(&registry_path).unwrap();
+    let next_before = fs::read(&next).unwrap();
+    let owned_paths = [
+        "envs",
+        "runtimes",
+        "snapshots",
+        "upgrade-history",
+        "upgrade-batches",
+    ];
+    let before = owned_paths.map(|path| inventory(&home.join(path)));
+    for args in [
+        vec!["upgrade", "demo", "--runtime", "next"],
+        vec!["upgrade", "rollback", "demo"],
+        vec![
+            "upgrade",
+            "batch",
+            "--envs",
+            "demo,sibling",
+            "--runtime",
+            "next",
+            "--accept-fleet-outage",
+        ],
+    ] {
+        let refused = run_ocm(&fixture.cwd, &fixture.env, &args);
+        assert!(!refused.status.success(), "accepted {args:?}");
+        assert!(
+            stderr(&refused).contains("dev session is active")
+                && stderr(&refused).contains("dev stop demo"),
+            "{args:?}: {}",
+            stderr(&refused)
+        );
+        assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+        assert_eq!(fs::read(&next).unwrap(), next_before);
+        assert_eq!(
+            owned_paths.map(|path| inventory(&home.join(path))),
+            before,
+            "mutated state for {args:?}"
+        );
+        assert_eq!(fs::read(&watch).unwrap(), watch_bytes);
+        assert!(!command_log.exists(), "invoked OpenClaw for {args:?}");
+    }
+}
+
 #[test]
 fn upgrade_rollback_restores_retained_in_place_runtime_bytes() {
     let root = TestDir::new("upgrade-explicit-rollback-in-place");
