@@ -31,7 +31,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 const MAX_SECURITY_BYTES: usize = 64 * 1024;
 
-fn with_user_only_security_attributes<T>(
+pub(crate) fn with_user_only_security_attributes<T>(
     user: &UserSid,
     action: impl FnOnce(&SECURITY_ATTRIBUTES) -> io::Result<T>,
 ) -> io::Result<T> {
@@ -89,7 +89,7 @@ pub(crate) fn create_private_file_new(path: &Path) -> io::Result<File> {
     })
 }
 
-fn owned_handle(raw: HANDLE) -> io::Result<OwnedHandle> {
+pub(crate) fn owned_handle(raw: HANDLE) -> io::Result<OwnedHandle> {
     if raw.is_null() || raw == INVALID_HANDLE_VALUE {
         Err(io::Error::last_os_error())
     } else {
@@ -97,16 +97,20 @@ fn owned_handle(raw: HANDLE) -> io::Result<OwnedHandle> {
     }
 }
 
-struct UserSid {
+pub(crate) struct UserSid {
     // TOKEN_USER contains a pointer into this allocation. Keep its alignment
     // and allocation stable until all SID comparisons have completed.
     storage: Vec<usize>,
 }
 
 impl UserSid {
-    fn current() -> io::Result<Self> {
+    pub(crate) fn current() -> io::Result<Self> {
+        Self::for_process(unsafe { GetCurrentProcess() })
+    }
+
+    pub(crate) fn for_process(process: HANDLE) -> io::Result<Self> {
         let mut token = ptr::null_mut();
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let token = owned_handle(token)?;
@@ -164,7 +168,7 @@ impl UserSid {
         Ok(user)
     }
 
-    fn as_sid(&self) -> PSID {
+    pub(crate) fn as_sid(&self) -> PSID {
         unsafe { &*self.storage.as_ptr().cast::<TOKEN_USER>() }
             .User
             .Sid

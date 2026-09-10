@@ -1,5 +1,5 @@
 mod binding;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod dev_handoff;
 mod execution;
 mod health;

@@ -153,15 +153,14 @@ It cannot be combined with `--service`.
 The controller owns Gateway, Vite and each dashboard helper. A component
 exit stops its sibling; `dev stop` stops both and gives a running helper only the
 remainder of its original 30-second budget. A late link is discarded, and uncertain
-cleanup retains ownership. On Linux and macOS, repeating the matching command
-requests a fresh native owner link from that controller while keeping Gateway,
+cleanup retains ownership. On Linux, macOS, and Windows, repeating the matching
+command requests a fresh native owner link from that controller while keeping Gateway,
 Vite and their address unchanged. One helper runs at a time; busy or unready
 requests report a pending link. Requests have a 30-second deadline, and a caller
 that exits or times out cannot redirect its eventual grant to another terminal.
 Older OCM controllers retain address-only reuse and report fresh links as
 unavailable until that dev session is restarted.
-Windows repeated commands continue to report the address. The UI address is
-retained across stop/start for the same environment. If that address is occupied
+The UI address is retained across stop/start for the same environment. If that address is occupied
 or reserved, startup fails until it is free. Cloned and imported environments
 select their own addresses; restore keeps the current environment's address.
 Stop the session before changing UI mode.

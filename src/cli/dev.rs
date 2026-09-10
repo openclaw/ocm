@@ -1366,7 +1366,7 @@ impl Cli {
                     .find(|child| child.env_name == meta.name)
             })
             .map(|child| child.pid);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let ui_active = ui.then(|| active.clone());
         let summary = self
             .build_dev_status_summary_with_watch(meta.clone(), service_pid, Ok(observation))?
@@ -1384,7 +1384,7 @@ impl Cli {
             meta.name
         ));
         self.stdout_lines(render_dev_status(&summary, self.dev_stdout_profile()));
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(active) = ui_active {
             use crate::env::dev_handoff::HandoffOutcome;
 

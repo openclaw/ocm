@@ -123,13 +123,12 @@ native browser handoff once both documents are ready. The UI uses a captured
 loopback address retained across stop/start for that environment. A busy retained
 port is an error; OCM does not silently choose another address. Clone and import
 select new addresses, while snapshot restore keeps the current environment's
-reservation. Removing the environment releases it. `ocm dev status luna` and
-matching repeated starts report the address.
-On Linux and macOS, a matching repeated start requests a fresh native browser
-grant from the existing controller without restarting Gateway or Vite. Busy or
-unready requests report a pending link. Older OCM controllers retain address-only
-reuse and report fresh links as unavailable until that dev session is restarted.
-Windows repeats still report the address.
+reservation. Removing the environment releases it. `ocm dev status luna` reports
+the address. On Linux, macOS, and Windows, a matching repeated start requests a
+fresh native browser grant from the existing controller without restarting
+Gateway or Vite. Busy or unready requests report a pending link.
+Older OCM controllers retain address-only reuse and report fresh links as
+unavailable until that dev session is restarted.
 `ocm dev stop luna` stops the components together. A pending initial request gets
 30 seconds and retains its helper until completion. Repeated requests have the
 same deadline; late or disconnected callers' grant bytes are discarded.

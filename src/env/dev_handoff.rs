@@ -7,6 +7,10 @@ use sha2::{Digest, Sha256};
 
 use super::source_watch_session::SourceWatchSession;
 
+#[cfg(windows)]
+#[path = "dev_handoff_windows.rs"]
+mod platform;
+
 const REQUEST: &[u8] = b"handoff\n";
 const ACK: &[u8] = b"\x06";
 const MAX_REPLY: usize = 64 * 1024;

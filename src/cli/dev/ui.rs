@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use url::Url;
 
 use super::*;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::env::dev_handoff::{self, HandoffOutcome, HandoffRequest, HandoffServer};
 use crate::env::{DevUiChildRole, SourceUiTarget};
 
@@ -541,7 +541,7 @@ impl Cli {
         Some(summary)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn reused_dev_ui_link(
         &self,
         meta: &EnvMeta,
@@ -574,7 +574,7 @@ impl Cli {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn verify_active_dev_ui(
         &self,
         meta: &EnvMeta,
@@ -756,13 +756,13 @@ for (const name of ['vite', 'dompurify']) {
             gateway_url: captured.gateway_url.clone(),
         };
         target.validate(meta.gateway_port.unwrap_or_default())?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let mut handoff_server = HandoffServer::bind(
             lease
                 .session()
                 .ok_or_else(|| "dev UI session ownership is missing".to_string())?,
         )?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let mut handoff_request: Option<HandoffRequest> = None;
         let mut children: Vec<OwnedUiChild> = Vec::new();
         let mut override_token = None;
@@ -835,7 +835,7 @@ for (const name of ['vite', 'dompurify']) {
                 if source_watch_cancelled(lease, stop)? {
                     return Ok(130);
                 }
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 if handoff_request
                     .as_mut()
                     .is_some_and(|request| request.expired() || request.disconnected())
@@ -872,7 +872,7 @@ for (const name of ['vite', 'dompurify']) {
                     last_probe = std::time::Instant::now();
                     let output = child.output();
                     if std::mem::take(&mut discarded) || expired {
-                        #[cfg(unix)]
+                        #[cfg(any(unix, windows))]
                         handoff_request.take();
                         if initial_handoff {
                             attempts = DASHBOARD_ATTEMPTS;
@@ -895,7 +895,7 @@ for (const name of ['vite', 'dompurify']) {
                             if source_watch_cancelled(lease, stop)? {
                                 return Ok(130);
                             }
-                            #[cfg(unix)]
+                            #[cfg(any(unix, windows))]
                             if let Some(mut request) = handoff_request.take() {
                                 let _ = request.deliver(&_native);
                             }
@@ -905,7 +905,7 @@ for (const name of ['vite', 'dompurify']) {
                             }
                         }
                         Err(error) => {
-                            #[cfg(unix)]
+                            #[cfg(any(unix, windows))]
                             if let Some(mut request) = handoff_request.take() {
                                 if status.success() {
                                     request.failed(&error);
@@ -923,7 +923,7 @@ for (const name of ['vite', 'dompurify']) {
                     && !discarded
                 {
                     discarded = true;
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     handoff_request.take();
                     if initial_handoff {
                         attempts = DASHBOARD_ATTEMPTS;
@@ -931,7 +931,7 @@ for (const name of ['vite', 'dompurify']) {
                         pending_reported = true;
                     }
                 }
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 if let Some(mut request) = handoff_server.poll()? {
                     if handoff_started.is_some() || handoff_request.is_some() {
                         request.pending();
@@ -940,9 +940,9 @@ for (const name of ['vite', 'dompurify']) {
                         last_probe = std::time::Instant::now() - Duration::from_secs(1);
                     }
                 }
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 let reuse_requested = handoff_request.is_some();
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, windows)))]
                 let reuse_requested = false;
                 if handoff_started.is_none()
                     && (reuse_requested || (!delivered && attempts < DASHBOARD_ATTEMPTS))
@@ -953,7 +953,7 @@ for (const name of ['vite', 'dompurify']) {
                         if source_watch_cancelled(lease, stop)? {
                             return Ok(130);
                         }
-                        #[cfg(unix)]
+                        #[cfg(any(unix, windows))]
                         if handoff_request
                             .as_mut()
                             .is_some_and(|request| request.expired() || request.disconnected())
@@ -987,7 +987,7 @@ for (const name of ['vite', 'dompurify']) {
                                 children.push(child);
                                 let child =
                                     children.last_mut().expect("dashboard child was recorded");
-                                #[cfg(unix)]
+                                #[cfg(any(unix, windows))]
                                 {
                                     child.handoff_deadline =
                                         handoff_request.as_ref().map(HandoffRequest::deadline);
@@ -997,7 +997,7 @@ for (const name of ['vite', 'dompurify']) {
                                 discarded = false;
                             }
                             Err(error) if error.cleanup_verified => {
-                                #[cfg(unix)]
+                                #[cfg(any(unix, windows))]
                                 if let Some(mut request) = handoff_request.take() {
                                     request.failed(&error.message);
                                 }
@@ -1008,7 +1008,7 @@ for (const name of ['vite', 'dompurify']) {
                             Err(error) => return Err(error),
                         }
                     } else {
-                        #[cfg(unix)]
+                        #[cfg(any(unix, windows))]
                         if let Some(mut request) = handoff_request.take() {
                             request.pending();
                         }
@@ -1039,7 +1039,7 @@ for (const name of ['vite', 'dompurify']) {
         })();
         let mut verified = source_watch_allows_service_restore(&result);
         let mut errors = Vec::new();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             // Stop admission and waiting callers before spending any grace on
             // the owned helper. No caller can extend this session's shutdown.

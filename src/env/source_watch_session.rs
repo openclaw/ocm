@@ -155,7 +155,7 @@ impl SourceWatchSessionPaths {
                 ))
             }
             Some(_session) => {
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 super::dev_handoff::cleanup_session(&_session)?;
                 Ok(())
             }
@@ -409,7 +409,7 @@ impl SourceWatchSessionPaths {
             clear_request()
         } else {
             clear_request()?;
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             super::dev_handoff::cleanup_session(session)?;
             // Completion and ownership closure are one atomic publication,
             // after the matching request has been removed successfully.
