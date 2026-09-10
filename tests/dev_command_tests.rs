@@ -1822,7 +1822,7 @@ fn dev_command_rejects_a_stale_registration_replaced_by_an_unrelated_clone() {
         fs::read_to_string(worktree_root.join("SENTINEL")).unwrap(),
         "preserve me\n"
     );
-    fs::remove_file(root.child("pnpm.log")).unwrap();
+    fs::remove_file(root.child("node.log")).unwrap();
     let config_path = PathBuf::from(show_json["configPath"].as_str().unwrap());
     let config_before = b"{\"agents\":{\"defaults\":{\"skipBootstrap\":true}}}\n";
     fs::write(&config_path, config_before).unwrap();
@@ -1860,6 +1860,7 @@ fn dev_command_rejects_a_stale_registration_replaced_by_an_unrelated_clone() {
             .contains("registered worktree is not a valid OpenClaw checkout")
     );
     assert!(!root.child("pnpm.log").exists());
+    assert!(!root.child("node.log").exists());
     assert_eq!(fs::read(config_path).unwrap(), config_before);
 }
 
