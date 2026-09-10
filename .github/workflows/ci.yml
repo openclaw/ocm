@@ -56,6 +56,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check Windows targets
         run: cargo check --workspace --all-targets --locked
+      - name: Prove private config replacement
+        run: cargo test --locked --lib private_config_
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: '22.15.0'

@@ -883,6 +883,24 @@ fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
         path_string(&worktree_root.join("extensions"))
     )));
     assert!(pnpm_log.contains(&format!("|devroot={}", path_string(&worktree_root))));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let auth = serde_json::json!({"mode": "token", "token": {"source": "env", "provider": "default", "id": "AUTHORED_TOKEN"}});
+        let mut authored = config.clone();
+        authored["gateway"]["auth"] = auth.clone();
+        fs::write(&config_path, serde_json::to_vec(&authored).unwrap()).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let resumed = run_ocm(&cwd, &env, &["dev", "demo"]);
+        assert!(resumed.status.success(), "{}", stderr(&resumed));
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "private config lost owner-only access on dev restart"
+        );
+        let updated: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(updated["gateway"]["auth"], auth);
+    }
 }
 
 #[test]

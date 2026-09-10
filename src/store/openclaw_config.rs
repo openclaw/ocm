@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -688,9 +689,129 @@ fn ensure_object_field<'a>(
 }
 
 fn write_config_value(config_path: &Path, value: &Value) -> Result<(), String> {
+    // Keep a private config private when replacing its inode. Other authored
+    // files retain the existing writer's access and replacement behavior.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        match fs::symlink_metadata(config_path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.permissions().mode() & 0o077 == 0 =>
+            {
+                let private_acl = {
+                    #[cfg(target_os = "macos")]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        let file = fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(libc::O_NOFOLLOW)
+                            .open(config_path)
+                            .map_err(|error| error.to_string())?;
+                        let opened = file.metadata().map_err(|error| error.to_string())?;
+                        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+                            return Err("OpenClaw config changed while inspecting private access"
+                                .to_string());
+                        }
+                        crate::infra::macos_security::file_has_no_extended_acl(&file)
+                            .map_err(|error| error.to_string())?
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        true
+                    }
+                };
+                if private_acl {
+                    let staged = stage_private_config(config_path, value)?;
+                    staged
+                        .as_file()
+                        .set_permissions(metadata.permissions())
+                        .map_err(|error| error.to_string())?;
+                    return replace_private_config(staged, config_path);
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    #[cfg(windows)]
+    if crate::infra::windows_security::file_has_user_only_access(config_path)
+        .map_err(|error| error.to_string())?
+    {
+        return replace_private_config(stage_private_config(config_path, value)?, config_path);
+    }
     let mut rewritten = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
     rewritten.push('\n');
     write_file_replacing_path(config_path, rewritten.as_bytes())
+}
+
+fn replace_private_config(
+    staged: tempfile::NamedTempFile,
+    config_path: &Path,
+) -> Result<(), String> {
+    let mut staged = staged.into_temp_path();
+    super::common::replace_path(&staged, config_path)?;
+    staged.disable_cleanup(true);
+    Ok(())
+}
+
+fn stage_private_config(
+    config_path: &Path,
+    value: &Value,
+) -> Result<tempfile::NamedTempFile, String> {
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| "OpenClaw config path has no parent".to_string())?;
+    ensure_dir(parent)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".openclaw-config-");
+    // Establish protection at creation, before writing any authentication bytes.
+    #[cfg(not(windows))]
+    let mut staged = builder
+        .tempfile_in(parent)
+        .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    let mut staged = builder
+        .make_in(
+            parent,
+            crate::infra::windows_security::create_private_file_new,
+        )
+        .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    crate::infra::macos_security::set_private_file_access(staged.as_file())
+        .map_err(|error| error.to_string())?;
+    write_private_config(&mut staged, value)?;
+    Ok(staged)
+}
+
+fn write_private_config(staged: &mut tempfile::NamedTempFile, value: &Value) -> Result<(), String> {
+    // Verify the applied protection while the empty file has a cleanup owner.
+    // Some Windows filesystems ignore the descriptor supplied at creation.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = staged
+            .as_file()
+            .metadata()
+            .map_err(|error| error.to_string())?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err("filesystem did not apply private OpenClaw config access".to_string());
+        }
+    }
+    #[cfg(windows)]
+    if !crate::infra::windows_security::has_user_only_access(staged.as_file())
+        .map_err(|error| error.to_string())?
+    {
+        return Err("filesystem did not apply private OpenClaw config access".to_string());
+    }
+    serde_json::to_writer_pretty(&mut *staged, value).map_err(|error| error.to_string())?;
+    staged.write_all(b"\n").map_err(|error| error.to_string())
 }
 
 fn collect_foreign_env_roots(
@@ -1337,6 +1458,165 @@ mod tests {
             std::process::id(),
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_config_replacement_preserves_unix_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut unprotected = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+        let unprotected_path = unprotected.path().to_path_buf();
+        unprotected
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert!(
+            write_private_config(
+                &mut unprotected,
+                &json!({"gateway": {"auth": {"token": "synthetic-unwritten-token"}}})
+            )
+            .is_err()
+        );
+        assert_eq!(unprotected.as_file().metadata().unwrap().len(), 0);
+        drop(unprotected);
+        assert!(!unprotected_path.exists());
+        let config = root.path().join("private.json");
+        fs::write(&config, "{}").unwrap();
+        for mode in [0o600, 0o400] {
+            fs::set_permissions(&config, fs::Permissions::from_mode(mode)).unwrap();
+            write_config_value(&config, &json!({"gateway": {"port": 19789}})).unwrap();
+            assert_eq!(
+                fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+
+        let authored = root.path().join("authored.json");
+        let control = root.path().join("control.json");
+        fs::write(&authored, "{}").unwrap();
+        fs::set_permissions(&authored, fs::Permissions::from_mode(0o644)).unwrap();
+        write_file_replacing_path(&control, b"{}\n").unwrap();
+        write_config_value(&authored, &json!({"gateway": {"port": 19790}})).unwrap();
+        assert_eq!(
+            fs::metadata(&authored).unwrap().permissions().mode(),
+            fs::metadata(&control).unwrap().permissions().mode()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_config_replacement_preserves_windows_acl() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = derive_env_paths(&root.path().join("custom-root"));
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        let granted = std::process::Command::new("icacls")
+            .arg(&paths.state_dir)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+            .output()
+            .unwrap();
+        assert!(
+            granted.status.success(),
+            "could not prepare the custom-root ACL"
+        );
+        let mut unprotected = tempfile::Builder::new()
+            .tempfile_in(&paths.state_dir)
+            .unwrap();
+        let unprotected_path = unprotected.path().to_path_buf();
+        assert!(
+            write_private_config(
+                &mut unprotected,
+                &json!({"gateway": {"auth": {"token": "synthetic-unwritten-token"}}}),
+            )
+            .is_err()
+        );
+        assert_eq!(unprotected.as_file().metadata().unwrap().len(), 0);
+        drop(unprotected);
+        assert!(!unprotected_path.exists());
+        let staged = stage_private_config(
+            &paths.config_path,
+            &json!({"gateway": {"auth": {"mode": "token", "token": "synthetic-existing-token"}}}),
+        )
+        .unwrap();
+        crate::infra::windows_security::assert_private_file_security(staged.as_file());
+        replace_private_config(staged, &paths.config_path).unwrap();
+        let original = read_config_value(&paths.config_path).unwrap().unwrap();
+        ensure_minimum_local_openclaw_config(&paths, 19800).unwrap();
+        assert!(
+            crate::infra::windows_security::file_has_user_only_access(&paths.config_path).unwrap()
+        );
+        let updated = read_config_value(&paths.config_path).unwrap().unwrap();
+        assert!(updated["gateway"]["auth"] == original["gateway"]["auth"]);
+
+        let authored = paths.state_dir.join("authored.json");
+        fs::write(&authored, b"{\"gateway\":{\"auth\":{\"mode\":\"none\"}}}\n").unwrap();
+        assert!(!crate::infra::windows_security::file_has_user_only_access(&authored).unwrap());
+        write_config_value(
+            &authored,
+            &json!({"gateway": {"auth": {"mode": "none"}, "port": 19801}}),
+        )
+        .unwrap();
+        assert!(!crate::infra::windows_security::file_has_user_only_access(&authored).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_config_replacement_excludes_inherited_macos_acl() {
+        use crate::infra::macos_security::file_has_no_extended_acl;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = derive_env_paths(&root.path().join("custom-root"));
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        let granted = std::process::Command::new("chmod")
+            .args([
+                "+a",
+                "everyone allow read,readattr,readextattr,readsecurity,file_inherit",
+            ])
+            .arg(&paths.state_dir)
+            .output()
+            .unwrap();
+        assert!(
+            granted.status.success(),
+            "could not prepare the custom-root ACL"
+        );
+        let authored = paths.state_dir.join("authored.json");
+        let control = paths.state_dir.join("control.json");
+        for path in [&authored, &control] {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            file.write_all(b"{}\n").unwrap();
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            assert!(!file_has_no_extended_acl(&file).unwrap());
+        }
+        let staged = stage_private_config(
+            &paths.config_path,
+            &json!({"gateway": {"auth": {"mode": "token", "token": "synthetic-existing-token"}}}),
+        )
+        .unwrap();
+        assert!(file_has_no_extended_acl(staged.as_file()).unwrap());
+        replace_private_config(staged, &paths.config_path).unwrap();
+        assert!(file_has_no_extended_acl(&fs::File::open(&paths.config_path).unwrap()).unwrap());
+        let original = read_config_value(&paths.config_path).unwrap().unwrap();
+        ensure_minimum_local_openclaw_config(&paths, 19800).unwrap();
+        assert!(file_has_no_extended_acl(&fs::File::open(&paths.config_path).unwrap()).unwrap());
+        let updated = read_config_value(&paths.config_path).unwrap().unwrap();
+        assert!(updated["gateway"]["auth"] == original["gateway"]["auth"]);
+
+        write_file_replacing_path(&control, b"{}\n").unwrap();
+        write_config_value(&authored, &json!({"gateway": {"auth": {"mode": "none"}}})).unwrap();
+        assert!(!file_has_no_extended_acl(&fs::File::open(&authored).unwrap()).unwrap());
+        assert!(!file_has_no_extended_acl(&fs::File::open(&control).unwrap()).unwrap());
+        assert_eq!(
+            fs::metadata(&authored).unwrap().permissions().mode(),
+            fs::metadata(&control).unwrap().permissions().mode()
+        );
+        assert!(!file_has_no_extended_acl(&fs::File::open(&paths.state_dir).unwrap()).unwrap());
     }
 
     #[test]

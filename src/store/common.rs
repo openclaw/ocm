@@ -222,12 +222,12 @@ pub(crate) fn write_file_replacing_path(path: &Path, raw: &[u8]) -> Result<(), S
 }
 
 #[cfg(not(windows))]
-fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
+pub(super) fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
     fs::rename(source, destination).map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]
-fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
+pub(super) fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
     let mut source_wide = source.as_os_str().encode_wide().collect::<Vec<_>>();
     source_wide.push(0);
     let mut destination_wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
