@@ -1018,8 +1018,20 @@ fn dev_ui_initial_handoff_and_owned_lifecycle() {
         if outcome == "deadline" {
             fs::write(root.child("dashboard-hold"), "hold").unwrap();
         }
+        if outcome == "stop" {
+            fs::write(root.child("ui-start-hold"), "hold").unwrap();
+        }
         let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &args);
         let gateway = initial_ui_process(&root, "gateway", &mut controller);
+        if outcome == "stop" {
+            let status = run_ocm(&repo, &env, &["dev", "status", "demo", "--json"]);
+            assert!(status.status.success(), "{}", stderr(&status));
+            let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+            assert_eq!(status["gatewayHealthReady"], true);
+            assert_eq!(status["ui"]["processRunning"], true);
+            assert_eq!(status["ui"]["httpReady"], false);
+            fs::remove_file(root.child("ui-start-hold")).unwrap();
+        }
         let ui = initial_ui_process(&root, "ui", &mut controller);
         let gateway_pid = gateway["pid"].as_u64().unwrap() as u32;
         let ui_pid = ui["pid"].as_u64().unwrap() as u32;
@@ -1043,6 +1055,60 @@ fn dev_ui_initial_handoff_and_owned_lifecycle() {
             !root.child("dashboard-attempts").exists(),
             "Gateway health alone started a handoff"
         );
+        if outcome == "stop" {
+            let meta = get_environment("demo", &env, &repo).unwrap();
+            let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
+            let config_before = fs::read(&config_path).unwrap();
+            let mut config: Value = serde_json::from_slice(&config_before).unwrap();
+            config["gateway"]["port"] = (meta.gateway_port.unwrap() + 300).into();
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let status = run_ocm(&repo, &env, &["dev", "status", "demo", "--json"]);
+            fs::write(&config_path, config_before).unwrap();
+            assert!(status.status.success(), "{}", stderr(&status));
+            let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+            assert_eq!(status["gatewayPort"], gateway["port"]);
+            assert_eq!(status["gatewayHealthReady"], true);
+            assert_eq!(status["ui"]["processRunning"], true);
+            assert_eq!(status["ui"]["httpReady"], true);
+            assert_eq!(status["uiUrl"], status["ui"]["url"]);
+            let raw = run_ocm(&repo, &env, &["dev", "status", "demo", "--raw"]);
+            assert!(raw.status.success(), "{}", stderr(&raw));
+            assert!(stdout(&raw).contains("ui_process_running=true"));
+            assert!(stdout(&raw).contains("ui_http_ready=true"));
+            assert!(stdout(&raw).contains("ui_url="));
+
+            let session_path = source_watch_override_path(&root, "demo").with_extension("session");
+            let saved_session = fs::read(&session_path).unwrap();
+            let ui_requests = fs::read(root.child("ui-requests")).unwrap();
+            for foreign_scope in [false, true] {
+                let mut changed: Value = serde_json::from_slice(&saved_session).unwrap();
+                if foreign_scope {
+                    changed["processScope"] = "another-process-scope".into();
+                } else {
+                    changed["ui"]["children"]["ui"]["startedAt"] = "another-process-start".into();
+                }
+                let changed = serde_json::to_vec(&changed).unwrap();
+                fs::write(&session_path, &changed).unwrap();
+                let status = run_ocm(&repo, &env, &["dev", "status", "demo", "--json"]);
+                let after = fs::read(&session_path).unwrap();
+                fs::write(&session_path, &saved_session).unwrap();
+                assert!(status.status.success(), "{}", stderr(&status));
+                assert_eq!(after, changed, "status modified session metadata");
+                let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+                let expected = if foreign_scope {
+                    Value::Null
+                } else {
+                    Value::Bool(false)
+                };
+                assert_eq!(status["ui"]["processRunning"], expected);
+                assert_eq!(status["ui"]["httpReady"], expected);
+                if foreign_scope {
+                    assert_eq!(status["sourceWatch"]["state"], "unknown");
+                    assert!(status["ui"]["issue"].as_str().is_some());
+                }
+                assert_eq!(fs::read(root.child("ui-requests")).unwrap(), ui_requests);
+            }
+        }
         fs::write(root.child("gateway-document-ready"), "ready").unwrap();
         assert!(wait_for_path(
             &root.child("dashboard-attempt-1"),
@@ -3011,6 +3077,7 @@ fn dev_status_reports_dev_envs() {
     assert!(reachable.status.success(), "{}", stderr(&reachable));
     let reachable: Value = serde_json::from_str(&stdout(&reachable)).unwrap();
     assert_eq!(reachable["gatewayPortReachable"], true);
+    assert_eq!(reachable["gatewayHealthReady"], false);
     assert_eq!(reachable["serviceRunning"], false);
     assert_eq!(reachable["sourceWatch"]["state"], "inactive");
     drop(listener);
@@ -3018,6 +3085,7 @@ fn dev_status_reports_dev_envs() {
     assert!(closed.status.success(), "{}", stderr(&closed));
     let closed: Value = serde_json::from_str(&stdout(&closed)).unwrap();
     assert_eq!(closed["gatewayPortReachable"], false);
+    assert_eq!(closed["gatewayHealthReady"], false);
     assert_eq!(fs::read(&config_path).unwrap(), listening_config);
     fs::write(&config_path, config_before).unwrap();
 

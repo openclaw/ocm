@@ -668,6 +668,13 @@ changing mode requires stopping it first. `dev status --json` reports active
 ownership separately from `sourceWatch.watching`. Plain runs still refuse a
 running background service; temporary takeover remains `--watch --force`.
 
+Named `dev status` and JSON/raw output also report Gateway `/health` responses
+and the captured UI process and HTML document separately. JSON includes
+`gatewayHealthReady`, `ui.processRunning`, `ui.httpReady`, and `ui.issue`;
+unverifiable UI ownership keeps readiness `null`. The existing `uiUrl`/`ui_url`
+address remains available for active UI sessions. These observations use bounded
+loopback requests and leave recorded state unchanged.
+
 `dev <env> --service` records its preparation children until verified completion.
 Use `dev stop <env>` to cancel setup; a managed Gateway already running keeps its
 launch plan, and deferred restart requests remain pending. Explicit service stop

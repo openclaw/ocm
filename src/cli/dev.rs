@@ -155,8 +155,10 @@ struct DevStatusSummary {
     gateway_port: u32,
     gateway_url: String,
     gateway_port_reachable: bool,
+    gateway_health_ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     ui_url: Option<String>,
+    ui: Option<DevUiStatusSummary>,
     config_path: String,
     workspace_dir: String,
     service_enabled: bool,
@@ -176,6 +178,17 @@ struct DevSourceWatchSummary {
     pid: Option<u32>,
     #[serde(with = "time::serde::rfc3339::option")]
     started_at: Option<time::OffsetDateTime>,
+    issue: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevUiStatusSummary {
+    port: u32,
+    url: String,
+    pid: Option<u32>,
+    process_running: Option<bool>,
+    http_ready: Option<bool>,
     issue: Option<String>,
 }
 
@@ -2044,6 +2057,7 @@ impl Cli {
         if meta.dev.is_none() && matches!(observation, Ok(SourceWatchState::Inactive)) {
             return Ok(None);
         }
+        let ui = self.inspect_dev_ui_status(&meta, &observation);
         let mut source_watch = DevSourceWatchSummary {
             watching: false,
             state: "inactive",
@@ -2115,7 +2129,9 @@ impl Cli {
             gateway_port,
             gateway_url: dev_gateway_url(gateway_port),
             gateway_port_reachable: crate::service::inspect::tcp_port_reachable(gateway_port),
+            gateway_health_ready: ui::http_ready(gateway_port, "/health", false),
             ui_url,
+            ui,
             config_path: display_path(&paths.config_path),
             workspace_dir: display_path(&paths.workspace_dir),
             service_enabled: meta.service_enabled,
@@ -3393,6 +3409,7 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
             format!("root={}", summary.root),
             format!("url={}", summary.gateway_url),
             format!("gateway_port_reachable={}", summary.gateway_port_reachable),
+            format!("gateway_health_ready={}", summary.gateway_health_ready),
             format!("watch={}", summary.source_watch.state),
             format!("watching={}", summary.source_watch.watching),
             format!("service_running={}", summary.service_running),
@@ -3413,6 +3430,24 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
         }
         if let Some(url) = &summary.ui_url {
             lines.push(format!("ui_url={url}"));
+        }
+        if let Some(ui) = &summary.ui {
+            lines.push(format!("ui_port={}", ui.port));
+            for (key, value) in [
+                ("ui_process_running", ui.process_running),
+                ("ui_http_ready", ui.http_ready),
+            ] {
+                lines.push(format!(
+                    "{key}={}",
+                    value.map_or("unknown", |value| if value { "true" } else { "false" })
+                ));
+            }
+            if let Some(pid) = ui.pid {
+                lines.push(format!("ui_pid={pid}"));
+            }
+            if let Some(issue) = &ui.issue {
+                lines.push(format!("ui_issue={issue}"));
+            }
         }
         return lines;
     }
@@ -3437,10 +3472,48 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
             ),
             KeyValueRow::plain("Dev session", summary.source_watch.state),
             KeyValueRow::plain("Watching", summary.source_watch.watching.to_string()),
+            KeyValueRow::plain(
+                "Gateway health",
+                if summary.gateway_health_ready {
+                    "ready"
+                } else {
+                    "not ready"
+                },
+            ),
             KeyValueRow::plain("Service", dev_service_state(summary)),
         ],
         profile.color,
     ));
+    if let Some(ui) = &summary.ui {
+        lines.extend(render_key_value_card(
+            "UI",
+            &[
+                KeyValueRow::plain("Port", ui.port.to_string()),
+                KeyValueRow::plain(
+                    "Process",
+                    match ui.process_running {
+                        Some(true) => "running",
+                        Some(false) => "not running",
+                        None => "unknown",
+                    },
+                ),
+                KeyValueRow::plain(
+                    "Document",
+                    match ui.http_ready {
+                        Some(true) => "ready",
+                        Some(false) => "not ready",
+                        None => "unknown",
+                    },
+                ),
+            ],
+            profile.color,
+        ));
+        if let Some(issue) = &ui.issue
+            && summary.source_watch.issue.as_ref() != Some(issue)
+        {
+            lines.push(paint(issue, Tone::Warning, profile.color));
+        }
+    }
     lines.extend(render_key_value_card(
         "Source",
         &[
@@ -4418,7 +4491,9 @@ fs.writeFileSync('source-ran', JSON.stringify({
             gateway_port: 18789,
             gateway_url: "http://127.0.0.1:18789".to_string(),
             gateway_port_reachable: true,
+            gateway_health_ready: true,
             ui_url: None,
+            ui: None,
             config_path: "/tmp/demo/.openclaw/openclaw.json".to_string(),
             workspace_dir: "/tmp/demo/.openclaw/workspace".to_string(),
             service_enabled: true,

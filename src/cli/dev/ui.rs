@@ -170,7 +170,7 @@ impl DevUiTarget {
     }
 }
 
-fn http_ready(port: u32, path: &str, html: bool) -> bool {
+pub(super) fn http_ready(port: u32, path: &str, html: bool) -> bool {
     if !(1..=u16::MAX as u32).contains(&port) {
         return false;
     }
@@ -444,6 +444,98 @@ impl OwnedUiChild {
 }
 
 impl Cli {
+    pub(super) fn inspect_dev_ui_status(
+        &self,
+        meta: &EnvMeta,
+        observation: &Result<SourceWatchState, String>,
+    ) -> Option<DevUiStatusSummary> {
+        let service = self.environment_service();
+        let active = match observation {
+            Ok(SourceWatchState::Active(active)) if active.ui.is_some() => active,
+            Err(error) => {
+                let session = service.source_watch_session(&meta.name).ok().flatten()?;
+                if session.closed {
+                    return None;
+                }
+                let ui = session.ui.as_ref()?;
+                let target = ui.target.as_ref()?;
+                return Some(DevUiStatusSummary {
+                    port: target.port,
+                    url: format!("http://127.0.0.1:{}/", target.port),
+                    pid: ui.children.get(DevUiChildRole::Ui).map(|child| child.pid),
+                    process_running: None,
+                    http_ready: None,
+                    issue: Some(error.clone()),
+                });
+            }
+            _ => return None,
+        };
+        let endpoint = active.ui.as_ref()?;
+        let mut summary = DevUiStatusSummary {
+            port: endpoint.port,
+            url: format!("http://127.0.0.1:{}/", endpoint.port),
+            pid: Some(endpoint.pid),
+            process_running: None,
+            http_ready: None,
+            issue: None,
+        };
+        let inspected = (|| -> Result<bool, String> {
+            let session = service
+                .source_watch_session(&meta.name)?
+                .ok_or_else(|| "dev UI session is no longer available".to_string())?;
+            if session.closed
+                || active.env_name != meta.name
+                || !session.restore_target_matches(meta)
+                || session.process_scope != process_scope_id()?
+            {
+                return Err("dev UI session identity or process scope changed".to_string());
+            }
+            if let Some(error) = session.unsafe_cleanup_error() {
+                return Err(error.to_string());
+            }
+            let ui = session
+                .ui
+                .as_ref()
+                .ok_or_else(|| "dev UI session no longer records a UI owner".to_string())?;
+            let target = ui
+                .target
+                .as_ref()
+                .ok_or_else(|| "dev UI session no longer records its target".to_string())?;
+            let child = ui
+                .children
+                .get(DevUiChildRole::Ui)
+                .ok_or_else(|| "dev UI session no longer records its process".to_string())?;
+            let generation = active
+                .token
+                .strip_prefix("lease:")
+                .and_then(|token| token.split_once(':'))
+                .map(|(generation, _)| generation);
+            if generation != Some(session.lease_id.as_str())
+                || active.watching != session.watching
+                || target.port != endpoint.port
+                || target.gateway_url != endpoint.gateway_url
+                || child.pid != endpoint.pid
+                || ui
+                    .children
+                    .get(DevUiChildRole::Gateway)
+                    .map(|child| child.pid)
+                    != Some(active.watch_pid)
+            {
+                return Err("dev UI generation, target or recorded process changed".to_string());
+            }
+            Ok(observe_process(child.pid)?
+                .is_some_and(|process| process.running && process.identity == *child))
+        })();
+        match inspected {
+            Ok(running) => {
+                summary.process_running = Some(running);
+                summary.http_ready = Some(running && http_ready(endpoint.port, "/", true));
+            }
+            Err(error) => summary.issue = Some(error),
+        }
+        Some(summary)
+    }
+
     pub(super) fn prepare_dev_ui(
         &self,
         meta: &EnvMeta,
