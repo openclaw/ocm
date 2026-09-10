@@ -1414,12 +1414,12 @@ impl Cli {
             }
         }
 
-        let restore = match self.environment_service().prepare_snapshot_restore_locked(
-            RestoreEnvSnapshotOptions {
+        let restore = match self
+            .environment_service()
+            .prepare_upgrade_snapshot_restore_locked(RestoreEnvSnapshotOptions {
                 env_name: env_name.to_string(),
                 snapshot_id: plan.record.snapshot_id.clone(),
-            },
-        ) {
+            }) {
             Ok(restore) => restore,
             Err(error) => {
                 return Ok(self.fail_upgrade_rollback_locked(
@@ -4865,12 +4865,12 @@ impl Cli {
         }) {
             self.restore_runtime_backup(runtime_backup)?;
         }
-        let restore = self.environment_service().prepare_snapshot_restore_locked(
-            RestoreEnvSnapshotOptions {
+        let restore = self
+            .environment_service()
+            .prepare_upgrade_snapshot_restore_locked(RestoreEnvSnapshotOptions {
                 env_name: env_name.to_string(),
                 snapshot_id: transaction.snapshot_id.clone(),
-            },
-        )?;
+            })?;
         // Keep displaced state until the restored service has recovered. Slow or
         // failed discard-only cleanup must not extend the outage.
         let acceptance = (|| {

@@ -249,6 +249,9 @@ safety snapshot and a linked history transaction before it stops a managed
 service or replaces runtime bytes. If restore or verification fails, OCM puts
 the pre-rollback runtime and environment state back. Rolling back the linked
 transaction safely reverses the rollback.
+Dev environments retain their current source binding during restore.
+Manual snapshot restore also keeps their current runtime/launcher binding;
+upgrade rollback restores the recorded runtime/launcher instead.
 Once an environment is bound to a runtime, direct `runtime update`,
 `runtime install --force`, `runtime build-local --force`, and `runtime remove`
 operations reject that runtime. Use `ocm upgrade <env>` so the environment gets

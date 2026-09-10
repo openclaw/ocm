@@ -1785,6 +1785,7 @@ pub fn env_snapshot_command_help(cmd: &str, action: &str) -> Option<String> {
             &[
                 "Restore uses an exclusive same-filesystem namespace and retains the displaced root through service acceptance.",
                 "Restore requires a completed source-watch session. Request shutdown of recorded ownership with dev stop. Older watches without an unfinished ownership record require their original dev terminal; unreadable or unverified ownership requires verified operator recovery.",
+                "Manual restore keeps a dev environment's current source binding and runtime/launcher binding. Upgrade rollback retains its dev identity while restoring the recorded runtime/launcher.",
             ],
         ),
         "remove" => render_leaf(

@@ -3856,6 +3856,24 @@ fn upgrade_rollback_refuses_a_broken_source_launcher_before_mutation() {
     assert!(history.status.success(), "{}", stderr(&history));
     let history_json: Value = serde_json::from_str(&stdout(&history)).unwrap();
     assert_eq!(history_json.as_array().unwrap().len(), 1);
+
+    fs::create_dir_all(&project_dir).unwrap();
+    let mut current = ocm::store::get_environment("hacking", &env, &cwd).unwrap();
+    current.dev = Some(ocm::env::EnvDevMeta {
+        repo_root: path_string(&project_dir),
+        worktree_root: path_string(&root.child("saved-worktree")),
+    });
+    let saved_dev = serde_json::to_value(&current.dev).unwrap();
+    ocm::store::save_environment(current, &env, &cwd).unwrap();
+    let rollback = run_ocm(&cwd, &env, &["upgrade", "rollback", "hacking", "--json"]);
+    assert!(rollback.status.success(), "{}", stderr(&rollback));
+    let restored = ocm::store::get_environment("hacking", &env, &cwd).unwrap();
+    assert!(restored.default_runtime.is_none());
+    assert_eq!(restored.default_launcher.as_deref(), Some("hacking.local"));
+    assert_eq!(serde_json::to_value(restored.dev).unwrap(), saved_dev);
+    let version = run_ocm(&cwd, &env, &["@hacking", "--", "--version"]);
+    assert!(version.status.success(), "{}", stderr(&version));
+    assert_eq!(stdout(&version).trim(), "2026.3.23");
 }
 
 #[test]
@@ -4394,6 +4412,14 @@ fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
     assert!(stdout(&upgrade).contains("outcome=switched"));
     fs::write(&marker, "after-upgrade").unwrap();
 
+    let mut current = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    current.dev = Some(ocm::env::EnvDevMeta {
+        repo_root: path_string(&root.child("saved-repo")),
+        worktree_root: path_string(&root.child("saved-worktree")),
+    });
+    let saved_dev = serde_json::to_value(&current.dev).unwrap();
+    ocm::store::save_environment(current, &env, &cwd).unwrap();
+
     let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(history.status.success(), "{}", stderr(&history));
     let history_json: Value = serde_json::from_str(&stdout(&history)).unwrap();
@@ -4438,6 +4464,10 @@ fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
     let version = run_ocm(&cwd, &env, &["@demo", "--", "--version"]);
     assert!(version.status.success(), "{}", stderr(&version));
     assert_eq!(stdout(&version).trim(), "2026.6.11");
+    assert_eq!(
+        serde_json::to_value(ocm::store::get_environment("demo", &env, &cwd).unwrap().dev).unwrap(),
+        saved_dev
+    );
 
     let rollback_history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(
@@ -4461,6 +4491,10 @@ fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
     let version = run_ocm(&cwd, &env, &["@demo", "--", "--version"]);
     assert!(version.status.success(), "{}", stderr(&version));
     assert_eq!(stdout(&version).trim(), "2026.6.33");
+    assert_eq!(
+        serde_json::to_value(ocm::store::get_environment("demo", &env, &cwd).unwrap().dev).unwrap(),
+        saved_dev
+    );
 
     let final_history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(final_history.status.success(), "{}", stderr(&final_history));
@@ -5714,6 +5748,14 @@ fn upgrade_rolls_back_runtime_binding_when_update_finalization_fails() {
     fs::create_dir_all(secondary_skill.parent().unwrap()).unwrap();
     fs::write(&secondary_skill, "skill before upgrade\n").unwrap();
 
+    let mut current = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    current.dev = Some(ocm::env::EnvDevMeta {
+        repo_root: path_string(&root.child("saved-repo")),
+        worktree_root: path_string(&root.child("saved-worktree")),
+    });
+    let saved_dev = serde_json::to_value(&current.dev).unwrap();
+    ocm::store::save_environment(current, &env, &cwd).unwrap();
+
     env.insert("OCM_TEST_FAIL_UPDATE_FINALIZE".to_string(), "1".to_string());
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new-local"]);
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
@@ -5729,6 +5771,10 @@ fn upgrade_rolls_back_runtime_binding_when_update_finalization_fails() {
     assert!(show.status.success(), "{}", stderr(&show));
     let env_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
     assert_eq!(env_json["defaultRuntime"], "old-local");
+    assert_eq!(
+        serde_json::to_value(ocm::store::get_environment("demo", &env, &cwd).unwrap().dev).unwrap(),
+        saved_dev
+    );
     assert_eq!(
         fs::read_to_string(secondary_skill).unwrap(),
         "skill before upgrade\n"
