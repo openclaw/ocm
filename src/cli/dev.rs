@@ -3671,7 +3671,7 @@ mod tests {
     #[test]
     fn source_startup_gate_precedes_native_node_preloads() {
         use std::io::Write as _;
-        use std::os::fd::AsRawFd as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::process::CommandExt as _;
         struct OwnedChild(std::process::Child);
         impl Drop for OwnedChild {
@@ -3716,10 +3716,6 @@ fs.writeFileSync('source-ran', JSON.stringify({
 "#,
             )
             .unwrap();
-            // POSIX shells do not all accept numeric <& duplication above fd9.
-            let _held: Vec<_> = (0..12)
-                .map(|_| std::fs::File::open(&preload).unwrap())
-                .collect();
             let args = vec!["gateway".to_string(), "value with spaces".to_string()];
             let mut command = super::source_watch_node_command(&args);
             command
@@ -3741,7 +3737,12 @@ fs.writeFileSync('source-ran', JSON.stringify({
                 ))
                 .process_group(0);
             let mut guard = super::SourceWatchProcessGuard::new_with_terminal(false).unwrap();
-            assert!(guard.startup_reader.as_raw_fd() > 9);
+            // Other tests may free low descriptors concurrently; reserve the
+            // high descriptor explicitly instead of relying on allocation order.
+            let fd =
+                unsafe { libc::fcntl(guard.startup_reader.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+            assert!(fd >= 10, "{}", std::io::Error::last_os_error());
+            guard.startup_reader = unsafe { std::io::PipeReader::from_raw_fd(fd) };
             guard.configure_command(&mut command).unwrap();
             let mut child = OwnedChild(command.spawn().unwrap());
             child
