@@ -26,7 +26,7 @@ use serde_json::Value;
 
 use crate::support::{
     TestDir, TestHttpServer, install_fake_launchctl, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script, write_text,
+    write_executable_script, write_json_replacing_path, write_text,
 };
 
 fn write_running_snapshot_service(
@@ -72,7 +72,7 @@ fn write_running_snapshot_service(
             stderr_path,
         }],
     };
-    fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    write_json_replacing_path(&runtime_path, &runtime);
 }
 
 fn write_empty_snapshot_service(runtime_path: &Path, ocm_home: &str) {
@@ -85,7 +85,7 @@ fn write_empty_snapshot_service(runtime_path: &Path, ocm_home: &str) {
         services: Vec::new(),
         children: Vec::new(),
     };
-    fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    write_json_replacing_path(runtime_path, &runtime);
 }
 
 #[test]
@@ -1191,7 +1191,8 @@ fn env_snapshot_create_and_restore_quiesce_a_running_managed_gateway() {
 
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     let registry_path = env_registry_path(&env, &cwd).unwrap();
-    let running_runtime = fs::read(&runtime_path).unwrap();
+    let running_runtime: SupervisorRuntimeState =
+        serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     let observer_done = Arc::new(AtomicBool::new(false));
     let observer_stop = Arc::clone(&observer_done);
@@ -1207,7 +1208,7 @@ fn env_snapshot_create_and_restore_quiesce_a_running_managed_gateway() {
                 .unwrap_or(last_running);
             if desired_running != last_running {
                 if desired_running {
-                    fs::write(&runtime_path, &running_runtime).unwrap();
+                    write_json_replacing_path(&runtime_path, &running_runtime);
                 } else {
                     write_empty_snapshot_service(&runtime_path, &ocm_home);
                 }
@@ -1299,7 +1300,8 @@ fn env_snapshot_create_waits_for_delayed_supervisor_stop_acknowledgement() {
 
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     let registry_path = env_registry_path(&env, &cwd).unwrap();
-    let running_runtime = fs::read(&runtime_path).unwrap();
+    let running_runtime: SupervisorRuntimeState =
+        serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     let observer_runtime_path = runtime_path.clone();
     let observer_done = Arc::new(AtomicBool::new(false));
@@ -1317,7 +1319,7 @@ fn env_snapshot_create_waits_for_delayed_supervisor_stop_acknowledgement() {
                 .unwrap_or(last_running);
             if desired_running != last_running {
                 if desired_running {
-                    fs::write(&observer_runtime_path, &running_runtime).unwrap();
+                    write_json_replacing_path(&observer_runtime_path, &running_runtime);
                 } else {
                     delayed_stop = true;
                     thread::sleep(Duration::from_millis(3_200));
@@ -1409,7 +1411,8 @@ fn env_snapshot_create_quiesces_desired_service_before_child_is_observable() {
 
     write_running_snapshot_service(&root, &cwd, &env, 19845);
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
-    let running_runtime = fs::read(&runtime_path).unwrap();
+    let running_runtime: SupervisorRuntimeState =
+        serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     write_empty_snapshot_service(&runtime_path, &ocm_home);
     let registry_path = env_registry_path(&env, &cwd).unwrap();
@@ -1432,7 +1435,7 @@ fn env_snapshot_create_quiesces_desired_service_before_child_is_observable() {
                 .unwrap_or(last_running);
             if desired_running != last_running {
                 if desired_running {
-                    fs::write(&observer_runtime_path, &running_runtime).unwrap();
+                    write_json_replacing_path(&observer_runtime_path, &running_runtime);
                     observer_start_count.fetch_add(1, Ordering::Relaxed);
                 } else {
                     write_empty_snapshot_service(&observer_runtime_path, &ocm_home);
@@ -1449,13 +1452,13 @@ fn env_snapshot_create_quiesces_desired_service_before_child_is_observable() {
         &env,
         &["env", "snapshot", "create", "source", "--label", "starting"],
     );
-    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     while start_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
     observer_done.store(true, Ordering::Relaxed);
     observer.join().unwrap();
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
     assert_eq!(stop_count.load(Ordering::Relaxed), 1);
     assert_eq!(start_count.load(Ordering::Relaxed), 1);
 
@@ -2264,7 +2267,8 @@ fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
 
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     let registry_path = env_registry_path(&env, &cwd).unwrap();
-    let running_runtime = fs::read(&runtime_path).unwrap();
+    let running_runtime: SupervisorRuntimeState =
+        serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     let observer_done = Arc::new(AtomicBool::new(false));
     let observer_mutated = Arc::new(AtomicBool::new(false));
@@ -2292,7 +2296,7 @@ fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
                             .is_ok_and(|mut entries| entries.next().is_some()),
                         Ordering::Relaxed,
                     );
-                    fs::write(&observer_runtime_path, &running_runtime).unwrap();
+                    write_json_replacing_path(&observer_runtime_path, &running_runtime);
                 } else {
                     fs::write(
                         &observer_database,
