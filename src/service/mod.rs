@@ -185,8 +185,8 @@ impl<'a> ServiceService<'a> {
         }
         preserve_operation_owner_before_managed_gateway_stop(
             name,
-            status.child_pid,
             self.env,
+            self.cwd,
             &format!("quiescing env \"{name}\""),
         )?;
         if state.running {
@@ -299,10 +299,21 @@ impl<'a> ServiceService<'a> {
 #[cfg(unix)]
 pub(crate) fn preserve_operation_owner_before_managed_gateway_stop(
     target_env: &str,
-    managed_gateway_pid: Option<u32>,
     env: &BTreeMap<String, String>,
+    cwd: &Path,
     operation: &str,
 ) -> Result<(), String> {
+    if env.get("OCM_ACTIVE_ENV").map(String::as_str) != Some(target_env) {
+        return Ok(());
+    }
+    // A Gateway can invoke OCM before spawn publishes its PID. Admission stays
+    // locked through that publication; preserve the caller before releasing it.
+    // The guard must drop before the caller begins stop or restart work.
+    let _admission =
+        crate::env::EnvironmentService::new(env, cwd).lock_gateway_admission(target_env)?;
+    let managed_gateway_pid =
+        crate::supervisor::SupervisorService::new(env, cwd).runtime_child_pid(target_env)?;
+
     // SAFETY: getpgrp has no preconditions and does not mutate memory.
     let process_group = unsafe { libc::getpgrp() };
     if !operation_owner_is_in_managed_gateway_group(
@@ -336,8 +347,8 @@ pub(crate) fn preserve_operation_owner_before_managed_gateway_stop(
 #[cfg(not(unix))]
 pub(crate) fn preserve_operation_owner_before_managed_gateway_stop(
     _target_env: &str,
-    _managed_gateway_pid: Option<u32>,
     _env: &BTreeMap<String, String>,
+    _cwd: &Path,
     _operation: &str,
 ) -> Result<(), String> {
     Ok(())

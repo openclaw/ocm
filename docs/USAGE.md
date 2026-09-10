@@ -344,6 +344,12 @@ ocm service status mira
 
 Use `service install` when you want a background service for an environment that was created with `--no-service`, or when you want to bring an older env under background management later.
 
+On Unix, OCM waits for Gateway PID publication before moving a matching caller
+out of the Gateway process group during daemon refresh, snapshot, or upgrade
+maintenance. This protects the caller from the supervisor's signals to that
+group. A systemd unit stop or restart can still terminate the caller through its
+service cgroup.
+
 ### Read logs
 
 ```bash

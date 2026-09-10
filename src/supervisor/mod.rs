@@ -763,17 +763,10 @@ impl<'a> SupervisorService<'a> {
         let Some(active_env) = self.env.get("OCM_ACTIVE_ENV") else {
             return Ok(());
         };
-        let managed_gateway_pid = self.read_runtime_state()?.and_then(|runtime| {
-            runtime
-                .children
-                .into_iter()
-                .find(|child| child.env_name == *active_env)
-                .map(|child| child.pid)
-        });
         crate::service::preserve_operation_owner_before_managed_gateway_stop(
             active_env,
-            managed_gateway_pid,
             self.env,
+            self.cwd,
             "refreshing the OCM background service",
         )
     }
@@ -968,6 +961,17 @@ impl<'a> SupervisorService<'a> {
                 "cannot start source watch: {error}; wait for daemon startup or refresh it from the updated OCM installation with \"ocm service refresh-daemon --acknowledge-gateway-restarts\" during a maintenance window"
             )
         })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn runtime_child_pid(&self, name: &str) -> Result<Option<u32>, String> {
+        Ok(self.read_runtime_state()?.and_then(|runtime| {
+            runtime
+                .children
+                .into_iter()
+                .find(|child| child.env_name == name)
+                .map(|child| child.pid)
+        }))
     }
 
     fn read_runtime_state(&self) -> Result<Option<SupervisorRuntimeState>, String> {
