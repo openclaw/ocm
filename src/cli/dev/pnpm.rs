@@ -232,7 +232,6 @@ struct InstallStream<W> {
     prefix: usize,
     line_start: bool,
     in_record: bool,
-    record_at_line_start: bool,
     discard: bool,
     record: Vec<u8>,
     human: Vec<u8>,
@@ -248,7 +247,6 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
             prefix: 0,
             line_start: true,
             in_record: false,
-            record_at_line_start: false,
             discard: false,
             record: Vec::new(),
             human: Vec::new(),
@@ -281,7 +279,7 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
             if self.in_record {
                 if byte == b'\n' {
                     if !self.discard {
-                        self.complete_record();
+                        self.complete_record(true);
                     }
                     self.record.clear();
                     self.in_record = false;
@@ -306,7 +304,6 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
                 self.flush_human();
                 self.record.push(byte);
                 self.in_record = true;
-                self.record_at_line_start = true;
                 self.line_start = false;
                 continue;
             }
@@ -317,7 +314,6 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
                     self.record.extend_from_slice(RECORD_PREFIX);
                     self.prefix = 0;
                     self.in_record = true;
-                    self.record_at_line_start = false;
                 }
             } else {
                 self.human.extend_from_slice(&RECORD_PREFIX[..self.prefix]);
@@ -339,27 +335,33 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
         self.flush_human();
     }
 
-    fn complete_record(&mut self) {
+    fn complete_record(&mut self, terminated: bool) {
         let Ok(record) = serde_json::from_slice::<Value>(&self.record) else {
-            if self.record_at_line_start || looks_like_envelope(&self.record) {
-                self.observer
-                    .fail("pnpm emitted unreadable lifecycle telemetry");
+            if looks_like_envelope(&self.record) {
+                self.observer.fail(if terminated {
+                    "pnpm emitted unreadable lifecycle telemetry"
+                } else {
+                    "pnpm ended with incomplete lifecycle telemetry"
+                });
             } else {
-                self.emit_plain_record();
+                self.emit_plain_record(terminated);
             }
             return;
         };
         let name = record.get("name").and_then(Value::as_str);
-        if name.is_none() {
-            if record.get("time").is_some() || record.get("pid").is_some() {
-                self.observer
-                    .fail("pnpm emitted an invalid reporter envelope");
-            } else {
-                self.emit_plain_record();
-            }
+        // Lifecycle scripts can write ordinary JSON on the reporter's channel.
+        // A valid object needs pnpm's namespace before it is treated as telemetry.
+        let reporter = name.is_some_and(|name| {
+            name.starts_with("pnpm:")
+                || (name == "pnpm" && record.get("time").is_some() && record.get("pid").is_some())
+        });
+        if !reporter {
+            self.emit_plain_record(terminated);
             return;
         }
-        if !name.is_some_and(|name| name == "pnpm" || name.starts_with("pnpm:")) {
+        if !terminated {
+            self.observer
+                .fail("pnpm ended with incomplete lifecycle telemetry");
             return;
         }
         self.observer.observe(&record);
@@ -393,9 +395,11 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
         }
     }
 
-    fn emit_plain_record(&mut self) {
+    fn emit_plain_record(&mut self, terminated: bool) {
         let mut bytes = self.record.clone();
-        bytes.push(b'\n');
+        if terminated {
+            bytes.push(b'\n');
+        }
         self.emit(self.channel, &bytes);
     }
 
@@ -407,24 +411,45 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
     }
 
     fn finish(&mut self) {
-        if self.in_record || self.prefix > 0 {
-            self.observer
-                .fail("pnpm ended with incomplete lifecycle telemetry");
+        if self.in_record && !self.discard {
+            self.complete_record(false);
+        }
+        if self.prefix > 0 {
+            self.human.extend_from_slice(&RECORD_PREFIX[..self.prefix]);
+            self.prefix = 0;
         }
         self.flush_human();
     }
 }
 
-fn looks_like_envelope(bytes: &[u8]) -> bool {
+fn skip_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
+        bytes = &bytes[1..];
+    }
     bytes
-        .windows(b"\"name\":\"pnpm".len())
-        .any(|part| part == b"\"name\":\"pnpm")
-        || (bytes
-            .windows(b"\"time\":".len())
-            .any(|part| part == b"\"time\":")
-            && bytes
-                .windows(b"\"pid\":".len())
-                .any(|part| part == b"\"pid\":"))
+}
+
+fn has_field_prefix(bytes: &[u8], field: &[u8], value: Option<&[u8]>) -> bool {
+    bytes
+        .windows(field.len())
+        .enumerate()
+        .any(|(offset, part)| {
+            if part != field {
+                return false;
+            }
+            let tail = skip_whitespace(&bytes[offset + field.len()..]);
+            let Some(tail) = tail.strip_prefix(b":") else {
+                return false;
+            };
+            value.is_none_or(|value| skip_whitespace(tail).starts_with(value))
+        })
+}
+
+fn looks_like_envelope(bytes: &[u8]) -> bool {
+    has_field_prefix(bytes, b"\"name\"", Some(b"\"pnpm:"))
+        || (has_field_prefix(bytes, b"\"name\"", Some(b"\"pnpm\""))
+            && has_field_prefix(bytes, b"\"time\"", None)
+            && has_field_prefix(bytes, b"\"pid\"", None))
 }
 
 #[cfg(test)]
@@ -495,6 +520,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pnpm_reporter_preserves_ordinary_braces_and_json() {
+        for human in [
+            "{\n  \"name\": \"fixture\",\n  \"pid\": 42,\n  \"time\": 1\n}\n",
+            "{ build output }\n",
+            "{\"time\":1,\"pid\":42,\"state\":\"done\"}\n",
+            "{\"time\":1,\"pid\":42,\"state\":\"done\"}",
+            "{\"name\":\"fixture\",\"time\":1,\"pid\":42}\n",
+            "{\"name\":\"fixture\",\"time\":1,\"pid\":42,\n \"state\":\"done\"}\n",
+            "{\"time\":1,\"pid\":42,\n \"state\":\"done\"}\n",
+            "[{\"time\":1,\"pid\":42,\"state\":\"done\"}]\n",
+            "{\"name\":\"pnpm\",\"version\":\"12.3.4\"}\n",
+            "{\"name\":\"pnpm\",\"version\":\"12.3.4\",\n \"state\":\"done\"}\n",
+            "{",
+        ] {
+            let observer = InstallObserver::default();
+            let output = Rc::new(RefCell::new(Vec::new()));
+            let captured = Rc::clone(&output);
+            let mut decoder = InstallStream::new(
+                observer.clone(),
+                OutputChannel::Stdout,
+                move |_, bytes: &[u8]| {
+                    captured.borrow_mut().extend_from_slice(bytes);
+                    Ok(())
+                },
+            );
+            for chunk in human.as_bytes().chunks(2) {
+                decoder.consume(chunk);
+            }
+            decoder.finish();
+            assert!(observer.finish().is_ok(), "{human:?}");
+            assert_eq!(output.borrow().as_slice(), human.as_bytes());
+        }
+    }
+
     trait OutputBytes {
         fn concat_bytes(&self) -> Vec<u8>;
     }
@@ -516,7 +576,11 @@ mod tests {
                 lifecycle("script", "b".into()),
             ],
             vec![b"{\"time\":1,\"pid\":42,\"name\":\"pnpm:lifecycle\",broken}\n".to_vec()],
-            vec![b"{\"time\":1,\"pid\":42".to_vec()],
+            vec![b"{\"name\":\"pnpm:lifecycle\",\"time\":1,\"pid\":42".to_vec()],
+            vec![
+                b"{ \"name\" : \"pnpm:lifecycle\", \"time\" : 1, \"pid\" : 42, broken }\n".to_vec(),
+            ],
+            vec![b"{ \"name\" : \"pnpm:lifecycle\", \"time\" : 1, \"pid\" : 42".to_vec()],
         ];
         for code in [-1, 137, 143] {
             if code < 0 || reserved_signal_exit(code) {
