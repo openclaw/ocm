@@ -415,11 +415,17 @@ pub(crate) fn ensure_openclaw_worktree(
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
 
+    // Git accepts the canonical Windows repository for -C, but not a verbatim
+    // Windows path as its new worktree destination. Keep this owned path
+    // relative to that repository without changing the stored source identity.
+    let worktree_argument = worktree_root
+        .strip_prefix(&repo_root)
+        .map_err(|_| "OCM-owned worktree destination is outside its repository".to_string())?;
     let output = Command::new("git")
         .arg("-C")
         .arg(&repo_root)
         .args(["worktree", "add", "--detach"])
-        .arg(&worktree_root)
+        .arg(worktree_argument)
         .output()
         .map_err(|error| format!("failed to run git worktree add: {error}"))?;
     if !output.status.success() {
@@ -913,6 +919,25 @@ mod tests {
         run_git(&repo, &["add", "."]);
         run_git(&repo, &["commit", "-m", "init"]);
         (temp, repo)
+    }
+
+    #[test]
+    fn owned_worktree_uses_canonical_repository_paths() {
+        let (temp, repo) = init_openclaw_repo();
+        let spaced = temp.path().join("OpenClaw source");
+        fs::rename(repo, &spaced).unwrap();
+        let repo = fs::canonicalize(spaced).unwrap();
+        let original = fs::read(repo.join("package.json")).unwrap();
+        let worktree = ensure_openclaw_worktree(&repo, "plain.stop").unwrap();
+        assert!(worktree.is_absolute() && worktree.join(".git").is_file());
+        assert_eq!(fs::read(worktree.join("package.json")).unwrap(), original);
+        assert_eq!(
+            ensure_openclaw_worktree(&repo, "plain.stop").unwrap(),
+            worktree
+        );
+        remove_openclaw_worktree(&repo, &worktree).unwrap();
+        assert!(!worktree.exists());
+        assert_eq!(fs::read(repo.join("package.json")).unwrap(), original);
     }
 
     #[test]

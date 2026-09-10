@@ -58,6 +58,8 @@ jobs:
         run: cargo check --workspace --all-targets --locked
       - name: Prove private config replacement
         run: cargo test --locked --lib private_config_
+      - name: Prove canonical owned worktree paths
+        run: cargo test --locked --lib openclaw_repo::tests::owned_worktree_uses_canonical_repository_paths -- --exact --nocapture
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: '22.15.0'
