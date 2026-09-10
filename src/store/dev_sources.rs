@@ -689,7 +689,7 @@ pub(crate) fn ensure_root_outside_dev_sources(
     Ok(())
 }
 
-fn ensure_root_outside_borrowed_source(
+pub(super) fn ensure_root_outside_borrowed_source(
     name: &str,
     root: &Path,
     source_name: &str,
@@ -735,7 +735,11 @@ pub(crate) fn ensure_borrowed_source_isolation(
     source_root: Option<&str>,
     envs: &[EnvMeta],
 ) -> Result<(), String> {
-    ensure_root_outside_dev_sources(name, root, envs)?;
+    for meta in envs {
+        if let Some(source) = meta.dev.as_ref().and_then(|dev| dev.borrowed_source_root()) {
+            ensure_root_outside_borrowed_source(name, root, &meta.name, Path::new(source))?;
+        }
+    }
     if let Some(source) = source_root {
         ensure_root_outside_borrowed_source(name, root, name, Path::new(source))?;
     }

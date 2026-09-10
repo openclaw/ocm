@@ -205,6 +205,8 @@ fn upsert_environment(registry: &mut EnvRegistry, meta: EnvMeta) -> Result<EnvMe
         .find(|current| current.name == meta.name)
         .is_none_or(|current| current.root != meta.root || current.dev != meta.dev)
     {
+        // Creation may have initialized a new root at an absent Owned path.
+        // Its pre-creation guard already checked Owned sources.
         super::dev_sources::ensure_borrowed_source_isolation(
             &meta.name,
             Path::new(&meta.root),
@@ -468,15 +470,19 @@ fn create_environment_with_runtime_validation(
         default_env_root(&name, env, cwd)?
     };
 
-    super::dev_sources::ensure_borrowed_source_isolation(
-        &name,
-        &root,
-        options
-            .dev
-            .as_ref()
-            .and_then(|dev| dev.borrowed_source_root()),
-        &registry.envs,
-    )?;
+    ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
+    if let Some(source) = options
+        .dev
+        .as_ref()
+        .and_then(|dev| dev.borrowed_source_root())
+    {
+        super::dev_sources::ensure_root_outside_borrowed_source(
+            &name,
+            &root,
+            &name,
+            Path::new(source),
+        )?;
+    }
     let paths = derive_env_paths(&root);
     if path_exists(&paths.root) {
         let mut entries = fs::read_dir(&paths.root).map_err(|error| error.to_string())?;
