@@ -287,15 +287,41 @@ impl<W: FnMut(OutputChannel, &[u8]) -> io::Result<()>> InstallStream<W> {
                     self.line_start = true;
                 } else if !self.discard {
                     if self.record.len() == MAX_RECORD_BYTES {
-                        self.observer
-                            .fail("pnpm reporter record exceeded its memory bound");
-                        self.record.clear();
-                        self.discard = true;
+                        if looks_like_envelope(&self.record) {
+                            self.observer
+                                .fail("pnpm reporter record exceeded its memory bound");
+                            self.record.clear();
+                            self.discard = true;
+                        } else {
+                            // Native pnpm and its Bole reporter emit the
+                            // namespace before variable payload. A large script
+                            // line without that header is ordinary output.
+                            let pending = if self.record.ends_with(RECORD_PREFIX) {
+                                RECORD_PREFIX.len()
+                            } else {
+                                usize::from(self.record.ends_with(&RECORD_PREFIX[..1]))
+                            };
+                            self.record.truncate(self.record.len() - pending);
+                            self.emit_plain_record(false);
+                            self.record.clear();
+                            self.line_start = false;
+                            if pending == RECORD_PREFIX.len() {
+                                self.record.extend_from_slice(RECORD_PREFIX);
+                                self.record.push(byte);
+                                continue;
+                            }
+                            self.in_record = false;
+                            self.prefix = pending;
+                            // Process the overflow byte normally, including a
+                            // new reporter prefix after unterminated output.
+                        }
                     } else {
                         self.record.push(byte);
                     }
                 }
-                continue;
+                if self.in_record || byte == b'\n' {
+                    continue;
+                }
             }
             // NDJSON object field order is not part of its interface. At a
             // line boundary accept any object; the compact native prefix also
@@ -522,6 +548,11 @@ mod tests {
 
     #[test]
     fn pnpm_reporter_preserves_ordinary_braces_and_json() {
+        let large = format!("{{\"data\":\"{}\"}}", "x".repeat(MAX_RECORD_BYTES + 17));
+        let large_named = format!(
+            "{{\"name\":\"fixture\",\"data\":\"{}\"}}\n",
+            "x".repeat(MAX_RECORD_BYTES + 17)
+        );
         for human in [
             "{\n  \"name\": \"fixture\",\n  \"pid\": 42,\n  \"time\": 1\n}\n",
             "{ build output }\n",
@@ -534,6 +565,8 @@ mod tests {
             "{\"name\":\"pnpm\",\"version\":\"12.3.4\"}\n",
             "{\"name\":\"pnpm\",\"version\":\"12.3.4\",\n \"state\":\"done\"}\n",
             "{",
+            &large,
+            &large_named,
         ] {
             let observer = InstallObserver::default();
             let output = Rc::new(RefCell::new(Vec::new()));
@@ -552,6 +585,32 @@ mod tests {
             decoder.finish();
             assert!(observer.finish().is_ok(), "{human:?}");
             assert_eq!(output.borrow().as_slice(), human.as_bytes());
+        }
+
+        // A reporter can follow an unterminated ordinary line with its compact
+        // prefix on either side of the buffer boundary.
+        for prefix_bytes in 0..=RECORD_PREFIX.len() {
+            let human = format!("{{{}", "x".repeat(MAX_RECORD_BYTES - prefix_bytes - 1));
+            let observer = InstallObserver::default();
+            let output = Rc::new(RefCell::new(Vec::new()));
+            let captured = Rc::clone(&output);
+            let mut decoder = InstallStream::new(
+                observer.clone(),
+                OutputChannel::Stderr,
+                move |_, bytes: &[u8]| {
+                    captured.borrow_mut().extend_from_slice(bytes);
+                    Ok(())
+                },
+            );
+            for chunk in human.as_bytes().chunks(8192) {
+                decoder.consume(chunk);
+            }
+            decoder.consume(&lifecycle("script", "build".into()));
+            decoder.consume(&lifecycle("exitCode", 0.into()));
+            decoder.finish();
+            assert!(observer.finish().is_ok());
+            let expected = format!("{human}postinstall: build\n");
+            assert_eq!(output.borrow().as_slice(), expected.as_bytes());
         }
     }
 
@@ -656,7 +715,7 @@ mod tests {
             InstallStream::new(oversized.clone(), OutputChannel::Stderr, |_, _: &[u8]| {
                 Ok(())
             });
-        decoder.consume(b"{\"time\":1,");
+        decoder.consume(b"{\"time\":1,\"pid\":42,\"name\":\"pnpm:progress\",");
         decoder.consume(&vec![b'x'; MAX_RECORD_BYTES]);
         decoder.consume(b"}\n");
         decoder.finish();
