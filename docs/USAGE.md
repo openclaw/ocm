@@ -636,6 +636,13 @@ env. Normal acknowledged errors remain retryable; released legacy watch records
 and Windows process-job recovery retain their existing rules. Use a compatible
 OCM CLI and refresh an older running daemon before creating a new generation.
 
+During watched dependency installation, pnpm lifecycle reports distinguish a
+completed installation error from interrupted or unfinished build scripts. On
+Unix, uncertain script cleanup retains ownership even when pnpm returns a normal
+error or allows an optional build to fail. Completed errors remain retryable.
+When run from a terminal, installation keeps interactive stdin while streaming
+build output and diagnostics. Onboarding keeps its real terminal output.
+
 `env remove` and `env prune` require active or unfinished source watches to be
 stopped first with `ocm dev stop <env>`. The same applies to a destroy guarded by
 `--if-state-token`: stop the watch, then request a fresh preview. A watch created

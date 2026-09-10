@@ -1170,7 +1170,8 @@ fn dev_dependencies_bootstrap_with_a_frozen_lockfile_and_retry_after_failure() {
     let log = fs::read_to_string(root.child("pnpm.log")).unwrap();
     assert_eq!(
         log.lines()
-            .filter(|line| line.ends_with("|install --frozen-lockfile"))
+            .filter(|line| line
+                .ends_with("|install --frozen-lockfile --reporter=ndjson --loglevel=debug"))
             .count(),
         2
     );
@@ -1211,6 +1212,116 @@ fn dev_dependencies_bootstrap_with_a_frozen_lockfile_and_retry_after_failure() {
         fs::read_to_string(worktree.join("pnpm-lock.yaml")).unwrap(),
         lockfile
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_dependencies_preserve_reported_lifecycle_uncertainty() {
+    for (label, lifecycle_exit, installer_exit, optional, retained) in [
+        ("ordinary", Some(23), 1, false, false),
+        ("signal", Some(-1), 1, false, true),
+        ("optional-signal", Some(-1), 0, true, true),
+        ("incomplete", None, 1, false, true),
+        ("wrapper-signal", Some(0), 137, false, true),
+    ] {
+        let root = TestDir::new(&format!("dev-install-reporter-{label}"));
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_probe_aware_fake_dev_runners(&root, &mut env);
+        let created = run_ocm(
+            &cwd,
+            &env,
+            &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+        );
+        assert!(created.status.success(), "{label}: {}", stderr(&created));
+        let meta = get_environment("demo", &env, &cwd).unwrap();
+        let source = Path::new(&meta.dev.as_ref().unwrap().worktree_root);
+        declare_source_tooling(source);
+        fs::write(source.join("pnpm-lock.yaml"), "retained frozen lock\n").unwrap();
+
+        // These are the pinned reporter's start/exit shapes. In particular, a
+        // signaled script reports -1 while the installer itself can return 1 or,
+        // for an optional build, 0. Ordinary acknowledged failures stay usable.
+        let record = |payload: Value| {
+            let mut value = serde_json::json!({
+                "time": 1, "hostname": "private-fixture-host", "pid": 42,
+                "name": "pnpm:lifecycle", "depPath": "private-fixture-dependency",
+                "stage": "install", "wd": "/private-fixture-cwd",
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(payload.as_object().unwrap().clone());
+            value.to_string()
+        };
+        let mut records = vec![
+            record(serde_json::json!({"script": "fixture install", "optional": optional})),
+            record(serde_json::json!({"line": "fixture install diagnostic", "stdio": "stderr"})),
+        ];
+        if let Some(code) = lifecycle_exit {
+            records.push(record(
+                serde_json::json!({"exitCode": code, "optional": optional}),
+            ));
+        }
+        let output = records
+            .into_iter()
+            .map(|line| format!("printf '%s\\n' '{line}' >&2\n"))
+            .collect::<String>();
+        write_executable_script(
+            &root.child("fake-dev-bin/pnpm"),
+            &format!("#!/bin/sh\n{output}exit {installer_exit}\n"),
+        );
+        let failed = run_ocm(&cwd, &env, &dev_watch(&["demo", "--watch"]));
+        assert!(!failed.status.success(), "{label}: {}", stderr(&failed));
+        assert!(
+            stderr(&failed).contains("fixture install diagnostic"),
+            "{label}"
+        );
+        let rendered = format!("{}{}", stdout(&failed), stderr(&failed));
+        assert!(!rendered.contains("private-fixture-host"), "{label}");
+        assert!(!rendered.contains("private-fixture-dependency"), "{label}");
+        assert!(!rendered.contains("private-fixture-cwd"), "{label}");
+        assert!(!root.child("node.log").exists(), "{label}");
+        assert_eq!(
+            fs::read_to_string(source.join("pnpm-lock.yaml")).unwrap(),
+            "retained frozen lock\n"
+        );
+        let session = read_source_watch_session(&root);
+        assert_eq!(session["closed"], !retained, "{label}");
+        if retained {
+            assert!(session["child"]["pid"].is_number(), "{label}");
+            assert!(
+                session["completion"]["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("cleanup is unverified")),
+                "{label}"
+            );
+            let session_path = source_watch_override_path(&root, "demo").with_extension("session");
+            let before = fs::read(&session_path).unwrap();
+            // All future fixture commands are finite even if admission regresses.
+            for args in [
+                vec!["dev", "stop", "demo"],
+                vec!["env", "destroy", "demo", "--yes"],
+                dev_watch(&["demo", "--watch"]),
+            ] {
+                let refused = run_ocm(&cwd, &env, &args);
+                assert!(!refused.status.success(), "{label}: {args:?}");
+                assert_eq!(
+                    fs::read(&session_path).unwrap(),
+                    before,
+                    "{label}: {args:?}"
+                );
+                assert!(source.is_dir() && Path::new(&meta.root).is_dir(), "{label}");
+            }
+        } else {
+            assert!(!source_watch_override_path(&root, "demo").exists());
+            install_frozen_source_dependency_runner(&root);
+            let retried = run_ocm(&cwd, &env, &dev_watch(&["demo", "--watch"]));
+            assert!(retried.status.success(), "{label}: {}", stderr(&retried));
+        }
+    }
 }
 
 #[test]
@@ -3673,10 +3784,10 @@ fn dev_stop_cancels_owned_preparation_before_gateway_start() {
         let started = root.child("preparation.started");
         let child_pid = root.child("preparation.pid");
         let release = root.child("source-watch.release");
-        let acknowledgment = if phase == "probe" {
-            ""
-        } else {
-            "trap 'exit 143' TERM\n"
+        let acknowledgment = match phase {
+            "probe" => "",
+            "dependencies" => "trap 'exit 0' TERM\n",
+            _ => "trap 'exit 143' TERM\n",
         };
         let script = format!(
             "#!/bin/sh\n{acknowledgment}printf '%s\\n' \"$$\" > '{}'\nprintf 'ready\\n' > '{}'\nwhile [ ! -f '{}' ]; do /bin/sleep 0.05; done\nprintf '[]\\n'\n",

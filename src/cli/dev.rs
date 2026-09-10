@@ -1,3 +1,5 @@
+mod pnpm;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -107,6 +109,13 @@ fn source_watch_node_command(args: &[String]) -> Command {
 }
 
 type SourceWatchResult<T> = Result<T, SourceWatchError>;
+
+#[derive(Clone, Copy)]
+enum SourcePreparationCommand {
+    Source,
+    DependencyInstall,
+    DependencyProbe,
+}
 
 #[derive(Clone, Debug)]
 struct SourceWatchError {
@@ -1299,6 +1308,7 @@ impl Cli {
         &self,
         program: &str,
         args: &[String],
+        kind: SourcePreparationCommand,
         env: &std::collections::BTreeMap<String, String>,
         cwd: &Path,
         lease: Option<&mut SourceWatchLease>,
@@ -1311,17 +1321,24 @@ impl Cli {
         if source_watch_cancelled(lease, stop)? {
             return Ok(130);
         }
+        let mut args = args.to_vec();
+        if matches!(kind, SourcePreparationCommand::DependencyInstall) {
+            args.extend([
+                "--reporter=ndjson".to_string(),
+                "--loglevel=debug".to_string(),
+            ]);
+        }
         #[cfg(unix)]
         let mut command = {
             let mut command = Command::new("/bin/sh");
             command.args(["-c", SOURCE_WATCH_SETUP_SHIM, "ocm-dev-setup", program]);
-            command.args(args);
+            command.args(&args);
             command
         };
         #[cfg(not(unix))]
         let mut command = {
             let mut command = Command::new(program);
-            command.args(args);
+            command.args(&args);
             command
         };
         command
@@ -1331,10 +1348,11 @@ impl Cli {
             .env_clear()
             .envs(env)
             .current_dir(cwd);
-        if !self.stdin_is_terminal() {
+        if !self.stdin_is_terminal() || matches!(kind, SourcePreparationCommand::DependencyInstall)
+        {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
-        let Some(output) = self.run_owned_source_watch_command(command, lease, stop, true)? else {
+        let Some(output) = self.run_owned_source_watch_command(command, lease, stop, kind)? else {
             return Ok(130);
         };
         Ok(source_watch_status_code(
@@ -1348,17 +1366,20 @@ impl Cli {
         mut command: Command,
         lease: &mut SourceWatchLease,
         stop: &AtomicBool,
-        terminal: bool,
+        kind: SourcePreparationCommand,
     ) -> SourceWatchResult<Option<std::process::Output>> {
         if source_watch_cancelled(lease, stop)? {
             return Ok(None);
         }
         lease.configure_child(&mut command);
+        let terminal = !matches!(kind, SourcePreparationCommand::DependencyProbe);
         let mut guard = SourceWatchProcessGuard::new_with_terminal(terminal)?;
         #[cfg(unix)]
         {
-            // The resolution probe does not execute source or preload hooks.
-            guard.source_execution = terminal;
+            // The resolution-only probe reads manifests/entry paths and cannot
+            // execute source, import dependency code, or spawn an intermediary.
+            guard.source_execution = !matches!(kind, SourcePreparationCommand::DependencyProbe);
+            guard.dependency_install = matches!(kind, SourcePreparationCommand::DependencyInstall);
         }
         guard.configure_command(&mut command)?;
         lease.begin_child_spawn()?;
@@ -1380,14 +1401,16 @@ impl Cli {
             #[cfg(not(windows))]
             return Err(stop_source_watch_after_error(&mut child, &guard, error));
         }
-        let stdout = child
-            .stdout
-            .take()
-            .map(|pipe| spawn_source_capture(pipe, "stdout", terminal));
-        let stderr = child
-            .stderr
-            .take()
-            .map(|pipe| spawn_source_capture(pipe, "stderr", terminal));
+        let install_observer = matches!(kind, SourcePreparationCommand::DependencyInstall)
+            .then(pnpm::InstallObserver::default);
+        let stdout = child.stdout.take().map(|pipe| match &install_observer {
+            Some(observer) => observer.spawn_reader(pipe, pnpm::OutputChannel::Stdout),
+            None => spawn_source_capture(pipe, "stdout", terminal),
+        });
+        let stderr = child.stderr.take().map(|pipe| match &install_observer {
+            Some(observer) => observer.spawn_reader(pipe, pnpm::OutputChannel::Stderr),
+            None => spawn_source_capture(pipe, "stderr", terminal),
+        });
         let observed_output = stdout.is_some() && stderr.is_some();
         let start = source_watch_cancelled(lease, stop).and_then(|cancelled| {
             if cancelled {
@@ -1396,21 +1419,27 @@ impl Cli {
                 guard.start_child(&child)
             }
         });
-        if let Err(error) = start {
-            #[cfg(windows)]
-            return Err(stop_suspended_source_watch_after_error(
-                &mut child, &guard, error,
-            ));
-            #[cfg(not(windows))]
-            return Err(stop_source_watch_after_error(&mut child, &guard, error));
-        }
-        let result = match wait_for_source_watch_child(&mut child, stop, &guard, lease) {
-            Ok(status) => Ok(status),
-            Err(error) => Err(stop_source_watch_after_error(
-                &mut child,
-                &guard,
-                error.message,
-            )),
+        let result = match start {
+            Err(error) => {
+                #[cfg(windows)]
+                {
+                    Err(stop_suspended_source_watch_after_error(
+                        &mut child, &guard, error,
+                    ))
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(stop_source_watch_after_error(&mut child, &guard, error))
+                }
+            }
+            Ok(()) => match wait_for_source_watch_child(&mut child, stop, &guard, lease) {
+                Ok(status) => Ok(status),
+                Err(error) => Err(stop_source_watch_after_error(
+                    &mut child,
+                    &guard,
+                    error.message,
+                )),
+            },
         };
         let result =
             guard.classify_completion(result, observed_output, stop.load(Ordering::SeqCst));
@@ -1422,9 +1451,19 @@ impl Cli {
                 cleanup_verified: error.cleanup_verified,
             }),
         };
+        // Restore the terminal and collect both pipes even if process cleanup or
+        // the first output stream failed. An empty process group is not EOF.
         let output = collect_source_captures(stdout, stderr);
         let output_result = output.as_ref().map(|_| ()).map_err(Clone::clone);
         let result = combine_source_watch_cleanup_results(result, output_result, Ok(()));
+        let install_result = install_observer.as_ref().map_or(Ok(()), |observer| {
+            #[cfg(windows)]
+            if source_watch_allows_service_restore(&result) {
+                return observer.finish_after_job_cleanup(stop.load(Ordering::SeqCst));
+            }
+            observer.finish()
+        });
+        let result = combine_source_watch_cleanup_results(result, install_result, Ok(()));
         if source_watch_allows_service_restore(&result) {
             lease.clear_child()?;
         }
@@ -1452,12 +1491,15 @@ impl Cli {
                 watch,
                 cfg!(unix),
                 |command| {
-                    self.run_owned_source_watch_command(command, lease, stop, false)?
-                        .ok_or_else(|| {
-                            SourceWatchError::from(
-                                "source watch preparation was cancelled".to_string(),
-                            )
-                        })
+                    self.run_owned_source_watch_command(
+                        command,
+                        lease,
+                        stop,
+                        SourcePreparationCommand::DependencyProbe,
+                    )?
+                    .ok_or_else(|| {
+                        SourceWatchError::from("source watch preparation was cancelled".to_string())
+                    })
                 },
             ),
             _ => inspect_source_dependencies(repo_root, env, watch).map_err(SourceWatchError::from),
@@ -1502,6 +1544,7 @@ impl Cli {
         let code = self.run_dev_setup(
             "pnpm",
             &["install".to_string(), "--frozen-lockfile".to_string()],
+            SourcePreparationCommand::DependencyInstall,
             &process_env,
             worktree_root,
             lease.as_deref_mut(),
@@ -1569,6 +1612,7 @@ impl Cli {
         self.run_dev_setup(
             "pnpm",
             &args,
+            SourcePreparationCommand::Source,
             &build_openclaw_dev_source_env(meta, &self.env, Path::new(&dev.worktree_root)),
             Path::new(&dev.worktree_root),
             lease,
@@ -2360,6 +2404,7 @@ fn classify_source_watch_completion(
     source_execution_started: bool,
     observed_output: bool,
     cancelled: bool,
+    dependency_install: bool,
 ) -> SourceWatchResult<std::process::ExitStatus> {
     if !source_execution_started {
         // A gated command or resolution-only probe cannot have executed source
@@ -2373,6 +2418,12 @@ fn classify_source_watch_completion(
         Some(format!(
             "source command terminated by signal {signal}; descendant cleanup is unverified and session ownership was retained"
         ))
+    } else if dependency_install
+        && status
+            .and_then(|status| status.code())
+            .is_some_and(pnpm::reserved_signal_exit)
+    {
+        Some("dependency installer returned a reserved signal exit; descendant cleanup is unverified and session ownership was retained".to_string())
     } else if !observed_output
         && (cancelled || result.is_err() || status.is_some_and(|status| !status.success()))
     {
@@ -2492,6 +2543,8 @@ struct SourceWatchProcessGuard {
     startup_released: AtomicBool,
     #[cfg(unix)]
     source_execution: bool,
+    #[cfg(unix)]
+    dependency_install: bool,
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -2537,6 +2590,7 @@ impl SourceWatchProcessGuard {
                 startup_writer,
                 startup_released: AtomicBool::new(false),
                 source_execution: true,
+                dependency_install: false,
             })
         }
         #[cfg(windows)]
@@ -2664,6 +2718,7 @@ impl SourceWatchProcessGuard {
                 self.source_execution && self.startup_released.load(Ordering::SeqCst),
                 observed_output,
                 cancelled,
+                self.dependency_install,
             )
         }
         #[cfg(not(unix))]
@@ -4141,6 +4196,7 @@ fs.writeFileSync('source-ran', JSON.stringify({
                 started,
                 observed,
                 cancelled,
+                false,
             )
         };
         for code in [0, 1, 23] {
@@ -4159,6 +4215,7 @@ fs.writeFileSync('source-ran', JSON.stringify({
         let error = super::classify_source_watch_completion(
             Err(SourceWatchError::from("wait failed".to_string())),
             true,
+            false,
             false,
             false,
         )
