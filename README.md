@@ -126,7 +126,7 @@ ocm dev shaks --service
 ocm dev shaks --onboard
 ```
 
-`dev` creates or reuses an isolated env, provisions an OpenClaw worktree under the repo's own `.worktrees/`, bootstraps the minimum local config so the gateway can run immediately, and then starts the gateway in the foreground. `--root` lets you choose the environment location. `--watch` keeps a source-run gateway rebuilding in place. While a foreground dev session is active, `ocm @<env> -- ...`, `ocm env run <env> -- ...`, `ocm env resolve <env> -- ...`, service resolution, and `ocm env exec <env> -- openclaw ...` use the same source checkout and run `node <checkout>/openclaw.mjs` directly instead of rebuilding through the package script. `--service` installs and starts the dev env in the OCM background service instead of keeping the process in the current terminal. If a dev env is already running in the background, `--watch --force` temporarily takes it over for the watch session and restores the background service when watch exits. For an existing runtime or launcher env, `--repo <path> --watch --force` temporarily runs that source checkout against the env's real root, config, state, and port without changing its binding, tees foreground output to the env gateway logs, then restores a running background service when watch exits. `--onboard` runs local onboarding first and then starts the dev gateway. For a new env, `dev` uses the explicit `--repo` checkout or the checkout enclosing the current directory. Outside an OpenClaw checkout, pass `--repo`; `dev` does not select a neighboring or previously remembered repository. Existing dev envs continue to use their recorded source.
+`dev` creates or reuses an isolated env, uses the selected OpenClaw checkout directly, bootstraps the minimum local config so the gateway can run immediately, and then starts the gateway in the foreground. `--root` lets you choose the environment location. `--watch` keeps a source-run gateway rebuilding in place. While a foreground dev session is active, `ocm @<env> -- ...`, `ocm env run <env> -- ...`, `ocm env resolve <env> -- ...`, service resolution, and `ocm env exec <env> -- openclaw ...` use the same source checkout and run `node <checkout>/openclaw.mjs` directly instead of rebuilding through the package script. `--service` installs and starts the dev env in the OCM background service instead of keeping the process in the current terminal. If a dev env is already running in the background, `--watch --force` temporarily takes it over for the watch session and restores the background service when watch exits. For an existing runtime or launcher env, `--repo <path> --watch --force` temporarily runs that source checkout against the env's real root, config, state, and port without changing its binding, tees foreground output to the env gateway logs, then restores a running background service when watch exits. `--onboard` runs local onboarding first and then starts the dev gateway. For a new env, `dev` uses the explicit `--repo` checkout or the checkout enclosing the current directory. Outside an OpenClaw checkout, pass `--repo`; `dev` does not select a neighboring or previously remembered repository. Existing dev envs continue to use their recorded source.
 
 Plain and watched foreground sessions support `ocm dev stop <env>` and reuse a
 matching active session. `dev status` reports backend watching separately from
@@ -314,7 +314,7 @@ ocm dev luna --watch
 ocm dev existing-env --repo ~/src/openclaw --watch --force
 ```
 
-Use `ocm dev` when you want an isolated source-run checkout with its own env root and gateway port, or when you want to temporarily run source against an existing env in watch mode without rebinding it. While a foreground dev session is running, OCM's OpenClaw-running commands for that env resolve to that source checkout, so one-shot checks use its built `openclaw.mjs`. OCM refuses background service installation, start, and restart for that env until the foreground session exits; a running service taken over with `--watch --force` is restored by the watch session after its source processes stop. Foreground output is saved under that env's `.openclaw/logs/` directory, so `ocm logs <env>` remains useful while the foreground Gateway is running. If you are already inside an OpenClaw checkout, `ocm setup` can detect that and suggest a local path automatically.
+Use `ocm dev` when you want to run your checkout with separate environment state and a gateway port, or when you want to temporarily run source against an existing env in watch mode without rebinding it. While a foreground dev session is running, OCM's OpenClaw-running commands for that env resolve to that source checkout, so one-shot checks use its built `openclaw.mjs`. OCM refuses background service installation, start, and restart for that env until the foreground session exits; a running service taken over with `--watch --force` is restored by the watch session after its source processes stop. Foreground output is saved under that env's `.openclaw/logs/` directory, so `ocm logs <env>` remains useful while the foreground Gateway is running. If you are already inside an OpenClaw checkout, `ocm setup` can detect that and suggest a local path automatically.
 
 On Unix, foreground Node commands wait until OCM records their process ownership before executing source or `NODE_OPTIONS` preload hooks. The gate preserves the command arguments, terminal input, and configured Node options after release.
 
@@ -327,7 +327,14 @@ updated OCM installation; this restarts managed gateways. Package version alone
 does not establish compatibility. A confirmed stopped or unloaded daemon does
 not require refresh, and existing session reuse and stop remain available.
 
-An existing dev env resumes its recorded worktree, preserving its uncommitted changes. If that worktree is missing or has been replaced by an unrelated checkout, `dev` reports an error instead of recreating it; restore the recorded checkout before retrying. An explicit `--repo` must still identify the env's original repository, including equivalent path aliases, and cannot rebind the env to another checkout.
+New dev environments borrow the exact selected main checkout or registered linked
+worktree, including its tracked edits and untracked files. OCM creates no Git
+worktree for them. Their environment state stays outside the source and its Git
+metadata. A borrowed environment resumes its recorded canonical source path;
+an explicit `--repo` or another enclosing checkout cannot rebind it. Restore a
+missing source, changed path alias, or invalid Git registration before retrying.
+
+An existing OCM-owned dev env resumes its recorded worktree, preserving its uncommitted changes. If that worktree is missing or has been replaced by an unrelated checkout, `dev` reports an error instead of recreating it; restore the recorded checkout before retrying. An explicit `--repo` must still identify the env's original repository, including equivalent path aliases, and cannot rebind the env to another checkout.
 
 Environment commands and Gateway resolution apply the same check when selecting
 the dev source, including routing through an active source watch. Saved service
@@ -335,7 +342,7 @@ plans also validate the recorded checkout before starting it. Restore the
 recorded checkout before retrying. Explicit runtime or launcher overrides and
 status inspection remain available. A worktree validation failure leaves config unchanged.
 
-Before starting source, `dev` checks the installed entry points for the tooling declared by that checkout. It reuses hoisted or isolated installs whose tooling resolves. Missing tooling in an OCM-owned dev worktree is prepared with `pnpm install --frozen-lockfile` and checked again. Source takeover of a runtime or launcher env only validates the borrowed checkout and fails before stopping its service if preparation is needed. OCM does not reinstall through linked dependency directories. A modules-directory environment override may select dependencies inside that checkout, including before OpenClaw creates its `node_modules` link. OCM inspects the configured tree without creating that link and rejects overrides that resolve outside the checkout. These are startup checks; OpenClaw still owns builds and validation of the running application.
+Before starting source, `dev` checks the installed entry points for the tooling declared by that checkout. It reuses hoisted or isolated installs whose tooling resolves. New borrowed environments and OCM-owned dev worktrees can prepare missing tooling with `pnpm install --frozen-lockfile` and check it again. A resumed borrowed environment reports missing tooling so you can prepare its checkout explicitly; it does not reinstall dependencies. Source takeover of a runtime or launcher env only validates the borrowed checkout and fails before stopping its service if preparation is needed. OCM does not reinstall through linked dependency directories. A modules-directory environment override may select dependencies inside that checkout, including before OpenClaw creates its `node_modules` link. OCM inspects the configured tree without creating that link and rejects overrides that resolve outside the checkout. These are startup checks; OpenClaw still owns builds and validation of the running application.
 
 Foreground dependency installation keeps build output and pnpm diagnostics readable while using lifecycle reports to check script completion. When run from a terminal, installation keeps interactive stdin while streaming that output. On Unix, interrupted or unfinished build scripts retain foreground ownership even if pnpm returns an ordinary error or an optional build lets it succeed. Completed installation errors remain retryable.
 
@@ -360,9 +367,18 @@ For new Unix foreground generations, output readers must finish before OCM clear
 
 `ocm env destroy <env> --yes` stops the recorded foreground generation and verifies shutdown before removing the environment. It rechecks the binding after stopping and preserves state if another owner or binding appears. While a watch is running, previews defer the changing process-tree inspection until after shutdown (`processInspectionDeferred` in JSON). `env remove` and `env prune` refuse active or unfinished watches; stop those sessions first. A guarded destroy with `--if-state-token` also requires `dev stop` followed by a fresh preview, so its original state guarantee remains intact. Completed watch records are removed with the env; synchronization lock files remain reusable.
 
-Environment creation, cloning, and import reject roots that overlap an already
-registered dev worktree that exists on disk, including source and destination
-path aliases. Choose a separate environment root to preserve the checkout.
+Environment creation, cloning, and import reject roots that overlap registered
+dev sources, including source and destination aliases. Missing borrowed paths
+remain reserved until their binding is removed. Removing a borrowed environment
+preserves its source, dependencies, generated output, and unrelated source workers.
+Restore and rollback also preserve borrowed source and known Git metadata;
+checkpoint exclusions must cover the affected paths, including missing source
+reservations.
+
+When a managed daemon is running, it must support new or changed borrowed
+bindings before registration. Older OCM readers refuse these records. Refresh an
+incompatible daemon with the command above; unchanged bindings and confirmed
+stopped or unloaded managers remain usable.
 
 Removal, pruning, destroy, and simulation cleanup preserve other registered dev sources and the Git metadata they need. Remove dependent dev environments before deleting their containing environment or worktree.
 

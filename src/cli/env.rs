@@ -452,7 +452,8 @@ impl Cli {
         summary.worktree_removed = env_meta
             .dev
             .as_ref()
-            .is_some_and(|dev| !Path::new(&dev.worktree_root).exists());
+            .and_then(|dev| dev.owned_worktree())
+            .is_some_and(|(_, worktree)| !Path::new(worktree).exists());
 
         // Snapshots are the recovery path if destructive cleanup fails, so
         // remove them only after the environment and worktree are gone.
@@ -1306,10 +1307,10 @@ impl Cli {
                 description: "terminate live OpenClaw processes for the env".to_string(),
             });
         }
-        if let Some(dev) = env_meta.dev.as_ref() {
+        if let Some((_, worktree)) = env_meta.dev.as_ref().and_then(|dev| dev.owned_worktree()) {
             steps.push(EnvDestroyStepSummary {
                 kind: "worktree".to_string(),
-                description: format!("remove dev worktree {}", dev.worktree_root),
+                description: format!("remove dev worktree {worktree}"),
             });
         }
         steps.push(EnvDestroyStepSummary {
@@ -1326,7 +1327,11 @@ impl Cli {
         Ok(EnvDestroySummary {
             env_name: env_meta.name,
             root: env_meta.root,
-            dev_worktree: env_meta.dev.as_ref().map(|dev| dev.worktree_root.clone()),
+            dev_worktree: env_meta
+                .dev
+                .as_ref()
+                .and_then(|dev| dev.owned_worktree())
+                .map(|(_, worktree)| worktree.to_string()),
             protected: env_meta.protected,
             apply,
             force,
@@ -2021,8 +2026,8 @@ fn process_belongs_to_env(
     .into_iter()
     .map(|value| normalize_process_path(&value))
     .collect::<Vec<_>>();
-    if let Some(dev) = meta.dev.as_ref() {
-        markers.push(normalize_process_path(&dev.worktree_root));
+    if let Some((_, worktree)) = meta.dev.as_ref().and_then(|dev| dev.owned_worktree()) {
+        markers.push(normalize_process_path(worktree));
     }
 
     let command = normalize_process_path(command);

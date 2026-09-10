@@ -9,7 +9,8 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ocm::env::{CreateEnvironmentOptions, EnvDevMeta, EnvironmentService};
+use fs2::FileExt;
+use ocm::env::{CreateEnvironmentOptions, EnvDevMeta, EnvMeta, EnvironmentService};
 use ocm::store::{env_registry_path, supervisor_runtime_path, supervisor_state_path};
 use serde_json::{Value, json};
 
@@ -132,6 +133,43 @@ impl AdmissionFixture {
         }
     }
 
+    fn prepare_borrowed_repo(&mut self) {
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&self.repo)
+            .output()
+            .unwrap();
+        assert!(
+            initialized.status.success(),
+            "{}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        self.repo = fs::canonicalize(&self.repo).unwrap();
+        write_executable_script(
+            &self.root.child("fake-bin/pnpm"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                path_string(&self.root.child("pnpm.log"))
+            ),
+        );
+    }
+
+    fn create_borrowed(&self, name: &str) -> Result<EnvMeta, String> {
+        EnvironmentService::new(&self.env, &self.cwd).create(CreateEnvironmentOptions {
+            name: name.to_string(),
+            root: Some(path_string(&self.root.child(name))),
+            gateway_port: None,
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: None,
+            dev: Some(EnvDevMeta::Borrowed {
+                source_root: path_string(&self.repo),
+            }),
+            protected: false,
+        })
+    }
+
     fn start_daemon(&mut self) -> Value {
         // No services are desired running, so the owned daemon has no child
         // processes. Its real native identity supplies the capability fixture.
@@ -155,7 +193,7 @@ impl AdmissionFixture {
                 && runtime["gatewayAdmission"]["process"]["pid"] == pid
             {
                 assert_eq!(runtime["children"], json!([]));
-                assert_eq!(runtime["gatewayAdmission"]["version"], 10);
+                assert_eq!(runtime["gatewayAdmission"]["version"], 11);
                 assert!(
                     runtime["gatewayAdmission"]["process"]["startedAt"]
                         .as_str()
@@ -428,6 +466,11 @@ fn dev_watch_allows_confirmed_stopped_and_unloaded_daemons() {
 
 #[test]
 fn saved_dev_plan_revalidates_source_and_binding_before_launch() {
+    assert_saved_dev_plan_revalidation(false);
+    assert_saved_dev_plan_revalidation(true);
+}
+
+fn assert_saved_dev_plan_revalidation(borrowed: bool) {
     let mut fixture = AdmissionFixture::new("dev-daemon-saved-plan");
     fixture.set_manager_state("stopped", 0);
     fixture.repo = fs::canonicalize(&fixture.repo).unwrap();
@@ -478,9 +521,15 @@ fn saved_dev_plan_revalidates_source_and_binding_before_launch() {
             service_running: true,
             default_runtime: None,
             default_launcher: None,
-            dev: Some(EnvDevMeta {
-                repo_root: path_string(&fixture.repo),
-                worktree_root: worktree_path.clone(),
+            dev: Some(if borrowed {
+                EnvDevMeta::Borrowed {
+                    source_root: worktree_path.clone(),
+                }
+            } else {
+                EnvDevMeta::Owned {
+                    repo_root: path_string(&fixture.repo),
+                    worktree_root: worktree_path.clone(),
+                }
             }),
             protected: false,
         })
@@ -500,22 +549,30 @@ fn saved_dev_plan_revalidates_source_and_binding_before_launch() {
     let worktree_git = worktree.join(".git");
     let git_link = fs::read(&worktree_git).unwrap();
 
-    for case in [
-        "replaced-worktree",
-        "saved-source",
-        "binding-name",
-        "runtime",
-        "launcher",
-    ] {
+    let cases: &[&str] = if borrowed {
+        &["saved-source", "missing-source"]
+    } else {
+        &[
+            "replaced-worktree",
+            "saved-source",
+            "binding-name",
+            "runtime",
+            "launcher",
+        ]
+    };
+    for &case in cases {
         let mut stale = plan.clone();
         let mut changed = source.clone();
         let expected = if case == "replaced-worktree" {
             "registered worktree is not a valid OpenClaw checkout"
         } else if case == "saved-source" {
             "saved dev source no longer matches"
+        } else if case == "missing-source" {
+            "restore that checkout"
         } else {
             "saved dev plan no longer matches the registered binding"
         };
+        let retained_source = fixture.root.child("retained-source");
         match case {
             "replaced-worktree" => {
                 fs::remove_file(&worktree_git).unwrap();
@@ -532,6 +589,7 @@ fn saved_dev_plan_revalidates_source_and_binding_before_launch() {
             "binding-name" => stale["children"][0]["bindingName"] = json!("old-dev"),
             "runtime" => changed.default_runtime = Some("stable".to_string()),
             "launcher" => changed.default_launcher = Some("custom".to_string()),
+            "missing-source" => fs::rename(&worktree, &retained_source).unwrap(),
             _ => unreachable!(),
         }
         ocm::store::save_environment(changed, &fixture.env, &fixture.cwd).unwrap();
@@ -596,5 +654,232 @@ fn saved_dev_plan_revalidates_source_and_binding_before_launch() {
         );
         assert!(!command_log.exists(), "{case} launched the stale command");
         assert!(!fixture.root.child("node.log").exists(), "{case}");
+        if case == "missing-source" {
+            fs::rename(&retained_source, &worktree).unwrap();
+        }
+    }
+}
+
+#[test]
+fn borrowed_dev_requires_decoder_capability_before_plain_watch_or_service_creation() {
+    let mut fixture = AdmissionFixture::new("borrowed-daemon-create");
+    fixture.prepare_borrowed_repo();
+    let current = fixture.start_daemon();
+    let mut legacy = current.clone();
+    legacy["gatewayAdmission"]["version"] = json!(10);
+    write_json_replacing_path(&fixture.runtime, &legacy);
+    let registry = env_registry_path(&fixture.env, &fixture.cwd).unwrap();
+    let before = fs::read(&registry).unwrap();
+    let config_path = fixture
+        .root
+        .child("ocm-home/envs/demo/.openclaw/openclaw.json");
+    let config_before = fs::read(&config_path).ok();
+    let source_before = fs::read(fixture.repo.join("package.json")).unwrap();
+    let runtime_before = fs::read(&fixture.runtime).unwrap();
+    let repo = path_string(&fixture.repo);
+    for (name, mode) in [
+        ("plain", None),
+        ("watch", Some("--watch")),
+        ("service", Some("--service")),
+    ] {
+        let root = fixture.root.child(format!("{name}-env"));
+        let root_arg = path_string(&root);
+        let mut args = vec!["dev", name, "--repo", &repo, "--root", &root_arg];
+        if let Some(mode) = mode {
+            args.push(mode);
+        }
+        let rejected = run_ocm(&fixture.cwd, &fixture.env, &args);
+        assert!(!rejected.status.success(), "{name}");
+        assert!(
+            stderr(&rejected).contains("unsupported Gateway admission version"),
+            "{name}: {}",
+            stderr(&rejected)
+        );
+        assert!(
+            stderr(&rejected).contains("service refresh-daemon --acknowledge-gateway-restarts")
+        );
+        assert!(
+            !root.exists(),
+            "{name} created its environment before admission"
+        );
+        assert_eq!(fs::read(&registry).unwrap(), before, "{name}");
+        assert_eq!(
+            fs::read(&fixture.runtime).unwrap(),
+            runtime_before,
+            "{name}"
+        );
+        assert_eq!(
+            fs::read(fixture.repo.join("package.json")).unwrap(),
+            source_before,
+            "{name}"
+        );
+        assert_eq!(fs::read(&config_path).ok(), config_before, "{name}");
+        assert!(!fixture.root.child("node.log").exists(), "{name}");
+        assert!(!fixture.root.child("pnpm.log").exists(), "{name}");
+        assert!(!fixture.repo.join(".worktrees").exists(), "{name}");
+        assert!(!fixture.repo.join("node_modules").exists(), "{name}");
+    }
+    let rejected = fixture.create_borrowed("direct").unwrap_err();
+    assert!(
+        rejected.contains("unsupported Gateway admission version"),
+        "{rejected}"
+    );
+    assert_eq!(fs::read(&registry).unwrap(), before);
+    assert!(!fixture.root.child("direct").exists());
+    write_json_replacing_path(&fixture.runtime, &current);
+    let accepted = fixture.create_borrowed("accepted").unwrap();
+    assert!(matches!(accepted.dev, Some(EnvDevMeta::Borrowed { .. })));
+    fixture.stop_daemon();
+    fixture.set_manager_state("stopped", 0);
+    write_json_replacing_path(&fixture.runtime, &legacy);
+    let stopped = fixture.create_borrowed("stopped").unwrap();
+    assert!(matches!(stopped.dev, Some(EnvDevMeta::Borrowed { .. })));
+}
+
+#[test]
+fn borrowed_new_saved_binding_requires_decoder_capability_but_unchanged_binding_does_not() {
+    let mut fixture = AdmissionFixture::new("borrowed-daemon-saved-binding");
+    fixture.prepare_borrowed_repo();
+    let mut current = fixture.start_daemon();
+    let source = fixture.create_borrowed("source-env").unwrap();
+    current["gatewayAdmission"]["version"] = json!(10);
+    write_json_replacing_path(&fixture.runtime, &current);
+    let registry = env_registry_path(&fixture.env, &fixture.cwd).unwrap();
+    let before = fs::read(&registry).unwrap();
+
+    let mut invalid = source.clone();
+    invalid.name = "relative-source".to_string();
+    invalid.dev = Some(EnvDevMeta::Borrowed {
+        source_root: "relative".to_string(),
+    });
+    let rejected = ocm::store::save_environment(invalid, &fixture.env, &fixture.cwd).unwrap_err();
+    assert!(rejected.contains("absolute checkout path"), "{rejected}");
+    assert_eq!(fs::read(&registry).unwrap(), before);
+
+    let mut replacement = ocm::store::get_environment("demo", &fixture.env, &fixture.cwd).unwrap();
+    replacement.dev = source.dev.clone();
+    let rejected =
+        ocm::store::save_environment(replacement, &fixture.env, &fixture.cwd).unwrap_err();
+    assert!(
+        rejected.contains("unsupported Gateway admission version"),
+        "{rejected}"
+    );
+    assert_eq!(fs::read(&registry).unwrap(), before);
+
+    let retained = EnvironmentService::new(&fixture.env, &fixture.cwd)
+        .set_protected(&source.name, true)
+        .unwrap();
+    assert_eq!(retained.dev, source.dev);
+    assert!(retained.protected);
+    let ordinary = EnvironmentService::new(&fixture.env, &fixture.cwd)
+        .set_protected("demo", true)
+        .unwrap();
+    assert!(ordinary.dev.is_none());
+}
+
+#[test]
+fn borrowed_publication_holds_daemon_lifecycle_until_registry_write() {
+    for source_removed in [false, true] {
+        let mut fixture = AdmissionFixture::new("borrowed-daemon-publication-lock");
+        fixture.prepare_borrowed_repo();
+        fixture.start_daemon();
+        let registry = env_registry_path(&fixture.env, &fixture.cwd).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let registry_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(registry.with_extension("lock"))
+            .unwrap();
+        registry_lock.lock_exclusive().unwrap();
+        let lifecycle = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(fixture.definition.with_extension("lifecycle.lock"))
+            .unwrap();
+        let target = fixture.root.child("queued-env");
+        let target_root = path_string(&target);
+        let source_root = path_string(&fixture.repo);
+        let env = fixture.env.clone();
+        let cwd = fixture.cwd.clone();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        // Exercise the registry producer directly: a foreground CLI command also
+        // briefly takes lifecycle for preflight, before it reaches publication.
+        let publisher = thread::spawn(move || {
+            let result = EnvironmentService::new(&env, &cwd).create(CreateEnvironmentOptions {
+                name: "queued".to_string(),
+                root: Some(target_root),
+                gateway_port: None,
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: None,
+                dev: Some(EnvDevMeta::Borrowed { source_root }),
+                protected: false,
+            });
+            let _ = published_tx.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match lifecycle.try_lock_exclusive() {
+                Ok(()) => FileExt::unlock(&lifecycle).unwrap(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("cannot inspect lifecycle lock: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "publisher never acquired lifecycle before the registry"
+            );
+            assert!(
+                matches!(
+                    published_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "publisher exited while waiting for registry"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !target.exists(),
+            "publisher changed the root before acquiring the registry"
+        );
+        let retained_source = fixture.root.child("retained-source");
+        if source_removed {
+            fs::rename(&fixture.repo, &retained_source).unwrap();
+        }
+        FileExt::unlock(&registry_lock).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match lifecycle.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "publisher did not release lifecycle"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("cannot inspect lifecycle release: {error}"),
+            }
+        }
+        let published = ocm::store::get_environment("queued", &fixture.env, &fixture.cwd);
+        FileExt::unlock(&lifecycle).unwrap();
+        let result = published_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        publisher.join().unwrap();
+        if source_removed {
+            let error = result.unwrap_err();
+            assert!(error.contains("restore that checkout"), "{error}");
+            assert!(published.is_err(), "invalidated source was published");
+            assert!(
+                !target.exists(),
+                "invalidated source created environment state"
+            );
+            assert_eq!(fs::read(&registry).unwrap(), registry_before);
+            assert!(retained_source.join("package.json").exists());
+        } else {
+            let published =
+                published.expect("daemon lifecycle was released before borrowed registration");
+            assert!(matches!(published.dev, Some(EnvDevMeta::Borrowed { .. })));
+            assert!(result.is_ok(), "{}", result.unwrap_err());
+        }
     }
 }

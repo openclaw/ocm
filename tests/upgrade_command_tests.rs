@@ -3267,14 +3267,7 @@ fi
             );
             None
         } else {
-            let created = run_ocm(
-                cwd,
-                &env,
-                &support::dev_plain(&["dependency", "--repo", &path_string(&repo)]),
-            );
-            assert!(created.status.success(), "{}", stderr(&created));
-            let peer = ocm::store::get_environment("dependency", &env, cwd).unwrap();
-            let source = PathBuf::from(peer.dev.unwrap().worktree_root);
+            let source = support::create_owned_dev_env(&repo, "dependency", &env, cwd);
             fs::create_dir_all(source.join("dist")).unwrap();
             fs::write(source.join("dist/sentinel"), "retained peer output\n").unwrap();
             Some(source)
@@ -3337,13 +3330,13 @@ fi
             );
             let child = ocm::store::get_environment("dependency", &env, cwd).unwrap();
             assert!(
-                Path::new(&child.dev.unwrap().worktree_root)
+                Path::new(child.dev.unwrap().source_root())
                     .join("package.json")
                     .is_file()
             );
             let simulation = ocm::store::get_environment(simulation_name, &env, cwd).unwrap();
             assert!(
-                Path::new(&simulation.dev.unwrap().worktree_root)
+                Path::new(simulation.dev.unwrap().source_root())
                     .join(".artifacts/build.json")
                     .is_file()
             );
@@ -4010,7 +4003,7 @@ fn upgrade_rollback_refuses_a_broken_source_launcher_before_mutation() {
 
     fs::create_dir_all(&project_dir).unwrap();
     let mut current = ocm::store::get_environment("hacking", &env, &cwd).unwrap();
-    current.dev = Some(ocm::env::EnvDevMeta {
+    current.dev = Some(ocm::env::EnvDevMeta::Owned {
         repo_root: path_string(&project_dir),
         worktree_root: path_string(&root.child("saved-worktree")),
     });
@@ -4564,7 +4557,7 @@ fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
     fs::write(&marker, "after-upgrade").unwrap();
 
     let mut current = ocm::store::get_environment("demo", &env, &cwd).unwrap();
-    current.dev = Some(ocm::env::EnvDevMeta {
+    current.dev = Some(ocm::env::EnvDevMeta::Owned {
         repo_root: path_string(&root.child("saved-repo")),
         worktree_root: path_string(&root.child("saved-worktree")),
     });
@@ -5900,7 +5893,7 @@ fn upgrade_rolls_back_runtime_binding_when_update_finalization_fails() {
     fs::write(&secondary_skill, "skill before upgrade\n").unwrap();
 
     let mut current = ocm::store::get_environment("demo", &env, &cwd).unwrap();
-    current.dev = Some(ocm::env::EnvDevMeta {
+    current.dev = Some(ocm::env::EnvDevMeta::Owned {
         repo_root: path_string(&root.child("saved-repo")),
         worktree_root: path_string(&root.child("saved-worktree")),
     });

@@ -11,11 +11,11 @@ use crate::openclaw_repo::{
 use crate::runtime::RuntimeService;
 use crate::store::{
     EnvironmentOperationLock, clone_environment, clone_environment_for_simulation,
-    create_environment_with_dev_registration, create_environment_with_validated_runtime,
-    export_environment, get_environment, get_runtime_verified, import_environment,
-    list_environments, lock_environment_operation, now_utc, remove_environment_locked,
-    resolve_config_gateway_port, resolve_effective_gateway_ports, resolve_env_gateway_port,
-    save_environment, set_environment_service_policy, with_prepared_dev_source,
+    create_environment_with_validated_runtime, export_environment, get_environment,
+    get_runtime_verified, import_environment, list_environments, lock_environment_operation,
+    now_utc, remove_environment_locked, resolve_config_gateway_port,
+    resolve_effective_gateway_ports, resolve_env_gateway_port, save_environment,
+    set_environment_service_policy,
 };
 use crate::supervisor::{sync_supervisor_env_if_present, sync_supervisor_if_present};
 
@@ -31,18 +31,133 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "DevSourceRecord", into = "DevSourceRecord")]
+pub enum EnvDevMeta {
+    Owned {
+        repo_root: String,
+        worktree_root: String,
+    },
+    Borrowed {
+        source_root: String,
+    },
+}
+
+// Keep the legacy owned wire format unchanged. Borrowed records deliberately
+// omit both legacy fields, so older OCM readers cannot mistake them for an
+// owned worktree and remove the checkout.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnvDevMeta {
-    pub repo_root: String,
-    pub worktree_root: String,
+#[serde(untagged)]
+enum DevSourceRecord {
+    Owned(OwnedDevSourceRecord),
+    Borrowed(BorrowedDevSourceRecord),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OwnedDevSourceRecord {
+    repo_root: String,
+    worktree_root: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BorrowedDevSourceRecord {
+    kind: BorrowedDevSourceKind,
+    source_root: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum BorrowedDevSourceKind {
+    #[serde(rename = "borrowed")]
+    Borrowed,
+}
+
+impl TryFrom<DevSourceRecord> for EnvDevMeta {
+    type Error = String;
+
+    fn try_from(record: DevSourceRecord) -> Result<Self, Self::Error> {
+        match record {
+            DevSourceRecord::Owned(record) => Ok(Self::Owned {
+                repo_root: record.repo_root,
+                worktree_root: record.worktree_root,
+            }),
+            DevSourceRecord::Borrowed(record) => {
+                if !Path::new(&record.source_root).is_absolute() {
+                    return Err("borrowed dev source must be an absolute checkout path".to_string());
+                }
+                Ok(Self::Borrowed {
+                    source_root: record.source_root,
+                })
+            }
+        }
+    }
+}
+
+impl From<EnvDevMeta> for DevSourceRecord {
+    fn from(meta: EnvDevMeta) -> Self {
+        match meta {
+            EnvDevMeta::Owned {
+                repo_root,
+                worktree_root,
+            } => Self::Owned(OwnedDevSourceRecord {
+                repo_root,
+                worktree_root,
+            }),
+            EnvDevMeta::Borrowed { source_root } => Self::Borrowed(BorrowedDevSourceRecord {
+                kind: BorrowedDevSourceKind::Borrowed,
+                source_root,
+            }),
+        }
+    }
 }
 
 impl EnvDevMeta {
+    pub fn repo_root(&self) -> &str {
+        match self {
+            Self::Owned { repo_root, .. } => repo_root,
+            Self::Borrowed { source_root } => source_root,
+        }
+    }
+
+    pub fn source_root(&self) -> &str {
+        match self {
+            Self::Owned { worktree_root, .. } => worktree_root,
+            Self::Borrowed { source_root } => source_root,
+        }
+    }
+
     pub(crate) fn execution_source_root(&self) -> Result<&Path, String> {
-        let source_root = Path::new(&self.worktree_root);
-        validate_openclaw_worktree(Path::new(&self.repo_root), source_root)?;
-        Ok(source_root)
+        match self {
+            Self::Owned {
+                repo_root,
+                worktree_root,
+            } => {
+                let source_root = Path::new(worktree_root);
+                validate_openclaw_worktree(Path::new(repo_root), source_root)?;
+                Ok(source_root)
+            }
+            Self::Borrowed { source_root } => {
+                crate::openclaw_repo::validate_borrowed_openclaw_checkout(Path::new(source_root))
+            }
+        }
+    }
+
+    pub fn owned_worktree(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Owned {
+                repo_root,
+                worktree_root,
+            } => Some((repo_root, worktree_root)),
+            Self::Borrowed { .. } => None,
+        }
+    }
+
+    pub fn borrowed_source_root(&self) -> Option<&str> {
+        match self {
+            Self::Borrowed { source_root } => Some(source_root),
+            Self::Owned { .. } => None,
+        }
     }
 }
 
@@ -249,22 +364,6 @@ impl<'a> EnvironmentService<'a> {
         Ok(meta)
     }
 
-    pub(crate) fn create_dev(
-        &self,
-        repo: &Path,
-        mut options: CreateEnvironmentOptions,
-    ) -> Result<EnvMeta, String> {
-        let name = options.name.clone();
-        let meta =
-            with_prepared_dev_source(repo, &name, self.env, self.cwd, |dev, registration| {
-                options.dev = Some(dev);
-                create_environment_with_dev_registration(options, registration, self.env, self.cwd)
-            })?;
-        // A sync error must preserve source whose binding was already published.
-        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
-        Ok(meta)
-    }
-
     pub fn clone(&self, options: CloneEnvironmentOptions) -> Result<EnvMeta, String> {
         let meta = clone_environment(options, self.env, self.cwd)?;
         sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
@@ -411,10 +510,12 @@ impl<'a> EnvironmentService<'a> {
     pub(crate) fn remove_simulation(&self, name: &str) -> Result<EnvMeta, String> {
         let _lock = self.lock_operation(name)?;
         self.remove_with_cleanup_locked(name, true, |meta| {
-            if let Some(dev) = meta.dev.as_ref() {
+            if let Some((repo_root, worktree_root)) =
+                meta.dev.as_ref().and_then(EnvDevMeta::owned_worktree)
+            {
                 prepare_openclaw_simulation_worktree_cleanup(
-                    Path::new(&dev.repo_root),
-                    Path::new(&dev.worktree_root),
+                    Path::new(repo_root),
+                    Path::new(worktree_root),
                     &meta.name,
                 )?;
             }
@@ -464,5 +565,78 @@ impl<'a> EnvironmentService<'a> {
             .copied()
             .map(|port| (port, "computed"))
             .ok_or_else(|| format!("failed to resolve gateway port for env \"{}\"", target.name))
+    }
+}
+
+#[cfg(test)]
+mod dev_source_tests {
+    use super::EnvDevMeta;
+    use serde::Deserialize;
+    use serde_json::json;
+
+    // This is the required-field decoder used by OCM before borrowed sources.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyDevMeta {
+        repo_root: String,
+        worktree_root: String,
+    }
+
+    #[test]
+    fn dev_source_records_preserve_owned_shape_and_reject_old_readers_for_borrowed_sources() {
+        let root = std::env::temp_dir()
+            .join("ocm-dev-source-record")
+            .to_string_lossy()
+            .into_owned();
+        let owned = EnvDevMeta::Owned {
+            repo_root: root.clone(),
+            worktree_root: format!("{root}/worktree"),
+        };
+        let owned_record = serde_json::to_value(&owned).unwrap();
+        assert_eq!(
+            owned_record,
+            json!({"repoRoot": root, "worktreeRoot": format!("{root}/worktree")})
+        );
+        let legacy: LegacyDevMeta = serde_json::from_value(owned_record.clone()).unwrap();
+        assert_eq!(legacy.repo_root, owned.repo_root());
+        assert_eq!(legacy.worktree_root, owned.source_root());
+        assert_eq!(
+            serde_json::from_value::<EnvDevMeta>(owned_record).unwrap(),
+            owned
+        );
+
+        let borrowed = EnvDevMeta::Borrowed {
+            source_root: root.clone(),
+        };
+        let borrowed_record = serde_json::to_value(&borrowed).unwrap();
+        assert_eq!(
+            borrowed_record,
+            json!({"kind": "borrowed", "sourceRoot": root})
+        );
+        assert!(serde_json::from_value::<LegacyDevMeta>(borrowed_record.clone()).is_err());
+        assert_eq!(
+            serde_json::from_value::<EnvDevMeta>(borrowed_record).unwrap(),
+            borrowed
+        );
+    }
+
+    #[test]
+    fn dev_source_records_reject_ambiguous_or_unknown_ownership() {
+        let root = std::env::temp_dir()
+            .join("ocm-dev-source-record")
+            .to_string_lossy()
+            .into_owned();
+        for record in [
+            json!({"kind": "borrowed", "sourceRoot": root, "repoRoot": root, "worktreeRoot": root}),
+            json!({"kind": "other", "sourceRoot": root}),
+            json!({"kind": "other", "repoRoot": root, "worktreeRoot": root}),
+            json!({"kind": "borrowed", "sourceRoot": "relative/checkout"}),
+            json!({"sourceRoot": root}),
+        ] {
+            assert!(
+                serde_json::from_value::<EnvDevMeta>(record.clone()).is_err(),
+                "accepted ambiguous dev source {record}"
+            );
+        }
     }
 }

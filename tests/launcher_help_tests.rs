@@ -20,7 +20,7 @@ fn top_level_help_is_clean_and_points_to_topics() {
     ));
     assert!(output.contains("ocm [--color <mode>] <command> [args]"));
     assert!(output.contains("Fast path: create or reuse an env and keep it running"));
-    assert!(output.contains("OpenClaw development envs with worktrees and watch mode"));
+    assert!(output.contains("Run selected OpenClaw checkouts with isolated environment state"));
     assert!(output.contains("Guided setup for release and local-dev flows"));
     assert!(output.contains("Safely update one env or all envs and restart services when needed"));
     assert!(output.contains("Check host software for release and feature readiness"));

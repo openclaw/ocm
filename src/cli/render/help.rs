@@ -102,7 +102,7 @@ pub fn root_help(cmd: &str) -> String {
             ("setup", "Guided setup for release and local-dev flows"),
             (
                 "dev",
-                "OpenClaw development envs with worktrees and watch mode",
+                "Run selected OpenClaw checkouts with isolated environment state",
             ),
             (
                 "start",
@@ -243,7 +243,7 @@ pub fn logs_help(cmd: &str) -> String {
 pub fn dev_help(cmd: &str) -> String {
     render_group(
         "Development envs",
-        "Provision OpenClaw dev envs from a checkout worktree, bootstrap the minimum local config, and run the gateway in the foreground with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. Background service installation, start, and restart are refused while source watch is active. New foreground sessions and service preparation require a compatible running daemon with verified process ownership; wait for startup or run service refresh-daemon --acknowledge-gateway-restarts from the updated OCM installation during a maintenance window. Confirmed stopped or unloaded daemons do not require refresh. New envs use the explicit --repo checkout or the checkout enclosing the current directory. Outside a checkout, pass --repo; neighboring and remembered repositories are not selected. Existing dev envs use their recorded source. Repeating a matching plain or --watch invocation returns the existing session status and link without setup or restart. Starting and restoring sessions report progress; they are not reported as ready. Stop the session before onboarding or changing --watch, source, root, or port. Reuse keeps the captured launch endpoint; an older watch without endpoint metadata must be stopped from its original terminal first. Add --ui to run native Vite beside a plain or watched Gateway. The controller owns both components and their initial native browser handoff. UI requires HTTP, enabled Control UI and installed UI dependencies; it cannot be combined with --service. The initial owner link is printed after both documents are ready. A pending request keeps its one helper owned, discards late grant bytes after 30 seconds, and leaves Gateway and Vite running. Matching reuse reports the captured UI address without requesting another grant. Stop before changing --ui; the address is scoped to the session.",
+        "Run the selected OpenClaw checkout with separate environment state, bootstrap the minimum local config, and run the gateway in the foreground with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. Background service installation, start, and restart are refused while source watch is active. Before new foreground sessions or service preparation, any running managed daemon must be compatible and have verified process ownership; wait for startup or run service refresh-daemon --acknowledge-gateway-restarts from the updated OCM installation during a maintenance window. Confirmed stopped or unloaded daemons do not require refresh. New envs borrow the exact --repo checkout or the checkout enclosing the current directory without creating a Git worktree. Main and registered linked checkouts are supported. Outside a checkout, pass --repo; neighboring and remembered repositories are not selected. Existing dev envs use their recorded source; borrowed envs refuse a different explicit or enclosing checkout. New borrowers may install missing tooling with pnpm install --frozen-lockfile; resumed borrowers require explicit preparation. Removing a borrower preserves its checkout and unrelated source workers. A running managed daemon must support new borrowed bindings; older OCM versions cannot read them. Repeating a matching plain or --watch invocation returns the existing session status and link without setup or restart. Starting and restoring sessions report progress; they are not reported as ready. Stop the session before onboarding or changing --watch, source, root, or port. Reuse keeps the captured launch endpoint; an older watch without endpoint metadata must be stopped from its original terminal first. Add --ui to run native Vite beside a plain or watched Gateway. The controller owns both components and their initial native browser handoff. UI requires HTTP, enabled Control UI and installed UI dependencies; it cannot be combined with --service. The initial owner link is printed after both documents are ready. A pending request keeps its one helper owned, discards late grant bytes after 30 seconds, and leaves Gateway and Vite running. Matching reuse reports the captured UI address without requesting another grant. Stop before changing --ui; the address is scoped to the session.",
         vec![format!(
             "{cmd} dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch] [--ui] [--force] [--service] [--onboard]"
         )],
@@ -1170,7 +1170,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Environments are the main isolation unit in OCM.",
-                "The root must not overlap an existing registered dev worktree, including source and destination path aliases.",
+                "The root must not overlap registered dev sources, including aliases and missing borrowed paths.",
                 "Computed gateway ports reserve the full local OpenClaw port family and skip the machine-wide OpenClaw config when present.",
                 "Use exactly one of `--runtime`, `--version`, or `--channel`.",
             ],
@@ -1199,7 +1199,8 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             vec![format!("{cmd} env clone mira rowan")],
             &[
                 "Clone resets environment identity while preserving the copied workspace and env config.",
-                "The destination root must not overlap an existing registered dev worktree, including source and destination path aliases.",
+                "Dev source bindings are not copied.",
+                "The destination root must not overlap registered dev sources, including aliases and missing borrowed paths.",
                 "Clone assigns a fresh gateway port to the new env to avoid collisions.",
                 "Computed gateway ports reserve the full local OpenClaw port family and skip the machine-wide OpenClaw config when present.",
                 "Clone rewrites env-scoped OpenClaw config paths inside the copied env root.",
@@ -1252,7 +1253,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             )],
             &[
                 "Imported environments get a fresh identity in the central env registry.",
-                "The destination root must not overlap an existing registered dev worktree, including source and destination path aliases.",
+                "The destination root must not overlap registered dev sources, including aliases and missing borrowed paths.",
                 "Import rewrites env-scoped OpenClaw config paths for the new root.",
                 "Import removes a copied public MCP app sandbox origin unless --sandbox-origin supplies a dedicated origin for the imported env.",
                 "If the config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin is owned by $include, flatten that section before importing so OCM can reset the origin without changing include ownership.",

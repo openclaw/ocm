@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde_json::Value;
-use support::{TestDir, ocm_env, run_ocm, stderr, stdout, write_executable_script, write_text};
+use support::{
+    TestDir, create_owned_dev_env, dev_plain, ocm_env, run_ocm, stderr, stdout,
+    write_executable_script, write_text,
+};
 
 struct Fixture {
     root: TestDir,
@@ -553,8 +556,19 @@ impl Fixture {
         self.run_ok(&args);
     }
 
-    fn register_child(&self) {
-        self.run_ok(&["dev", "child", "--repo", self.project.to_str().unwrap()]);
+    fn register_child(&self, borrowed: bool) {
+        let source = self.project.join(".worktrees/child");
+        let repo = if borrowed {
+            source_test_git(
+                &self.project,
+                &["worktree", "add", "--detach", ".worktrees/child"],
+            );
+            &source
+        } else {
+            create_owned_dev_env(&self.project, "child", &self.env, self.root.path());
+            &self.project
+        };
+        self.run_ok(&dev_plain(&["child", "--repo", repo.to_str().unwrap()]));
         write_text(
             &self.project.join(".worktrees/child/authored"),
             "current child work\n",
@@ -590,13 +604,15 @@ impl Fixture {
 #[test]
 fn restore_and_explicit_rollback_preserve_registered_source_and_git_identity() {
     // capture_git is irrelevant for the separately requested full snapshot.
-    for (action, capture_git, current_git, allowed) in [
-        ("full", false, true, false),
-        ("restore", false, true, false),
-        ("restore", true, false, true),
-        ("rollback", false, true, false),
-        ("rollback", true, false, false),
-        ("rollback", true, true, true),
+    for (action, capture_git, current_git, allowed, borrowed) in [
+        ("full", false, true, false, false),
+        ("restore", false, true, false, false),
+        ("restore", true, false, true, false),
+        ("rollback", false, true, false, false),
+        ("rollback", true, false, false, false),
+        ("rollback", true, true, true, false),
+        ("full", false, true, false, true),
+        ("restore", true, false, true, true),
     ] {
         let fixture = Fixture::with_dev_repo();
         fixture.source_scope(capture_git);
@@ -609,7 +625,7 @@ fn restore_and_explicit_rollback_preserve_registered_source_and_git_identity() {
         let id = capture[if action == "full" { "id" } else { "snapshotId" }]
             .as_str()
             .unwrap();
-        fixture.register_child();
+        fixture.register_child(borrowed);
         fixture.source_scope(current_git);
         if action == "full" {
             let mut meta =
@@ -631,7 +647,7 @@ fn restore_and_explicit_rollback_preserve_registered_source_and_git_identity() {
         assert_eq!(
             result.status.success(),
             allowed,
-            "{action}, captured Git={capture_git}, current Git={current_git}: {} {}",
+            "{action}, borrowed={borrowed}, captured Git={capture_git}, current Git={current_git}: {} {}",
             stdout(&result),
             stderr(&result)
         );
@@ -661,8 +677,103 @@ fn restore_and_explicit_rollback_preserve_registered_source_and_git_identity() {
             assert_eq!(stdout(&fixture.run_ok(&snapshots)), snapshots_before);
         }
         assert_eq!(fixture.child_witness(), child_before);
-        fixture.run_ok(&["dev", "child"]);
+        fixture.run_ok(&dev_plain(&["child"]));
     }
+}
+
+#[test]
+fn restore_keeps_a_missing_borrowed_checkout_reserved() {
+    let fixture = Fixture::with_dev_repo();
+    let source = fixture.project.join(".worktrees/child");
+    write_text(&source.join("captured-state"), "old environment content\n");
+    fixture.run_ok(&[
+        "env",
+        "set-independent-paths",
+        "demo",
+        ".openclaw/workspace/projects/example/.worktrees/other",
+        ".openclaw/workspace/projects/example/.git",
+    ]);
+    let capture = fixture.run_ok(&["upgrade", "demo", "--runtime", "new", "--json"]);
+    let capture: Value = serde_json::from_str(&stdout(&capture)).unwrap();
+    let id = capture["snapshotId"].as_str().unwrap();
+    fs::remove_dir_all(&source).unwrap();
+    fixture.register_child(true);
+    let child_before = fixture.child_witness();
+    let retained = fixture.root.child("retained-child");
+    fs::rename(&source, &retained).unwrap();
+    let registry = ocm::store::env_registry_path(&fixture.env, fixture.root.path()).unwrap();
+    let registry_before = fs::read(&registry).unwrap();
+    let snapshots = ["env", "snapshot", "list", "demo", "--json"];
+    let snapshots_before = stdout(&fixture.run_ok(&snapshots));
+    let restored = fixture.run(&["env", "snapshot", "restore", "demo", id]);
+    assert!(!restored.status.success());
+    assert!(
+        stderr(&restored).contains("registered dev source"),
+        "{}",
+        stderr(&restored)
+    );
+    assert!(
+        !source.exists(),
+        "restore recreated the missing borrowed checkout"
+    );
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
+    assert_eq!(stdout(&fixture.run_ok(&snapshots)), snapshots_before);
+    fs::rename(&retained, &source).unwrap();
+    assert_eq!(fixture.child_witness(), child_before);
+}
+
+#[test]
+fn restore_protects_its_own_borrowed_git_metadata() {
+    let fixture = Fixture::with_dev_repo();
+    fixture.register_child(true);
+    let source = fixture.project.join(".worktrees/child");
+    let capture = fixture.run_ok(&["env", "snapshot", "create", "child", "--json"]);
+    let capture: Value = serde_json::from_str(&stdout(&capture)).unwrap();
+    let args = [
+        "env",
+        "snapshot",
+        "restore",
+        "child",
+        capture["id"].as_str().unwrap(),
+    ];
+    let child = ocm::store::get_environment("child", &fixture.env, fixture.root.path()).unwrap();
+    fixture.run_ok(&args);
+    assert_eq!(
+        ocm::store::get_environment("child", &fixture.env, fixture.root.path())
+            .unwrap()
+            .dev,
+        child.dev
+    );
+    let identity = source_test_git(
+        &source,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    );
+    let identity = String::from_utf8(identity).unwrap();
+    let mut identity = identity.lines();
+    let private = PathBuf::from(identity.next().unwrap());
+    let common = identity.next().unwrap();
+    let moved = PathBuf::from(child.root).join(".openclaw/workspace/projects/git-private");
+    fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    fs::rename(&private, &moved).unwrap();
+    fs::write(moved.join("commondir"), format!("{common}\n")).unwrap();
+    symlink(&moved, &private).unwrap();
+    let child_before = fixture.child_witness();
+    let registry = ocm::store::env_registry_path(&fixture.env, fixture.root.path()).unwrap();
+    let registry_before = fs::read(&registry).unwrap();
+    let restored = fixture.run(&args);
+    assert!(!restored.status.success());
+    assert!(
+        stderr(&restored).contains("registered dev source"),
+        "{}",
+        stderr(&restored)
+    );
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
+    assert_eq!(fixture.child_witness(), child_before);
 }
 
 #[test]
@@ -671,7 +782,7 @@ fn upgrade_requires_safe_rollback_but_respects_no_rollback() {
     fixture
         .env
         .insert("OCM_PROOF_FAIL".to_string(), "1".to_string());
-    fixture.register_child();
+    fixture.register_child(false);
     fixture.source_scope(false);
     let child_before = fixture.child_witness();
     let registry = ocm::store::env_registry_path(&fixture.env, fixture.root.path()).unwrap();
@@ -717,9 +828,9 @@ fn upgrade_requires_safe_rollback_but_respects_no_rollback() {
     assert_eq!(fixture.child_witness(), child_before);
 }
 
-fn check_snapshot_residue_preserves_source(root_link: bool) {
+fn check_snapshot_residue_preserves_source(root_link: bool, borrowed: bool) {
     let fixture = Fixture::with_dev_repo();
-    fixture.register_child();
+    fixture.register_child(borrowed);
     fixture.run_ok(&["env", "create", "linked"]);
     let source = fixture.project.join(".worktrees/child");
     let linked = fixture.root.child("ocm-home/envs/linked");
@@ -760,12 +871,14 @@ fn check_snapshot_residue_preserves_source(root_link: bool) {
 
 #[test]
 fn snapshot_residue_cleanup_preserves_state_directory_links() {
-    check_snapshot_residue_preserves_source(false);
+    check_snapshot_residue_preserves_source(false, false);
 }
 
 #[test]
 fn snapshot_residue_cleanup_preserves_root_directory_links() {
-    check_snapshot_residue_preserves_source(true);
+    for borrowed in [false, true] {
+        check_snapshot_residue_preserves_source(true, borrowed);
+    }
 }
 
 #[test]
@@ -776,7 +889,7 @@ fn legacy_snapshot_restore_preserves_linked_registered_source() {
     };
 
     let fixture = Fixture::with_dev_repo();
-    fixture.register_child();
+    fixture.register_child(false);
     fixture.run_ok(&["env", "create", "linked"]);
     let source = fixture.project.join(".worktrees/child");
     let linked = fixture.root.child("ocm-home/envs/linked");

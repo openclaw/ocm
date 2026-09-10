@@ -69,6 +69,82 @@ impl Drop for TestDir {
     }
 }
 
+pub fn register_owned_dev_env(
+    repo: &Path,
+    worktree: &Path,
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> ocm::env::EnvMeta {
+    register_owned_dev_env_with_root(repo, worktree, name, None, env, cwd)
+}
+
+fn register_owned_dev_env_with_root(
+    repo: &Path,
+    worktree: &Path,
+    name: &str,
+    root: Option<&Path>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> ocm::env::EnvMeta {
+    ocm::env::EnvironmentService::new(env, cwd)
+        .create(ocm::env::CreateEnvironmentOptions {
+            name: name.to_string(),
+            root: root.map(path_string),
+            gateway_port: None,
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: None,
+            dev: Some(ocm::env::EnvDevMeta::Owned {
+                repo_root: path_string(&fs::canonicalize(repo).unwrap()),
+                worktree_root: path_string(worktree),
+            }),
+            protected: false,
+        })
+        .unwrap()
+}
+
+pub fn create_owned_dev_env(
+    repo: &Path,
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> PathBuf {
+    create_owned_dev_env_with_root(repo, name, None, env, cwd)
+}
+
+pub fn create_owned_dev_env_at_root(
+    repo: &Path,
+    name: &str,
+    root: &Path,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> PathBuf {
+    create_owned_dev_env_with_root(repo, name, Some(root), env, cwd)
+}
+
+fn create_owned_dev_env_with_root(
+    repo: &Path,
+    name: &str,
+    root: Option<&Path>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> PathBuf {
+    let relative = Path::new(".worktrees").join(name);
+    let created = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "add", "--detach"])
+        .arg(&relative)
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{}", stderr(&created));
+    let worktree = fs::canonicalize(repo).unwrap().join(relative);
+    register_owned_dev_env_with_root(repo, &worktree, name, root, env, cwd);
+    worktree
+}
+
 impl TestHttpServer {
     pub fn serve_bytes(path: &str, content_type: &str, body: &[u8]) -> Self {
         Self::serve_bytes_times(path, content_type, body, 1)
@@ -423,7 +499,7 @@ pub fn enable_fake_daemon_gateway_admission(
     let (started_at, process_scope) = fixture_process_ownership();
     let capability =
         serde_json::from_value::<ocm::supervisor::SupervisorGatewayAdmission>(serde_json::json!({
-            "version": 10,
+            "version": 11,
             "process": { "pid": std::process::id(), "startedAt": started_at },
             "processScope": process_scope,
         }))

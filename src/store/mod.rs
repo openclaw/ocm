@@ -42,8 +42,7 @@ pub use envs::{
 };
 pub(crate) use envs::{
     clone_environment_for_simulation, clone_environment_with_sandbox_origin,
-    create_environment_with_dev_registration, create_environment_with_validated_runtime,
-    import_environment_with_sandbox_origin,
+    create_environment_with_validated_runtime, import_environment_with_sandbox_origin,
 };
 pub(crate) use envs::{
     save_environment_with_dev_registration, save_environment_with_validated_launcher,
@@ -146,8 +145,8 @@ pub fn summarize_env(meta: &EnvMeta) -> EnvSummary {
         service_running: meta.service_running,
         default_runtime: meta.default_runtime.clone(),
         default_launcher: meta.default_launcher.clone(),
-        dev_repo_root: meta.dev.as_ref().map(|dev| dev.repo_root.clone()),
-        dev_worktree_root: meta.dev.as_ref().map(|dev| dev.worktree_root.clone()),
+        dev_repo_root: meta.dev.as_ref().map(|dev| dev.repo_root().to_string()),
+        dev_worktree_root: meta.dev.as_ref().map(|dev| dev.source_root().to_string()),
         protected: meta.protected,
         created_at: meta.created_at,
         last_used_at: meta.last_used_at,

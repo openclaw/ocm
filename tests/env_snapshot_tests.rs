@@ -393,12 +393,12 @@ fn env_snapshot_restore_preserves_the_current_complete_dev_binding() {
 
         let mut current = get_environment("source", &env, &cwd).unwrap();
         if binding != "ordinary" {
-            current.dev = Some(EnvDevMeta {
+            current.dev = Some(EnvDevMeta::Owned {
                 repo_root: path_string(&root.child("saved-repo")),
                 worktree_root: path_string(&root.child("saved-worktree")),
             });
             if binding == "dev" {
-                let repo = Path::new(&current.dev.as_ref().unwrap().repo_root);
+                let repo = Path::new(current.dev.as_ref().unwrap().repo_root());
                 write_text(&repo.join("package.json"), r#"{"name":"openclaw"}"#);
                 write_text(&repo.join("scripts/run-node.mjs"), "");
                 for args in [
@@ -490,7 +490,7 @@ fn env_snapshot_restore_preserves_the_current_complete_dev_binding() {
         if binding == "dev" {
             assert_eq!(
                 resolved.run_dir,
-                current.dev.as_ref().unwrap().worktree_root
+                current.dev.as_ref().unwrap().source_root()
             );
         }
     }
@@ -1131,7 +1131,7 @@ fn env_snapshot_restore_remains_compatible_with_legacy_tar_metadata() {
     assert_eq!(fs::read_to_string(&notes).unwrap(), "legacy-snapshot\n");
 
     let mut current = get_environment("source", &env, &cwd).unwrap();
-    current.dev = Some(EnvDevMeta {
+    current.dev = Some(EnvDevMeta::Owned {
         repo_root: path_string(&root.child("saved-repo")),
         worktree_root: path_string(&root.child("saved-worktree")),
     });

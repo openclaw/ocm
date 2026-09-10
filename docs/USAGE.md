@@ -96,7 +96,20 @@ ocm start luna --command 'pnpm openclaw' --cwd /path/to/openclaw --no-service
 
 Use this when you are developing OpenClaw locally or want a custom run command.
 
-For an isolated development worktree, use `ocm dev luna --repo /path/to/openclaw`.
+Use `ocm dev luna --repo /path/to/openclaw` to run that exact checkout with separate
+environment state. New dev environments borrow main or registered linked
+checkouts without creating a Git worktree. Outside a checkout, pass `--repo`;
+otherwise OCM can use the checkout enclosing the current directory. A resumed
+borrower keeps its canonical source path and refuses a different explicit or
+enclosing checkout. Existing OCM-owned environments retain their recorded
+worktrees and original repository selection.
+
+New borrowers may prepare missing tooling with `pnpm install --frozen-lockfile`.
+Resumed borrowers report missing tooling for explicit preparation; they do not
+reinstall dependencies. Removing a borrower preserves source files, dependencies,
+generated output, and unrelated source processes. Older OCM readers refuse the
+new binding records. Refresh an incompatible running daemon with
+`ocm service refresh-daemon --acknowledge-gateway-restarts` before registration.
 If an environment containing or owning the source or its required Git metadata is
 busy, retry dev creation or local upgrade simulation after its operation finishes.
 New dev environments publish a private config with a persistent Gateway token
@@ -454,9 +467,10 @@ ocm self update --check
 ## Environment lifecycle
 
 Environment creation, including `start` and migration, and `env clone` and
-`env import` require a root outside every registered dev worktree that exists
-on disk. The root must neither contain an existing registered source nor be
-inside it. OCM resolves source and destination aliases and also protects source
+`env import` require a root outside registered dev sources. Missing borrowed
+source paths remain reserved until their binding is removed; missing paths of
+OCM-owned worktrees can still be reused. The root must neither contain
+a registered source nor be inside it. OCM resolves source and destination aliases and also protects source
 symlinks that failed clone or import cleanup would remove. Choose a separate
 environment root.
 
@@ -470,7 +484,7 @@ before writing the destination. Check the recorded source with `ocm env show
 ocm env clone mira rowan
 ```
 
-Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. The usual next step is:
+Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Clone does not copy dev source bindings. The usual next step is:
 
 ```bash
 ocm start rowan
@@ -520,7 +534,8 @@ not add crash recovery for an uncatchable process or machine failure.
 This policy belongs to the environment registration. Clone and import start with
 an empty list. A separately requested full snapshot, export, or clone still
 includes independent content. Full snapshot restore still rewinds unregistered
-independent content and the selected environment's own source.
+independent content and the selected environment's OCM-owned worktree when those
+paths were captured inside the environment root.
 
 Restores and required rollbacks refuse checkpoints whose recorded scope would
 replace another named environment's registered dev source or required Git
@@ -531,6 +546,11 @@ and Git identity metadata, including surviving history for a missing worktree.
 Checkpoint traversal still leaves independent content opaque; post-copy updates
 and residue cleanup leave directory links untouched. Excluding only a worktree
 is insufficient when its required Git metadata remains in scope.
+Borrowed source and its known Git metadata also remain protected from a restore
+of the borrowing environment itself. Missing borrowed paths stay reserved until
+the binding is removed; an unrelated excluded sibling does not preserve that
+reservation. Select a checkpoint whose saved exclusions cover the source and
+all affected Git metadata.
 
 ### Snapshots
 

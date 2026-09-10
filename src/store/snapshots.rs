@@ -19,7 +19,10 @@ use super::checkpoints::{
     prepare_scoped_tree_checkpoint_in, remove_tree_if_present,
 };
 use super::common::{copy_path_recursive, load_json_files, path_exists, read_json, write_json};
-use super::dev_sources::{contains_existing, path_identity, registered_dev_source_footprint};
+use super::dev_sources::{
+    contains_existing, path_identity, projected_path_contains, projected_path_relative,
+    registered_dev_source_footprint,
+};
 use super::layout::{
     derive_env_paths, display_path, snapshot_archive_path, snapshot_checkpoint_path,
     snapshot_env_dir, snapshot_meta_path, validate_name,
@@ -445,10 +448,12 @@ pub(crate) fn ensure_restore_preserves_dev_sources(
     cwd: &Path,
 ) -> Result<(), String> {
     super::with_locked_environments(env, cwd, |envs| {
-        if !envs
-            .iter()
-            .any(|meta| meta.name != target.name && meta.dev.is_some())
-        {
+        let protected = |meta: &EnvMeta| {
+            meta.dev
+                .as_ref()
+                .is_some_and(|dev| meta.name != target.name || dev.borrowed_source_root().is_some())
+        };
+        if !envs.iter().any(protected) {
             return Ok(());
         }
         let target_root = Path::new(&target.root);
@@ -480,15 +485,20 @@ pub(crate) fn ensure_restore_preserves_dev_sources(
             }
             Ok(None)
         };
-        for meta in envs
-            .iter()
-            .filter(|meta| meta.name != target.name && meta.dev.is_some())
-        {
+        for meta in envs.iter().filter(|meta| protected(meta)) {
             let Some(footprint) = registered_dev_source_footprint(meta, envs).map_err(|error| {
                 format!("cannot protect dev source for env {}: {error}", meta.name)
             })?
             else {
                 continue;
+            };
+            let replacement_error = |path: &Path| {
+                format!(
+                    "restoring env {} would replace registered dev source or Git metadata for env {} at {}; choose a checkpoint that preserves the complete source and Git metadata",
+                    target.name,
+                    meta.name,
+                    display_path(path)
+                )
             };
             for (path, contents) in footprint
                 .entries
@@ -513,12 +523,19 @@ pub(crate) fn ensure_restore_preserves_dev_sources(
                         )?
                 };
                 if affected {
-                    return Err(format!(
-                        "restoring env {} would replace registered dev source or Git metadata for env {} at {}; choose a checkpoint that preserves the complete source and Git metadata",
-                        target.name,
-                        meta.name,
-                        display_path(path)
-                    ));
+                    return Err(replacement_error(path));
+                }
+            }
+            for path in &footprint.reserved_roots {
+                let affected = if let Some(relative) = projected_path_relative(&root, path)? {
+                    !independent
+                        .iter()
+                        .any(|excluded| relative.starts_with(excluded))
+                } else {
+                    projected_path_contains(path, &root)?
+                };
+                if affected {
+                    return Err(replacement_error(path));
                 }
             }
         }
