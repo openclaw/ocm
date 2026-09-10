@@ -118,7 +118,7 @@ fn dev_help_is_available_from_help_and_bare_group() {
     assert!(output.contains("ocm dev shaks --watch"));
     assert!(output.contains("ocm dev shaks --watch --force"));
     assert!(output.contains("ocm dev shaks --watch --ui"));
-    assert!(output.contains("initial native browser handoff"));
+    assert!(output.contains("each native browser handoff"));
     assert!(output.contains("ocm dev shaks --repo /path/to/openclaw --watch --force"));
     assert!(output.contains("ocm dev shaks --service"));
     assert!(output.contains("ocm help dev status"));

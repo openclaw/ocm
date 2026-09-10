@@ -1,4 +1,6 @@
 mod binding;
+#[cfg(unix)]
+pub(crate) mod dev_handoff;
 mod execution;
 mod health;
 mod inspect;

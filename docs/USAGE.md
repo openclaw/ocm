@@ -124,10 +124,13 @@ loopback address retained across stop/start for that environment. A busy retaine
 port is an error; OCM does not silently choose another address. Clone and import
 select new addresses, while snapshot restore keeps the current environment's
 reservation. Removing the environment releases it. `ocm dev status luna` and
-matching repeated starts report the address; repeated starts do not issue
-another browser grant.
+matching repeated starts report the address.
+On Linux and macOS, a matching repeated start requests a fresh native browser
+grant from the existing controller without restarting Gateway or Vite. Busy or
+unready requests report a pending link; Windows repeats still report the address.
 `ocm dev stop luna` stops the components together. A pending initial request gets
-30 seconds and retains its helper until completion; late grant bytes are discarded.
+30 seconds and retains its helper until completion. Repeated requests have the
+same deadline; late or disconnected callers' grant bytes are discarded.
 An unfinished or interrupted cleanup keeps its recorded ownership.
 UI requires HTTP, enabled Control UI and installed source UI dependencies, and
 cannot run with `--service`. Existing authentication settings remain in effect.

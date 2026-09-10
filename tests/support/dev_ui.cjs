@@ -40,6 +40,7 @@ if (role === "dashboard") {
       url: `${gatewayUrl}#token=synthetic-legacy-token`,
       gatewayPassword: "synthetic-legacy-password",
     }));
+    fs.writeFileSync(file(`dashboard-emitted-${count}`), "ready");
     process.exit(0);
   };
   const timer = setInterval(() => {

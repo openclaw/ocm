@@ -424,6 +424,7 @@ struct DevWatchFixture {
     child: Option<std::process::Child>,
     release: PathBuf,
     session: PathBuf,
+    owns_session: bool,
 }
 
 #[cfg(unix)]
@@ -449,7 +450,19 @@ impl DevWatchFixture {
             session: PathBuf::from(&env["OCM_HOME"])
                 .join("source-watch")
                 .join(format!("{}.session", args[1])),
+            owns_session: true,
         }
+    }
+
+    fn spawn_caller(
+        root: &TestDir,
+        cwd: &Path,
+        env: &std::collections::BTreeMap<String, String>,
+        args: &[&str],
+    ) -> Self {
+        let mut caller = Self::spawn(root, cwd, env, args);
+        caller.owns_session = false;
+        caller
     }
 
     fn crash_controller(&mut self) {
@@ -459,7 +472,11 @@ impl DevWatchFixture {
     }
 
     fn wait_without_release(&mut self) -> std::process::Output {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        self.wait_without_release_for(Duration::from_secs(20))
+    }
+
+    fn wait_without_release_for(&mut self, timeout: Duration) -> std::process::Output {
+        let deadline = Instant::now() + timeout;
         while self.child.as_mut().unwrap().try_wait().unwrap().is_none() {
             assert!(
                 Instant::now() < deadline,
@@ -479,7 +496,9 @@ impl DevWatchFixture {
 #[cfg(unix)]
 impl Drop for DevWatchFixture {
     fn drop(&mut self) {
-        let _ = fs::write(&self.release, "release\n");
+        if self.owns_session {
+            let _ = fs::write(&self.release, "release\n");
+        }
         if let Some(mut child) = self.child.take() {
             let deadline = Instant::now() + Duration::from_secs(2);
             while Instant::now() < deadline {
@@ -490,6 +509,9 @@ impl Drop for DevWatchFixture {
             }
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if !self.owns_session {
+            return;
         }
         if let Ok(pid) =
             fs::read_to_string(self.release.with_file_name("source-watch-descendant.pid"))
@@ -1016,12 +1038,11 @@ fn dev_ui_initial_handoff_and_owned_lifecycle() {
         let mut env = ocm_env(&root);
         let repo = prepare_initial_ui_repo(&root, &mut env);
         let repo_arg = path_string(&repo);
-        let mut args = if watch {
-            dev_watch(&["demo", "--repo", &repo_arg, "--watch"])
+        let args = if watch {
+            dev_watch(&["demo", "--repo", &repo_arg, "--watch", "--ui"])
         } else {
-            dev_plain(&["demo", "--repo", &repo_arg])
+            dev_plain(&["demo", "--repo", &repo_arg, "--ui"])
         };
-        args.push("--ui");
         if outcome == "deadline" {
             fs::write(root.child("dashboard-hold"), "hold").unwrap();
         }
@@ -1220,6 +1241,290 @@ fn dev_ui_initial_handoff_and_owned_lifecycle() {
         assert!(wait_for_process_exit(gateway_pid, Duration::from_secs(3)));
         assert!(wait_for_process_exit(ui_pid, Duration::from_secs(3)));
     }
+}
+
+#[cfg(unix)]
+fn wait_for_ui_command_cleanup(root: &TestDir) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let session = read_source_watch_session(root);
+        if session["ui"]["children"].get("command").is_none() && session["ui"]["pending"].is_null()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native helper ownership was not cleared"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn ui_dashboard_pid(root: &TestDir, attempt: usize) -> u32 {
+    let path = root.child(format!("dashboard-attempt-{attempt}"));
+    assert!(wait_for_path(&path, Duration::from_secs(5)));
+    fs::read_to_string(path).unwrap().parse().unwrap()
+}
+
+#[cfg(unix)]
+fn ui_handoff_directory(session: &Value) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let identity = serde_json::to_vec(&(
+        &session["envName"],
+        &session["envRoot"],
+        &session["leaseId"],
+    ))
+    .unwrap();
+    let digest = Sha256::digest(identity)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    PathBuf::from("/tmp").join(format!("ocm-dev-ui-{digest}"))
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_ui_reuse_gets_fresh_grants_without_restarting_components() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for watching in [false, true] {
+        let root = TestDir::new("ui-fresh-reuse");
+        let mut env = ocm_env(&root);
+        let repo = prepare_initial_ui_repo(&root, &mut env);
+        let repo_arg = path_string(&repo);
+        let args = if watching {
+            dev_watch(&["demo", "--repo", &repo_arg, "--watch", "--ui"])
+        } else {
+            dev_plain(&["demo", "--repo", &repo_arg, "--ui"])
+        };
+        fs::write(root.child("gateway-document-ready"), "ready").unwrap();
+        let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &args);
+        let gateway = initial_ui_process(&root, "gateway", &mut controller);
+        let ui = initial_ui_process(&root, "ui", &mut controller);
+        ui_dashboard_pid(&root, 1);
+        wait_for_ui_command_cleanup(&root);
+        let initial = read_source_watch_session(&root);
+        assert_eq!(initial["kind"], "ocm-source-ui-session-v1");
+        assert_eq!(initial["watching"], watching);
+        for attempt in [2, 3] {
+            let mut caller = DevWatchFixture::spawn_caller(&root, &repo, &env, &args);
+            let reused = caller.wait_without_release_for(Duration::from_secs(5));
+            assert!(reused.status.success(), "{}", stderr(&reused));
+            let output = stdout(&reused);
+            let link = output
+                .lines()
+                .find_map(|line| line.strip_prefix("UI: "))
+                .unwrap();
+            assert!(link.contains(&format!("bootstrapToken=synthetic-owner-grant-{attempt}")));
+            assert_eq!(
+                url::Url::parse(link).unwrap().port(),
+                Some(ui["port"].as_u64().unwrap() as u16)
+            );
+            assert!(!output.contains("synthetic-legacy"));
+            let current = read_source_watch_session(&root);
+            assert_eq!(current["controller"], initial["controller"]);
+            assert_eq!(current["leaseId"], initial["leaseId"]);
+            assert_eq!(current["ui"], initial["ui"]);
+            for process in [&gateway, &ui] {
+                assert!(process_is_alive(process["pid"].as_u64().unwrap() as u32));
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(root.child("dashboard-attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        let stopped = run_dev_stop(&repo, &env);
+        assert!(stopped.status.success(), "{}", stderr(&stopped));
+        let output = controller.wait_without_release();
+        assert_eq!(output.status.code(), Some(130));
+        assert!(stdout(&output).contains("synthetic-owner-grant-1"));
+        assert!(!stdout(&output).contains("synthetic-owner-grant-2"));
+        assert!(!stdout(&output).contains("synthetic-owner-grant-3"));
+        assert!(!ui_handoff_directory(&initial).exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_ui_reuse_discards_disconnected_callers_and_closes_pending_requests_on_stop() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = TestDir::new("ui-reuse-owned-helper");
+    let mut env = ocm_env(&root);
+    let repo = prepare_initial_ui_repo(&root, &mut env);
+    let repo_arg = path_string(&repo);
+    let args = dev_plain(&["demo", "--repo", &repo_arg, "--ui"]);
+    fs::write(root.child("gateway-document-ready"), "ready").unwrap();
+    let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &args);
+    let gateway = initial_ui_process(&root, "gateway", &mut controller);
+    let ui = initial_ui_process(&root, "ui", &mut controller);
+    ui_dashboard_pid(&root, 1);
+    wait_for_ui_command_cleanup(&root);
+    fs::write(root.child("dashboard-hold"), "hold").unwrap();
+    let mut requester = DevWatchFixture::spawn_caller(&root, &repo, &env, &args);
+    let helper = ui_dashboard_pid(&root, 2);
+    let session = read_source_watch_session(&root);
+    assert_eq!(
+        session["controller"]["pid"],
+        controller.child.as_ref().unwrap().id()
+    );
+    assert_eq!(session["ui"]["children"]["command"]["pid"], helper);
+    assert_eq!(session["ui"]["children"].as_object().unwrap().len(), 3);
+    for crash in [false, true] {
+        if crash {
+            requester.crash_controller();
+        }
+        let mut busy = DevWatchFixture::spawn_caller(&root, &repo, &env, &args);
+        let output = busy.wait_without_release_for(Duration::from_secs(5));
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(stdout(&output).contains("ui_url="));
+        assert!(!stdout(&output).contains("bootstrapToken"));
+        assert_eq!(read_source_watch_session(&root)["ui"], session["ui"]);
+        assert!(process_is_alive(helper));
+        assert_eq!(
+            fs::read_to_string(root.child("dashboard-attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+    fs::remove_file(root.child("dashboard-hold")).unwrap();
+    assert!(wait_for_path(
+        &root.child("dashboard-emitted-2"),
+        Duration::from_secs(5)
+    ));
+    wait_for_ui_command_cleanup(&root);
+    assert!(wait_for_process_exit(helper, Duration::from_secs(3)));
+    let mut fresh = DevWatchFixture::spawn_caller(&root, &repo, &env, &args);
+    let output = fresh.wait_without_release_for(Duration::from_secs(5));
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("synthetic-owner-grant-3"));
+    assert!(!stdout(&output).contains("synthetic-owner-grant-2"));
+
+    thread::scope(|scope| {
+        // On a failed assertion, close the owner before scoped connectors join.
+        let mut controller = controller;
+        fs::write(root.child("dashboard-hold"), "hold").unwrap();
+        let mut pending = DevWatchFixture::spawn_caller(&root, &repo, &env, &args);
+        let helper = ui_dashboard_pid(&root, 4);
+        let socket_dir = ui_handoff_directory(&session);
+        assert!(socket_dir.join("socket").exists());
+        let controller_pid = controller.child.as_ref().unwrap().id();
+        assert_eq!(
+            unsafe { libc::kill(controller_pid as i32, libc::SIGSTOP) },
+            0
+        );
+        assert!(wait_for_process_stop(
+            controller_pid,
+            Duration::from_secs(3)
+        ));
+        const QUEUED_CALLERS: usize = 8;
+        let ready = Arc::new(std::sync::Barrier::new(QUEUED_CALLERS + 1));
+        let (completed, results) = std::sync::mpsc::channel();
+        let queued = (0..QUEUED_CALLERS)
+            .map(|_| {
+                let endpoint = socket_dir.join("socket");
+                let ready = Arc::clone(&ready);
+                let completed = completed.clone();
+                scope.spawn(move || {
+                    ready.wait();
+                    let connection =
+                        std::os::unix::net::UnixStream::connect(endpoint).and_then(|stream| {
+                            stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+                            Ok(stream)
+                        });
+                    let _ = completed.send(connection.as_ref().map(|_| ()).map_err(|e| e.kind()));
+                    connection
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(completed);
+        ready.wait();
+        let mut admitted = 0;
+        while let Ok(result) = results.recv_timeout(Duration::from_millis(500)) {
+            match result {
+                Ok(()) => admitted += 1,
+                // Darwin refuses a full backlog; Linux waits for admission.
+                Err(error) => assert_eq!(error, std::io::ErrorKind::ConnectionRefused),
+            }
+        }
+        assert!(
+            admitted > 0 && admitted < QUEUED_CALLERS,
+            "request queue did not fill"
+        );
+        let mut stopper =
+            DevWatchFixture::spawn_caller(&root, &repo, &env, &["dev", "stop", "demo", "--json"]);
+        let output = pending.wait_without_release_for(Duration::from_secs(5));
+        assert!(!stdout(&output).contains("bootstrapToken"));
+        assert!(!socket_dir.exists());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queued.iter().any(|client| !client.is_finished()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        for client in queued {
+            assert!(
+                client.is_finished(),
+                "queued connection survived listener closure"
+            );
+            if let Ok(mut stream) = client.join().unwrap() {
+                assert!(match stream.read(&mut [0; 1]) {
+                    Ok(0) => true,
+                    Err(error) => error.kind() == std::io::ErrorKind::ConnectionReset,
+                    _ => false,
+                });
+            }
+        }
+        assert!(std::os::unix::net::UnixStream::connect(socket_dir.join("socket")).is_err());
+        for process in [&gateway, &ui] {
+            assert!(wait_for_process_exit(
+                process["pid"].as_u64().unwrap() as u32,
+                Duration::from_secs(5)
+            ));
+        }
+        assert!(
+            process_is_alive(helper),
+            "stop shortened the original native helper budget"
+        );
+        assert!(
+            stopper
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        let stopping = read_source_watch_session(&root);
+        assert_eq!(stopping["closed"], false);
+        assert_eq!(stopping["ui"]["children"]["command"]["pid"], helper);
+        fs::remove_file(root.child("dashboard-hold")).unwrap();
+        assert!(wait_for_path(
+            &root.child("dashboard-emitted-4"),
+            Duration::from_secs(5)
+        ));
+        let stopped = stopper.wait_without_release();
+        assert!(stopped.status.success(), "{}", stderr(&stopped));
+        let output = controller.wait_without_release();
+        assert_eq!(output.status.code(), Some(130));
+        assert!(stdout(&output).contains("synthetic-owner-grant-1"));
+        for attempt in 2..=4 {
+            assert!(!stdout(&output).contains(&format!("synthetic-owner-grant-{attempt}")));
+        }
+        assert!(wait_for_process_exit(helper, Duration::from_secs(3)));
+        let closed = read_source_watch_session(&root);
+        assert_eq!(closed["closed"], true);
+        assert!(closed["ui"]["children"].as_object().unwrap().is_empty());
+        assert!(closed["ui"]["pending"].is_null());
+        assert!(!source_watch_override_path(&root, "demo").exists());
+        assert!(!socket_dir.exists());
+    });
 }
 
 #[cfg(unix)]
@@ -4929,6 +5234,7 @@ setInterval(() => { if (fs.existsSync(path.join(root,'source-watch.release'))) p
         let terminal_drain = PtyOutputDrain::start(terminal);
         let mut watch = DevWatchFixture {
             child: Some(child),
+            owns_session: true,
             release: root.child("source-watch.release"),
             session: source_watch_override_path(&root, "demo").with_extension("session"),
         };

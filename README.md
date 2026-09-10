@@ -150,15 +150,19 @@ the Gateway identity and credentials; only the browser document moves to Vite.
 UI requires a local HTTP Gateway with Control UI enabled and installed UI dependencies.
 It cannot be combined with `--service`.
 
-The controller owns Gateway, Vite and the initial dashboard helper. A component
+The controller owns Gateway, Vite and each dashboard helper. A component
 exit stops its sibling; `dev stop` stops both and gives a running helper only the
 remainder of its original 30-second budget. A late link is discarded, and uncertain
-cleanup retains ownership. Repeating the matching command reports the current
-address without starting another helper. The UI address is retained across
-stop/start for the same environment. If that address is occupied or reserved,
-startup fails until it is free. Cloned and imported environments select their own
-addresses; restore keeps the current environment's address. Stop the session
-before changing UI mode or requesting a new initial owner link.
+cleanup retains ownership. On Linux and macOS, repeating the matching command
+requests a fresh native owner link from that controller while keeping Gateway,
+Vite and their address unchanged. One helper runs at a time; busy or unready
+requests report a pending link. Requests have a 30-second deadline, and a caller
+that exits or times out cannot redirect its eventual grant to another terminal.
+Windows repeated commands continue to report the address. The UI address is
+retained across stop/start for the same environment. If that address is occupied
+or reserved, startup fails until it is free. Cloned and imported environments
+select their own addresses; restore keeps the current environment's address.
+Stop the session before changing UI mode.
 
 If you already have a plain `~/.openclaw` home you care about, use `ocm migrate <env>` instead of starting fresh. `setup` and `start` now point that out when they detect an existing plain OpenClaw home.
 
