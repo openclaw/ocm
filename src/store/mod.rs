@@ -1,7 +1,7 @@
 mod checkpoint_scope;
 mod checkpoints;
 mod common;
-mod dev_sources;
+pub(crate) mod dev_sources;
 mod envs;
 mod gateway_ports;
 mod launchers;
@@ -25,6 +25,7 @@ pub(crate) use common::{
     ExclusiveFileLock, copy_dir_recursive, ensure_dir, lock_file, read_json, try_lock_file,
     write_json,
 };
+pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
 pub(crate) use envs::{
     EnvironmentOperationLock, lock_env_registry, lock_environment_operation,
     remove_environment_locked,

@@ -392,49 +392,49 @@ impl Cli {
             summary.service_uninstalled = true;
         }
 
-        if expected_state_token.is_some() {
-            summary.processes_terminated =
-                match self.terminate_env_processes_exact(&summary.process_candidates) {
-                    Ok(count) => count,
-                    Err(error) => {
-                        summary.processes_terminated = error.terminated;
-                        summary.code = Some("partial_apply".to_string());
-                        summary.blockers.push(format!(
-                            "process teardown failed after environment teardown began: {}",
-                            error.message
-                        ));
-                        if json_flag {
-                            self.print_json(&summary)?;
-                        } else {
-                            self.stdout_lines(render::env::env_destroy_preview(
-                                &summary,
-                                profile,
-                                &self.command_example(),
+        let removal = self.environment_service().remove_with_cleanup_locked(name, force, |meta| {
+            if expected_state_token.is_some() {
+                summary.processes_terminated =
+                    match self.terminate_env_processes_exact(&summary.process_candidates) {
+                        Ok(count) => count,
+                        Err(error) => {
+                            summary.processes_terminated = error.terminated;
+                            summary.code = Some("partial_apply".to_string());
+                            summary.blockers.push(format!(
+                                "process teardown failed after environment teardown began: {}",
+                                error.message
                             ));
+                            return Err(error.message);
                         }
-                        return Ok(1);
-                    }
-                };
-        } else {
-            summary.processes_terminated = self.terminate_env_processes(&env_meta)?;
-        }
-        let process_change = if expected_state_token.is_some() {
-            match self.destroy_process_candidates(&env_meta) {
-                Ok(candidates) if candidates.is_empty() => None,
-                Ok(_) => Some(
-                    "environment process state changed after teardown began; preview again to finish cleanup"
-                        .to_string(),
-                ),
-                Err(error) => Some(format!(
-                    "process state could not be verified after teardown began: {error}"
-                )),
+                    };
+            } else {
+                summary.processes_terminated = self.terminate_env_processes(meta)?;
             }
-        } else {
-            None
-        };
-        if let Some(blocker) = process_change {
-            summary.code = Some("partial_apply".to_string());
-            summary.blockers.push(blocker);
+            let process_change = if expected_state_token.is_some() {
+                match self.destroy_process_candidates(meta) {
+                    Ok(candidates) if candidates.is_empty() => None,
+                    Ok(_) => Some(
+                        "environment process state changed after teardown began; preview again to finish cleanup"
+                            .to_string(),
+                    ),
+                    Err(error) => Some(format!(
+                        "process state could not be verified after teardown began: {error}"
+                    )),
+                }
+            } else {
+                None
+            };
+            if let Some(blocker) = process_change {
+                summary.code = Some("partial_apply".to_string());
+                summary.blockers.push(blocker.clone());
+                return Err(blocker);
+            }
+            Ok(())
+        });
+        if let Err(error) = removal {
+            if summary.code.as_deref() != Some("partial_apply") {
+                return Err(error);
+            }
             if json_flag {
                 self.print_json(&summary)?;
             } else {
@@ -447,7 +447,6 @@ impl Cli {
             return Ok(1);
         }
 
-        self.environment_service().remove_locked(name, force)?;
         let _ = &operation_lock;
         summary.removed = true;
         summary.worktree_removed = env_meta
@@ -1240,6 +1239,15 @@ impl Cli {
         let mut snapshots = self.environment_service().list_snapshots(Some(name))?;
         snapshots.sort_by(|left, right| left.id.cmp(&right.id));
         let mut blockers = Vec::new();
+        let source_blocked = if let Err(error) =
+            crate::store::with_locked_environments(&self.env, &self.cwd, |envs| {
+                crate::store::ensure_environment_removal_preserves_dev_sources(&env_meta, envs)
+            }) {
+            blockers.push(error);
+            true
+        } else {
+            false
+        };
         let source_watch_session = self
             .environment_service()
             .source_watch_session(name)?
@@ -1255,7 +1263,7 @@ impl Cli {
         // its generation-bound protocol before taking the ordinary stable
         // process snapshot; a token-guarded apply refuses unfinished sessions.
         let process_inspection_deferred = source_watch_session.is_some() || source_watch_active;
-        let process_candidates = if process_inspection_deferred {
+        let process_candidates = if process_inspection_deferred || source_blocked {
             Vec::new()
         } else {
             self.destroy_process_candidates(&env_meta)?

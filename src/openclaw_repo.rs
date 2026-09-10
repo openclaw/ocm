@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -421,7 +422,7 @@ pub(crate) fn ensure_openclaw_worktree(
     let worktree_argument = worktree_root
         .strip_prefix(&repo_root)
         .map_err(|_| "OCM-owned worktree destination is outside its repository".to_string())?;
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(&repo_root)
         .args(["worktree", "add", "--detach"])
@@ -514,7 +515,7 @@ fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), Strin
         return Ok(());
     }
 
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(worktree_root)
         .args([
@@ -549,7 +550,7 @@ fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), Strin
 fn remove_registered_worktree(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
     ensure_worktree_clean(worktree_root)?;
 
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_root)
         .args(["worktree", "remove", "--force"])
@@ -571,7 +572,7 @@ fn ensure_worktree_clean(worktree_root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let output = Command::new("git")
+    let output = git_command()
         .args(["-c", "status.showUntrackedFiles=all"])
         .arg("-C")
         .arg(worktree_root)
@@ -601,7 +602,7 @@ fn ensure_worktree_clean(worktree_root: &Path) -> Result<(), String> {
 }
 
 fn ensure_no_ignored_local_files(worktree_root: &Path) -> Result<(), String> {
-    let worktree_output = Command::new("git")
+    let worktree_output = git_command()
         .arg("-C")
         .arg(worktree_root)
         .args([
@@ -624,7 +625,7 @@ fn ensure_no_ignored_local_files(worktree_root: &Path) -> Result<(), String> {
         return Err(format!("git ignored-file inspection failed: {detail}"));
     }
 
-    let submodule_output = Command::new("git")
+    let submodule_output = git_command()
         .arg("-C")
         .arg(worktree_root)
         .args([
@@ -674,7 +675,7 @@ fn is_disposable_ignored_path(path: &Path) -> bool {
 }
 
 fn registered_worktree_paths(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_root)
         .args(["worktree", "list", "--porcelain", "-z"])
@@ -684,7 +685,7 @@ fn registered_worktree_paths(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
         return parse_registered_worktree_paths(&output.stdout);
     }
 
-    let fallback = Command::new("git")
+    let fallback = git_command()
         .arg("-C")
         .arg(repo_root)
         .args([
@@ -779,7 +780,7 @@ fn is_existing_openclaw_worktree(repo_root: &Path, path: &Path) -> bool {
     detect_openclaw_checkout(path).is_some() && has_expected_worktree_identity(repo_root, path)
 }
 
-fn has_expected_worktree_identity(repo_root: &Path, path: &Path) -> bool {
+pub(crate) fn has_expected_worktree_identity(repo_root: &Path, path: &Path) -> bool {
     path.exists()
         && path.join(".git").exists()
         && git_top_level(path).is_some_and(|top_level| {
@@ -793,8 +794,139 @@ fn has_expected_worktree_identity(repo_root: &Path, path: &Path) -> bool {
         })
 }
 
-fn git_common_dir(path: &Path) -> Option<PathBuf> {
+pub(crate) fn git_common_dir(path: &Path) -> Option<PathBuf> {
     git_rev_parse_path(path, "--git-common-dir")
+}
+
+pub(crate) struct GitIdentityPaths {
+    pub(crate) entries: Vec<PathBuf>,
+    pub(crate) private_dir: PathBuf,
+    pub(crate) common_dir: PathBuf,
+    pub(crate) worktree_entry: Option<PathBuf>,
+}
+
+// Keep raw pointer paths: Git's resolved query output can erase an intermediate
+// symlink whose removal would break the recorded entry point.
+pub(crate) fn git_identity_paths(root: &Path) -> Result<Option<GitIdentityPaths>, String> {
+    match fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    }
+    let mut git_entry = None;
+    for ancestor in root.ancestors() {
+        let candidate = ancestor.join(".git");
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => {
+                git_entry = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let Some(git_entry) = git_entry.or_else(|| git_rev_parse_path(root, "--git-dir")) else {
+        return Ok(None); // Missing/non-Git tuples remain valid store inputs.
+    };
+    let private_dir = if fs::metadata(&git_entry)
+        .map_err(|error| error.to_string())?
+        .is_dir()
+    {
+        git_entry.clone()
+    } else {
+        read_git_pointer(&git_entry, git_entry.parent().unwrap(), b"gitdir: ")?
+            .ok_or_else(|| format!("Git entry disappeared: {}", display_path(&git_entry)))?
+    };
+    let mut identity = git_registration_paths(&private_dir)?;
+    identity.entries.push(git_entry);
+    Ok(Some(identity))
+}
+
+pub(crate) fn git_registration_paths(private_dir: &Path) -> Result<GitIdentityPaths, String> {
+    let mut entries = Vec::new();
+    let common_pointer = private_dir.join("commondir");
+    let common_dir = if let Some(common) = read_git_pointer(&common_pointer, &private_dir, b"")? {
+        entries.push(common_pointer);
+        common
+    } else {
+        private_dir.to_path_buf()
+    };
+    let backlink = private_dir.join("gitdir");
+    let worktree_entry = read_git_pointer(&backlink, private_dir, b"")?;
+    if worktree_entry.is_some() {
+        entries.push(backlink);
+    }
+    Ok(GitIdentityPaths {
+        entries,
+        private_dir: private_dir.to_path_buf(),
+        common_dir,
+        worktree_entry,
+    })
+}
+
+pub(crate) fn worktree_registration_entries(
+    repo: &Path,
+    root: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let Some(identity) = git_identity_paths(repo)? else {
+        return Ok(Vec::new());
+    };
+    git_registration_entries(&identity.common_dir, root)
+}
+
+pub(crate) fn git_registration_entries(common: &Path, root: &Path) -> Result<Vec<PathBuf>, String> {
+    let common = fs::canonicalize(common).map_err(|error| error.to_string())?;
+    let expected = normalize_worktree_path(root);
+    let mut entries = Vec::new();
+    let slots = match fs::read_dir(common.join("worktrees")) {
+        Ok(slots) => slots,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in slots {
+        let entry = entry.map_err(|error| error.to_string())?.path();
+        if let Some(backlink) = read_git_pointer(&entry.join("gitdir"), &entry, b"")?
+            && backlink.file_name().is_some_and(|name| name == ".git")
+            && backlink
+                .parent()
+                .is_some_and(|parent| normalize_worktree_path(parent) == expected)
+        {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn read_git_pointer(path: &Path, base: &Path, prefix: &[u8]) -> Result<Option<PathBuf>, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !metadata.is_file() || metadata.len() > 65536 {
+        return Err(format!(
+            "invalid Git identity pointer: {}",
+            display_path(path)
+        ));
+    }
+    let mut contents = Vec::new();
+    fs::File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(65537)
+        .read_to_end(&mut contents)
+        .map_err(|error| error.to_string())?;
+    let value = trim_git_line(&contents)
+        .strip_prefix(prefix)
+        .filter(|value| !value.is_empty() && contents.len() <= 65536)
+        .ok_or_else(|| format!("invalid Git identity pointer: {}", display_path(path)))?;
+    let target = PathBuf::from(git_path_from_bytes(value)?);
+    // Do not collapse '..' before preceding symlinks have been followed.
+    Ok(Some(if target.is_absolute() {
+        target
+    } else {
+        base.join(target)
+    }))
 }
 
 fn git_top_level(path: &Path) -> Option<PathBuf> {
@@ -813,8 +945,19 @@ fn git_worktree_backlink(path: &Path) -> Option<PathBuf> {
     }
 }
 
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    // Inspection and mutation must use the checkout and index selected by -C.
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    command
+}
+
 fn git_rev_parse_path(path: &Path, selector: &str) -> Option<PathBuf> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", selector])

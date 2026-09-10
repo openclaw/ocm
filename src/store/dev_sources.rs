@@ -1,7 +1,8 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::env::EnvMeta;
+use crate::env::{EnvDevMeta, EnvMeta};
 
 use super::display_path;
 
@@ -31,14 +32,14 @@ fn destination_ancestor(path: &Path) -> Result<(PathBuf, bool), String> {
 }
 
 #[cfg(unix)]
-fn path_identity(path: &Path) -> Result<(u64, u64), String> {
+pub(crate) fn path_identity(path: &Path) -> Result<(u64, u64), String> {
     use std::os::unix::fs::MetadataExt;
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(windows)]
-fn path_identity(path: &Path) -> Result<(u64, u64), String> {
+pub(crate) fn path_identity(path: &Path) -> Result<(u64, u64), String> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -63,11 +64,11 @@ fn path_identity(path: &Path) -> Result<(u64, u64), String> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn path_identity(_path: &Path) -> Result<(u64, u64), String> {
+pub(crate) fn path_identity(_path: &Path) -> Result<(u64, u64), String> {
     Err("cannot establish dev source identity on this platform".to_string())
 }
 
-fn contains_existing(root: &Path, path: &Path) -> Result<bool, String> {
+pub(crate) fn contains_existing(root: &Path, path: &Path) -> Result<bool, String> {
     if path.starts_with(root) {
         return Ok(true);
     }
@@ -78,6 +79,284 @@ fn contains_existing(root: &Path, path: &Path) -> Result<bool, String> {
         }
     }
     Ok(false)
+}
+
+fn existing_cleanup_path(path: &Path) -> Result<Option<PathBuf>, String> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to resolve cleanup path {}: {error}",
+            display_path(path)
+        )),
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SourceFootprint {
+    pub(crate) entries: BTreeSet<PathBuf>,
+    pub(crate) content_roots: BTreeSet<PathBuf>,
+}
+
+fn record_path_entries(
+    path: &Path,
+    entries: &mut BTreeSet<PathBuf>,
+    links: &mut BTreeSet<PathBuf>,
+) -> Result<PathBuf, String> {
+    let resolved = fs::canonicalize(path).map_err(|error| {
+        format!(
+            "cannot resolve source identity path {}: {error}",
+            display_path(path)
+        )
+    })?;
+    entries.insert(resolved.clone());
+    for ancestor in path.ancestors() {
+        if !fs::symlink_metadata(ancestor)
+            .map_err(|error| error.to_string())?
+            .is_symlink()
+        {
+            continue;
+        }
+        let parent = ancestor.parent().ok_or("source symlink has no parent")?;
+        let entry = fs::canonicalize(parent)
+            .map_err(|error| error.to_string())?
+            .join(ancestor.file_name().ok_or("source symlink has no name")?);
+        entries.insert(entry.clone());
+        if links.insert(entry) {
+            let target = fs::read_link(ancestor).map_err(|error| error.to_string())?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                parent.join(target)
+            };
+            record_path_entries(&target, entries, links)?;
+        }
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn existing_source_path_entries(path: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    let mut entries = BTreeSet::new();
+    record_path_entries(path, &mut entries, &mut BTreeSet::new())?;
+    Ok(entries)
+}
+
+fn append_git_footprint(
+    footprint: &mut SourceFootprint,
+    git: crate::openclaw_repo::GitIdentityPaths,
+    include_worktree_entry: bool,
+    links: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    for path in git.entries {
+        record_path_entries(&path, &mut footprint.entries, links)?;
+    }
+    if include_worktree_entry && let Some(path) = git.worktree_entry {
+        record_path_entries(&path, &mut footprint.entries, links)?;
+    }
+    for path in [git.private_dir, git.common_dir] {
+        let resolved = record_path_entries(&path, &mut footprint.entries, links)?;
+        footprint.content_roots.insert(resolved);
+    }
+    Ok(())
+}
+
+// This primitive describes existing paths, not source eligibility. Registration
+// may retain absent/non-Git tuples; callers own that policy and path reservations.
+pub(crate) fn inspect_source_footprint(root: &Path) -> Result<SourceFootprint, String> {
+    let mut footprint = SourceFootprint::default();
+    if existing_cleanup_path(root)?.is_none() {
+        return Ok(footprint);
+    }
+    footprint.entries = existing_source_path_entries(root)?;
+    let mut links = BTreeSet::new();
+    if let Some(git) = crate::openclaw_repo::git_identity_paths(root)? {
+        let registrations = match git.worktree_entry.as_ref().and_then(|path| path.parent()) {
+            Some(worktree) => {
+                crate::openclaw_repo::git_registration_entries(&git.common_dir, worktree)?
+            }
+            None => Vec::new(),
+        };
+        append_git_footprint(&mut footprint, git, true, &mut links)?;
+        for path in registrations {
+            append_git_footprint(
+                &mut footprint,
+                crate::openclaw_repo::git_registration_paths(&path)?,
+                true,
+                &mut links,
+            )?;
+        }
+    }
+    Ok(footprint)
+}
+
+pub(crate) fn inspect_dev_source_metadata(dev: &EnvDevMeta) -> Result<SourceFootprint, String> {
+    let mut footprint = inspect_source_footprint(Path::new(&dev.repo_root))?;
+    let mut links = BTreeSet::new();
+    for path in crate::openclaw_repo::worktree_registration_entries(
+        Path::new(&dev.repo_root),
+        Path::new(&dev.worktree_root),
+    )? {
+        // Missing working files do not discard the slot's recoverable history.
+        // Preserve existing metadata, without reserving the absent .git entry.
+        append_git_footprint(
+            &mut footprint,
+            crate::openclaw_repo::git_registration_paths(&path)?,
+            false,
+            &mut links,
+        )?;
+    }
+    Ok(footprint)
+}
+
+pub(crate) fn inspect_dev_source_footprint(dev: &EnvDevMeta) -> Result<SourceFootprint, String> {
+    let mut footprint = inspect_dev_source_metadata(dev)?;
+    let worktree = inspect_source_footprint(Path::new(&dev.worktree_root))?;
+    footprint.entries.extend(worktree.entries);
+    footprint.content_roots.extend(worktree.content_roots);
+    if let Some(source) = existing_cleanup_path(Path::new(&dev.worktree_root))? {
+        footprint.content_roots.insert(source);
+    }
+    Ok(footprint)
+}
+
+pub(crate) fn registered_dev_source_footprint(
+    dev: &EnvDevMeta,
+) -> Result<Option<SourceFootprint>, String> {
+    if existing_cleanup_path(Path::new(&dev.worktree_root))?.is_some()
+        && !crate::openclaw_repo::has_expected_worktree_identity(
+            Path::new(&dev.repo_root),
+            Path::new(&dev.worktree_root),
+        )
+    {
+        return Err(format!(
+            "cannot verify Git identity for registered dev source {}",
+            dev.worktree_root
+        ));
+    }
+    let footprint = inspect_dev_source_footprint(dev)?;
+    Ok((!footprint.entries.is_empty()).then_some(footprint))
+}
+
+pub(crate) fn ensure_environment_removal_preserves_dev_sources(
+    target: &EnvMeta,
+    envs: &[EnvMeta],
+) -> Result<(), String> {
+    let mut footprints = Vec::new();
+    for meta in envs.iter().filter(|meta| meta.name != target.name) {
+        let Some(dev) = &meta.dev else { continue };
+        // Creation can reuse a missing worktree path for new env state. That
+        // state belongs to the new env; retain only the old record's repo data.
+        let replaced = if fs::symlink_metadata(Path::new(&dev.worktree_root).join(".git"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            match (
+                existing_cleanup_path(Path::new(&dev.worktree_root))?,
+                existing_cleanup_path(Path::new(&target.root))?,
+            ) {
+                (Some(source), Some(root)) => path_identity(&source)? == path_identity(&root)?,
+                _ => false,
+            }
+        } else {
+            false
+        };
+        let footprint = if replaced {
+            Some(inspect_dev_source_metadata(dev)?)
+        } else {
+            registered_dev_source_footprint(dev)?
+        };
+        if let Some(footprint) = footprint {
+            footprints.push((meta.name.as_str(), footprint));
+        }
+    }
+    if footprints.is_empty() {
+        return Ok(());
+    }
+    let root_path = Path::new(&target.root);
+    let root = existing_cleanup_path(root_path)?;
+    let worktree = target
+        .dev
+        .as_ref()
+        .map(|dev| existing_cleanup_path(Path::new(&dev.worktree_root)))
+        .transpose()?
+        .flatten();
+    // Removing a final symlink also changes its containing source, even when
+    // the link resolves outside that source (or its destination is missing).
+    let entry_parent = if fs::symlink_metadata(root_path).is_ok_and(|meta| meta.is_symlink()) {
+        root_path
+            .parent()
+            .map(existing_cleanup_path)
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let mut registrations = Vec::new();
+    let mut registration_links = Vec::new();
+    if let Some(dev) = &target.dev {
+        for path in crate::openclaw_repo::worktree_registration_entries(
+            Path::new(&dev.repo_root),
+            Path::new(&dev.worktree_root),
+        )? {
+            if fs::symlink_metadata(&path)
+                .map_err(|error| error.to_string())?
+                .is_symlink()
+            {
+                // Git unlinks the administrative slot itself, not its referent.
+                let parent =
+                    fs::canonicalize(path.parent().unwrap()).map_err(|error| error.to_string())?;
+                registration_links.push(parent.join(path.file_name().unwrap()));
+            } else {
+                registrations.push(fs::canonicalize(path).map_err(|error| error.to_string())?);
+            }
+        }
+    }
+    if root.is_none()
+        && worktree.is_none()
+        && entry_parent.is_none()
+        && registrations.is_empty()
+        && registration_links.is_empty()
+    {
+        return Ok(());
+    }
+    let preserve = |path: &Path, owner: &str, contents: bool| -> Result<(), String> {
+        let mut affected = false;
+        // An owned child worktree may be removed from inside another source.
+        // Refuse only when that worktree itself contains a protected path.
+        for (root, symmetric) in [(root.as_ref(), true), (worktree.as_ref(), false)] {
+            if let Some(root) = root {
+                affected |= contains_existing(root, path)?
+                    || (symmetric && contents && contains_existing(path, root)?);
+            }
+        }
+        if let Some(parent) = &entry_parent
+            && contents
+        {
+            affected |= contains_existing(path, parent)?;
+        }
+        for root in &registrations {
+            affected |= contains_existing(root, path)?;
+        }
+        for entry in &registration_links {
+            affected |= path_identity(entry)? == path_identity(path)?;
+        }
+        if affected {
+            return Err(format!(
+                "cleanup for env {} would affect registered dev source for env {owner} at {}; remove the dependent dev env first",
+                target.name,
+                display_path(path)
+            ));
+        }
+        Ok(())
+    };
+    for (owner, footprint) in footprints {
+        for path in &footprint.entries {
+            preserve(path, owner, false)?;
+        }
+        for path in &footprint.content_roots {
+            preserve(path, owner, true)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_root_outside_dev_sources(

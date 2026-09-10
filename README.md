@@ -327,6 +327,8 @@ Environment creation, cloning, and import reject roots that overlap an already
 registered dev worktree that exists on disk, including source and destination
 path aliases. Choose a separate environment root to preserve the checkout.
 
+Removal, pruning, destroy, and simulation cleanup preserve other registered dev sources and the Git metadata they need. Remove dependent dev environments before deleting their containing environment or worktree.
+
 ### Try beta or pin a specific release
 
 ```bash

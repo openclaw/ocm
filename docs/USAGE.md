@@ -643,6 +643,10 @@ by an older OCM without usable stop ownership must be stopped from its original
 terminal. Environment removal clears completed watch records and retains the
 reusable synchronization lock files.
 
+Cleanup refuses to remove another registered dev source or its required Git
+metadata, including sources reached through path aliases. Destroy checks before
+signalling source workers; simulation checks before discarding generated files.
+
 `destroy` is the stronger cleanup path.
 
 ## Updating `ocm` itself

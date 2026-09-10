@@ -1549,6 +1549,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 "An ordinary --yes apply first stops and verifies the recorded source-watch generation. Unverifiable ownership blocks removal.",
                 "Guarded --if-state-token apply requires a stopped watch: run dev stop, then request a fresh destroy preview.",
                 "Destroy does not remove shared runtimes or launchers.",
+                "Other registered dev sources and their required Git metadata block containing cleanup, even with --force.",
                 "If the separate machine-wide OpenClaw service is using the env, destroy refuses to apply.",
                 "TTY output uses cards by default. Piped output stays plain.",
             ],
@@ -1573,6 +1574,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Protected environments require `--force`.",
+                "Cleanup preserves other registered dev sources and their required Git metadata.",
                 "Active or unfinished source watches must be stopped with dev stop before remove or prune can delete their state.",
             ],
         ),
@@ -1600,6 +1602,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Active or unfinished source watches block removal; run dev stop for those envs first.",
+                "Cleanup preserves other registered dev sources and their required Git metadata.",
             ],
         ),
         "snapshot" => env_snapshot_help(cmd),

@@ -378,23 +378,32 @@ impl<'a> EnvironmentService<'a> {
     }
 
     pub(crate) fn remove_locked(&self, name: &str, force: bool) -> Result<EnvMeta, String> {
-        let meta = remove_environment_locked(name, force, self.env, self.cwd)?;
+        self.remove_with_cleanup_locked(name, force, |_| Ok(()))
+    }
+
+    pub(crate) fn remove_with_cleanup_locked(
+        &self,
+        name: &str,
+        force: bool,
+        before_remove: impl FnOnce(&EnvMeta) -> Result<(), String>,
+    ) -> Result<EnvMeta, String> {
+        let meta = remove_environment_locked(name, force, self.env, self.cwd, before_remove)?;
         sync_supervisor_env_if_present(self.env, self.cwd, name)?;
         Ok(meta)
     }
 
     pub(crate) fn remove_simulation(&self, name: &str) -> Result<EnvMeta, String> {
         let _lock = self.lock_operation(name)?;
-        self.ensure_source_watch_stopped(name)?;
-        let meta = get_environment(name, self.env, self.cwd)?;
-        if let Some(dev) = meta.dev.as_ref() {
-            prepare_openclaw_simulation_worktree_cleanup(
-                Path::new(&dev.repo_root),
-                Path::new(&dev.worktree_root),
-                &meta.name,
-            )?;
-        }
-        self.remove_locked(name, true)
+        self.remove_with_cleanup_locked(name, true, |meta| {
+            if let Some(dev) = meta.dev.as_ref() {
+                prepare_openclaw_simulation_worktree_cleanup(
+                    Path::new(&dev.repo_root),
+                    Path::new(&dev.worktree_root),
+                    &meta.name,
+                )?;
+            }
+            Ok(())
+        })
     }
 
     pub fn prune_candidates(&self, older_than_days: i64) -> Result<Vec<EnvMeta>, String> {

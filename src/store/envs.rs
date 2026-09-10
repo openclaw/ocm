@@ -1044,7 +1044,7 @@ pub fn remove_environment(
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
     let _operation = lock_environment_operation(name, env, cwd)?;
-    remove_environment_locked(name, force, env, cwd)
+    remove_environment_locked(name, force, env, cwd, |_| Ok(()))
 }
 
 pub(crate) fn remove_environment_locked(
@@ -1052,6 +1052,7 @@ pub(crate) fn remove_environment_locked(
     force: bool,
     env: &BTreeMap<String, String>,
     cwd: &Path,
+    before_remove: impl FnOnce(&EnvMeta) -> Result<(), String>,
 ) -> Result<EnvMeta, String> {
     let safe_name = validate_name(name, "Environment name")?;
     let source_service = crate::env::EnvironmentService::new(env, cwd);
@@ -1069,6 +1070,11 @@ pub(crate) fn remove_environment_locked(
     }
 
     let paths = derive_env_paths(Path::new(&meta.root));
+
+    super::dev_sources::ensure_environment_removal_preserves_dev_sources(&meta, &registry.envs)?;
+    // Preliminary cleanup shares this registry lock through final deletion.
+    // It must not call back into registry-mutating operations.
+    before_remove(&meta)?;
 
     if let Some(dev) = meta.dev.as_ref() {
         remove_openclaw_worktree(Path::new(&dev.repo_root), Path::new(&dev.worktree_root))?;
