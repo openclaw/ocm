@@ -298,7 +298,7 @@ Use `ocm dev` when you want an isolated source-run checkout with its own env roo
 
 On Unix, foreground Node commands wait until OCM records their process ownership before executing source or `NODE_OPTIONS` preload hooks. The gate preserves the command arguments, terminal input, and configured Node options after release.
 
-Before starting a new foreground session, OCM checks that a running background daemon uses
+Before starting a new foreground session or service preparation, OCM checks that a running background daemon uses
 compatible ownership locks and that its runtime record identifies the current
 process. A daemon whose compatibility cannot be verified must finish starting
 or be refreshed before the session can claim ownership. During a maintenance
@@ -324,6 +324,15 @@ Repeating plain `ocm dev <env>` or `ocm dev <env> --watch` for the same active m
 Use `ocm dev status [env]` to inspect dev environments and temporary source watches on runtime or launcher environments. It reports the source path, gateway URL, and session ownership (`starting`, `active`, `restoring`, `inactive`, or `unknown`). Active foreground ownership can outlive the wrapper process and does not imply that the Gateway is ready. JSON reports backend watching as `sourceWatch.watching`, keeps `serviceRunning` separate from the saved `serviceDesiredRunning` policy and includes the watch PID, start time, and any inspection issue. `gatewayPortReachable` uses a 100 ms loopback TCP check; an open port does not establish Gateway identity or readiness. Status leaves watch metadata unchanged and omits lease tokens.
 
 Use `ocm dev stop <env>` from another terminal to cancel an owned plain or watched foreground session, including dependency preparation and onboarding. It waits for the source processes to stop and restores a background service previously taken over with `--watch --force`. The environment, configuration, source checkout, and dependencies remain available for the next run. `--json` reports `envName`, `stopped`, and `serviceRestored`; repeated stops after completion are harmless. Independently managed background services keep their existing stop commands.
+
+`ocm dev <env> --service` owns dependency preparation and onboarding until their
+processes finish. `ocm dev stop <env>` can cancel that preparation while keeping
+an already-running managed Gateway and its launch plan intact. Sibling service
+updates defer changes and restart requests for that Gateway until preparation
+ends; an explicit service stop or uninstall still takes effect. Successful
+preparation rechecks the environment, source binding, and service policy before
+starting the service. Repeating `--service` with an unchanged binding avoids an
+install/stop/start cycle.
 
 For new Unix foreground generations, output readers must finish before OCM clears child ownership. A read failure, missing output completion, raw termination signal, or lost controller retains an unfinished session. Stopping a matching process group alone cannot prove detached workers stopped; subsequent stop, watch, service-start, and destroy requests preserve that uncertainty. Ordinary acknowledged errors remain retryable after output completes. Onboarding keeps real terminal output: unsuccessful or cancelled onboarding without observed output remains unfinished, while successful interactive onboarding still works. Released legacy watch records retain their existing recovery rules, and Windows keeps its process-job cleanup proof. Unknown or pending ownership still requires operator verification. Use an updated OCM CLI and refresh an incompatible running daemon before starting a new foreground generation; updating files does not refresh an old process.
 

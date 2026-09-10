@@ -644,6 +644,13 @@ changing mode requires stopping it first. `dev status --json` reports active
 ownership separately from `sourceWatch.watching`. Plain runs still refuse a
 running background service; temporary takeover remains `--watch --force`.
 
+`dev <env> --service` records its preparation children until verified completion.
+Use `dev stop <env>` to cancel setup; a managed Gateway already running keeps its
+launch plan, and deferred restart requests remain pending. Explicit service stop
+or uninstall still wins. After setup, OCM closes preparation and rechecks the
+same environment, source binding, and service policy under one operation lock
+before starting the managed service. An unchanged rerun keeps the running service.
+
 During foreground dependency installation, pnpm lifecycle reports distinguish a
 completed installation error from interrupted or unfinished build scripts. On
 Unix, uncertain script cleanup retains ownership even when pnpm returns a normal

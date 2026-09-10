@@ -2769,6 +2769,13 @@ fn dev_command_can_start_a_background_service() {
     let show_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
     assert_eq!(show_json["serviceEnabled"], true);
     assert_eq!(show_json["serviceRunning"], true);
+    #[cfg(unix)]
+    {
+        let preparation = read_source_watch_session(&root);
+        assert_eq!(preparation["servicePreparation"], true);
+        assert_eq!(preparation["closed"], true);
+        assert_eq!(preparation["restoreService"], false);
+    }
 
     let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
     assert!(status.status.success(), "{}", stderr(&status));
@@ -3863,20 +3870,140 @@ setInterval(() => { if (fs.existsSync(path.join(root,'source-watch.release'))) p
 
 #[cfg(unix)]
 #[test]
+fn dev_service_preparation_cancellation_preserves_its_running_service() {
+    let root = TestDir::new("dev-service-owned-preparation");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = service_env_with_gateway_admission(&root);
+    install_fake_dev_runners(&root, &mut env);
+    let initial = run_ocm(
+        &cwd,
+        &env,
+        &["dev", "demo", "--repo", &path_string(&repo), "--service"],
+    );
+    assert!(initial.status.success(), "{}", stderr(&initial));
+    let meta = get_environment("demo", &env, &cwd).unwrap();
+    assert!(meta.service_running && meta.service_enabled);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let initial_state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(initial_state["children"].as_array().unwrap().len(), 1);
+    let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
+    let original_config = fs::read(&config_path).unwrap();
+    let (started, _, _) = install_blocking_fake_dev_runners(&root, &mut env);
+    let mut preparation = DevWatchFixture::spawn(
+        &root,
+        &cwd,
+        &env,
+        &["dev", "demo", "--service", "--onboard"],
+    );
+    assert!(wait_for_path(&started, Duration::from_secs(10)));
+    let session = read_source_watch_session(&root);
+    assert_eq!(session["servicePreparation"], true);
+    assert_eq!(session["watching"], false);
+    assert_eq!(session["restoreService"], false);
+    assert!(session["child"]["pid"].is_number());
+    assert!(get_environment("demo", &env, &cwd).unwrap().service_running);
+
+    let mut edited_config: Value = serde_json::from_slice(&original_config).unwrap();
+    edited_config["gateway"]["port"] = (meta.gateway_port.unwrap() + 1000).into();
+    let edited_config = serde_json::to_vec(&edited_config).unwrap();
+    fs::write(&config_path, &edited_config).unwrap();
+    let supervisor = ocm::supervisor::SupervisorService::new(&env, &cwd);
+    supervisor.sync().unwrap();
+    let during: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        during["children"], initial_state["children"],
+        "preparation changed the running service plan"
+    );
+    let conflicting_start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(!conflicting_start.status.success());
+    let conflicting_foreground = run_ocm(&cwd, &env, &["dev", "demo"]);
+    assert!(!conflicting_foreground.status.success());
+    assert!(stderr(&conflicting_foreground).contains("service preparation"));
+
+    let stopped = run_dev_stop(&cwd, &env);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let output = preparation.wait_without_release();
+    assert_eq!(output.status.code(), Some(130), "{}", stderr(&output));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&stopped)).unwrap()["serviceRestored"],
+        false
+    );
+    let completed = read_source_watch_session(&root);
+    assert_eq!(completed["closed"], true);
+    assert_eq!(completed["restoreService"], false);
+    let after = get_environment("demo", &env, &cwd).unwrap();
+    assert!(after.service_running && after.service_enabled);
+    assert_eq!(
+        after
+            .dev
+            .as_ref()
+            .map(|dev| (&dev.repo_root, &dev.worktree_root)),
+        meta.dev
+            .as_ref()
+            .map(|dev| (&dev.repo_root, &dev.worktree_root))
+    );
+    assert_eq!(fs::read(&config_path).unwrap(), edited_config);
+    let after_state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(after_state["children"], initial_state["children"]);
+
+    // A completed preparation does not make an unchanged --service rerun an
+    // install/stop/start cycle. The native start owner retains the same plan.
+    fs::write(&config_path, original_config).unwrap();
+    let repeated = run_ocm(&cwd, &env, &["dev", "demo", "--service"]);
+    assert!(repeated.status.success(), "{}", stderr(&repeated));
+    let repeated_state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(repeated_state["children"], initial_state["children"]);
+    assert_eq!(
+        repeated_state["restartRequests"],
+        initial_state["restartRequests"]
+    );
+    assert!(get_environment("demo", &env, &cwd).unwrap().service_running);
+
+    // A newer stop intent wins even when the service was already stopped.
+    drop(preparation);
+    fs::remove_file(root.child("source-watch.release")).unwrap();
+    fs::remove_file(&started).unwrap();
+    let stop = run_ocm(&cwd, &env, &["service", "stop", "demo"]);
+    assert!(stop.status.success(), "{}", stderr(&stop));
+    let preparation = DevWatchFixture::spawn(
+        &root,
+        &cwd,
+        &env,
+        &["dev", "demo", "--service", "--onboard"],
+    );
+    assert!(wait_for_path(&started, Duration::from_secs(10)));
+    let stop = run_ocm(&cwd, &env, &["service", "stop", "demo"]);
+    assert!(stop.status.success(), "{}", stderr(&stop));
+    let output = preparation.finish();
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("service policy changed during service preparation"));
+    assert!(!get_environment("demo", &env, &cwd).unwrap().service_running);
+    assert_eq!(read_source_watch_session(&root)["closed"], true);
+    let final_state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert!(final_state["children"].as_array().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_stop_cancels_owned_preparation_before_gateway_start() {
-    for (phase, watching) in [
-        ("dependencies", true),
-        ("probe", true),
-        ("onboard", true),
-        ("dependencies", false),
-        ("probe", false),
-        ("onboard", false),
+    for (phase, mode) in [
+        ("dependencies", "watch"),
+        ("probe", "watch"),
+        ("onboard", "watch"),
+        ("dependencies", "plain"),
+        ("probe", "plain"),
+        ("onboard", "plain"),
+        ("dependencies", "service"),
+        ("probe", "service"),
+        ("onboard", "service"),
     ] {
-        let root = TestDir::new(&format!("dev-stop-{phase}-{watching}"));
+        let root = TestDir::new(&format!("dev-stop-{phase}-{mode}"));
         let repo = init_openclaw_repo(&root);
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
-        let mut env = ocm_env(&root);
+        let mut env = service_env_with_gateway_admission(&root);
         install_probe_aware_fake_dev_runners(&root, &mut env);
         let prepare = run_ocm(
             &cwd,
@@ -3908,10 +4035,10 @@ fn dev_stop_cancels_owned_preparation_before_gateway_start() {
         } else {
             write_executable_script(&root.child("fake-dev-bin/pnpm"), &script);
         }
-        let mut args = if watching {
-            dev_watch(&["demo", "--watch"])
-        } else {
-            dev_plain(&["demo"])
+        let mut args = match mode {
+            "watch" => dev_watch(&["demo", "--watch"]),
+            "service" => vec!["dev", "demo", "--service"],
+            _ => dev_plain(&["demo"]),
         };
         if phase == "onboard" {
             args.push("--onboard");
@@ -3928,7 +4055,8 @@ fn dev_stop_cancels_owned_preparation_before_gateway_start() {
             .unwrap();
         let session = read_source_watch_session(&root);
         assert_eq!(session["child"]["pid"], pid);
-        assert_eq!(session["watching"], watching);
+        assert_eq!(session["watching"], mode == "watch");
+        assert_eq!(session["servicePreparation"], mode == "service");
         let status = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
         let stopped = run_dev_stop(&cwd, &env);
         let watched = watch.finish();
@@ -3957,6 +4085,7 @@ fn dev_stop_cancels_owned_preparation_before_gateway_start() {
         assert!(worktree.join("package.json").is_file());
         assert!(Path::new(&meta.root).is_dir());
         assert_eq!(read_source_watch_session(&root)["closed"], true);
+        assert!(!get_environment("demo", &env, &cwd).unwrap().service_running);
     }
 }
 

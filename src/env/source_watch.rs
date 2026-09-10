@@ -71,6 +71,22 @@ pub(crate) enum SourceWatchState {
     Restoring,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SourceWatchMode {
+    Foreground { watching: bool },
+    ServicePreparation,
+}
+
+impl SourceWatchMode {
+    pub(super) fn is_watching(self) -> bool {
+        matches!(self, Self::Foreground { watching: true })
+    }
+
+    pub(super) fn is_service_preparation(self) -> bool {
+        matches!(self, Self::ServicePreparation)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CreateSourceWatchOverrideOptions {
     pub(crate) env_name: String,
@@ -85,6 +101,7 @@ pub(crate) struct SourceWatchLease {
     lease_id: String,
     lock_file: File,
     service_was_running: bool,
+    service_preparation_revision: Option<u64>,
     watching: bool,
     session_paths: SourceWatchSessionPaths,
     session: Option<SourceWatchSession>,
@@ -104,6 +121,10 @@ impl SourceWatchLease {
 
     pub(crate) fn service_was_running(&self) -> bool {
         self.service_was_running
+    }
+
+    pub(crate) fn service_preparation_revision(&self) -> Option<u64> {
+        self.service_preparation_revision
     }
 
     pub(crate) fn session(&self) -> Option<&SourceWatchSession> {
@@ -333,6 +354,7 @@ impl<'a> EnvironmentService<'a> {
             lease_id: session.lease_id.clone(),
             lock_file,
             service_was_running: session.restore_service,
+            service_preparation_revision: None,
             watching: session.is_watching(),
             session_paths,
             session: Some(session),
@@ -446,7 +468,7 @@ impl<'a> EnvironmentService<'a> {
         &self,
         env_name: &str,
         allow_service_takeover: bool,
-        watching: bool,
+        mode: SourceWatchMode,
     ) -> Result<SourceWatchLease, String> {
         let env_name = validate_name(env_name, "Environment name")?;
         // Match service updates: operation, daemon lifecycle, then Gateway
@@ -458,10 +480,22 @@ impl<'a> EnvironmentService<'a> {
         } else {
             Some(supervisor.lock_daemon_lifecycle()?)
         };
+        // A planner must not publish a pre-admission view after preparation
+        // claims the environment. Take its existing state lock before admission.
+        let _state_lock = mode
+            .is_service_preparation()
+            .then(|| supervisor.lock_state_publication())
+            .transpose()?;
         let _admission_lock = self.lock_gateway_admission(&env_name)?;
         supervisor.ensure_source_watch_daemon_compatible()?;
         let meta = self.get(&env_name)?;
-        if meta.service_running && !allow_service_takeover {
+        let service_preparation_revision = mode
+            .is_service_preparation()
+            .then(|| {
+                crate::store::environment_service_policy_revision(&env_name, self.env, self.cwd)
+            })
+            .transpose()?;
+        if meta.service_running && !allow_service_takeover && !mode.is_service_preparation() {
             return Err(format!(
                 "dev env {env_name} is already running in the background; stop it first or rerun with --watch --force to take it over temporarily"
             ));
@@ -527,15 +561,16 @@ impl<'a> EnvironmentService<'a> {
         // lease, even if its child PID has since been reused by another process.
         remove_file_if_present(&override_path)?;
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-        let session = Some(session_paths.create_session(&meta, &lease_id, watching)?);
+        let session = Some(session_paths.create_session(&meta, &lease_id, mode)?);
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let session = None;
         Ok(SourceWatchLease {
             env_name,
             lease_id,
             lock_file,
-            service_was_running: meta.service_running,
-            watching,
+            service_was_running: meta.service_running && !mode.is_service_preparation(),
+            service_preparation_revision,
+            watching: mode.is_watching(),
             session_paths,
             session,
             #[cfg(windows)]

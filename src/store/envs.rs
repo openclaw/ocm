@@ -223,6 +223,19 @@ fn bump_service_policy_revision(registry: &mut EnvRegistry, name: &str) -> u64 {
     *revision
 }
 
+pub(crate) fn environment_service_policy_revision(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<u64, String> {
+    let name = validate_name(name, "Environment name")?;
+    Ok(load_env_registry(env, cwd)?
+        .service_policy_revisions
+        .get(&name)
+        .copied()
+        .unwrap_or_default())
+}
+
 pub fn list_environments(
     env: &BTreeMap<String, String>,
     cwd: &Path,

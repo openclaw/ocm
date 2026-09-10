@@ -45,9 +45,10 @@ use openclaw_handoff::{
 const SUPERVISOR_STATE_KIND: &str = "ocm-supervisor-state";
 const SUPERVISOR_RUNTIME_KIND: &str = "ocm-supervisor-runtime";
 // This capability covers the current admission filename through child publication.
-// Version 8 covers foreground-session admission and retained completion ownership.
+// Version 9 adds service-preparation admission and running-service retention to
+// foreground-session admission and retained completion ownership.
 // Values 2 through 6 were used by incompatible development snapshots.
-const GATEWAY_ADMISSION_VERSION: u32 = 8;
+const GATEWAY_ADMISSION_VERSION: u32 = 9;
 const SUPERVISOR_POLL_INTERVAL_MS: u64 = 200;
 const SUPERVISOR_RESTART_DELAY_MS: u64 = 1_000;
 const SUPERVISOR_MAX_RESTART_DELAY_MS: u64 = 30_000;
@@ -580,6 +581,10 @@ impl<'a> SupervisorService<'a> {
         lock_file(&lock_path, "managed service lifecycle")
     }
 
+    pub(crate) fn lock_state_publication(&self) -> Result<crate::store::ExclusiveFileLock, String> {
+        lock_supervisor_state(&supervisor_state_path(self.env, self.cwd)?)
+    }
+
     pub(crate) fn has_desired_running_services(&self) -> Result<bool, String> {
         Ok(list_environments(self.env, self.cwd)?
             .iter()
@@ -663,6 +668,7 @@ impl<'a> SupervisorService<'a> {
 
         let mut children = Vec::new();
         let mut skipped_envs = Vec::new();
+        let mut preparation_state: Option<SupervisorState> = None;
         for env_meta in envs {
             let name = env_meta.name.clone();
             if !env_meta.service_enabled {
@@ -677,6 +683,46 @@ impl<'a> SupervisorService<'a> {
                     env_name: name,
                     reason: "service is stopped".to_string(),
                 });
+                continue;
+            }
+            if let Some(session) = env_service.source_watch_session(&name)?
+                && session.service_preparation_is_active(&env_service)?
+            {
+                if !session.restore_target_matches(&env_meta) {
+                    return Err(format!(
+                        "env {name} changed during service preparation; its previous service plan was retained"
+                    ));
+                }
+                // Preparation does not take over an existing Gateway. Preserve
+                // its exact plan across sibling syncs/config edits; the shared
+                // admission gate still prevents any new process from starting.
+                if preparation_state.is_none() {
+                    let path = supervisor_state_path(self.env, self.cwd)?;
+                    if path.try_exists().map_err(|error| {
+                        format!("failed inspecting service state during preparation: {error}")
+                    })? {
+                        let previous: SupervisorState = read_json(&path)?;
+                        if previous.kind != SUPERVISOR_STATE_KIND
+                            || previous.ocm_home != display_path(&ocm_home)
+                        {
+                            return Err(
+                                "service preparation found an incompatible saved service plan"
+                                    .to_string(),
+                            );
+                        }
+                        preparation_state = Some(previous);
+                    }
+                }
+                if let Some(previous) = preparation_state
+                    .as_ref()
+                    .and_then(|state| state.children.iter().find(|child| child.env_name == name))
+                {
+                    children.push(previous.clone());
+                } else {
+                    return Err(format!(
+                        "cannot preserve the saved service plan for env {name} during preparation; the existing plan was left unchanged"
+                    ));
+                }
                 continue;
             }
             match env_service
@@ -1073,9 +1119,11 @@ impl<'a> SupervisorService<'a> {
         let mut managed_child_count = active_state.children.len();
         let mut child_results = Vec::new();
 
+        let env_service = EnvironmentService::new(self.env, self.cwd);
         while !stop_requested.load(Ordering::SeqCst) {
             let mut runtime_dirty = refresh_active_state(
                 state_path,
+                &env_service,
                 &mut active_state,
                 &mut managed_child_count,
                 &mut running,
@@ -1084,6 +1132,7 @@ impl<'a> SupervisorService<'a> {
             );
             runtime_dirty |= process_exited_children(
                 state_path,
+                &env_service,
                 &stop_requested,
                 &mut active_state,
                 &mut managed_child_count,
@@ -1518,23 +1567,116 @@ fn read_updated_supervisor_state(
 
 fn refresh_active_state(
     state_path: &Path,
+    env_service: &EnvironmentService<'_>,
     active_state: &mut SupervisorState,
     managed_child_count: &mut usize,
     running: &mut BTreeMap<String, RunningSupervisorChild>,
     pending: &mut BTreeMap<String, PendingSupervisorChild>,
     inactive: &mut BTreeMap<String, InactiveSupervisorChild>,
 ) -> bool {
-    let Some(next_state) = read_updated_supervisor_state(state_path, active_state) else {
+    let Some(mut next_state) = read_updated_supervisor_state(state_path, active_state) else {
         return false;
+    };
+    let restart_requests = new_supervisor_restart_requests(active_state, &next_state);
+    let admission_locks = match retain_running_services_during_preparation(
+        env_service,
+        running,
+        &restart_requests,
+        &mut next_state,
+    ) {
+        Ok(Some(locks)) => locks,
+        Ok(None) => return false,
+        Err(error) => {
+            eprintln!("ocm service: service preparation deferred state reconciliation: {error}");
+            return false;
+        }
     };
     let restart_requests = new_supervisor_restart_requests(active_state, &next_state);
     let mut runtime_dirty = reconcile_running_children(running, pending, inactive, &next_state);
     runtime_dirty |=
         reconcile_restart_requests(&restart_requests, running, pending, inactive, &next_state);
+    drop(admission_locks);
     *managed_child_count = next_state.children.len();
     *active_state = next_state;
     clear_processed_restart_requests(state_path, &restart_requests);
     runtime_dirty
+}
+
+// Only updates that would change a live child need preparation inspection.
+// Keep the actual owner's spec rather than trusting a stale saved plan. Deferred
+// restart requests stay on disk and are omitted only from this in-memory view,
+// so they are observed again after preparation ends. Return the admission locks
+// through reconciliation so preparation cannot begin between inspection and stop.
+fn retain_running_services_during_preparation(
+    env_service: &EnvironmentService<'_>,
+    running: &BTreeMap<String, RunningSupervisorChild>,
+    restart_requests: &[SupervisorRestartRequest],
+    next_state: &mut SupervisorState,
+) -> Result<Option<Vec<crate::store::ExclusiveFileLock>>, String> {
+    let desired = child_map(&next_state.children);
+    let restarting: BTreeSet<_> = restart_requests
+        .iter()
+        .map(|request| request.env_name.as_str())
+        .collect();
+    let affected: Vec<_> = running
+        .iter()
+        .filter_map(|(name, child)| {
+            (desired.get(name).is_none_or(|spec| *spec != child.spec)
+                || restarting.contains(name.as_str()))
+            .then_some(name.clone())
+        })
+        .collect();
+    if affected.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut admission_locks = Vec::with_capacity(affected.len());
+    for name in &affected {
+        let Some(admission) = env_service.try_lock_gateway_admission(name)? else {
+            return Ok(None);
+        };
+        admission_locks.push(admission);
+    }
+    let metas: BTreeMap<_, _> = env_service
+        .list()?
+        .into_iter()
+        .map(|meta| (meta.name.clone(), meta))
+        .collect();
+    for name in affected {
+        let Some(meta) = metas.get(&name) else {
+            continue;
+        };
+        // An explicit stop/disable remains authoritative during preparation.
+        if !meta.service_enabled || !meta.service_running {
+            continue;
+        }
+        let Some(session) = env_service.source_watch_session(&name)? else {
+            continue;
+        };
+        if !session.service_preparation_is_active(env_service)? {
+            continue;
+        }
+        if !session.restore_target_matches(meta) {
+            return Err(format!(
+                "env {name} changed during its recorded service preparation"
+            ));
+        }
+        let existing = &running
+            .get(&name)
+            .expect("affected running child exists")
+            .spec;
+        next_state.children.retain(|child| child.env_name != name);
+        next_state.children.push(existing.clone());
+        next_state
+            .skipped_envs
+            .retain(|skipped| skipped.env_name != name);
+        next_state
+            .restart_requests
+            .retain(|request| request.env_name != name);
+    }
+    next_state
+        .children
+        .sort_by(|left, right| left.env_name.cmp(&right.env_name));
+    Ok(Some(admission_locks))
 }
 
 fn reconcile_running_children(
@@ -1765,6 +1907,7 @@ fn collect_exited_children(
 
 fn process_exited_children(
     state_path: &Path,
+    env_service: &EnvironmentService<'_>,
     stop_requested: &AtomicBool,
     active_state: &mut SupervisorState,
     managed_child_count: &mut usize,
@@ -1792,6 +1935,7 @@ fn process_exited_children(
         ));
         runtime_dirty |= refresh_active_state(
             state_path,
+            env_service,
             active_state,
             managed_child_count,
             running,
@@ -3478,6 +3622,299 @@ mod tests {
                 request_id: "restart-1".to_string(),
             }]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_preparation_preserves_running_spec_and_deferred_restart() {
+        struct RunningFixture(BTreeMap<String, RunningSupervisorChild>);
+        impl Drop for RunningFixture {
+            fn drop(&mut self) {
+                for child in self.0.values_mut() {
+                    stop_supervisor_child(child);
+                }
+            }
+        }
+        for change in ["removed", "changed", "restart"] {
+            let root = tempfile::tempdir().unwrap();
+            let env = BTreeMap::from([
+                ("HOME".to_string(), display_path(&root.path().join("home"))),
+                (
+                    "OCM_HOME".to_string(),
+                    display_path(&root.path().join("store")),
+                ),
+                (
+                    "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+                    "unsupported".to_string(),
+                ),
+            ]);
+            let service = EnvironmentService::new(&env, root.path());
+            let meta = service
+                .create(crate::env::CreateEnvironmentOptions {
+                    name: "demo".to_string(),
+                    root: None,
+                    gateway_port: Some(19999),
+                    service_enabled: false,
+                    service_running: false,
+                    default_runtime: None,
+                    default_launcher: None,
+                    dev: None,
+                    protected: false,
+                })
+                .unwrap();
+            crate::store::set_environment_service_policy(
+                &meta.name,
+                Some(true),
+                Some(true),
+                &env,
+                root.path(),
+            )
+            .unwrap();
+            let supervisor = SupervisorService::new(&env, root.path());
+            let state_path = supervisor_state_path(&env, root.path()).unwrap();
+            let mut original = child_spec("demo", 19999);
+            original.binary_path = Some("/bin/sleep".to_string());
+            original.args = vec!["30".to_string()];
+            original.run_dir = display_path(root.path());
+            original.process_env = env.clone();
+            let child = Command::new("/bin/sleep")
+                .arg("30")
+                .current_dir(root.path())
+                .env_clear()
+                .envs(&env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let mut running = RunningFixture(BTreeMap::from([(
+                "demo".to_string(),
+                RunningSupervisorChild {
+                    spec: original.clone(),
+                    child,
+                    restart_count: 0,
+                    quick_clean_restart_count: 0,
+                    restart_handoff_support: RestartHandoffSupport::Unsupported(
+                        "fixture".to_string(),
+                    ),
+                    started_at: Instant::now(),
+                },
+            )]));
+            let mut active = SupervisorState {
+                kind: SUPERVISOR_STATE_KIND.to_string(),
+                ocm_home: env["OCM_HOME"].clone(),
+                generated_at: now_utc(),
+                children: vec![original.clone()],
+                skipped_envs: Vec::new(),
+                restart_requests: Vec::new(),
+            };
+            let mut next = active.clone();
+            match change {
+                "removed" => next.children.clear(),
+                "changed" => next.children[0].args = vec!["29".to_string()],
+                "restart" => next.restart_requests.push(SupervisorRestartRequest {
+                    env_name: "demo".to_string(),
+                    request_id: "during-preparation".to_string(),
+                }),
+                _ => unreachable!(),
+            }
+            write_json(&state_path, &next).unwrap();
+            let mut count = 1;
+            let mut pending = BTreeMap::new();
+            let mut inactive = BTreeMap::new();
+            let admission = service.lock_gateway_admission("demo").unwrap();
+            assert!(!refresh_active_state(
+                &state_path,
+                &service,
+                &mut active,
+                &mut count,
+                &mut running.0,
+                &mut pending,
+                &mut inactive
+            ));
+            let owner = running.0.get_mut("demo").unwrap();
+            assert_eq!(owner.child.id(), pid);
+            assert!(owner.child.try_wait().unwrap().is_none());
+            let saved: SupervisorState = read_json(&state_path).unwrap();
+            assert!(supervisor_state_equivalent(&saved, &next));
+            drop(admission);
+
+            let mut preparation = std::thread::scope(|scope| {
+                let state_lock = supervisor.lock_state_publication().unwrap();
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                let (lease_tx, lease_rx) = std::sync::mpsc::channel();
+                let service = &service;
+                let worker = scope.spawn(move || {
+                    started_tx.send(()).unwrap();
+                    let lease = service.acquire_source_watch_lease(
+                        "demo",
+                        false,
+                        crate::env::SourceWatchMode::ServicePreparation,
+                    );
+                    assert!(lease_tx.send(lease).is_ok());
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(matches!(
+                    lease_rx.recv_timeout(Duration::from_millis(150)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ));
+                assert!(service.source_watch_session("demo").unwrap().is_none());
+                assert!(
+                    service
+                        .observe_source_watch_lease("demo")
+                        .unwrap()
+                        .is_none()
+                );
+                drop(state_lock);
+                let lease = lease_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap();
+                worker.join().unwrap();
+                lease
+            });
+            if state_path.exists() {
+                fs::remove_file(&state_path).unwrap();
+            }
+            let missing_plan = supervisor.sync().unwrap_err();
+            assert!(
+                missing_plan.contains("cannot preserve the saved service plan"),
+                "{missing_plan}"
+            );
+            assert!(
+                !state_path.exists(),
+                "missing preparation plan must not be published as an omission"
+            );
+
+            write_json(&state_path, &active).unwrap();
+            assert_eq!(supervisor.sync().unwrap().children, active.children);
+            for invalid in ["kind", "home"] {
+                let mut incompatible = active.clone();
+                if invalid == "kind" {
+                    incompatible.kind = "incompatible".to_string();
+                } else {
+                    incompatible.ocm_home = display_path(&root.path().join("other-store"));
+                }
+                write_json(&state_path, &incompatible).unwrap();
+                let error = supervisor.sync().unwrap_err();
+                assert!(error.contains("incompatible saved service plan"), "{error}");
+                let saved: SupervisorState = read_json(&state_path).unwrap();
+                assert!(supervisor_state_equivalent(&saved, &incompatible));
+            }
+            write_json(&state_path, &next).unwrap();
+            assert!(
+                !refresh_active_state(
+                    &state_path,
+                    &service,
+                    &mut active,
+                    &mut count,
+                    &mut running.0,
+                    &mut pending,
+                    &mut inactive
+                ),
+                "{change}"
+            );
+            let owner = running.0.get_mut("demo").unwrap();
+            assert_eq!(owner.child.id(), pid);
+            assert!(
+                owner.child.try_wait().unwrap().is_none(),
+                "{change} stopped the running service during preparation"
+            );
+            assert_eq!(owner.spec, original);
+            assert_eq!(active.children, vec![original]);
+            assert_eq!(count, 1);
+            assert!(pending.is_empty());
+            assert!(active.restart_requests.is_empty());
+
+            if change == "restart" {
+                let saved: SupervisorState = read_json(&state_path).unwrap();
+                assert_eq!(
+                    saved.restart_requests.len(),
+                    1,
+                    "deferred restart must remain on disk"
+                );
+                preparation.finish_session(false, None, false).unwrap();
+                assert!(
+                    service
+                        .source_watch_session("demo")
+                        .unwrap()
+                        .unwrap()
+                        .closed
+                );
+                assert_eq!(supervisor.sync().unwrap().children, active.children);
+                let retained: SupervisorState = read_json(&state_path).unwrap();
+                assert_eq!(retained.restart_requests, saved.restart_requests);
+                assert!(!refresh_active_state(
+                    &state_path,
+                    &service,
+                    &mut active,
+                    &mut count,
+                    &mut running.0,
+                    &mut pending,
+                    &mut inactive
+                ));
+                let owner = running.0.get_mut("demo").unwrap();
+                assert_eq!(owner.child.id(), pid);
+                assert!(owner.child.try_wait().unwrap().is_none());
+                assert_eq!(owner.spec, active.children[0]);
+                assert!(pending.is_empty());
+                let retained: SupervisorState = read_json(&state_path).unwrap();
+                assert_eq!(retained.restart_requests, saved.restart_requests);
+                drop(preparation);
+                assert!(refresh_active_state(
+                    &state_path,
+                    &service,
+                    &mut active,
+                    &mut count,
+                    &mut running.0,
+                    &mut pending,
+                    &mut inactive
+                ));
+                assert!(running.0.is_empty());
+                assert_eq!(pending["demo"].restart_count, 1);
+                let saved: SupervisorState = read_json(&state_path).unwrap();
+                assert!(saved.restart_requests.is_empty());
+                assert!(!refresh_active_state(
+                    &state_path,
+                    &service,
+                    &mut active,
+                    &mut count,
+                    &mut running.0,
+                    &mut pending,
+                    &mut inactive
+                ));
+                assert_eq!(pending["demo"].restart_count, 1);
+            } else {
+                crate::store::set_environment_service_policy(
+                    &meta.name,
+                    (change == "changed").then_some(false),
+                    (change == "removed").then_some(false),
+                    &env,
+                    root.path(),
+                )
+                .unwrap();
+                next.children.clear();
+                write_json(&state_path, &next).unwrap();
+                assert!(
+                    refresh_active_state(
+                        &state_path,
+                        &service,
+                        &mut active,
+                        &mut count,
+                        &mut running.0,
+                        &mut pending,
+                        &mut inactive
+                    ),
+                    "explicit stop/disable must remain effective during preparation"
+                );
+                assert!(running.0.is_empty());
+                assert!(pending.is_empty());
+                assert_eq!(count, 0);
+                preparation.finish_session(false, None, false).unwrap();
+            }
+        }
     }
 
     #[test]
