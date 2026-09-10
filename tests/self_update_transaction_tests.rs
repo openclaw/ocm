@@ -9,6 +9,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use flate2::{Compression, write::GzEncoder};
+use fs2::FileExt;
 use ocm::infra::download::file_sha256;
 use serde_json::{Value, json};
 use support::{TestDir, TestHttpServer, ocm_env, run_ocm_binary, stderr, write_executable_script};
@@ -215,6 +216,26 @@ process.exit(0);
         read_json(&self.root.child("bin/.ocm.self-update/receipt.json"))
     }
 
+    fn wait_for_update_lock(&self) {
+        let path = self.root.child("bin/.ocm.self-update/lock");
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap_or_else(|error| panic!("open update lock {}: {error}", path.display()));
+        // A receipt or daemon PID can be published before the worker or its
+        // inherited service-manager command releases admission to this journal.
+        wait_for(
+            || match FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) => panic!("probe update lock {}: {error}", path.display()),
+            },
+            &format!("update journal lock release: {}", path.display()),
+        );
+        drop(lock);
+    }
+
     fn setup_gateway(&self) {
         let gateway = self.root.child("gateway");
         write_executable_script(
@@ -327,12 +348,15 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
             .unwrap(),
         receipt
     );
+    success.wait_for_update_lock();
     let manager_before = fs::read(success.root.child("manager.log")).unwrap();
+    let no_op = success.run(&["self", "update", "--version", "9.9.9", "--json"]);
     assert!(
-        success
-            .run(&["self", "update", "--version", "9.9.9", "--json"])
-            .status
-            .success()
+        no_op.status.success(),
+        "same-version no-op: status={}, stdout={}, stderr={}",
+        no_op.status,
+        String::from_utf8_lossy(&no_op.stdout),
+        stderr(&no_op)
     );
     assert_eq!(
         fs::read(success.root.child("manager.log")).unwrap(),
@@ -416,10 +440,16 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
         || crash.root.child("daemon.pid").exists(),
         "orphan activation completed",
     );
-    sleep(Duration::from_millis(200));
+    crash.wait_for_update_lock();
     let retry = crash.run(&["self", "update", "--version", "9.9.9"]);
     assert!(!retry.status.success());
-    assert!(stderr(&retry).contains("unfinished self-update"));
+    assert!(
+        stderr(&retry).contains("unfinished self-update"),
+        "retry after orphan activation: status={}, stdout={}, stderr={}",
+        retry.status,
+        String::from_utf8_lossy(&retry.stdout),
+        stderr(&retry)
+    );
     let recovered = crash.run(&["self", "update", "--recover"]);
     assert_eq!(
         crash.receipt()["phase"],

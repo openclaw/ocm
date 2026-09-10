@@ -1,4 +1,5 @@
 mod pnpm;
+mod ui;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -154,6 +155,10 @@ struct DevStatusSummary {
     gateway_port: u32,
     gateway_url: String,
     gateway_port_reachable: bool,
+    gateway_health_ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ui_url: Option<String>,
+    ui: Option<DevUiStatusSummary>,
     config_path: String,
     workspace_dir: String,
     service_enabled: bool,
@@ -176,6 +181,17 @@ struct DevSourceWatchSummary {
     issue: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevUiStatusSummary {
+    port: u32,
+    url: String,
+    pid: Option<u32>,
+    process_running: Option<bool>,
+    http_ready: Option<bool>,
+    issue: Option<String>,
+}
+
 struct ExistingEnvSourceWatchOptions {
     repo_root: Option<String>,
     root: Option<String>,
@@ -183,6 +199,7 @@ struct ExistingEnvSourceWatchOptions {
     watch: bool,
     force: bool,
     onboard: bool,
+    ui: bool,
 }
 
 #[derive(Serialize)]
@@ -442,10 +459,31 @@ impl Cli {
         Ok(0)
     }
 
+    fn acquire_dev_lease(
+        &self,
+        name: &str,
+        force: bool,
+        mode: SourceWatchMode,
+        ui: bool,
+    ) -> Result<SourceWatchLease, String> {
+        match (mode, ui) {
+            (SourceWatchMode::Foreground { watching }, true) => self
+                .environment_service()
+                .acquire_source_ui_lease(name, force, watching),
+            (_, false) => self
+                .environment_service()
+                .acquire_source_watch_lease(name, force, mode),
+            (SourceWatchMode::ServicePreparation, true) => {
+                Err("dev cannot combine --ui with --service".to_string())
+            }
+        }
+    }
+
     fn handle_dev_run(&self, args: Vec<String>) -> Result<i32, String> {
         let (args, force) = Self::consume_flag(args, "--force");
         let (args, service_requested) = Self::consume_flag(args, "--service");
         let (args, watch) = Self::consume_flag(args, "--watch");
+        let (args, ui) = Self::consume_flag(args, "--ui");
         let (args, onboard) = Self::consume_flag(args, "--onboard");
         let (args, repo_root) = Self::consume_option(args, "--repo")?;
         let repo_root = Self::require_option_value(repo_root, "--repo")?;
@@ -466,6 +504,13 @@ impl Cli {
         if watch && service_requested {
             return Err("dev cannot combine --watch with --service".to_string());
         }
+        if ui && service_requested {
+            return Err("dev cannot combine --ui with --service".to_string());
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        if ui {
+            return Err("native dev UI sessions are unsupported on this platform".to_string());
+        }
         if service_requested && let Some(error) = service_backend_support_error(&self.env) {
             return Err(error);
         }
@@ -485,6 +530,7 @@ impl Cli {
                     gateway_port,
                     onboard,
                     watch,
+                    ui,
                 )?
             {
                 return Ok(0);
@@ -499,6 +545,7 @@ impl Cli {
                         watch,
                         force,
                         onboard,
+                        ui,
                     },
                 );
             }
@@ -526,11 +573,8 @@ impl Cli {
         } else {
             SourceWatchMode::Foreground { watching: watch }
         };
-        let mut source_watch_lease = Some(
-            match self
-                .environment_service()
-                .acquire_source_watch_lease(&meta.name, force, mode)
-            {
+        let mut source_watch_lease =
+            Some(match self.acquire_dev_lease(&meta.name, force, mode, ui) {
                 Ok(lease) => lease,
                 Err(error) => {
                     // A competing invocation may have claimed the lease after the first lookup.
@@ -543,14 +587,14 @@ impl Cli {
                             gateway_port,
                             onboard,
                             watch,
+                            ui,
                         )?
                     {
                         return Ok(0);
                     }
                     return Err(error);
                 }
-            },
-        );
+            });
         // Preparation belongs to the lease owner, including a newly created env.
         // A losing invocation must not rewrite config before returning the winner's status.
         let prepared = (|| {
@@ -564,6 +608,12 @@ impl Cli {
             let prepared = self
                 .environment_service()
                 .apply_effective_gateway_port(current)?;
+            if ui {
+                crate::store::dev_ui_gateway_url(
+                    &derive_env_paths(Path::new(&prepared.root)),
+                    prepared.gateway_port.unwrap_or_default(),
+                )?;
+            }
             self.bootstrap_dev_env(&prepared)?;
             Ok::<_, String>(prepared)
         })();
@@ -611,12 +661,28 @@ impl Cli {
             stderr_profile,
         ));
 
-        let preparation = self.prepare_dev_run(
-            &meta,
-            onboard,
-            source_watch_lease.as_mut(),
-            watch_stop.as_deref(),
-        );
+        let preparation = self
+            .prepare_dev_run(
+                &meta,
+                onboard,
+                source_watch_lease.as_mut(),
+                watch_stop.as_deref(),
+            )
+            .and_then(|code| {
+                if code == 0 && ui {
+                    self.prepare_dev_ui(
+                        &meta,
+                        Path::new(&dev.worktree_root),
+                        source_watch_lease
+                            .as_mut()
+                            .ok_or_else(|| "dev UI lease is missing".to_string())?,
+                        watch_stop
+                            .as_deref()
+                            .ok_or_else(|| "dev UI cancellation state is missing".to_string())?,
+                    )?;
+                }
+                Ok(code)
+            });
         if !matches!(&preparation, Ok(0)) {
             return match source_watch_lease.as_mut() {
                 Some(lease) => {
@@ -805,6 +871,7 @@ impl Cli {
             watch,
             force,
             onboard,
+            ui,
         } = options;
         if !watch || !force {
             return Err(format!(
@@ -840,10 +907,11 @@ impl Cli {
         let meta = existing;
         let watch_stop = install_source_watch_signal_handler()?;
         let mut source_watch_lease = Some(
-            match self.environment_service().acquire_source_watch_lease(
+            match self.acquire_dev_lease(
                 &meta.name,
                 true,
                 SourceWatchMode::Foreground { watching: true },
+                ui,
             ) {
                 Ok(lease) => lease,
                 Err(error) => {
@@ -854,6 +922,7 @@ impl Cli {
                         None,
                         false,
                         true,
+                        ui,
                     )? {
                         return Ok(0);
                     }
@@ -904,6 +973,9 @@ impl Cli {
         };
         if !matches!(&preparation, Ok(0)) {
             return finish_source_watch_session(&meta.name, lease, preparation, Ok(()), false);
+        }
+        if ui && let Err(error) = self.prepare_dev_ui(&meta, &repo_root, lease, &watch_stop) {
+            return finish_source_watch_session(&meta.name, lease, Err(error), Ok(()), false);
         }
         let stderr_profile = self.dev_stderr_profile();
         self.stderr_lines(render_source_watch_takeover_summary(
@@ -1150,6 +1222,7 @@ impl Cli {
         gateway_port: Option<u32>,
         onboard: bool,
         watching: bool,
+        ui: bool,
     ) -> Result<bool, String> {
         let env_service = self.environment_service();
         let _operation = env_service.lock_operation(&meta.name)?;
@@ -1162,6 +1235,15 @@ impl Cli {
             SourceWatchState::Active(_) => "active",
             SourceWatchState::Restoring => "restoring",
         };
+        let actual_ui = env_service
+            .source_watch_session(&meta.name)?
+            .is_some_and(|session| !session.closed && session.ui.is_some());
+        if actual_ui != ui {
+            return Err(format!(
+                "dev env {} is running in a different UI mode; stop it before changing --ui",
+                meta.name
+            ));
+        }
         let actual_watching = match &observation {
             SourceWatchState::Active(active) => Some(active.watching.unwrap_or(true)),
             _ => {
@@ -1747,6 +1829,9 @@ impl Cli {
         lease: &mut SourceWatchLease,
         stop_requested: &AtomicBool,
     ) -> SourceWatchResult<i32> {
+        if lease.has_ui() {
+            return self.run_source_gateway_ui(meta, repo_root, lease, stop_requested);
+        }
         let args = [
             if lease.is_watching() {
                 "scripts/watch-node.mjs"
@@ -1972,6 +2057,7 @@ impl Cli {
         if meta.dev.is_none() && matches!(observation, Ok(SourceWatchState::Inactive)) {
             return Ok(None);
         }
+        let ui = self.inspect_dev_ui_status(&meta, &observation);
         let mut source_watch = DevSourceWatchSummary {
             watching: false,
             state: "inactive",
@@ -1980,6 +2066,7 @@ impl Cli {
             issue: None,
         };
         let mut active_endpoint = None;
+        let mut ui_url = None;
         let active_source = match observation {
             Ok(SourceWatchState::Inactive) => None,
             Ok(SourceWatchState::Starting) => {
@@ -1999,6 +2086,10 @@ impl Cli {
                     source_watch.issue = Some("This watch has no recorded launch endpoint; the displayed URL comes from current configuration.".to_string());
                 }
                 active_endpoint = watch.endpoint;
+                ui_url = watch
+                    .ui
+                    .as_ref()
+                    .map(|ui| format!("http://127.0.0.1:{}/", ui.port));
                 Some(watch.repo_root)
             }
             Err(error) => {
@@ -2038,6 +2129,9 @@ impl Cli {
             gateway_port,
             gateway_url: dev_gateway_url(gateway_port),
             gateway_port_reachable: crate::service::inspect::tcp_port_reachable(gateway_port),
+            gateway_health_ready: ui::http_ready(gateway_port, "/health", false),
+            ui_url,
+            ui,
             config_path: display_path(&paths.config_path),
             workspace_dir: display_path(&paths.workspace_dir),
             service_enabled: meta.service_enabled,
@@ -2252,12 +2346,23 @@ fn stop_orphaned_source_watch(session: &SourceWatchSession) -> Result<(), String
         return Err("source watch process scope changed; no processes were signaled".to_string());
     }
     #[cfg(windows)]
-    if session.child_spawn_pending {
+    if session.child_pending() {
         return Err("source watch controller exited before publishing child ownership; Windows crash cleanup cannot be verified, so the unfinished session was retained".to_string());
     }
-    let Some(child) = &session.child else {
-        return Ok(());
-    };
+    let mut errors = Vec::new();
+    for (_, child) in session.recorded_children() {
+        if let Err(error) = stop_orphaned_source_child(&child, session.is_legacy_watch()) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn stop_orphaned_source_child(child: &ProcessIdentity, legacy: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
         let process = observe_process(child.pid)?;
@@ -2265,7 +2370,7 @@ fn stop_orphaned_source_watch(session: &SourceWatchSession) -> Result<(), String
             .as_ref()
             .is_some_and(|process| process.running && process.identity == *child)
         {
-            if session.is_legacy_watch() && process_group_members(child.pid)?.is_empty() {
+            if legacy && process_group_members(child.pid)?.is_empty() {
                 return Ok(());
             }
             return Err("recorded source child no longer matches a live group owner; cleanup cannot be verified from an empty process group, so its session was retained and no processes were signaled".to_string());
@@ -2355,6 +2460,7 @@ fn stop_orphaned_source_watch(session: &SourceWatchSession) -> Result<(), String
     }
     #[cfg(windows)]
     {
+        let _ = legacy;
         // The existing kill-on-close job contains all children when its
         // controller exits. Never replace that authority with a PID tree scan.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -3303,6 +3409,7 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
             format!("root={}", summary.root),
             format!("url={}", summary.gateway_url),
             format!("gateway_port_reachable={}", summary.gateway_port_reachable),
+            format!("gateway_health_ready={}", summary.gateway_health_ready),
             format!("watch={}", summary.source_watch.state),
             format!("watching={}", summary.source_watch.watching),
             format!("service_running={}", summary.service_running),
@@ -3320,6 +3427,27 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
         }
         if let Some(issue) = &summary.source_watch.issue {
             lines.push(format!("watch_issue={issue}"));
+        }
+        if let Some(url) = &summary.ui_url {
+            lines.push(format!("ui_url={url}"));
+        }
+        if let Some(ui) = &summary.ui {
+            lines.push(format!("ui_port={}", ui.port));
+            for (key, value) in [
+                ("ui_process_running", ui.process_running),
+                ("ui_http_ready", ui.http_ready),
+            ] {
+                lines.push(format!(
+                    "{key}={}",
+                    value.map_or("unknown", |value| if value { "true" } else { "false" })
+                ));
+            }
+            if let Some(pid) = ui.pid {
+                lines.push(format!("ui_pid={pid}"));
+            }
+            if let Some(issue) = &ui.issue {
+                lines.push(format!("ui_issue={issue}"));
+            }
         }
         return lines;
     }
@@ -3344,10 +3472,48 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
             ),
             KeyValueRow::plain("Dev session", summary.source_watch.state),
             KeyValueRow::plain("Watching", summary.source_watch.watching.to_string()),
+            KeyValueRow::plain(
+                "Gateway health",
+                if summary.gateway_health_ready {
+                    "ready"
+                } else {
+                    "not ready"
+                },
+            ),
             KeyValueRow::plain("Service", dev_service_state(summary)),
         ],
         profile.color,
     ));
+    if let Some(ui) = &summary.ui {
+        lines.extend(render_key_value_card(
+            "UI",
+            &[
+                KeyValueRow::plain("Port", ui.port.to_string()),
+                KeyValueRow::plain(
+                    "Process",
+                    match ui.process_running {
+                        Some(true) => "running",
+                        Some(false) => "not running",
+                        None => "unknown",
+                    },
+                ),
+                KeyValueRow::plain(
+                    "Document",
+                    match ui.http_ready {
+                        Some(true) => "ready",
+                        Some(false) => "not ready",
+                        None => "unknown",
+                    },
+                ),
+            ],
+            profile.color,
+        ));
+        if let Some(issue) = &ui.issue
+            && summary.source_watch.issue.as_ref() != Some(issue)
+        {
+            lines.push(paint(issue, Tone::Warning, profile.color));
+        }
+    }
     lines.extend(render_key_value_card(
         "Source",
         &[
@@ -3369,6 +3535,9 @@ fn render_dev_status(summary: &DevStatusSummary, profile: RenderProfile) -> Vec<
     ));
     if let Some(issue) = &summary.source_watch.issue {
         lines.push(paint(issue, Tone::Warning, profile.color));
+    }
+    if let Some(url) = &summary.ui_url {
+        lines.push(format!("UI address: {url}"));
     }
     lines
 }
@@ -4322,6 +4491,9 @@ fs.writeFileSync('source-ran', JSON.stringify({
             gateway_port: 18789,
             gateway_url: "http://127.0.0.1:18789".to_string(),
             gateway_port_reachable: true,
+            gateway_health_ready: true,
+            ui_url: None,
+            ui: None,
             config_path: "/tmp/demo/.openclaw/openclaw.json".to_string(),
             workspace_dir: "/tmp/demo/.openclaw/workspace".to_string(),
             service_enabled: true,

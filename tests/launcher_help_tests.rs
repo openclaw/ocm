@@ -112,11 +112,13 @@ fn dev_help_is_available_from_help_and_bare_group() {
     assert_eq!(output, stdout(&bare));
     assert!(output.contains("Development envs"));
     assert!(output.contains(
-        "ocm dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch] [--force] [--service] [--onboard]"
+        "ocm dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch] [--ui] [--force] [--service] [--onboard]"
     ));
     assert!(output.contains("ocm dev shaks --root /tmp/shaks"));
     assert!(output.contains("ocm dev shaks --watch"));
     assert!(output.contains("ocm dev shaks --watch --force"));
+    assert!(output.contains("ocm dev shaks --watch --ui"));
+    assert!(output.contains("initial native browser handoff"));
     assert!(output.contains("ocm dev shaks --repo /path/to/openclaw --watch --force"));
     assert!(output.contains("ocm dev shaks --service"));
     assert!(output.contains("ocm help dev status"));

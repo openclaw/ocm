@@ -118,6 +118,7 @@ If you are developing OpenClaw itself, use the dev path:
 ocm dev shaks
 ocm dev shaks --root /tmp/shaks
 ocm dev shaks --watch
+ocm dev shaks --watch --ui
 ocm dev shaks --watch --force
 ocm dev stop shaks
 ocm dev shaks --repo /path/to/openclaw --watch --force
@@ -141,6 +142,20 @@ the environment is registered. The token remains stable through restarts and
 source rebuilds, so paired clients can reconnect. Initialization never replaces an
 existing config or its auth/SecretRefs. Repeating minimum setup leaves an unchanged
 config untouched.
+
+Add `--ui` to run OpenClaw's native Vite server beside either foreground mode.
+OCM prints the session's UI address, then its initial native owner link after
+both Vite and the Gateway Control UI document are ready. The native handoff keeps
+the Gateway identity and credentials; only the browser document moves to Vite.
+UI requires a local HTTP Gateway with Control UI enabled and installed UI dependencies.
+It cannot be combined with `--service`.
+
+The controller owns Gateway, Vite and the initial dashboard helper. A component
+exit stops its sibling; `dev stop` stops both and gives a running helper only the
+remainder of its original 30-second budget. A late link is discarded, and uncertain
+cleanup retains ownership. Repeating the matching command reports the current
+address without starting another helper. The address belongs to this session;
+stop the session before changing UI mode or requesting a new initial owner link.
 
 If you already have a plain `~/.openclaw` home you care about, use `ocm migrate <env>` instead of starting fresh. `setup` and `start` now point that out when they detect an existing plain OpenClaw home.
 
@@ -327,6 +342,8 @@ Foreground dependency installation keeps build output and pnpm diagnostics reada
 Repeating plain `ocm dev <env>` or `ocm dev <env> --watch` for the same active mode and source returns its status and existing gateway link without preparing dependencies, onboarding, or restarting processes. Mode/source/root/port mismatches and onboarding during a foreground session are errors. Startup and service restoration are reported as progress; an invocation during startup does not claim a source identity that has not yet been published. Temporary runtime or launcher takeovers retain the `--repo <path> --watch --force` form. Active status and routed source commands use the captured launch root and port even if config is edited; an explicit different port is refused. Watch sessions started by an older OCM without endpoint metadata need to be stopped from their original terminal and started again before they can be reused. Only the foreground invocation that acquires the lease prepares configuration.
 
 Use `ocm dev status [env]` to inspect dev environments and temporary source watches on runtime or launcher environments. It reports the source path, gateway URL, and session ownership (`starting`, `active`, `restoring`, `inactive`, or `unknown`). Active foreground ownership can outlive the wrapper process and does not imply that the Gateway is ready. JSON reports backend watching as `sourceWatch.watching`, keeps `serviceRunning` separate from the saved `serviceDesiredRunning` policy and includes the watch PID, start time, and any inspection issue. `gatewayPortReachable` uses a 100 ms loopback TCP check; an open port does not establish Gateway identity or readiness. Status leaves watch metadata unchanged and omits lease tokens.
+
+Named status and JSON/raw output also report `gatewayHealthReady` from `/health` and `ui.processRunning`/`ui.httpReady` for the recorded UI process and HTML document. Active sessions use their captured Gateway endpoint. UI readiness stays unknown when ownership cannot be verified; `ui.issue` explains the observation. The existing `uiUrl`/`ui_url` field retains the basic address of an active UI session.
 
 Use `ocm dev stop <env>` from another terminal to cancel an owned plain or watched foreground session, including dependency preparation and onboarding. It waits for the source processes to stop and restores a background service previously taken over with `--watch --force`. The environment, configuration, source checkout, and dependencies remain available for the next run. `--json` reports `envName`, `stopped`, and `serviceRestored`; repeated stops after completion are harmless. Independently managed background services keep their existing stop commands.
 
