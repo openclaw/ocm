@@ -110,9 +110,11 @@ async function start(name, watching = true, withUi = false) {
   const ready = path.join(directory, 'ready');
   const rootPid = path.join(directory, 'root.pid');
   const descendantPid = path.join(directory, 'descendant.pid');
+  const sourceEnvironment = path.join(directory, 'source-environment.json');
   const watch = [
     'import fs from "node:fs";',
     'import {spawn} from "node:child_process";',
+    'fs.writeFileSync(' + JSON.stringify(sourceEnvironment) + ',JSON.stringify({pid:process.pid,cacheVariables:Object.entries(process.env).filter(([key])=>["NODE_COMPILE_CACHE","NODE_DISABLE_COMPILE_CACHE"].includes(key.toUpperCase())),nodeOptions:process.env.NODE_OPTIONS}));',
     'const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore",windowsHide:true});',
     'child.once("spawn",()=>{fs.writeFileSync(' + JSON.stringify(rootPid) + ',String(process.pid));fs.writeFileSync(' + JSON.stringify(descendantPid) + ',String(child.pid));fs.writeFileSync(' + JSON.stringify(ready) + ',process.argv[1]);});',
     'setInterval(()=>{},1000);'
@@ -159,7 +161,13 @@ async function start(name, watching = true, withUi = false) {
     }));
   }
   const args = ['dev',name,'--repo',repo,...(watching ? ['--watch','--force'] : ['--root',envRoot,'--port',port]), ...(withUi ? ['--ui'] : [])];
-  const sourceEnv = withUi ? {...env, OCM_TEST_DEV_UI_DIR:directory, OCM_TEST_DEV_UI_DESCENDANTS:'1'} : env;
+  const sourceEnv = {
+    ...env,
+    ...(withUi ? {OCM_TEST_DEV_UI_DIR:directory, OCM_TEST_DEV_UI_DESCENDANTS:'1'} : {}),
+    NoDe_CoMpIlE_CaChE: path.join(directory, 'inherited-cache'),
+    nOdE_dIsAbLe_CoMpIlE_cAcHe: '0',
+    NODE_OPTIONS: '--no-warnings'
+  };
   const controller = cp.spawn(binary, args, {cwd:root, env:sourceEnv, stdio:['ignore','pipe','pipe'], windowsHide:true});
   const output = capture(controller);
   const record = {name, directory, repo, controller, output, identities:[]};
@@ -210,6 +218,13 @@ async function start(name, watching = true, withUi = false) {
   }
   assert.ok(record.identities.every(identity => /^\d+$/.test(identity.startedAt)));
   assert.ok(record.sourcePids.every(alive));
+  if (!withUi) {
+    assert.deepEqual(JSON.parse(fs.readFileSync(sourceEnvironment, 'utf8')), {
+      pid:watcher,
+      cacheVariables:[['NODE_DISABLE_COMPILE_CACHE', '1']],
+      nodeOptions:sourceEnv.NODE_OPTIONS
+    });
+  }
   record.original = fs.readFileSync(sessionPath(name));
   record.watcher = watcher;
   record.descendant = descendant;

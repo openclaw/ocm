@@ -717,6 +717,13 @@ error or allows an optional build to fail. Completed errors remain retryable.
 When run from a terminal, installation keeps interactive stdin while streaming
 build output and diagnostics. Onboarding keeps its real terminal output.
 
+For direct dev-source commands, OCM disables Node's module compile cache before
+launch by setting `NODE_DISABLE_COMPILE_CACHE=1` and removing `NODE_COMPILE_CACHE`.
+This avoids the launcher's compile-cache bootstrap wrapper without changing
+`NODE_OPTIONS`, native runner selection, rebuilds or auto-doctor. The policy is
+scoped to source execution; ordinary runtime and launcher environments retain
+their existing Node settings.
+
 `env remove` and `env prune` require active or unfinished source watches to be
 stopped first with `ocm dev stop <env>`. The same applies to a destroy guarded by
 `--if-state-token`: stop the watch, then request a fresh preview. A watch created

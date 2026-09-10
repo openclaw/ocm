@@ -144,6 +144,14 @@ pub fn build_openclaw_dev_source_env(
     source_root: &Path,
 ) -> BTreeMap<String, String> {
     let mut next = build_openclaw_env(meta, base_env);
+    // Avoid the source launcher's compile-cache bootstrap process.
+    #[cfg(windows)]
+    next.retain(|key, _| {
+        !key.eq_ignore_ascii_case("NODE_COMPILE_CACHE")
+            && !key.eq_ignore_ascii_case("NODE_DISABLE_COMPILE_CACHE")
+    });
+    next.insert("NODE_DISABLE_COMPILE_CACHE".to_string(), "1".to_string());
+    next.remove("NODE_COMPILE_CACHE");
     let extensions_dir = source_root.join("extensions");
     if extensions_dir.is_dir() {
         next.insert(
@@ -292,6 +300,11 @@ mod tests {
         };
         let base = BTreeMap::from([
             ("NODE_OPTIONS".to_string(), "--cpu-prof".to_string()),
+            (
+                "NODE_COMPILE_CACHE".to_string(),
+                "/tmp/node-cache".to_string(),
+            ),
+            ("NODE_DISABLE_COMPILE_CACHE".to_string(), "0".to_string()),
             ("OPENCLAW_HOME".to_string(), "/tmp/wrong".to_string()),
             ("OPENCLAW_GATEWAY_PORT".to_string(), "12345".to_string()),
             ("OPENCLAW_PROFILE".to_string(), "wrong".to_string()),
@@ -324,6 +337,14 @@ mod tests {
         assert_eq!(
             env.get("NODE_OPTIONS").map(String::as_str),
             Some("--cpu-prof")
+        );
+        assert_eq!(
+            env.get("NODE_COMPILE_CACHE").map(String::as_str),
+            Some("/tmp/node-cache")
+        );
+        assert_eq!(
+            env.get("NODE_DISABLE_COMPILE_CACHE").map(String::as_str),
+            Some("0")
         );
         assert_eq!(
             env.get("OPENCLAW_HOME").map(String::as_str),
@@ -373,7 +394,7 @@ mod tests {
 
     #[test]
     fn build_openclaw_dev_source_env_points_bundled_plugins_at_source_extensions() {
-        let meta = EnvMeta {
+        let mut meta = EnvMeta {
             upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
             name: "demo".to_string(),
@@ -395,8 +416,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("extensions/codex")).unwrap();
 
-        let env = build_openclaw_dev_source_env(&meta, &BTreeMap::new(), &root);
+        let base = BTreeMap::from([
+            (
+                "NODE_OPTIONS".to_string(),
+                "--no-warnings --cpu-prof".to_string(),
+            ),
+            (
+                "NODE_COMPILE_CACHE".to_string(),
+                "/tmp/node-cache".to_string(),
+            ),
+            ("NODE_DISABLE_COMPILE_CACHE".to_string(), "0".to_string()),
+            (
+                "node_compile_cache".to_string(),
+                "/tmp/other-cache".to_string(),
+            ),
+            ("node_disable_compile_cache".to_string(), "0".to_string()),
+        ]);
+        let env = build_openclaw_dev_source_env(&meta, &base, &root);
 
+        assert_eq!(
+            env.get("NODE_DISABLE_COMPILE_CACHE").map(String::as_str),
+            Some("1")
+        );
+        assert!(!env.contains_key("NODE_COMPILE_CACHE"));
+        for alias in ["node_compile_cache", "node_disable_compile_cache"] {
+            assert_eq!(env.contains_key(alias), !cfg!(windows));
+        }
+        assert_eq!(env.get("NODE_OPTIONS"), base.get("NODE_OPTIONS"));
         assert_eq!(
             env.get("OPENCLAW_BUNDLED_PLUGINS_DIR").map(String::as_str),
             Some(root.join("extensions").to_string_lossy().as_ref())
@@ -405,6 +451,15 @@ mod tests {
             env.get("OPENCLAW_DEV_SOURCE_ROOT").map(String::as_str),
             Some(root.to_string_lossy().as_ref())
         );
+        meta.service_running = false;
+        let plain = build_openclaw_dev_source_env(&meta, &BTreeMap::new(), &root.join("absent"));
+        assert_eq!(
+            plain.get("NODE_DISABLE_COMPILE_CACHE").map(String::as_str),
+            Some("1")
+        );
+        assert!(!plain.contains_key("NODE_COMPILE_CACHE"));
+        assert!(!plain.contains_key("OPENCLAW_NO_RESPAWN"));
+        assert!(!plain.contains_key("OPENCLAW_DEV_SOURCE_ROOT"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
