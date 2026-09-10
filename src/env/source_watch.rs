@@ -20,8 +20,12 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use super::EnvironmentService;
-use super::source_watch_session::{SourceWatchSession, SourceWatchSessionPaths};
-use crate::infra::process_identity::{current_process_identity, observe_process, process_scope_id};
+use super::source_watch_session::{
+    DevUiChildRole, SourceUiTarget, SourceWatchSession, SourceWatchSessionPaths,
+};
+use crate::infra::process_identity::{
+    ProcessIdentity, current_process_identity, observe_process, process_scope_id,
+};
 use crate::service::platform::{ServiceManagerKind, service_manager_kind};
 use crate::store::{
     ExclusiveFileLock, display_path, ensure_dir, lock_file, now_utc, read_json,
@@ -51,9 +55,19 @@ pub struct SourceWatchOverride {
     pub watch_pid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watching: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<SourceWatchUiEndpoint>,
     pub token: String,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceWatchUiEndpoint {
+    pub port: u32,
+    pub pid: u32,
+    pub gateway_url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,6 +133,12 @@ impl SourceWatchLease {
         self.watching
     }
 
+    pub(crate) fn has_ui(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.ui.is_some())
+    }
+
     pub(crate) fn service_was_running(&self) -> bool {
         self.service_was_running
     }
@@ -143,6 +163,9 @@ impl SourceWatchLease {
     }
 
     pub(crate) fn begin_child_spawn(&mut self) -> Result<(), String> {
+        if self.has_ui() {
+            return self.begin_ui_child_spawn(DevUiChildRole::Command);
+        }
         if let Some(session) = &mut self.session {
             session.child = None;
             session.child_spawn_pending = true;
@@ -152,6 +175,11 @@ impl SourceWatchLease {
     }
 
     pub(crate) fn record_child(&mut self, pid: u32) -> Result<(), String> {
+        if self.has_ui() {
+            return self
+                .record_ui_child(DevUiChildRole::Command, pid)
+                .map(|_| ());
+        }
         if let Some(session) = &mut self.session {
             let process = observe_process(pid)?.ok_or_else(|| {
                 format!("failed to inspect source watch child identity for pid {pid}")
@@ -164,12 +192,111 @@ impl SourceWatchLease {
     }
 
     pub(crate) fn clear_child(&mut self) -> Result<(), String> {
+        if self.has_ui() {
+            let expected = self
+                .session
+                .as_ref()
+                .and_then(|session| session.ui.as_ref())
+                .and_then(|ui| ui.children.get(DevUiChildRole::Command))
+                .cloned();
+            return self.clear_ui_child(DevUiChildRole::Command, expected.as_ref());
+        }
         if let Some(session) = &mut self.session {
             session.child = None;
             session.child_spawn_pending = false;
             self.session_paths.save_session(session)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn claim_ui_target(&mut self, target: SourceUiTarget) -> Result<(), String> {
+        if !target.valid() {
+            return Err("the dev UI target is invalid".to_string());
+        }
+        let session = self.session.as_mut().ok_or("dev UI session is missing")?;
+        if session.closed || session.has_child_ownership() {
+            return Err("dev UI target cannot change while a child is owned".to_string());
+        }
+        let ui = session
+            .ui
+            .as_mut()
+            .ok_or("dev session did not request a UI")?;
+        if ui.target.as_ref().is_some_and(|current| current != &target) {
+            return Err("dev UI target was already captured".to_string());
+        }
+        ui.target = Some(target);
+        self.session_paths.save_session(session)
+    }
+
+    pub(crate) fn begin_ui_child_spawn(&mut self, role: DevUiChildRole) -> Result<(), String> {
+        let session = self.session.as_mut().ok_or("dev UI session is missing")?;
+        let ui = session
+            .ui
+            .as_mut()
+            .ok_or("dev session did not request a UI")?;
+        if session.closed
+            || ui.pending.is_some()
+            || ui.children.get(role).is_some()
+            || (role != DevUiChildRole::Command && ui.target.is_none())
+        {
+            return Err("dev UI child cannot replace existing ownership".to_string());
+        }
+        ui.pending = Some(role);
+        self.session_paths.save_session(session)
+    }
+
+    pub(crate) fn record_ui_child(
+        &mut self,
+        role: DevUiChildRole,
+        pid: u32,
+    ) -> Result<ProcessIdentity, String> {
+        let process =
+            observe_process(pid)?.ok_or_else(|| format!("failed to inspect dev UI child {pid}"))?;
+        let session = self.session.as_mut().ok_or("dev UI session is missing")?;
+        if session
+            .recorded_children()
+            .iter()
+            .any(|(_, child)| child.pid == pid)
+            || session.controller.pid == pid
+        {
+            return Err("dev UI child identity is already owned".to_string());
+        }
+        let ui = session
+            .ui
+            .as_mut()
+            .ok_or("dev session did not request a UI")?;
+        if ui.pending != Some(role) || ui.children.get(role).is_some() {
+            return Err("dev UI child has no matching pending spawn".to_string());
+        }
+        *ui.children.get_mut(role) = Some(process.identity.clone());
+        ui.pending = None;
+        self.session_paths.save_session(session)?;
+        Ok(process.identity)
+    }
+
+    pub(crate) fn clear_ui_child(
+        &mut self,
+        role: DevUiChildRole,
+        expected: Option<&ProcessIdentity>,
+    ) -> Result<(), String> {
+        let session = self.session.as_mut().ok_or("dev UI session is missing")?;
+        let ui = session
+            .ui
+            .as_mut()
+            .ok_or("dev session did not request a UI")?;
+        if ui
+            .children
+            .get(role)
+            .is_some_and(|child| Some(child) != expected)
+            || (expected.is_some() && ui.pending == Some(role))
+        {
+            return Err("dev UI child changed; refusing stale cleanup".to_string());
+        }
+        *ui.children.get_mut(role) = None;
+        if ui.pending == Some(role) {
+            ui.pending = None;
+        }
+        self.session_paths.save_session(session)
     }
 
     pub(crate) fn begin_service_takeover(&mut self) -> Result<(), String> {
@@ -346,6 +473,10 @@ impl<'a> EnvironmentService<'a> {
         session.process_scope = process_scope_id()?;
         session.child = None;
         session.child_spawn_pending = false;
+        if let Some(ui) = &mut session.ui {
+            ui.children = Default::default();
+            ui.pending = None;
+        }
         session.closed = false;
         session.completion = None;
         session_paths.save_session(&session)?;
@@ -448,7 +579,7 @@ impl<'a> EnvironmentService<'a> {
                 return Err(error.to_string());
             }
             if !session.closed
-                && (session.child.is_some() || session.child_spawn_pending)
+                && session.has_child_ownership()
                 && !session.controller_is_running()?
             {
                 return Err(format!(
@@ -469,6 +600,30 @@ impl<'a> EnvironmentService<'a> {
         env_name: &str,
         allow_service_takeover: bool,
         mode: SourceWatchMode,
+    ) -> Result<SourceWatchLease, String> {
+        self.acquire_foreground_lease(env_name, allow_service_takeover, mode, false)
+    }
+
+    pub(crate) fn acquire_source_ui_lease(
+        &self,
+        env_name: &str,
+        allow_service_takeover: bool,
+        watching: bool,
+    ) -> Result<SourceWatchLease, String> {
+        self.acquire_foreground_lease(
+            env_name,
+            allow_service_takeover,
+            SourceWatchMode::Foreground { watching },
+            true,
+        )
+    }
+
+    fn acquire_foreground_lease(
+        &self,
+        env_name: &str,
+        allow_service_takeover: bool,
+        mode: SourceWatchMode,
+        ui: bool,
     ) -> Result<SourceWatchLease, String> {
         let env_name = validate_name(env_name, "Environment name")?;
         // Match service updates: operation, daemon lifecycle, then Gateway
@@ -561,7 +716,11 @@ impl<'a> EnvironmentService<'a> {
         // lease, even if its child PID has since been reused by another process.
         remove_file_if_present(&override_path)?;
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-        let session = Some(session_paths.create_session(&meta, &lease_id, mode)?);
+        let session = Some(if ui {
+            session_paths.create_ui_session(&meta, &lease_id, mode.is_watching())?
+        } else {
+            session_paths.create_session(&meta, &lease_id, mode)?
+        });
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let session = None;
         Ok(SourceWatchLease {
@@ -589,7 +748,29 @@ impl<'a> EnvironmentService<'a> {
                 lease.env_name, options.env_name
             ));
         }
-        self.write_source_watch_override(options, &lease.lease_id, lease.watching)
+        let ui = if let Some(ui) = lease.session().and_then(|session| session.ui.as_ref()) {
+            let target = ui.target.as_ref().ok_or("dev UI target was not captured")?;
+            if ui
+                .children
+                .get(DevUiChildRole::Gateway)
+                .map(|child| child.pid)
+                != Some(options.watch_pid)
+            {
+                return Err("dev Gateway does not match its recorded UI session".to_string());
+            }
+            Some(SourceWatchUiEndpoint {
+                port: target.port,
+                pid: ui
+                    .children
+                    .get(DevUiChildRole::Ui)
+                    .ok_or("dev UI child was not recorded")?
+                    .pid,
+                gateway_url: target.gateway_url.clone(),
+            })
+        } else {
+            None
+        };
+        self.write_source_watch_override(options, &lease.lease_id, lease.watching, ui)
     }
 
     fn write_source_watch_override(
@@ -597,6 +778,7 @@ impl<'a> EnvironmentService<'a> {
         options: CreateSourceWatchOverrideOptions,
         lease_id: &str,
         watching: bool,
+        ui: Option<SourceWatchUiEndpoint>,
     ) -> Result<SourceWatchOverride, String> {
         let env_name = validate_name(&options.env_name, "Environment name")?;
         let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
@@ -615,6 +797,7 @@ impl<'a> EnvironmentService<'a> {
             endpoint: Some(options.endpoint),
             watch_pid: options.watch_pid,
             watching: Some(watching),
+            ui,
             token,
             started_at: now_utc(),
         };
@@ -665,7 +848,8 @@ impl<'a> EnvironmentService<'a> {
         cleanup_stale: bool,
     ) -> Result<SourceWatchState, String> {
         let env_name = validate_name(env_name, "Environment name")?;
-        if let Some(session) = self.source_watch_session(&env_name)? {
+        let session = self.source_watch_session(&env_name)?;
+        if let Some(session) = &session {
             if let Some(error) = session.unsafe_cleanup_error() {
                 return Err(error.to_string());
             }
@@ -706,7 +890,13 @@ impl<'a> EnvironmentService<'a> {
 
         #[cfg(windows)]
         if let Some(_lease_event) = open_windows_source_watch_event(&lock_path)? {
-            return read_leased_source_watch_state(&path, &lock_path, &env_name, cleanup_stale);
+            return read_leased_source_watch_state(
+                &path,
+                &lock_path,
+                &env_name,
+                cleanup_stale,
+                session.as_ref(),
+            );
         }
 
         match try_lock_source_watch_file(&lock_file, false) {
@@ -733,7 +923,13 @@ impl<'a> EnvironmentService<'a> {
                     .unwrap_or(SourceWatchState::Inactive))
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                read_leased_source_watch_state(&path, &lock_path, &env_name, cleanup_stale)
+                read_leased_source_watch_state(
+                    &path,
+                    &lock_path,
+                    &env_name,
+                    cleanup_stale,
+                    session.as_ref(),
+                )
             }
             Err(error) => Err(format!(
                 "failed checking source watch lock {}: {error}",
@@ -772,6 +968,7 @@ fn read_leased_source_watch_state(
     lock_path: &Path,
     env_name: &str,
     cleanup_stale: bool,
+    session: Option<&SourceWatchSession>,
 ) -> Result<SourceWatchState, String> {
     let lock_lease_id = File::open(lock_path)
         .and_then(|mut file| read_source_watch_lock(&mut file))
@@ -800,6 +997,34 @@ fn read_leased_source_watch_state(
     if source_watch_matches_lease(&meta, &lock_lease_id)
         && is_valid_source_watch_structure(&meta, env_name)
     {
+        if meta.ui.is_some() || session.is_some_and(|session| session.ui.is_some()) {
+            let matched = session.is_some_and(|session| {
+                let Some(ui) = &session.ui else { return false };
+                let Some(target) = &ui.target else {
+                    return false;
+                };
+                let Some(endpoint) = &meta.ui else {
+                    return false;
+                };
+                !session.closed
+                    && session.lease_id == lock_lease_id
+                    && meta.watching == session.watching
+                    && target.port == endpoint.port
+                    && target.gateway_url == endpoint.gateway_url
+                    && ui
+                        .children
+                        .get(DevUiChildRole::Gateway)
+                        .map(|child| child.pid)
+                        == Some(meta.watch_pid)
+                    && ui.children.get(DevUiChildRole::Ui).map(|child| child.pid)
+                        == Some(endpoint.pid)
+            });
+            if !matched {
+                return Err(
+                    "dev UI metadata does not match its recorded children and target".to_string(),
+                );
+            }
+        }
         Ok(SourceWatchState::Active(meta))
     } else {
         Err(format!(
@@ -1205,6 +1430,7 @@ mod tests {
             endpoint: None,
             watch_pid: 123,
             watching: None,
+            ui: None,
             token: "123-token".to_string(),
             started_at: OffsetDateTime::UNIX_EPOCH,
         };

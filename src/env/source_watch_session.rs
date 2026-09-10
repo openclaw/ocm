@@ -16,7 +16,77 @@ const LEGACY_SESSION_KIND: &str = "ocm-source-watch-session";
 const WATCH_V2_SESSION_KIND: &str = "ocm-source-watch-session-v2";
 const SESSION_KIND: &str = "ocm-source-foreground-session-v1";
 const SERVICE_PREPARATION_SESSION_KIND: &str = "ocm-source-service-preparation-session-v1";
+const UI_SESSION_KIND: &str = "ocm-source-ui-session-v1";
 const STOP_KIND: &str = "ocm-source-watch-stop";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum DevUiChildRole {
+    Gateway,
+    Ui,
+    Command,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SourceUiTarget {
+    pub(crate) port: u32,
+    pub(crate) gateway_url: String,
+}
+
+impl SourceUiTarget {
+    pub(super) fn valid(&self) -> bool {
+        (1..=u16::MAX as u32).contains(&self.port)
+            && url::Url::parse(&self.gateway_url).is_ok_and(|url| {
+                url.scheme() == "http"
+                    && url.host_str() == Some("127.0.0.1")
+                    && url.port_or_known_default().is_some_and(|port| port > 0)
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            })
+    }
+}
+
+// Fixed fields reject unknown or duplicate roles while keeping the older
+// single-child representation unchanged for sessions without a UI.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SourceUiChildren {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway: Option<ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ui: Option<ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<ProcessIdentity>,
+}
+
+impl SourceUiChildren {
+    pub(crate) fn get(&self, role: DevUiChildRole) -> Option<&ProcessIdentity> {
+        match role {
+            DevUiChildRole::Gateway => self.gateway.as_ref(),
+            DevUiChildRole::Ui => self.ui.as_ref(),
+            DevUiChildRole::Command => self.command.as_ref(),
+        }
+    }
+
+    pub(super) fn get_mut(&mut self, role: DevUiChildRole) -> &mut Option<ProcessIdentity> {
+        match role {
+            DevUiChildRole::Gateway => &mut self.gateway,
+            DevUiChildRole::Ui => &mut self.ui,
+            DevUiChildRole::Command => &mut self.command,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SourceUiSession {
+    pub(crate) target: Option<SourceUiTarget>,
+    pub(crate) children: SourceUiChildren,
+    pub(crate) pending: Option<DevUiChildRole>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +105,8 @@ pub(crate) struct SourceWatchSession {
     pub(crate) watching: Option<bool>,
     #[serde(default)]
     pub(crate) service_preparation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ui: Option<SourceUiSession>,
     pub(crate) restore_service: bool,
     #[serde(default)]
     pub(crate) closed: bool,
@@ -92,8 +164,34 @@ impl SourceWatchSessionPaths {
         lease_id: &str,
         mode: super::SourceWatchMode,
     ) -> Result<SourceWatchSession, String> {
+        self.create_session_with_mode(meta, lease_id, mode, false)
+    }
+
+    pub(super) fn create_ui_session(
+        &self,
+        meta: &EnvMeta,
+        lease_id: &str,
+        watching: bool,
+    ) -> Result<SourceWatchSession, String> {
+        self.create_session_with_mode(
+            meta,
+            lease_id,
+            super::SourceWatchMode::Foreground { watching },
+            true,
+        )
+    }
+
+    fn create_session_with_mode(
+        &self,
+        meta: &EnvMeta,
+        lease_id: &str,
+        mode: super::SourceWatchMode,
+        ui: bool,
+    ) -> Result<SourceWatchSession, String> {
         let session = SourceWatchSession {
-            kind: if mode.is_service_preparation() {
+            kind: if ui {
+                UI_SESSION_KIND
+            } else if mode.is_service_preparation() {
                 SERVICE_PREPARATION_SESSION_KIND
             } else {
                 SESSION_KIND
@@ -109,6 +207,7 @@ impl SourceWatchSessionPaths {
             child_spawn_pending: false,
             watching: Some(mode.is_watching()),
             service_preparation: mode.is_service_preparation(),
+            ui: ui.then(SourceUiSession::default),
             restore_service: false,
             closed: false,
             completion: None,
@@ -129,14 +228,18 @@ impl SourceWatchSessionPaths {
             session.kind.as_str(),
             SESSION_KIND
                 | SERVICE_PREPARATION_SESSION_KIND
+                | UI_SESSION_KIND
                 | WATCH_V2_SESSION_KIND
                 | LEGACY_SESSION_KIND
-        ) || (session.kind == SESSION_KIND && session.watching.is_none())
+        ) || (matches!(session.kind.as_str(), SESSION_KIND | UI_SESSION_KIND)
+            && session.watching.is_none())
             || (session.kind == SERVICE_PREPARATION_SESSION_KIND
                 && (!session.service_preparation
                     || session.watching != Some(false)
                     || session.restore_service))
             || (session.service_preparation && session.kind != SERVICE_PREPARATION_SESSION_KIND)
+            || (session.kind == UI_SESSION_KIND) != session.ui.is_some()
+            || (session.ui.is_some() && (session.child.is_some() || session.child_spawn_pending))
             || session.env_name != env_name
             || session.lease_id.trim().is_empty()
             || session.controller.pid == 0
@@ -151,12 +254,33 @@ impl SourceWatchSessionPaths {
                 "source watch ownership metadata for env \"{env_name}\" is invalid"
             ));
         }
+        let children = session.recorded_children();
+        if session.ui.as_ref().is_some_and(|ui| {
+            children.iter().any(|(_, child)| {
+                child.pid == 0 || child.started_at.is_empty() || child.pid == session.controller.pid
+            }) || children.iter().enumerate().any(|(index, (_, child))| {
+                children[..index]
+                    .iter()
+                    .any(|(_, prior)| prior.pid == child.pid)
+            }) || ui.target.as_ref().is_some_and(|target| !target.valid())
+                || ui
+                    .pending
+                    .is_some_and(|role| ui.children.get(role).is_some())
+                || (ui.target.is_none()
+                    && (ui.children.get(DevUiChildRole::Gateway).is_some()
+                        || ui.children.get(DevUiChildRole::Ui).is_some()
+                        || ui
+                            .pending
+                            .is_some_and(|role| role != DevUiChildRole::Command)))
+                || (session.closed && session.has_child_ownership())
+        }) {
+            return Err("dev UI ownership metadata is invalid".to_string());
+        }
         #[cfg(unix)]
         if session.controller.pid > i32::MAX as u32
-            || session
-                .child
-                .as_ref()
-                .is_some_and(|child| child.pid <= 1 || child.pid > i32::MAX as u32)
+            || children
+                .iter()
+                .any(|(_, child)| child.pid <= 1 || child.pid > i32::MAX as u32)
         {
             return Err("source watch ownership contains an invalid process range".to_string());
         }
@@ -175,6 +299,20 @@ impl SourceWatchSessionPaths {
                 "source watch session for env \"{}\" changed; refusing to replace its ownership metadata",
                 session.env_name
             ));
+        }
+        if current.kind != session.kind
+            || current.watching != session.watching
+            || current.service_preparation != session.service_preparation
+            || current.ui.is_some() != session.ui.is_some()
+            || current
+                .ui
+                .as_ref()
+                .and_then(|ui| ui.target.as_ref())
+                .is_some_and(|target| {
+                    session.ui.as_ref().and_then(|ui| ui.target.as_ref()) != Some(target)
+                })
+        {
+            return Err("dev session mode or captured UI target changed".to_string());
         }
         write_json(&self.session, session)
     }
@@ -243,6 +381,9 @@ impl SourceWatchSessionPaths {
                 session.env_name
             ));
         }
+        if session.ui.is_some() && !preserve_session && session.has_child_ownership() {
+            return Err("dev UI cleanup still owns a child; refusing session closure".to_string());
+        }
         let mut completed = session.clone();
         completed.closed = !preserve_session;
         completed.completion = Some(SourceWatchCompletion {
@@ -278,6 +419,38 @@ impl SourceWatchSession {
         ) || self.watching.unwrap_or(true)
     }
 
+    pub(crate) fn recorded_children(&self) -> Vec<(DevUiChildRole, ProcessIdentity)> {
+        if let Some(ui) = &self.ui {
+            [
+                DevUiChildRole::Gateway,
+                DevUiChildRole::Ui,
+                DevUiChildRole::Command,
+            ]
+            .into_iter()
+            .filter_map(|role| ui.children.get(role).cloned().map(|child| (role, child)))
+            .collect()
+        } else {
+            self.child
+                .clone()
+                .map(|child| vec![(DevUiChildRole::Gateway, child)])
+                .unwrap_or_default()
+        }
+    }
+
+    pub(crate) fn child_pending(&self) -> bool {
+        self.child_spawn_pending || self.ui.as_ref().is_some_and(|ui| ui.pending.is_some())
+    }
+
+    pub(crate) fn has_child_ownership(&self) -> bool {
+        self.child.is_some()
+            || self.child_pending()
+            || self.ui.as_ref().is_some_and(|ui| {
+                ui.children.gateway.is_some()
+                    || ui.children.ui.is_some()
+                    || ui.children.command.is_some()
+            })
+    }
+
     pub(crate) fn is_legacy_watch(&self) -> bool {
         self.kind == LEGACY_SESSION_KIND
     }
@@ -300,16 +473,11 @@ impl SourceWatchSession {
 
     #[cfg(unix)]
     pub(crate) fn requires_controller_completion(&self) -> bool {
-        !self.is_legacy_watch()
-            && !self.closed
-            && (self.child.is_some() || self.child_spawn_pending)
+        !self.is_legacy_watch() && !self.closed && self.has_child_ownership()
     }
 
     pub(crate) fn unsafe_cleanup_error(&self) -> Option<&str> {
-        if !self.is_legacy_watch()
-            && !self.closed
-            && (self.child.is_some() || self.child_spawn_pending)
-        {
+        if !self.is_legacy_watch() && !self.closed && self.has_child_ownership() {
             self.completion
                 .as_ref()
                 .and_then(|completion| completion.error.as_deref())
@@ -327,7 +495,7 @@ impl SourceWatchSession {
             return Ok(false);
         }
         #[cfg(windows)]
-        if self.child_spawn_pending {
+        if self.child_pending() {
             return Ok(false);
         }
         // A current Unix source session can own native descendants outside its
@@ -337,9 +505,9 @@ impl SourceWatchSession {
         if self.requires_controller_completion() {
             return Ok(false);
         }
-        if let Some(child) = &self.child {
+        for (_, child) in self.recorded_children() {
             if observe_process(child.pid)?
-                .is_some_and(|process| process.running && process.identity == *child)
+                .is_some_and(|process| process.running && process.identity == child)
             {
                 return Ok(false);
             }
@@ -514,6 +682,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ui_session_keeps_child_ownership_and_rejects_ambiguous_records() {
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([("OCM_HOME".to_string(), display_path(root.path()))]);
+        let meta = crate::store::create_environment(
+            super::super::CreateEnvironmentOptions {
+                name: "demo".to_string(),
+                root: None,
+                gateway_port: Some(19789),
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: None,
+                dev: None,
+                protected: false,
+            },
+            &env,
+            root.path(),
+        )
+        .unwrap();
+        let paths = EnvironmentService::new(&env, root.path())
+            .source_watch_session_paths("demo")
+            .unwrap();
+        let mut session = paths
+            .create_ui_session(&meta, "ui-generation", false)
+            .unwrap();
+        assert!(!session.is_watching());
+        assert!(!session.service_preparation);
+        let gateway = ProcessIdentity {
+            pid: session.controller.pid + 10000,
+            started_at: "gateway".to_string(),
+        };
+        let ui_child = ProcessIdentity {
+            pid: gateway.pid + 1,
+            started_at: "ui".to_string(),
+        };
+        let ui = session.ui.as_mut().unwrap();
+        ui.target = Some(SourceUiTarget {
+            port: 5173,
+            gateway_url: "http://127.0.0.1:19789/".to_string(),
+        });
+        ui.children.gateway = Some(gateway);
+        ui.children.ui = Some(ui_child);
+        paths.save_session(&session).unwrap();
+        assert!(paths.finish(&session, false, None, false).is_err());
+        assert!(!paths.load_session("demo").unwrap().unwrap().closed);
+        paths
+            .finish(
+                &session,
+                false,
+                Some("unverified UI cleanup".to_string()),
+                true,
+            )
+            .unwrap();
+        let retained = paths.load_session("demo").unwrap().unwrap();
+        assert_eq!(retained.recorded_children().len(), 2);
+        assert!(paths.request_stop(&retained).is_err());
+        assert!(paths.ensure_previous_session_finished("demo").is_err());
+
+        let mut mixed = session.clone();
+        mixed.kind = SESSION_KIND.to_string();
+        write_json(&paths.session, &mixed).unwrap();
+        assert!(paths.load_session("demo").is_err());
+        let mut mixed = session.clone();
+        mixed.service_preparation = true;
+        write_json(&paths.session, &mixed).unwrap();
+        assert!(paths.load_session("demo").is_err());
+        let mut unknown = serde_json::to_value(&session).unwrap();
+        unknown["ui"]["children"]["unowned"] = serde_json::json!({"pid": 1, "startedAt": "other"});
+        write_json(&paths.session, &unknown).unwrap();
+        assert!(paths.load_session("demo").is_err());
+        let duplicate = serde_json::to_string(&session).unwrap().replacen(
+            "\"gateway\":",
+            "\"gateway\":{\"pid\":1,\"startedAt\":\"other\"},\"gateway\":",
+            1,
+        );
+        fs::write(&paths.session, duplicate).unwrap();
+        assert!(paths.load_session("demo").is_err());
+    }
+
+    #[test]
     fn unverified_completion_survives_bad_stop_metadata_and_reclaim() {
         let root = tempfile::tempdir().unwrap();
         let env = BTreeMap::from([("OCM_HOME".to_string(), display_path(root.path()))]);
@@ -535,6 +783,7 @@ mod tests {
             child_spawn_pending: false,
             watching: Some(false),
             service_preparation: false,
+            ui: None,
             restore_service: false,
             closed: false,
             completion: None,
@@ -647,6 +896,7 @@ mod tests {
             child_spawn_pending: false,
             watching: Some(false),
             service_preparation: false,
+            ui: None,
             restore_service: false,
             closed: false,
             completion: None,

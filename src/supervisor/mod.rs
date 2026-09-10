@@ -47,8 +47,10 @@ const SUPERVISOR_RUNTIME_KIND: &str = "ocm-supervisor-runtime";
 // This capability covers the current admission filename through child publication.
 // Version 9 adds service-preparation admission and running-service retention to
 // foreground-session admission and retained completion ownership.
+// Version 10 also covers UI session roles, their captured address and cleanup.
+// Version 11 adds borrowed-source decoding and ownership-aware admission.
 // Values 2 through 6 were used by incompatible development snapshots.
-const GATEWAY_ADMISSION_VERSION: u32 = 9;
+const GATEWAY_ADMISSION_VERSION: u32 = 11;
 const SUPERVISOR_POLL_INTERVAL_MS: u64 = 200;
 const SUPERVISOR_RESTART_DELAY_MS: u64 = 1_000;
 const SUPERVISOR_MAX_RESTART_DELAY_MS: u64 = 30_000;
@@ -934,6 +936,21 @@ impl<'a> SupervisorService<'a> {
     /// The caller holds daemon lifecycle and Gateway admission until its lease
     /// is published. Existing watches and stop/recovery do not use this check.
     pub(crate) fn ensure_source_watch_daemon_compatible(&self) -> Result<(), String> {
+        self.ensure_gateway_admission_compatible("start source watch")
+    }
+
+    pub(crate) fn lock_borrowed_source_publication(
+        &self,
+    ) -> Result<Option<crate::store::ExclusiveFileLock>, String> {
+        if service_manager_kind(self.env) == ServiceManagerKind::Unsupported {
+            return Ok(None);
+        }
+        let lock = self.lock_daemon_lifecycle()?;
+        self.ensure_gateway_admission_compatible("register borrowed dev source")?;
+        Ok(Some(lock))
+    }
+
+    fn ensure_gateway_admission_compatible(&self, action: &str) -> Result<(), String> {
         if service_manager_kind(self.env) == ServiceManagerKind::Unsupported {
             return Ok(());
         }
@@ -1004,7 +1021,7 @@ impl<'a> SupervisorService<'a> {
         })();
         result.map_err(|error| {
             format!(
-                "cannot start source watch: {error}; wait for daemon startup or refresh it from the updated OCM installation with \"ocm service refresh-daemon --acknowledge-gateway-restarts\" during a maintenance window"
+                "cannot {action}: {error}; wait for daemon startup or refresh it from the updated OCM installation with \"ocm service refresh-daemon --acknowledge-gateway-restarts\" during a maintenance window"
             )
         })
     }
@@ -2513,7 +2530,7 @@ fn admit_supervisor_child_start(
             .dev
             .as_ref()
             .ok_or_else(|| format!("dev binding is missing for env {}", meta.name))?;
-        let source_root = Path::new(&dev.worktree_root);
+        let source_root = Path::new(dev.source_root());
         if source_root != Path::new(&spec.run_dir) {
             return Err(format!(
                 "refusing to start env \"{}\": its saved dev source no longer matches {}; restart the service to refresh its plan",
@@ -2521,6 +2538,7 @@ fn admit_supervisor_child_start(
                 source_root.display()
             ));
         }
+        dev.execution_source_root()?;
     }
     Ok(admission)
 }

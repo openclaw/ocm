@@ -602,6 +602,49 @@ fn minimum_local_config_value(
     Ok(value)
 }
 
+pub(crate) fn dev_ui_gateway_url(paths: &EnvPaths, port: u32) -> Result<String, String> {
+    let config = load_effective_openclaw_config(&paths.config_path)?
+        .map(|config| config.value)
+        .unwrap_or_else(|| json!({}));
+    let gateway = config.get("gateway");
+    if gateway
+        .and_then(|value| value.get("tls"))
+        .and_then(|value| value.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Err(
+            "--ui currently requires a local HTTP Gateway; this environment enables Gateway TLS. Omit --ui to keep using its configured Gateway"
+                .to_string(),
+        );
+    }
+    let control_ui = gateway.and_then(|value| value.get("controlUi"));
+    if control_ui
+        .and_then(|value| value.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return Err(
+            "the environment disables the Control UI; omit --ui to keep using its configured Gateway"
+                .to_string(),
+        );
+    }
+    let base = match control_ui.and_then(|value| value.get("basePath")) {
+        None | Some(Value::Null) => "",
+        Some(Value::String(value)) => value.trim().trim_matches('/'),
+        Some(_) => return Err("gateway.controlUi.basePath must be a URL path".to_string()),
+    };
+    if base.contains(['?', '#', '\\']) || base.split('/').any(|part| matches!(part, "." | "..")) {
+        return Err("gateway.controlUi.basePath must be a URL path without a query, fragment, or dot segments".to_string());
+    }
+    let mut url =
+        Url::parse(&format!("http://127.0.0.1:{port}/")).map_err(|error| error.to_string())?;
+    if !base.is_empty() {
+        url.set_path(&format!("/{base}/"));
+    }
+    Ok(url.to_string())
+}
+
 pub(crate) fn clear_skip_bootstrap_for_openclaw_onboarding(
     target_paths: &EnvPaths,
 ) -> Result<bool, String> {

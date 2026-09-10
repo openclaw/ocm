@@ -15,11 +15,11 @@ use serde_json::{Value, json};
 
 use super::{Cli, render};
 use crate::env::{
-    CloneEnvironmentOptions, CreateEnvSnapshotOptions, EnvDevMeta, EnvSnapshotSummary,
+    CloneEnvironmentOptions, CreateEnvSnapshotOptions, EnvSnapshotSummary,
     RestoreEnvSnapshotOptions, resolve_runtime_run_dir,
 };
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
-use crate::openclaw_repo::{detect_openclaw_checkout, ensure_openclaw_worktree};
+use crate::openclaw_repo::detect_openclaw_checkout;
 use crate::runtime::releases::{
     OpenClawRelease, compare_runtime_release_versions, is_official_openclaw_releases_url,
     normalize_openclaw_channel_selector, official_openclaw_releases_url,
@@ -38,8 +38,9 @@ use crate::store::{
     install_runtime_from_selected_official_openclaw_release, list_upgrade_history,
     lock_env_registry, lock_upgrade_batch, lock_upgrade_participant, lock_upgrade_transaction,
     remove_runtime, remove_upgrade_recovery, resolve_absolute_path, runtime_install_root,
-    runtime_integrity_issue, runtime_meta_path, save_environment, save_upgrade_history_record,
-    upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir, write_json,
+    runtime_integrity_issue, runtime_meta_path, save_environment_with_dev_registration,
+    save_upgrade_history_record, upgrade_history_recovery_dir,
+    upgrade_history_runtime_recovery_dir, with_prepared_dev_source, write_json,
 };
 
 const UPGRADE_INTERRUPT_REQUESTED: usize = 1 << (usize::BITS - 1);
@@ -775,11 +776,16 @@ impl Cli {
         self.save_upgrade_batch_journal(&journal_path, &summary)?;
 
         let checkpoint_label = format!("fast-batch-{batch_id}");
+        let rollback_enabled = options.failure_policy == UpgradeFleetFailurePolicy::Rollback;
         let checkpoint_results = self.run_parallel_batch_work(
             &options.env_names,
             options.parallel,
             move |cli, env_name| {
-                cli.create_upgrade_batch_checkpoint_locked(env_name, &checkpoint_label)
+                cli.create_upgrade_batch_checkpoint_locked(
+                    env_name,
+                    &checkpoint_label,
+                    rollback_enabled,
+                )
             },
         );
         for (env_name, result) in checkpoint_results {
@@ -956,8 +962,15 @@ impl Cli {
         &self,
         env_name: &str,
         label: &str,
+        rollback_enabled: bool,
     ) -> Result<EnvSnapshotSummary, String> {
         let interrupt_fence = UpgradeInterruptFence::enter()?;
+        if rollback_enabled {
+            self.environment_service()
+                .ensure_upgrade_rollback_preserves_dev_sources_locked(
+                    &self.environment_service().get(env_name)?,
+                )?;
+        }
         let prepared = self
             .environment_service()
             .prepare_upgrade_checkpoint_locked(env_name)?;
@@ -1197,7 +1210,8 @@ impl Cli {
                 record.id
             ));
         }
-        self.environment_service()
+        let snapshot = self
+            .environment_service()
             .get_snapshot(env_name, &record.snapshot_id)
             .map_err(|error| {
                 format!(
@@ -1205,6 +1219,10 @@ impl Cli {
                     record.id
                 )
             })?;
+        self.environment_service()
+            .ensure_snapshot_restore_preserves_dev_sources_locked(&snapshot)?;
+        self.environment_service()
+            .ensure_upgrade_rollback_preserves_dev_sources_locked(&current)?;
         self.verify_rollback_target_version(env_name, &record)?;
         let recovery = self.verify_rollback_source(env_name, &record)?;
         Ok(UpgradeRollbackPlan { record, recovery })
@@ -1970,15 +1988,24 @@ impl Cli {
                 ))
             }
             UpgradeSimulationTarget::LocalRepo { repo_root, .. } => {
-                let worktree_root = ensure_openclaw_worktree(repo_root, simulation_name)?;
                 let mut meta = self.environment_service().get(simulation_name)?;
                 meta.default_runtime = None;
                 meta.default_launcher = None;
-                meta.dev = Some(EnvDevMeta {
-                    repo_root: display_path(repo_root),
-                    worktree_root: display_path(&worktree_root),
-                });
-                let mut meta = save_environment(meta, &self.env, &self.cwd)?;
+                let mut meta = with_prepared_dev_source(
+                    repo_root,
+                    simulation_name,
+                    &self.env,
+                    &self.cwd,
+                    |dev, registration| {
+                        meta.dev = Some(dev);
+                        save_environment_with_dev_registration(
+                            meta,
+                            registration,
+                            &self.env,
+                            &self.cwd,
+                        )
+                    },
+                )?;
                 meta = self
                     .environment_service()
                     .apply_effective_gateway_port(meta)?;
@@ -2061,7 +2088,7 @@ impl Cli {
             .dev
             .as_ref()
             .ok_or_else(|| format!("environment \"{}\" is missing its dev binding", meta.name))?;
-        let worktree_root = Path::new(&dev.worktree_root);
+        let worktree_root = dev.execution_source_root()?;
         let pnpm_store = worktree_root.join("node_modules").join(".pnpm");
         let tsx_bin = worktree_root.join("node_modules").join(".bin").join("tsx");
         if pnpm_store.exists() && tsx_bin.exists() {
@@ -2136,10 +2163,14 @@ impl Cli {
                         ),
                     );
                 };
+                let source_root = match dev.execution_source_root() {
+                    Ok(root) => root,
+                    Err(error) => return UpgradeSimulationCheck::failed(name, error),
+                };
                 let mut command = Command::new("pnpm");
                 command
                     .arg(script)
-                    .current_dir(&dev.worktree_root)
+                    .current_dir(source_root)
                     .env_clear()
                     .envs(build_openclaw_env(&env_meta, &self.env))
                     .stdin(Stdio::null())
@@ -4343,6 +4374,10 @@ impl Cli {
         let interrupt_fence = UpgradeInterruptFence::enter()?;
         let snapshot_preparation_started = timings.start();
         let env_meta = self.environment_service().get(env_name)?;
+        if rollback_enabled {
+            self.environment_service()
+                .ensure_upgrade_rollback_preserves_dev_sources_locked(&env_meta)?;
+        }
         let prepared = self
             .environment_service()
             .prepare_upgrade_checkpoint_locked(env_name)?;

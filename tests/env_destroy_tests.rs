@@ -13,12 +13,13 @@ use std::thread::sleep;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use ocm::env::EnvDevMeta;
+use ocm::env::{EnvDevMeta, EnvMeta};
 use ocm::store::{get_environment, save_environment};
 
 use crate::support::{
-    TestDir, dev_plain, managed_service_definition_path, ocm_env, path_string, run_ocm, stderr,
-    stdout, write_executable_script,
+    TestDir, create_owned_dev_env, create_owned_dev_env_at_root, dev_plain,
+    managed_service_definition_path, ocm_env, path_string, run_ocm, stderr, stdout,
+    write_executable_script,
 };
 
 fn install_fake_launchctl(root: &TestDir, env: &mut BTreeMap<String, String>) {
@@ -171,6 +172,27 @@ fn install_fake_dev_runners(root: &TestDir, env: &mut BTreeMap<String, String>) 
     write_executable_script(&bin_dir.join("pnpm"), &pnpm);
     write_executable_script(&bin_dir.join("node"), &node);
     prepend_fake_bin(env, &bin_dir);
+}
+
+fn git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    stdout(&output).trim().to_string()
+}
+
+fn create_dev_source(
+    repo: &Path,
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> EnvMeta {
+    create_owned_dev_env(repo, name, env, cwd);
+    get_environment(name, env, cwd).unwrap()
 }
 
 #[cfg(unix)]
@@ -550,6 +572,7 @@ fn env_destroy_yes_removes_dev_worktree() {
     install_fake_launchctl(&root, &mut env);
     install_fake_dev_runners(&root, &mut env);
 
+    let worktree = create_owned_dev_env(&repo, "demo", &env, &cwd);
     let run = run_ocm(
         &cwd,
         &env,
@@ -557,12 +580,624 @@ fn env_destroy_yes_removes_dev_worktree() {
     );
     assert!(run.status.success(), "{}", stderr(&run));
 
-    let worktree = repo.join(".worktrees/demo");
     assert!(worktree.exists());
 
     let destroy = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--yes"]);
     assert!(destroy.status.success(), "{}", stderr(&destroy));
     assert!(!worktree.exists(), "dev worktree should be removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn env_destroy_borrower_preserves_shared_source_and_its_worker() {
+    let root = TestDir::new("env-destroy-borrowed-source");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.path();
+    let mut env = ocm_launchd_env(&root);
+    install_fake_launchctl(&root, &mut env);
+    install_fake_dev_runners(&root, &mut env);
+    let source = create_owned_dev_env(&repo, "owner", &env, cwd);
+    let created = run_ocm(
+        cwd,
+        &env,
+        &dev_plain(&["borrower", "--repo", &path_string(&source)]),
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let borrower = get_environment("borrower", &env, cwd).unwrap();
+    assert!(borrower.dev.as_ref().unwrap().owned_worktree().is_none());
+    fs::write(source.join("retained.txt"), "uncommitted source\n").unwrap();
+    let registrations = git(&repo, &["worktree", "list", "--porcelain"]);
+    let registry = ocm::store::env_registry_path(&env, cwd).unwrap();
+    let before = fs::read(&registry).unwrap();
+    let mut worker = Command::new("python3")
+        .current_dir(&source)
+        .args(["-c", "import time; time.sleep(60)"])
+        .env_clear()
+        .envs(&env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let owner = run_ocm(
+        cwd,
+        &env,
+        &["env", "destroy", "owner", "--yes", "--force", "--json"],
+    );
+    let owner_preserved = fs::read(&registry).unwrap() == before;
+    let owner_worker_alive = worker.try_wait().unwrap().is_none();
+    let destroyed = run_ocm(
+        cwd,
+        &env,
+        &["env", "destroy", "borrower", "--yes", "--force", "--json"],
+    );
+    let borrower_worker_alive = worker.try_wait().unwrap().is_none();
+    if borrower_worker_alive {
+        let _ = worker.kill();
+    }
+    let _ = worker.wait();
+    assert!(!owner.status.success(), "{}", stdout(&owner));
+    assert!(
+        stdout(&owner).contains("registered dev source"),
+        "{}",
+        stdout(&owner)
+    );
+    assert!(owner_preserved && owner_worker_alive);
+    assert!(
+        destroyed.status.success(),
+        "{} {}",
+        stdout(&destroyed),
+        stderr(&destroyed)
+    );
+    assert!(
+        borrower_worker_alive,
+        "borrowed source CWD did not grant process ownership"
+    );
+    let summary: serde_json::Value = serde_json::from_str(&stdout(&destroyed)).unwrap();
+    assert_eq!(summary["worktreeRemoved"], false);
+    assert!(summary["devWorktree"].is_null());
+    assert_eq!(summary["processesTerminated"], 0);
+    assert!(
+        summary["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["kind"] != "worktree")
+    );
+    assert!(!Path::new(&borrower.root).exists());
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"]),
+        registrations
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("retained.txt")).unwrap(),
+        "uncommitted source\n"
+    );
+    assert!(get_environment("owner", &env, cwd).is_ok());
+
+    let created = run_ocm(
+        cwd,
+        &env,
+        &dev_plain(&["borrower", "--repo", &path_string(&source)]),
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let retained = root.child("retained-worktree");
+    fs::rename(&source, &retained).unwrap();
+    let registrations = git(&repo, &["worktree", "list", "--porcelain"]);
+    let before = fs::read(&registry).unwrap();
+    let owner = run_ocm(
+        cwd,
+        &env,
+        &["env", "destroy", "owner", "--yes", "--force", "--json"],
+    );
+    assert!(!owner.status.success(), "{}", stdout(&owner));
+    assert!(stdout(&owner).contains("registered dev source"));
+    assert_eq!(fs::read(&registry).unwrap(), before);
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"]),
+        registrations
+    );
+    assert!(!source.exists());
+    // Once an external prune removes the slot too, owner cleanup no longer
+    // mutates this missing source and may remove its separate environment state.
+    git(&repo, &["worktree", "prune", "--expire", "now"]);
+    for name in ["owner", "borrower"] {
+        let removed = run_ocm(cwd, &env, &["env", "remove", name, "--force"]);
+        assert!(removed.status.success(), "{name}: {}", stderr(&removed));
+    }
+    assert_eq!(
+        fs::read_to_string(retained.join("retained.txt")).unwrap(),
+        "uncommitted source\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn env_remove_preserves_a_dangling_root_link_used_by_a_borrowed_source() {
+    let root = TestDir::new("env-remove-borrowed-root-link");
+    let cwd = root.path();
+    let mut env = ocm_launchd_env(&root);
+    install_fake_launchctl(&root, &mut env);
+    install_fake_dev_runners(&root, &mut env);
+    let created = run_ocm(cwd, &env, &["env", "create", "parent"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let parent = get_environment("parent", &env, cwd).unwrap();
+    let source = Path::new(&parent.root).join("project");
+    fs::rename(init_openclaw_repo(&root), &source).unwrap();
+    let created = run_ocm(
+        cwd,
+        &env,
+        &dev_plain(&["borrower", "--repo", &path_string(&source)]),
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let retained = root.child("retained-parent");
+    fs::rename(&parent.root, &retained).unwrap();
+    let missing = root.child("missing-parent");
+    std::os::unix::fs::symlink(&missing, &parent.root).unwrap();
+    let registry = ocm::store::env_registry_path(&env, cwd).unwrap();
+    let before = fs::read(&registry).unwrap();
+    let rejected = ocm::store::remove_environment("parent", true, &env, cwd).unwrap_err();
+    assert!(rejected.contains("registered dev source"), "{rejected}");
+    assert_eq!(fs::read(&registry).unwrap(), before);
+    assert_eq!(fs::read_link(&parent.root).unwrap(), missing);
+    assert!(retained.join("project/scripts/run-node.mjs").is_file());
+    ocm::store::remove_environment("borrower", true, &env, cwd).unwrap();
+    ocm::store::remove_environment("parent", true, &env, cwd).unwrap();
+    assert!(get_environment("borrower", &env, cwd).is_err());
+    assert!(get_environment("parent", &env, cwd).is_err());
+    // Removing registry records preserves an already dangling environment link.
+    assert_eq!(fs::read_link(&parent.root).unwrap(), missing);
+    assert!(retained.join("project/scripts/run-node.mjs").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn env_destroy_preserves_nested_registered_dev_source_and_worker() {
+    let root = TestDir::new("env-destroy-nested-dev-source");
+    let cwd = root.path();
+    let mut env = ocm_launchd_env(&root);
+    install_fake_launchctl(&root, &mut env);
+    install_fake_dev_runners(&root, &mut env);
+    let created = run_ocm(cwd, &env, &["env", "create", "parent"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let parent = get_environment("parent", &env, cwd).unwrap();
+    let repo = Path::new(&parent.root).join(".openclaw/workspace/projects/openclaw");
+    fs::create_dir_all(repo.parent().unwrap()).unwrap();
+    fs::rename(init_openclaw_repo(&root), &repo).unwrap();
+    let child = create_dev_source(&repo, "child", &env, cwd);
+    let worktree = Path::new(child.dev.as_ref().unwrap().source_root());
+    let parent_root = fs::canonicalize(&parent.root).unwrap();
+    assert!(
+        fs::canonicalize(worktree)
+            .unwrap()
+            .starts_with(&parent_root)
+    );
+    assert!(
+        !fs::canonicalize(&child.root)
+            .unwrap()
+            .starts_with(&parent_root)
+    );
+    let source = worktree.join("package.json");
+    let source_before = fs::read(&source).unwrap();
+    let mut aged = parent.clone();
+    aged.created_at -= time::Duration::days(30);
+    save_environment(aged, &env, cwd).unwrap();
+    let registry = ocm::store::env_registry_path(&env, cwd).unwrap();
+    let registry_before = fs::read(&registry).unwrap();
+    let direct = ocm::store::remove_environment("parent", true, &env, cwd).unwrap_err();
+    assert!(direct.contains("registered dev source"), "{direct}");
+    for args in [
+        vec!["env", "remove", "parent", "--force"],
+        vec!["env", "prune", "--older-than", "14", "--yes"],
+    ] {
+        let refused = run_ocm(cwd, &env, &args);
+        assert!(!refused.status.success(), "{}", stdout(&refused));
+        assert!(
+            stderr(&refused).contains("registered dev source"),
+            "{}",
+            stderr(&refused)
+        );
+    }
+    let mut worker = Command::new("python3")
+        .current_dir(worktree)
+        .args(["-c", "import time; time.sleep(60)"])
+        .env_clear()
+        .envs(&env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let destroy = run_ocm(
+        cwd,
+        &env,
+        &["env", "destroy", "parent", "--yes", "--force", "--json"],
+    );
+    let worker_alive = worker.try_wait().unwrap().is_none();
+    if worker_alive {
+        let _ = worker.kill();
+    }
+    let _ = worker.wait();
+    let source_unchanged = fs::read(&source).is_ok_and(|bytes| bytes == source_before);
+    let registry_unchanged = fs::read(&registry).unwrap() == registry_before;
+    assert!(
+        !destroy.status.success() && worker_alive && source_unchanged && registry_unchanged,
+        "destroy success={}, worker alive={worker_alive}, source unchanged={source_unchanged}, registry unchanged={registry_unchanged}; {} {}",
+        destroy.status.success(),
+        stdout(&destroy),
+        stderr(&destroy)
+    );
+    assert!(
+        stdout(&destroy).contains("registered dev source"),
+        "{}",
+        stdout(&destroy)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn env_cleanup_preserves_registered_dev_identity_paths() {
+    use std::os::unix::fs::symlink;
+    for layout in [
+        "common",
+        "repo-entry",
+        "source-bridge",
+        "git-bridge",
+        "private",
+        "repo-private",
+        "common-bridge",
+        "backlink-bridge",
+        "registry-bridge",
+    ] {
+        let root = TestDir::new(&format!("env-cleanup-identity-{layout}"));
+        let cwd = root.path();
+        let mut env = ocm_launchd_env(&root);
+        install_fake_launchctl(&root, &mut env);
+        install_fake_dev_runners(&root, &mut env);
+        let created = run_ocm(cwd, &env, &["env", "create", "parent"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let parent = PathBuf::from(get_environment("parent", &env, cwd).unwrap().root);
+        let mut repo = init_openclaw_repo(&root);
+        if layout == "common" {
+            let contained = parent.join(".openclaw/workspace/projects/openclaw");
+            fs::create_dir_all(contained.parent().unwrap()).unwrap();
+            fs::rename(&repo, &contained).unwrap();
+            repo = root.child("outside-linked");
+            git(
+                &contained,
+                &["worktree", "add", "--detach", &path_string(&repo), "HEAD"],
+            );
+        } else if matches!(layout, "repo-entry" | "repo-private") {
+            let linked = if layout == "repo-entry" {
+                parent.join("linked")
+            } else {
+                root.child("outside-linked")
+            };
+            git(
+                &repo,
+                &["worktree", "add", "--detach", &path_string(&linked), "HEAD"],
+            );
+            repo = linked;
+        }
+        let pool = root.child("outside-pool");
+        fs::create_dir_all(&pool).unwrap();
+        let bridge = parent.join("bridge");
+        if matches!(layout, "repo-entry" | "source-bridge") {
+            symlink(&pool, &bridge).unwrap();
+            symlink(
+                if layout == "repo-entry" {
+                    &pool
+                } else {
+                    &bridge
+                },
+                repo.join(".worktrees"),
+            )
+            .unwrap();
+        } else if layout == "git-bridge" {
+            let metadata = root.child("outside-git");
+            fs::rename(repo.join(".git"), &metadata).unwrap();
+            symlink(&metadata, &bridge).unwrap();
+            symlink(&bridge, repo.join(".git")).unwrap();
+        }
+        let child = create_dev_source(&repo, "child", &env, cwd);
+        let worktree = Path::new(child.dev.as_ref().unwrap().source_root());
+        let entrypoint = if layout == "repo-private" {
+            repo.as_path()
+        } else {
+            worktree
+        };
+        let private = PathBuf::from(git(entrypoint, &["rev-parse", "--absolute-git-dir"]));
+        let common = PathBuf::from(git(
+            entrypoint,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ));
+        if matches!(layout, "private" | "repo-private") {
+            let moved = parent.join("private");
+            fs::rename(&private, &moved).unwrap();
+            fs::write(moved.join("commondir"), format!("{}\n", common.display())).unwrap();
+            symlink(&moved, &private).unwrap();
+        } else if layout == "common-bridge" {
+            symlink(&common, &bridge).unwrap();
+            fs::write(private.join("commondir"), format!("{}\n", bridge.display())).unwrap();
+        } else if layout == "backlink-bridge" {
+            symlink(worktree.parent().unwrap(), &bridge).unwrap();
+            fs::write(
+                private.join("gitdir"),
+                format!(
+                    "{}/.git\n",
+                    bridge.join(worktree.file_name().unwrap()).display()
+                ),
+            )
+            .unwrap();
+        } else if layout == "registry-bridge" {
+            let moved = root.child("outside-private");
+            fs::rename(&private, &moved).unwrap();
+            fs::write(moved.join("commondir"), format!("{}\n", common.display())).unwrap();
+            symlink(&moved, &bridge).unwrap();
+            symlink(&bridge, &private).unwrap();
+            fs::write(
+                worktree.join(".git"),
+                format!("gitdir: {}\n", moved.display()),
+            )
+            .unwrap();
+        }
+        let resumed = run_ocm(cwd, &env, &dev_plain(&["child"]));
+        assert!(resumed.status.success(), "{layout}: {}", stderr(&resumed));
+        let source_before = fs::read(worktree.join("package.json")).unwrap();
+        let registry = ocm::store::env_registry_path(&env, cwd).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let unrelated = root.child("unrelated-git");
+        fs::create_dir_all(&unrelated).unwrap();
+        git(&unrelated, &["init"]);
+        for overridden in [false, true] {
+            if overridden {
+                for key in ["GIT_DIR", "GIT_COMMON_DIR"] {
+                    env.insert(key.to_string(), path_string(&unrelated.join(".git")));
+                }
+                env.insert("GIT_WORK_TREE".to_string(), path_string(&unrelated));
+            }
+            let refused = run_ocm(
+                cwd,
+                &env,
+                &["env", "destroy", "parent", "--yes", "--force", "--json"],
+            );
+            assert!(!refused.status.success(), "{layout}: {}", stdout(&refused));
+            assert!(
+                stdout(&refused).contains("registered dev source"),
+                "{layout}: {} {}",
+                stdout(&refused),
+                stderr(&refused)
+            );
+            assert_eq!(fs::read(&registry).unwrap(), registry_before, "{layout}");
+            assert_eq!(
+                fs::read(worktree.join("package.json")).unwrap(),
+                source_before,
+                "{layout}"
+            );
+            git(worktree, &["status", "--porcelain"]);
+        }
+    }
+}
+
+#[test]
+fn env_remove_keeps_independent_owned_children_removable() {
+    let root = TestDir::new("env-remove-owned-child");
+    let repo = init_openclaw_repo(&root);
+    let mut env = ocm_launchd_env(&root);
+    install_fake_launchctl(&root, &mut env);
+    install_fake_dev_runners(&root, &mut env);
+    let parent = create_dev_source(&repo, "parent", &env, root.path());
+    let source = Path::new(parent.dev.as_ref().unwrap().source_root());
+    create_dev_source(source, "child", &env, root.path());
+    let refused = run_ocm(root.path(), &env, &["env", "remove", "parent"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("registered dev source"),
+        "{}",
+        stderr(&refused)
+    );
+    let removed = run_ocm(root.path(), &env, &["env", "remove", "child"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+
+    let tracked_file = source.join("scripts/run-node.mjs");
+    let original = fs::read(&tracked_file).unwrap();
+    let private = PathBuf::from(git(source, &["rev-parse", "--absolute-git-dir"]));
+    let misleading_index = root.child("misleading-index");
+    fs::copy(private.join("index"), &misleading_index).unwrap();
+    let hidden = Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["update-index", "--assume-unchanged", "scripts/run-node.mjs"])
+        .env("GIT_INDEX_FILE", &misleading_index)
+        .output()
+        .unwrap();
+    assert!(hidden.status.success(), "{}", stderr(&hidden));
+    fs::write(&tracked_file, "console.log('retained modification');\n").unwrap();
+    env.insert("GIT_INDEX_FILE".to_string(), path_string(&misleading_index));
+    let refused = run_ocm(root.path(), &env, &["env", "remove", "parent"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("modified or untracked files"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        fs::read_to_string(&tracked_file).unwrap(),
+        "console.log('retained modification');\n"
+    );
+    fs::write(&tracked_file, original).unwrap();
+    let removed = run_ocm(root.path(), &env, &["env", "remove", "parent"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+}
+
+#[cfg(unix)]
+#[test]
+fn env_remove_preserves_missing_owned_worktree_recovery() {
+    for (private_inside, dev_replacement) in [(false, false), (true, false), (true, true)] {
+        let root = TestDir::new(&format!(
+            "env-remove-missing-owned-recovery-{private_inside}-{dev_replacement}"
+        ));
+        let mut env = ocm_launchd_env(&root);
+        install_fake_launchctl(&root, &mut env);
+        install_fake_dev_runners(&root, &mut env);
+        let created = run_ocm(root.path(), &env, &["env", "create", "parent"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let parent = get_environment("parent", &env, root.path()).unwrap();
+        let mut repo = init_openclaw_repo(&root);
+        if !private_inside {
+            let contained = Path::new(&parent.root).join("project");
+            fs::rename(&repo, &contained).unwrap();
+            repo = contained;
+        }
+        let child = create_dev_source(&repo, "child", &env, root.path());
+        let worktree = Path::new(child.dev.as_ref().unwrap().source_root());
+        fs::write(worktree.join("retained.txt"), "unique detached work\n").unwrap();
+        git(worktree, &["add", "retained.txt"]);
+        git(worktree, &["commit", "-m", "retain detached dev history"]);
+        let detached = git(worktree, &["rev-parse", "HEAD"]);
+        assert_ne!(detached, git(&repo, &["rev-parse", "HEAD"]));
+        if private_inside {
+            let private = PathBuf::from(git(worktree, &["rev-parse", "--absolute-git-dir"]));
+            let common = git(
+                worktree,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            );
+            let moved = Path::new(&parent.root).join("private");
+            fs::rename(&private, &moved).unwrap();
+            fs::write(moved.join("commondir"), format!("{common}\n")).unwrap();
+            std::os::unix::fs::symlink(&moved, &private).unwrap();
+            let resumed = run_ocm(root.path(), &env, &dev_plain(&["child"]));
+            assert!(resumed.status.success(), "{}", stderr(&resumed));
+        }
+        fs::remove_dir_all(worktree).unwrap();
+        let refused = run_ocm(root.path(), &env, &["env", "remove", "parent"]);
+        assert!(!refused.status.success());
+        assert!(
+            stderr(&refused).contains("registered dev source"),
+            "{}",
+            stderr(&refused)
+        );
+        assert!(repo.join(".git").is_dir());
+        assert!(
+            git(&repo, &["worktree", "list", "--porcelain"]).contains(&format!("HEAD {detached}"))
+        );
+        assert!(
+            !worktree.exists(),
+            "cleanup must not recreate the missing worktree"
+        );
+        let replacement_root = if private_inside {
+            let alias = root.child("replacement-parent");
+            std::os::unix::fs::symlink(worktree.parent().unwrap(), &alias).unwrap();
+            alias.join(worktree.file_name().unwrap())
+        } else {
+            worktree.to_path_buf()
+        };
+        if dev_replacement {
+            create_owned_dev_env_at_root(
+                &repo,
+                "replacement",
+                &replacement_root,
+                &env,
+                root.path(),
+            );
+        } else {
+            let replacement = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "create",
+                    "replacement",
+                    "--root",
+                    &path_string(&replacement_root),
+                ],
+            );
+            assert!(replacement.status.success(), "{}", stderr(&replacement));
+        }
+        let replacement = get_environment("replacement", &env, root.path()).unwrap();
+        let replacement_before = serde_json::to_value(&replacement).unwrap();
+        let retained_state = Path::new(&replacement.root).join("retained-state.txt");
+        fs::write(&retained_state, "replacement state\n").unwrap();
+        let unrelated = run_ocm(root.path(), &env, &["env", "create", "unrelated"]);
+        assert!(unrelated.status.success(), "{}", stderr(&unrelated));
+        let removed = run_ocm(root.path(), &env, &["env", "remove", "unrelated"]);
+        assert!(
+            removed.status.success(),
+            "unrelated cleanup with replacement: {}",
+            stderr(&removed)
+        );
+        assert_eq!(
+            fs::read_to_string(&retained_state).unwrap(),
+            "replacement state\n"
+        );
+        assert_eq!(
+            serde_json::to_value(get_environment("replacement", &env, root.path()).unwrap())
+                .unwrap(),
+            replacement_before
+        );
+        assert!(
+            git(&repo, &["worktree", "list", "--porcelain"]).contains(&format!("HEAD {detached}"))
+        );
+        let refused = run_ocm(root.path(), &env, &["env", "remove", "parent"]);
+        assert!(!refused.status.success());
+        assert!(
+            stderr(&refused).contains("registered dev source"),
+            "{}",
+            stderr(&refused)
+        );
+        for name in ["replacement", "child", "parent"] {
+            let removed = run_ocm(root.path(), &env, &["env", "remove", name]);
+            assert!(removed.status.success(), "{}: {}", name, stderr(&removed));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_remove_preserves_source_inside_owned_git_registration() {
+    for alias in [false, true] {
+        let root = TestDir::new(&format!("env-remove-registration-source-{alias}"));
+        let repo = init_openclaw_repo(&root);
+        if alias {
+            let pool = root.child("outside-pool");
+            fs::create_dir_all(&pool).unwrap();
+            std::os::unix::fs::symlink(pool, repo.join(".worktrees")).unwrap();
+        }
+        let mut env = ocm_launchd_env(&root);
+        install_fake_launchctl(&root, &mut env);
+        install_fake_dev_runners(&root, &mut env);
+        let owner = create_dev_source(&repo, "owner", &env, root.path());
+        let worktree = Path::new(owner.dev.as_ref().unwrap().source_root());
+        let registration = PathBuf::from(git(worktree, &["rev-parse", "--absolute-git-dir"]));
+        let child_repo = registration.join("project");
+        git(
+            &repo,
+            &[
+                "clone",
+                "--quiet",
+                "--no-local",
+                &path_string(&repo),
+                &path_string(&child_repo),
+            ],
+        );
+        let child = create_dev_source(&child_repo, "child", &env, root.path());
+        let child_source = Path::new(child.dev.as_ref().unwrap().source_root());
+        // Missing target files still leave a registration slot that Git removes.
+        fs::remove_dir_all(worktree).unwrap();
+        fs::remove_dir_all(&owner.root).unwrap();
+        let refused = run_ocm(root.path(), &env, &["env", "remove", "owner"]);
+        assert!(!refused.status.success());
+        assert!(
+            stderr(&refused).contains("registered dev source"),
+            "{}",
+            stderr(&refused)
+        );
+        assert!(child_source.join("package.json").is_file());
+        for name in ["child", "owner"] {
+            let removed = run_ocm(root.path(), &env, &["env", "remove", name]);
+            assert!(removed.status.success(), "{name}: {}", stderr(&removed));
+        }
+    }
 }
 
 #[test]
@@ -580,7 +1215,7 @@ fn env_destroy_preserves_recovery_data_when_worktree_removal_fails() {
     let invalid_worktree = root.child("invalid-worktree");
     fs::write(&invalid_worktree, "not a directory").unwrap();
     let mut meta = get_environment("demo", &env, &cwd).unwrap();
-    meta.dev = Some(EnvDevMeta {
+    meta.dev = Some(EnvDevMeta::Owned {
         repo_root: path_string(&root.child("missing-repo")),
         worktree_root: path_string(&invalid_worktree),
     });

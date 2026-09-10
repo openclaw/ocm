@@ -25,9 +25,9 @@ use sha2::{Digest, Sha512};
 use tar::{Builder, Header};
 
 use crate::support::{
-    TestDir, TestHttpServer, install_fake_launchctl, install_fake_node_and_npm, ocm_env,
-    path_string, run_ocm, stderr, stdout, write_executable_script, write_json_replacing_path,
-    write_text,
+    TestDir, TestHttpServer, hold_environment_operation, install_fake_launchctl,
+    install_fake_node_and_npm, ocm_env, path_string, run_ocm, stderr, stdout,
+    write_executable_script, write_json_replacing_path, write_text,
 };
 
 fn append_tar_file(
@@ -3231,6 +3231,121 @@ fn upgrade_simulate_reports_local_repo_doctor_failures() {
 
 #[cfg(unix)]
 #[test]
+fn upgrade_simulate_cleanup_preserves_registered_dev_source() {
+    for nested in [true, false] {
+        let root = TestDir::new(&format!("upgrade-simulate-registered-source-{nested}"));
+        let cwd = root.path();
+        let repo = init_openclaw_repo(&root);
+        let mut env = ocm_env(&root);
+        install_fake_node_and_npm(&root, &mut env, "22.22.3");
+        install_fake_simulation_pnpm(&root, &mut env);
+        env.insert("OCM_TEST_SIMULATION_DOCTOR_OK".to_string(), "1".to_string());
+        let protected_source = if nested {
+            env.insert("OCM_TEST_SOURCE_REPO".to_string(), path_string(&repo));
+            env.insert(
+                "OCM_TEST_SOURCE_CLI".to_string(),
+                path_string(&support::ocm_test_binary_path()),
+            );
+            env.insert(
+                "OCM_TEST_SOURCE_LOG".to_string(),
+                path_string(&root.child("child.log")),
+            );
+            let pnpm = root.child("fake-sim-bin/pnpm");
+            let original = fs::read_to_string(&pnpm).unwrap();
+            write_executable_script(
+                &pnpm,
+                &format!(
+                    r#"#!/bin/sh
+if [ "$1" = build ]; then
+  mkdir -p .artifacts
+  git clone --quiet --no-local "$OCM_TEST_SOURCE_REPO" .artifacts/project || exit 1
+  "$OCM_TEST_SOURCE_CLI" dev dependency --repo "$PWD/.artifacts/project" > "$OCM_TEST_SOURCE_LOG" 2>&1 || exit 1
+fi
+{}"#,
+                    original
+                ),
+            );
+            None
+        } else {
+            let source = support::create_owned_dev_env(&repo, "dependency", &env, cwd);
+            fs::create_dir_all(source.join("dist")).unwrap();
+            fs::write(source.join("dist/sentinel"), "retained peer output\n").unwrap();
+            Some(source)
+        };
+        let started = run_ocm(
+            cwd,
+            &env,
+            &[
+                "start",
+                "demo",
+                "--command",
+                "pnpm openclaw",
+                "--cwd",
+                &path_string(&repo),
+                "--no-service",
+            ],
+        );
+        assert!(started.status.success(), "{}", stderr(&started));
+        if let Some(source) = &protected_source {
+            env.insert("GIT_DIR".to_string(), path_string(&repo.join(".git")));
+            env.insert(
+                "GIT_COMMON_DIR".to_string(),
+                path_string(&repo.join(".git")),
+            );
+            env.insert("GIT_WORK_TREE".to_string(), path_string(source));
+            env.insert(
+                "GIT_INDEX_FILE".to_string(),
+                path_string(&repo.join(".git/index")),
+            );
+        }
+        let simulated = run_ocm(
+            cwd,
+            &env,
+            &[
+                "upgrade",
+                "simulate",
+                "demo",
+                "--to",
+                &path_string(&repo),
+                "--json",
+            ],
+        );
+        let result: Value = serde_json::from_str(&stdout(&simulated)).unwrap();
+        assert_eq!(result["outcome"], "passed", "{result:#}");
+        let simulation_name = result["simulationEnv"].as_str().unwrap();
+        if let Some(source) = protected_source {
+            assert!(simulated.status.success(), "{result:#}");
+            assert_eq!(result["cleanup"], "cleaned", "{result:#}");
+            assert_eq!(
+                fs::read_to_string(source.join("dist/sentinel")).unwrap(),
+                "retained peer output\n"
+            );
+            assert!(!repo.join(".worktrees").join(simulation_name).exists());
+            assert!(ocm::store::get_environment(simulation_name, &env, cwd).is_err());
+        } else {
+            assert_eq!(result["cleanup"], "failed", "{result:#}");
+            assert!(
+                stdout(&simulated).contains("registered dev source"),
+                "{result:#}"
+            );
+            let child = ocm::store::get_environment("dependency", &env, cwd).unwrap();
+            assert!(
+                Path::new(child.dev.unwrap().source_root())
+                    .join("package.json")
+                    .is_file()
+            );
+            let simulation = ocm::store::get_environment(simulation_name, &env, cwd).unwrap();
+            assert!(
+                Path::new(simulation.dev.unwrap().source_root())
+                    .join(".artifacts/build.json")
+                    .is_file()
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
     let root = TestDir::new("upgrade-simulate-cleanup-outcome");
     let cwd = root.child("workspace");
@@ -3240,6 +3355,13 @@ fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
     let mut env = ocm_env(&root);
     install_fake_node_and_npm(&root, &mut env, "22.22.3");
     install_fake_simulation_pnpm(&root, &mut env);
+
+    let parent = run_ocm(&cwd, &env, &["env", "create", "parent"]);
+    assert!(parent.status.success(), "{}", stderr(&parent));
+    let parent = ocm::store::get_environment("parent", &env, &cwd).unwrap();
+    let source = Path::new(&parent.root).join(".openclaw/workspace/openclaw");
+    fs::rename(repo, &source).unwrap();
+    let repo = source;
 
     let start = run_ocm(
         &cwd,
@@ -3255,6 +3377,28 @@ fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
         ],
     );
     assert!(start.status.success(), "{}", stderr(&start));
+
+    let lock = hold_environment_operation(&root, "parent");
+    let blocked = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "simulate",
+            "demo",
+            "--to",
+            &path_string(&repo),
+            "--raw",
+        ],
+    );
+    assert!(!blocked.status.success());
+    assert!(
+        stdout(&blocked).contains("environment parent has an operation in progress"),
+        "{}",
+        stdout(&blocked)
+    );
+    assert!(!repo.join(".worktrees").exists());
+    drop(lock);
 
     env.insert("OCM_TEST_SIMULATION_DOCTOR_OK".to_string(), "1".to_string());
     env.insert(
@@ -3859,7 +4003,7 @@ fn upgrade_rollback_refuses_a_broken_source_launcher_before_mutation() {
 
     fs::create_dir_all(&project_dir).unwrap();
     let mut current = ocm::store::get_environment("hacking", &env, &cwd).unwrap();
-    current.dev = Some(ocm::env::EnvDevMeta {
+    current.dev = Some(ocm::env::EnvDevMeta::Owned {
         repo_root: path_string(&project_dir),
         worktree_root: path_string(&root.child("saved-worktree")),
     });
@@ -4413,7 +4557,7 @@ fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
     fs::write(&marker, "after-upgrade").unwrap();
 
     let mut current = ocm::store::get_environment("demo", &env, &cwd).unwrap();
-    current.dev = Some(ocm::env::EnvDevMeta {
+    current.dev = Some(ocm::env::EnvDevMeta::Owned {
         repo_root: path_string(&root.child("saved-repo")),
         worktree_root: path_string(&root.child("saved-worktree")),
     });
@@ -5749,7 +5893,7 @@ fn upgrade_rolls_back_runtime_binding_when_update_finalization_fails() {
     fs::write(&secondary_skill, "skill before upgrade\n").unwrap();
 
     let mut current = ocm::store::get_environment("demo", &env, &cwd).unwrap();
-    current.dev = Some(ocm::env::EnvDevMeta {
+    current.dev = Some(ocm::env::EnvDevMeta::Owned {
         repo_root: path_string(&root.child("saved-repo")),
         worktree_root: path_string(&root.child("saved-worktree")),
     });

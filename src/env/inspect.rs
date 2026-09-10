@@ -141,7 +141,7 @@ impl<'a> EnvironmentService<'a> {
                 if let Some(dev) = env.dev.as_ref() {
                     summary.command = Some("pnpm openclaw".to_string());
                     summary.binary_path = Some("pnpm".to_string());
-                    summary.run_dir = Some(dev.worktree_root.clone());
+                    summary.run_dir = Some(dev.source_root().to_string());
                 } else {
                     summary.issue = Some(format!(
                         "environment \"{}\" is missing its dev binding",

@@ -1,7 +1,8 @@
 mod checkpoint_scope;
 mod checkpoints;
 mod common;
-mod dev_sources;
+mod dev_registration;
+pub(crate) mod dev_sources;
 mod envs;
 mod gateway_ports;
 mod launchers;
@@ -25,6 +26,8 @@ pub(crate) use common::{
     ExclusiveFileLock, copy_dir_recursive, ensure_dir, lock_file, read_json, try_lock_file,
     write_json,
 };
+pub(crate) use dev_registration::{DevSourceRegistration, with_prepared_dev_source};
+pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
 pub(crate) use envs::{
     EnvironmentOperationLock, lock_env_registry, lock_environment_operation,
     remove_environment_locked,
@@ -42,12 +45,12 @@ pub(crate) use envs::{
     create_environment_with_validated_runtime, import_environment_with_sandbox_origin,
 };
 pub(crate) use envs::{
-    save_environment_with_validated_launcher, save_environment_with_validated_runtime,
-    with_locked_environments,
+    save_environment_with_dev_registration, save_environment_with_validated_launcher,
+    save_environment_with_validated_runtime, with_locked_environments,
 };
 pub(crate) use gateway_ports::{
-    openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,
-    resolve_effective_gateway_ports, resolve_env_gateway_port,
+    choose_source_ui_port, openclaw_port_family_available, openclaw_port_family_range,
+    resolve_config_gateway_port, resolve_effective_gateway_ports, resolve_env_gateway_port,
 };
 pub use launchers::{add_launcher, get_launcher, list_launchers, remove_launcher};
 pub use layout::{
@@ -61,10 +64,11 @@ pub use layout::{
 };
 pub(crate) use openclaw_config::{
     OpenClawConfigAudit, audit_openclaw_config, clear_skip_bootstrap_for_openclaw_onboarding,
-    ensure_minimum_local_openclaw_config, normalize_new_environment_sandbox_origin,
-    openclaw_config_include_paths, openclaw_config_uses_includes,
-    reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
-    repair_openclaw_config, rewrite_external_workspace_paths_for_migration,
+    dev_ui_gateway_url, ensure_minimum_local_openclaw_config,
+    normalize_new_environment_sandbox_origin, openclaw_config_include_paths,
+    openclaw_config_uses_includes, reject_include_owned_agent_workspaces,
+    reject_include_owned_sandbox_origin, repair_openclaw_config,
+    rewrite_external_workspace_paths_for_migration,
     rewrite_identity_bound_workspace_paths_for_target, rewrite_openclaw_config_for_migration,
     rewrite_openclaw_config_for_new_environment, rewrite_openclaw_config_for_simulation,
     rewrite_openclaw_config_for_target, rewrite_openclaw_config_includes_for_target,
@@ -90,8 +94,8 @@ pub use runtimes::{
 };
 pub(crate) use snapshots::{
     EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
-    create_env_snapshot_from_preparation, prepare_env_snapshot_capture,
-    prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
+    create_env_snapshot_from_preparation, ensure_restore_preserves_dev_sources,
+    prepare_env_snapshot_capture, prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
     prepare_upgrade_snapshot_restore, rollback_env_snapshot_restore,
     validate_upgrade_independent_paths,
 };
@@ -141,8 +145,8 @@ pub fn summarize_env(meta: &EnvMeta) -> EnvSummary {
         service_running: meta.service_running,
         default_runtime: meta.default_runtime.clone(),
         default_launcher: meta.default_launcher.clone(),
-        dev_repo_root: meta.dev.as_ref().map(|dev| dev.repo_root.clone()),
-        dev_worktree_root: meta.dev.as_ref().map(|dev| dev.worktree_root.clone()),
+        dev_repo_root: meta.dev.as_ref().map(|dev| dev.repo_root().to_string()),
+        dev_worktree_root: meta.dev.as_ref().map(|dev| dev.source_root().to_string()),
         protected: meta.protected,
         created_at: meta.created_at,
         last_used_at: meta.last_used_at,

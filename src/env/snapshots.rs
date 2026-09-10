@@ -3,14 +3,14 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
-use super::EnvironmentService;
+use super::{EnvMeta, EnvironmentService};
 use crate::store::{
     EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
-    create_env_snapshot, create_env_snapshot_from_preparation, get_env_snapshot,
-    list_all_env_snapshots, list_env_snapshots, now_utc, prepare_env_snapshot_capture,
-    prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
-    prepare_upgrade_snapshot_restore, remove_env_snapshot, rollback_env_snapshot_restore,
-    summarize_snapshot,
+    create_env_snapshot, create_env_snapshot_from_preparation,
+    ensure_restore_preserves_dev_sources, get_env_snapshot, list_all_env_snapshots,
+    list_env_snapshots, now_utc, prepare_env_snapshot_capture, prepare_env_snapshot_restore,
+    prepare_upgrade_checkpoint_capture, prepare_upgrade_snapshot_restore, remove_env_snapshot,
+    rollback_env_snapshot_restore, summarize_snapshot,
 };
 use crate::supervisor::sync_supervisor_env_if_present;
 
@@ -198,6 +198,34 @@ impl<'a> EnvironmentService<'a> {
     ) -> Result<EnvSnapshotSummary, String> {
         let snapshot = get_env_snapshot(env_name, snapshot_id, self.env, self.cwd)?;
         Ok(summarize_snapshot(&snapshot))
+    }
+
+    pub(crate) fn ensure_snapshot_restore_preserves_dev_sources_locked(
+        &self,
+        snapshot: &EnvSnapshotSummary,
+    ) -> Result<(), String> {
+        ensure_restore_preserves_dev_sources(
+            &self.get(&snapshot.env_name)?,
+            snapshot
+                .upgrade_scope
+                .as_ref()
+                .map(|scope| scope.independent_paths.as_slice())
+                .unwrap_or_default(),
+            self.env,
+            self.cwd,
+        )
+    }
+
+    pub(crate) fn ensure_upgrade_rollback_preserves_dev_sources_locked(
+        &self,
+        meta: &EnvMeta,
+    ) -> Result<(), String> {
+        ensure_restore_preserves_dev_sources(
+            meta,
+            &meta.upgrade_independent_paths,
+            self.env,
+            self.cwd,
+        )
     }
 
     pub fn restore_snapshot(

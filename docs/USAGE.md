@@ -96,11 +96,37 @@ ocm start luna --command 'pnpm openclaw' --cwd /path/to/openclaw --no-service
 
 Use this when you are developing OpenClaw locally or want a custom run command.
 
-For an isolated development worktree, use `ocm dev luna --repo /path/to/openclaw`.
+Use `ocm dev luna --repo /path/to/openclaw` to run that exact checkout with separate
+environment state. New dev environments borrow main or registered linked
+checkouts without creating a Git worktree. Outside a checkout, pass `--repo`;
+otherwise OCM can use the checkout enclosing the current directory. A resumed
+borrower keeps its canonical source path and refuses a different explicit or
+enclosing checkout. Existing OCM-owned environments retain their recorded
+worktrees and original repository selection.
+
+New borrowers may prepare missing tooling with `pnpm install --frozen-lockfile`.
+Resumed borrowers report missing tooling for explicit preparation; they do not
+reinstall dependencies. Removing a borrower preserves source files, dependencies,
+generated output, and unrelated source processes. Older OCM readers refuse the
+new binding records. Refresh an incompatible running daemon with
+`ocm service refresh-daemon --acknowledge-gateway-restarts` before registration.
+If an environment containing or owning the source or its required Git metadata is
+busy, retry dev creation or local upgrade simulation after its operation finishes.
 New dev environments publish a private config with a persistent Gateway token
 before registration, so paired clients can reconnect after a restart or source
 rebuild. Initialization preserves existing config files, including authored auth
 and SecretRefs. Repeating minimum setup preserves unchanged config bytes.
+
+For live Control UI edits, run `ocm dev luna --watch --ui` (or `--ui` with a plain
+foreground Gateway). OCM owns the native Vite process and prints its initial
+native browser handoff once both documents are ready. The UI uses a captured
+loopback address for that session. `ocm dev status luna` and matching repeated
+starts report the address; repeated starts do not issue another browser grant.
+`ocm dev stop luna` stops the components together. A pending initial request gets
+30 seconds and retains its helper until completion; late grant bytes are discarded.
+An unfinished or interrupted cleanup keeps its recorded ownership.
+UI requires HTTP, enabled Control UI and installed source UI dependencies, and
+cannot run with `--service`. Existing authentication settings remain in effect.
 
 If you run `ocm setup` from inside an OpenClaw checkout, local mode can detect that and fill in sensible defaults.
 
@@ -441,9 +467,10 @@ ocm self update --check
 ## Environment lifecycle
 
 Environment creation, including `start` and migration, and `env clone` and
-`env import` require a root outside every registered dev worktree that exists
-on disk. The root must neither contain an existing registered source nor be
-inside it. OCM resolves source and destination aliases and also protects source
+`env import` require a root outside registered dev sources. Missing borrowed
+source paths remain reserved until their binding is removed; missing paths of
+OCM-owned worktrees can still be reused. The root must neither contain
+a registered source nor be inside it. OCM resolves source and destination aliases and also protects source
 symlinks that failed clone or import cleanup would remove. Choose a separate
 environment root.
 
@@ -457,7 +484,7 @@ before writing the destination. Check the recorded source with `ocm env show
 ocm env clone mira rowan
 ```
 
-Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. The usual next step is:
+Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Clone does not copy dev source bindings. The usual next step is:
 
 ```bash
 ocm start rowan
@@ -506,7 +533,24 @@ not add crash recovery for an uncatchable process or machine failure.
 
 This policy belongs to the environment registration. Clone and import start with
 an empty list. A separately requested full snapshot, export, or clone still
-includes independent content. Full snapshot restore still rewinds that content.
+includes independent content. Full snapshot restore still rewinds unregistered
+independent content and the selected environment's OCM-owned worktree when those
+paths were captured inside the environment root.
+
+Restores and required rollbacks refuse checkpoints whose recorded scope would
+replace another named environment's registered dev source or required Git
+metadata, before service quiescence or restore staging. Explicit rollback checks
+both the selected checkpoint and its failure-recovery checkpoint. `--no-rollback`
+keeps its existing behavior. The check reads only known registered source paths
+and Git identity metadata, including surviving history for a missing worktree.
+Checkpoint traversal still leaves independent content opaque; post-copy updates
+and residue cleanup leave directory links untouched. Excluding only a worktree
+is insufficient when its required Git metadata remains in scope.
+Borrowed source and its known Git metadata also remain protected from a restore
+of the borrowing environment itself. Missing borrowed paths stay reserved until
+the binding is removed; an unrelated excluded sibling does not preserve that
+reservation. Select a checkpoint whose saved exclusions cover the source and
+all affected Git metadata.
 
 ### Snapshots
 
@@ -644,6 +688,13 @@ changing mode requires stopping it first. `dev status --json` reports active
 ownership separately from `sourceWatch.watching`. Plain runs still refuse a
 running background service; temporary takeover remains `--watch --force`.
 
+Named `dev status` and JSON/raw output also report Gateway `/health` responses
+and the captured UI process and HTML document separately. JSON includes
+`gatewayHealthReady`, `ui.processRunning`, `ui.httpReady`, and `ui.issue`;
+unverifiable UI ownership keeps readiness `null`. The existing `uiUrl`/`ui_url`
+address remains available for active UI sessions. These observations use bounded
+loopback requests and leave recorded state unchanged.
+
 `dev <env> --service` records its preparation children until verified completion.
 Use `dev stop <env>` to cancel setup; a managed Gateway already running keeps its
 launch plan, and deferred restart requests remain pending. Explicit service stop
@@ -664,6 +715,10 @@ stopped first with `ocm dev stop <env>`. The same applies to a destroy guarded b
 by an older OCM without usable stop ownership must be stopped from its original
 terminal. Environment removal clears completed watch records and retains the
 reusable synchronization lock files.
+
+Cleanup refuses to remove another registered dev source or its required Git
+metadata, including sources reached through path aliases. Destroy checks before
+signalling source workers; simulation checks before discarding generated files.
 
 `destroy` is the stronger cleanup path.
 

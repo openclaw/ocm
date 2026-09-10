@@ -71,7 +71,7 @@ ocm start <env> --command 'pnpm openclaw' --cwd /path/to/openclaw
 ocm start <env> --command 'pnpm openclaw' --cwd /path/to/openclaw --no-service
 ```
 
-## Dev Worktree Envs
+## Dev Checkout Envs
 
 Use for source-backed development and reproductions. Do not use this as proof
 of release packaging.
@@ -86,8 +86,11 @@ ocm dev status
 ocm dev status <env>
 ```
 
-Rerun `ocm dev <env>` after pulling the source repo to refresh the worktree
-binding.
+New dev envs use the exact explicit or enclosing checkout with separate state;
+they create no Git worktree. Existing envs keep their recorded source, including
+legacy OCM-owned worktrees. Rerun `ocm dev <env>` after editing or pulling that
+source. A resumed borrower reports missing tooling for explicit preparation.
+Removing it preserves the checkout and dependencies.
 
 ## Runtime Management
 
@@ -150,6 +153,8 @@ Clone first when the test does not need sessions, logs, or backups. A clone
 retains durable auth/settings and is therefore secret-bearing. Keep its service
 stopped until credentials are replaced with mocks or dedicated test accounts,
 or the user explicitly authorizes real external access.
+
+Clone does not copy dev source bindings.
 
 ```sh
 ocm env clone <existing-env> <test-env>

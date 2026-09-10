@@ -19,14 +19,15 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ocm::env::EnvDevMeta;
 use ocm::store::{get_environment, now_utc, save_environment, supervisor_runtime_path};
 use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
 use serde_json::Value;
 
 use crate::support::{
-    TestDir, dev_plain, dev_watch, enable_fake_daemon_gateway_admission,
-    install_fake_service_manager, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script,
+    TestDir, create_owned_dev_env, dev_plain, dev_watch, enable_fake_daemon_gateway_admission,
+    hold_environment_operation, install_fake_service_manager, ocm_env, path_string,
+    register_owned_dev_env, run_ocm, stderr, stdout, write_executable_script,
 };
 
 fn init_openclaw_repo(root: &TestDir) -> PathBuf {
@@ -445,7 +446,9 @@ impl DevWatchFixture {
         Self {
             child: Some(child),
             release: root.child("source-watch.release"),
-            session: source_watch_override_path(root, args[1]).with_extension("session"),
+            session: PathBuf::from(&env["OCM_HOME"])
+                .join("source-watch")
+                .join(format!("{}.session", args[1])),
         }
     }
 
@@ -500,6 +503,17 @@ impl Drop for DevWatchFixture {
             .and_then(|session| session["child"]["pid"].as_u64())
         {
             let _ = wait_for_process_exit(pid as u32, Duration::from_secs(2));
+        }
+        if let Some(children) = fs::read(&self.session)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|session| session["ui"]["children"].as_object().cloned())
+        {
+            for child in children.values() {
+                if let Some(pid) = child["pid"].as_u64() {
+                    let _ = wait_for_process_exit(pid as u32, Duration::from_secs(3));
+                }
+            }
         }
     }
 }
@@ -837,8 +851,481 @@ fn service_env_with_gateway_admission(
     env
 }
 
+#[cfg(unix)]
+static INITIAL_UI_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+fn prepare_initial_ui_repo(
+    root: &TestDir,
+    env: &mut std::collections::BTreeMap<String, String>,
+) -> PathBuf {
+    let repo = init_openclaw_repo(root);
+    let node = Command::new("node")
+        .args(["-p", "process.execPath"])
+        .env_clear()
+        .envs(&*env)
+        .output()
+        .unwrap();
+    assert!(node.status.success(), "{}", stderr(&node));
+    let node = stdout(&node).trim().replace('\'', "'\\''");
+    let bin = root.child("initial-ui-bin");
+    fs::create_dir_all(&bin).unwrap();
+    // Root dependency inspection is covered by its own owner. The UI probe
+    // executes real resolution against these deliberately nonexecutable stubs.
+    write_executable_script(
+        &bin.join("node"),
+        &format!(
+            r#"#!/bin/sh
+case "${{3:-}}" in
+  *uiRequire*) exec '{node}' "$@";;
+  *createRequire*|*ocm-source-dependencies*)
+    if [ -n "$OCM_SOURCE_WATCH_START_FD" ]; then
+      IFS= read -r start < "/dev/fd/$OCM_SOURCE_WATCH_START_FD" || exit 1
+      unset OCM_SOURCE_WATCH_START_FD
+    fi
+    exit 0;;
+esac
+exec '{node}' "$@"
+"#
+        ),
+    );
+    prepend_fake_bin(env, &bin);
+    env.insert("OCM_TEST_DEV_UI_DIR".to_string(), path_string(root.path()));
+    fs::create_dir_all(repo.join("ui")).unwrap();
+    fs::write(
+        repo.join("ui/index.html"),
+        "<!doctype html><title>UI fixture</title>",
+    )
+    .unwrap();
+    fs::write(repo.join("ui/package.json"), r#"{"name":"ui-fixture"}"#).unwrap();
+    fs::write(
+        repo.join("scripts/dev-ui-fixture.cjs"),
+        include_str!("support/dev_ui.cjs"),
+    )
+    .unwrap();
+    fs::write(
+        repo.join("scripts/ui.js"),
+        "require('./dev-ui-fixture.cjs');\n",
+    )
+    .unwrap();
+    for entry in ["watch-node.mjs", "run-node.mjs"] {
+        fs::write(
+            repo.join("scripts").join(entry),
+            "import './dev-ui-fixture.cjs';\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        repo.join("openclaw.mjs"),
+        "import './scripts/dev-ui-fixture.cjs';\n",
+    )
+    .unwrap();
+    for name in ["vite", "dompurify"] {
+        let directory = repo.join("node_modules").join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("package.json"),
+            format!(r#"{{"name":"{name}","main":"index.js"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("index.js"),
+            "throw new Error('UI inspection must not execute package code');\n",
+        )
+        .unwrap();
+    }
+    // These are tiny synthetic resolution fixtures, not copied dependencies.
+    let added = Command::new("git")
+        .args(["-C", &path_string(&repo), "add", "-f", "node_modules"])
+        .output()
+        .unwrap();
+    assert!(added.status.success(), "{}", stderr(&added));
+    commit_nested_openclaw_repo(&repo);
+    repo
+}
+
+#[cfg(unix)]
+fn initial_ui_process(root: &TestDir, role: &str, owner: &mut DevWatchFixture) -> Value {
+    let file = root.child(format!("{role}.json"));
+    if !wait_for_path(&file, Duration::from_secs(10)) {
+        // Read only bytes already in this fixture's stderr pipe; diagnosing a
+        // failed startup must not block on EOF or release/stop its processes.
+        let mut diagnostic = String::new();
+        let mut controller = None;
+        let mut status = None;
+        if let Some(child) = owner.child.as_mut() {
+            controller = Some(child.id());
+            status = Some(child.try_wait());
+            if let Some(stderr) = child.stderr.as_mut() {
+                let mut available: libc::c_int = 0;
+                if unsafe { libc::ioctl(stderr.as_raw_fd(), libc::FIONREAD, &mut available) } == 0
+                    && available > 0
+                {
+                    let mut bytes = vec![0; (available as usize).min(64 * 1024)];
+                    if stderr.read_exact(&mut bytes).is_ok() {
+                        diagnostic = String::from_utf8_lossy(&bytes).into_owned();
+                    }
+                }
+            }
+        }
+        let recorded = fs::read_to_string(&owner.session).unwrap_or_default();
+        let source = owner
+            .session
+            .parent()
+            .and_then(Path::parent)
+            .and_then(|store| fs::read(store.join("envs.json")).ok())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|registry| {
+                registry["envs"].as_array().and_then(|envs| {
+                    envs.iter()
+                        .find(|meta| {
+                            meta["name"].as_str()
+                                == owner.session.file_stem().and_then(|name| name.to_str())
+                        })
+                        .map(|meta| meta["dev"].clone())
+                })
+            });
+        panic!(
+            "{role} did not start at {}; controller={controller:?}, status={status:?}, source={source:?}, session={recorded}, stderr={diagnostic}",
+            file.display()
+        );
+    }
+    serde_json::from_slice(&fs::read(file).unwrap()).unwrap()
+}
+
+#[cfg(unix)]
 #[test]
-fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
+fn dev_ui_initial_handoff_and_owned_lifecycle() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (watch, outcome) in [
+        (false, "stop"),
+        (true, "sibling"),
+        (false, "deadline"),
+        (true, "raw"),
+        (true, "crash"),
+    ] {
+        let root = TestDir::new("initial-ui-owner");
+        let mut env = ocm_env(&root);
+        let repo = prepare_initial_ui_repo(&root, &mut env);
+        let repo_arg = path_string(&repo);
+        let mut args = if watch {
+            dev_watch(&["demo", "--repo", &repo_arg, "--watch"])
+        } else {
+            dev_plain(&["demo", "--repo", &repo_arg])
+        };
+        args.push("--ui");
+        if outcome == "deadline" {
+            fs::write(root.child("dashboard-hold"), "hold").unwrap();
+        }
+        if outcome == "stop" {
+            fs::write(root.child("ui-start-hold"), "hold").unwrap();
+        }
+        let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &args);
+        let gateway = initial_ui_process(&root, "gateway", &mut controller);
+        if outcome == "stop" {
+            let status = run_ocm(&repo, &env, &["dev", "status", "demo", "--json"]);
+            assert!(status.status.success(), "{}", stderr(&status));
+            let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+            assert_eq!(status["gatewayHealthReady"], true);
+            assert_eq!(status["ui"]["processRunning"], true);
+            assert_eq!(status["ui"]["httpReady"], false);
+            fs::remove_file(root.child("ui-start-hold")).unwrap();
+        }
+        let ui = initial_ui_process(&root, "ui", &mut controller);
+        let gateway_pid = gateway["pid"].as_u64().unwrap() as u32;
+        let ui_pid = ui["pid"].as_u64().unwrap() as u32;
+        let session = read_source_watch_session(&root);
+        assert_eq!(session["watching"], watch);
+        assert_eq!(session["ui"]["children"]["gateway"]["pid"], gateway_pid);
+        assert_eq!(session["ui"]["children"]["ui"]["pid"], ui_pid);
+        assert_eq!(session["ui"]["target"]["port"], ui["port"]);
+        assert_eq!(gateway["cwd"], ui["cwd"]);
+        assert_eq!(ui["cwd"], path_string(&fs::canonicalize(&repo).unwrap()));
+        assert!(
+            ui["args"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("--strictPort".to_string()))
+        );
+        let until = Instant::now() + Duration::from_secs(3);
+        while !root.child("gateway-requests").exists() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !root.child("dashboard-attempts").exists(),
+            "Gateway health alone started a handoff"
+        );
+        if outcome == "stop" {
+            let meta = get_environment("demo", &env, &repo).unwrap();
+            let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
+            let config_before = fs::read(&config_path).unwrap();
+            let mut config: Value = serde_json::from_slice(&config_before).unwrap();
+            config["gateway"]["port"] = (meta.gateway_port.unwrap() + 300).into();
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let status = run_ocm(&repo, &env, &["dev", "status", "demo", "--json"]);
+            fs::write(&config_path, config_before).unwrap();
+            assert!(status.status.success(), "{}", stderr(&status));
+            let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+            assert_eq!(status["gatewayPort"], gateway["port"]);
+            assert_eq!(status["gatewayHealthReady"], true);
+            assert_eq!(status["ui"]["processRunning"], true);
+            assert_eq!(status["ui"]["httpReady"], true);
+            assert_eq!(status["uiUrl"], status["ui"]["url"]);
+            let raw = run_ocm(&repo, &env, &["dev", "status", "demo", "--raw"]);
+            assert!(raw.status.success(), "{}", stderr(&raw));
+            assert!(stdout(&raw).contains("ui_process_running=true"));
+            assert!(stdout(&raw).contains("ui_http_ready=true"));
+            assert!(stdout(&raw).contains("ui_url="));
+
+            let session_path = source_watch_override_path(&root, "demo").with_extension("session");
+            let saved_session = fs::read(&session_path).unwrap();
+            let ui_requests = fs::read(root.child("ui-requests")).unwrap();
+            for foreign_scope in [false, true] {
+                let mut changed: Value = serde_json::from_slice(&saved_session).unwrap();
+                if foreign_scope {
+                    changed["processScope"] = "another-process-scope".into();
+                } else {
+                    changed["ui"]["children"]["ui"]["startedAt"] = "another-process-start".into();
+                }
+                let changed = serde_json::to_vec(&changed).unwrap();
+                fs::write(&session_path, &changed).unwrap();
+                let status = run_ocm(&repo, &env, &["dev", "status", "demo", "--json"]);
+                let after = fs::read(&session_path).unwrap();
+                fs::write(&session_path, &saved_session).unwrap();
+                assert!(status.status.success(), "{}", stderr(&status));
+                assert_eq!(after, changed, "status modified session metadata");
+                let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+                let expected = if foreign_scope {
+                    Value::Null
+                } else {
+                    Value::Bool(false)
+                };
+                assert_eq!(status["ui"]["processRunning"], expected);
+                assert_eq!(status["ui"]["httpReady"], expected);
+                if foreign_scope {
+                    assert_eq!(status["sourceWatch"]["state"], "unknown");
+                    assert!(status["ui"]["issue"].as_str().is_some());
+                }
+                assert_eq!(fs::read(root.child("ui-requests")).unwrap(), ui_requests);
+            }
+        }
+        fs::write(root.child("gateway-document-ready"), "ready").unwrap();
+        assert!(wait_for_path(
+            &root.child("dashboard-attempt-1"),
+            Duration::from_secs(5)
+        ));
+        if outcome == "deadline" {
+            let helper = fs::read_to_string(root.child("dashboard-attempt-1"))
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap();
+            thread::sleep(Duration::from_secs(31));
+            assert!(
+                process_is_alive(helper)
+                    && process_is_alive(gateway_pid)
+                    && process_is_alive(ui_pid)
+            );
+            let reused = run_ocm(&repo, &env, &args);
+            assert!(reused.status.success(), "{}", stderr(&reused));
+            assert!(stdout(&reused).contains("ui_url="));
+            assert!(!stdout(&reused).contains("bootstrapToken"));
+            assert_eq!(
+                fs::read_to_string(root.child("dashboard-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            fs::remove_file(root.child("dashboard-hold")).unwrap();
+            assert!(wait_for_process_exit(helper, Duration::from_secs(3)));
+        }
+        let until = Instant::now() + Duration::from_secs(3);
+        while read_source_watch_session(&root)["ui"]["children"]
+            .get("command")
+            .is_some()
+            && Instant::now() < until
+        {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            read_source_watch_session(&root)["ui"]["children"]
+                .get("command")
+                .is_none()
+        );
+        let mismatch = run_ocm(
+            &repo,
+            &env,
+            &if watch {
+                dev_watch(&["demo", "--watch"])
+            } else {
+                dev_plain(&["demo"])
+            },
+        );
+        assert!(!mismatch.status.success());
+        assert!(stderr(&mismatch).contains("different UI mode"));
+        if outcome == "raw" || outcome == "crash" {
+            if outcome == "crash" {
+                controller.crash_controller();
+            } else {
+                assert_eq!(
+                    unsafe { libc::kill(ui_pid as libc::pid_t, libc::SIGKILL) },
+                    0
+                );
+                let output = controller.wait_without_release();
+                assert!(!output.status.success());
+                assert!(stderr(&output).contains("terminated by signal"));
+                let retained = read_source_watch_session(&root);
+                assert_eq!(retained["ui"]["children"]["ui"]["pid"], ui_pid);
+                assert!(retained["ui"]["children"].get("gateway").is_none());
+            }
+            let stopped = run_dev_stop(&repo, &env);
+            assert!(!stopped.status.success());
+            assert!(stderr(&stopped).contains(if outcome == "crash" {
+                "source controller exited"
+            } else {
+                "terminated by signal"
+            }));
+            assert_eq!(read_source_watch_session(&root)["closed"], false);
+            let session_path = source_watch_override_path(&root, "demo").with_extension("session");
+            let retained = fs::read(&session_path).unwrap();
+            let removed = run_ocm(&repo, &env, &["env", "destroy", "demo", "--yes"]);
+            assert!(!removed.status.success());
+            assert!(stderr(&removed).contains("unverified"));
+            assert!(fs::read(session_path).unwrap() == retained);
+        } else if outcome == "sibling" {
+            fs::write(root.child("ui.exit"), "exit").unwrap();
+            let output = controller.wait_without_release();
+            assert_eq!(output.status.code(), Some(17));
+            assert!(stdout(&output).contains("UI: http://127.0.0.1:"));
+        } else {
+            let stopped = run_dev_stop(&repo, &env);
+            assert!(stopped.status.success(), "{}", stderr(&stopped));
+            let output = controller.wait_without_release();
+            assert_eq!(output.status.code(), Some(130));
+            assert_eq!(
+                stdout(&output).contains("UI: http://127.0.0.1:"),
+                outcome != "deadline"
+            );
+            assert!(!stdout(&output).contains("synthetic-legacy"));
+        }
+        assert!(wait_for_process_exit(gateway_pid, Duration::from_secs(3)));
+        assert!(wait_for_process_exit(ui_pid, Duration::from_secs(3)));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_ui_claims_an_address_before_the_listener_starts() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = TestDir::new("initial-ui-first-claim");
+    let mut env = ocm_env(&root);
+    let repo = prepare_initial_ui_repo(&root, &mut env);
+    fs::write(root.child("ui-start-hold"), "hold").unwrap();
+    fs::write(root.child("gateway-start-hold"), "hold").unwrap();
+    let mut first = DevWatchFixture::spawn(
+        &root,
+        &repo,
+        &env,
+        &["dev", "first", "--repo", &path_string(&repo), "--ui"],
+    );
+    assert!(wait_for_path(
+        &source_watch_override_path(&root, "first"),
+        Duration::from_secs(10)
+    ));
+    let session_file = source_watch_override_path(&root, "first").with_extension("session");
+    let session: Value = serde_json::from_slice(&fs::read(&session_file).unwrap()).unwrap();
+    let gateway_port = url::Url::parse(session["ui"]["target"]["gatewayUrl"].as_str().unwrap())
+        .unwrap()
+        .port()
+        .unwrap();
+    // Other tests' isolated stores probe this same OS port after selection.
+    // Hold one such transient conflict until the fake actually observes it.
+    let until = Instant::now() + Duration::from_secs(5);
+    let probe = loop {
+        match std::net::TcpListener::bind(("127.0.0.1", gateway_port)) {
+            Ok(probe) => break probe,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < until =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("failed to hold the selected Gateway port: {error}"),
+        }
+    };
+    fs::remove_file(root.child("gateway-start-hold")).unwrap();
+    assert!(wait_for_path(
+        &root.child("gateway-listen-error"),
+        Duration::from_secs(5)
+    ));
+    assert_eq!(
+        fs::read_to_string(root.child("gateway-listen-error")).unwrap(),
+        "EADDRINUSE"
+    );
+    assert!(!root.child("gateway.json").exists());
+    drop(probe);
+    let first_gateway = initial_ui_process(&root, "gateway", &mut first);
+    let port = session["ui"]["target"]["port"].as_u64().unwrap() as u16;
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "held UI already listened"
+    );
+    let second_root = TestDir::new("initial-ui-second-claim");
+    let mut second_env = ocm_env(&second_root);
+    let second_repo = prepare_initial_ui_repo(&second_root, &mut second_env);
+    second_env.insert("OCM_HOME".to_string(), env["OCM_HOME"].clone());
+    let mut second = DevWatchFixture::spawn(
+        &second_root,
+        &second_repo,
+        &second_env,
+        &[
+            "dev",
+            "second",
+            "--repo",
+            &path_string(&second_repo),
+            "--ui",
+        ],
+    );
+    let second_gateway = initial_ui_process(&second_root, "gateway", &mut second);
+    let second_ui = initial_ui_process(&second_root, "ui", &mut second);
+    assert_ne!(second_ui["port"].as_u64().unwrap(), u64::from(port));
+    fs::remove_file(root.child("ui-start-hold")).unwrap();
+    let first_ui = initial_ui_process(&root, "ui", &mut first);
+    for name in ["first", "second"] {
+        let stopped = run_named_dev_stop(&repo, &env, name);
+        assert!(stopped.status.success(), "{}", stderr(&stopped));
+    }
+    assert_eq!(first.wait_without_release().status.code(), Some(130));
+    assert_eq!(second.wait_without_release().status.code(), Some(130));
+    for process in [first_gateway, first_ui, second_gateway, second_ui] {
+        assert!(wait_for_process_exit(
+            process["pid"].as_u64().unwrap() as u32,
+            Duration::from_secs(3)
+        ));
+    }
+}
+
+#[test]
+fn dev_ui_rejects_service_mode_before_creating_environment() {
+    let root = TestDir::new("initial-ui-service-conflict");
+    let env = ocm_env(&root);
+    let result = run_ocm(root.path(), &env, &["dev", "demo", "--ui", "--service"]);
+    assert!(!result.status.success());
+    assert!(stderr(&result).contains("cannot combine --ui with --service"));
+    let listed = run_ocm(root.path(), &env, &["env", "list", "--json"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&listed)).unwrap(),
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn dev_command_borrows_checkout_bootstraps_config_and_runs_gateway() {
     let root = TestDir::new("dev-command-run");
     let repo = init_openclaw_repo(&root);
     let canonical_repo = fs::canonicalize(&repo).unwrap();
@@ -846,6 +1333,7 @@ fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    let registered = git_worktree_paths(&repo);
 
     let run = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
     assert!(run.status.success(), "{}", stderr(&run));
@@ -858,7 +1346,13 @@ fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
     let workspace_dir = PathBuf::from(show_json["workspaceDir"].as_str().unwrap());
 
     assert_eq!(show_json["devRepoRoot"], path_string(&canonical_repo));
-    assert!(worktree_root.starts_with(canonical_repo.join(".worktrees")));
+    assert_eq!(worktree_root, canonical_repo);
+    assert_eq!(git_worktree_paths(&repo), registered);
+    assert!(!repo.join(".worktrees").exists());
+    assert!(matches!(
+        get_environment("demo", &env, &cwd).unwrap().dev,
+        Some(EnvDevMeta::Borrowed { .. })
+    ));
     assert!(worktree_root.join(".git").exists());
 
     let config: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -918,6 +1412,167 @@ fn dev_command_provisions_worktree_bootstraps_config_and_runs_gateway() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn dev_registration_rejects_a_busy_containing_environment_before_preparing_source() {
+    let root = TestDir::new("dev-registration-operation-lock");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+    let parent = run_ocm(&cwd, &env, &["env", "create", "parent"]);
+    assert!(parent.status.success(), "{}", stderr(&parent));
+    let parent = get_environment("parent", &env, &cwd).unwrap();
+    let source = Path::new(&parent.root).join(".openclaw/workspace/openclaw");
+    fs::rename(init_openclaw_repo(&root), &source).unwrap();
+
+    let lock = hold_environment_operation(&root, "parent");
+    let registry = ocm::store::env_registry_path(&env, &cwd).unwrap();
+    let before = fs::read(&registry).unwrap();
+    let mut child = DevWatchFixture::spawn(
+        &root,
+        &cwd,
+        &env,
+        &dev_plain(&["child", "--repo", &path_string(&source)]),
+    );
+    let rejected = child.wait_without_release();
+    assert!(
+        !rejected.status.success(),
+        "dev published a child while its containing environment operation was locked"
+    );
+    assert!(
+        stderr(&rejected).contains("parent"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(fs::read(&registry).unwrap(), before);
+    assert!(!source.join(".worktrees/child").exists());
+    assert!(!source.join(".git/worktrees/child").exists());
+    assert!(!root.child("pnpm.log").exists());
+
+    let independent = init_openclaw_repo(&root);
+    let allowed = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["independent", "--repo", &path_string(&independent)]),
+    );
+    assert!(allowed.status.success(), "{}", stderr(&allowed));
+    drop(lock);
+    create_owned_dev_env(&source, "child", &env, &cwd);
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["child", "--repo", &path_string(&source)]),
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let dev = get_environment("child", &env, &cwd).unwrap().dev.unwrap();
+    assert_eq!(
+        dev.repo_root(),
+        path_string(&fs::canonicalize(&source).unwrap())
+    );
+    assert!(Path::new(dev.source_root()).join(".git").exists());
+    let _child_operation = hold_environment_operation(&root, "child");
+    let before_nested = fs::read(&registry).unwrap();
+    let mut nested = DevWatchFixture::spawn(
+        &root,
+        &cwd,
+        &env,
+        &dev_plain(&["grandchild", "--repo", dev.source_root()]),
+    );
+    let rejected = nested.wait_without_release();
+    assert!(!rejected.status.success());
+    assert!(
+        stderr(&rejected).contains("environment child has an operation in progress"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(fs::read(&registry).unwrap(), before_nested);
+    assert!(
+        !Path::new(dev.source_root())
+            .join(".worktrees/grandchild")
+            .exists()
+    );
+    // A sibling uses the common repository without depending on child's assets.
+    let sibling = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["sibling", "--repo", &path_string(&source)]),
+    );
+    assert!(sibling.status.success(), "{}", stderr(&sibling));
+}
+
+#[test]
+fn dev_registration_failures_preserve_source_and_existing_worktrees() {
+    let root = TestDir::new("dev-registration-cleanup");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let occupied = root.child("occupied");
+    fs::create_dir_all(&occupied).unwrap();
+    fs::write(occupied.join("sentinel"), "keep").unwrap();
+    for name in ["fresh", "reused"] {
+        let worktree = repo.join(".worktrees").join(name);
+        if name == "reused" {
+            let added = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "add", "--detach"])
+                .arg(&worktree)
+                .output()
+                .unwrap();
+            assert!(added.status.success(), "{}", stderr(&added));
+        }
+        let rejected = run_ocm(
+            &cwd,
+            &env,
+            &dev_plain(&[
+                name,
+                "--repo",
+                &path_string(&repo),
+                "--root",
+                &path_string(&occupied),
+            ]),
+        );
+        assert!(!rejected.status.success());
+        assert!(
+            stderr(&rejected).contains("root already exists and is not empty"),
+            "{}",
+            stderr(&rejected)
+        );
+        assert_eq!(worktree.exists(), name == "reused");
+        assert_eq!(
+            repo.join(".git/worktrees").join(name).exists(),
+            name == "reused"
+        );
+        assert!(get_environment(name, &env, &cwd).is_err());
+    }
+    let state = ocm::store::supervisor_state_path(&env, &cwd).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let sync_failed = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["published", "--repo", &path_string(&repo)]),
+    );
+    assert!(!sync_failed.status.success());
+    let published = get_environment("published", &env, &cwd)
+        .unwrap()
+        .dev
+        .unwrap();
+    assert_eq!(
+        published.source_root(),
+        path_string(&fs::canonicalize(&repo).unwrap())
+    );
+    assert!(!repo.join(".worktrees/published").exists());
+    assert!(state.is_dir());
+    #[cfg(unix)]
+    assert!(
+        stderr(&sync_failed).contains("directory"),
+        "{}",
+        stderr(&sync_failed)
+    );
+}
+
 #[test]
 fn dev_command_rejects_an_unregistered_clone_at_the_managed_path() {
     let root = TestDir::new("dev-command-unregistered-clone");
@@ -927,6 +1582,7 @@ fn dev_command_rejects_an_unregistered_clone_at_the_managed_path() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let env = ocm_env(&root);
+    register_owned_dev_env(&repo, &worktree_root, "demo", &env, &cwd);
 
     let run = run_ocm(
         &cwd,
@@ -946,6 +1602,244 @@ fn dev_command_rejects_an_unregistered_clone_at_the_managed_path() {
 }
 
 #[test]
+fn dev_borrowed_linked_checkout_uses_explicit_and_enclosing_source() {
+    let root = TestDir::new("dev-borrowed-linked");
+    let repo = init_openclaw_repo(&root);
+    for destination in [".worktrees/input", ".worktrees/other"] {
+        let linked = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "--detach", destination])
+            .output()
+            .unwrap();
+        assert!(linked.status.success(), "{}", stderr(&linked));
+    }
+    let source = fs::canonicalize(repo.join(".worktrees/input")).unwrap();
+    let source_arg = path_string(&source);
+    fs::write(source.join("scripts/run-node.mjs"), "// current edits\n").unwrap();
+    let legacy_path = source.join(".worktrees/demo");
+    fs::create_dir_all(&legacy_path).unwrap();
+    fs::write(legacy_path.join("SENTINEL"), "untracked source\n").unwrap();
+    fs::create_dir_all(source.join("node_modules/local")).unwrap();
+    fs::write(
+        source.join("node_modules/local/entry.js"),
+        "// retained dependency\n",
+    )
+    .unwrap();
+    let registered = git_worktree_paths(&repo);
+    let nested = source.join("scripts");
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+
+    for (name, cwd, args) in [
+        ("demo", &repo, dev_plain(&["demo", "--repo", &source_arg])),
+        ("enclosing", &nested, dev_plain(&["enclosing"])),
+    ] {
+        let created = run_ocm(cwd, &env, &args);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let meta = get_environment(name, &env, cwd).unwrap();
+        assert_eq!(
+            meta.dev.unwrap().borrowed_source_root(),
+            Some(source_arg.as_str())
+        );
+    }
+    let resumed = run_ocm(&nested, &env, &dev_plain(&["demo"]));
+    assert!(resumed.status.success(), "{}", stderr(&resumed));
+    let node_before = fs::read(root.child("node.log")).unwrap();
+    let repo_arg = path_string(&repo);
+    for args in [
+        dev_plain(&["demo"]),
+        dev_plain(&["demo", "--repo", &repo_arg]),
+    ] {
+        let changed = run_ocm(&repo, &env, &args);
+        assert!(!changed.status.success());
+        assert!(stderr(&changed).contains("cannot change the repo"));
+    }
+    let git_path = source.join(".git");
+    let original_git = fs::read(&git_path).unwrap();
+    fs::copy(repo.join(".worktrees/other/.git"), &git_path).unwrap();
+    let wrong_backlink = run_ocm(&nested, &env, &dev_plain(&["demo"]));
+    fs::write(&git_path, &original_git).unwrap();
+    assert!(!wrong_backlink.status.success());
+    assert!(
+        stderr(&wrong_backlink).contains("not the registered root"),
+        "{}",
+        stderr(&wrong_backlink)
+    );
+    let common = Command::new("git")
+        .arg("-C")
+        .arg(&source)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .unwrap();
+    assert!(common.status.success(), "{}", stderr(&common));
+    fs::write(&git_path, format!("gitdir: {}\n", stdout(&common).trim())).unwrap();
+    let stale_slot = run_ocm(&nested, &env, &dev_plain(&["demo"]));
+    fs::write(&git_path, original_git).unwrap();
+    assert!(!stale_slot.status.success());
+    assert!(
+        stderr(&stale_slot).contains("not the registered root"),
+        "{}",
+        stderr(&stale_slot)
+    );
+    assert_eq!(fs::read(root.child("node.log")).unwrap(), node_before);
+    let prefix = format!("{source_arg}|");
+    assert!(
+        String::from_utf8(node_before)
+            .unwrap()
+            .lines()
+            .all(|line| line.starts_with(&prefix))
+    );
+    for name in ["demo", "enclosing"] {
+        let removed = run_ocm(&repo, &env, &["env", "remove", name]);
+        assert!(removed.status.success(), "{}", stderr(&removed));
+    }
+    assert_eq!(git_worktree_paths(&repo), registered);
+    assert_eq!(
+        fs::read_to_string(source.join("scripts/run-node.mjs")).unwrap(),
+        "// current edits\n"
+    );
+    assert_eq!(
+        fs::read_to_string(legacy_path.join("SENTINEL")).unwrap(),
+        "untracked source\n"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("node_modules/local/entry.js")).unwrap(),
+        "// retained dependency\n"
+    );
+}
+
+#[test]
+fn dev_borrowed_missing_or_redirected_source_is_not_recreated() {
+    let root = TestDir::new("dev-borrowed-missing");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let meta = get_environment("demo", &env, &cwd).unwrap();
+    let binding = meta.dev;
+    let retained = root.child("retained-source");
+    fs::rename(&repo, &retained).unwrap();
+    fs::remove_file(root.child("node.log")).unwrap();
+    for args in [
+        dev_plain(&["demo"]),
+        vec!["env", "resolve", "demo", "--json"],
+    ] {
+        let missing = run_ocm(&cwd, &env, &args);
+        assert!(!missing.status.success());
+        assert!(
+            stderr(&missing).contains("restore that checkout"),
+            "{}",
+            stderr(&missing)
+        );
+    }
+    assert!(!repo.exists());
+    let watch_path = source_watch_override_path(&root, "demo");
+    let metadata = [
+        ocm::store::env_registry_path(&env, &cwd).unwrap(),
+        Path::new(&meta.root).join(".openclaw/openclaw.json"),
+        watch_path.with_extension("session"),
+        watch_path,
+        root.child("pnpm.log"),
+    ];
+    let metadata_before = metadata.each_ref().map(|path| fs::read(path).ok());
+    let status = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+    let source = binding.as_ref().unwrap().source_root();
+    assert_eq!(status["repoRoot"].as_str(), Some(source));
+    assert_eq!(status["worktreeRoot"].as_str(), Some(source));
+    assert_eq!(
+        metadata.each_ref().map(|path| fs::read(path).ok()),
+        metadata_before
+    );
+    assert!(
+        !repo.exists(),
+        "passive status recreated the borrowed source"
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&retained, &repo).unwrap();
+        let redirected = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
+        assert!(!redirected.status.success());
+        assert!(stderr(&redirected).contains("now resolves to a different checkout"));
+        fs::remove_file(&repo).unwrap();
+    }
+    assert!(!root.child("node.log").exists());
+    assert_eq!(get_environment("demo", &env, &cwd).unwrap().dev, binding);
+    let removed = run_ocm(&cwd, &env, &["env", "remove", "demo"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(retained.join("scripts/run-node.mjs").exists());
+    assert!(!repo.exists());
+}
+
+#[test]
+fn dev_borrowed_dependencies_are_prepared_only_on_first_creation() {
+    for mode in [None, Some("--watch"), Some("--service")] {
+        let root = TestDir::new("dev-borrowed-dependencies");
+        let repo = init_openclaw_repo(&root);
+        declare_source_tooling(&repo);
+        fs::write(repo.join("pnpm-lock.yaml"), "frozen fixture\n").unwrap();
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env_with_gateway_admission(&root);
+        install_probe_aware_fake_dev_runners(&root, &mut env);
+        install_frozen_source_dependency_runner(&root);
+        let repo_arg = path_string(&repo);
+        let mut args = vec!["dev", "demo", "--repo", &repo_arg];
+        args.extend(mode);
+        let created = run_ocm(&cwd, &env, &args);
+        assert!(created.status.success(), "{mode:?}: {}", stderr(&created));
+        let install_log = fs::read(root.child("pnpm.log")).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&install_log)
+                .lines()
+                .filter(|line| line.contains("|install --frozen-lockfile"))
+                .count(),
+            1
+        );
+        assert!(repo.join("node_modules/tsx/entry.mjs").is_file());
+        fs::remove_file(repo.join("node_modules/tsx/entry.mjs")).unwrap();
+        let before = serde_json::to_value(get_environment("demo", &env, &cwd).unwrap()).unwrap();
+        let node_before = fs::read(root.child("node.log")).ok();
+        let mut attempts = vec![args.clone()];
+        if mode.is_none() {
+            attempts.extend([
+                vec!["dev", "demo", "--ui"],
+                vec!["dev", "demo", "--watch", "--ui"],
+            ]);
+        }
+        for args in attempts {
+            let refused = run_ocm(&cwd, &env, &args);
+            assert!(!refused.status.success());
+            assert!(
+                stderr(&refused).contains("pnpm install --frozen-lockfile"),
+                "{}",
+                stderr(&refused)
+            );
+            assert_eq!(fs::read(root.child("pnpm.log")).unwrap(), install_log);
+            assert_eq!(fs::read(root.child("node.log")).ok(), node_before);
+            assert_eq!(
+                serde_json::to_value(get_environment("demo", &env, &cwd).unwrap()).unwrap(),
+                before
+            );
+        }
+        assert!(!repo.join("node_modules/tsx/entry.mjs").exists());
+        assert_eq!(
+            fs::read_to_string(repo.join("pnpm-lock.yaml")).unwrap(),
+            "frozen fixture\n"
+        );
+    }
+}
+
+#[test]
 fn dev_dependencies_reuse_flat_source_tooling_without_running_it() {
     let root = TestDir::new("dev-dependencies-reuse");
     let repo = init_openclaw_repo(&root);
@@ -960,7 +1854,7 @@ fn dev_dependencies_reuse_flat_source_tooling_without_running_it() {
     );
     assert!(created.status.success(), "{}", stderr(&created));
     let meta = get_environment("demo", &env, &cwd).unwrap();
-    let worktree = PathBuf::from(meta.dev.unwrap().worktree_root);
+    let worktree = PathBuf::from(meta.dev.unwrap().source_root());
     declare_source_tooling(&worktree);
     // The normal source runner does not require the watch-only package.
     write_resolvable_source_tool(&worktree, "tsx");
@@ -1145,6 +2039,7 @@ fn dev_dependencies_bootstrap_with_a_frozen_lockfile_and_retry_after_failure() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_probe_aware_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
     install_frozen_source_dependency_runner(&root);
     env.insert("OCM_TEST_INSTALL_EXIT_CODE".to_string(), "42".to_string());
 
@@ -1155,7 +2050,7 @@ fn dev_dependencies_bootstrap_with_a_frozen_lockfile_and_retry_after_failure() {
     );
     assert_eq!(failed.status.code(), Some(42), "{}", stderr(&failed));
     let meta = get_environment("demo", &env, &cwd).unwrap();
-    let worktree = PathBuf::from(meta.dev.unwrap().worktree_root);
+    let worktree = PathBuf::from(meta.dev.unwrap().source_root());
     assert!(!root.child("node.log").exists());
     assert!(!source_watch_override_path(&root, "demo").exists());
     assert_eq!(
@@ -1229,6 +2124,7 @@ fn dev_dependencies_preserve_reported_lifecycle_uncertainty() {
         fs::create_dir_all(&cwd).unwrap();
         let mut env = ocm_env(&root);
         install_probe_aware_fake_dev_runners(&root, &mut env);
+        create_owned_dev_env(&repo, "demo", &env, &cwd);
         let created = run_ocm(
             &cwd,
             &env,
@@ -1237,7 +2133,7 @@ fn dev_dependencies_preserve_reported_lifecycle_uncertainty() {
         assert!(created.status.success(), "{label}: {}", stderr(&created));
         fs::remove_file(root.child("node.log")).unwrap();
         let meta = get_environment("demo", &env, &cwd).unwrap();
-        let source = Path::new(&meta.dev.as_ref().unwrap().worktree_root);
+        let source = Path::new(meta.dev.as_ref().unwrap().source_root());
         declare_source_tooling(source);
         fs::write(source.join("pnpm-lock.yaml"), "retained frozen lock\n").unwrap();
 
@@ -1490,11 +2386,12 @@ fn dev_dependencies_reject_unready_borrowed_source_before_service_changes() {
 #[cfg(unix)]
 #[test]
 fn dev_dependencies_do_not_repair_through_linked_install_targets() {
-    for (relative, configured) in [
-        ("node_modules", false),
-        ("node_modules/.pnpm", false),
-        ("installed-modules", true),
-        ("installed-modules/.pnpm", true),
+    for (relative, configured, borrowed) in [
+        ("node_modules", false, false),
+        ("node_modules/.pnpm", false, false),
+        ("installed-modules", true, false),
+        ("installed-modules/.pnpm", true, false),
+        ("node_modules/.pnpm", false, true),
     ] {
         let root = TestDir::new("dev-dependencies-linked-install");
         let repo = init_openclaw_repo(&root);
@@ -1502,19 +2399,11 @@ fn dev_dependencies_do_not_repair_through_linked_install_targets() {
         fs::create_dir_all(&cwd).unwrap();
         let mut env = ocm_env(&root);
         install_probe_aware_fake_dev_runners(&root, &mut env);
-        let created = run_ocm(
-            &cwd,
-            &env,
-            &dev_plain(&["demo", "--repo", &path_string(&repo)]),
-        );
-        assert!(created.status.success(), "{}", stderr(&created));
-        let worktree = PathBuf::from(
-            get_environment("demo", &env, &cwd)
-                .unwrap()
-                .dev
-                .unwrap()
-                .worktree_root,
-        );
+        let worktree = if borrowed {
+            repo.clone()
+        } else {
+            create_owned_dev_env(&repo, "demo", &env, &cwd)
+        };
         declare_source_tooling(&worktree);
         if configured {
             env.insert(
@@ -1527,9 +2416,11 @@ fn dev_dependencies_do_not_repair_through_linked_install_targets() {
         let target = worktree.join("borrowed-modules");
         fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        fs::remove_file(root.child("node.log")).unwrap();
-
-        let failed = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
+        let failed = run_ocm(
+            &cwd,
+            &env,
+            &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+        );
         assert!(!failed.status.success());
         assert!(stderr(&failed).contains("refusing to install"));
         assert_eq!(fs::read_link(&link).unwrap(), target);
@@ -1546,6 +2437,7 @@ fn dev_command_does_not_recreate_a_missing_saved_worktree() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let first = run_ocm(
         &cwd,
@@ -1567,7 +2459,7 @@ fn dev_command_does_not_recreate_a_missing_saved_worktree() {
     assert_eq!(git_worktree_paths(&repo), registered);
     assert!(!root.child("node.log").exists());
     let meta = get_environment("demo", &env, &cwd).unwrap();
-    assert_eq!(meta.dev.unwrap().worktree_root, path_string(&worktree_root));
+    assert_eq!(meta.dev.unwrap().source_root(), path_string(&worktree_root));
 
     let resolve = run_ocm(&cwd, &env, &["env", "resolve", "demo", "--json"]);
     assert!(!resolve.status.success());
@@ -1645,6 +2537,7 @@ fn dev_command_resumes_the_recorded_worktree_without_recreating_the_default() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let first = run_ocm(
         &cwd,
@@ -1654,7 +2547,7 @@ fn dev_command_resumes_the_recorded_worktree_without_recreating_the_default() {
     assert!(first.status.success(), "{}", stderr(&first));
     let mut meta = get_environment("demo", &env, &cwd).unwrap();
     let dev = meta.dev.as_mut().unwrap();
-    let original_worktree = PathBuf::from(&dev.worktree_root);
+    let original_worktree = PathBuf::from(dev.source_root());
     let recorded_worktree = repo.join(".worktrees/recorded-source");
     let moved = Command::new("git")
         .arg("-C")
@@ -1665,7 +2558,10 @@ fn dev_command_resumes_the_recorded_worktree_without_recreating_the_default() {
         .output()
         .unwrap();
     assert!(moved.status.success(), "{}", stderr(&moved));
-    dev.worktree_root = path_string(&recorded_worktree);
+    *dev = EnvDevMeta::Owned {
+        repo_root: dev.repo_root().to_string(),
+        worktree_root: path_string(&recorded_worktree),
+    };
     save_environment(meta, &env, &cwd).unwrap();
     fs::write(recorded_worktree.join("SENTINEL"), "keep my edits\n").unwrap();
     fs::write(
@@ -1720,6 +2616,7 @@ fn dev_command_rejects_an_unrelated_recorded_worktree_before_running_source() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let first = run_ocm(
         &cwd,
@@ -1730,7 +2627,10 @@ fn dev_command_rejects_an_unrelated_recorded_worktree_before_running_source() {
     let unrelated_worktree = root.child("unrelated-source");
     init_nested_openclaw_repo(&unrelated_worktree);
     let mut meta = get_environment("demo", &env, &cwd).unwrap();
-    meta.dev.as_mut().unwrap().worktree_root = path_string(&unrelated_worktree);
+    meta.dev = Some(EnvDevMeta::Owned {
+        repo_root: meta.dev.as_ref().unwrap().repo_root().to_string(),
+        worktree_root: path_string(&unrelated_worktree),
+    });
     save_environment(meta, &env, &cwd).unwrap();
     fs::remove_file(root.child("node.log")).unwrap();
 
@@ -1753,6 +2653,7 @@ fn dev_command_accepts_a_repo_alias_without_rebinding_the_env() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let first = run_ocm(
         &cwd,
@@ -1771,8 +2672,7 @@ fn dev_command_accepts_a_repo_alias_without_rebinding_the_env() {
     );
     assert!(resumed.status.success(), "{}", stderr(&resumed));
     let after = get_environment("demo", &env, &cwd).unwrap().dev.unwrap();
-    assert_eq!(after.repo_root, before.repo_root);
-    assert_eq!(after.worktree_root, before.worktree_root);
+    assert_eq!(after, before);
 
     let unrelated_repo = root.child("unrelated-repo");
     init_nested_openclaw_repo(&unrelated_repo);
@@ -1785,9 +2685,13 @@ fn dev_command_accepts_a_repo_alias_without_rebinding_the_env() {
     );
     assert!(!changed.status.success());
     assert!(stderr(&changed).contains("dev cannot change the repo for existing env"));
+    let worktree_cwd = Path::new(before.source_root()).join("scripts");
+    for cwd in [&unrelated_repo, &worktree_cwd] {
+        let resumed = run_ocm(cwd, &env, &dev_plain(&["demo"]));
+        assert!(resumed.status.success(), "{}", stderr(&resumed));
+    }
     let after = get_environment("demo", &env, &cwd).unwrap().dev.unwrap();
-    assert_eq!(after.repo_root, before.repo_root);
-    assert_eq!(after.worktree_root, before.worktree_root);
+    assert_eq!(after, before);
 }
 
 #[test]
@@ -1798,6 +2702,7 @@ fn dev_command_rejects_a_stale_registration_replaced_by_an_unrelated_clone() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let first = run_ocm(
         &cwd,
@@ -1822,7 +2727,7 @@ fn dev_command_rejects_a_stale_registration_replaced_by_an_unrelated_clone() {
         fs::read_to_string(worktree_root.join("SENTINEL")).unwrap(),
         "preserve me\n"
     );
-    fs::remove_file(root.child("pnpm.log")).unwrap();
+    fs::remove_file(root.child("node.log")).unwrap();
     let config_path = PathBuf::from(show_json["configPath"].as_str().unwrap());
     let config_before = b"{\"agents\":{\"defaults\":{\"skipBootstrap\":true}}}\n";
     fs::write(&config_path, config_before).unwrap();
@@ -1860,6 +2765,7 @@ fn dev_command_rejects_a_stale_registration_replaced_by_an_unrelated_clone() {
             .contains("registered worktree is not a valid OpenClaw checkout")
     );
     assert!(!root.child("pnpm.log").exists());
+    assert!(!root.child("node.log").exists());
     assert_eq!(fs::read(config_path).unwrap(), config_before);
 }
 
@@ -1890,6 +2796,7 @@ fn dev_command_rejects_a_symlink_alias_to_another_registered_worktree() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let env = ocm_env(&root);
+    register_owned_dev_env(&repo, &repo.join(".worktrees/demo"), "demo", &env, &cwd);
 
     let run = run_ocm(
         &cwd,
@@ -1916,6 +2823,7 @@ fn env_remove_preserves_an_untracked_dev_worktree() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let run = run_ocm(
         &cwd,
@@ -1966,6 +2874,7 @@ fn env_remove_preserves_ignored_local_files() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let run = run_ocm(
         &cwd,
@@ -1995,6 +2904,7 @@ fn env_remove_discards_installed_node_modules() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let run = run_ocm(
         &cwd,
@@ -2021,6 +2931,7 @@ fn dev_command_rejects_another_worktrees_git_backlink() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let first = run_ocm(
         &cwd,
@@ -2087,6 +2998,7 @@ fn env_remove_accepts_a_clean_worktree_with_an_initialized_submodule() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
     let run = run_ocm(
         &cwd,
         &env,
@@ -2111,6 +3023,7 @@ fn env_remove_accepts_a_missing_worktree_with_a_non_git_repo_path() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let run = run_ocm(
         &cwd,
@@ -2140,6 +3053,7 @@ fn env_remove_accepts_a_clean_registered_worktree_without_openclaw_markers() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let run = run_ocm(
         &cwd,
@@ -2190,6 +3104,7 @@ fn env_remove_preserves_ignored_files_inside_initialized_submodules() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let run = run_ocm(
         &cwd,
@@ -2237,6 +3152,7 @@ fn dev_command_supports_relative_worktree_links() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let run = run_ocm(
         &cwd,
@@ -2257,6 +3173,7 @@ fn env_remove_refuses_an_unrelated_replacement_checkout() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let run = run_ocm(
         &cwd,
@@ -2305,6 +3222,7 @@ fn env_remove_refuses_a_clean_replacement_at_a_stale_registered_path() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     install_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let run = run_ocm(
         &cwd,
@@ -2392,12 +3310,7 @@ fn dev_status_reports_dev_envs() {
     assert_eq!(summary["serviceRunning"], false);
     assert_eq!(summary["sourceWatch"]["state"], "inactive");
     assert_eq!(summary["repoRoot"], path_string(&canonical_repo));
-    assert!(
-        summary["worktreeRoot"]
-            .as_str()
-            .unwrap()
-            .contains("/.worktrees/demo")
-    );
+    assert_eq!(summary["worktreeRoot"], path_string(&canonical_repo));
     assert!(summary["gatewayPort"].as_u64().unwrap() > 0);
     assert_eq!(
         summary["gatewayUrl"],
@@ -2430,6 +3343,7 @@ fn dev_status_reports_dev_envs() {
     assert!(reachable.status.success(), "{}", stderr(&reachable));
     let reachable: Value = serde_json::from_str(&stdout(&reachable)).unwrap();
     assert_eq!(reachable["gatewayPortReachable"], true);
+    assert_eq!(reachable["gatewayHealthReady"], false);
     assert_eq!(reachable["serviceRunning"], false);
     assert_eq!(reachable["sourceWatch"]["state"], "inactive");
     drop(listener);
@@ -2437,6 +3351,7 @@ fn dev_status_reports_dev_envs() {
     assert!(closed.status.success(), "{}", stderr(&closed));
     let closed: Value = serde_json::from_str(&stdout(&closed)).unwrap();
     assert_eq!(closed["gatewayPortReachable"], false);
+    assert_eq!(closed["gatewayHealthReady"], false);
     assert_eq!(fs::read(&config_path).unwrap(), listening_config);
     fs::write(&config_path, config_before).unwrap();
 
@@ -2696,6 +3611,7 @@ fn dev_command_discovers_the_enclosing_checkout_from_a_deep_directory() {
         show_json["devRepoRoot"],
         path_string(&fs::canonicalize(&repo).unwrap())
     );
+    assert_eq!(show_json["devWorktreeRoot"], show_json["devRepoRoot"]);
 }
 
 #[test]
@@ -2712,13 +3628,27 @@ fn dev_command_does_not_select_a_neighboring_checkout() {
     assert!(!repo.join(".worktrees/demo").exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn dev_command_records_the_canonical_explicit_source() {
     let root = TestDir::new("dev-command-canonical-source");
     let repo = init_openclaw_repo(&root);
-    let alias = root.child("source-alias");
-    std::os::unix::fs::symlink(&repo, &alias).unwrap();
+    let separate = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["init", "--quiet", "--separate-git-dir"])
+        .arg(root.child("external-git-dir"))
+        .output()
+        .unwrap();
+    assert!(separate.status.success(), "{}", stderr(&separate));
+    assert!(repo.join(".git").is_file());
+    #[cfg(unix)]
+    let alias = {
+        let alias = root.child("source-alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        alias
+    };
+    #[cfg(not(unix))]
+    let alias = repo.clone();
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
@@ -3257,7 +4187,7 @@ fn dev_destroy_stops_the_recorded_watch_before_removing_state() {
         assert!(source_watch_lock_path(&root, "demo").exists());
         assert!(repo.exists());
         if let Some(dev) = before.dev {
-            assert!(!Path::new(&dev.worktree_root).exists());
+            assert!(Path::new(dev.source_root()).exists());
         }
     }
 }
@@ -3516,7 +4446,7 @@ fn dev_foreground_reuses_plain_mode_and_named_stop_preserves_source() {
     assert_eq!(session["kind"], "ocm-source-foreground-session-v1");
     assert_eq!(session["watching"], false);
     let meta = get_environment("demo", &env, &cwd).unwrap();
-    let source = Path::new(&meta.dev.as_ref().unwrap().worktree_root);
+    let source = Path::new(meta.dev.as_ref().unwrap().source_root());
     let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
     config["gateway"].as_object_mut().unwrap().remove("mode");
@@ -3608,7 +4538,7 @@ fn dev_watch_retains_unverified_worker_ownership_across_retries() {
                     .unwrap()
                     .dev
                     .unwrap()
-                    .worktree_root,
+                    .source_root(),
             )
         };
         let entry = source.join(if watching {
@@ -3934,15 +4864,7 @@ fn dev_service_preparation_cancellation_preserves_its_running_service() {
     assert_eq!(completed["restoreService"], false);
     let after = get_environment("demo", &env, &cwd).unwrap();
     assert!(after.service_running && after.service_enabled);
-    assert_eq!(
-        after
-            .dev
-            .as_ref()
-            .map(|dev| (&dev.repo_root, &dev.worktree_root)),
-        meta.dev
-            .as_ref()
-            .map(|dev| (&dev.repo_root, &dev.worktree_root))
-    );
+    assert_eq!(after.dev, meta.dev);
     assert_eq!(fs::read(&config_path).unwrap(), edited_config);
     let after_state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert_eq!(after_state["children"], initial_state["children"]);
@@ -4004,6 +4926,7 @@ fn dev_stop_cancels_owned_preparation_before_gateway_start() {
         fs::create_dir_all(&cwd).unwrap();
         let mut env = service_env_with_gateway_admission(&root);
         install_probe_aware_fake_dev_runners(&root, &mut env);
+        create_owned_dev_env(&repo, "demo", &env, &cwd);
         let prepare = run_ocm(
             &cwd,
             &env,
@@ -4011,7 +4934,7 @@ fn dev_stop_cancels_owned_preparation_before_gateway_start() {
         );
         assert!(prepare.status.success(), "{}", stderr(&prepare));
         let meta = get_environment("demo", &env, &cwd).unwrap();
-        let worktree = Path::new(&meta.dev.as_ref().unwrap().worktree_root);
+        let worktree = Path::new(meta.dev.as_ref().unwrap().source_root());
         if phase != "onboard" {
             declare_source_tooling(worktree);
         }
@@ -4268,6 +5191,7 @@ fn dev_watch_reuses_active_session_and_reclaims_the_released_lock() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = service_env(&root);
     let (started, release, watch_log) = install_blocking_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
 
     let mut first = Command::new(env!("CARGO_BIN_EXE_ocm"));
     first
@@ -4295,7 +5219,7 @@ fn dev_watch_reuses_active_session_and_reclaims_the_released_lock() {
     config["gateway"].as_object_mut().unwrap().remove("bind");
     let config_before = serde_json::to_vec(&config).unwrap();
     fs::write(&config_path, &config_before).unwrap();
-    let worktree = Path::new(&meta.dev.as_ref().unwrap().worktree_root);
+    let worktree = Path::new(meta.dev.as_ref().unwrap().source_root());
     let manifest_before = fs::read(worktree.join("package.json")).unwrap();
     declare_source_tooling(worktree);
     let pnpm_before = fs::read(root.child("pnpm.log")).ok();

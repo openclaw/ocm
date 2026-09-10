@@ -432,8 +432,8 @@ impl<'a> EnvironmentService<'a> {
                 program_args.extend(args.clone());
                 Ok(ResolvedExecution::Dev {
                     env,
-                    repo_root: dev.repo_root,
-                    worktree_root: dev.worktree_root,
+                    repo_root: dev.repo_root().to_string(),
+                    worktree_root: dev.source_root().to_string(),
                     forwarded_args: args,
                     program: "pnpm".to_string(),
                     program_args,

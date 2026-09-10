@@ -120,7 +120,7 @@ fn resolve_execution_binding_falls_back_to_launcher_default() {
 #[test]
 fn resolve_execution_binding_falls_back_to_dev_binding() {
     let mut env = sample_env(None, None);
-    env.dev = Some(EnvDevMeta {
+    env.dev = Some(EnvDevMeta::Owned {
         repo_root: "/tmp/openclaw".to_string(),
         worktree_root: "/tmp/openclaw/.worktrees/demo".to_string(),
     });
