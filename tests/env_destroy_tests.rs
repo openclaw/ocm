@@ -17,8 +17,8 @@ use ocm::env::EnvDevMeta;
 use ocm::store::{get_environment, save_environment};
 
 use crate::support::{
-    TestDir, managed_service_definition_path, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script,
+    TestDir, dev_plain, managed_service_definition_path, ocm_env, path_string, run_ocm, stderr,
+    stdout, write_executable_script,
 };
 
 fn install_fake_launchctl(root: &TestDir, env: &mut BTreeMap<String, String>) {
@@ -550,7 +550,11 @@ fn env_destroy_yes_removes_dev_worktree() {
     install_fake_launchctl(&root, &mut env);
     install_fake_dev_runners(&root, &mut env);
 
-    let run = run_ocm(&cwd, &env, &["dev", "demo", "--repo", &path_string(&repo)]);
+    let run = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+    );
     assert!(run.status.success(), "{}", stderr(&run));
 
     let worktree = repo.join(".worktrees/demo");

@@ -16,8 +16,8 @@ use ocm::supervisor::SupervisorService;
 use serde_json::{Value, json};
 
 use crate::support::{
-    TestDir, install_fake_service_manager, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script,
+    TestDir, dev_watch, install_fake_service_manager, ocm_env, path_string, run_ocm, stderr,
+    stdout, write_executable_script,
 };
 
 fn install_fake_node(root: &TestDir, env: &mut BTreeMap<String, String>) -> PathBuf {
@@ -260,14 +260,13 @@ fn dev_status_observes_active_and_transitional_source_watch() {
     let legacy_reuse = run_ocm(
         &cwd,
         &env,
-        &[
-            "dev",
+        &dev_watch(&[
             "demo",
             "--repo",
             &path_string(&source_repo),
             "--watch",
             "--force",
-        ],
+        ]),
     );
     assert!(!legacy_reuse.status.success());
     assert!(
@@ -281,14 +280,13 @@ fn dev_status_observes_active_and_transitional_source_watch() {
     let mismatch = run_ocm(
         &cwd,
         &env,
-        &[
-            "dev",
+        &dev_watch(&[
             "demo",
             "--repo",
             &path_string(&foreign_repo),
             "--watch",
             "--force",
-        ],
+        ]),
     );
     assert!(!mismatch.status.success());
     assert!(
@@ -309,14 +307,13 @@ fn dev_status_observes_active_and_transitional_source_watch() {
     let repeated = run_ocm(
         &cwd,
         &env,
-        &[
-            "dev",
+        &dev_watch(&[
             "demo",
             "--repo",
             &path_string(&source_repo),
             "--watch",
             "--force",
-        ],
+        ]),
     );
     assert!(repeated.status.success(), "{}", stderr(&repeated));
     assert!(stderr(&repeated).contains("is starting; keeping the existing session"));
@@ -733,14 +730,13 @@ fn restoring_source_watch_lease_allows_runtime_fallback() {
     let overlapping_watch = run_ocm(
         &cwd,
         &env,
-        &[
-            "dev",
+        &dev_watch(&[
             "demo",
             "--repo",
             &path_string(&source_repo),
             "--watch",
             "--force",
-        ],
+        ]),
     );
     assert!(
         overlapping_watch.status.success(),

@@ -856,6 +856,35 @@ pub fn ocm_test_binary_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ocm")))
 }
 
+// Use these only when a fixture needs a fixed foreground mode. Default-mode,
+// service, help, and flag-validation cases should keep their raw CLI arguments.
+pub fn dev_plain<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    dev_mode_args(args, false)
+}
+
+pub fn dev_watch<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    dev_mode_args(args, true)
+}
+
+fn dev_mode_args<'a>(args: &[&'a str], watch: bool) -> Vec<&'a str> {
+    assert!(
+        args.first()
+            .is_some_and(|name| !name.starts_with('-') && !matches!(*name, "status" | "stop")),
+        "a fixed dev mode requires an environment name"
+    );
+    assert!(
+        !args.contains(&"--service"),
+        "service arguments must stay explicit"
+    );
+    assert_eq!(
+        args.contains(&"--watch"),
+        watch,
+        "dev fixture mode does not match its arguments"
+    );
+    // Keep the explicit watch flag and every other argument in their original order.
+    std::iter::once("dev").chain(args.iter().copied()).collect()
+}
+
 pub fn run_ocm(cwd: &Path, env: &BTreeMap<String, String>, args: &[&str]) -> Output {
     run_ocm_binary(&ocm_test_binary_path(), cwd, env, args)
 }

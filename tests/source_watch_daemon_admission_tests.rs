@@ -14,9 +14,9 @@ use ocm::store::{env_registry_path, supervisor_runtime_path, supervisor_state_pa
 use serde_json::{Value, json};
 
 use support::{
-    TestDir, install_fake_launchctl, install_fake_systemd_tools, managed_service_definition_path,
-    ocm_env, ocm_test_binary_path, path_string, run_ocm, stderr, write_executable_script,
-    write_json_replacing_path,
+    TestDir, dev_watch, install_fake_launchctl, install_fake_systemd_tools,
+    managed_service_definition_path, ocm_env, ocm_test_binary_path, path_string, run_ocm, stderr,
+    write_executable_script, write_json_replacing_path,
 };
 
 struct AdmissionFixture {
@@ -208,14 +208,13 @@ impl AdmissionFixture {
         run_ocm(
             &self.cwd,
             &self.env,
-            &[
-                "dev",
+            &dev_watch(&[
                 "demo",
                 "--repo",
                 &path_string(&self.repo),
                 "--watch",
                 "--force",
-            ],
+            ]),
         )
     }
 
@@ -347,15 +346,14 @@ fn dev_watch_rejects_unknown_daemon_before_creating_an_environment() {
     let rejected = run_ocm(
         &fixture.cwd,
         &fixture.env,
-        &[
-            "dev",
+        &dev_watch(&[
             "fresh",
             "--repo",
             &path_string(&fixture.repo),
             "--root",
             &path_string(&root),
             "--watch",
-        ],
+        ]),
     );
     assert!(!rejected.status.success());
     assert!(
