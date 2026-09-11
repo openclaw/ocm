@@ -225,6 +225,37 @@ fn borrowed(source: &Path) -> EnvDevMeta {
 }
 
 #[test]
+fn missing_unicode_borrowed_sources_preserve_aliases_and_allow_siblings() {
+    let fixture = TestDir::new("missing-unicode-borrowed-source");
+    let cwd = fixture.path();
+    let env = ocm_env(&fixture);
+    let source = init_checkout(&fixture.child("projects/café-source"));
+    create("developer", None, Some(borrowed(&source)), &env, cwd).unwrap();
+    let retained = fixture.child("retained");
+    fs::rename(&source, &retained).unwrap();
+    let registry = env_registry_path(&env, cwd).unwrap();
+    let before = fs::read(&registry).unwrap();
+
+    for destination in [
+        source.clone(),
+        source.with_file_name("CAFE\u{301}-SOURCE").join("state"),
+    ] {
+        let error = create("blocked", Some(&destination), None, &env, cwd).unwrap_err();
+        assert!(error.contains("overlaps borrowed source"), "{error}");
+        assert_eq!(fs::read(&registry).unwrap(), before);
+        assert!(!destination.exists());
+    }
+    let sibling = source.with_file_name("日本語の環境ルート");
+    create("sibling", Some(&sibling), None, &env, cwd).unwrap();
+    assert!(sibling.join(".openclaw/workspace").is_dir());
+    assert!(!source.exists());
+    assert_eq!(
+        fs::read_to_string(retained.join("scripts/run-node.mjs")).unwrap(),
+        "// retained source\n"
+    );
+}
+
+#[test]
 fn missing_borrowed_sources_remain_reserved_until_the_binding_is_removed() {
     let fixture = TestDir::new("missing-borrowed-reservations");
     let cwd = fixture.path();

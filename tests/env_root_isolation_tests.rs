@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Output;
 
-use ocm::store::env_registry_path;
+use ocm::store::{env_registry_path, get_environment};
 
 use support::{TestDir, ocm_env, path_string, run_ocm, stderr, write_text};
 
@@ -176,6 +176,111 @@ fn missing_registered_roots_still_reserve_their_locations() {
     let sibling = reserved.with_file_name("reserved-sibling");
     let accepted = admit(&fixture, &env, "create", "sibling", &sibling);
     assert!(accepted.status.success(), "{}", stderr(&accepted));
+}
+
+#[test]
+fn missing_unicode_roots_allow_disjoint_siblings() {
+    for (reserved_name, sibling_name) in [
+        ("日本語の環境ルート", "second-environment"),
+        ("reserved-environment", "日本語の環境ルート"),
+        ("日本語の環境ルート", "开发环境-configuration"),
+        ("café-environment", "résumé-environment"),
+        ("ქართული-environment", "second-environment"),
+        ("👩\u{200d}💻-environment", "second-environment"),
+        #[cfg(not(windows))]
+        ("日本語", "second-environment"),
+    ] {
+        let fixture = TestDir::new("missing-unicode-root-siblings");
+        let env = ocm_env(&fixture);
+        template(&fixture, &env);
+        let reserved = fixture.child("roots").join(reserved_name);
+        let created = admit(&fixture, &env, "create", "reserved", &reserved);
+        assert!(created.status.success(), "{}", stderr(&created));
+        write_text(&reserved.join(".openclaw/workspace/keep.txt"), "retained\n");
+        let displaced = fixture.child("displaced");
+        fs::rename(&reserved, &displaced).unwrap();
+
+        for action in ["create", "clone", "import"] {
+            let name = format!("sibling-{action}");
+            let destination = reserved.with_file_name(format!("{sibling_name}-{action}"));
+            let accepted = admit(&fixture, &env, action, &name, &destination);
+            assert!(accepted.status.success(), "{}", stderr(&accepted));
+            assert!(destination.join(".openclaw/workspace").is_dir());
+            assert_eq!(
+                get_environment(&name, &env, fixture.path()).unwrap().name,
+                name
+            );
+            assert!(!reserved.exists());
+            assert_eq!(
+                fs::read_to_string(displaced.join(".openclaw/workspace/keep.txt")).unwrap(),
+                "retained\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn missing_unicode_root_aliases_remain_reserved() {
+    for (reserved_name, alias_name) in [
+        ("café-environment", "CAFE\u{301}-ENVIRONMENT"),
+        ("Σ-environment", "ς-environment"),
+        ("K-environment", "k-environment"),
+        ("repo\u{200c}-environment", "repo-environment"),
+        ("Ⴀ-environment", "ა-environment"),
+        ("Ⴀ-environment", "ⴀ-environment"),
+        ("Ა-environment", "ⴀ-environment"),
+        #[cfg(windows)]
+        ("I-environment", "ı-environment"),
+    ] {
+        let fixture = TestDir::new("missing-unicode-root-aliases");
+        let env = ocm_env(&fixture);
+        template(&fixture, &env);
+        let reserved = fixture.child("roots").join(reserved_name);
+        let created = admit(&fixture, &env, "create", "reserved", &reserved);
+        assert!(created.status.success(), "{}", stderr(&created));
+        write_text(&reserved.join(".openclaw/workspace/keep.txt"), "retained\n");
+        let displaced = fixture.child("displaced");
+        fs::rename(&reserved, &displaced).unwrap();
+        let registry = env_registry_path(&env, fixture.path()).unwrap();
+        let before = fs::read(&registry).unwrap();
+        let alias = reserved.with_file_name(alias_name);
+
+        for action in ["create", "clone", "import"] {
+            let rejected = admit(&fixture, &env, action, "blocked", &alias.join("child"));
+            assert!(!rejected.status.success());
+            assert!(
+                stderr(&rejected).contains("overlaps environment reserved root"),
+                "{}",
+                stderr(&rejected)
+            );
+            assert_eq!(fs::read(&registry).unwrap(), before);
+            assert!(!reserved.exists());
+            assert!(!alias.exists());
+            assert_eq!(
+                fs::read_to_string(displaced.join(".openclaw/workspace/keep.txt")).unwrap(),
+                "retained\n"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn missing_unicode_short_names_remain_ambiguous() {
+    let fixture = TestDir::new("missing-unicode-short-name");
+    let env = ocm_env(&fixture);
+    let reserved = fixture.child("roots/日本語");
+    let created = admit(&fixture, &env, "create", "reserved", &reserved);
+    assert!(created.status.success(), "{}", stderr(&created));
+    fs::rename(&reserved, fixture.child("displaced")).unwrap();
+    let registry = env_registry_path(&env, fixture.path()).unwrap();
+    let before = fs::read(&registry).unwrap();
+    let destination = reserved.with_file_name("second-environment");
+    let rejected = admit(&fixture, &env, "create", "blocked", &destination);
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("cannot distinguish missing Windows short-name aliases"));
+    assert_eq!(fs::read(&registry).unwrap(), before);
+    assert!(!destination.exists());
 }
 
 #[cfg(unix)]

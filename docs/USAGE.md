@@ -526,6 +526,11 @@ disjoint custom roots remain valid. This applies to `env create`, `env clone`,
 `env import`, and new environments created by `start`, `setup`, `dev`, `migrate`,
 `adopt import`, or upgrade simulation.
 
+A registered root remains reserved while its directory is missing. Disjoint
+Unicode roots remain valid; case and normalization aliases of a missing root
+are still reserved. On Windows, an ambiguous missing 8.3 short name requires
+restoring the registered path before retrying.
+
 These operations also require a root outside registered dev sources. Missing borrowed
 source paths remain reserved until their binding is removed; missing paths of
 OCM-owned worktrees can still be reused. The root must neither contain

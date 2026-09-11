@@ -2,6 +2,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use caseless::Caseless;
+use icu_properties::{CodePointSetData, props::DefaultIgnorableCodePoint};
+
 use crate::env::{EnvDevMeta, EnvMeta};
 
 use super::display_path;
@@ -141,11 +144,8 @@ pub(crate) fn projected_path_relative(root: &Path, path: &Path) -> Result<Option
         if component == expected {
             continue;
         }
-        let component = component
-            .as_os_str()
-            .to_str()
-            .filter(|name| name.is_ascii());
-        let expected = expected.as_os_str().to_str().filter(|name| name.is_ascii());
+        let component = component.as_os_str().to_str();
+        let expected = expected.as_os_str().to_str();
         let (Some(component), Some(expected)) = (component, expected) else {
             return Err("cannot distinguish differently encoded missing source names; restore the source before retrying".to_string());
         };
@@ -154,9 +154,17 @@ pub(crate) fn projected_path_relative(root: &Path, path: &Path) -> Result<Option
             component.trim_end_matches(&['.', ' '][..]),
             expected.trim_end_matches(&['.', ' '][..]),
         );
-        // Missing names lack filesystem identity. Reserve possible case aliases
-        // without changing comparisons between existing entries.
-        if component.eq_ignore_ascii_case(expected) {
+        // Missing names lack filesystem identity. Reserve possible Unicode
+        // aliases without changing comparisons between existing entries.
+        if component.eq_ignore_ascii_case(expected)
+            || ((!component.is_ascii() || !expected.is_ascii())
+                && missing_name_characters(component)
+                    .compatibility_caseless_match(missing_name_characters(expected)))
+        {
+            continue;
+        }
+        #[cfg(windows)]
+        if windows_case_alias(component, expected)? {
             continue;
         }
         #[cfg(windows)]
@@ -170,12 +178,50 @@ pub(crate) fn projected_path_relative(root: &Path, path: &Path) -> Result<Option
     Ok(Some(actual.collect()))
 }
 
+fn missing_name_characters(name: &str) -> impl Iterator<Item = char> + '_ {
+    let ignorables = CodePointSetData::new::<DefaultIgnorableCodePoint>();
+    name.chars()
+        // HFS+ ignores formatting characters in filename comparisons. This is
+        // only a conservative reservation key; never rewrite a stored path.
+        .filter(move |character| !ignorables.contains(*character))
+        .map(|character| match character {
+            // HFS+ folds Georgian Asomtavruli to Mkhedruli, whereas modern
+            // Unicode folds it to Nuskhuri. Preserve both equivalences before
+            // applying standard Unicode compatibility caseless matching.
+            // https://developer.apple.com/library/archive/technotes/tn/tn1150.html
+            '\u{10a0}'..='\u{10c5}' => char::from_u32(character as u32 + 0x30).unwrap(),
+            '\u{2d00}'..='\u{2d25}' => char::from_u32(character as u32 - 0x1c30).unwrap(),
+            _ => character,
+        })
+}
+
+#[cfg(windows)]
+fn windows_case_alias(left: &str, right: &str) -> Result<bool, String> {
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    let left: Vec<u16> = left.encode_utf16().collect();
+    let right: Vec<u16> = right.encode_utf16().collect();
+    let left_len = i32::try_from(left.len()).map_err(|error| error.to_string())?;
+    let right_len = i32::try_from(right.len()).map_err(|error| error.to_string())?;
+    // Both buffers remain live for their explicit UTF-16 lengths. Use the OS
+    // uppercase table as well as Unicode folding (for example, dotless i).
+    let comparison =
+        unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
+    if comparison == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(comparison == CSTR_EQUAL)
+}
+
 #[cfg(windows)]
 fn possible_short_name(name: &str) -> bool {
     let mut parts = name.split('.');
     let base = parts.next().unwrap_or_default();
     let extension = parts.next().unwrap_or_default();
-    !base.is_empty() && base.len() <= 8 && extension.len() <= 3 && parts.next().is_none()
+    !base.is_empty()
+        && base.encode_utf16().count() <= 8
+        && extension.encode_utf16().count() <= 3
+        && parts.next().is_none()
 }
 
 #[cfg(windows)]

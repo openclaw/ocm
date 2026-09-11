@@ -38,6 +38,8 @@ time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 indicatif = { version = "0.18", default-features = false, features = ["unicode-width"] }
 unicode-width = "0.2"
+caseless = "0.2"
+icu_properties = "2.3"
 terminal_size = "0.4"
 dialoguer = { version = "0.12", default-features = false }
 zip = { version = "8.5", default-features = false, features = ["deflate"] }
@@ -53,6 +55,7 @@ xattr = "1.6"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
