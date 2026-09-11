@@ -339,6 +339,62 @@ fn independent_project_survives_success_failure_interrupt_and_explicit_rollback(
 }
 
 #[test]
+fn configured_workspace_policy_ignores_unrelated_dangling_home_alias() {
+    for redeclare in [false, true] {
+        let mut fixture = Fixture::with_independent_root("development/projects");
+        let root = fixture.state.parent().unwrap();
+        let config = serde_json::json!({
+            "agents": {"defaults": {"workspace": root.join("development")}}
+        });
+        write_text(&fixture.state.join("openclaw.json"), &config.to_string());
+        symlink("missing-tool-target", root.join(".old-tool")).unwrap();
+        if redeclare {
+            let result = fixture.run(&[
+                "env",
+                "set-independent-paths",
+                "demo",
+                "development/projects",
+            ]);
+            assert!(result.status.success(), "{}", stderr(&result));
+        }
+        write_text(&fixture.root.child("release"), "continue");
+        fixture.env.insert(
+            "OCM_PROOF_READY".into(),
+            fixture.root.child("ready").to_str().unwrap().into(),
+        );
+        fixture.env.insert(
+            "OCM_PROOF_RELEASE".into(),
+            fixture.root.child("release").to_str().unwrap().into(),
+        );
+        let upgrade = fixture.run(&["upgrade", "demo", "--runtime", "new", "--json"]);
+        assert!(
+            upgrade.status.success(),
+            "{} {}",
+            stdout(&upgrade),
+            stderr(&upgrade)
+        );
+        let expected = fixture.edit_project();
+        write_text(&fixture.state.join("credentials/synthetic"), "after\n");
+        let rollback = fixture.run(&["upgrade", "rollback", "demo", "--json"]);
+        assert!(
+            rollback.status.success(),
+            "{} {}",
+            stdout(&rollback),
+            stderr(&rollback)
+        );
+        fixture.assert_project(&expected);
+        assert_eq!(
+            fs::read_to_string(fixture.state.join("credentials/synthetic")).unwrap(),
+            "fixture-only\n"
+        );
+        assert_eq!(
+            fs::read_link(root.join(".old-tool")).unwrap(),
+            PathBuf::from("missing-tool-target")
+        );
+    }
+}
+
+#[test]
 fn excluded_development_directories_are_not_opened_during_upgrade() {
     for independent in [".openclaw/worktrees", "development/checkouts"] {
         let fixture = Fixture::with_independent_root(independent);

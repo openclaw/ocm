@@ -212,6 +212,17 @@ pub(crate) fn validate_upgrade_independent_paths(
                 display_path(relative)
             ));
         }
+        // Preserve established workspace eligibility before considering new
+        // locations: unrelated hidden aliases must not invalidate saved policy.
+        if workspaces
+            .workspace_roots()
+            .any(|workspace| absolute.starts_with(workspace))
+            || workspace_targets
+                .iter()
+                .any(|workspace| resolved.starts_with(workspace))
+        {
+            continue;
+        }
         // OpenClaw keeps managed checkout contents beside its workspace, while
         // their registry remains in the owned state database. Operators may
         // also keep projects elsewhere in the environment's home. These are
@@ -248,15 +259,7 @@ pub(crate) fn validate_upgrade_independent_paths(
                 }
             }
         }
-        if !managed_worktree_content
-            && !home_content
-            && !workspaces
-                .workspace_roots()
-                .any(|workspace| absolute.starts_with(workspace))
-            && !workspace_targets
-                .iter()
-                .any(|workspace| resolved.starts_with(workspace))
-        {
+        if !managed_worktree_content && !home_content {
             return Err(format!(
                 "independent paths must be beneath a configured workspace, in .openclaw/worktrees, or in a non-hidden environment-home directory: {}",
                 display_path(relative)
