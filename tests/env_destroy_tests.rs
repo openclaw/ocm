@@ -1090,7 +1090,28 @@ fn env_remove_preserves_missing_owned_worktree_recovery() {
             std::os::unix::fs::symlink(worktree.parent().unwrap(), &alias).unwrap();
             alias.join(worktree.file_name().unwrap())
         } else {
-            worktree.to_path_buf()
+            let registry = ocm::store::env_registry_path(&env, root.path()).unwrap();
+            let before = fs::read(&registry).unwrap();
+            let replacement = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "create",
+                    "replacement",
+                    "--root",
+                    &path_string(worktree),
+                ],
+            );
+            assert!(!replacement.status.success());
+            assert!(
+                stderr(&replacement).contains("overlaps environment parent root"),
+                "{}",
+                stderr(&replacement)
+            );
+            assert_eq!(fs::read(&registry).unwrap(), before);
+            assert!(!worktree.exists());
+            root.child("replacement")
         };
         if dev_replacement {
             create_owned_dev_env_at_root(
