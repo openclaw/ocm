@@ -300,6 +300,12 @@ pub fn base_env(home: &Path) -> BTreeMap<String, String> {
     if let Ok(path) = std::env::var("PATH") {
         env.insert("PATH".to_string(), path);
     }
+    #[cfg(windows)]
+    {
+        // Windows system DLLs still need SystemRoot in an isolated environment.
+        let system_root = std::env::var("SystemRoot").expect("Windows fixture requires SystemRoot");
+        env.insert("SystemRoot".to_string(), system_root);
+    }
     env
 }
 

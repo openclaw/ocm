@@ -57,6 +57,7 @@ jobs:
       - name: Check Windows targets
         run: cargo check --workspace --all-targets --locked
       - name: Prove missing Unicode environment root isolation
+        timeout-minutes: 5
         run: cargo test --locked --test env_root_isolation_tests missing_unicode_
       - name: Prove private config writes
         run: cargo test --locked --lib private_config_

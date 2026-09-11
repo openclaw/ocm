@@ -31,6 +31,13 @@ fn admit(
 fn template(fixture: &TestDir, env: &BTreeMap<String, String>) {
     let created = run_ocm(fixture.path(), env, &["env", "create", "template"]);
     assert!(created.status.success(), "{}", stderr(&created));
+    let port = get_environment("template", env, fixture.path())
+        .unwrap()
+        .gateway_port;
+    assert!(
+        port.is_some_and(|port| (1..=u16::MAX as u32).contains(&port)),
+        "invalid fixture gateway port: {port:?}"
+    );
     let exported = run_ocm(
         fixture.path(),
         env,
@@ -206,9 +213,14 @@ fn missing_unicode_roots_allow_disjoint_siblings() {
             let accepted = admit(&fixture, &env, action, &name, &destination);
             assert!(accepted.status.success(), "{}", stderr(&accepted));
             assert!(destination.join(".openclaw/workspace").is_dir());
-            assert_eq!(
-                get_environment(&name, &env, fixture.path()).unwrap().name,
-                name
+            let registered = get_environment(&name, &env, fixture.path()).unwrap();
+            assert_eq!(registered.name, name);
+            assert!(
+                registered
+                    .gateway_port
+                    .is_some_and(|port| (1..=u16::MAX as u32).contains(&port)),
+                "invalid sibling gateway port: {:?}",
+                registered.gateway_port
             );
             assert!(!reserved.exists());
             assert_eq!(
