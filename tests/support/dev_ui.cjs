@@ -12,16 +12,21 @@ const controlUi = config.gateway.controlUi?.$include
   : config.gateway.controlUi;
 // Controlled peers implement only the config inputs used by these CLI tests.
 // Native OpenClaw remains the authority for its complete config/env semantics.
-const nativeEnv = {...process.env};
+const nativeEnv = {
+  UI_BASE: process.env.UI_BASE,
+  OCM_TEST_UI_BASE: process.env.OCM_TEST_UI_BASE,
+  OCM_ACTIVE_ENV: process.env.OCM_ACTIVE_ENV,
+  OPENCLAW_GATEWAY_PORT: process.env.OPENCLAW_GATEWAY_PORT,
+};
 for (const dotenv of [path.join(process.cwd(), ".env"), path.join(path.dirname(process.env.OPENCLAW_CONFIG_PATH), ".env")]) {
   if (!fs.existsSync(dotenv)) continue;
   for (const line of fs.readFileSync(dotenv, "utf8").split(/\r?\n/)) {
     const entry = /^([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line);
-    if (entry && nativeEnv[entry[1]] === undefined) nativeEnv[entry[1]] = entry[2];
+    if (entry && Object.hasOwn(nativeEnv, entry[1]) && nativeEnv[entry[1]] === undefined) nativeEnv[entry[1]] = entry[2];
   }
 }
 for (const [key, value] of Object.entries({...config.env?.vars, ...config.env})) {
-  if (typeof value === "string" && value.trim() && !value.includes("${") && !nativeEnv[key]?.trim()) {
+  if (Object.hasOwn(nativeEnv, key) && typeof value === "string" && value.trim() && !value.includes("${") && !nativeEnv[key]?.trim()) {
     nativeEnv[key] = value;
   }
 }
