@@ -249,6 +249,10 @@ directories as independent before upgrading:
 ocm env set-independent-paths mira .openclaw/workspace/projects
 ```
 
+Explicit declarations also support `.openclaw/worktrees` and non-hidden
+development directories elsewhere in the environment home. Other hidden
+home/state namespaces, including credentials and the state database, stay protected.
+
 Upgrade checkpoints then omit those directories without reading their contents,
 and rollback restores the surrounding owned state while leaving those directories
 in place. The list is explicit and empty by default; names such as `node_modules`

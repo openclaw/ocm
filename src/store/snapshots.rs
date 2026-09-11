@@ -212,15 +212,53 @@ pub(crate) fn validate_upgrade_independent_paths(
                 display_path(relative)
             ));
         }
-        if !workspaces
-            .workspace_roots()
-            .any(|workspace| absolute.starts_with(workspace))
+        // OpenClaw keeps managed checkout contents beside its workspace, while
+        // their registry remains in the owned state database. Operators may
+        // also keep projects elsewhere in the environment's home. These are
+        // eligible locations, not automatic exclusions: every boundary still
+        // requires an explicit declaration and all checks above.
+        let mut managed_worktree_content = relative.starts_with(".openclaw/worktrees");
+        // Keep other hidden home/state namespaces closed, including unknown
+        // future state directories and tool credential/configuration homes.
+        let mut home_content = relative
+            .components()
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            .is_some_and(|name| !name.starts_with('.'));
+        if home_content || managed_worktree_content {
+            // A hidden state/tool home may alias an ordinary directory. Check
+            // only top-level aliases, never the declared project's contents.
+            for entry in fs::read_dir(&paths.root).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                if managed_worktree_content && entry.file_name() == ".openclaw" {
+                    continue;
+                }
+                if entry.file_name().to_string_lossy().starts_with('.')
+                    && entry
+                        .file_type()
+                        .map_err(|error| error.to_string())?
+                        .is_symlink()
+                {
+                    let target = resolve_scope_path(&entry.path())?;
+                    if resolved.starts_with(&target) || target.starts_with(&resolved) {
+                        home_content = false;
+                        managed_worktree_content = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !managed_worktree_content
+            && !home_content
+            && !workspaces
+                .workspace_roots()
+                .any(|workspace| absolute.starts_with(workspace))
             && !workspace_targets
                 .iter()
                 .any(|workspace| resolved.starts_with(workspace))
         {
             return Err(format!(
-                "independent paths must be beneath a configured workspace: {}",
+                "independent paths must be beneath a configured workspace, in .openclaw/worktrees, or in a non-hidden environment-home directory: {}",
                 display_path(relative)
             ));
         }

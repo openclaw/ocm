@@ -557,13 +557,26 @@ their directories before the upgrade:
 
 ```bash
 ocm env set-independent-paths mira .openclaw/workspace/projects .openclaw/workspace/worktrees
+# Include separately located managed worktrees and a development checkout:
+ocm env set-independent-paths mira .openclaw/workspace/projects .openclaw/worktrees development/checkouts
 ocm env show mira --json
 ocm env set-independent-paths mira none
 ```
 
-The command replaces the list. Paths are relative to the environment root, must
-be strictly beneath a configured workspace, and must name directories. A declared
-directory may be absent if its parents exist. Parents must be real directories;
+The command replaces the list. Paths are relative to the environment root and
+must name directories in one of these locations:
+
+- strictly beneath a configured workspace;
+- the managed-worktree content directory `.openclaw/worktrees`, or beneath it;
+- a non-hidden top-level directory of the environment home, or beneath it.
+
+Other hidden home/state directories remain ineligible. For example, `.openclaw/agents`,
+`.openclaw/credentials`, `.openclaw/state`, and `.codex` cannot be excluded. The
+managed-worktree registry and migration state remain in the state database, not
+in the excluded checkout contents. These locations are eligibility rules only:
+no content is excluded without an explicit declaration.
+
+A declared directory may be absent if its parents exist. Parents must be real directories;
 symlinks within an independent directory remain untouched. Individual files cannot
 be declared independently, keeping SQLite databases and their adjacent WAL and
 journal files together. Paths cannot overlap, escape the environment, contain

@@ -1489,7 +1489,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
         ),
         "set-independent-paths" => render_leaf(
             "Set independent upgrade paths",
-            "Declare content beneath configured workspaces that core upgrades must not checkpoint or rewind. This replaces the previous list; use none to clear it.",
+            "Declare independent development directories that core upgrades must not checkpoint or rewind. This replaces the previous list; use none to clear it.",
             vec![
                 format!("{cmd} env set-independent-paths <name> <relative-path>... [--json]"),
                 format!("{cmd} env set-independent-paths <name> none [--json]"),
@@ -1500,6 +1500,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             )],
             &[
                 "Paths name directories relative to the environment root. Configuration, config includes and entire configured workspaces cannot be declared independent.",
+                "Eligible locations are beneath configured workspaces, in .openclaw/worktrees, or in non-hidden environment-home directories. Other hidden home/state namespaces remain protected.",
                 "Declare only content that core and plugin migrations do not own. OCM does not sandbox runtime writes into declared paths.",
                 "Full snapshots still include these paths. Existing checkpoints keep the scope recorded when they were captured.",
             ],

@@ -25,6 +25,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_independent_root(".openclaw/workspace/projects")
+    }
+
+    fn with_independent_root(independent: &str) -> Self {
         let root = TestDir::new("upgrade-independent-project");
         let env = ocm_env(&root);
         for (name, version) in [("old", "2026.9.1"), ("new", "2026.9.2")] {
@@ -72,7 +76,7 @@ esac
         );
         assert!(result.status.success(), "{}", stderr(&result));
         let state = root.child("ocm-home/envs/demo/.openclaw");
-        let project = state.join("workspace/projects/example");
+        let project = state.parent().unwrap().join(independent).join("example");
         write_text(&state.join("openclaw.json"), "{}\n");
         write_text(&project.join("code"), "before\n");
         write_text(&project.join("deleted"), "before\n");
@@ -89,6 +93,14 @@ esac
         );
         write_text(&state.join("unknown/regular.sock"), "ordinary file\n");
         write_text(&state.join("credentials/synthetic"), "fixture-only\n");
+        write_text(
+            &state.join("agents/main/sessions/synthetic.jsonl"),
+            "session-before\n",
+        );
+        write_text(
+            &state.parent().unwrap().join("unlisted-project/code"),
+            "unlisted-before\n",
+        );
         fs::set_permissions(
             state.join("credentials/synthetic"),
             fs::Permissions::from_mode(0o600),
@@ -106,12 +118,7 @@ esac
             state,
             project,
         };
-        let result = fixture.run(&[
-            "env",
-            "set-independent-paths",
-            "demo",
-            ".openclaw/workspace/projects",
-        ]);
+        let result = fixture.run(&["env", "set-independent-paths", "demo", independent]);
         assert!(result.status.success(), "{}", stderr(&result));
         fixture
     }
@@ -164,8 +171,15 @@ esac
 
 #[test]
 fn independent_project_survives_success_failure_interrupt_and_explicit_rollback() {
-    for mode in ["success", "failure", "interrupt"] {
-        let fixture = Fixture::new();
+    for (independent, mode) in [
+        ".openclaw/workspace/projects",
+        ".openclaw/worktrees",
+        "development/checkouts",
+    ]
+    .into_iter()
+    .flat_map(|independent| ["success", "failure", "interrupt"].map(|mode| (independent, mode)))
+    {
+        let fixture = Fixture::with_independent_root(independent);
         let ready = fixture.root.child("ready");
         let release = fixture.root.child("release");
         let mut child = Command::new(env!("CARGO_BIN_EXE_ocm"))
@@ -210,6 +224,22 @@ fn independent_project_survives_success_failure_interrupt_and_explicit_rollback(
         );
         fs::remove_file(fixture.state.join("workspace/.openclaw/legacy-state")).unwrap();
         write_text(&fixture.state.join("migration-receipt"), "partial\n");
+        write_text(
+            &fixture.state.join("credentials/synthetic"),
+            "credential-after\n",
+        );
+        write_text(
+            &fixture.state.join("agents/main/sessions/synthetic.jsonl"),
+            "session-after\n",
+        );
+        write_text(
+            &fixture
+                .state
+                .parent()
+                .unwrap()
+                .join("unlisted-project/code"),
+            "unlisted-after\n",
+        );
         if mode == "interrupt" {
             // This child belongs exclusively to this fixture.
             assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
@@ -263,6 +293,25 @@ fn independent_project_survives_success_failure_interrupt_and_explicit_rollback(
                 .exists()
         );
         assert!(!fixture.state.join("migration-receipt").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.state.join("credentials/synthetic")).unwrap(),
+            "fixture-only\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.state.join("agents/main/sessions/synthetic.jsonl")).unwrap(),
+            "session-before\n"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                fixture
+                    .state
+                    .parent()
+                    .unwrap()
+                    .join("unlisted-project/code")
+            )
+            .unwrap(),
+            "unlisted-before\n"
+        );
         let db = Connection::open(fixture.state.join("arbitrary.data")).unwrap();
         assert_eq!(
             db.query_row("SELECT value FROM durable", [], |row| row
@@ -283,10 +332,179 @@ fn independent_project_survives_success_failure_interrupt_and_explicit_rollback(
         let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
         assert!(
             !PathBuf::from(snapshot["archivePath"].as_str().unwrap())
-                .join(".openclaw/workspace/projects")
+                .join(independent)
                 .exists()
         );
     }
+}
+
+#[test]
+fn excluded_development_directories_are_not_opened_during_upgrade() {
+    for independent in [".openclaw/worktrees", "development/checkouts"] {
+        let fixture = Fixture::with_independent_root(independent);
+        let boundary = fixture.state.parent().unwrap().join(independent);
+        let permissions = fs::metadata(&boundary).unwrap().permissions();
+        fs::set_permissions(&boundary, fs::Permissions::from_mode(0)).unwrap();
+        write_text(&fixture.root.child("release"), "continue");
+        let output = Command::new(env!("CARGO_BIN_EXE_ocm"))
+            .args(["upgrade", "demo", "--runtime", "new", "--json"])
+            .current_dir(fixture.root.path())
+            .env_clear()
+            .envs(&fixture.env)
+            .env("OCM_PROOF_READY", fixture.root.child("ready"))
+            .env("OCM_PROOF_RELEASE", fixture.root.child("release"))
+            .output()
+            .unwrap();
+        // Restore access before assertions so failed tests remain cleanable.
+        fs::set_permissions(&boundary, permissions).unwrap();
+        assert!(
+            output.status.success(),
+            "{independent}: {} {}",
+            stdout(&output),
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn hidden_home_aliases_do_not_make_runtime_state_independent() {
+    let fixture = Fixture::new();
+    let root = fixture.state.parent().unwrap();
+    fs::rename(&fixture.state, root.join("runtime-state")).unwrap();
+    symlink("runtime-state", &fixture.state).unwrap();
+    fs::create_dir_all(root.join("tool-data/credentials")).unwrap();
+    symlink("tool-data", root.join(".codex")).unwrap();
+    for forbidden in [
+        "runtime-state/credentials",
+        "runtime-state/agents",
+        "tool-data",
+        "tool-data/credentials",
+    ] {
+        let result = fixture.run(&["env", "set-independent-paths", "demo", forbidden]);
+        assert!(
+            !result.status.success(),
+            "hidden home alias accepted: {forbidden}"
+        );
+    }
+    let workspace_child = fixture.run(&[
+        "env",
+        "set-independent-paths",
+        "demo",
+        "runtime-state/workspace/projects",
+    ]);
+    assert!(
+        workspace_child.status.success(),
+        "existing workspace alias refused: {}",
+        stderr(&workspace_child)
+    );
+    fs::create_dir_all(root.join("unrelated-project")).unwrap();
+    let unrelated = fixture.run(&["env", "set-independent-paths", "demo", "unrelated-project"]);
+    assert!(
+        unrelated.status.success(),
+        "unrelated home project refused: {}",
+        stderr(&unrelated)
+    );
+
+    let fixture = Fixture::with_independent_root(".openclaw/worktrees");
+    symlink(
+        ".openclaw/worktrees/example",
+        fixture.state.parent().unwrap().join(".codex"),
+    )
+    .unwrap();
+    let protected = fixture.run(&[
+        "env",
+        "set-independent-paths",
+        "demo",
+        ".openclaw/worktrees",
+    ]);
+    assert!(
+        !protected.status.success(),
+        "managed worktree containing a hidden tool home accepted"
+    );
+}
+
+#[test]
+fn development_locations_require_explicit_safe_directory_boundaries() {
+    let fixture = Fixture::new();
+    let root = fixture.state.parent().unwrap();
+    for independent in [
+        ".openclaw/worktrees",
+        ".openclaw/worktrees/task",
+        "clawrouter-live-test/workspace",
+        "other-projects",
+    ] {
+        fs::create_dir_all(root.join(independent).parent().unwrap()).unwrap();
+        // The boundary itself may be absent, as with workspace declarations.
+        let result = fixture.run(&["env", "set-independent-paths", "demo", independent]);
+        assert!(
+            result.status.success(),
+            "{independent}: {}",
+            stderr(&result)
+        );
+    }
+    let saved = fixture.run(&["env", "show", "demo", "--json"]);
+    let saved: Value = serde_json::from_str(&stdout(&saved)).unwrap();
+    for forbidden in [
+        ".openclaw/agents/main/sessions",
+        ".openclaw/credentials",
+        ".openclaw/state",
+        ".openclaw/logs",
+        ".openclaw/unknown",
+        ".openclaw/worktrees-other",
+        ".codex/projects",
+        ".config/tool",
+        ".clawdbot/worktrees",
+    ] {
+        fs::create_dir_all(root.join(forbidden)).unwrap();
+        let result = fixture.run(&["env", "set-independent-paths", "demo", forbidden]);
+        assert!(
+            !result.status.success(),
+            "protected namespace accepted: {forbidden}"
+        );
+        let current = fixture.run(&["env", "show", "demo", "--json"]);
+        let current: Value = serde_json::from_str(&stdout(&current)).unwrap();
+        assert_eq!(
+            current["upgradeIndependentPaths"],
+            saved["upgradeIndependentPaths"]
+        );
+    }
+    for independent in [".openclaw/worktrees", "development/checkouts"] {
+        fs::create_dir_all(root.join(independent)).unwrap();
+        write_text(&root.join(independent).join("file"), "not a directory");
+        symlink("file", root.join(independent).join("alias")).unwrap();
+        for suffix in ["file", "alias", "alias/child", "../escape"] {
+            let path = format!("{independent}/{suffix}");
+            let result = fixture.run(&["env", "set-independent-paths", "demo", &path]);
+            assert!(!result.status.success(), "unsafe boundary accepted: {path}");
+        }
+        let child = format!("{independent}/child");
+        let overlap = fixture.run(&["env", "set-independent-paths", "demo", independent, &child]);
+        assert!(!overlap.status.success(), "overlapping boundaries accepted");
+        // A configured whole workspace is protected even at a new location.
+        write_text(
+            &fixture.state.join("openclaw.json"),
+            &serde_json::json!({"agents":{"defaults":{"workspace":root.join(independent)}}})
+                .to_string(),
+        );
+        let workspace = fixture.run(&["env", "set-independent-paths", "demo", independent]);
+        assert!(
+            !workspace.status.success(),
+            "whole workspace accepted: {independent}"
+        );
+        write_text(&fixture.state.join("openclaw.json"), "{}");
+    }
+    write_text(&fixture.state.join("worktrees/include.json"), "{}");
+    write_text(
+        &fixture.state.join("openclaw.json"),
+        r#"{"$include":"worktrees/include.json"}"#,
+    );
+    let include = fixture.run(&[
+        "env",
+        "set-independent-paths",
+        "demo",
+        ".openclaw/worktrees",
+    ]);
+    assert!(!include.status.success(), "included configuration excluded");
 }
 
 #[test]
@@ -408,7 +626,17 @@ fn configured_workspace_alias_cannot_hide_a_whole_workspace_exclusion() {
 
 #[test]
 fn frozen_scope_and_invalid_metadata_never_fall_back_to_whole_root_restore() {
-    let fixture = Fixture::new();
+    for independent in [
+        ".openclaw/workspace/projects",
+        ".openclaw/worktrees",
+        "development/checkouts",
+    ] {
+        frozen_scope_preserves_independent_root(independent);
+    }
+}
+
+fn frozen_scope_preserves_independent_root(independent: &str) {
+    let fixture = Fixture::with_independent_root(independent);
     let ready = fixture.root.child("ready");
     let release = fixture.root.child("release");
     write_text(&release, "continue");
@@ -440,17 +668,14 @@ fn frozen_scope_and_invalid_metadata_never_fall_back_to_whole_root_restore() {
     fixture.assert_project(&expected);
     fs::write(&snapshot_meta, original).unwrap();
     // An artifact with an undeclared captured copy must also be refused.
-    write_text(
-        &archive.join(".openclaw/workspace/projects/injected"),
-        "unsafe",
-    );
+    write_text(&archive.join(independent).join("injected"), "unsafe");
     let restore = fixture.run(&["env", "snapshot", "restore", "demo", id]);
     assert!(
         !restore.status.success(),
         "conflicting artifact was accepted"
     );
     fixture.assert_project(&expected);
-    fs::remove_dir_all(archive.join(".openclaw/workspace/projects")).unwrap();
+    fs::remove_dir_all(archive.join(independent)).unwrap();
     let restore = fixture.run(&["env", "snapshot", "restore", "demo", id]);
     assert!(restore.status.success(), "{}", stderr(&restore));
     fixture.assert_project(&expected);
@@ -458,7 +683,17 @@ fn frozen_scope_and_invalid_metadata_never_fall_back_to_whole_root_restore() {
 
 #[test]
 fn full_backup_still_rewinds_declared_independent_content() {
-    let fixture = Fixture::new();
+    for independent in [
+        ".openclaw/workspace/projects",
+        ".openclaw/worktrees",
+        "development/checkouts",
+    ] {
+        full_backup_rewinds_independent_root(independent);
+    }
+}
+
+fn full_backup_rewinds_independent_root(independent: &str) {
+    let fixture = Fixture::with_independent_root(independent);
     let snapshot = fixture.run(&["env", "snapshot", "create", "demo", "--json"]);
     assert!(snapshot.status.success(), "{}", stderr(&snapshot));
     let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
