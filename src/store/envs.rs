@@ -721,6 +721,12 @@ fn clone_environment_with_policy(
             }
         };
 
+        super::openclaw_state::relocate_installed_plugin_index_paths(
+            &target_paths.state_dir.join("state/openclaw.sqlite"),
+            &source_paths.state_dir,
+            &target_paths.state_dir,
+        )?;
+
         let meta = EnvMeta {
             upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
