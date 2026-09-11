@@ -159,14 +159,14 @@ async function start(name, watching = true, withUi = false, defaults = false) {
   if (withUi && takeover) {
     fs.mkdirSync(path.join(envRoot, '.openclaw'), {recursive:true});
     fs.writeFileSync(path.join(envRoot, '.openclaw', 'openclaw.json'), JSON.stringify({
-      gateway:{controlUi:{basePath:'/console'}, auth:{mode:'token', token:'synthetic-fixture-auth'}},
+      gateway:{controlUi:{basePath:'${OCM_TEST_UI_BASE}'}, auth:{mode:'token', token:'synthetic-fixture-auth'}},
     }));
   }
   const modes = defaults ? [] : [watching ? '--watch' : '--no-watch', withUi ? '--ui' : '--no-ui'];
   const args = ['dev',name,...(defaults ? [] : ['--repo',repo]),...(takeover ? ['--force'] : ['--root',envRoot,'--port',port]),...modes];
   const sourceEnv = {
     ...env,
-    ...(withUi ? {OCM_TEST_DEV_UI_DIR:directory, OCM_TEST_DEV_UI_DESCENDANTS:'1'} : {}),
+    ...(withUi ? {OCM_TEST_DEV_UI_DIR:directory, OCM_TEST_DEV_UI_DESCENDANTS:'1', OCM_TEST_UI_BASE:'/console'} : {}),
     NoDe_CoMpIlE_CaChE: path.join(directory, 'inherited-cache'),
     nOdE_dIsAbLe_CoMpIlE_cAcHe: '0',
     NODE_OPTIONS: '--no-warnings'
@@ -288,6 +288,7 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
       'Completed initial handoff was not acknowledged');
     assert.match(normal.output(), /UI: http:\/\/127\.0\.0\.1:\d+\/#bootstrapToken=synthetic-owner-grant-1/);
     assert.ok(!normal.output().includes('synthetic-legacy'));
+    assert.ok(!fs.existsSync(path.join(normal.directory, 'config-attempts')), 'Default path ran an extra config command');
     const active = JSON.parse(run(['dev','status',normal.name,'--json']).stdout);
     assert.equal(active.sourceWatch.state, 'active', 'Held watch lease was not readable by dev status');
     assert.equal(active.sourceWatch.watching, true);
@@ -438,6 +439,10 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     results.push('native plain named stop, descendant cleanup, env/source preservation');
 
     const crashed = await start('crashed', true, true);
+    assert.equal(fs.readFileSync(path.join(crashed.directory, 'config-attempts'), 'utf8').trim().split(/\r?\n/).length, 1,
+      'Native config must be resolved once before UI startup');
+    assert.ok(session(crashed.name).ui.target.gatewayUrl.endsWith('/console/'), 'Native config did not resolve the UI path');
+    assert.ok(!crashed.output().includes('synthetic-private-config'), 'Native config output reached the terminal');
     await crash(crashed);
     await stop(crashed.name);
     await checkPreserved(crashed);
