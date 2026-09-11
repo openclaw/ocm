@@ -5147,6 +5147,7 @@ fn dev_stop_restores_service_and_preserves_the_env_and_borrowed_source() {
     let help = run_ocm(&cwd, &env, &["help", "dev", "stop"]);
     assert!(help.status.success(), "{}", stderr(&help));
     assert!(stdout(&help).contains("dev stop <env>"));
+    assert!(stdout(&help).contains("--acknowledge-stopped-processes"));
 }
 
 #[cfg(unix)]
@@ -5511,7 +5512,7 @@ setInterval(() => { if (fs.existsSync(path.join(root, 'source-watch.release'))) 
 #[cfg(unix)]
 #[test]
 fn dev_watch_interactive_setup_requires_completion_evidence() {
-    for success in [true, false] {
+    for mode in ["success", "cancel", "detached"] {
         let root = TestDir::new("dev-watch-interactive-completion");
         let repo = init_openclaw_repo(&root);
         let cwd = root.child("workspace");
@@ -5541,20 +5542,20 @@ fn dev_watch_interactive_setup_requires_completion_evidence() {
         assert!(created.status.success(), "{}", stderr(&created));
         fs::remove_file(root.child("node.log")).unwrap();
         env.insert("OCM_TEST_FOREGROUND_ROOT".into(), path_string(root.path()));
-        env.insert(
-            "OCM_TEST_SETUP_SUCCESS".into(),
-            if success { "1" } else { "0" }.into(),
-        );
+        env.insert("OCM_TEST_SETUP_MODE".into(), mode.into());
         let script = root.child("setup.mjs");
         fs::write(&script, r#"
 import fs from 'node:fs'; import path from 'node:path'; import { isatty } from 'node:tty';
 import { spawn } from 'node:child_process';
 const root = process.env.OCM_TEST_FOREGROUND_ROOT;
 fs.writeFileSync(path.join(root,'setup-tty'), JSON.stringify([0,1,2].map(isatty)));
-if (process.env.OCM_TEST_SETUP_SUCCESS === '1') process.exit(0);
+if (process.env.OCM_TEST_SETUP_MODE === 'success') process.exit(0);
 process.on('SIGTERM', () => process.exit(0));
 const worker = `const fs=require('node:fs'),path=require('node:path'),root=process.env.OCM_TEST_FOREGROUND_ROOT,file=path.join(root,'source-watch-descendant.pid');fs.writeFileSync(file+'.tmp',String(process.pid));fs.renameSync(file+'.tmp',file);setInterval(()=>{if(fs.existsSync(path.join(root,'source-watch.release')))process.exit(0)},25);`;
-spawn(process.execPath,['-e',worker],{detached:true,stdio:'ignore',env:process.env}).unref();
+if (process.env.OCM_TEST_SETUP_MODE === 'detached') {
+  spawn(process.execPath,['-e',worker],{detached:true,stdio:'ignore',env:process.env}).unref();
+}
+fs.writeFileSync(path.join(root,'setup-ready'), 'ready');
 setInterval(() => { if (fs.existsSync(path.join(root,'source-watch.release'))) process.exit(0); },25);
 "#).unwrap();
         let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
@@ -5583,28 +5584,60 @@ setInterval(() => { if (fs.existsSync(path.join(root,'source-watch.release'))) p
             release: root.child("source-watch.release"),
             session: source_watch_override_path(&root, "demo").with_extension("session"),
         };
-        if success {
+        if mode == "success" {
             assert!(watch.wait_without_release().status.success());
             assert_eq!(read_source_watch_session(&root)["closed"], true);
             drop(watch);
         } else {
-            let pid_path = root.child("source-watch-descendant.pid");
-            assert!(wait_for_path(&pid_path, Duration::from_secs(20)));
-            let worker = fs::read_to_string(pid_path)
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap();
+            assert!(wait_for_path(
+                &root.child("setup-ready"),
+                Duration::from_secs(20)
+            ));
+            let worker = if mode == "detached" {
+                let pid_path = root.child("source-watch-descendant.pid");
+                assert!(wait_for_path(&pid_path, Duration::from_secs(20)));
+                Some(
+                    fs::read_to_string(pid_path)
+                        .unwrap()
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let recover = || {
+                run_ocm(
+                    &cwd,
+                    &env,
+                    &[
+                        "dev",
+                        "stop",
+                        "demo",
+                        "--acknowledge-stopped-processes",
+                        "--json",
+                    ],
+                )
+            };
+            assert!(
+                !recover().status.success(),
+                "cannot recover an active controller"
+            );
             let stopped = run_dev_stop(&cwd, &env);
             let output = watch.wait_without_release();
             if stopped.status.success() {
                 drop(watch);
-                assert!(wait_for_process_exit(worker, Duration::from_secs(3)));
+                if let Some(worker) = worker {
+                    assert!(wait_for_process_exit(worker, Duration::from_secs(3)));
+                }
                 panic!(
                     "cancelled inherited-output setup certified cleanup after exit0; fixture cleanup verified"
                 );
             }
-            assert!(!output.status.success() && process_is_alive(worker));
+            assert!(!output.status.success());
+            if let Some(worker) = worker {
+                assert!(process_is_alive(worker));
+            }
             assert!(
                 !root.child("node.log").exists(),
                 "unverified setup must not start the watcher"
@@ -5617,8 +5650,79 @@ setInterval(() => { if (fs.existsSync(path.join(root,'source-watch.release'))) p
                     .unwrap()
                     .contains("output EOF witness")
             );
+            let session_path = watch.session.clone();
+            let retained = fs::read(&session_path).unwrap();
+            assert!(!run_dev_stop(&cwd, &env).status.success());
+            assert_eq!(fs::read(&session_path).unwrap(), retained);
+            // The operator must stop detached workers before acknowledging.
             drop(watch);
-            assert!(wait_for_process_exit(worker, Duration::from_secs(3)));
+            if let Some(worker) = worker {
+                assert!(wait_for_process_exit(worker, Duration::from_secs(3)));
+            }
+            if mode == "cancel" {
+                for invalid in ["binding", "pending", "scope"] {
+                    let mut changed = session.clone();
+                    match invalid {
+                        "binding" => {
+                            changed["envRoot"] = path_string(&root.child("replacement")).into()
+                        }
+                        "pending" => {
+                            changed["child"] = Value::Null;
+                            changed["childSpawnPending"] = true.into();
+                        }
+                        "scope" => changed["processScope"] = "other-process-scope".into(),
+                        _ => unreachable!(),
+                    }
+                    let bytes = serde_json::to_vec(&changed).unwrap();
+                    fs::write(&session_path, &bytes).unwrap();
+                    assert!(!recover().status.success(), "{invalid}");
+                    assert_eq!(fs::read(&session_path).unwrap(), bytes, "{invalid}");
+                }
+                fs::write(&session_path, &retained).unwrap();
+                let lock_path = source_watch_lock_path(&root, "demo");
+                let generation = fs::read(&lock_path).unwrap();
+                fs::write(&lock_path, "another-generation\n").unwrap();
+                assert!(!recover().status.success());
+                assert_eq!(fs::read(&session_path).unwrap(), retained);
+                fs::write(&lock_path, generation).unwrap();
+                let held_lease = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .unwrap();
+                fs2::FileExt::try_lock_exclusive(&held_lease).unwrap();
+                assert!(!recover().status.success());
+                assert_eq!(fs::read(&session_path).unwrap(), retained);
+                drop(held_lease);
+                let request = session_path.with_extension("stop");
+                fs::write(&request, "broken request").unwrap();
+                assert!(!recover().status.success());
+                assert_eq!(fs::read(&session_path).unwrap(), retained);
+                fs::remove_file(request).unwrap();
+            }
+            let meta = get_environment("demo", &env, &cwd).unwrap();
+            let config = Path::new(&meta.root).join(".openclaw/openclaw.json");
+            let config_before = fs::read(&config).unwrap();
+            let recovered = recover();
+            assert!(recovered.status.success(), "{}", stderr(&recovered));
+            assert_eq!(
+                serde_json::from_str::<Value>(&stdout(&recovered)).unwrap(),
+                serde_json::json!({"envName":"demo", "stopped":true, "serviceRestored":false}),
+            );
+            assert_eq!(read_source_watch_session(&root)["closed"], true);
+            assert_eq!(fs::read(config).unwrap(), config_before);
+            let after = get_environment("demo", &env, &cwd).unwrap();
+            assert_eq!(after.service_enabled, meta.service_enabled);
+            assert_eq!(after.service_running, meta.service_running);
+            assert!(run_dev_stop(&cwd, &env).status.success());
+            let retry = run_ocm(&cwd, &env, &["dev", "demo", "--no-watch", "--no-ui"]);
+            assert!(retry.status.success(), "{}", stderr(&retry));
+            let removed = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--yes"]);
+            assert!(removed.status.success(), "{}", stderr(&removed));
+            assert!(
+                repo.is_dir(),
+                "recovery/removal must preserve borrowed source"
+            );
         }
         terminal_drain.finish();
         assert_eq!(

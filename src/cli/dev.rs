@@ -222,15 +222,26 @@ impl Cli {
     }
 
     fn handle_dev_stop(&self, args: Vec<String>) -> Result<i32, String> {
+        let (args, acknowledge_stopped) =
+            Self::consume_flag(args, "--acknowledge-stopped-processes");
         let (args, json, _profile) = self.consume_human_output_flags(args, "dev stop")?;
         let name = args
             .first()
             .ok_or_else(|| "dev stop requires an environment name".to_string())?;
         let name = validate_name(name, "Environment name")?;
         Self::assert_no_extra_args(&args[1..])?;
-        let summary = self.stop_source_watch(&name)?;
+        let summary = if acknowledge_stopped {
+            self.recover_source_watch(&name)?
+        } else {
+            self.stop_source_watch(&name)?
+        };
         if json {
             self.print_json(&summary)?;
+        } else if acknowledge_stopped && summary.stopped {
+            self.stdout_line(format!(
+                "Recovered unfinished source-watch ownership for {}. Service policy was preserved.",
+                summary.env_name
+            ));
         } else if summary.stopped {
             self.stdout_line(format!("Stopped source watch for {}.", summary.env_name));
             if summary.service_restored {
@@ -246,6 +257,70 @@ impl Cli {
             ));
         }
         Ok(0)
+    }
+
+    fn recover_source_watch(&self, env_name: &str) -> Result<DevStopSummary, String> {
+        let env_service = self.environment_service();
+        let _operation = env_service.lock_operation(env_name)?;
+        let admission = env_service.lock_gateway_admission(env_name)?;
+        let meta = env_service.get(env_name)?;
+        let session = env_service.source_watch_session(env_name)?.ok_or_else(|| {
+            "no failed source-watch session to recover; use dev stop without acknowledgement"
+                .to_string()
+        })?;
+        if !session.restore_target_matches(&meta) {
+            return Err("the environment changed since the failed source watch; its ownership and service policy were preserved".to_string());
+        }
+        if session.process_scope != process_scope_id()? {
+            return Err(
+                "source watch belongs to another boot or process namespace; recovery was refused"
+                    .to_string(),
+            );
+        }
+        if session.unsafe_cleanup_error().is_none() {
+            return Err("source watch has no retained cleanup failure; use dev stop without acknowledgement".to_string());
+        }
+        if session.child_pending() {
+            return Err(
+                "source watch has unpublished child ownership; recovery cannot check its processes"
+                    .to_string(),
+            );
+        }
+        if session.controller_is_running()? {
+            return Err(
+                "source watch controller is still running; recovery was refused".to_string(),
+            );
+        }
+        for (_, child) in session.recorded_children() {
+            if observe_process(child.pid)?
+                .is_some_and(|process| process.running && process.identity == child)
+            {
+                return Err(format!(
+                    "recorded source watch process {} is still running; stop it before acknowledging recovery",
+                    child.pid
+                ));
+            }
+            #[cfg(unix)]
+            if !process_group_members(child.pid)?.is_empty() {
+                return Err(format!(
+                    "recorded source watch process group {} is still active; stop it before acknowledging recovery",
+                    child.pid
+                ));
+            }
+        }
+        // The acknowledgement supplies the evidence for detached workers that
+        // cannot be recovered from a dead controller's process group. Reclaim
+        // still requires the exact generation's exclusive lease; never signal
+        // unknown processes or turn this into automatic stop/crash recovery.
+        let mut lease = env_service.lock_source_watch_recovery_locked(session)?;
+        env_service.clear_source_watch_override_for_lease(env_name, lease.lease_id())?;
+        drop(admission);
+        lease.acknowledge_stopped_processes()?;
+        Ok(DevStopSummary {
+            env_name: env_name.to_string(),
+            stopped: true,
+            service_restored: false,
+        })
     }
 
     pub(super) fn stop_source_watch(&self, env_name: &str) -> Result<DevStopSummary, String> {

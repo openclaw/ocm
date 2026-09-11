@@ -284,11 +284,17 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
         "stop" => Some(render_leaf(
             "Stop foreground dev session",
             "Ask the recorded dev controller to stop its setup, Gateway and optional UI processes, including --service preparation. Preserve the env, source checkout, dependencies, and configuration; report unverified completion without discarding ownership.",
-            vec![format!("{cmd} dev stop <env> [--raw] [--json]")],
+            vec![format!(
+                "{cmd} dev stop <env> [--acknowledge-stopped-processes] [--raw] [--json]"
+            )],
             &[
                 (
                     "<env>",
                     "Environment whose foreground dev session should stop",
+                ),
+                (
+                    "--acknowledge-stopped-processes",
+                    "Recover failed ownership after independently verifying that all source processes, including detached workers, have stopped",
                 ),
                 ("--raw", "Print plain output"),
                 (
@@ -306,6 +312,7 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
                 "For UI sessions, persistent components stop first; a dashboard helper can use only the remaining original 30-second request budget. Unverified cleanup keeps ownership.",
                 "For new Unix foreground generations, a lost controller, raw termination signal, or incomplete output retains unfinished ownership even if the recorded process group stops. Stop/reuse/service-start/destroy cannot erase that uncertainty. Released legacy records keep their recovery rules.",
                 "Ordinary acknowledged errors remain retryable after output completes. Onboarding keeps real terminal output; cancellation or failure without observed output retains ownership, while successful onboarding remains supported.",
+                "After verifying all source workers have stopped, --acknowledge-stopped-processes releases a retained cleanup failure. It refuses active controllers, recorded children or process groups, held leases, pending child ownership, and changed environment/process scope. It does not signal processes or restart services; current service policy is preserved. Start a background service separately when wanted.",
                 "During Unix foreground preparation, pnpm lifecycle reports distinguish completed install errors from interrupted or unfinished build scripts; uncertain script cleanup retains ownership even if pnpm returns an ordinary error or succeeds after an optional build. Installer stdin stays interactive when run from a terminal; human output is streamed.",
                 "On Windows, recovery cannot verify a controller crash before child ownership is published; that unfinished session is retained for operator recovery.",
                 "After updating OCM, refresh an older running daemon from that installation with service refresh-daemon --acknowledge-gateway-restarts so it understands the current foreground ownership and completion records.",

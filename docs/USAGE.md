@@ -726,6 +726,18 @@ env. Normal acknowledged errors remain retryable; released legacy watch records
 and Windows process-job recovery retain their existing rules. Use a compatible
 OCM CLI and refresh an older running daemon before creating a new generation.
 
+If a stopped controller retained a cleanup failure, first independently verify
+that every source process, including detached workers, has stopped. Then run
+`ocm dev stop <env> --acknowledge-stopped-processes` to release that failed
+session. An empty recorded process group alone does not establish that detached
+workers stopped. OCM refuses recovery while its controller, recorded children,
+process groups, or lease are active, or when child ownership is unpublished or
+the environment/process scope changed. Recovery preserves the checkout, config,
+and current service policy; it does not signal processes or restart a service.
+`--json` retains the stop summary with `serviceRestored: false`. After recovery,
+normal dev retry and environment removal are available. Start the background
+service separately if wanted.
+
 `dev <env>` owns setup, the native Gateway watcher and Vite UI by default.
 `--no-watch` uses `scripts/run-node.mjs` instead of `scripts/watch-node.mjs` for
 the Gateway; `--no-ui` disables Vite. `dev stop <env>` stops the recorded session

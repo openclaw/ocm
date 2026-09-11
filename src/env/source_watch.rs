@@ -332,6 +332,24 @@ impl SourceWatchLease {
         Ok(())
     }
 
+    pub(crate) fn acknowledge_stopped_processes(&mut self) -> Result<(), String> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or("source watch session is missing")?;
+        session.child = None;
+        session.child_spawn_pending = false;
+        if let Some(ui) = &mut session.ui {
+            ui.children = Default::default();
+            ui.pending = None;
+        }
+        session.restore_service = false;
+        // Publish closure only after request/endpoint cleanup succeeds. Until
+        // then the persisted failure and child identities remain available for
+        // another recovery attempt. The operator owns detached-process proof.
+        self.finish_session(false, None, false)
+    }
+
     pub(crate) fn begin_service_restore(&mut self) -> Result<(), String> {
         let _admission = lock_file(&self.session_paths.admission, "gateway admission")?;
         write_source_watch_lock(&mut self.lock_file, &format!("restoring:{}", self.lease_id))
@@ -442,7 +460,32 @@ impl<'a> EnvironmentService<'a> {
     // verified that the recorded controller and its owned process group stopped.
     pub(crate) fn reclaim_source_watch_lease_locked(
         &self,
-        mut session: SourceWatchSession,
+        session: SourceWatchSession,
+    ) -> Result<SourceWatchLease, String> {
+        let mut lease = self.lock_source_watch_recovery_locked(session)?;
+        let session = lease
+            .session
+            .as_mut()
+            .ok_or("source watch session is missing")?;
+        session.controller = current_process_identity()?;
+        session.process_scope = process_scope_id()?;
+        session.child = None;
+        session.child_spawn_pending = false;
+        if let Some(ui) = &mut session.ui {
+            ui.children = Default::default();
+            ui.pending = None;
+        }
+        session.closed = false;
+        session.completion = None;
+        lease.session_paths.save_session(session)?;
+        Ok(lease)
+    }
+
+    // Caller holds operation/admission. Acquiring this exact-generation lease
+    // does not change the persisted session or claim that cleanup succeeded.
+    pub(crate) fn lock_source_watch_recovery_locked(
+        &self,
+        session: SourceWatchSession,
     ) -> Result<SourceWatchLease, String> {
         let override_path = source_watch_override_path(&session.env_name, self.env, self.cwd)?;
         let lock_path = override_path.with_extension("lock");
@@ -469,17 +512,6 @@ impl<'a> EnvironmentService<'a> {
             return Err("source watch generation changed; refusing stale recovery".to_string());
         }
         let session_paths = SourceWatchSessionPaths::from_override(&override_path);
-        session.controller = current_process_identity()?;
-        session.process_scope = process_scope_id()?;
-        session.child = None;
-        session.child_spawn_pending = false;
-        if let Some(ui) = &mut session.ui {
-            ui.children = Default::default();
-            ui.pending = None;
-        }
-        session.closed = false;
-        session.completion = None;
-        session_paths.save_session(&session)?;
         Ok(SourceWatchLease {
             env_name: session.env_name.clone(),
             lease_id: session.lease_id.clone(),
