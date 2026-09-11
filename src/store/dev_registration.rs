@@ -27,7 +27,7 @@ struct SourceIdentity {
     preparation_paths: BTreeSet<PathBuf>,
 }
 
-fn registration_path(path: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), String> {
+pub(super) fn registration_path(path: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), String> {
     let mut pending = path.to_path_buf();
     let mut entries = BTreeSet::new();
     loop {
@@ -85,14 +85,14 @@ fn registration_path(path: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), String
 }
 
 fn source_identity(dev: &EnvDevMeta) -> Result<SourceIdentity, String> {
-    let repo = inspect_source_footprint(Path::new(&dev.repo_root))?;
+    let repo = inspect_source_footprint(Path::new(dev.repo_root()))?;
     let mut footprint = inspect_dev_source_footprint(dev)?;
     let mut preparation_paths = repo.entries.clone();
     preparation_paths.extend(repo.content_roots.iter().cloned());
     let mut locations = Vec::new();
     // Before worktree creation, retain the existing path through .worktrees,
     // including symlinks into another environment. This reserves no new paths.
-    for root in [&dev.repo_root, &dev.worktree_root] {
+    for root in [dev.repo_root(), dev.source_root()] {
         let (resolved, entries) = registration_path(Path::new(root))?;
         locations.push(resolved);
         preparation_paths.extend(entries.iter().cloned());
@@ -127,9 +127,12 @@ fn containing_environments(
             continue;
         }
         // Displaced roots still belong to the operation that will restore them.
-        for root in std::iter::once(meta.root.as_str())
-            .chain(meta.dev.as_ref().map(|dev| dev.worktree_root.as_str()))
-        {
+        for root in std::iter::once(meta.root.as_str()).chain(
+            meta.dev
+                .as_ref()
+                .and_then(|dev| dev.owned_worktree())
+                .map(|(_, root)| root),
+        ) {
             let (root, _) = registration_path(Path::new(root))?;
             if !root.exists()
                 && identity
@@ -145,18 +148,13 @@ fn containing_environments(
     Ok(owners)
 }
 
-fn source_tuple(dev: Option<&EnvDevMeta>) -> Option<(&str, &str)> {
-    dev.map(|dev| (dev.repo_root.as_str(), dev.worktree_root.as_str()))
-}
-
 fn source_changed(name: &str, dev: Option<&EnvDevMeta>, envs: &[EnvMeta]) -> bool {
     dev.is_some()
-        && source_tuple(dev)
-            != source_tuple(
-                envs.iter()
-                    .find(|meta| meta.name == name)
-                    .and_then(|meta| meta.dev.as_ref()),
-            )
+        && dev
+            != envs
+                .iter()
+                .find(|meta| meta.name == name)
+                .and_then(|meta| meta.dev.as_ref())
 }
 
 #[derive(Default)]
@@ -165,6 +163,7 @@ pub(crate) struct DevSourceRegistration {
     owners: BTreeSet<String>,
     _locks: Vec<EnvironmentOperationLock>,
     held_files: BTreeSet<(u64, u64)>,
+    _daemon_lifecycle: Option<super::ExclusiveFileLock>,
 }
 
 impl DevSourceRegistration {
@@ -191,12 +190,21 @@ impl DevSourceRegistration {
         env: &BTreeMap<String, String>,
         cwd: &Path,
     ) -> Result<Self, String> {
+        if dev.borrowed_source_root().is_some() {
+            dev.execution_source_root()?;
+        }
         let identity = source_identity(dev)?;
         let mut registration = Self {
             source: Some((dev.clone(), identity)),
             ..Self::default()
         };
         registration.lock_owners(envs, env, cwd)?;
+        if dev.borrowed_source_root().is_some() {
+            // The containing owner's operation may have completed since inspection.
+            dev.execution_source_root()?;
+            registration._daemon_lifecycle = crate::supervisor::SupervisorService::new(env, cwd)
+                .lock_borrowed_source_publication()?;
+        }
         Ok(registration)
     }
 
@@ -240,12 +248,13 @@ impl DevSourceRegistration {
     }
 
     fn recheck_source(&self, dev: &EnvDevMeta, envs: &[EnvMeta]) -> Result<(), String> {
+        if dev.borrowed_source_root().is_some() {
+            dev.execution_source_root()?;
+        }
         let Some((expected, identity)) = &self.source else {
             return Err(Self::changed());
         };
-        if source_tuple(Some(expected)) != source_tuple(Some(dev))
-            || source_identity(dev)? != *identity
-        {
+        if expected != dev || source_identity(dev)? != *identity {
             return Err(Self::changed());
         }
         if !containing_environments(identity, envs)?.is_subset(&self.owners) {
@@ -259,7 +268,7 @@ impl DevSourceRegistration {
             return Err(Self::changed());
         };
         let after = source_identity(dev)?;
-        if source_tuple(Some(expected)) != source_tuple(Some(dev))
+        if expected != dev
             || (!created && *before != after)
             || before.repo != after.repo
             || before.preparation_paths.iter().any(|path| {
@@ -286,7 +295,7 @@ pub(crate) fn with_prepared_dev_source<T>(
     publish: impl FnOnce(EnvDevMeta, &DevSourceRegistration) -> Result<T, String>,
 ) -> Result<T, String> {
     let name = validate_name(name, "Environment name")?;
-    let dev = EnvDevMeta {
+    let dev = EnvDevMeta::Owned {
         repo_root: display_path(repo),
         worktree_root: display_path(&default_worktree_root(repo, &name)),
     };

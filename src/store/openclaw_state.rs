@@ -919,6 +919,7 @@ mod tests {
             default_runtime: None,
             default_launcher: None,
             dev: None,
+            dev_ui_port: None,
             protected: false,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,

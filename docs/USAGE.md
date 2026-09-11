@@ -96,24 +96,53 @@ ocm start luna --command 'pnpm openclaw' --cwd /path/to/openclaw --no-service
 
 Use this when you are developing OpenClaw locally or want a custom run command.
 
-For an isolated development worktree, use `ocm dev luna --repo /path/to/openclaw`.
+Use `ocm dev luna --repo /path/to/openclaw` to run that exact checkout with separate
+environment state. New dev environments borrow main or registered linked
+checkouts without creating a Git worktree. Outside a checkout, pass `--repo`;
+otherwise OCM can use the checkout enclosing the current directory. A resumed
+borrower keeps its canonical source path and refuses a different explicit or
+enclosing checkout. Existing OCM-owned environments retain their recorded
+worktrees and original repository selection.
+
+New borrowers may prepare missing tooling with `pnpm install --frozen-lockfile`.
+Resumed borrowers report missing tooling for explicit preparation; they do not
+reinstall dependencies. Removing a borrower preserves source files, dependencies,
+generated output, and unrelated source processes. Older OCM readers refuse the
+new binding records. Refresh an incompatible running daemon with
+`ocm service refresh-daemon --acknowledge-gateway-restarts` before registration.
 If an environment containing or owning the source or its required Git metadata is
 busy, retry dev creation or local upgrade simulation after its operation finishes.
+
+Foreground dev starts the native Gateway watcher and live UI by default.
+`--no-ui` runs the Gateway watcher alone; `--no-watch` keeps the live UI with a
+Gateway that does not rebuild automatically. Combine both for a plain foreground
+Gateway. `--watch` and `--ui` remain explicit aliases for the defaults; each
+conflicts with its negative counterpart.
+
 New dev environments publish a private config with a persistent Gateway token
 before registration, so paired clients can reconnect after a restart or source
 rebuild. Initialization preserves existing config files, including authored auth
 and SecretRefs. Repeating minimum setup preserves unchanged config bytes.
 
-For live Control UI edits, run `ocm dev luna --watch --ui` (or `--ui` with a plain
-foreground Gateway). OCM owns the native Vite process and prints its initial
+OCM owns the native Vite process and prints its initial
 native browser handoff once both documents are ready. The UI uses a captured
-loopback address for that session. `ocm dev status luna` and matching repeated
-starts report the address; repeated starts do not issue another browser grant.
+loopback address retained across stop/start for that environment. A busy retained
+port is an error; OCM does not silently choose another address. Clone and import
+select new addresses, while snapshot restore keeps the current environment's
+reservation. Removing the environment releases it. `ocm dev status luna` reports
+the address. On Linux, macOS, and Windows, a matching repeated start requests a
+fresh native browser grant from the existing controller without restarting
+Gateway or Vite. Busy or unready requests report a pending link.
+Older OCM controllers retain address-only reuse and report fresh links as
+unavailable until that dev session is restarted.
 `ocm dev stop luna` stops the components together. A pending initial request gets
-30 seconds and retains its helper until completion; late grant bytes are discarded.
+30 seconds and retains its helper until completion. Repeated requests have the
+same deadline; late or disconnected callers' grant bytes are discarded.
 An unfinished or interrupted cleanup keeps its recorded ownership.
-UI requires HTTP, enabled Control UI and installed source UI dependencies, and
-cannot run with `--service`. Existing authentication settings remain in effect.
+UI requires HTTP, enabled Control UI and installed source UI dependencies; use
+`--no-ui` for TLS or disabled-UI environments. `--service` uses the background
+workflow without foreground watching or UI and rejects explicit `--watch` or
+`--ui`. Existing authentication settings remain in effect.
 
 If you run `ocm setup` from inside an OpenClaw checkout, local mode can detect that and fill in sensible defaults.
 
@@ -484,9 +513,10 @@ ocm self update --check
 ## Environment lifecycle
 
 Environment creation, including `start` and migration, and `env clone` and
-`env import` require a root outside every registered dev worktree that exists
-on disk. The root must neither contain an existing registered source nor be
-inside it. OCM resolves source and destination aliases and also protects source
+`env import` require a root outside registered dev sources. Missing borrowed
+source paths remain reserved until their binding is removed; missing paths of
+OCM-owned worktrees can still be reused. The root must neither contain
+a registered source nor be inside it. OCM resolves source and destination aliases and also protects source
 symlinks that failed clone or import cleanup would remove. Choose a separate
 environment root.
 
@@ -500,7 +530,7 @@ before writing the destination. Check the recorded source with `ocm env show
 ocm env clone mira rowan
 ```
 
-Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. The usual next step is:
+Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Clone does not copy dev source bindings. The usual next step is:
 
 ```bash
 ocm start rowan
@@ -550,7 +580,8 @@ not add crash recovery for an uncatchable process or machine failure.
 This policy belongs to the environment registration. Clone and import start with
 an empty list. A separately requested full snapshot, export, or clone still
 includes independent content. Full snapshot restore still rewinds unregistered
-independent content and the selected environment's own source.
+independent content and the selected environment's OCM-owned worktree when those
+paths were captured inside the environment root.
 
 Restores and required rollbacks refuse checkpoints whose recorded scope would
 replace another named environment's registered dev source or required Git
@@ -561,6 +592,11 @@ and Git identity metadata, including surviving history for a missing worktree.
 Checkpoint traversal still leaves independent content opaque; post-copy updates
 and residue cleanup leave directory links untouched. Excluding only a worktree
 is insufficient when its required Git metadata remains in scope.
+Borrowed source and its known Git metadata also remain protected from a restore
+of the borrowing environment itself. Missing borrowed paths stay reserved until
+the binding is removed; an unrelated excluded sibling does not preserve that
+reservation. Select a checkpoint whose saved exclusions cover the source and
+all affected Git metadata.
 
 ### Snapshots
 
@@ -690,13 +726,15 @@ env. Normal acknowledged errors remain retryable; released legacy watch records
 and Windows process-job recovery retain their existing rules. Use a compatible
 OCM CLI and refresh an older running daemon before creating a new generation.
 
-Both plain `dev <env>` and `dev <env> --watch` own setup and the native Gateway.
-Plain mode runs `scripts/run-node.mjs`; watch mode runs `scripts/watch-node.mjs`.
-`dev stop <env>` stops either recorded session without removing its environment
-or source. Repeating the same mode and launch endpoint reuses the session;
-changing mode requires stopping it first. `dev status --json` reports active
-ownership separately from `sourceWatch.watching`. Plain runs still refuse a
-running background service; temporary takeover remains `--watch --force`.
+`dev <env>` owns setup, the native Gateway watcher and Vite UI by default.
+`--no-watch` uses `scripts/run-node.mjs` instead of `scripts/watch-node.mjs` for
+the Gateway; `--no-ui` disables Vite. `dev stop <env>` stops the recorded session
+without removing its environment or source. Repeating the same source, launch
+endpoint and effective backend watching/UI choices reuses the session; changing
+those choices requires stopping it first. `dev status --json` reports active
+ownership separately from `sourceWatch.watching`. `--force` temporarily takes
+over a running background service while backend watching is enabled and restores
+it on exit; it rejects `--no-watch` or `--service`.
 
 Named `dev status` and JSON/raw output also report Gateway `/health` responses
 and the captured UI process and HTML document separately. JSON includes
@@ -718,6 +756,13 @@ Unix, uncertain script cleanup retains ownership even when pnpm returns a normal
 error or allows an optional build to fail. Completed errors remain retryable.
 When run from a terminal, installation keeps interactive stdin while streaming
 build output and diagnostics. Onboarding keeps its real terminal output.
+
+For direct dev-source commands, OCM disables Node's module compile cache before
+launch by setting `NODE_DISABLE_COMPILE_CACHE=1` and removing `NODE_COMPILE_CACHE`.
+This avoids the launcher's compile-cache bootstrap wrapper without changing
+`NODE_OPTIONS`, native runner selection, rebuilds or auto-doctor. The policy is
+scoped to source execution; ordinary runtime and launcher environments retain
+their existing Node settings.
 
 `env remove` and `env prune` require active or unfinished source watches to be
 stopped first with `ocm dev stop <env>`. The same applies to a destroy guarded by

@@ -2088,7 +2088,7 @@ impl Cli {
             .dev
             .as_ref()
             .ok_or_else(|| format!("environment \"{}\" is missing its dev binding", meta.name))?;
-        let worktree_root = Path::new(&dev.worktree_root);
+        let worktree_root = dev.execution_source_root()?;
         let pnpm_store = worktree_root.join("node_modules").join(".pnpm");
         let tsx_bin = worktree_root.join("node_modules").join(".bin").join("tsx");
         if pnpm_store.exists() && tsx_bin.exists() {
@@ -2163,10 +2163,14 @@ impl Cli {
                         ),
                     );
                 };
+                let source_root = match dev.execution_source_root() {
+                    Ok(root) => root,
+                    Err(error) => return UpgradeSimulationCheck::failed(name, error),
+                };
                 let mut command = Command::new("pnpm");
                 command
                     .arg(script)
-                    .current_dir(&dev.worktree_root)
+                    .current_dir(source_root)
                     .env_clear()
                     .envs(build_openclaw_env(&env_meta, &self.env))
                     .stdin(Stdio::null())

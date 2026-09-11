@@ -74,6 +74,112 @@ fn artifact_export_preserves_raw_bytes_at_the_exact_limit() {
 
 #[cfg(unix)]
 #[test]
+fn artifact_export_reads_the_home_for_owned_and_borrowed_sources() {
+    use ocm::env::{EnvDevMeta, EnvironmentService};
+    use ocm::store::{env_registry_path, save_environment};
+    use std::path::Path;
+    use std::process::Command;
+    use support::{path_string, write_text};
+
+    for (label, borrowed, linked) in [
+        ("owned", false, true),
+        ("borrowed-main", true, false),
+        ("borrowed-linked", true, true),
+    ] {
+        let fixture = Fixture::new();
+        let repo = fixture.temp.child("repo");
+        write_text(&repo.join("package.json"), r#"{"name":"openclaw"}"#);
+        write_text(&repo.join("scripts/run-node.mjs"), "// retained source\n");
+        write_text(&repo.join("reports/result"), "source bytes\n");
+        write_text(&repo.join("source-only"), "not an environment artifact\n");
+        let git = |path: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(path)
+                .args(args)
+                .env_clear()
+                .envs(&fixture.env)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{label}: {}", stderr(&output));
+            output.stdout
+        };
+        git(&repo, &["init"]);
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=OCM Tests",
+                "-c",
+                "user.email=tests@example.com",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        );
+        let source = if linked {
+            git(&repo, &["worktree", "add", "--detach", "../linked"]);
+            fixture.temp.child("linked")
+        } else {
+            repo.clone()
+        };
+        let source = fs::canonicalize(source).unwrap();
+        let service = EnvironmentService::new(&fixture.env, fixture.temp.path());
+        let mut meta = service.get("demo").unwrap();
+        meta.dev = Some(if borrowed {
+            EnvDevMeta::Borrowed {
+                source_root: path_string(&source),
+            }
+        } else {
+            EnvDevMeta::Owned {
+                repo_root: path_string(&fs::canonicalize(&repo).unwrap()),
+                worktree_root: path_string(&source),
+            }
+        });
+        save_environment(meta, &fixture.env, fixture.temp.path()).unwrap();
+        let registry = env_registry_path(&fixture.env, fixture.temp.path()).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let source_status = git(&source, &["status", "--porcelain"]);
+        fixture.write("reports/result", b"home bytes\n");
+
+        let output = fixture.export("reports/result", "1024");
+        assert!(output.status.success(), "{label}: {}", stderr(&output));
+        assert_eq!(output.stdout, b"home bytes\n", "{label}");
+        assert!(output.stderr.is_empty(), "{label}: {}", stderr(&output));
+        let missing = fixture.export("source-only", "1024");
+        assert_eq!(missing.status.code(), Some(1), "{label}");
+        assert!(missing.stdout.is_empty(), "{label}");
+        assert!(stderr(&missing).contains("open artifact"), "{label}");
+        assert_eq!(git(&source, &["status", "--porcelain"]), source_status);
+
+        let retained_source = if borrowed {
+            let moved = fixture.temp.child("moved-source");
+            fs::rename(&source, &moved).unwrap();
+            let output = fixture.export("reports/result", "1024");
+            assert!(output.status.success(), "{label}: {}", stderr(&output));
+            assert_eq!(output.stdout, b"home bytes\n", "{label}");
+            assert!(output.stderr.is_empty(), "{label}: {}", stderr(&output));
+            assert!(!source.exists(), "{label}");
+            moved
+        } else {
+            source
+        };
+        assert_eq!(
+            fs::read(retained_source.join("reports/result")).unwrap(),
+            b"source bytes\n",
+            "{label}"
+        );
+        assert_eq!(
+            fs::read(retained_source.join("source-only")).unwrap(),
+            b"not an environment artifact\n",
+            "{label}"
+        );
+        assert_eq!(fs::read(&registry).unwrap(), registry_before, "{label}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn artifact_export_rejects_oversize_and_invalid_paths_without_output() {
     let fixture = Fixture::new();
     let file = fixture.write("report.json", b"1234");

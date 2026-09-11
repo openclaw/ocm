@@ -70,11 +70,12 @@ fn empty_env_registry() -> EnvRegistry {
 
 fn load_env_registry(env: &BTreeMap<String, String>, cwd: &Path) -> Result<EnvRegistry, String> {
     let path = env_registry_path(env, cwd)?;
-    if !path_exists(&path) {
-        return Ok(empty_env_registry());
-    }
-
-    let mut registry: EnvRegistry = read_json(&path)?;
+    let mut registry: EnvRegistry = if path_exists(&path) {
+        read_json(&path)?
+    } else {
+        empty_env_registry()
+    };
+    super::dev_ui_ports::hydrate(&mut registry.envs, env, cwd)?;
     registry.kind = "ocm-env-registry".to_string();
     registry
         .envs
@@ -199,6 +200,21 @@ fn canonicalize_launcher_binding(
 
 fn upsert_environment(registry: &mut EnvRegistry, meta: EnvMeta) -> Result<EnvMeta, String> {
     let meta = normalize_environment(meta)?;
+    if registry
+        .envs
+        .iter()
+        .find(|current| current.name == meta.name)
+        .is_none_or(|current| current.root != meta.root || current.dev != meta.dev)
+    {
+        // Creation may have initialized a new root at an absent Owned path.
+        // Its pre-creation guard already checked Owned sources.
+        super::dev_sources::ensure_borrowed_source_isolation(
+            &meta.name,
+            Path::new(&meta.root),
+            meta.dev.as_ref().and_then(|dev| dev.borrowed_source_root()),
+            &registry.envs,
+        )?;
+    }
     registry.envs.retain(|entry| entry.name != meta.name);
     registry.envs.push(meta.clone());
     Ok(meta)
@@ -402,7 +418,7 @@ pub fn create_environment(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
-    create_environment_with_runtime_validation(options, false, None, env, cwd)
+    create_environment_with_runtime_validation(options, false, env, cwd)
 }
 
 pub(crate) fn create_environment_with_validated_runtime(
@@ -410,34 +426,17 @@ pub(crate) fn create_environment_with_validated_runtime(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
-    create_environment_with_runtime_validation(options, true, None, env, cwd)
-}
-
-pub(crate) fn create_environment_with_dev_registration(
-    options: CreateEnvironmentOptions,
-    registration: &DevSourceRegistration,
-    env: &BTreeMap<String, String>,
-    cwd: &Path,
-) -> Result<EnvMeta, String> {
-    create_environment_with_runtime_validation(options, true, Some(registration), env, cwd)
+    create_environment_with_runtime_validation(options, true, env, cwd)
 }
 
 fn create_environment_with_runtime_validation(
     options: CreateEnvironmentOptions,
     validate_runtime: bool,
-    registration: Option<&DevSourceRegistration>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
     let name = validate_name(&options.name, "Environment name")?;
-    let acquired;
-    let registration = match registration {
-        Some(registration) => registration,
-        None => {
-            acquired = DevSourceRegistration::acquire(&name, options.dev.as_ref(), env, cwd)?;
-            &acquired
-        }
-    };
+    let registration = DevSourceRegistration::acquire(&name, options.dev.as_ref(), env, cwd)?;
     let service = crate::env::EnvironmentService::new(env, cwd);
     let _admission_lock = service.lock_gateway_admission(&name)?;
     if options.service_enabled && options.service_running {
@@ -473,6 +472,18 @@ fn create_environment_with_runtime_validation(
     };
 
     ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
+    if let Some(source) = options
+        .dev
+        .as_ref()
+        .and_then(|dev| dev.borrowed_source_root())
+    {
+        super::dev_sources::ensure_root_outside_borrowed_source(
+            &name,
+            &root,
+            &name,
+            Path::new(source),
+        )?;
+    }
     let paths = derive_env_paths(&root);
     if path_exists(&paths.root) {
         let mut entries = fs::read_dir(&paths.root).map_err(|error| error.to_string())?;
@@ -509,6 +520,7 @@ fn create_environment_with_runtime_validation(
         default_runtime,
         default_launcher,
         dev: options.dev,
+        dev_ui_port: None,
         protected: options.protected,
         created_at,
         updated_at: created_at,
@@ -721,6 +733,7 @@ fn clone_environment_with_policy(
             default_runtime: source.default_runtime,
             default_launcher: source.default_launcher,
             dev: None,
+            dev_ui_port: None,
             protected: source.protected,
             created_at,
             updated_at: created_at,
@@ -1043,6 +1056,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 default_runtime: extracted.metadata.env.default_runtime.clone(),
                 default_launcher: extracted.metadata.env.default_launcher.clone(),
                 dev: None,
+                dev_ui_port: None,
                 protected: extracted.metadata.env.protected,
                 created_at,
                 updated_at: created_at,
@@ -1117,8 +1131,9 @@ pub(crate) fn remove_environment_locked(
     // It must not call back into registry-mutating operations.
     before_remove(&meta)?;
 
-    if let Some(dev) = meta.dev.as_ref() {
-        remove_openclaw_worktree(Path::new(&dev.repo_root), Path::new(&dev.worktree_root))?;
+    if let Some((repo_root, worktree_root)) = meta.dev.as_ref().and_then(|dev| dev.owned_worktree())
+    {
+        remove_openclaw_worktree(Path::new(repo_root), Path::new(worktree_root))?;
     }
 
     if path_exists(&paths.root) {
@@ -1131,6 +1146,7 @@ pub(crate) fn remove_environment_locked(
     // later environment that reuses the same name.
     bump_service_policy_revision(&mut registry, &meta.name);
     write_env_registry(&mut registry, env, cwd)?;
+    super::dev_ui_ports::remove(&meta, env, cwd)?;
 
     Ok(meta)
 }
@@ -1185,7 +1201,7 @@ mod tests {
         for (name, dev) in [
             (
                 "dev",
-                Some(EnvDevMeta {
+                Some(EnvDevMeta::Owned {
                     repo_root: root.path().join("repo").display().to_string(),
                     worktree_root: root.path().join("worktree").display().to_string(),
                 }),

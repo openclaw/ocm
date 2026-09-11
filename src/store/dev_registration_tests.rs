@@ -58,7 +58,7 @@ fn owned_source(repo: &Path) -> EnvDevMeta {
     }
     let worktree = ensure_openclaw_worktree(repo, "child").unwrap();
     assert!(worktree.created);
-    EnvDevMeta {
+    EnvDevMeta::Owned {
         repo_root: display_path(repo),
         worktree_root: display_path(&worktree.root),
     }
@@ -83,11 +83,33 @@ fn fixture() -> (tempfile::TempDir, BTreeMap<String, String>, EnvDevMeta) {
 
 #[test]
 fn every_publisher_refuses_a_new_or_changed_source_during_its_owners_operation() {
-    let (temp, env, dev) = fixture();
+    assert_publishers_preserve_busy_source(false);
+    assert_publishers_preserve_busy_source(true);
+}
+
+fn assert_publishers_preserve_busy_source(borrowed: bool) {
+    let (temp, env, owned) = fixture();
+    let dev = if borrowed {
+        EnvDevMeta::Borrowed {
+            source_root: display_path(&fs::canonicalize(owned.source_root()).unwrap()),
+        }
+    } else {
+        owned.clone()
+    };
     let cwd = temp.path();
     let mut changed = create_environment(options("child", Some(dev.clone())), &env, cwd).unwrap();
-    let replacement = ensure_openclaw_worktree(Path::new(&dev.repo_root), "replacement").unwrap();
-    changed.dev.as_mut().unwrap().worktree_root = display_path(&replacement.root);
+    let replacement =
+        ensure_openclaw_worktree(Path::new(owned.repo_root()), "replacement").unwrap();
+    changed.dev = Some(if borrowed {
+        EnvDevMeta::Borrowed {
+            source_root: display_path(&fs::canonicalize(&replacement.root).unwrap()),
+        }
+    } else {
+        EnvDevMeta::Owned {
+            repo_root: owned.repo_root().to_string(),
+            worktree_root: display_path(&replacement.root),
+        }
+    });
     let _owner = lock_environment_operation("parent", &env, cwd).unwrap();
     for save in SAVES {
         let error = save(changed.clone(), &env, cwd).unwrap_err();
@@ -107,7 +129,7 @@ fn every_publisher_refuses_a_new_or_changed_source_during_its_owners_operation()
         );
     }
     let current = get_environment("child", &env, cwd).unwrap();
-    assert_eq!(source_tuple(current.dev.as_ref()), source_tuple(Some(&dev)));
+    assert_eq!(current.dev.as_ref(), Some(&dev));
     assert!(get_environment("new-child", &env, cwd).is_err());
 }
 
@@ -127,7 +149,7 @@ fn unchanged_source_saves_allow_locked_recovery_with_displaced_source() {
         save(child.clone(), &env, cwd).unwrap();
         let current = get_environment("child", &env, cwd).unwrap();
         assert_eq!(current.protected, child.protected);
-        assert_eq!(source_tuple(current.dev.as_ref()), source_tuple(Some(&dev)));
+        assert_eq!(current.dev.as_ref(), Some(&dev));
     }
     drop(_target);
     for save in SAVES {
@@ -168,7 +190,7 @@ fn publication_rechecks_late_owners_and_replaced_source_without_taking_locks() {
     let registration =
         DevSourceRegistration::acquire("child", child.dev.as_ref(), &env, cwd).unwrap();
     let original_root = late.root.clone();
-    late.root = dev.repo_root.clone();
+    late.root = dev.repo_root().to_string();
     save_environment(late.clone(), &env, cwd).unwrap();
     let late_lock = environment_operation_lock_path("late", &env, cwd).unwrap();
     assert!(!late_lock.exists());
@@ -181,9 +203,9 @@ fn publication_rechecks_late_owners_and_replaced_source_without_taking_locks() {
     );
     late.root = original_root;
     save_environment(late, &env, cwd).unwrap();
-    fs::rename(&dev.repo_root, temp.path().join("original-source")).unwrap();
-    let replacement = owned_source(Path::new(&dev.repo_root));
-    assert_eq!(source_tuple(Some(&replacement)), source_tuple(Some(&dev)));
+    fs::rename(dev.repo_root(), temp.path().join("original-source")).unwrap();
+    let replacement = owned_source(Path::new(dev.repo_root()));
+    assert_eq!(replacement, dev);
     let error =
         save_environment_with_dev_registration(child, &registration, &env, cwd).unwrap_err();
     assert!(error.contains("changed during registration"), "{error}");

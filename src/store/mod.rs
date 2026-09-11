@@ -3,6 +3,7 @@ mod checkpoints;
 mod common;
 mod dev_registration;
 pub(crate) mod dev_sources;
+mod dev_ui_ports;
 mod envs;
 mod gateway_ports;
 mod launchers;
@@ -28,6 +29,7 @@ pub(crate) use common::{
 };
 pub(crate) use dev_registration::{DevSourceRegistration, with_prepared_dev_source};
 pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
+pub(crate) use dev_ui_ports::reserve as reserve_dev_ui_port;
 pub(crate) use envs::{
     EnvironmentOperationLock, lock_env_registry, lock_environment_operation,
     remove_environment_locked,
@@ -42,16 +44,15 @@ pub use envs::{
 };
 pub(crate) use envs::{
     clone_environment_for_simulation, clone_environment_with_sandbox_origin,
-    create_environment_with_dev_registration, create_environment_with_validated_runtime,
-    import_environment_with_sandbox_origin,
+    create_environment_with_validated_runtime, import_environment_with_sandbox_origin,
 };
 pub(crate) use envs::{
     save_environment_with_dev_registration, save_environment_with_validated_launcher,
     save_environment_with_validated_runtime, with_locked_environments,
 };
 pub(crate) use gateway_ports::{
-    choose_source_ui_port, openclaw_port_family_available, openclaw_port_family_range,
-    resolve_config_gateway_port, resolve_effective_gateway_ports, resolve_env_gateway_port,
+    openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,
+    resolve_effective_gateway_ports, resolve_env_gateway_port,
 };
 pub use launchers::{add_launcher, get_launcher, list_launchers, remove_launcher};
 pub use layout::{
@@ -146,8 +147,9 @@ pub fn summarize_env(meta: &EnvMeta) -> EnvSummary {
         service_running: meta.service_running,
         default_runtime: meta.default_runtime.clone(),
         default_launcher: meta.default_launcher.clone(),
-        dev_repo_root: meta.dev.as_ref().map(|dev| dev.repo_root.clone()),
-        dev_worktree_root: meta.dev.as_ref().map(|dev| dev.worktree_root.clone()),
+        dev_repo_root: meta.dev.as_ref().map(|dev| dev.repo_root().to_string()),
+        dev_worktree_root: meta.dev.as_ref().map(|dev| dev.source_root().to_string()),
+        dev_ui_port: meta.dev_ui_port,
         protected: meta.protected,
         created_at: meta.created_at,
         last_used_at: meta.last_used_at,

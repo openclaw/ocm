@@ -1,6 +1,6 @@
 [package]
 name = "ocm"
-version = "0.2.43"
+version = "0.2.44"
 publish = false
 edition = "2024"
 rust-version = "1.88"
@@ -58,6 +58,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_Pipes",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }

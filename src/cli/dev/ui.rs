@@ -2,6 +2,8 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use url::Url;
 
 use super::*;
+#[cfg(any(unix, windows))]
+use crate::env::dev_handoff::{self, HandoffOutcome, HandoffRequest, HandoffServer};
 use crate::env::{DevUiChildRole, SourceUiTarget};
 
 #[derive(Clone, Debug)]
@@ -104,7 +106,7 @@ impl DevUiTarget {
             .is_none_or(|expires| i128::from(expires) <= now_ms)
         {
             return Err(
-                "the native dashboard handoff is missing or expired; restart dev to request a fresh link"
+                "the native dashboard handoff is missing or expired; no browser link was delivered"
                     .to_string(),
             );
         }
@@ -234,6 +236,7 @@ struct OwnedUiChild {
     guard: SourceWatchProcessGuard,
     identity: ProcessIdentity,
     started: Option<std::time::Instant>,
+    handoff_deadline: Option<std::time::Instant>,
     completion: Option<SourceWatchResult<std::process::ExitStatus>>,
     stdout: Option<JoinHandle<SourceWatchResult<Vec<u8>>>>,
     stderr: Option<JoinHandle<SourceWatchResult<Vec<u8>>>>,
@@ -331,6 +334,7 @@ fn spawn_ui_child(
         guard,
         identity,
         started: None,
+        handoff_deadline: None,
         completion: None,
         stdout,
         stderr,
@@ -366,7 +370,8 @@ impl OwnedUiChild {
         {
             // The original request budget also bounds stop-time grace. Native
             // dashboard reads can finish normally after the Gateway stops.
-            while started.elapsed() < DASHBOARD_TIMEOUT {
+            let deadline = self.handoff_deadline.unwrap_or(started + DASHBOARD_TIMEOUT);
+            while std::time::Instant::now() < deadline {
                 if self.poll()?.is_some() {
                     return Ok(());
                 }
@@ -536,6 +541,99 @@ impl Cli {
         Some(summary)
     }
 
+    #[cfg(any(unix, windows))]
+    pub(super) fn reused_dev_ui_link(
+        &self,
+        meta: &EnvMeta,
+        active: &crate::env::SourceWatchOverride,
+        stop: &AtomicBool,
+    ) -> Result<HandoffOutcome<String>, String> {
+        let ui = active
+            .ui
+            .as_ref()
+            .ok_or("the active dev session has no UI")?;
+        let endpoint = active
+            .endpoint
+            .as_ref()
+            .ok_or("the active dev session has no captured endpoint")?;
+        let target = DevUiTarget {
+            port: ui.port,
+            gateway_url: ui.gateway_url.clone(),
+        };
+        target.validate(endpoint.gateway_port)?;
+        let session = self.verify_active_dev_ui(meta, active)?;
+        let output = dev_handoff::request(&session, stop)?;
+        self.verify_active_dev_ui(meta, active)?;
+        if stop.load(Ordering::SeqCst) {
+            return Err("dev dashboard request was cancelled".to_string());
+        }
+        match output {
+            HandoffOutcome::Link(output) => target.handoff_url(&output).map(HandoffOutcome::Link),
+            HandoffOutcome::Pending => Ok(HandoffOutcome::Pending),
+            HandoffOutcome::Unavailable => Ok(HandoffOutcome::Unavailable),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn verify_active_dev_ui(
+        &self,
+        meta: &EnvMeta,
+        active: &crate::env::SourceWatchOverride,
+    ) -> Result<SourceWatchSession, String> {
+        let service = self.environment_service();
+        let _operation = service.lock_operation(&meta.name)?;
+        let session = service
+            .source_watch_session(&meta.name)?
+            .ok_or("the dev UI session has no recorded process ownership")?;
+        let current = service.get(&meta.name)?;
+        if session.closed
+            || !session.restore_target_matches(meta)
+            || !session.restore_target_matches(&current)
+            || session.process_scope != process_scope_id()?
+        {
+            return Err(
+                "the dev UI ownership changed; no new browser link was delivered".to_string(),
+            );
+        }
+        match service.observe_source_watch(&meta.name)? {
+            SourceWatchState::Active(current)
+                if current.token == active.token
+                    && current.ui == active.ui
+                    && current.repo_root == active.repo_root
+                    && current.watch_pid == active.watch_pid
+                    && current.watching == active.watching
+                    && current
+                        .endpoint
+                        .as_ref()
+                        .map(|e| (&e.env_root, e.gateway_port))
+                        == active
+                            .endpoint
+                            .as_ref()
+                            .map(|e| (&e.env_root, e.gateway_port)) => {}
+            _ => {
+                return Err(
+                    "the dev UI session changed; no new browser link was delivered".to_string(),
+                );
+            }
+        }
+        let ui = session
+            .ui
+            .as_ref()
+            .ok_or("the dev UI ownership is incomplete")?;
+        for role in [DevUiChildRole::Gateway, DevUiChildRole::Ui] {
+            let expected = ui
+                .children
+                .get(role)
+                .ok_or("the dev UI ownership is incomplete")?;
+            if !observe_process(expected.pid)?
+                .is_some_and(|process| process.running && process.identity == *expected)
+            {
+                return Err("a dev process ended; no new browser link was delivered".to_string());
+            }
+        }
+        Ok(session)
+    }
+
     pub(super) fn prepare_dev_ui(
         &self,
         meta: &EnvMeta,
@@ -593,23 +691,24 @@ for (const name of ['vite', 'dompurify']) {
             )?
             .ok_or_else(|| SourceWatchError::from("dev UI setup was cancelled".to_string()))?;
         if !output.status.success() {
-            return Err("Control UI dependencies are not ready; run pnpm install --frozen-lockfile in the selected checkout before retrying --ui".to_string().into());
+            return Err("Control UI dependencies are not ready; run pnpm install --frozen-lockfile in the selected checkout before retrying dev, or use --no-ui for Gateway-only development".to_string().into());
         }
         let service = self.environment_service();
         let _operation = service.lock_operation(&meta.name)?;
-        // Only startup reads other live session claims. The registry lock joins
-        // simultaneous selections until this lease publishes its chosen address.
+        // Serialize selection, persistent reservation, and the session claim
+        // with other environments and registry writers.
         crate::store::with_locked_environments(&self.env, &self.cwd, |metas| {
             if source_watch_cancelled(lease, stop)? {
                 return Err("dev UI setup was cancelled".to_string());
             }
-            if !metas.iter().any(|current| {
-                lease
-                    .session()
-                    .is_some_and(|session| session.restore_target_matches(current))
-            }) {
-                return Err("dev environment changed before UI startup".to_string());
-            }
+            let current = metas
+                .iter()
+                .find(|current| {
+                    lease
+                        .session()
+                        .is_some_and(|session| session.restore_target_matches(current))
+                })
+                .ok_or_else(|| "dev environment changed before UI startup".to_string())?;
             let mut claimed = Vec::new();
             for other in metas {
                 if other.name == meta.name {
@@ -622,7 +721,8 @@ for (const name of ['vite', 'dompurify']) {
                     claimed.push(target.port);
                 }
             }
-            let port = crate::store::choose_source_ui_port(metas, &claimed, &self.env)?;
+            let port =
+                crate::store::reserve_dev_ui_port(current, metas, &claimed, &self.env, &self.cwd)?;
             let target = DevUiTarget {
                 port,
                 gateway_url: gateway_url.clone(),
@@ -656,6 +756,14 @@ for (const name of ['vite', 'dompurify']) {
             gateway_url: captured.gateway_url.clone(),
         };
         target.validate(meta.gateway_port.unwrap_or_default())?;
+        #[cfg(any(unix, windows))]
+        let mut handoff_server = HandoffServer::bind(
+            lease
+                .session()
+                .ok_or_else(|| "dev UI session ownership is missing".to_string())?,
+        )?;
+        #[cfg(any(unix, windows))]
+        let mut handoff_request: Option<HandoffRequest> = None;
         let mut children: Vec<OwnedUiChild> = Vec::new();
         let mut override_token = None;
         let result = (|| {
@@ -718,6 +826,7 @@ for (const name of ['vite', 'dompurify']) {
             let mut last_probe = began - Duration::from_secs(1);
             let mut attempts = 0;
             let mut handoff_started: Option<std::time::Instant> = None;
+            let mut initial_handoff = true;
             let mut discarded = false;
             let mut delivered = false;
             let mut pending_reported = false;
@@ -725,6 +834,16 @@ for (const name of ['vite', 'dompurify']) {
             loop {
                 if source_watch_cancelled(lease, stop)? {
                     return Ok(130);
+                }
+                #[cfg(any(unix, windows))]
+                if handoff_request
+                    .as_mut()
+                    .is_some_and(|request| request.expired() || request.disconnected())
+                {
+                    handoff_request.take();
+                    // Losing the recipient never releases its helper slot or
+                    // redirects an eventual grant to the original terminal.
+                    discarded = handoff_started.is_some();
                 }
                 let mut index = 0;
                 while index < children.len() {
@@ -745,50 +864,107 @@ for (const name of ['vite', 'dompurify']) {
                         ));
                     }
                     let expired = handoff_started
-                        .is_some_and(|started| started.elapsed() >= DASHBOARD_TIMEOUT);
+                        .is_some_and(|started| started.elapsed() >= DASHBOARD_TIMEOUT)
+                        || child
+                            .handoff_deadline
+                            .is_some_and(|deadline| std::time::Instant::now() >= deadline);
                     handoff_started = None;
                     last_probe = std::time::Instant::now();
                     let output = child.output();
                     if std::mem::take(&mut discarded) || expired {
-                        attempts = DASHBOARD_ATTEMPTS;
-                        if !pending_reported {
+                        #[cfg(any(unix, windows))]
+                        handoff_request.take();
+                        if initial_handoff {
+                            attempts = DASHBOARD_ATTEMPTS;
+                        }
+                        if initial_handoff && !pending_reported {
                             self.report_initial_ui_pending("the native dashboard request exceeded 30 seconds; no browser link was delivered");
                             pending_reported = true;
                         }
                         continue;
                     }
                     let link = if status.success() {
-                        output.and_then(|(stdout, _)| target.handoff_url(&stdout))
+                        output.and_then(|(stdout, _)| {
+                            target.handoff_url(&stdout).map(|link| (stdout, link))
+                        })
                     } else {
                         Err("the native dashboard did not produce a browser handoff".to_string())
                     };
                     match link {
-                        Ok(link) => {
+                        Ok((_native, link)) => {
                             if source_watch_cancelled(lease, stop)? {
                                 return Ok(130);
                             }
-                            self.stdout_line(format!("UI: {link}"));
-                            delivered = true;
+                            #[cfg(any(unix, windows))]
+                            if let Some(mut request) = handoff_request.take() {
+                                let _ = request.deliver(&_native);
+                            }
+                            if initial_handoff {
+                                self.stdout_line(format!("UI: {link}"));
+                                delivered = true;
+                            }
                         }
-                        Err(error) => handoff_failure = Some(error),
+                        Err(error) => {
+                            #[cfg(any(unix, windows))]
+                            if let Some(mut request) = handoff_request.take() {
+                                if status.success() {
+                                    request.failed(&error);
+                                } else {
+                                    request.pending();
+                                }
+                            }
+                            if initial_handoff {
+                                handoff_failure = Some(error);
+                            }
+                        }
                     }
                 }
                 if handoff_started.is_some_and(|started| started.elapsed() >= DASHBOARD_TIMEOUT)
                     && !discarded
                 {
                     discarded = true;
-                    attempts = DASHBOARD_ATTEMPTS;
-                    self.report_initial_ui_pending("the native dashboard request exceeded 30 seconds; its helper remains owned until completion");
-                    pending_reported = true;
+                    #[cfg(any(unix, windows))]
+                    handoff_request.take();
+                    if initial_handoff {
+                        attempts = DASHBOARD_ATTEMPTS;
+                        self.report_initial_ui_pending("the native dashboard request exceeded 30 seconds; its helper remains owned until completion");
+                        pending_reported = true;
+                    }
                 }
-                if !delivered
-                    && handoff_started.is_none()
-                    && attempts < DASHBOARD_ATTEMPTS
+                #[cfg(any(unix, windows))]
+                if let Some(mut request) = handoff_server.poll()? {
+                    if handoff_started.is_some() || handoff_request.is_some() {
+                        request.pending();
+                    } else if !request.expired() && !request.disconnected() {
+                        handoff_request = Some(request);
+                        last_probe = std::time::Instant::now() - Duration::from_secs(1);
+                    }
+                }
+                #[cfg(any(unix, windows))]
+                let reuse_requested = handoff_request.is_some();
+                #[cfg(not(any(unix, windows)))]
+                let reuse_requested = false;
+                if handoff_started.is_none()
+                    && (reuse_requested || (!delivered && attempts < DASHBOARD_ATTEMPTS))
                     && last_probe.elapsed() >= Duration::from_secs(1)
                 {
                     last_probe = std::time::Instant::now();
                     if target.documents_ready() {
-                        attempts += 1;
+                        if source_watch_cancelled(lease, stop)? {
+                            return Ok(130);
+                        }
+                        #[cfg(any(unix, windows))]
+                        if handoff_request
+                            .as_mut()
+                            .is_some_and(|request| request.expired() || request.disconnected())
+                        {
+                            handoff_request.take();
+                            continue;
+                        }
+                        initial_handoff = !reuse_requested;
+                        if initial_handoff {
+                            attempts += 1;
+                        }
                         let service = self.environment_service();
                         let current = service.get(&meta.name)?;
                         if !lease
@@ -811,14 +987,30 @@ for (const name of ['vite', 'dompurify']) {
                                 children.push(child);
                                 let child =
                                     children.last_mut().expect("dashboard child was recorded");
+                                #[cfg(any(unix, windows))]
+                                {
+                                    child.handoff_deadline =
+                                        handoff_request.as_ref().map(HandoffRequest::deadline);
+                                }
                                 child.start()?;
                                 handoff_started = child.started;
                                 discarded = false;
                             }
                             Err(error) if error.cleanup_verified => {
-                                handoff_failure = Some(error.message)
+                                #[cfg(any(unix, windows))]
+                                if let Some(mut request) = handoff_request.take() {
+                                    request.failed(&error.message);
+                                }
+                                if initial_handoff {
+                                    handoff_failure = Some(error.message);
+                                }
                             }
                             Err(error) => return Err(error),
+                        }
+                    } else {
+                        #[cfg(any(unix, windows))]
+                        if let Some(mut request) = handoff_request.take() {
+                            request.pending();
                         }
                     }
                 }
@@ -847,6 +1039,15 @@ for (const name of ['vite', 'dompurify']) {
         })();
         let mut verified = source_watch_allows_service_restore(&result);
         let mut errors = Vec::new();
+        #[cfg(any(unix, windows))]
+        {
+            // Stop admission and waiting callers before spending any grace on
+            // the owned helper. No caller can extend this session's shutdown.
+            handoff_request.take();
+            if let Err(error) = handoff_server.close() {
+                errors.push(error);
+            }
+        }
         // Persistent components precede Command, whose stop grace is limited to
         // the remaining original request budget. Every error still stops siblings.
         for child in &mut children {

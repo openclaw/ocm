@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStringExt;
 
 use serde_json::Value;
 
-use crate::store::{clean_path, display_path};
+use crate::store::{clean_path, dev_sources::path_identity, display_path};
 
 const SOURCE_DEPENDENCY_PROBE: &str = r#"import fs from "node:fs";
 import { createRequire } from "node:module";
@@ -98,6 +98,59 @@ pub(crate) fn discover_openclaw_checkout(cwd: &Path) -> Option<PathBuf> {
 
 pub(crate) fn discover_enclosing_openclaw_checkout(cwd: &Path) -> Option<PathBuf> {
     cwd.ancestors().find_map(detect_openclaw_checkout)
+}
+
+pub(crate) fn validate_borrowed_openclaw_checkout(path: &Path) -> Result<&Path, String> {
+    if !path.is_absolute() {
+        return Err("borrowed dev source must be an absolute checkout path".to_string());
+    }
+    let checkout = fs::canonicalize(path).map_err(|error| {
+        format!(
+            "failed to resolve OpenClaw source {}: {error}; restore that checkout before retrying",
+            display_path(path)
+        )
+    })?;
+    if checkout != path {
+        return Err(format!(
+            "saved dev source {} now resolves to a different checkout; restore the recorded path before retrying",
+            display_path(path)
+        ));
+    }
+    if detect_openclaw_checkout(path).is_none() {
+        return Err(format!(
+            "OpenClaw checkout not found at {}",
+            display_path(path)
+        ));
+    }
+    let registered = registered_worktree_paths(path)?;
+    let identity = git_identity_paths(path)?
+        .ok_or_else(|| format!("Git checkout not found at {}", display_path(path)))?;
+    let private = fs::canonicalize(&identity.private_dir).map_err(|error| error.to_string())?;
+    let common = fs::canonicalize(&identity.common_dir).map_err(|error| error.to_string())?;
+    let private_identity = path_identity(&private)?;
+    let registrations = git_registration_entries(&common, path)?;
+    let registration_matches = if private_identity == path_identity(&common)? {
+        // Git lists a --separate-git-dir main checkout by its common directory.
+        // A linked slot naming this path must not be mistaken for such a main.
+        registrations.is_empty()
+    } else {
+        contains_worktree_path(&registered, path)
+            && identity.worktree_entry.as_ref().is_some_and(|backlink| {
+                normalize_git_file_path(backlink) == normalize_git_file_path(&path.join(".git"))
+            })
+            && registrations.iter().any(|slot| {
+                fs::canonicalize(slot).is_ok_and(|slot| {
+                    path_identity(&slot).is_ok_and(|slot| slot == private_identity)
+                })
+            })
+    };
+    if !git_top_level(path).is_some_and(|root| root == checkout) || !registration_matches {
+        return Err(format!(
+            "selected source is not the registered root of an OpenClaw checkout: {}",
+            display_path(path)
+        ));
+    }
+    Ok(path)
 }
 
 /// Rejects checkout dependencies that resolve through another checkout.

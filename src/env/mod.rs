@@ -1,5 +1,7 @@
 mod artifact;
 mod binding;
+#[cfg(any(unix, windows))]
+pub(crate) mod dev_handoff;
 mod execution;
 mod health;
 mod inspect;

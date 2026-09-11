@@ -98,7 +98,9 @@ function capture(child) {
 }
 function sessionPath(name) { return path.join(env.OCM_HOME, 'source-watch', name + '.session'); }
 function session(name) { return JSON.parse(fs.readFileSync(sessionPath(name), 'utf8')); }
-async function start(name, watching = true, withUi = false) {
+async function start(name, watching = true, withUi = false, defaults = false) {
+  assert.ok(!defaults || (watching && withUi));
+  const takeover = watching && !defaults;
   const directory = path.join(root, name);
   const repo = path.join(directory, 'repo');
   fs.mkdirSync(path.join(repo, 'scripts'), {recursive:true});
@@ -110,9 +112,11 @@ async function start(name, watching = true, withUi = false) {
   const ready = path.join(directory, 'ready');
   const rootPid = path.join(directory, 'root.pid');
   const descendantPid = path.join(directory, 'descendant.pid');
+  const sourceEnvironment = path.join(directory, 'source-environment.json');
   const watch = [
     'import fs from "node:fs";',
     'import {spawn} from "node:child_process";',
+    'fs.writeFileSync(' + JSON.stringify(sourceEnvironment) + ',JSON.stringify({pid:process.pid,cacheVariables:Object.entries(process.env).filter(([key])=>["NODE_COMPILE_CACHE","NODE_DISABLE_COMPILE_CACHE"].includes(key.toUpperCase())),nodeOptions:process.env.NODE_OPTIONS}));',
     'const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore",windowsHide:true});',
     'child.once("spawn",()=>{fs.writeFileSync(' + JSON.stringify(rootPid) + ',String(process.pid));fs.writeFileSync(' + JSON.stringify(descendantPid) + ',String(child.pid));fs.writeFileSync(' + JSON.stringify(ready) + ',process.argv[1]);});',
     'setInterval(()=>{},1000);'
@@ -143,7 +147,7 @@ async function start(name, watching = true, withUi = false) {
   assert.equal(init.status, 0, init.stderr);
   const envRoot = path.join(directory, 'env');
   const port = String(21901 + 32 * tracked.length);
-  if (watching) {
+  if (takeover) {
     run(['env','create',name,'--runtime','proof-node','--root',envRoot,'--port',port]);
   } else {
     for (const args of [['add','.'], ['-c','user.name=OCM Tests','-c','user.email=tests@example.com','-c','commit.gpgsign=false','commit','--quiet','-m','fixture']]) {
@@ -152,15 +156,22 @@ async function start(name, watching = true, withUi = false) {
       assert.equal(saved.status, 0, saved.stderr);
     }
   }
-  if (withUi) {
+  if (withUi && takeover) {
     fs.mkdirSync(path.join(envRoot, '.openclaw'), {recursive:true});
     fs.writeFileSync(path.join(envRoot, '.openclaw', 'openclaw.json'), JSON.stringify({
       gateway:{controlUi:{basePath:'/console'}, auth:{mode:'token', token:'synthetic-fixture-auth'}},
     }));
   }
-  const args = ['dev',name,'--repo',repo,...(watching ? ['--watch','--force'] : ['--root',envRoot,'--port',port]), ...(withUi ? ['--ui'] : [])];
-  const sourceEnv = withUi ? {...env, OCM_TEST_DEV_UI_DIR:directory, OCM_TEST_DEV_UI_DESCENDANTS:'1'} : env;
-  const controller = cp.spawn(binary, args, {cwd:root, env:sourceEnv, stdio:['ignore','pipe','pipe'], windowsHide:true});
+  const modes = defaults ? [] : [watching ? '--watch' : '--no-watch', withUi ? '--ui' : '--no-ui'];
+  const args = ['dev',name,...(defaults ? [] : ['--repo',repo]),...(takeover ? ['--force'] : ['--root',envRoot,'--port',port]),...modes];
+  const sourceEnv = {
+    ...env,
+    ...(withUi ? {OCM_TEST_DEV_UI_DIR:directory, OCM_TEST_DEV_UI_DESCENDANTS:'1'} : {}),
+    NoDe_CoMpIlE_CaChE: path.join(directory, 'inherited-cache'),
+    nOdE_dIsAbLe_CoMpIlE_cAcHe: '0',
+    NODE_OPTIONS: '--no-warnings'
+  };
+  const controller = cp.spawn(binary, args, {cwd:defaults ? repo : root, env:sourceEnv, stdio:['ignore','pipe','pipe'], windowsHide:true});
   const output = capture(controller);
   const record = {name, directory, repo, controller, output, identities:[]};
   tracked.push(record);
@@ -175,7 +186,7 @@ async function start(name, watching = true, withUi = false) {
   const gateway = withUi ? JSON.parse(fs.readFileSync(gatewayFile)) : {
     pid:Number(fs.readFileSync(rootPid,'utf8')), descendantPid:Number(fs.readFileSync(descendantPid,'utf8')),
   };
-  if (!withUi) assert.equal(path.basename(fs.readFileSync(ready, 'utf8')), watching ? 'watch-node.mjs' : 'run-node.mjs');
+  assert.equal(withUi ? gateway.entrypoint : path.basename(fs.readFileSync(ready, 'utf8')), watching ? 'watch-node.mjs' : 'run-node.mjs');
   const watcher = gateway.pid;
   const descendant = gateway.descendantPid;
   assert.equal(owner.controller.pid, controller.pid);
@@ -210,10 +221,17 @@ async function start(name, watching = true, withUi = false) {
   }
   assert.ok(record.identities.every(identity => /^\d+$/.test(identity.startedAt)));
   assert.ok(record.sourcePids.every(alive));
+  if (!withUi) {
+    assert.deepEqual(JSON.parse(fs.readFileSync(sourceEnvironment, 'utf8')), {
+      pid:watcher,
+      cacheVariables:[['NODE_DISABLE_COMPILE_CACHE', '1']],
+      nodeOptions:sourceEnv.NODE_OPTIONS
+    });
+  }
   record.original = fs.readFileSync(sessionPath(name));
   record.watcher = watcher;
   record.descendant = descendant;
-  record.source = watching ? repo : JSON.parse(run(['env','show',name,'--json']).stdout).devWorktreeRoot;
+  record.source = withUi ? gateway.cwd : takeover ? repo : JSON.parse(run(['env','show',name,'--json']).stdout).devWorktreeRoot;
   fs.writeFileSync(path.join(envRoot, 'SENTINEL'), 'preserve environment');
   return record;
 }
@@ -264,7 +282,7 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     // No subprocess may be created before this handshake completes.
     assert.equal(native('ready').ready, true);
     run(['runtime','add','proof-node','--path',process.execPath]);
-    const normal = await start('normal.stop', true, true);
+    const normal = await start('normal.stop', true, true, true);
     fs.rmSync(path.join(normal.directory, 'dashboard-hold'));
     await waitFor(() => !alive(normal.helperPid) && !session(normal.name).ui.children.command && normal.output().includes('UI: '),
       'Completed initial handoff was not acknowledged');
@@ -273,13 +291,141 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     const active = JSON.parse(run(['dev','status',normal.name,'--json']).stdout);
     assert.equal(active.sourceWatch.state, 'active', 'Held watch lease was not readable by dev status');
     assert.equal(active.sourceWatch.watching, true);
-    await stop(normal.name);
-    await waitFor(() => normal.sourcePids.every(pid => !alive(pid)), 'Named stop left a Gateway/UI tree running');
-    await waitFor(() => normal.controller.exitCode !== null, 'Controller did not acknowledge named stop');
+    const originalOwner = session(normal.name);
+    const componentPids = normal.sourcePids.filter(pid => pid !== normal.helperPid);
+    const reuseArgs = ['dev',normal.name,'--repo',normal.repo,'--watch','--force','--ui'];
+    const hold = path.join(normal.directory, 'dashboard-hold');
+    const attempts = () => fs.readFileSync(path.join(normal.directory, 'dashboard-attempts'), 'utf8').trim().split(/\r?\n/).length;
+    let controllerOutputClosed = false;
+    normal.controller.once('close', () => {controllerOutputClosed = true;});
+    const assertOriginalOwner = () => {
+      const current = session(normal.name);
+      assert.equal(current.leaseId, originalOwner.leaseId, 'Requester replaced the watch lease');
+      assert.equal(current.envRoot, originalOwner.envRoot);
+      assert.deepEqual(current.controller, originalOwner.controller);
+      assert.deepEqual(current.ui.target, originalOwner.ui.target, 'Reuse changed the captured UI address');
+      assert.deepEqual(current.ui.children.gateway, originalOwner.ui.children.gateway);
+      assert.deepEqual(current.ui.children.ui, originalOwner.ui.children.ui);
+      assert.equal(current.ui.pending, null);
+      assert.equal(current.closed, false);
+      assert.ok([normal.controller.pid, ...componentPids].every(alive), 'Requester exit stopped an original process');
+      assert.ok(!fs.readFileSync(sessionPath(normal.name), 'utf8').includes('synthetic-'), 'Session persisted a native grant');
+    };
+    const assertFreshGrant = (response, ordinal) => {
+      const links = [...response.stdout.matchAll(/^UI: (http:\/\/\S+)$/gm)];
+      assert.equal(links.length, 1, 'Reused CLI must return one native grant\n' + response.stdout + response.stderr);
+      const link = new URL(links[0][1]);
+      assert.equal(link.origin, 'http://127.0.0.1:' + originalOwner.ui.target.port);
+      assert.equal(link.pathname, '/');
+      const fragment = new URLSearchParams(link.hash.slice(1));
+      assert.equal(fragment.get('bootstrapToken'), 'synthetic-owner-grant-' + ordinal);
+      assert.equal(fragment.get('bootstrapProfile'), 'control-ui-owner');
+      assert.equal(fragment.get('gatewayUrl'), originalOwner.ui.target.gatewayUrl.replace(/^http:/, 'ws:'));
+      assert.ok(!response.stdout.includes('synthetic-legacy') && !response.stderr.includes('synthetic-'));
+      assert.equal(attempts(), ordinal, 'Reuse launched an extra native helper');
+    };
+    const startCli = (args) => {
+      const child = cp.spawn(binary, args, {cwd:root, env, stdio:['ignore','pipe','pipe'], windowsHide:true});
+      const output = capture(child);
+      let stdout = '';
+      let closed = false;
+      child.stdout.on('data', chunk => {stdout = (stdout + chunk.toString()).slice(-12000);});
+      child.once('close', () => {closed = true;});
+      assert.ok(child.pid, 'CLI process did not spawn');
+      return {child, output, stdout:() => stdout, closed:() => closed};
+    };
+    const captureCli = (request) => {
+      const identity = {pid:request.child.pid, startedAt:startIdentity(request.child.pid)};
+      normal.identities.push(identity);
+      return {...request, identity};
+    };
+    const heldRequest = async (ordinal) => {
+      fs.writeFileSync(hold, 'hold');
+      const helperFile = path.join(normal.directory, 'dashboard-attempt-' + ordinal);
+      const deadline = Date.now() + 15000;
+      let request;
+      let pid = 0;
+      for (;;) {
+        assert.ok(Date.now() < deadline, 'UI handoff listener did not become available');
+        request = startCli(reuseArgs);
+        await waitFor(() => {
+          if (fs.existsSync(helperFile)) pid = Number(fs.readFileSync(helperFile));
+          return (Number.isInteger(pid) && pid > 0) || request.closed();
+        }, () => 'Reused native helper did not start\n' + request.output() + normal.output(), deadline - Date.now());
+        if (Number.isInteger(pid) && pid > 0) break;
+        // Command metadata can clear before the preceding ACK releases the pipe.
+        // Retry only an explicit pending response that created no native helper.
+        assert.equal(request.child.exitCode, 0, request.output());
+        assert.match(request.output(), /UI link pending/);
+        assert.ok(!request.output().includes('synthetic-'));
+        assert.equal(attempts(), ordinal - 1, 'Pending requester changed native helper ownership');
+      }
+      assert.ok(!request.closed(), 'Held requester exited before its native helper completed');
+      const helperIdentity = {pid, startedAt:startIdentity(pid)};
+      normal.identities.push(helperIdentity);
+      normal.sourcePids.push(pid);
+      assert.deepEqual(session(normal.name).ui.children.command, helperIdentity, 'Requester took helper ownership');
+      assert.equal(attempts(), ordinal);
+      assertOriginalOwner();
+      return {...captureCli(request), helperIdentity};
+    };
+
+    assertFreshGrant(run(reuseArgs), 2);
+    await waitFor(() => !session(normal.name).ui.children.command, 'Fresh handoff retained completed helper ownership');
+    assertOriginalOwner();
+
+    const abandoned = await heldRequest(3);
+    const busy = run(reuseArgs);
+    assert.match(busy.stdout + busy.stderr, /UI link pending/);
+    assert.ok(!busy.stdout.includes('synthetic-') && !busy.stderr.includes('synthetic-'));
+    assert.equal(attempts(), 3, 'Busy requester started a second native helper');
+    assert.deepEqual(session(normal.name).ui.children.command, abandoned.helperIdentity);
+    assertOriginalOwner();
+    assert.ok(killRecordedProcess(abandoned.identity.pid, abandoned.identity.startedAt), 'Requester exited before termination');
+    await waitFor(abandoned.closed, 'Terminated requester kept its output open');
+    assert.ok(alive(abandoned.helperIdentity.pid), 'Requester exit killed the controller-owned helper');
+    assert.deepEqual(session(normal.name).ui.children.command, abandoned.helperIdentity);
+    assertOriginalOwner();
+    fs.rmSync(hold);
+    await waitFor(() => !alive(abandoned.helperIdentity.pid) && !session(normal.name).ui.children.command,
+      'Abandoned handoff helper did not complete under the original controller');
+    assert.equal(attempts(), 3, 'Abandoned requester caused a replacement helper');
+    assert.ok(!abandoned.output().includes('synthetic-owner-grant'), 'Abandoned requester received a grant');
+    assert.ok(!normal.output().includes('synthetic-owner-grant-3'), 'Abandoned grant reached the original terminal');
+    assertFreshGrant(run(reuseArgs), 4);
+    await waitFor(() => !session(normal.name).ui.children.command, 'Next handoff retained completed helper ownership');
+    assertOriginalOwner();
+    assert.equal(JSON.parse(run(['dev','status',normal.name,'--json']).stdout).sourceWatch.state, 'active');
+
+    // Keep a native helper active while named stop closes the original component
+    // Jobs. Release it only after those trees stop; the outer fixture Job stays open.
+    const stoppingRequest = await heldRequest(5);
+    const stopping = captureCli(startCli(['dev','stop',normal.name,'--json']));
+    await waitFor(() => componentPids.every(pid => !alive(pid)), 'Named stop left a Gateway/UI tree running');
+    assert.ok(alive(stoppingRequest.helperIdentity.pid), 'Native helper ownership ended before completion');
+    assert.ok(alive(normal.controller.pid), 'Controller exited before its native helper completed');
+    assert.ok(alive(stopping.identity.pid), 'Named stop returned before its native helper completed');
+    assert.deepEqual(session(normal.name).ui.children.command, stoppingRequest.helperIdentity);
+    assert.equal(session(normal.name).closed, false);
+    fs.rmSync(hold);
+    await waitFor(stopping.closed, () => 'Named stop did not complete\n' + stopping.output());
+    assert.equal(stopping.child.exitCode, 0, stopping.output());
+    const stopped = JSON.parse(stopping.stdout());
+    assert.equal(stopped.envName, normal.name);
+    assert.equal(stopped.stopped, true);
+    assert.equal(stopped.serviceRestored, false);
+    assert.equal(session(normal.name).closed, true);
+    assert.ok(!fs.readFileSync(sessionPath(normal.name), 'utf8').includes('synthetic-'), 'Closed session persisted a native grant');
+    await waitFor(() => normal.sourcePids.every(pid => !alive(pid)), 'Named stop left an owned helper running');
+    await waitFor(() => normal.controller.exitCode !== null && controllerOutputClosed, 'Controller did not acknowledge named stop');
+    await waitFor(stoppingRequest.closed, 'Stopped handoff requester did not exit');
+    assert.equal(attempts(), 5, 'Stop launched an extra native helper');
+    assert.ok(!stoppingRequest.output().includes('synthetic-owner-grant'), 'Stop delivered a cancelled grant');
+    assert.deepEqual(normal.output().match(/synthetic-owner-grant-\d+/g), ['synthetic-owner-grant-1']);
     await checkPreserved(normal);
     const again = JSON.parse(run(['dev','stop',normal.name,'--json']).stdout);
     assert.equal(again.stopped, false);
-    results.push('native initial UI handoff, both component trees stopped, repeat stop, env/source preservation');
+    results.push('native bare dev defaults, fresh UI reuse, abandoned grant discarded, original helper/component ownership, named stop, env/source preservation');
 
     const plain = await start('plain.stop', false);
     const plainStatus = JSON.parse(run(['dev','status',plain.name,'--json']).stdout);
