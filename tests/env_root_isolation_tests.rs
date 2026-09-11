@@ -241,8 +241,6 @@ fn missing_unicode_root_aliases_remain_reserved() {
         ("Ⴀ-environment", "ა-environment"),
         ("Ⴀ-environment", "ⴀ-environment"),
         ("Ა-environment", "ⴀ-environment"),
-        #[cfg(windows)]
-        ("I-environment", "ı-environment"),
     ] {
         let fixture = TestDir::new("missing-unicode-root-aliases");
         let env = ocm_env(&fixture);
@@ -259,7 +257,10 @@ fn missing_unicode_root_aliases_remain_reserved() {
 
         for action in ["create", "clone", "import"] {
             let rejected = admit(&fixture, &env, action, "blocked", &alias.join("child"));
-            assert!(!rejected.status.success());
+            assert!(
+                !rejected.status.success(),
+                "{action} admitted {alias_name:?} for missing {reserved_name:?}"
+            );
             assert!(
                 stderr(&rejected).contains("overlaps environment reserved root"),
                 "{}",
@@ -274,6 +275,35 @@ fn missing_unicode_root_aliases_remain_reserved() {
             );
         }
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn missing_unicode_windows_ordinal_names_remain_distinct() {
+    let fixture = TestDir::new("missing-unicode-windows-ordinal");
+    let env = ocm_env(&fixture);
+    let reserved = fixture.child("roots/I-environment");
+    let distinct = reserved.with_file_name("ı-environment");
+    let created = admit(&fixture, &env, "create", "reserved", &reserved);
+    assert!(created.status.success(), "{}", stderr(&created));
+    write_text(&reserved.join(".openclaw/workspace/keep.txt"), "retained\n");
+
+    // Verify the filesystem distinguishes these names before testing the
+    // missing-path policy. Windows ordinal casing leaves dotless i unchanged.
+    fs::create_dir(&distinct).expect("Windows must distinguish I from dotless i");
+    fs::remove_dir(&distinct).unwrap();
+    let displaced = fixture.child("displaced");
+    fs::rename(&reserved, &displaced).unwrap();
+
+    let destination = distinct.join("child");
+    let accepted = admit(&fixture, &env, "create", "sibling", &destination);
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
+    assert!(destination.join(".openclaw/workspace").is_dir());
+    assert!(!reserved.exists());
+    assert_eq!(
+        fs::read_to_string(displaced.join(".openclaw/workspace/keep.txt")).unwrap(),
+        "retained\n"
+    );
 }
 
 #[cfg(windows)]

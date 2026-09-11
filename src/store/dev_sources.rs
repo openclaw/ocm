@@ -204,7 +204,7 @@ fn windows_case_alias(left: &str, right: &str) -> Result<bool, String> {
     let left_len = i32::try_from(left.len()).map_err(|error| error.to_string())?;
     let right_len = i32::try_from(right.len()).map_err(|error| error.to_string())?;
     // Both buffers remain live for their explicit UTF-16 lengths. Use the OS
-    // uppercase table as well as Unicode folding (for example, dotless i).
+    // uppercase table as well as Unicode folding.
     let comparison =
         unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
     if comparison == 0 {
