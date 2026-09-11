@@ -421,6 +421,48 @@ pub fn create_environment(
     create_environment_with_runtime_validation(options, false, env, cwd)
 }
 
+fn ensure_root_outside_environments(
+    name: &str,
+    root: &Path,
+    envs: &[EnvMeta],
+) -> Result<(), String> {
+    if envs.is_empty() {
+        return Ok(());
+    }
+    let resolve = |root: &Path| {
+        super::dev_registration::registration_path(root).map_err(|error| {
+            format!(
+                "failed to resolve environment root {}: {error}",
+                display_path(root)
+            )
+        })
+    };
+    let (target, mut target_entries) = resolve(root)?;
+    target_entries.insert(target.clone());
+    for current in envs {
+        let (registered, mut registered_entries) = resolve(Path::new(&current.root))?;
+        registered_entries.insert(registered.clone());
+        // Compare both the resolved roots and the links that keep them reachable.
+        // A disjoint target reached through a link inside another root is unsafe too.
+        for (container, entries) in [
+            (&registered, &target_entries),
+            (&target, &registered_entries),
+        ] {
+            for entry in entries {
+                if super::dev_sources::projected_path_contains(container, entry)? {
+                    return Err(format!(
+                        "environment {name} root {} overlaps environment {} root {}; choose a separate environment root",
+                        display_path(root),
+                        current.name,
+                        current.root
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn create_environment_with_validated_runtime(
     options: CreateEnvironmentOptions,
     env: &BTreeMap<String, String>,
@@ -484,6 +526,7 @@ fn create_environment_with_runtime_validation(
             Path::new(source),
         )?;
     }
+    ensure_root_outside_environments(&name, &root, &registry.envs)?;
     let paths = derive_env_paths(&root);
     if path_exists(&paths.root) {
         let mut entries = fs::read_dir(&paths.root).map_err(|error| error.to_string())?;
@@ -610,6 +653,7 @@ fn clone_environment_with_policy(
         default_env_root(&name, env, cwd)?
     };
     ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
+    ensure_root_outside_environments(&name, &root, &registry.envs)?;
     let target_paths = derive_env_paths(&root);
     if path_exists(&target_paths.root) {
         let mut entries = fs::read_dir(&target_paths.root).map_err(|error| error.to_string())?;
@@ -988,6 +1032,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
             default_env_root(&name, env, cwd)?
         };
         ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
+        ensure_root_outside_environments(&name, &root, &registry.envs)?;
         let target_paths = derive_env_paths(&root);
         if path_exists(&target_paths.root) {
             let mut entries =
@@ -1396,6 +1441,26 @@ mod tests {
         fs::create_dir_all(source_paths.state_dir.join("logs")).unwrap();
         fs::write(source_paths.state_dir.join("logs/gateway.log"), "source\n").unwrap();
         fs::write(source_paths.state_dir.join("openclaw.json.bak"), "{}\n").unwrap();
+
+        let registry = super::env_registry_path(&env, &cwd).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let nested = source_paths.root.join("nested-simulation");
+        let rejected = clone_environment_for_simulation(
+            CloneEnvironmentOptions {
+                source_name: "source".to_string(),
+                name: "blocked-simulation".to_string(),
+                root: Some(nested.display().to_string()),
+            },
+            &env,
+            &cwd,
+        )
+        .unwrap_err();
+        assert!(
+            rejected.contains("overlaps environment source root"),
+            "{rejected}"
+        );
+        assert!(!nested.exists());
+        assert_eq!(fs::read(&registry).unwrap(), registry_before);
 
         let simulation = clone_environment_for_simulation(
             CloneEnvironmentOptions {

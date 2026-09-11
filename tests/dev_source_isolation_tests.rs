@@ -151,12 +151,18 @@ fn create_clone_and_import_reject_registered_dev_source_destinations() {
         assert!(case_result.status.success(), "{}", stderr(&case_result));
     }
 
-    // The originating repo, a source's sibling, and another env's root retain
-    // their existing custom-root behavior; only registered source overlaps fail.
+    let nested = Path::new(&template.root).join("nested");
+    let rejected = create("nested-state", Some(&nested), None, &env, cwd).unwrap_err();
+    assert!(
+        rejected.contains("overlaps environment template root"),
+        "{rejected}"
+    );
+    assert!(!nested.exists());
+
+    // Separate roots in the originating repo and beside a source remain valid.
     for (name, destination) in [
         ("repo-state", fixture.child("repo/state")),
         ("source-sibling", fixture.child("repo/worktree-other")),
-        ("nested-state", Path::new(&template.root).join("nested")),
     ] {
         let created = run_ocm(
             cwd,
@@ -279,12 +285,22 @@ fn missing_borrowed_sources_remain_reserved_until_the_binding_is_removed() {
             assert!(!source.exists());
         }
     }
-    for (name, destination) in [
-        ("sibling", source.with_file_name("sibling")),
-        ("nested", Path::new(&template.root).join("nested")),
-    ] {
-        create(name, Some(&destination), None, &env, cwd).unwrap();
-    }
+    let nested = Path::new(&template.root).join("nested");
+    let rejected = create("nested", Some(&nested), None, &env, cwd).unwrap_err();
+    assert!(
+        rejected.contains("overlaps environment template root"),
+        "{rejected}"
+    );
+    assert_eq!(fs::read(&registry).unwrap(), before);
+    assert!(!nested.exists());
+    create(
+        "sibling",
+        Some(&source.with_file_name("sibling")),
+        None,
+        &env,
+        cwd,
+    )
+    .unwrap();
     let removed = run_ocm(cwd, &env, &["env", "remove", "developer", "--force"]);
     assert!(removed.status.success(), "{}", stderr(&removed));
     create("reused", Some(&source), None, &env, cwd).unwrap();

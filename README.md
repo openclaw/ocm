@@ -400,8 +400,14 @@ After independently verifying that **all source processes, including detached wo
 
 `ocm env destroy <env> --yes` stops the recorded foreground generation and verifies shutdown before removing the environment. It rechecks the binding after stopping and preserves state if another owner or binding appears. While a watch is running, previews defer the changing process-tree inspection until after shutdown (`processInspectionDeferred` in JSON). `env remove` and `env prune` refuse active or unfinished watches; stop those sessions first. A guarded destroy with `--if-state-token` also requires `dev stop` followed by a fresh preview, so its original state guarantee remains intact. Completed watch records are removed with the env; synchronization lock files remain reusable.
 
-Environment creation, cloning, and import reject roots that overlap registered
-dev sources, including source and destination aliases. Missing borrowed paths
+New environment roots must be separate: a root cannot equal, contain, or sit
+inside another registered environment root, including through path aliases.
+Creation, cloning, import, and other commands that create an environment reject
+overlap before writing environment state, regardless of protection flags.
+Default sibling roots and disjoint custom roots remain valid.
+
+These operations also reject roots that overlap registered dev sources,
+including source and destination aliases. Missing borrowed paths
 remain reserved until their binding is removed. Removing a borrowed environment
 preserves its source, dependencies, generated output, and unrelated source workers.
 Restore and rollback also preserve borrowed source and known Git metadata;

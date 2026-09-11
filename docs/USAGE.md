@@ -518,8 +518,15 @@ ocm self update --check
 
 ## Environment lifecycle
 
-Environment creation, including `start` and migration, and `env clone` and
-`env import` require a root outside registered dev sources. Missing borrowed
+New environment roots must be separate. A root cannot equal, contain, or sit
+inside another registered environment root, including through path aliases.
+OCM rejects overlap before creating or copying environment state or registering
+the new environment, regardless of protection flags. Default sibling roots and
+disjoint custom roots remain valid. This applies to `env create`, `env clone`,
+`env import`, and new environments created by `start`, `setup`, `dev`, `migrate`,
+`adopt import`, or upgrade simulation.
+
+These operations also require a root outside registered dev sources. Missing borrowed
 source paths remain reserved until their binding is removed; missing paths of
 OCM-owned worktrees can still be reused. The root must neither contain
 a registered source nor be inside it. OCM resolves source and destination aliases and also protects source
