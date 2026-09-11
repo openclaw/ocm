@@ -5511,6 +5511,92 @@ setInterval(() => { if (fs.existsSync(path.join(root, 'source-watch.release'))) 
 
 #[cfg(unix)]
 #[test]
+fn dev_stop_acknowledgement_refuses_live_recorded_ownership() {
+    let root = TestDir::new("dev-stop-acknowledge-live");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+    let started = root.child("source-watch.started");
+    let release = root.child("source-watch.release");
+    let worker_path = root.child("source-watch-descendant.pid");
+    let script = format!(
+        "#!/bin/sh\n(while [ ! -f \"{release}\" ]; do /bin/sleep 0.05; done) &\nprintf '%s\\n' \"$!\" > \"{worker}\"\nprintf ready > \"{started}\"\nwhile [ ! -f \"{release}\" ]; do /bin/sleep 0.05; done\n",
+        release = path_string(&release),
+        worker = path_string(&worker_path),
+        started = path_string(&started),
+    );
+    write_fake_dev_node(&root, &script);
+    let mut watch = DevWatchFixture::spawn(
+        &root,
+        &cwd,
+        &env,
+        &dev_watch(&["demo", "--repo", &path_string(&repo), "--watch"]),
+    );
+    assert!(wait_for_path(&started, Duration::from_secs(20)));
+    let worker = fs::read_to_string(worker_path)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let session_path = watch.session.clone();
+    let mut session = read_source_watch_session(&root);
+    let leader = session["child"]["pid"].as_u64().unwrap() as u32;
+    session["completion"] = serde_json::json!({
+        "serviceRestored":false, "error":"fixture retained cleanup failure",
+    });
+    let retained = serde_json::to_vec(&session).unwrap();
+    fs::write(&session_path, &retained).unwrap();
+    let recover = || {
+        run_ocm(
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "stop",
+                "demo",
+                "--acknowledge-stopped-processes",
+                "--json",
+            ],
+        )
+    };
+    let controller_live = recover();
+    assert!(!controller_live.status.success());
+    assert!(stderr(&controller_live).contains("controller is still running"));
+    assert_eq!(fs::read(&session_path).unwrap(), retained);
+    assert!(process_is_alive(leader) && process_is_alive(worker));
+
+    watch.crash_controller();
+    let child_live = recover();
+    assert!(!child_live.status.success());
+    assert!(stderr(&child_live).contains(&format!("process {leader} is still running")));
+    assert_eq!(fs::read(&session_path).unwrap(), retained);
+    assert!(process_is_alive(leader) && process_is_alive(worker));
+
+    assert_eq!(
+        unsafe { libc::kill(leader as libc::pid_t, libc::SIGKILL) },
+        0
+    );
+    assert!(wait_for_process_exit(leader, Duration::from_secs(3)));
+    let group_live = recover();
+    assert!(!group_live.status.success());
+    assert!(stderr(&group_live).contains(&format!("process group {leader} is still active")));
+    assert_eq!(fs::read(&session_path).unwrap(), retained);
+    assert!(
+        process_is_alive(worker),
+        "acknowledgement must not signal live processes"
+    );
+
+    drop(watch);
+    assert!(wait_for_process_exit(worker, Duration::from_secs(3)));
+    let recovered = recover();
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+    assert_eq!(read_source_watch_session(&root)["closed"], true);
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_watch_interactive_setup_requires_completion_evidence() {
     for mode in ["success", "cancel", "detached"] {
         let root = TestDir::new("dev-watch-interactive-completion");
