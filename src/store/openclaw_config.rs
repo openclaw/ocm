@@ -602,7 +602,7 @@ fn minimum_local_config_value(
     Ok(value)
 }
 
-pub(crate) fn dev_ui_gateway_url(paths: &EnvPaths, port: u32) -> Result<String, String> {
+pub(crate) fn dev_ui_gateway_base_path(paths: &EnvPaths) -> Result<String, String> {
     let config = load_effective_openclaw_config(&paths.config_path)?
         .map(|config| config.value)
         .unwrap_or_else(|| json!({}));
@@ -631,9 +631,14 @@ pub(crate) fn dev_ui_gateway_url(paths: &EnvPaths, port: u32) -> Result<String, 
     }
     let base = match control_ui.and_then(|value| value.get("basePath")) {
         None | Some(Value::Null) => "",
-        Some(Value::String(value)) => value.trim().trim_matches('/'),
+        Some(Value::String(value)) => value,
         Some(_) => return Err("gateway.controlUi.basePath must be a URL path".to_string()),
     };
+    Ok(base.to_string())
+}
+
+pub(crate) fn dev_ui_gateway_url(base: &str, port: u32) -> Result<String, String> {
+    let base = base.trim().trim_matches('/');
     if base.contains(['?', '#', '\\']) || base.split('/').any(|part| matches!(part, "." | "..")) {
         return Err("gateway.controlUi.basePath must be a URL path without a query, fragment, or dot segments".to_string());
     }

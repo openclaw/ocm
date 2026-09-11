@@ -1574,6 +1574,7 @@ fn dev_ui_reuse_gets_fresh_grants_without_restarting_components() {
         let ui = initial_ui_process(&root, "ui", &mut controller);
         ui_dashboard_pid(&root, 1);
         wait_for_ui_command_cleanup(&root);
+        assert!(!root.child("config-attempts").exists());
         let initial = read_source_watch_session(&root);
         assert_eq!(initial["kind"], "ocm-source-ui-session-v1");
         assert_eq!(initial["watching"], watching);
@@ -1615,6 +1616,201 @@ fn dev_ui_reuse_gets_fresh_grants_without_restarting_components() {
         assert!(!stdout(&output).contains("synthetic-owner-grant-2"));
         assert!(!stdout(&output).contains("synthetic-owner-grant-3"));
         assert!(!ui_handoff_directory(&initial).exists());
+    }
+}
+
+#[cfg(unix)]
+fn create_ui_config_environment(
+    repo: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+) -> ocm::env::EnvMeta {
+    ocm::store::create_environment(
+        ocm::env::CreateEnvironmentOptions {
+            name: "demo".to_string(),
+            root: None,
+            gateway_port: None,
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: None,
+            dev: Some(EnvDevMeta::Borrowed {
+                source_root: path_string(&fs::canonicalize(repo).unwrap()),
+            }),
+            protected: false,
+        },
+        env,
+        repo,
+    )
+    .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_ui_resolves_native_config_once_and_reuses_the_captured_target() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (variant, expected_base) in [
+        ("caller", "/caller"),
+        ("config", "/configured"),
+        ("config-vars", "/vars"),
+        ("workspace-dotenv", "/workspace"),
+        ("state-dotenv", "/state"),
+    ] {
+        let root = TestDir::new(&format!("dev-ui-native-config-{variant}"));
+        let mut env = ocm_env(&root);
+        let repo = prepare_initial_ui_repo(&root, &mut env);
+        env.insert("OCM_ACTIVE_ENV".to_string(), "another-env".to_string());
+        env.insert("OPENCLAW_GATEWAY_PORT".to_string(), "1".to_string());
+        let meta = create_ui_config_environment(&repo, &env);
+        let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
+        let include_path = config_path.with_file_name("control-ui.json");
+        let include = br#"{"basePath":"${UI_BASE}/${OCM_ACTIVE_ENV}/${OPENCLAW_GATEWAY_PORT}"}"#;
+        fs::write(&include_path, include).unwrap();
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config["gateway"]["controlUi"] = serde_json::json!({"$include": "./control-ui.json"});
+        config["env"] = serde_json::json!({"vars": {"UI_BASE": "/vars"}});
+        if variant != "config-vars" {
+            config["env"]["UI_BASE"] = "/configured".into();
+        }
+        match variant {
+            "caller" => {
+                env.insert("UI_BASE".to_string(), "/caller".to_string());
+            }
+            "workspace-dotenv" => fs::write(repo.join(".env"), "UI_BASE=/workspace\n").unwrap(),
+            "state-dotenv" => {
+                fs::write(config_path.with_file_name(".env"), "UI_BASE=/state\n").unwrap()
+            }
+            _ => {}
+        }
+        let config_bytes = serde_json::to_vec_pretty(&config).unwrap();
+        fs::write(&config_path, &config_bytes).unwrap();
+        fs::write(root.child("gateway-document-ready"), "ready").unwrap();
+        let args = ["dev", "demo", "--no-watch", "--ui"];
+        let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &args);
+        let gateway = initial_ui_process(&root, "gateway", &mut controller);
+        let ui = initial_ui_process(&root, "ui", &mut controller);
+        ui_dashboard_pid(&root, 1);
+        wait_for_ui_command_cleanup(&root);
+        let expected = format!(
+            "http://127.0.0.1:{}{expected_base}/demo/{}/",
+            gateway["port"].as_u64().unwrap(),
+            gateway["port"].as_u64().unwrap(),
+        );
+        let initial = read_source_watch_session(&root);
+        assert_eq!(initial["ui"]["target"]["gatewayUrl"], expected, "{variant}");
+        assert_eq!(ui["gatewayUrl"], expected, "{variant}");
+        let native_reads = fs::read(root.child("config-attempts")).unwrap();
+        assert_eq!(String::from_utf8_lossy(&native_reads).lines().count(), 1);
+
+        let mut caller_env = env.clone();
+        caller_env.insert("UI_BASE".to_string(), "/different-caller".to_string());
+        let mut caller = DevWatchFixture::spawn_caller(&root, &repo, &caller_env, &args);
+        let reused = caller.wait_without_release_for(Duration::from_secs(5));
+        assert!(reused.status.success(), "{variant}: {}", stderr(&reused));
+        assert!(stdout(&reused).contains("synthetic-owner-grant-2"));
+        assert_eq!(
+            fs::read(root.child("config-attempts")).unwrap(),
+            native_reads
+        );
+        assert_eq!(read_source_watch_session(&root)["ui"], initial["ui"]);
+        assert_eq!(fs::read(&config_path).unwrap(), config_bytes);
+        assert_eq!(fs::read(&include_path).unwrap(), include);
+        let stopped = run_dev_stop(&repo, &env);
+        assert!(stopped.status.success(), "{variant}: {}", stderr(&stopped));
+        let output = controller.wait_without_release();
+        assert_eq!(output.status.code(), Some(130));
+        assert!(stdout(&output).contains("synthetic-owner-grant-1"));
+        assert!(!stderr(&output).contains("synthetic-private-config"));
+        assert_eq!(read_source_watch_session(&root)["closed"], true);
+        for process in [gateway, ui] {
+            assert!(wait_for_process_exit(
+                process["pid"].as_u64().unwrap() as u32,
+                Duration::from_secs(3),
+            ));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_ui_native_config_failures_and_cancellation_preserve_private_output_and_state() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (variant, expected) in [
+        ("fail", "could not resolve gateway.controlUi.basePath"),
+        ("malformed", "did not return a string"),
+        ("unresolved", "still contains an environment placeholder"),
+        ("unsafe-path", "without a query, fragment, or dot segments"),
+        ("cancel", ""),
+    ] {
+        let root = TestDir::new(&format!("dev-ui-config-{variant}"));
+        let mut env = ocm_env(&root);
+        let repo = prepare_initial_ui_repo(&root, &mut env);
+        let meta = create_ui_config_environment(&repo, &env);
+        let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config["gateway"]["controlUi"] = serde_json::json!({"basePath": "${UI_BASE}"});
+        let config_bytes = serde_json::to_vec_pretty(&config).unwrap();
+        fs::write(&config_path, &config_bytes).unwrap();
+        if variant != "unresolved" {
+            env.insert(
+                "UI_BASE".to_string(),
+                if variant == "unsafe-path" {
+                    "/../private"
+                } else {
+                    "/console"
+                }
+                .to_string(),
+            );
+        }
+        if matches!(variant, "fail" | "malformed" | "cancel") {
+            fs::write(
+                root.child(if variant == "cancel" {
+                    "config-hold".to_string()
+                } else {
+                    format!("config-{variant}")
+                }),
+                "hold",
+            )
+            .unwrap();
+        }
+        let mut controller =
+            DevWatchFixture::spawn(&root, &repo, &env, &["dev", "demo", "--no-watch", "--ui"]);
+        assert!(wait_for_path(
+            &root.child("config-attempts"),
+            Duration::from_secs(10)
+        ));
+        let query_pid = fs::read_to_string(root.child("config-attempts"))
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        if variant == "cancel" {
+            let stopped = run_dev_stop(&repo, &env);
+            assert!(stopped.status.success(), "{}", stderr(&stopped));
+        }
+        let output = controller.wait_without_release();
+        assert_eq!(
+            output.status.code(),
+            Some(if variant == "cancel" { 130 } else { 1 })
+        );
+        assert!(
+            stderr(&output).contains(expected),
+            "{variant}: {}",
+            stderr(&output)
+        );
+        assert!(!stdout(&output).contains("synthetic-private-config"));
+        assert!(!stderr(&output).contains("synthetic-private-config"));
+        assert!(!root.child("gateway.json").exists());
+        assert!(!root.child("ui.json").exists());
+        assert_eq!(fs::read(&config_path).unwrap(), config_bytes);
+        let session = read_source_watch_session(&root);
+        assert_eq!(session["closed"], true, "{variant}");
+        assert!(session["ui"]["children"].as_object().unwrap().is_empty());
+        assert!(session["ui"]["pending"].is_null());
+        assert!(wait_for_process_exit(query_pid, Duration::from_secs(3)));
     }
 }
 

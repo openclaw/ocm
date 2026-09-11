@@ -640,14 +640,13 @@ impl Cli {
         source: &Path,
         lease: &mut SourceWatchLease,
         stop: &AtomicBool,
-    ) -> SourceWatchResult<()> {
+    ) -> SourceWatchResult<i32> {
         if source_watch_cancelled(lease, stop)? {
-            return Err("dev UI setup was cancelled".to_string().into());
+            return Ok(130);
         }
-        let gateway_url = crate::store::dev_ui_gateway_url(
-            &derive_env_paths(Path::new(&meta.root)),
-            meta.gateway_port.unwrap_or_default(),
-        )?;
+        let base =
+            crate::store::dev_ui_gateway_base_path(&derive_env_paths(Path::new(&meta.root)))?;
+        crate::store::dev_ui_gateway_url(&base, meta.gateway_port.unwrap_or_default())?;
         if !source.join("scripts/ui.js").is_file() || !source.join("ui/index.html").is_file() {
             return Err("the selected source does not contain the native Control UI development entry point".to_string().into());
         }
@@ -682,17 +681,32 @@ for (const name of ['vite', 'dompurify']) {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let output = self
-            .run_owned_source_watch_command(
-                probe,
-                lease,
-                stop,
-                SourcePreparationCommand::DependencyProbe,
-            )?
-            .ok_or_else(|| SourceWatchError::from("dev UI setup was cancelled".to_string()))?;
+        let Some(output) = self.run_owned_source_watch_command(
+            probe,
+            lease,
+            stop,
+            SourcePreparationCommand::DependencyProbe,
+        )?
+        else {
+            return Ok(130);
+        };
+        if source_watch_cancelled(lease, stop)? {
+            return Ok(130);
+        }
         if !output.status.success() {
             return Err("Control UI dependencies are not ready; run pnpm install --frozen-lockfile in the selected checkout before retrying dev, or use --no-ui for Gateway-only development".to_string().into());
         }
+        let base = if base.contains("${") {
+            let Some(base) = self.resolve_native_dev_ui_base_path(meta, source, lease, stop)?
+            else {
+                return Ok(130);
+            };
+            base
+        } else {
+            base
+        };
+        let gateway_url =
+            crate::store::dev_ui_gateway_url(&base, meta.gateway_port.unwrap_or_default())?;
         let service = self.environment_service();
         let _operation = service.lock_operation(&meta.name)?;
         // Serialize selection, persistent reservation, and the session claim
@@ -733,7 +747,60 @@ for (const name of ['vite', 'dompurify']) {
                 gateway_url: gateway_url.clone(),
             })
         })?;
-        Ok(())
+        Ok(0)
+    }
+
+    fn resolve_native_dev_ui_base_path(
+        &self,
+        meta: &EnvMeta,
+        source: &Path,
+        lease: &mut SourceWatchLease,
+        stop: &AtomicBool,
+    ) -> SourceWatchResult<Option<String>> {
+        let mut command = source_watch_node_command(
+            "scripts/run-node.mjs",
+            &[
+                "config".to_string(),
+                "get".to_string(),
+                "gateway.controlUi.basePath".to_string(),
+                "--json".to_string(),
+            ],
+        );
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_clear()
+            .envs(build_openclaw_dev_source_env(meta, &self.env, source))
+            .current_dir(source);
+        // Use OpenClaw's read-only config command so its dotenv, config.env and
+        // shell environment rules stay owned by the selected source. Both
+        // output streams stay private, including failures and cancellation.
+        let Some(output) = self.run_owned_source_watch_command(
+            command,
+            lease,
+            stop,
+            SourcePreparationCommand::CapturedSource,
+        )?
+        else {
+            return Ok(None);
+        };
+        if source_watch_cancelled(lease, stop)? {
+            return Ok(None);
+        }
+        if !output.status.success() {
+            return Err(format!(
+                "OpenClaw could not resolve gateway.controlUi.basePath; inspect it with {} @{} -- config get gateway.controlUi.basePath --json before retrying dev, or use --no-ui",
+                self.command_example(), meta.name,
+            ).into());
+        }
+        let base: String = serde_json::from_slice(&output.stdout).map_err(|_| {
+            "OpenClaw did not return a string for gateway.controlUi.basePath; use a literal URL path or --no-ui".to_string()
+        })?;
+        if base.contains("${") {
+            return Err("gateway.controlUi.basePath still contains an environment placeholder; set its variables in the environment or OpenClaw config, use a concrete URL path, or pass --no-ui".to_string().into());
+        }
+        Ok(Some(base))
     }
 
     pub(super) fn run_source_gateway_ui(

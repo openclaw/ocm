@@ -133,6 +133,12 @@ reservation. Removing the environment releases it. `ocm dev status luna` reports
 the address. On Linux, macOS, and Windows, a matching repeated start requests a
 fresh native browser grant from the existing controller without restarting
 Gateway or Vite. Busy or unready requests report a pending link.
+Templated `gateway.controlUi.basePath` values are resolved by the selected
+checkout's native config command before startup, including OpenClaw's `.env`
+and config environment rules. The private read preserves the authored config,
+and repeated starts keep the original controller's resolved target. If variables
+remain unresolved, supply them or use a concrete base path before retrying;
+`--no-ui` still starts the Gateway without a UI target.
 Older OCM controllers retain address-only reuse and report fresh links as
 unavailable until that dev session is restarted.
 `ocm dev stop luna` stops the components together. A pending initial request gets

@@ -111,6 +111,7 @@ type SourceWatchResult<T> = Result<T, SourceWatchError>;
 #[derive(Clone, Copy)]
 enum SourcePreparationCommand {
     Source,
+    CapturedSource,
     DependencyInstall,
     DependencyProbe,
 }
@@ -697,10 +698,10 @@ impl Cli {
                 .environment_service()
                 .apply_effective_gateway_port(current)?;
             if ui {
-                crate::store::dev_ui_gateway_url(
-                    &derive_env_paths(Path::new(&prepared.root)),
-                    prepared.gateway_port.unwrap_or_default(),
-                )?;
+                let base = crate::store::dev_ui_gateway_base_path(&derive_env_paths(Path::new(
+                    &prepared.root,
+                )))?;
+                crate::store::dev_ui_gateway_url(&base, prepared.gateway_port.unwrap_or_default())?;
             }
             self.bootstrap_dev_env(&prepared)?;
             Ok::<_, String>(prepared)
@@ -759,7 +760,7 @@ impl Cli {
             )
             .and_then(|code| {
                 if code == 0 && ui {
-                    self.prepare_dev_ui(
+                    return self.prepare_dev_ui(
                         &meta,
                         dev.execution_source_root()?,
                         source_watch_lease
@@ -768,7 +769,7 @@ impl Cli {
                         watch_stop
                             .as_deref()
                             .ok_or_else(|| "dev UI cancellation state is missing".to_string())?,
-                    )?;
+                    );
                 }
                 Ok(code)
             });
@@ -1057,8 +1058,11 @@ impl Cli {
         if !matches!(&preparation, Ok(0)) {
             return finish_source_watch_session(&meta.name, lease, preparation, Ok(()), false);
         }
-        if ui && let Err(error) = self.prepare_dev_ui(&meta, &repo_root, lease, &watch_stop) {
-            return finish_source_watch_session(&meta.name, lease, Err(error), Ok(()), false);
+        if ui {
+            let preparation = self.prepare_dev_ui(&meta, &repo_root, lease, &watch_stop);
+            if !matches!(&preparation, Ok(0)) {
+                return finish_source_watch_session(&meta.name, lease, preparation, Ok(()), false);
+            }
         }
         let stderr_profile = self.dev_stderr_profile();
         self.stderr_lines(render_source_watch_takeover_summary(
@@ -1666,7 +1670,10 @@ impl Cli {
             return Ok(None);
         }
         lease.configure_child(&mut command);
-        let terminal = !matches!(kind, SourcePreparationCommand::DependencyProbe);
+        let terminal = !matches!(
+            kind,
+            SourcePreparationCommand::DependencyProbe | SourcePreparationCommand::CapturedSource
+        );
         let mut guard = SourceWatchProcessGuard::new_with_terminal(terminal)?;
         #[cfg(unix)]
         {

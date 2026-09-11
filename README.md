@@ -156,6 +156,14 @@ OCM prints the session's UI address, then its initial native owner link after
 both Vite and the Gateway Control UI document are ready. The native handoff keeps
 the Gateway identity and credentials; only the browser document moves to Vite.
 UI requires a local HTTP Gateway with Control UI enabled and installed UI dependencies.
+For a templated `gateway.controlUi.basePath` such as `${UI_BASE}`, OCM reads the
+effective path through the selected checkout's native config command. OpenClaw
+resolves its environment, `.env` files, and config-provided variables; OCM keeps
+that read private and leaves the authored config unchanged. An unresolved
+placeholder is an error: supply its value or use a concrete path before retrying.
+The resolved target stays captured for the session, including repeated starts
+from terminals with different environment variables. Literal paths need no
+additional config command.
 `--service` uses the background workflow without foreground watching or UI and
 rejects explicit `--watch` or `--ui`.
 

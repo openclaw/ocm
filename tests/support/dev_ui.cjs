@@ -7,17 +7,60 @@ const root = process.env.OCM_TEST_DEV_UI_DIR;
 const file = (name) => path.join(root, name);
 const exists = (name) => fs.existsSync(file(name));
 const config = JSON.parse(fs.readFileSync(process.env.OPENCLAW_CONFIG_PATH, "utf8"));
+const controlUi = config.gateway.controlUi?.$include
+  ? JSON.parse(fs.readFileSync(path.resolve(path.dirname(process.env.OPENCLAW_CONFIG_PATH), config.gateway.controlUi.$include), "utf8"))
+  : config.gateway.controlUi;
+// Controlled peers implement only the config inputs used by these CLI tests.
+// Native OpenClaw remains the authority for its complete config/env semantics.
+const nativeEnv = {...process.env};
+for (const dotenv of [path.join(process.cwd(), ".env"), path.join(path.dirname(process.env.OPENCLAW_CONFIG_PATH), ".env")]) {
+  if (!fs.existsSync(dotenv)) continue;
+  for (const line of fs.readFileSync(dotenv, "utf8").split(/\r?\n/)) {
+    const entry = /^([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line);
+    if (entry && nativeEnv[entry[1]] === undefined) nativeEnv[entry[1]] = entry[2];
+  }
+}
+for (const [key, value] of Object.entries({...config.env?.vars, ...config.env})) {
+  if (typeof value === "string" && value.trim() && !value.includes("${") && !nativeEnv[key]?.trim()) {
+    nativeEnv[key] = value;
+  }
+}
+const resolvedBase = String(controlUi?.basePath ?? "").replace(/\$\$?\{([A-Z_][A-Z0-9_]*)\}/g,
+  (reference, name) => reference.startsWith("$$") ? reference.slice(1) : nativeEnv[name] || reference);
 const gatewayPort = Number(process.env.OPENCLAW_GATEWAY_PORT);
-const base = String(config.gateway.controlUi?.basePath ?? "").replace(/^\/+|\/+$/g, "");
+const base = resolvedBase.replace(/^\/+|\/+$/g, "");
 const documentPath = base ? `/${base}/` : "/";
 const gatewayUrl = `http://127.0.0.1:${gatewayPort}${documentPath}`;
-const role = process.argv.includes("dashboard")
+const role = process.argv.includes("config")
+  ? "config"
+  : process.argv.includes("dashboard")
   ? "dashboard"
   : process.argv[1].endsWith("ui.js")
     ? "ui"
     : "gateway";
 
-if (role === "dashboard") {
+if (role === "config") {
+  if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(["config", "get", "gateway.controlUi.basePath", "--json"])) {
+    throw new Error("unexpected native config read");
+  }
+  fs.appendFileSync(file("config-attempts"), `${process.pid}\n`);
+  process.stderr.write("synthetic-private-config-diagnostic\n");
+  process.once("SIGTERM", () => process.exit(143));
+  const timer = setInterval(() => {
+    if (exists("source-watch.release")) process.exit(0);
+    if (exists("config-hold")) return;
+    clearInterval(timer);
+    if (exists("config-fail")) {
+      process.stdout.write("synthetic-private-config-output\n");
+      process.exit(7);
+    }
+    if (exists("config-malformed")) {
+      process.stdout.write("synthetic-private-config-output\n");
+    } else {
+      console.log(JSON.stringify(resolvedBase));
+    }
+  }, 20);
+} else if (role === "dashboard") {
   const attempts = file("dashboard-attempts");
   fs.appendFileSync(attempts, `${process.pid}\n`);
   const count = fs.readFileSync(attempts, "utf8").trim().split("\n").length;

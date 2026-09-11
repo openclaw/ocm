@@ -66,7 +66,7 @@ pub use layout::{
 };
 pub(crate) use openclaw_config::{
     OpenClawConfigAudit, audit_openclaw_config, clear_skip_bootstrap_for_openclaw_onboarding,
-    dev_ui_gateway_url, ensure_minimum_local_openclaw_config,
+    dev_ui_gateway_base_path, dev_ui_gateway_url, ensure_minimum_local_openclaw_config,
     normalize_new_environment_sandbox_origin, openclaw_config_include_paths,
     openclaw_config_uses_includes, reject_include_owned_agent_workspaces,
     reject_include_owned_sandbox_origin, repair_openclaw_config,
