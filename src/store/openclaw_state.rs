@@ -308,7 +308,7 @@ fn rewrite_runtime_state_root_refs_inner(
     Ok(())
 }
 
-fn relocate_installed_plugin_index_paths(
+pub(super) fn relocate_installed_plugin_index_paths(
     database_path: &Path,
     source_state_root: &Path,
     target_state_root: &Path,
@@ -340,16 +340,26 @@ fn relocate_installed_plugin_index_paths(
             )
         })?
         .is_some();
-    if !table_exists {
-        return Ok(MigratedRuntimeStateResult::default());
-    }
+    let (select_sql, update_sql) = if table_exists {
+        (
+            "SELECT install_records_json FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'",
+            "UPDATE installed_plugin_index SET install_records_json = ?1 WHERE index_key = 'installed-plugin-index'",
+        )
+    } else {
+        let machine_state_exists = connection
+            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_machine_state'", [], |_| Ok(()))
+            .optional().map_err(|error| error.to_string())?.is_some();
+        if !machine_state_exists {
+            return Ok(MigratedRuntimeStateResult::default());
+        }
+        (
+            "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'",
+            "UPDATE config_machine_state SET value_json = ?1 WHERE state_key = 'plugins.installedIndex'",
+        )
+    };
 
     let Some(raw_records) = connection
-        .query_row(
-            "SELECT install_records_json FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
+        .query_row(select_sql, [], |row| row.get::<_, String>(0))
         .optional()
         .map_err(|error| {
             format!(
@@ -361,13 +371,21 @@ fn relocate_installed_plugin_index_paths(
         return Ok(MigratedRuntimeStateResult::default());
     };
 
-    let mut records: Value = serde_json::from_str(&raw_records).map_err(|error| {
+    let mut document: Value = serde_json::from_str(&raw_records).map_err(|error| {
         format!(
             "failed to parse imported OpenClaw plugin install records {}: {error}",
             display_path(&database_path)
         )
     })?;
-    let Some(records) = records.as_object_mut() else {
+    let records = if table_exists {
+        document.as_object_mut()
+    } else {
+        document
+            .get_mut("index")
+            .and_then(|index| index.get_mut("installRecords"))
+            .and_then(Value::as_object_mut)
+    };
+    let Some(records) = records else {
         return Err(format!(
             "imported OpenClaw plugin install records are not an object: {}",
             display_path(&database_path)
@@ -419,10 +437,7 @@ fn relocate_installed_plugin_index_paths(
     }
 
     connection
-        .execute(
-            "UPDATE installed_plugin_index SET install_records_json = ?1 WHERE index_key = 'installed-plugin-index'",
-            [Value::Object(records.clone()).to_string()],
-        )
+        .execute(update_sql, [document.to_string()])
         .map_err(|error| {
             format!(
                 "failed to relocate imported OpenClaw plugin install records {}: {error}",

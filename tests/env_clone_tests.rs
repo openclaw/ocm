@@ -3,9 +3,92 @@ mod support;
 use std::fs;
 use std::path::Path;
 
+use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout, write_text};
+
+#[test]
+fn env_clone_relocates_plugin_registry_without_changing_source() {
+    check_clone_plugin_registry(false);
+}
+
+#[test]
+fn env_clone_relocates_folded_plugin_registry_without_changing_source() {
+    check_clone_plugin_registry(true);
+}
+
+fn check_clone_plugin_registry(folded: bool) {
+    let root = TestDir::new("clone-plugin-registry");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    let target = root.child("ocm-home/envs/target/.openclaw");
+    let relative = "npm/projects/demo/node_modules/demo";
+    write_text(&source.join(relative).join("index.js"), "original");
+    fs::create_dir_all(source.join("state")).unwrap();
+    let db_path = source.join("state/openclaw.sqlite");
+    let records = serde_json::json!({"demo": {
+        "source": "npm",
+        "installPath": source.join(relative),
+        "sourcePath": source.join(relative)
+    }});
+    {
+        let db = Connection::open(&db_path).unwrap();
+        if folded {
+            db.execute_batch("CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT NOT NULL)").unwrap();
+            db.execute("INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?1)",
+                [serde_json::json!({"revision": 42, "index": {"installRecords": records, "plugins": [], "diagnostics": []}}).to_string()]).unwrap();
+        } else {
+            db.execute_batch("CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT NOT NULL)").unwrap();
+            db.execute(
+                "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1)",
+                [records.to_string()],
+            )
+            .unwrap();
+        }
+    }
+    let before = fs::read(&db_path).unwrap();
+    let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+    assert!(clone.status.success(), "{}", stderr(&clone));
+    let db = Connection::open(target.join("state/openclaw.sqlite")).unwrap();
+    let raw: String = db
+        .query_row(
+            if folded {
+                "SELECT value_json FROM config_machine_state"
+            } else {
+                "SELECT install_records_json FROM installed_plugin_index"
+            },
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let document: Value = serde_json::from_str(&raw).unwrap();
+    let copied = if folded {
+        assert_eq!(document["revision"], 42);
+        &document["index"]["installRecords"]
+    } else {
+        &document
+    };
+    for field in ["installPath", "sourcePath"] {
+        assert_eq!(
+            copied["demo"][field],
+            target.join(relative).to_str().unwrap()
+        );
+    }
+    write_text(
+        &Path::new(copied["demo"]["installPath"].as_str().unwrap()).join("index.js"),
+        "updated",
+    );
+    assert_eq!(fs::read(&db_path).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(source.join(relative).join("index.js")).unwrap(),
+        "original"
+    );
+}
 
 #[test]
 fn env_clone_copies_state_into_a_new_environment() {
