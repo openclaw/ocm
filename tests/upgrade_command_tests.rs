@@ -369,6 +369,10 @@ case "$1" in
           printf '{{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{{"checkId":"core/doctor/lint-selection","severity":"error","message":"Unknown health check id selected by --only: codex/managed-app-server.","path":"codex/managed-app-server"}}]}}\n'
           exit 1
           ;;
+        mixed)
+          printf '{{"ok":false,"checksRun":1,"checksSkipped":1,"findings":[{{"checkId":"core/doctor/lint-selection","severity":"error","message":"Unknown health check id selected by --only: codex/managed-app-server.","path":"codex/managed-app-server"}},{{"checkId":"core/doctor/final-config-validation","severity":"error","message":"Invalid configuration","path":"meta.lastTouchedAt"}}]}}\n'
+          exit 1
+          ;;
       esac
     fi
     has_arg "--non-interactive" "$@" && has_arg "--fix" "$@" || {{
@@ -6443,6 +6447,35 @@ fn upgrade_validates_managed_codex_candidate_before_finalization() {
         .find("update finalize --json --yes --no-restart")
         .expect("target finalization must run");
     assert!(candidate < finalize, "{command_log}");
+}
+
+#[test]
+fn upgrade_rejects_mixed_unsupported_candidate_failure_before_finalization() {
+    let root = TestDir::new("upgrade-codex-candidate-mixed-failure");
+    let (cwd, mut env, _env_root) = setup_named_runtime_candidate_fixture(&root);
+    env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "mixed".to_string());
+    let command_log_path = root.child("mixed-failure-commands.log");
+    env.insert(
+        "OCM_TEST_COMMAND_LOG".to_string(),
+        path_string(&command_log_path),
+    );
+
+    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new-local"]);
+    assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
+    assert!(
+        stdout(&upgrade).contains("candidate managed Codex preflight failed"),
+        "{}",
+        stdout(&upgrade)
+    );
+
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let env_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert_eq!(env_json["defaultRuntime"], "old-local");
+
+    let command_log = fs::read_to_string(command_log_path).unwrap();
+    assert!(command_log.contains("doctor --lint --only codex/managed-app-server --json"));
+    assert!(!command_log.contains("update finalize"), "{command_log}");
 }
 
 #[test]

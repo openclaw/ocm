@@ -5582,42 +5582,91 @@ fn command_output_reports_unsupported_command(stdout: &str, stderr: &str) -> boo
     })
 }
 
-fn candidate_codex_preflight_is_unsupported(stdout: &str, stderr: &str) -> bool {
+fn candidate_codex_preflight_json_is_unsupported(value: &Value, stderr: &str) -> bool {
     const CHECK_ID: &str = "codex/managed-app-server";
-    if let Ok(value) = serde_json::from_str::<Value>(stdout)
-        && value
-            .get("findings")
-            .and_then(Value::as_array)
-            .is_some_and(|findings| {
-                findings.iter().any(|finding| {
-                    finding.get("checkId").and_then(Value::as_str)
-                        == Some("core/doctor/lint-selection")
-                        && finding.get("path").and_then(Value::as_str) == Some(CHECK_ID)
-                        && finding
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .is_some_and(|message| {
-                                message.contains("Unknown health check id selected by --only")
-                            })
-                })
-            })
-    {
-        return true;
+    if !stderr.trim().is_empty() {
+        return false;
     }
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object
+        .get("ok")
+        .is_some_and(|value| value.as_bool() != Some(false))
+        || object
+            .get("checksRun")
+            .is_some_and(|value| value.as_u64() != Some(0))
+        || object
+            .get("checksSkipped")
+            .is_some_and(|value| value.as_u64().is_none())
+    {
+        return false;
+    }
+    let Some([finding]) = object
+        .get("findings")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+    else {
+        return false;
+    };
+    finding.get("checkId").and_then(Value::as_str) == Some("core/doctor/lint-selection")
+        && finding.get("path").and_then(Value::as_str) == Some(CHECK_ID)
+        && finding
+            .get("severity")
+            .is_none_or(|value| value.as_str() == Some("error"))
+        && finding
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.trim().trim_end_matches('.')
+                    == "Unknown health check id selected by --only: codex/managed-app-server"
+            })
+}
 
-    let normalized = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-    [
-        "unknown command 'doctor'",
-        "unknown command \"doctor\"",
-        "unrecognized command 'doctor'",
-        "unrecognized command \"doctor\"",
-        "unknown option '--lint'",
-        "unknown option \"--lint\"",
-        "unrecognized option '--lint'",
-        "unrecognized option \"--lint\"",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
+fn candidate_codex_preflight_text_is_unsupported(stdout: &str, stderr: &str) -> bool {
+    let mut unsupported_lines = 0;
+    for line in stdout.lines().chain(stderr.lines()) {
+        let normalized = line.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        let diagnostic = normalized
+            .strip_prefix("error: ")
+            .unwrap_or(&normalized)
+            .trim_end_matches('.');
+        if [
+            "unknown command 'doctor'",
+            "unknown command \"doctor\"",
+            "unrecognized command 'doctor'",
+            "unrecognized command \"doctor\"",
+            "unknown option '--lint'",
+            "unknown option \"--lint\"",
+            "unrecognized option '--lint'",
+            "unrecognized option \"--lint\"",
+        ]
+        .contains(&diagnostic)
+        {
+            unsupported_lines += 1;
+            continue;
+        }
+        if normalized.starts_with("usage:") || normalized.starts_with("for more information") {
+            continue;
+        }
+        return false;
+    }
+    unsupported_lines == 1
+}
+
+fn candidate_codex_preflight_is_unsupported(stdout: &str, stderr: &str) -> bool {
+    let trimmed_stdout = stdout.trim();
+    if !trimmed_stdout.is_empty() {
+        match serde_json::from_str::<Value>(trimmed_stdout) {
+            Ok(value) => return candidate_codex_preflight_json_is_unsupported(&value, stderr),
+            Err(_) if trimmed_stdout.starts_with(['{', '[']) => return false,
+            Err(_) => {}
+        }
+    }
+    candidate_codex_preflight_text_is_unsupported(stdout, stderr)
 }
 
 fn shell_command(command: &str) -> Command {
@@ -6072,12 +6121,22 @@ mod tests {
     #[test]
     fn codex_candidate_probe_only_skips_explicit_unsupported_results() {
         assert!(candidate_codex_preflight_is_unsupported(
-            r#"{"findings":[{"checkId":"core/doctor/lint-selection","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
+            r#"{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
             ""
         ));
+        for checks_skipped in [0, 4] {
+            let output = format!(
+                r#"{{"ok":false,"checksRun":0,"checksSkipped":{checks_skipped},"findings":[{{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}}]}}"#
+            );
+            assert!(candidate_codex_preflight_is_unsupported(&output, ""));
+        }
         assert!(candidate_codex_preflight_is_unsupported(
             "",
             "error: unknown option '--lint'"
+        ));
+        assert!(candidate_codex_preflight_is_unsupported(
+            "",
+            "error: unknown option '--lint'\n\nUsage: openclaw doctor [options]"
         ));
         assert!(!candidate_codex_preflight_is_unsupported(
             r#"{"findings":[{"checkId":"codex/managed-app-server","path":"/candidate/codex","message":"version mismatch"}]}"#,
@@ -6086,6 +6145,34 @@ mod tests {
         assert!(!candidate_codex_preflight_is_unsupported(
             "",
             "managed Codex binary command not found"
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."},{"checkId":"core/doctor/final-config-validation","severity":"error","message":"Invalid configuration"}]}"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server; invalid configuration"}]}"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":true,"checksRun":1,"checksSkipped":0,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"checksRun":0,"checksSkipped":"4","findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"findings":[{"checkId":"core/doctor/lint-selection","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
+            "fatal: staged runtime could not load its configuration"
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            "",
+            "error: unknown option '--lint'\nfatal: staged runtime could not load its configuration"
         ));
     }
 }
