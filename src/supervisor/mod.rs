@@ -67,6 +67,9 @@ const SERVICE_PROXY_ENV_KEYS: [&str; 8] = [
     "all_proxy",
 ];
 const SERVICE_EXTRA_ENV_KEYS: [&str; 2] = ["NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA"];
+// Native CLIs use the account name to find their existing login (for example,
+// Claude's macOS Keychain account). Keep it across both service boundaries.
+const SERVICE_USER_ENV_KEYS: [&str; 2] = ["USER", "LOGNAME"];
 const SUPERVISED_CHILD_BASE_ENV_KEYS: [&str; 5] = ["HOME", "PATH", "OCM_HOME", "OCM_SELF", "SHELL"];
 const SUPERVISED_CHILD_RUNTIME_ENV_KEYS: [&str; 4] =
     ["NODE_OPTIONS", "NODE_ENV", "NODE_PATH", "PNPM_HOME"];
@@ -2571,7 +2574,10 @@ fn supervisor_service_environment(
             service_env.insert(key.to_string(), value.trim().to_string());
         }
     }
-    for key in SERVICE_EXTRA_ENV_KEYS {
+    for key in SERVICE_EXTRA_ENV_KEYS
+        .into_iter()
+        .chain(SERVICE_USER_ENV_KEYS)
+    {
         if let Some(value) = process_env
             .get(key)
             .filter(|value| !value.trim().is_empty())
@@ -2830,6 +2836,7 @@ fn stable_supervised_child_env_key(key: &str) -> bool {
         || key.starts_with("npm_config_")
         || key.starts_with("COREPACK_")
         || SUPERVISED_CHILD_BASE_ENV_KEYS.contains(&key)
+        || SERVICE_USER_ENV_KEYS.contains(&key)
         || SUPERVISED_CHILD_RUNTIME_ENV_KEYS.contains(&key)
         || SERVICE_PROXY_ENV_KEYS.contains(&key)
         || SERVICE_EXTRA_ENV_KEYS.contains(&key)
@@ -4091,6 +4098,36 @@ mod tests {
         assert!(!process_env.contains_key("OPENCLAW_LAUNCHD_LABEL"));
         assert!(!process_env.contains_key("OPENCLAW_SYSTEMD_UNIT"));
         assert!(!process_env.contains_key("OPENCLAW_WINDOWS_TASK_NAME"));
+    }
+
+    #[test]
+    fn service_environments_preserve_only_nonempty_user_identity() {
+        for (user, logname) in [(" fixture-user ", "fixture-login"), (" ", "")] {
+            let env = BTreeMap::from([
+                ("USER".to_string(), user.to_string()),
+                ("LOGNAME".to_string(), logname.to_string()),
+                ("GH_TOKEN".to_string(), "fixture-token".to_string()),
+                ("LD_PRELOAD".to_string(), "fixture.so".to_string()),
+                (
+                    "DYLD_INSERT_LIBRARIES".to_string(),
+                    "fixture.dylib".to_string(),
+                ),
+            ]);
+            for actual in [
+                supervisor_service_environment(&env, Path::new("/fixture"), Path::new("/bin/ocm")),
+                build_supervised_openclaw_env(env),
+            ] {
+                for (key, value) in [("USER", user), ("LOGNAME", logname)] {
+                    assert_eq!(
+                        actual.get(key).map(String::as_str),
+                        (!value.trim().is_empty()).then_some(value.trim())
+                    );
+                }
+                for excluded in ["GH_TOKEN", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"] {
+                    assert!(!actual.contains_key(excluded));
+                }
+            }
+        }
     }
 
     #[test]

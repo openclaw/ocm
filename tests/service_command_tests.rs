@@ -351,6 +351,61 @@ fn service_install_enables_the_env_and_installs_the_ocm_service() {
 }
 
 #[test]
+fn service_start_preserves_native_cli_identity_across_service_boundaries() {
+    for systemd in [false, true] {
+        let root = TestDir::new("service-native-cli-identity");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = if systemd {
+            systemd_env(&root)
+        } else {
+            launchd_env(&root)
+        };
+        env.insert("USER".to_string(), "fixture-user".to_string());
+        env.insert("LOGNAME".to_string(), "fixture-user".to_string());
+        env.insert("GH_TOKEN".to_string(), "fixture-token".to_string());
+        env.insert(
+            "CODEX_SESSION_ID".to_string(),
+            "fixture-session".to_string(),
+        );
+        let marker = root.child("native-cli-identity.txt");
+        write_executable_script(
+            &root.child("fake-bin/openclaw"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"${{USER-unset}}:${{LOGNAME-unset}}:${{GH_TOKEN-unset}}:${{CODEX_SESSION_ID-unset}}\" > '{}'\n",
+                path_string(&marker)
+            ),
+        );
+        setup_launcher_env(&cwd, &env);
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+        assert!(started.status.success(), "{}", stderr(&started));
+
+        let definition =
+            fs::read_to_string(managed_service_definition_path(&env, &cwd, "ocm")).unwrap();
+        for key in ["USER", "LOGNAME"] {
+            let expected = if systemd {
+                format!("Environment=\"{key}=fixture-user\"")
+            } else {
+                format!("<key>{key}</key>\n      <string>fixture-user</string>")
+            };
+            assert!(definition.contains(&expected), "{definition}");
+        }
+        assert!(!definition.contains("fixture-token"));
+        assert!(!definition.contains("fixture-session"));
+
+        // The daemon must launch with the saved identity, not an ambient shell's.
+        env.remove("USER");
+        env.remove("LOGNAME");
+        let run = run_ocm(&cwd, &env, &["__daemon", "run", "--once", "--json"]);
+        assert!(run.status.success(), "{}", stderr(&run));
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "fixture-user:fixture-user:unset:unset\n"
+        );
+    }
+}
+
+#[test]
 fn service_install_uses_valid_path_ocm_for_dev_artifact() {
     let root = TestDir::new("service-install-valid-path-ocm");
     let cwd = root.child("workspace");
