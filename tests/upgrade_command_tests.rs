@@ -6793,6 +6793,76 @@ fn upgrade_validates_managed_codex_candidate_before_finalization() {
 }
 
 #[test]
+fn named_runtime_upgrade_preserves_non_comparable_release_version() {
+    let root = TestDir::new("upgrade-named-release-label");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let binary = recording_openclaw_script("nightly");
+    let binary_path = root.child("openclaw-nightly");
+    write_text(&binary_path, &binary);
+    let binary_server = TestHttpServer::serve_bytes(
+        "/artifacts/openclaw-nightly",
+        "application/octet-stream",
+        binary.as_bytes(),
+    );
+    let manifest = serde_json::json!({
+        "releases": [{
+            "version": "nightly",
+            "channel": "dev",
+            "url": binary_server.url(),
+            "sha256": file_sha256(&binary_path).unwrap(),
+        }],
+    });
+    let manifest_server = TestHttpServer::serve_bytes(
+        "/releases.json",
+        "application/json",
+        manifest.to_string().as_bytes(),
+    );
+    let install = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "custom",
+            "--manifest-url",
+            &manifest_server.url(),
+            "--version",
+            "nightly",
+        ],
+    );
+    assert!(install.status.success(), "{}", stderr(&install));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--runtime", "custom"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+
+    let args = ["upgrade", "demo", "--runtime", "custom", "--json"];
+    let upgrade = run_ocm(&cwd, &env, &args);
+    assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+    let receipt: Value = serde_json::from_str(&stdout(&upgrade)).unwrap();
+    assert_eq!(receipt["runtimeReleaseVersion"], "nightly");
+    assert_eq!(receipt["runtimeReleaseChannel"], "dev");
+
+    let mut preview_args = args.to_vec();
+    preview_args.push("--dry-run");
+    let preview = run_ocm(&cwd, &env, &preview_args);
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    let preview: Value = serde_json::from_str(&stdout(&preview)).unwrap();
+    assert_eq!(
+        preview["runtimeReleaseVersion"],
+        receipt["runtimeReleaseVersion"]
+    );
+    assert_eq!(
+        preview["runtimeReleaseChannel"],
+        receipt["runtimeReleaseChannel"]
+    );
+}
+
+#[test]
 fn upgrade_repairs_migratable_config_before_managed_codex_candidate_validation() {
     let root = TestDir::new("upgrade-codex-candidate-after-config-repair");
     let (cwd, mut env, env_root) = setup_named_runtime_candidate_fixture(&root);

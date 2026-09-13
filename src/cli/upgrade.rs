@@ -2419,6 +2419,9 @@ impl Cli {
             let resolved = self.resolve_upgrade_target(target)?;
             let target_runtime_name = resolved.name.clone();
             let target_version = self.resolved_target_version(env_name, &resolved)?;
+            let target_release_version = target_version
+                .clone()
+                .or_else(|| resolved.release_version.clone());
             let target_channel = resolved.release_channel.clone();
             let source_version = self.ensure_upgrade_is_not_downgrade(
                 env_name,
@@ -2442,7 +2445,7 @@ impl Cli {
                     } else {
                         "would-update".to_string()
                     },
-                    runtime_release_version: target_version.clone(),
+                    runtime_release_version: target_release_version.clone(),
                     runtime_release_channel: target_channel,
                     service_action: service_action_for_dry_run(
                         service.as_ref(),
@@ -2472,7 +2475,7 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
+                        target_release_version.clone(),
                         target_channel,
                         error,
                     );
@@ -2513,7 +2516,7 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     target_runtime_name,
-                    target_version,
+                    target_release_version,
                     target_channel,
                     transaction,
                     UPGRADE_INTERRUPTED_ERROR.to_string(),
@@ -2531,7 +2534,7 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
+                        target_release_version.clone(),
                         target_channel,
                         transaction,
                         error,
@@ -2554,7 +2557,7 @@ impl Cli {
                             previous_binding_name,
                             "runtime",
                             prepared.name,
-                            target_version,
+                            target_release_version,
                             target_channel,
                             transaction,
                             error,
@@ -2590,7 +2593,7 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     prepared.name,
-                    target_version,
+                    target_release_version,
                     target_channel,
                     transaction,
                     format!("failed to publish upgraded runtime: {error}"),
@@ -2612,7 +2615,7 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        target_version,
+                        target_release_version,
                         target_channel,
                         transaction,
                         error,
@@ -2662,7 +2665,7 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        target_version,
+                        target_release_version,
                         target_channel,
                         transaction,
                         error,
@@ -2688,7 +2691,7 @@ impl Cli {
                 } else {
                     outcome_for_official_prepare_action(&prepared.action)
                 },
-                runtime_release_version: target_version,
+                runtime_release_version: target_release_version,
                 runtime_release_channel: target_channel,
                 service_action,
                 snapshot_id: Some(transaction.snapshot_id.clone()),
@@ -2750,6 +2753,9 @@ impl Cli {
             let resolved = self.resolve_upgrade_target(&target)?;
             let target_runtime_name = resolved.name.clone();
             let target_version = self.resolved_target_version(env_name, &resolved)?;
+            let target_release_version = target_version
+                .clone()
+                .or_else(|| resolved.release_version.clone());
             let target_channel = resolved.release_channel.clone();
             let source_version = self.ensure_upgrade_is_not_downgrade(
                 env_name,
@@ -2764,7 +2770,7 @@ impl Cli {
                     binding_kind: "runtime".to_string(),
                     binding_name: target_runtime_name,
                     outcome: "would-update".to_string(),
-                    runtime_release_version: target_version.clone(),
+                    runtime_release_version: target_release_version.clone(),
                     runtime_release_channel: target_channel,
                     service_action: service_action_for_dry_run(service.as_ref(), false, true),
                     snapshot_id: None,
@@ -2785,7 +2791,7 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
+                        target_release_version.clone(),
                         target_channel,
                         error,
                     );
@@ -2829,7 +2835,7 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     target_runtime_name,
-                    target_version,
+                    target_release_version,
                     target_channel,
                     transaction,
                     UPGRADE_INTERRUPTED_ERROR.to_string(),
@@ -2847,7 +2853,7 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
+                        target_release_version.clone(),
                         target_channel,
                         transaction,
                         error,
@@ -2869,7 +2875,7 @@ impl Cli {
                             previous_binding_name,
                             "runtime",
                             prepared.name,
-                            target_version,
+                            target_release_version,
                             target_channel,
                             transaction,
                             error,
@@ -2891,7 +2897,7 @@ impl Cli {
                             previous_binding_name,
                             "runtime",
                             prepared.name,
-                            target_version,
+                            target_release_version,
                             target_channel,
                             transaction,
                             error,
@@ -2929,7 +2935,7 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     prepared.name,
-                    target_version,
+                    target_release_version,
                     target_channel,
                     transaction,
                     format!("failed to publish upgraded runtime: {error}"),
@@ -2951,7 +2957,7 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        target_version,
+                        target_release_version,
                         target_channel,
                         transaction,
                         error,
@@ -2994,7 +3000,7 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        target_version,
+                        target_release_version,
                         target_channel,
                         transaction,
                         error,
@@ -3008,7 +3014,7 @@ impl Cli {
                 binding_kind: "runtime".to_string(),
                 binding_name: prepared.name.clone(),
                 outcome: outcome_for_official_prepare_action(&prepared.action),
-                runtime_release_version: target_version,
+                runtime_release_version: target_release_version,
                 runtime_release_channel: target_channel,
                 service_action,
                 snapshot_id: Some(transaction.snapshot_id.clone()),
@@ -3333,6 +3339,9 @@ impl Cli {
         let resolved = self.resolve_upgrade_target(target)?;
         let target_runtime_name = resolved.name.clone();
         let target_version = self.resolved_target_version(env_name, &resolved)?;
+        let target_release_version = target_version
+            .clone()
+            .or_else(|| resolved.release_version.clone());
         let target_channel = resolved.release_channel.clone();
         let source_version =
             self.ensure_upgrade_is_not_downgrade(env_name, None, target_version.as_deref())?;
@@ -3348,7 +3357,7 @@ impl Cli {
                 binding_kind: "runtime".to_string(),
                 binding_name: target_runtime_name,
                 outcome: "would-switch".to_string(),
-                runtime_release_version: target_version.clone(),
+                runtime_release_version: target_release_version.clone(),
                 runtime_release_channel: target_channel,
                 service_action: service_action_for_dry_run(service.as_ref(), true, true),
                 snapshot_id: None,
@@ -3368,7 +3377,7 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     target_runtime_name,
-                    target_version.clone(),
+                    target_release_version.clone(),
                     target_channel,
                     error,
                 );
@@ -3409,7 +3418,7 @@ impl Cli {
                 launcher_name.to_string(),
                 "runtime",
                 target_runtime_name,
-                target_version,
+                target_release_version,
                 target_channel,
                 transaction,
                 UPGRADE_INTERRUPTED_ERROR.to_string(),
@@ -3427,7 +3436,7 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     target_runtime_name,
-                    target_version.clone(),
+                    target_release_version.clone(),
                     target_channel,
                     transaction,
                     error,
@@ -3448,7 +3457,7 @@ impl Cli {
                         launcher_name.to_string(),
                         "runtime",
                         prepared.name,
-                        target_version,
+                        target_release_version,
                         target_channel,
                         transaction,
                         error,
@@ -3479,7 +3488,7 @@ impl Cli {
                 launcher_name.to_string(),
                 "runtime",
                 prepared.name,
-                target_version,
+                target_release_version,
                 target_channel,
                 transaction,
                 format!("failed to publish upgraded runtime: {error}"),
@@ -3501,7 +3510,7 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     prepared.name,
-                    target_version,
+                    target_release_version,
                     target_channel,
                     transaction,
                     error,
@@ -3544,7 +3553,7 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     prepared.name,
-                    target_version,
+                    target_release_version,
                     target_channel,
                     transaction,
                     error,
@@ -3558,7 +3567,7 @@ impl Cli {
             binding_kind: "runtime".to_string(),
             binding_name: prepared.name.clone(),
             outcome: "switched".to_string(),
-            runtime_release_version: target_version,
+            runtime_release_version: target_release_version,
             runtime_release_channel: target_channel,
             service_action,
             snapshot_id: Some(transaction.snapshot_id.clone()),
