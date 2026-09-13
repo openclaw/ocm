@@ -856,7 +856,11 @@ impl Cli {
                                 "failed to leave the gateway stopped for external recovery: {error}"
                             ),
                         };
-                        result.note = join_optional_warnings(result.note, Some(stop_note));
+                        let note = match result.note.take() {
+                            Some(diagnostic) => format!("{diagnostic}\n{stop_note}"),
+                            None => stop_note,
+                        };
+                        result.note = crate::infra::command_output::bounded_summary(note.lines());
                         Ok(result)
                     }
                     other => other,

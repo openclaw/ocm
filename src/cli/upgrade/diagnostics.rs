@@ -2,7 +2,9 @@ use std::fmt;
 
 use serde_json::Value;
 
-use crate::infra::command_output::{bounded_summary, structured_error_message};
+use crate::infra::command_output::{
+    bounded_summary, structured_error_message, summarize_command_failure,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CandidateFailureKind {
@@ -116,14 +118,24 @@ fn readable_command_detail(text: &str) -> Option<String> {
     if let Some(error) = structured_error_message(text) {
         return bounded_summary(error.lines());
     }
+    bounded_summary(
+        plain_command_output(text)?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty()),
+    )
+}
+
+fn plain_command_output(text: &str) -> Option<&str> {
     // Unknown or malformed machine output is not a license to dump its JSON.
-    // Ordinary text still uses the same redaction and bounds as other errors.
+    // Keep eligible streams intact until chatter filtering and stream selection;
+    // truncating early could make an omission marker masquerade as the cause.
     let machine_output = serde_json::from_str::<Value>(text.trim()).is_ok()
         || text.lines().any(looks_like_machine_output);
     if machine_output {
         return None;
     }
-    bounded_summary(text.lines().map(str::trim).filter(|line| !line.is_empty()))
+    Some(text)
 }
 
 fn looks_like_machine_output(line: &str) -> bool {
@@ -202,8 +214,12 @@ fn summarize_candidate_output(stdout: &str, stderr: &str) -> (CandidateFailureKi
         .into_iter()
         .find_map(structured_error_message)
         .and_then(|message| bounded_summary(message.lines()))
-        .or_else(|| readable_command_detail(stderr))
-        .or_else(|| readable_command_detail(stdout))
+        .or_else(|| {
+            summarize_command_failure(
+                plain_command_output(stderr).unwrap_or_default(),
+                plain_command_output(stdout).unwrap_or_default(),
+            )
+        })
         .unwrap_or_else(|| {
             if stdout.trim().is_empty() && stderr.trim().is_empty() {
                 "no output".to_string()
@@ -303,6 +319,20 @@ mod tests {
         assert_eq!(
             summarize_candidate_output("", "[ERROR] dependency token=private-token").1,
             "[ERROR] dependency token=<redacted>"
+        );
+        let npm_warning = "npm warn optional dependency unavailable";
+        assert_eq!(
+            summarize_candidate_output("actual candidate failure", npm_warning).1,
+            "actual candidate failure"
+        );
+        assert_eq!(summarize_candidate_output("", npm_warning).1, npm_warning);
+        let many_warnings = (0..20)
+            .map(|index| format!("npm warn optional warning {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            summarize_candidate_output("actual candidate failure", &many_warnings).1,
+            "actual candidate failure"
         );
     }
 
