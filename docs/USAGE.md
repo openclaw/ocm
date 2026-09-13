@@ -491,6 +491,11 @@ ocm upgrade mira
 This is the normal command when `mira` tracks a channel like `stable` or `beta`.
 Use `--dry-run` to preview the transaction without writing snapshots, runtimes, envs, or services.
 
+In `--json` output, `runtimeReleaseVersion` and `runtimeReleaseChannel` describe
+the resolved target even when preparation fails or the upgrade rolls back.
+The version includes a named runtime's detected version; the channel remains
+`null` when the selected runtime's channel is unknown.
+
 ### Upgrade every environment that can be updated safely
 
 ```bash
