@@ -190,6 +190,60 @@ fn installed_openclaw_runtime_entrypoint(install_root: &std::path::Path) -> std:
     install_root.join("files/node_modules/openclaw/openclaw.mjs")
 }
 
+fn install_npm_lifecycle_probe(
+    root: &TestDir,
+    env: &mut BTreeMap<String, String>,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let source_home = root.child("source-home");
+    let source_state = source_home.join(".openclaw/state/openclaw.sqlite");
+    let source_config = source_home.join(".openclaw/openclaw.json");
+    let probe_log = root.child("npm-lifecycle-environment.log");
+    let probe = root.child("npm-lifecycle-probe");
+    fs::create_dir_all(source_state.parent().unwrap()).unwrap();
+    fs::write(&source_state, b"source database\n").unwrap();
+    fs::write(&source_config, b"source config\n").unwrap();
+    write_executable_script(
+        &probe,
+        &format!(
+            r#"#!/bin/sh
+openclaw_home="${{OPENCLAW_HOME:-${{HOME}}/.openclaw}}"
+state_dir="${{OPENCLAW_STATE_DIR:-${{openclaw_home}}/state}}"
+config_path="${{OPENCLAW_CONFIG_PATH:-${{openclaw_home}}/openclaw.json}}"
+printf 'HOME=%s\nOPENCLAW_HOME=%s\nOPENCLAW_STATE_DIR=%s\nOPENCLAW_CONFIG_PATH=%s\nOCM_ACTIVE_ENV=%s\nOPENCLAW_PROFILE=%s\n' \
+  "${{HOME-unset}}" "${{OPENCLAW_HOME-unset}}" "${{OPENCLAW_STATE_DIR-unset}}" \
+  "${{OPENCLAW_CONFIG_PATH-unset}}" "${{OCM_ACTIVE_ENV-unset}}" \
+  "${{OPENCLAW_PROFILE-unset}}" > "{}"
+mkdir -p "$state_dir" "$(dirname "$config_path")"
+printf 'lifecycle mutation\n' > "$state_dir/openclaw.sqlite"
+printf 'lifecycle mutation\n' > "$config_path"
+"#,
+            path_string(&probe_log)
+        ),
+    );
+
+    let source_openclaw_home = source_home.join(".openclaw");
+    env.insert("HOME".to_string(), path_string(&source_home));
+    env.insert(
+        "OPENCLAW_HOME".to_string(),
+        path_string(&source_openclaw_home),
+    );
+    env.insert(
+        "OPENCLAW_STATE_DIR".to_string(),
+        path_string(source_state.parent().unwrap()),
+    );
+    env.insert(
+        "OPENCLAW_CONFIG_PATH".to_string(),
+        path_string(&source_config),
+    );
+    env.insert("OCM_ACTIVE_ENV".to_string(), "source".to_string());
+    env.insert("OPENCLAW_PROFILE".to_string(), "source".to_string());
+    env.insert(
+        "OCM_TEST_NPM_LIFECYCLE_PROBE".to_string(),
+        path_string(&probe),
+    );
+    (source_state, source_config, probe_log)
+}
+
 fn install_fake_node_and_packing_npm(
     root: &TestDir,
     env: &mut BTreeMap<String, String>,
@@ -2042,6 +2096,78 @@ fn runtime_install_from_official_release_installs_the_openclaw_package() {
         "\"installRoot\": \"{}\"",
         path_string(&install_root)
     )));
+}
+
+#[test]
+fn official_runtime_install_isolates_npm_lifecycle_from_caller_openclaw_state() {
+    for (case, managed_node) in [("host-npm", false), ("managed-node", true)] {
+        let root = TestDir::new(&format!("runtime-install-isolation-{case}"));
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let tarball = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
+        let integrity = sha512_integrity(&tarball);
+        let tarball_server = TestHttpServer::serve_bytes(
+            "/openclaw-2026.3.24.tgz",
+            "application/octet-stream",
+            &tarball,
+        );
+        let packument = format!(
+            "{{\"dist-tags\":{{\"latest\":\"2026.3.24\"}},\"versions\":{{\"2026.3.24\":{{\"version\":\"2026.3.24\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}}}},\"time\":{{\"2026.3.24\":\"2026-03-25T16:35:52.000Z\"}}}}",
+            tarball_server.url(),
+            integrity
+        );
+        let packument_server =
+            TestHttpServer::serve_bytes("/openclaw", "application/json", packument.as_bytes());
+        let mut env = ocm_env(&root);
+        install_fake_node_and_npm(&root, &mut env, "22.22.3");
+        let _managed_node_server =
+            managed_node.then(|| install_fake_managed_node_archive(&root, &mut env, "24.15.0"));
+        if managed_node {
+            env.insert(
+                "OCM_INTERNAL_NPM_BIN".to_string(),
+                path_string(&root.child("missing-npm")),
+            );
+        }
+        env.insert(
+            "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
+            packument_server.url(),
+        );
+        let (source_state, source_config, probe_log) = install_npm_lifecycle_probe(&root, &mut env);
+        let state_before = fs::read(&source_state).unwrap();
+        let config_before = fs::read(&source_config).unwrap();
+
+        let install = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "install", "--channel", "stable", "--json"],
+        );
+
+        assert!(install.status.success(), "{case}: {}", stderr(&install));
+        assert!(
+            probe_log.is_file(),
+            "{case}: npm lifecycle probe did not run"
+        );
+        assert_eq!(
+            fs::read(&source_state).unwrap(),
+            state_before,
+            "{case}: npm lifecycle mutated the caller's OpenClaw state"
+        );
+        assert_eq!(
+            fs::read(&source_config).unwrap(),
+            config_before,
+            "{case}: npm lifecycle mutated the caller's OpenClaw config"
+        );
+        let probe_environment = fs::read_to_string(&probe_log).unwrap();
+        assert!(
+            probe_environment.contains("OCM_ACTIVE_ENV=unset"),
+            "{case}: {probe_environment}"
+        );
+        assert!(
+            probe_environment.contains("OPENCLAW_PROFILE=unset"),
+            "{case}: {probe_environment}"
+        );
+    }
 }
 
 #[test]

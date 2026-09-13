@@ -919,6 +919,38 @@ fn local_build_npm_adapter(
     }))
 }
 
+fn isolate_npm_lifecycle_environment(
+    command: &mut Command,
+    install_root: &Path,
+) -> Result<PathBuf, String> {
+    // Package lifecycle scripts must not discover or migrate caller-owned OpenClaw state.
+    // Keep their home and config disposable for both host and managed npm installs.
+    let lifecycle_root = install_root.join(".ocm-npm-lifecycle");
+    let home = lifecycle_root.join("home");
+    let openclaw_home = home.join(".openclaw");
+    let state_dir = openclaw_home.join("state");
+    ensure_dir(&state_dir)?;
+    command
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("OPENCLAW_HOME", &openclaw_home)
+        .env("OPENCLAW_STATE_DIR", &state_dir)
+        .env("OPENCLAW_CONFIG_PATH", openclaw_home.join("openclaw.json"))
+        .env_remove("OCM_ACTIVE_ENV")
+        .env_remove("OCM_ACTIVE_ENV_ROOT")
+        .env_remove("OPENCLAW_PROFILE");
+    Ok(lifecycle_root)
+}
+
+fn cleanup_npm_lifecycle_environment(lifecycle_root: &Path) -> Result<(), String> {
+    fs::remove_dir_all(lifecycle_root).map_err(|error| {
+        format!(
+            "failed to remove isolated npm lifecycle state at {}: {error}",
+            display_path(lifecycle_root)
+        )
+    })
+}
+
 fn install_openclaw_package_with_npm(
     archive_path: &Path,
     additional_archives: &[PathBuf],
@@ -961,12 +993,16 @@ fn install_openclaw_package_with_npm(
     if let Some(local_adapter) = local_adapter {
         local_adapter.apply_environment(&mut command);
     }
-    let output = command.output().map_err(|error| {
+    let lifecycle_root = isolate_npm_lifecycle_environment(&mut command, install_files)?;
+    let output = command.output();
+    let cleanup = cleanup_npm_lifecycle_environment(&lifecycle_root);
+    let output = output.map_err(|error| {
         format!(
             "failed to run {} while installing the OpenClaw package: {error}",
             install_command.program
         )
     })?;
+    cleanup?;
 
     if output.status.success() {
         return Ok(());
@@ -1374,12 +1410,16 @@ fn install_local_openclaw_companion(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     install_command.apply_environment(&mut command, context.env)?;
-    let output = command.output().map_err(|error| {
+    let lifecycle_root = isolate_npm_lifecycle_environment(&mut command, &install_root)?;
+    let output = command.output();
+    let cleanup = cleanup_npm_lifecycle_environment(&lifecycle_root);
+    let output = output.map_err(|error| {
         format!(
             "failed to install local companion {} with {}: {error}",
             packed.spec.id, install_command.program
         )
     })?;
+    cleanup?;
     if !output.status.success() {
         let detail =
             summarize_command_output(&output.stdout, &output.stderr).unwrap_or_else(|| {

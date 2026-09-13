@@ -1,0 +1,83 @@
+name: Reproduce OCM 98 runtime-install isolation
+
+on:
+  push:
+    branches:
+      - codex/ocm-98-runtime-install-repro
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    name: Credential-free clean-room reproduction
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.15.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run runtime-install isolation regression
+        run: >-
+          cargo test --locked --test runtime_command_tests
+          official_runtime_install_isolates_npm_lifecycle_from_caller_openclaw_state
+          -- --exact
+
+      - name: Run full test suite
+        run: cargo test --locked
+
+      - name: Build current OCM
+        run: cargo build --release --locked --target-dir "$RUNNER_TEMP/target-current"
+
+      - name: Build OCM v0.2.32
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/ocm-v0.2.32" v0.2.32
+          cargo build \
+            --release \
+            --locked \
+            --manifest-path "$RUNNER_TEMP/ocm-v0.2.32/Cargo.toml" \
+            --target-dir "$RUNNER_TEMP/target-v0.2.32"
+
+      - name: Run credential-free reproduction
+        run: |
+          bash scripts/reproduce-ocm-98.sh \
+            "$RUNNER_TEMP/target-current/release/ocm" \
+            "$RUNNER_TEMP/target-v0.2.32/release/ocm" \
+            "$RUNNER_TEMP/ocm98-evidence"
+
+      - name: Upload reproduction evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ocm-98-credential-free-reproduction
+          path: |
+            ${{ runner.temp }}/ocm98-evidence/*.txt
+            ${{ runner.temp }}/ocm98-evidence/*.json
+            ${{ runner.temp }}/ocm98-evidence/*.log
+            ${{ runner.temp }}/ocm98-evidence/v0.2.32/*.txt
+            ${{ runner.temp }}/ocm98-evidence/v0.2.32/*.json
+            ${{ runner.temp }}/ocm98-evidence/v0.2.32/*.sha256
+            ${{ runner.temp }}/ocm98-evidence/current-main/*.txt
+            ${{ runner.temp }}/ocm98-evidence/current-main/*.json
+            ${{ runner.temp }}/ocm98-evidence/current-main/*.sha256
+            ${{ runner.temp }}/ocm98-evidence/explicit-path-control/*.txt
+            ${{ runner.temp }}/ocm98-evidence/explicit-path-control/*.json
+            ${{ runner.temp }}/ocm98-evidence/explicit-path-control/*.sha256
+          if-no-files-found: error
+          retention-days: 14
