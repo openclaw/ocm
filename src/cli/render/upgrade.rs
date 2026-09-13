@@ -79,7 +79,14 @@ pub fn upgrade_env(
                 ),
             ),
             KeyValueRow::plain(
-                "Now using",
+                if matches!(
+                    summary.outcome.as_str(),
+                    "failed" | "rolled-back" | "rollback-failed"
+                ) {
+                    "Target"
+                } else {
+                    "Now using"
+                },
                 format!("{}:{}", summary.binding_kind, summary.binding_name),
             ),
             KeyValueRow::new("OpenClaw", &summary.outcome, outcome_tone(&summary.outcome)),

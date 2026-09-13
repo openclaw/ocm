@@ -41,7 +41,7 @@ pub(crate) fn summarize_command_failure(primary: &str, secondary: &str) -> Optio
     bounded_summary(fallback.iter().map(String::as_str))
 }
 
-fn structured_error_message(text: &str) -> Option<String> {
+pub(crate) fn structured_error_message(text: &str) -> Option<String> {
     let extract = |value: Value| match value.get("error")? {
         Value::String(message) => Some(message.clone()),
         Value::Object(error) => ["message", "detail", "cause"]
@@ -72,7 +72,7 @@ fn command_lines(text: &str, include_npm_chatter: bool) -> Vec<String> {
         .collect()
 }
 
-fn bounded_summary<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
+pub(crate) fn bounded_summary<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
     let lines = lines.map(redact_obvious_secrets).collect::<Vec<_>>();
     if lines.is_empty() {
         return None;

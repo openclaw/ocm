@@ -496,6 +496,15 @@ the resolved target even when preparation fails or the upgrade rolls back.
 The version includes a named runtime's detected version; the channel remains
 `null` when the selected runtime's channel is unknown.
 
+When candidate validation fails, the report keeps bounded, redacted Doctor
+findings and identifies candidate-provided hints as information captured before
+recovery. OCM's recovery guidance describes the current environment binding and
+whether the failed candidate was retained, removed, or replaced by the previous
+runtime. With `--no-rollback`, completed target configuration repairs remain in
+the environment. Per-environment upgrade history records only cleanup diagnostics,
+excluding general child output. Fleet batch journals retain the same bounded,
+redacted result notes shown by the batch command.
+
 ### Upgrade every environment that can be updated safely
 
 ```bash
