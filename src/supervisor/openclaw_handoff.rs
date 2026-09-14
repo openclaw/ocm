@@ -2,9 +2,9 @@ use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -240,7 +240,11 @@ fn run_openclaw_machine_command(
     let stdout_reader = thread::spawn(move || read_bounded(stdout));
     let stderr_reader = thread::spawn(move || read_bounded(stderr));
 
-    let status = wait_for_child(&mut child, COMMAND_TIMEOUT);
+    let status = crate::infra::process::wait_for_child(
+        &mut child,
+        COMMAND_TIMEOUT,
+        "restart-handoff command",
+    );
     let stdout = stdout_reader
         .join()
         .map_err(|_| "restart-handoff stdout reader panicked".to_string())?
@@ -338,53 +342,6 @@ fn read_bounded<R: Read>(mut reader: R) -> std::io::Result<Vec<u8>> {
         kept.extend_from_slice(&chunk[..read.min(remaining)]);
     }
     Ok(kept)
-}
-
-fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, String> {
-    let started_at = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if started_at.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Ok(None) => {
-                terminate_child(child);
-                return Err(format!(
-                    "restart-handoff command timed out after {} seconds",
-                    timeout.as_secs()
-                ));
-            }
-            Err(error) => {
-                terminate_child(child);
-                return Err(format!(
-                    "failed waiting for restart-handoff command: {error}"
-                ));
-            }
-        }
-    }
-}
-
-fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let process_group = format!("-{}", child.id());
-        let _ = Command::new("kill")
-            .args(["-TERM", "--", &process_group])
-            .status();
-        for _ in 0..20 {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(Duration::from_millis(25)),
-                Err(_) => break,
-            }
-        }
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &process_group])
-            .status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn command_failure_detail(status: ExitStatus) -> String {
