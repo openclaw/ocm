@@ -3,9 +3,468 @@ mod support;
 use std::fs;
 use std::path::Path;
 
+use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout, write_text};
+
+fn seed_plugin_registry(path: &Path, folded: bool, records: Value) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let db = Connection::open(path).unwrap();
+    if folded {
+        db.execute_batch("CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT NOT NULL)").unwrap();
+        db.execute("INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?1)",
+            [serde_json::json!({"revision": 42, "index": {"installRecords": records, "plugins": [], "diagnostics": []}}).to_string()]).unwrap();
+    } else {
+        db.execute_batch("CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT NOT NULL)").unwrap();
+        db.execute(
+            "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1)",
+            [records.to_string()],
+        )
+        .unwrap();
+    }
+}
+
+fn read_plugin_registry(path: &Path, folded: bool) -> Value {
+    let db = Connection::open(path).unwrap();
+    let raw: String = db
+        .query_row(
+            if folded {
+                "SELECT value_json FROM config_machine_state"
+            } else {
+                "SELECT install_records_json FROM installed_plugin_index"
+            },
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let document: Value = serde_json::from_str(&raw).unwrap();
+    if folded {
+        assert_eq!(document["revision"], 42);
+        document["index"]["installRecords"].clone()
+    } else {
+        document
+    }
+}
+
+#[test]
+fn env_clone_relocates_plugin_registry_without_changing_source() {
+    check_clone_plugin_registry(false);
+}
+
+#[test]
+fn env_clone_relocates_folded_plugin_registry_without_changing_source() {
+    check_clone_plugin_registry(true);
+}
+
+fn check_clone_plugin_registry(folded: bool) {
+    let root = TestDir::new("clone-plugin-registry");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    let target = root.child("ocm-home/envs/target/.openclaw");
+    let relative = "npm/projects/demo/node_modules/demo";
+    write_text(&source.join(relative).join("index.js"), "original");
+    let project = root.child("local-plugin-project");
+    write_text(&project.join("index.js"), "project original");
+    let local = "extensions/local-copy";
+    let archive = "extensions/archive-copy";
+    let packed = "extensions/npm-pack-copy";
+    let linked = "extensions/internal-linked";
+    let missing = "npm/node_modules/absent/package";
+    let recovered = "extensions/copied-gateway";
+    for relative in [local, archive, packed, linked, recovered] {
+        write_text(&source.join(relative).join("index.js"), "payload original");
+    }
+    let archive_source = root.child("local-plugin.tgz");
+    write_text(&archive_source, "archive provenance");
+    let db_path = source.join("state/openclaw.sqlite");
+    let records = serde_json::json!({"demo": {
+        "source": "npm",
+        "installPath": source.join(relative),
+        "sourcePath": source.join(relative)
+    }, "local": {
+        "source":"path", "sourcePath":project, "installPath":source.join(local), "version":"1.0.0"
+    }, "archive": {
+        "source":"archive", "sourcePath":archive_source, "installPath":source.join(archive)
+    }, "packed": {
+        "source":"npm", "artifactKind":"npm-pack", "sourcePath":archive_source,
+        "installPath":source.join(packed), "spec":"packed@1.0.0"
+    }, "missing": {
+        "source":"npm", "installPath":source.join(missing), "spec":"absent@1.0.0"
+    }, "linked": {
+        "source":"path", "sourcePath":source.join(linked), "installPath":source.join(linked)
+    }, "recovered": {
+        "source":"npm", "installPath":root.child("former-home/.openclaw").join(recovered)
+    }});
+    seed_plugin_registry(&db_path, folded, records);
+    let before = fs::read(&db_path).unwrap();
+    let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+    assert!(clone.status.success(), "{}", stderr(&clone));
+    let copied = read_plugin_registry(&target.join("state/openclaw.sqlite"), folded);
+    for field in ["installPath", "sourcePath"] {
+        assert_eq!(
+            copied["demo"][field],
+            target.join(relative).to_str().unwrap()
+        );
+    }
+    assert_eq!(copied["local"]["sourcePath"], project.to_str().unwrap());
+    assert_eq!(
+        copied["local"]["installPath"],
+        target.join(local).to_str().unwrap()
+    );
+    assert_eq!(copied["local"]["version"], "1.0.0");
+    for (id, relative) in [("archive", archive), ("packed", packed)] {
+        assert_eq!(copied[id]["sourcePath"], archive_source.to_str().unwrap());
+        assert_eq!(
+            copied[id]["installPath"],
+            target.join(relative).to_str().unwrap()
+        );
+    }
+    assert_eq!(copied["packed"]["artifactKind"], "npm-pack");
+    assert_eq!(
+        fs::read_to_string(&archive_source).unwrap(),
+        "archive provenance"
+    );
+    assert_eq!(
+        copied["missing"]["installPath"],
+        target.join(missing).to_str().unwrap()
+    );
+    assert_eq!(copied["missing"]["spec"], "absent@1.0.0");
+    assert!(!source.join(missing).exists());
+    assert!(!target.join(missing).exists());
+    for field in ["installPath", "sourcePath"] {
+        assert_eq!(
+            copied["linked"][field],
+            target.join(linked).to_str().unwrap()
+        );
+    }
+    assert_eq!(
+        copied["recovered"]["installPath"],
+        target.join(recovered).to_str().unwrap()
+    );
+    write_text(&target.join(local).join("index.js"), "clone local update");
+    assert_eq!(
+        fs::read_to_string(source.join(local).join("index.js")).unwrap(),
+        "payload original"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("index.js")).unwrap(),
+        "project original"
+    );
+    write_text(
+        &Path::new(copied["demo"]["installPath"].as_str().unwrap()).join("index.js"),
+        "updated",
+    );
+    assert_eq!(fs::read(&db_path).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(source.join(relative).join("index.js")).unwrap(),
+        "original"
+    );
+}
+
+#[test]
+fn env_clone_rejects_unowned_plugin_paths_without_changing_source() {
+    for folded in [false, true] {
+        for case in [
+            "external",
+            "source-only",
+            "outside-missing",
+            "traversal",
+            "target-traversal",
+        ] {
+            let root = TestDir::new("clone-unowned-plugin");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = ocm_env(&root);
+            let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source/.openclaw");
+            let target = root.child("ocm-home/envs/target/.openclaw");
+            let external = root.child("external-plugin");
+            write_text(&external.join("index.js"), "external original");
+            fs::create_dir_all(source.join("extensions")).unwrap();
+            let (kind, path) = match case {
+                "external" | "source-only" => ("path", external.clone()),
+                "outside-missing" => ("npm", root.child("former-home/.openclaw/extensions/demo")),
+                "traversal" => ("npm", source.join("extensions/../extensions/demo")),
+                "target-traversal" => ("npm", target.join("extensions/../extensions/demo")),
+                _ => unreachable!(),
+            };
+            let db = source.join("state/openclaw.sqlite");
+            let field = if case == "source-only" {
+                "sourcePath"
+            } else {
+                "installPath"
+            };
+            seed_plugin_registry(
+                &db,
+                folded,
+                serde_json::json!({"demo":{"source":kind,(field):path}}),
+            );
+            let before = fs::read(&db).unwrap();
+            let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+            assert!(
+                !clone.status.success(),
+                "case={case} folded={folded}: {}",
+                stdout(&clone)
+            );
+            assert!(
+                stderr(&clone).contains("could not be isolated"),
+                "case={case}: {}",
+                stderr(&clone)
+            );
+            assert_eq!(fs::read(&db).unwrap(), before);
+            assert_eq!(
+                fs::read_to_string(external.join("index.js")).unwrap(),
+                "external original"
+            );
+            assert!(!target.parent().unwrap().exists());
+            let shown = run_ocm(&cwd, &env, &["env", "show", "target"]);
+            assert!(!shown.status.success());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_rejects_plugin_links_outside_the_copied_state() {
+    use std::os::unix::fs::symlink;
+    for folded in [false, true] {
+        for case in ["source-link", "dangling", "missing-child"] {
+            let root = TestDir::new("clone-plugin-link");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = ocm_env(&root);
+            let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source/.openclaw");
+            let payload = match case {
+                "source-link" => source.join("extensions/actual"),
+                "dangling" => root.child("outside/absent"),
+                "missing-child" => root.child("outside"),
+                _ => unreachable!(),
+            };
+            if case != "dangling" {
+                write_text(&payload.join("index.js"), "source original");
+            }
+            fs::create_dir_all(source.join("extensions")).unwrap();
+            // Existing absolute in-source links escape after copying; dangling
+            // outside links must not become trusted merely because the leaf is absent.
+            symlink(&payload, source.join("extensions/link")).unwrap();
+            let recorded = if case == "missing-child" {
+                source.join("extensions/link/absent")
+            } else {
+                source.join("extensions/link")
+            };
+            let db = source.join("state/openclaw.sqlite");
+            seed_plugin_registry(
+                &db,
+                folded,
+                serde_json::json!({"demo":{"source":"npm","installPath":recorded}}),
+            );
+            let before = fs::read(&db).unwrap();
+            let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+            assert!(!clone.status.success(), "case={case}: {}", stdout(&clone));
+            assert!(
+                stderr(&clone).contains("could not be isolated"),
+                "{}",
+                stderr(&clone)
+            );
+            assert_eq!(fs::read(&db).unwrap(), before);
+            if case != "dangling" {
+                assert_eq!(
+                    fs::read_to_string(payload.join("index.js")).unwrap(),
+                    "source original"
+                );
+            }
+            assert!(!root.child("ocm-home/envs/target").exists());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_preserves_owned_relative_plugin_links() {
+    use std::os::unix::fs::symlink;
+    for folded in [false, true] {
+        for missing in [false, true] {
+            let root = TestDir::new("clone-owned-plugin-link");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = ocm_env(&root);
+            let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source/.openclaw");
+            let target = root.child("ocm-home/envs/target/.openclaw");
+            write_text(
+                &source.join("extensions/actual/index.js"),
+                "source original",
+            );
+            symlink("actual", source.join("extensions/link")).unwrap();
+            let relative = if missing {
+                "extensions/link/absent"
+            } else {
+                "extensions/link"
+            };
+            let db = source.join("state/openclaw.sqlite");
+            seed_plugin_registry(
+                &db,
+                folded,
+                serde_json::json!({"demo":{"source":"npm","installPath":source.join(relative)}}),
+            );
+            let before = fs::read(&db).unwrap();
+            let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+            assert!(clone.status.success(), "{}", stderr(&clone));
+            let records = read_plugin_registry(&target.join("state/openclaw.sqlite"), folded);
+            assert_eq!(
+                records["demo"]["installPath"],
+                target.join(relative).to_str().unwrap()
+            );
+            assert_eq!(target.join(relative).exists(), !missing);
+            assert_eq!(
+                fs::read_link(target.join("extensions/link")).unwrap(),
+                Path::new("actual")
+            );
+            assert_eq!(fs::read(&db).unwrap(), before);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_relocates_owned_plugin_aliases_and_config() {
+    use std::os::unix::fs::symlink;
+    for folded in [false, true] {
+        for relative in [".openclaw/extensions/linked", "local-plugin"] {
+            let root = TestDir::new("clone-owned-plugin-alias");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = ocm_env(&root);
+            let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source");
+            let target = root.child("ocm-home/envs/target");
+            let payload = source.join(relative);
+            write_text(&payload.join("index.js"), "source original");
+            let alias = root.child("alias-plugin");
+            symlink(&payload, &alias).unwrap();
+            let config_path = source.join(".openclaw/openclaw.json");
+            let config = serde_json::json!({"plugins":{"load":{"paths":[alias]}}}).to_string();
+            fs::write(&config_path, &config).unwrap();
+            let db = source.join(".openclaw/state/openclaw.sqlite");
+            seed_plugin_registry(
+                &db,
+                folded,
+                serde_json::json!({"demo":{"source":"path","installPath":alias,"sourcePath":alias}}),
+            );
+            let before = fs::read(&db).unwrap();
+            let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+            assert!(
+                clone.status.success(),
+                "relative={relative}: {}",
+                stderr(&clone)
+            );
+            let records =
+                read_plugin_registry(&target.join(".openclaw/state/openclaw.sqlite"), folded);
+            for field in ["installPath", "sourcePath"] {
+                assert_eq!(
+                    records["demo"][field],
+                    target.join(relative).to_str().unwrap()
+                );
+            }
+            let copied_config: Value =
+                serde_json::from_slice(&fs::read(target.join(".openclaw/openclaw.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                copied_config["plugins"]["load"]["paths"][0],
+                target.join(relative).to_str().unwrap()
+            );
+            write_text(&target.join(relative).join("index.js"), "clone update");
+            assert_eq!(
+                fs::read_to_string(payload.join("index.js")).unwrap(),
+                "source original"
+            );
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+            assert_eq!(fs::read(&db).unwrap(), before);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_rejects_database_links_without_writing_source() {
+    use std::os::unix::fs::symlink;
+    for folded in [false, true] {
+        for case in ["database", "parent", "state-root-explicit-workspace"] {
+            let root = TestDir::new("clone-plugin-database-link");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = ocm_env(&root);
+            let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source");
+            let state = source.join(".openclaw");
+            write_text(&state.join("openclaw.json"), "{}\n");
+            let external = root.child("external-state");
+            let external_db = if case == "state-root-explicit-workspace" {
+                external.join("state/openclaw.sqlite")
+            } else {
+                external.join("openclaw.sqlite")
+            };
+            seed_plugin_registry(
+                &external_db,
+                folded,
+                serde_json::json!({"demo":{"source":"npm","installPath":state.join("extensions/demo")}}),
+            );
+            if case == "state-root-explicit-workspace" {
+                let workspace = source.join("custom-workspace");
+                write_text(&workspace.join("marker"), "workspace original");
+                write_text(
+                    &external.join("openclaw.json"),
+                    &serde_json::json!({"agents":{"defaults":{"workspace":workspace}}}).to_string(),
+                );
+                fs::remove_dir_all(&state).unwrap();
+                symlink(&external, &state).unwrap();
+            } else if case == "parent" {
+                symlink(&external, state.join("state")).unwrap();
+            } else {
+                fs::create_dir_all(state.join("state")).unwrap();
+                symlink(&external_db, state.join("state/openclaw.sqlite")).unwrap();
+            }
+            let before = fs::read(&external_db).unwrap();
+            let config_before = fs::read(state.join("openclaw.json")).unwrap();
+            let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+            assert!(!clone.status.success(), "case={case}: {}", stdout(&clone));
+            if case == "state-root-explicit-workspace" {
+                assert!(
+                    stderr(&clone).contains("outside the environment root"),
+                    "{}",
+                    stderr(&clone)
+                );
+                assert_eq!(
+                    fs::read_to_string(source.join("custom-workspace/marker")).unwrap(),
+                    "workspace original"
+                );
+            } else {
+                assert!(
+                    stderr(&clone).contains("database must be a regular file"),
+                    "{}",
+                    stderr(&clone)
+                );
+            }
+            assert_eq!(fs::read(&external_db).unwrap(), before);
+            assert_eq!(
+                fs::read(state.join("openclaw.json")).unwrap(),
+                config_before
+            );
+            assert!(!root.child("ocm-home/envs/target").exists());
+        }
+    }
+}
 
 #[test]
 fn env_clone_copies_state_into_a_new_environment() {

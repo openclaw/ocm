@@ -311,6 +311,11 @@ operations reject that runtime. Use `ocm upgrade <env>` so the environment gets
 the snapshot, OpenClaw migration, rollback, and verification path, or clear the
 binding first when intentionally managing an unused runtime.
 
+Runtime package and companion installation preserves the caller's npm settings,
+including script policy and home-relative configuration. OpenClaw lifecycle
+state uses a disposable directory, and inherited service state paths are cleared
+so installation cannot discover the caller's OpenClaw state through those paths.
+
 For unreleased OpenClaw workspaces, `runtime build-local` follows the complete
 transitive closure of private `workspace:*` packages. It rewrites nested
 workspace specs only inside scratch archives before installation; the source
@@ -455,6 +460,10 @@ Environment clone, export, and import flows preserve managed OpenClaw plugin
 payloads under the legacy, extension, npm, and Git install roots. Clone and
 import still clear live sessions, logs, backups, and process residue so the new
 environment does not share active runtime state with its source.
+
+Cloned plugin registrations use the clone's managed files. Copied local projects
+and archives retain their original source information, and missing managed
+payloads retain clone-owned records for independent diagnosis or repair.
 
 Clone, import, and migration give the target environment a new local gateway and MCP app sandbox listener. They do not copy a public `mcp.apps.sandboxOrigin` because that URL belongs to the source environment's external routing and may still reach the source sandbox. Direct connections derive the target sandbox port automatically. For a target behind a reverse proxy or tunnel, pass its dedicated public origin explicitly:
 

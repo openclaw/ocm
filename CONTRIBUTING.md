@@ -35,6 +35,9 @@ cargo install --locked --path . --root "$install_root"
 ```
 
 The npm launcher integration tests need Node.js `^22.15.0 || >=24.0.0`.
+Runtime-install integration tests require Node.js `22.22.3+`, `24.15.0+`, or
+`25.9.0+` and npm; CI uses Node.js `24.15.0`. Their npm packages are local
+fixtures and require no registry dependency downloads.
 Packaging tests use Python 3.13 and npm 11.19.0, with a private local fixture
 registry, cache, prefix, and home:
 

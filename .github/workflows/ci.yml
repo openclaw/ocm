@@ -93,7 +93,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
-          node-version: '22.15.0'
+          node-version: '24.15.0'
           package-manager-cache: false
       - name: Prove macOS private config creation across users
         if: runner.os == 'macOS'

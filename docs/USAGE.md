@@ -491,6 +491,20 @@ ocm upgrade mira
 This is the normal command when `mira` tracks a channel like `stable` or `beta`.
 Use `--dry-run` to preview the transaction without writing snapshots, runtimes, envs, or services.
 
+In `--json` output, `runtimeReleaseVersion` and `runtimeReleaseChannel` describe
+the resolved target even when preparation fails or the upgrade rolls back.
+The version includes a named runtime's detected version; the channel remains
+`null` when the selected runtime's channel is unknown.
+
+When candidate validation fails, the report keeps bounded, redacted Doctor
+findings and identifies candidate-provided hints as information captured before
+recovery. OCM's recovery guidance describes the current environment binding and
+whether the failed candidate was retained, removed, or replaced by the previous
+runtime. With `--no-rollback`, completed target configuration repairs remain in
+the environment. Per-environment upgrade history records only cleanup diagnostics,
+excluding general child output. Fleet batch journals retain the same bounded,
+redacted result notes shown by the batch command.
+
 ### Upgrade every environment that can be updated safely
 
 ```bash
@@ -553,6 +567,14 @@ Clone copies the workspace and env config into a new environment, gives the clon
 ```bash
 ocm start rowan
 ```
+
+Registered managed plugins use the clone's installed files. Local project and
+archive paths can remain as source information once the installed payload's
+location is proved to belong to the clone. Missing managed payloads stay missing,
+with their install records rebased onto the target for diagnosis or repair.
+Active plugin paths and copied databases must remain inside the cloned environment;
+locations that escape through external paths or symlinks are rejected before publication. The
+same plugin isolation applies to upgrade simulation clones.
 
 ### Upgrade checkpoint scope
 

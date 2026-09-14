@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, VecDeque};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,6 +13,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+mod diagnostics;
+use diagnostics::{CandidateFailure, CandidateFailureKind};
 
 use super::{Cli, render};
 use crate::env::{
@@ -489,10 +493,6 @@ impl UpgradeTarget {
         )
     }
 
-    fn release_channel_hint(&self) -> Option<String> {
-        self.channel.clone()
-    }
-
     fn is_named_runtime(&self) -> bool {
         self.runtime.is_some()
     }
@@ -856,7 +856,11 @@ impl Cli {
                                 "failed to leave the gateway stopped for external recovery: {error}"
                             ),
                         };
-                        result.note = join_optional_warnings(result.note, Some(stop_note));
+                        let note = match result.note.take() {
+                            Some(diagnostic) => format!("{diagnostic}\n{stop_note}"),
+                            None => stop_note,
+                        };
+                        result.note = crate::infra::command_output::bounded_summary(note.lines());
                         Ok(result)
                     }
                     other => other,
@@ -1585,7 +1589,7 @@ impl Cli {
     ) -> UpgradeRollbackSummary {
         let rollback_transaction_id = transaction.id.clone();
         let safety_snapshot_id = transaction.snapshot_id.clone();
-        let restore_result = self.rollback_upgrade_locked(env_name, &transaction);
+        let restore_result = self.rollback_upgrade_locked(env_name, &mut transaction);
         if let Ok(cleanup_note) = &restore_result {
             transaction.cleanup_note = cleanup_note.clone();
         }
@@ -2423,6 +2427,10 @@ impl Cli {
             let resolved = self.resolve_upgrade_target(target)?;
             let target_runtime_name = resolved.name.clone();
             let target_version = self.resolved_target_version(env_name, &resolved)?;
+            let target_release_version = target_version
+                .clone()
+                .or_else(|| resolved.release_version.clone());
+            let target_channel = resolved.release_channel.clone();
             let source_version = self.ensure_upgrade_is_not_downgrade(
                 env_name,
                 current.release_version.as_deref(),
@@ -2445,8 +2453,8 @@ impl Cli {
                     } else {
                         "would-update".to_string()
                     },
-                    runtime_release_version: target_version.clone(),
-                    runtime_release_channel: resolved.release_channel.clone(),
+                    runtime_release_version: target_release_version.clone(),
+                    runtime_release_channel: target_channel,
                     service_action: service_action_for_dry_run(
                         service.as_ref(),
                         binding_changed,
@@ -2475,8 +2483,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
-                        target.release_channel_hint(),
+                        target_release_version.clone(),
+                        target_channel,
                         error,
                     );
                 }
@@ -2516,8 +2524,8 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     target_runtime_name,
-                    target_version,
-                    target.release_channel_hint(),
+                    target_release_version,
+                    target_channel,
                     transaction,
                     UPGRADE_INTERRUPTED_ERROR.to_string(),
                 );
@@ -2534,8 +2542,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
-                        target.release_channel_hint(),
+                        target_release_version.clone(),
+                        target_channel,
                         transaction,
                         error,
                     );
@@ -2557,10 +2565,10 @@ impl Cli {
                             previous_binding_name,
                             "runtime",
                             prepared.name,
-                            prepared.meta.release_version,
-                            prepared.meta.release_channel,
+                            target_release_version,
+                            target_channel,
                             transaction,
-                            error,
+                            error.to_string(),
                         );
                     }
                 };
@@ -2593,8 +2601,8 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     prepared.name,
-                    prepared.meta.release_version,
-                    prepared.meta.release_channel,
+                    target_release_version,
+                    target_channel,
                     transaction,
                     format!("failed to publish upgraded runtime: {error}"),
                 );
@@ -2615,8 +2623,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
+                        target_release_version,
+                        target_channel,
                         transaction,
                         error,
                     );
@@ -2665,8 +2673,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
+                        target_release_version,
+                        target_channel,
                         transaction,
                         error,
                     );
@@ -2691,8 +2699,8 @@ impl Cli {
                 } else {
                     outcome_for_official_prepare_action(&prepared.action)
                 },
-                runtime_release_version: prepared.meta.release_version.clone(),
-                runtime_release_channel: prepared.meta.release_channel.clone(),
+                runtime_release_version: target_release_version,
+                runtime_release_channel: target_channel,
                 service_action,
                 snapshot_id: Some(transaction.snapshot_id.clone()),
                 rollback: None,
@@ -2753,6 +2761,10 @@ impl Cli {
             let resolved = self.resolve_upgrade_target(&target)?;
             let target_runtime_name = resolved.name.clone();
             let target_version = self.resolved_target_version(env_name, &resolved)?;
+            let target_release_version = target_version
+                .clone()
+                .or_else(|| resolved.release_version.clone());
+            let target_channel = resolved.release_channel.clone();
             let source_version = self.ensure_upgrade_is_not_downgrade(
                 env_name,
                 current.release_version.as_deref(),
@@ -2766,8 +2778,8 @@ impl Cli {
                     binding_kind: "runtime".to_string(),
                     binding_name: target_runtime_name,
                     outcome: "would-update".to_string(),
-                    runtime_release_version: target_version.clone(),
-                    runtime_release_channel: resolved.release_channel.clone(),
+                    runtime_release_version: target_release_version.clone(),
+                    runtime_release_channel: target_channel,
                     service_action: service_action_for_dry_run(service.as_ref(), false, true),
                     snapshot_id: None,
                     rollback: None,
@@ -2787,8 +2799,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
-                        target.release_channel_hint(),
+                        target_release_version.clone(),
+                        target_channel,
                         error,
                     );
                 }
@@ -2831,8 +2843,8 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     target_runtime_name,
-                    target_version,
-                    target.release_channel_hint(),
+                    target_release_version,
+                    target_channel,
                     transaction,
                     UPGRADE_INTERRUPTED_ERROR.to_string(),
                 );
@@ -2849,8 +2861,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
-                        target.release_channel_hint(),
+                        target_release_version.clone(),
+                        target_channel,
                         transaction,
                         error,
                     );
@@ -2871,10 +2883,10 @@ impl Cli {
                             previous_binding_name,
                             "runtime",
                             prepared.name,
-                            prepared.meta.release_version,
-                            prepared.meta.release_channel,
+                            target_release_version,
+                            target_channel,
                             transaction,
-                            error,
+                            error.to_string(),
                         );
                     }
                 }
@@ -2893,10 +2905,10 @@ impl Cli {
                             previous_binding_name,
                             "runtime",
                             prepared.name,
-                            prepared.meta.release_version,
-                            prepared.meta.release_channel,
+                            target_release_version,
+                            target_channel,
                             transaction,
-                            error,
+                            error.to_string(),
                         );
                     }
                 };
@@ -2931,8 +2943,8 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     prepared.name,
-                    prepared.meta.release_version,
-                    prepared.meta.release_channel,
+                    target_release_version,
+                    target_channel,
                     transaction,
                     format!("failed to publish upgraded runtime: {error}"),
                 );
@@ -2953,8 +2965,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
+                        target_release_version,
+                        target_channel,
                         transaction,
                         error,
                     );
@@ -2996,8 +3008,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
+                        target_release_version,
+                        target_channel,
                         transaction,
                         error,
                     );
@@ -3010,8 +3022,8 @@ impl Cli {
                 binding_kind: "runtime".to_string(),
                 binding_name: prepared.name.clone(),
                 outcome: outcome_for_official_prepare_action(&prepared.action),
-                runtime_release_version: prepared.meta.release_version.clone(),
-                runtime_release_channel: prepared.meta.release_channel.clone(),
+                runtime_release_version: target_release_version,
+                runtime_release_channel: target_channel,
                 service_action,
                 snapshot_id: Some(transaction.snapshot_id.clone()),
                 rollback: None,
@@ -3073,7 +3085,7 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         current.name,
-                        current.release_version,
+                        Some(target_version.clone()),
                         current.release_channel,
                         error,
                     );
@@ -3113,7 +3125,7 @@ impl Cli {
                 previous_binding_name,
                 "runtime",
                 current.name,
-                current.release_version,
+                Some(target_version.clone()),
                 current.release_channel,
                 transaction,
                 UPGRADE_INTERRUPTED_ERROR.to_string(),
@@ -3129,7 +3141,7 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     current.name,
-                    current.release_version,
+                    Some(target_version.clone()),
                     current.release_channel,
                     transaction,
                     error,
@@ -3153,7 +3165,7 @@ impl Cli {
                         updated.release_version,
                         updated.release_channel,
                         transaction,
-                        error,
+                        error.to_string(),
                     );
                 }
             };
@@ -3335,6 +3347,10 @@ impl Cli {
         let resolved = self.resolve_upgrade_target(target)?;
         let target_runtime_name = resolved.name.clone();
         let target_version = self.resolved_target_version(env_name, &resolved)?;
+        let target_release_version = target_version
+            .clone()
+            .or_else(|| resolved.release_version.clone());
+        let target_channel = resolved.release_channel.clone();
         let source_version =
             self.ensure_upgrade_is_not_downgrade(env_name, None, target_version.as_deref())?;
         if !target.is_named_runtime() {
@@ -3349,8 +3365,8 @@ impl Cli {
                 binding_kind: "runtime".to_string(),
                 binding_name: target_runtime_name,
                 outcome: "would-switch".to_string(),
-                runtime_release_version: target_version.clone(),
-                runtime_release_channel: resolved.release_channel.clone(),
+                runtime_release_version: target_release_version.clone(),
+                runtime_release_channel: target_channel,
                 service_action: service_action_for_dry_run(service.as_ref(), true, true),
                 snapshot_id: None,
                 rollback: None,
@@ -3369,8 +3385,8 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     target_runtime_name,
-                    target_version.clone(),
-                    target.release_channel_hint(),
+                    target_release_version.clone(),
+                    target_channel,
                     error,
                 );
             }
@@ -3410,8 +3426,8 @@ impl Cli {
                 launcher_name.to_string(),
                 "runtime",
                 target_runtime_name,
-                target_version,
-                target.release_channel_hint(),
+                target_release_version,
+                target_channel,
                 transaction,
                 UPGRADE_INTERRUPTED_ERROR.to_string(),
             );
@@ -3428,8 +3444,8 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     target_runtime_name,
-                    target_version.clone(),
-                    target.release_channel_hint(),
+                    target_release_version.clone(),
+                    target_channel,
                     transaction,
                     error,
                 );
@@ -3449,10 +3465,10 @@ impl Cli {
                         launcher_name.to_string(),
                         "runtime",
                         prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
+                        target_release_version,
+                        target_channel,
                         transaction,
-                        error,
+                        error.to_string(),
                     );
                 }
             };
@@ -3480,8 +3496,8 @@ impl Cli {
                 launcher_name.to_string(),
                 "runtime",
                 prepared.name,
-                prepared.meta.release_version,
-                prepared.meta.release_channel,
+                target_release_version,
+                target_channel,
                 transaction,
                 format!("failed to publish upgraded runtime: {error}"),
             );
@@ -3502,8 +3518,8 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     prepared.name,
-                    prepared.meta.release_version,
-                    prepared.meta.release_channel,
+                    target_release_version,
+                    target_channel,
                     transaction,
                     error,
                 );
@@ -3545,8 +3561,8 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     prepared.name,
-                    prepared.meta.release_version,
-                    prepared.meta.release_channel,
+                    target_release_version,
+                    target_channel,
                     transaction,
                     error,
                 );
@@ -3559,8 +3575,8 @@ impl Cli {
             binding_kind: "runtime".to_string(),
             binding_name: prepared.name.clone(),
             outcome: "switched".to_string(),
-            runtime_release_version: prepared.meta.release_version.clone(),
-            runtime_release_channel: prepared.meta.release_channel.clone(),
+            runtime_release_version: target_release_version,
+            runtime_release_channel: target_channel,
             service_action,
             snapshot_id: Some(transaction.snapshot_id.clone()),
             rollback: None,
@@ -3763,20 +3779,26 @@ impl Cli {
         &self,
         env_name: &str,
         runtime: &RuntimeMeta,
-    ) -> Result<(), String> {
+    ) -> Result<(), CandidateFailure> {
         let args = managed_codex_candidate_args();
-        let launch = resolve_runtime_launch(runtime, &args, &self.env, &self.cwd, true)
-            .map_err(|error| format!("candidate managed Codex preflight failed: {error}"))?;
-        let env_meta = self
-            .environment_service()
-            .get(env_name)
-            .map_err(|error| format!("candidate managed Codex preflight failed: {error}"))?;
+        let launch = resolve_runtime_launch(runtime, &args, &self.env, &self.cwd, true).map_err(
+            |error| {
+                CandidateFailure::launch(format!(
+                    "candidate managed Codex preflight failed: {error}"
+                ))
+            },
+        )?;
+        let env_meta = self.environment_service().get(env_name).map_err(|error| {
+            CandidateFailure::launch(format!("candidate managed Codex preflight failed: {error}"))
+        })?;
         let mut process_env = build_openclaw_env(&env_meta, &self.env);
         crate::managed_node::apply_path_prepend_to_environment(
             &mut process_env,
             launch.path_prepend.as_deref(),
         )
-        .map_err(|error| format!("candidate managed Codex preflight failed: {error}"))?;
+        .map_err(|error| {
+            CandidateFailure::launch(format!("candidate managed Codex preflight failed: {error}"))
+        })?;
         process_env.insert("OPENCLAW_UPDATE_IN_PROGRESS".to_string(), "1".to_string());
 
         let output = Command::new(&launch.program)
@@ -3789,10 +3811,10 @@ impl Cli {
             .stderr(Stdio::piped())
             .output()
             .map_err(|error| {
-                format!(
+                CandidateFailure::launch(format!(
                     "candidate managed Codex preflight failed to start {}: {error}",
                     display_path(Path::new(&launch.program))
-                )
+                ))
             })?;
         let output = SimulationCommandOutput::from_output(output);
         if output.status.success() {
@@ -3801,9 +3823,10 @@ impl Cli {
         if candidate_codex_preflight_is_unsupported(&output.stdout, &output.stderr) {
             return Ok(());
         }
-        Err(format!(
-            "candidate managed Codex preflight failed: {}. Repair or reinstall the staged OpenClaw runtime, then rerun the upgrade; the source environment was not changed",
-            output.failure_summary()
+        Err(CandidateFailure::from_output(
+            output.status.code(),
+            &output.stdout,
+            &output.stderr,
         ))
     }
 
@@ -4051,7 +4074,7 @@ impl Cli {
         env_name: &str,
         runtime: &RuntimeMeta,
         timings: &mut UpgradeTimingRecorder,
-    ) -> Result<PostCoreUpdateResult, String> {
+    ) -> Result<PostCoreUpdateResult, PostCoreUpdateFailure> {
         // Resolve the replacement explicitly while the previous binding remains published.
         // A failed finalizer can then roll back without ever activating the replacement.
         let config_repaired = self.prepare_target_openclaw_update(env_name, runtime, timings)?;
@@ -4072,7 +4095,7 @@ impl Cli {
                     finalize_started,
                     "failed",
                 );
-                return Err(error);
+                return Err(PostCoreUpdateFailure::Finalization(error));
             }
         };
         let child_phases = parse_openclaw_finalize_phases(&output.stdout);
@@ -4088,10 +4111,10 @@ impl Cli {
             } else {
                 timings.append_openclaw_phases(finalize_started, &child_phases);
             }
-            return Err(format!(
+            return Err(PostCoreUpdateFailure::Finalization(format!(
                 "openclaw update finalize failed: {}",
                 output.failure_summary()
-            ));
+            )));
         }
         let completion_deferred = child_phases
             .iter()
@@ -4122,9 +4145,10 @@ impl Cli {
         env_name: &str,
         runtime: &RuntimeMeta,
         timings: &mut UpgradeTimingRecorder,
-    ) -> Result<bool, String> {
-        let config_repaired =
-            self.repair_target_openclaw_config(env_name, &runtime.name, timings)?;
+    ) -> Result<bool, PostCoreUpdateFailure> {
+        let config_repaired = self
+            .repair_target_openclaw_config(env_name, &runtime.name, timings)
+            .map_err(PostCoreUpdateFailure::Configuration)?;
         let candidate_started = timings.start();
         let candidate_result = self.validate_committed_upgrade_target(env_name, runtime);
         timings.finish(
@@ -4138,12 +4162,9 @@ impl Cli {
                 "failed"
             },
         );
-        candidate_result.map_err(|error| {
-            if config_repaired {
-                format!("candidate validation failed after target config repair: {error}")
-            } else {
-                error
-            }
+        candidate_result.map_err(|failure| PostCoreUpdateFailure::Candidate {
+            failure,
+            config_repaired,
         })?;
         Ok(config_repaired)
     }
@@ -4516,6 +4537,8 @@ impl Cli {
                 status: "not-run".to_string(),
                 note: None,
             },
+            candidate_failure: None,
+            candidate_runtime_recovery: CandidateRuntimeRecovery::Retained,
             service_quiesced,
             mutated_runtime_names: BTreeSet::new(),
             rollback_of,
@@ -4822,11 +4845,13 @@ impl Cli {
                     Some(format!("upgrade history was not recorded: {history_error}")),
                 );
             }
+            self.append_candidate_recovery_note(&mut summary, &transaction, false);
             transaction.cleanup();
             return Ok(summary);
         }
 
-        let rollback_result = self.rollback_upgrade_locked(env_name, &transaction);
+        let rollback_result = self.rollback_upgrade_locked(env_name, &mut transaction);
+        let rollback_restored = rollback_result.is_ok();
         if let Ok(cleanup_note) = &rollback_result {
             transaction.cleanup_note = cleanup_note.clone();
         }
@@ -4874,14 +4899,99 @@ impl Cli {
                 Some(format!("upgrade history was not recorded: {history_error}")),
             );
         }
+        self.append_candidate_recovery_note(&mut summary, &transaction, rollback_restored);
         transaction.cleanup();
         Ok(summary)
+    }
+
+    fn append_candidate_recovery_note(
+        &self,
+        summary: &mut UpgradeEnvSummary,
+        transaction: &UpgradeTransaction,
+        rollback_restored: bool,
+    ) {
+        let Some(kind) = transaction.candidate_failure else {
+            return;
+        };
+        let runtime_name = &transaction.target.name;
+        let binding = self.environment_service().get(&summary.env_name).ok();
+        let binding_note = match binding.as_ref() {
+            Some(env) => match (&env.default_runtime, &env.default_launcher) {
+                (Some(runtime), _) => format!("Current environment binding: runtime {runtime:?}."),
+                (_, Some(launcher)) => {
+                    format!("Current environment binding: launcher {launcher:?}.")
+                }
+                _ => "The environment has no runtime or launcher binding.".to_string(),
+            },
+            None => "The current environment binding could not be confirmed.".to_string(),
+        };
+        let mut state = transaction.candidate_runtime_recovery;
+        if matches!(state, CandidateRuntimeRecovery::Retained)
+            && !self
+                .runtime_service()
+                .show(runtime_name)
+                .ok()
+                .is_some_and(|runtime| {
+                    Path::new(&runtime.binary_path)
+                        .try_exists()
+                        .unwrap_or(false)
+                })
+        {
+            state = CandidateRuntimeRecovery::Incomplete;
+        }
+        let runtime_note = match state {
+            CandidateRuntimeRecovery::Retained => {
+                format!("Candidate runtime {runtime_name:?} was retained.")
+            }
+            CandidateRuntimeRecovery::RestoredPrevious => {
+                format!("The previous runtime was restored at {runtime_name:?}.")
+            }
+            CandidateRuntimeRecovery::Removed => {
+                format!("Candidate runtime {runtime_name:?} was removed during rollback.")
+            }
+            CandidateRuntimeRecovery::Incomplete => format!(
+                "Candidate runtime {runtime_name:?} restoration or cleanup could not be confirmed."
+            ),
+        };
+        let mut note = format!("OCM recovery result: {binding_note} {runtime_note}");
+        if !transaction.rollback_enabled && transaction.migration.status == "repaired" {
+            note.push_str(" Target configuration repair completed; its changes were retained because rollback was disabled.");
+        }
+        if (transaction.rollback_enabled && !rollback_restored)
+            || matches!(state, CandidateRuntimeRecovery::Incomplete)
+            || binding.is_none()
+        {
+            note.push_str(&format!(
+                " Inspect the environment and runtime with `ocm env show {:?}` and `ocm runtime show {runtime_name:?}`, and resolve the recovery or cleanup errors before retrying.",
+                summary.env_name,
+            ));
+        } else {
+            match kind {
+                CandidateFailureKind::Configuration => note.push_str(" Correct the reported target-configuration finding before retrying the upgrade."),
+                CandidateFailureKind::ManagedRuntime => match state {
+                    CandidateRuntimeRecovery::Retained => note.push_str(&format!(" Repair or reinstall runtime {runtime_name:?}, then retry the upgrade.")),
+                    CandidateRuntimeRecovery::RestoredPrevious | CandidateRuntimeRecovery::Removed => note.push_str(" Retry the upgrade with a corrected target release to prepare a fresh candidate."),
+                    CandidateRuntimeRecovery::Incomplete => unreachable!("handled above"),
+                },
+                CandidateFailureKind::Launch => note.push_str(" Resolve the reported executable, dependency, or permission error before retrying the upgrade."),
+                CandidateFailureKind::Other => note.push_str(" Resolve the reported candidate findings before retrying the upgrade."),
+            }
+        }
+        // History was recorded above using only transaction cleanup diagnostics.
+        // This operator-facing note can contain private, redacted child output.
+        // Redaction of an Authorization header consumes the rest of its line.
+        // Keep OCM's recovery advice separate from every child diagnostic line.
+        let combined = match summary.note.take() {
+            Some(diagnostic) => format!("{diagnostic}\n{note}"),
+            None => note,
+        };
+        summary.note = crate::infra::command_output::bounded_summary(combined.lines());
     }
 
     fn rollback_upgrade_locked(
         &self,
         env_name: &str,
-        transaction: &UpgradeTransaction,
+        transaction: &mut UpgradeTransaction,
     ) -> Result<Option<String>, String> {
         let changes_runtime_trees = !transaction.mutated_runtime_names.is_empty();
         let changes_binding = transaction.source.kind != transaction.target.kind
@@ -4898,7 +5008,14 @@ impl Cli {
                 .mutated_runtime_names
                 .contains(&backup.meta.name)
         }) {
+            let restores_candidate = runtime_backup.meta.name == transaction.target.name;
+            if restores_candidate {
+                transaction.candidate_runtime_recovery = CandidateRuntimeRecovery::Incomplete;
+            }
             self.restore_runtime_backup(runtime_backup)?;
+            if restores_candidate {
+                transaction.candidate_runtime_recovery = CandidateRuntimeRecovery::RestoredPrevious;
+            }
         }
         let restore = self
             .environment_service()
@@ -4934,10 +5051,33 @@ impl Cli {
             .iter()
             .filter(|runtime_name| transaction.mutated_runtime_names.contains(*runtime_name))
         {
-            if let Err(error) = self.remove_runtime_created_during_upgrade(runtime_name) {
-                restored.warnings.push(format!(
+            let removes_candidate = runtime_name == &transaction.target.name;
+            if removes_candidate {
+                transaction.candidate_runtime_recovery = CandidateRuntimeRecovery::Incomplete;
+            }
+            match self.remove_runtime_created_during_upgrade(runtime_name) {
+                Ok(()) if removes_candidate => {
+                    let absent = [
+                        runtime_meta_path(runtime_name, &self.env, &self.cwd),
+                        runtime_install_root(runtime_name, &self.env, &self.cwd),
+                    ]
+                    .into_iter()
+                    .all(|path| {
+                        path.is_ok_and(|path| {
+                            matches!(
+                                fs::symlink_metadata(path),
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                            )
+                        })
+                    });
+                    if absent {
+                        transaction.candidate_runtime_recovery = CandidateRuntimeRecovery::Removed;
+                    }
+                }
+                Ok(()) => {}
+                Err(error) => restored.warnings.push(format!(
                     "unused runtime {runtime_name} cleanup requires attention: {error}"
-                ));
+                )),
             }
         }
         Ok((!restored.warnings.is_empty()).then(|| restored.warnings.join("; ")))
@@ -4997,6 +5137,47 @@ struct OpenClawFinalizePhaseTiming {
 struct PostCoreUpdateResult {
     note: Option<String>,
     completion_deferred: bool,
+}
+
+#[derive(Debug)]
+enum PostCoreUpdateFailure {
+    Configuration(String),
+    Candidate {
+        failure: CandidateFailure,
+        config_repaired: bool,
+    },
+    Finalization(String),
+}
+
+impl fmt::Display for PostCoreUpdateFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configuration(message) | Self::Finalization(message) => {
+                formatter.write_str(message)
+            }
+            Self::Candidate {
+                failure,
+                config_repaired,
+            } => {
+                if *config_repaired {
+                    write!(
+                        formatter,
+                        "candidate validation failed after target config repair: {failure}"
+                    )
+                } else {
+                    write!(formatter, "{failure}")
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CandidateRuntimeRecovery {
+    Retained,
+    RestoredPrevious,
+    Removed,
+    Incomplete,
 }
 
 fn parse_openclaw_finalize_phases(stdout: &str) -> Vec<OpenClawFinalizePhaseTiming> {
@@ -5182,6 +5363,9 @@ struct UpgradeTransaction {
     service_before: UpgradeHistoryServiceState,
     migration: UpgradeHistoryStage,
     finalization: UpgradeHistoryStage,
+    // Transient report context; child diagnostics never belong in history.
+    candidate_failure: Option<CandidateFailureKind>,
+    candidate_runtime_recovery: CandidateRuntimeRecovery,
     service_quiesced: bool,
     mutated_runtime_names: BTreeSet<String>,
     rollback_of: Option<String>,
@@ -5206,21 +5390,29 @@ impl UpgradeTransaction {
         self.finalization.status = "completed".to_string();
     }
 
-    fn mark_post_update_failed(&mut self, error: &str) {
-        if error.contains("openclaw update finalize failed") {
-            self.migration.status = "validated".to_string();
-            self.finalization.status = "failed".to_string();
-        } else if error.contains("candidate managed Codex preflight failed") {
-            self.migration.status =
-                if error.starts_with("candidate validation failed after target config repair") {
-                    "repaired".to_string()
+    fn mark_post_update_failed(&mut self, error: &PostCoreUpdateFailure) {
+        match error {
+            PostCoreUpdateFailure::Finalization(_) => {
+                self.migration.status = "validated".to_string();
+                self.finalization.status = "failed".to_string();
+            }
+            PostCoreUpdateFailure::Candidate {
+                failure,
+                config_repaired,
+            } => {
+                self.migration.status = if *config_repaired {
+                    "repaired"
                 } else {
-                    "validated".to_string()
-                };
-            self.finalization.status = "not-run".to_string();
-        } else {
-            self.migration.status = "failed".to_string();
-            self.finalization.status = "not-run".to_string();
+                    "validated"
+                }
+                .to_string();
+                self.finalization.status = "not-run".to_string();
+                self.candidate_failure = Some(failure.kind);
+            }
+            PostCoreUpdateFailure::Configuration(_) => {
+                self.migration.status = "failed".to_string();
+                self.finalization.status = "not-run".to_string();
+            }
         }
     }
 

@@ -765,6 +765,8 @@ fn clone_environment_with_policy(
             }
         };
 
+        super::openclaw_state::relocate_cloned_plugin_index_paths(&source_paths, &target_paths)?;
+
         let meta = EnvMeta {
             upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
@@ -1442,6 +1444,30 @@ mod tests {
         fs::write(source_paths.state_dir.join("logs/gateway.log"), "source\n").unwrap();
         fs::write(source_paths.state_dir.join("openclaw.json.bak"), "{}\n").unwrap();
 
+        let local_plugin = source_paths.root.join("local-plugin");
+        fs::create_dir_all(&local_plugin).unwrap();
+        fs::write(local_plugin.join("index.js"), "export default {};\n").unwrap();
+        let external_project = root.join("plugin-project");
+        fs::create_dir_all(&external_project).unwrap();
+        let database = source_paths.state_dir.join("state/openclaw.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute(
+            "CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT NOT NULL)",
+            [],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO config_machine_state (state_key, value_json) VALUES ('plugins.installedIndex', ?1)",
+            [json!({"revision": 42, "index": {"installRecords": {
+                "local": {"source": "path", "sourcePath": external_project,
+                    "installPath": local_plugin},
+                "missing": {"source": "npm", "spec": "absent-plugin@1.0.0",
+                    "installPath": source_paths.state_dir.join("extensions/absent")}
+            }}}).to_string()],
+        ).unwrap();
+        drop(connection);
+        let source_database_before = fs::read(&database).unwrap();
+
         let registry = super::env_registry_path(&env, &cwd).unwrap();
         let registry_before = fs::read(&registry).unwrap();
         let nested = source_paths.root.join("nested-simulation");
@@ -1474,6 +1500,45 @@ mod tests {
         .unwrap();
 
         let target_paths = derive_env_paths(Path::new(&simulation.root));
+        let connection =
+            rusqlite::Connection::open(target_paths.state_dir.join("state/openclaw.sqlite"))
+                .unwrap();
+        let document: String = connection.query_row(
+            "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        drop(connection);
+        let document: Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(document["revision"], 42);
+        let records = &document["index"]["installRecords"];
+        assert_eq!(
+            records["local"]["sourcePath"],
+            external_project.display().to_string()
+        );
+        assert_eq!(
+            records["local"]["installPath"],
+            target_paths.root.join("local-plugin").display().to_string()
+        );
+        assert_eq!(
+            records["missing"]["installPath"],
+            target_paths
+                .state_dir
+                .join("extensions/absent")
+                .display()
+                .to_string()
+        );
+        assert!(!target_paths.state_dir.join("extensions/absent").exists());
+        fs::write(
+            target_paths.root.join("local-plugin/index.js"),
+            "clone-only\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(local_plugin.join("index.js")).unwrap(),
+            "export default {};\n"
+        );
+        assert_eq!(fs::read(&database).unwrap(), source_database_before);
         let config: Value =
             serde_json::from_str(&fs::read_to_string(&target_paths.config_path).unwrap()).unwrap();
         let gateway_port = simulation.gateway_port.unwrap();
