@@ -48,6 +48,66 @@ fn read_plugin_registry(path: &Path, folded: bool) -> Value {
 }
 
 #[test]
+fn env_clone_drops_database_owners_without_changing_source_or_durable_state() {
+    let root = TestDir::new("clone-database-owners");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source/.openclaw/state/openclaw.sqlite");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let connection = Connection::open(&source).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE agent_database_leases (
+            lease_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, path TEXT NOT NULL,
+            owner_pid INTEGER NOT NULL, owner_start_time INTEGER, opened_at INTEGER NOT NULL
+        ) STRICT;
+        CREATE TABLE durable_fixture (value TEXT NOT NULL) STRICT;
+        INSERT INTO durable_fixture VALUES ('keep user state');
+        PRAGMA user_version = 42;",
+        )
+        .unwrap();
+    // The test process is live throughout cloning. A missing start identity
+    // must still fence source maintenance, but it cannot own the new clone.
+    connection.execute(
+        "INSERT INTO agent_database_leases VALUES ('live', 'fixture', '/source/agent.sqlite', ?1, NULL, 1)",
+        [std::process::id()],
+    ).unwrap();
+    drop(connection);
+    let before = fs::read(&source).unwrap();
+    let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+    assert!(clone.status.success(), "{}", stderr(&clone));
+    assert_eq!(fs::read(&source).unwrap(), before);
+    let copied =
+        Connection::open(root.child("ocm-home/envs/target/.openclaw/state/openclaw.sqlite"))
+            .unwrap();
+    assert_eq!(
+        copied
+            .query_row("SELECT COUNT(*) FROM agent_database_leases", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        copied
+            .query_row("SELECT value FROM durable_fixture", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "keep user state"
+    );
+    assert_eq!(
+        copied
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        42
+    );
+}
+
+#[test]
 fn env_clone_relocates_plugin_registry_without_changing_source() {
     check_clone_plugin_registry(false);
 }

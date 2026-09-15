@@ -330,6 +330,33 @@ pub(super) fn relocate_cloned_plugin_index_paths(
     )
 }
 
+pub(super) fn clear_cloned_agent_database_leases(target: &EnvPaths) -> Result<(), String> {
+    let Some(database_path) = contained_imported_database(
+        &target.state_dir.join("state/openclaw.sqlite"),
+        &target.root,
+    )?
+    else {
+        return Ok(());
+    };
+    if !is_sqlite_database(&database_path)? {
+        return Ok(());
+    }
+    let connection = Connection::open(&database_path).map_err(|error| error.to_string())?;
+    let has_leases = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_database_leases')",
+        [],
+        |row| row.get::<_, bool>(0),
+    ).map_err(|error| error.to_string())?;
+    if has_leases {
+        // Only a new independent clone loses these source-process claims.
+        // Shared repair/import/restore cleanup must preserve its own live owners.
+        connection
+            .execute("DELETE FROM agent_database_leases", [])
+            .map_err(|error| format!("failed to clear cloned agent database leases: {error}"))?;
+    }
+    Ok(())
+}
+
 fn relocate_installed_plugin_index_paths(
     database_path: &Path,
     source_state_root: &Path,

@@ -766,6 +766,7 @@ fn clone_environment_with_policy(
         };
 
         super::openclaw_state::relocate_cloned_plugin_index_paths(&source_paths, &target_paths)?;
+        super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
 
         let meta = EnvMeta {
             upgrade_independent_paths: Vec::new(),
@@ -1465,6 +1466,10 @@ mod tests {
                     "installPath": source_paths.state_dir.join("extensions/absent")}
             }}}).to_string()],
         ).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE agent_database_leases (lease_id TEXT PRIMARY KEY, owner_pid INTEGER NOT NULL);
+             INSERT INTO agent_database_leases VALUES ('copied-source-owner', 1);",
+        ).unwrap();
         drop(connection);
         let source_database_before = fs::read(&database).unwrap();
 
@@ -1503,6 +1508,12 @@ mod tests {
         let connection =
             rusqlite::Connection::open(target_paths.state_dir.join("state/openclaw.sqlite"))
                 .unwrap();
+        let lease_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM agent_database_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lease_count, 0);
         let document: String = connection.query_row(
             "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'",
             [],

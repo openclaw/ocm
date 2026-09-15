@@ -459,7 +459,9 @@ inside the plain home because OCM does not take ownership of external config.
 Environment clone, export, and import flows preserve managed OpenClaw plugin
 payloads under the legacy, extension, npm, and Git install roots. Clone and
 import still clear live sessions, logs, backups, and process residue so the new
-environment does not share active runtime state with its source.
+environment does not share active runtime state with its source. New clones also
+clear copied agent database process leases while keeping the state database,
+durable rows, and source leases unchanged.
 
 Cloned plugin registrations use the clone's managed files. Copied local projects
 and archives retain their original source information, and missing managed
