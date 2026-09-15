@@ -9,22 +9,81 @@ use base64::Engine;
 use flate2::read::GzDecoder;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256, Sha512};
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::time::Duration as TransportDuration;
+use ureq::unversioned::transport::{Buffers, Connector, DefaultConnector, NextTimeout, Transport};
 
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const HTTP_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
-// ureq carries a recv-response deadline into body reads. Bound the header wait from the
-// completed request-send phase instead, then use recv-body as the per-read stall timeout.
-static HTTP_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
-    ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_resolve(Some(HTTP_PHASE_TIMEOUT))
-            .timeout_connect(Some(HTTP_PHASE_TIMEOUT))
-            .timeout_send_request(Some(HTTP_PHASE_TIMEOUT))
-            .timeout_recv_body(Some(HTTP_PHASE_TIMEOUT))
-            .build(),
-    )
-});
+static HTTP_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| build_http_agent(HTTP_PHASE_TIMEOUT));
+
+#[derive(Debug)]
+struct ReadInactivityConnector {
+    timeout: Duration,
+}
+
+impl<In: Transport> Connector<In> for ReadInactivityConnector {
+    type Out = ReadInactivityTransport<In>;
+
+    fn connect(
+        &self,
+        _details: &ureq::unversioned::transport::ConnectionDetails<'_>,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| ReadInactivityTransport {
+            inner,
+            timeout: self.timeout,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct ReadInactivityTransport<Inner> {
+    inner: Inner,
+    timeout: Duration,
+}
+
+impl<Inner: Transport> Transport for ReadInactivityTransport<Inner> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, mut timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let inactivity_timeout = TransportDuration::from(self.timeout);
+        if inactivity_timeout < timeout.after {
+            timeout.after = inactivity_timeout;
+            timeout.reason = ureq::Timeout::RecvBody;
+        }
+        self.inner.await_input(timeout)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
+
+fn build_http_agent(phase_timeout: Duration) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_resolve(Some(phase_timeout))
+        .timeout_connect(Some(phase_timeout))
+        .timeout_send_request(Some(phase_timeout))
+        .timeout_recv_response(Some(phase_timeout))
+        .build();
+    let connector = DefaultConnector::default().chain(ReadInactivityConnector {
+        timeout: phase_timeout,
+    });
+
+    ureq::Agent::with_parts(config, connector, DefaultResolver::default())
+}
 
 pub(crate) fn http_agent() -> &'static ureq::Agent {
     &HTTP_AGENT
@@ -116,12 +175,21 @@ fn open_url_reader(
     accept: Option<&str>,
     compressed_json: bool,
 ) -> Result<Box<dyn io::Read>, String> {
+    open_url_reader_with_agent(http_agent(), url, accept, compressed_json)
+}
+
+fn open_url_reader_with_agent(
+    agent: &ureq::Agent,
+    url: &str,
+    accept: Option<&str>,
+    compressed_json: bool,
+) -> Result<Box<dyn io::Read>, String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err("runtime URL is required".to_string());
     }
 
-    let mut request = http_agent().get(trimmed);
+    let mut request = agent.get(trimmed);
     if compressed_json {
         request = request.header("Accept-Encoding", "gzip");
     }
@@ -255,8 +323,103 @@ fn verify_file_sha512_base64(
 
 #[cfg(test)]
 mod tests {
-    use super::{artifact_file_name_from_url, copy_capped};
-    use std::io::{self, Read};
+    use super::*;
+    use std::io::{self, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::{self, JoinHandle};
+
+    const TEST_TIMEOUT: Duration = Duration::from_millis(250);
+
+    #[test]
+    fn http_agent_times_out_while_waiting_for_response_headers() {
+        let (url, server) = serve_once(|mut stream| {
+            thread::sleep(TEST_TIMEOUT * 2);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let agent = build_http_agent(TEST_TIMEOUT);
+
+        let error = reader_error(open_url_reader_with_agent(&agent, &url, None, false));
+
+        assert!(
+            error.to_ascii_lowercase().contains("receive response"),
+            "{error}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_agent_times_out_when_a_response_body_stalls() {
+        let (url, server) = serve_once(|mut stream| {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\na")
+                .unwrap();
+            thread::sleep(TEST_TIMEOUT * 2);
+            let _ = stream.write_all(b"b");
+        });
+        let agent = build_http_agent(TEST_TIMEOUT);
+        let mut reader = open_url_reader_with_agent(&agent, &url, None, false).unwrap();
+
+        let error = reader.read_to_end(&mut Vec::new()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("receive body"),
+            "{error}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_agent_allows_progressing_bodies_past_the_inactivity_budget() {
+        let (url, server) = serve_once(|mut stream| {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\na")
+                .unwrap();
+            for byte in b"bcd" {
+                thread::sleep(TEST_TIMEOUT * 2 / 5);
+                stream.write_all(&[*byte]).unwrap();
+            }
+        });
+        let agent = build_http_agent(TEST_TIMEOUT);
+        let mut reader = open_url_reader_with_agent(&agent, &url, None, false).unwrap();
+        let mut body = Vec::new();
+
+        reader.read_to_end(&mut body).unwrap();
+
+        assert_eq!(body, b"abcd");
+        server.join().unwrap();
+    }
+
+    fn reader_error(result: Result<Box<dyn Read>, String>) -> String {
+        match result {
+            Ok(_) => panic!("request unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+
+    fn serve_once(handler: impl FnOnce(TcpStream) + Send + 'static) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request_headers(&mut stream);
+            handler(stream);
+        });
+        (format!("http://{address}/artifact"), server)
+    }
+
+    fn read_request_headers(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "client closed before completing request headers");
+            request.extend_from_slice(&buffer[..read]);
+        }
+    }
 
     #[test]
     fn artifact_file_name_rejects_cross_platform_path_components() {
