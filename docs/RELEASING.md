@@ -55,6 +55,21 @@ ownership guard. The workflow rejects v0.2.39 and other older sources. Future
 version bumps, signed releases, and publications still require explicit
 maintainer authorization.
 
+### CI installation fixture
+
+`scripts/tests/test_npm_install.py --published-binary-fixture` installs the
+existing v0.2.39 binaries through a private npm registry and checks their bytes,
+version, and CLI. The fixture records that release's verified public Apple Team
+ID alongside its version. Both macOS architectures always run the existing
+Developer ID, team, identifier, hardened-runtime, timestamp, and notarization
+checks, including on fork pull requests without `MACOS_TEAM_ID`. A negative
+control also checks that a different expected team is rejected.
+
+The `--packages` publication check separately requires a valid `MACOS_TEAM_ID`;
+it never falls back to the historical fixture's signer. Changing the fixture's
+version requires verifying its expected signer as well. Neither fixture mode
+nor the local npm tests sign or publish a release.
+
 ### Account setup
 
 An npm maintainer with write access to the `openclaw` scope must separately

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import tarfile
 import tempfile
 from threading import Thread
 import unittest
+from unittest import mock
 from urllib.parse import unquote
 
 from test_npm_release import release, stage_fixture
@@ -129,7 +131,45 @@ def installed_native(prefix):
     return matches[0]
 
 
+def macos_team_id(value):
+    team = (value or "").strip()
+    if re.fullmatch(r"[A-Z0-9]{10}", team):
+        return team
+    return None
+
+
+def macos_signature_command(value):
+    team_id = macos_team_id(value)
+    if team_id:
+        return ["--team-id", team_id, "--require-notarization"]
+    raise AssertionError(
+        "expected macOS signer must be a 10-character Apple Developer Team ID "
+        "(MACOS_TEAM_ID for publication)"
+    )
+
+
 class NpmInstallTests(unittest.TestCase):
+    def test_smoke_rejects_changed_installed_bytes_before_execution(self):
+        with tempfile.TemporaryDirectory(prefix="ocm-npm-tamper-") as temporary:
+            packages, _ = stage_fixture(
+                Path(temporary), binary=b"#!/bin/sh\nprintf '1.0.0\\n'\n"
+            )
+            find_native = installed_native
+
+            def change_installed_bytes(prefix):
+                binary = find_native(prefix)
+                with binary.open("ab") as file:
+                    file.write(b"\n# changed after npm installation\n")
+                return binary
+
+            with mock.patch(
+                f"{__name__}.installed_native", side_effect=change_installed_bytes
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "npm install changed native executable bytes"
+                ):
+                    smoke(packages, expected_macos_team_id="AB12CD34EF")
+
     def test_real_global_upgrade_reinstall_local_npx_and_missing_optionals(self):
         with tempfile.TemporaryDirectory(prefix="ocm-npm-test-") as temporary:
             root = Path(temporary)
@@ -324,7 +364,71 @@ esac
             self.assertIn(message, result.stderr)
 
 
-def smoke(directory):
+class MacosTeamIdTests(unittest.TestCase):
+    def test_accepts_a_ten_character_team_id(self):
+        self.assertEqual(macos_team_id("AB12CD34EF"), "AB12CD34EF")
+
+    def test_rejects_empty_missing_and_whitespace(self):
+        self.assertIsNone(macos_team_id(""))
+        self.assertIsNone(macos_team_id(None))
+        self.assertIsNone(macos_team_id("   "))
+
+    def test_rejects_wrong_shape(self):
+        self.assertIsNone(macos_team_id("ab12cd34ef"))
+        self.assertIsNone(macos_team_id("ABC"))
+        self.assertIsNone(macos_team_id("ABCDEFGHIJK"))
+
+    def test_valid_team_id_always_verifies(self):
+        expected = ["--team-id", "AB12CD34EF", "--require-notarization"]
+        self.assertEqual(macos_signature_command("AB12CD34EF"), expected)
+        self.assertEqual(macos_signature_command(" AB12CD34EF\n"), expected)
+
+    def test_publication_requires_its_own_valid_team_id_before_install(self):
+        with tempfile.TemporaryDirectory(prefix="ocm-npm-team-") as temporary:
+            missing = Path(temporary) / "missing-packages"
+            for value in [None, "", "   ", "invalid", "ABCDEFGHIJK"]:
+                with self.subTest(value=value), mock.patch.dict(os.environ):
+                    os.environ.pop("MACOS_TEAM_ID", None)
+                    if value is not None:
+                        os.environ["MACOS_TEAM_ID"] = value
+                    with mock.patch.object(sys, "platform", "darwin"):
+                        with self.assertRaisesRegex(AssertionError, "MACOS_TEAM_ID"):
+                            smoke(missing)
+
+    def test_fixture_signer_does_not_depend_on_publication_configuration(self):
+        with tempfile.TemporaryDirectory(prefix="ocm-npm-team-") as temporary:
+            missing = Path(temporary) / "missing-packages"
+            for value in [None, "", "invalid", "ZZ99YY88XX"]:
+                with self.subTest(value=value), mock.patch.dict(os.environ):
+                    os.environ.pop("MACOS_TEAM_ID", None)
+                    if value is not None:
+                        os.environ["MACOS_TEAM_ID"] = value
+                    with mock.patch.object(sys, "platform", "darwin"):
+                        with self.assertRaises(FileNotFoundError) as failure:
+                            smoke(missing, expected_macos_team_id="AB12CD34EF")
+                    self.assertEqual(
+                        failure.exception.filename, str(missing / "release.json")
+                    )
+
+    def test_invalid_explicit_signer_never_falls_back_to_publication(self):
+        with tempfile.TemporaryDirectory(prefix="ocm-npm-team-") as temporary:
+            missing = Path(temporary) / "missing-packages"
+            with mock.patch.dict(os.environ, {"MACOS_TEAM_ID": "AB12CD34EF"}):
+                with mock.patch.object(sys, "platform", "darwin"):
+                    for value in ["", "   ", "invalid"]:
+                        with self.subTest(value=value):
+                            with self.assertRaisesRegex(AssertionError, "10-character"):
+                                smoke(missing, expected_macos_team_id=value)
+
+
+def smoke(directory, *, expected_macos_team_id=None):
+    signature_command = None
+    if sys.platform == "darwin":
+        signature_command = macos_signature_command(
+            expected_macos_team_id
+            if expected_macos_team_id is not None
+            else os.environ.get("MACOS_TEAM_ID")
+        )
     receipt = release.read_receipt(directory)
     with tempfile.TemporaryDirectory(prefix="ocm-npm-native-") as temporary:
         root = Path(temporary)
@@ -357,19 +461,18 @@ def smoke(directory):
                     "installed executable version differs from package"
                 )
             run([str(entrypoint), "--help"], root, env)
-            if sys.platform == "darwin":
+            if signature_command is not None:
                 run(
                     [
                         str(release.ROOT / "scripts/verify-macos-release.sh"),
                         "--binary",
                         str(binary),
-                        "--team-id",
-                        os.environ["MACOS_TEAM_ID"],
-                        "--require-notarization",
+                        *signature_command,
                     ],
                     root,
                     env,
                 )
+                print("Verified macOS signature and notarization after npm installation")
             print(
                 f"Verified npm install, CLI, and unchanged native bytes on {platform.platform()}"
             )
@@ -378,7 +481,10 @@ def smoke(directory):
 def published_binary_fixture():
     # This old release proves signed-byte preservation only. Production prepare
     # rejects it because the native npm ownership guard had not shipped.
-    repo, tag = "openclaw/ocm", "v0.2.39"
+    # Public expected signer of this pinned release, verified on both macOS
+    # architectures. It is independent of the current publisher's configuration.
+    repo, version, team_id = "openclaw/ocm", "0.2.39", "FWJYW4S8P8"
+    tag = f"v{version}"
     snapshot = release.release_snapshot(repo, tag)
     with tempfile.TemporaryDirectory(prefix="ocm-npm-release-fixture-") as temporary:
         root = Path(temporary)
@@ -387,7 +493,7 @@ def published_binary_fixture():
         release.download_assets(repo, tag, snapshot, assets)
         output = root / "npm"
         release.stage(
-            "0.2.39",
+            version,
             {"repository": repo, "tag": tag, "assets": snapshot},
             assets,
             (release.ROOT / "npm/ocm.cjs").read_bytes(),
@@ -395,7 +501,37 @@ def published_binary_fixture():
             (release.ROOT / "npm/README.md").read_bytes(),
             output,
         )
-        smoke(output)
+        smoke(output, expected_macos_team_id=team_id)
+        if sys.platform == "darwin":
+            # Reuse the downloaded fixture to prove a different expected team
+            # cannot pass the same verifier used for the installed executable.
+            target = release.TARGETS[
+                "darwin-arm64" if platform.machine() == "arm64" else "darwin-x64"
+            ]
+            binary = root / "wrong-team-ocm"
+            binary.write_bytes(release.native_bytes(assets / f"ocm-{target}.tar.gz"))
+            binary.chmod(0o755)
+            wrong_team = "AAAAAAAAAA" if team_id != "AAAAAAAAAA" else "BBBBBBBBBB"
+            result = subprocess.run(
+                [
+                    str(release.ROOT / "scripts/verify-macos-release.sh"),
+                    "--binary",
+                    str(binary),
+                    *macos_signature_command(wrong_team),
+                ],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                timeout=90,
+            )
+            if result.returncode == 0 or (
+                f"not signed by Apple Developer Team {wrong_team}" not in result.stderr
+            ):
+                raise AssertionError(
+                    "wrong-signer control did not reject the team: "
+                    f"{result.stdout}{result.stderr}"
+                )
+            print("Verified that a different expected macOS signer is rejected")
 
 
 if __name__ == "__main__":
