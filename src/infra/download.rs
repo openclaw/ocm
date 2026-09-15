@@ -18,6 +18,8 @@ const HTTP_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 static HTTP_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| build_http_agent(HTTP_PHASE_TIMEOUT));
 
+// ureq 3.4.1's receive-body timeout is total. Clamp each blocking transport read
+// instead so continuous progress can outlive the inactivity window.
 #[derive(Debug)]
 struct ReadInactivityConnector {
     timeout: Duration,
@@ -328,7 +330,7 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread::{self, JoinHandle};
 
-    const TEST_TIMEOUT: Duration = Duration::from_millis(250);
+    const TEST_TIMEOUT: Duration = Duration::from_millis(500);
 
     #[test]
     fn http_agent_times_out_while_waiting_for_response_headers() {
@@ -376,10 +378,10 @@ mod tests {
     fn http_agent_allows_progressing_bodies_past_the_inactivity_budget() {
         let (url, server) = serve_once(|mut stream| {
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\na")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\na")
                 .unwrap();
-            for byte in b"bcd" {
-                thread::sleep(TEST_TIMEOUT * 2 / 5);
+            for byte in b"bcdefg" {
+                thread::sleep(TEST_TIMEOUT / 5);
                 stream.write_all(&[*byte]).unwrap();
             }
         });
@@ -389,7 +391,7 @@ mod tests {
 
         reader.read_to_end(&mut body).unwrap();
 
-        assert_eq!(body, b"abcd");
+        assert_eq!(body, b"abcdefg");
         server.join().unwrap();
     }
 
