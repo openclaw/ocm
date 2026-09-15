@@ -1467,6 +1467,67 @@ fn wait_for_ui_command_cleanup(root: &TestDir) {
     }
 }
 
+#[test]
+fn dev_ui_dashboard_publishes_complete_pid() {
+    let root = TestDir::new("dev-ui-dashboard-pid-publication");
+    let config = root.child("openclaw.json");
+    fs::write(&config, r#"{"gateway":{"controlUi":{}}}"#).unwrap();
+    let fixture = root.child("dev-ui-fixture.cjs");
+    fs::write(&fixture, include_str!("support/dev_ui.cjs")).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert("OCM_TEST_DEV_UI_DIR".into(), path_string(root.path()));
+    env.insert("OPENCLAW_CONFIG_PATH".into(), path_string(&config));
+    env.insert("OPENCLAW_GATEWAY_PORT".into(), "19789".into());
+    let child = Command::new("node")
+        .args([
+            "-e",
+            r#"
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const published = path.join(process.env.OCM_TEST_DEV_UI_DIR, 'dashboard-attempt-1');
+const writeFile = fs.writeFileSync;
+let pidWrites = 0;
+setTimeout(() => { throw new Error('dashboard fixture did not finish'); }, 5000).unref();
+fs.writeFileSync = (destination, data, ...options) => {
+  if (data !== String(process.pid)) return writeFile(destination, data, ...options);
+  pidWrites++;
+  // Observe the real open-before-write interval without delaying the reader.
+  const fd = fs.openSync(destination, 'w');
+  try {
+    assert.equal(fs.fstatSync(fd).size, 0);
+    assert.equal(fs.existsSync(published), false, 'PID path appeared before contents were ready');
+    writeFile(fd, data, ...options);
+  } finally {
+    fs.closeSync(fd);
+  }
+};
+require(process.argv[1]);
+assert.equal(pidWrites, 1, 'the actual dashboard PID write must be observed');
+"#,
+            &path_string(&fixture),
+            "dashboard",
+        ])
+        .current_dir(root.path())
+        .env_clear()
+        .envs(&env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(root.child("dashboard-attempt-1"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap(),
+        pid
+    );
+}
+
 #[cfg(unix)]
 fn ui_dashboard_pid(root: &TestDir, attempt: usize) -> u32 {
     let path = root.child(format!("dashboard-attempt-{attempt}"));

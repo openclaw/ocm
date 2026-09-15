@@ -69,7 +69,9 @@ if (role === "config") {
   const attempts = file("dashboard-attempts");
   fs.appendFileSync(attempts, `${process.pid}\n`);
   const count = fs.readFileSync(attempts, "utf8").trim().split("\n").length;
-  fs.writeFileSync(file(`dashboard-attempt-${count}`), String(process.pid));
+  const temporary = file(`dashboard-attempt-${count}.${process.pid}.tmp`);
+  fs.writeFileSync(temporary, String(process.pid));
+  fs.renameSync(temporary, file(`dashboard-attempt-${count}`));
   const deliver = () => {
     if (exists("dashboard-pending")) {
       console.log(JSON.stringify({ ok: false, reason: "fixture Gateway is pending" }));
