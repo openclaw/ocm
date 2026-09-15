@@ -17,7 +17,7 @@ use crate::store::{
     resolve_effective_gateway_ports, resolve_env_gateway_port, save_environment,
     set_environment_service_policy,
 };
-use crate::supervisor::{sync_supervisor_env_if_present, sync_supervisor_if_present};
+use crate::supervisor::sync_supervisor_env_if_present;
 
 pub fn default_service_enabled() -> bool {
     true
@@ -488,7 +488,7 @@ impl<'a> EnvironmentService<'a> {
             self.env,
             self.cwd,
         )?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &change.applied.name)?;
         Ok(change.applied)
     }
 

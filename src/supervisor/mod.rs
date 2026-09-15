@@ -286,19 +286,6 @@ pub struct SupervisorService<'a> {
     cwd: &'a Path,
 }
 
-pub fn sync_supervisor_if_present(
-    env: &BTreeMap<String, String>,
-    cwd: &Path,
-) -> Result<bool, String> {
-    let state_path = supervisor_state_path(env, cwd)?;
-    let runtime_path = supervisor_runtime_path(env, cwd)?;
-    if !state_path.exists() && !runtime_path.exists() {
-        return Ok(false);
-    }
-    SupervisorService::new(env, cwd).sync()?;
-    Ok(true)
-}
-
 pub fn sync_supervisor_env_if_present(
     env: &BTreeMap<String, String>,
     cwd: &Path,

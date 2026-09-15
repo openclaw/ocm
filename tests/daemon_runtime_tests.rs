@@ -1789,8 +1789,9 @@ fn daemon_defers_a_saved_service_start_until_source_watch_releases_the_env() {
 
     let mut daemon = spawn_daemon_process(&cwd, &env);
     let during = wait_for_runtime_children(&runtime_path, 1, Some("prod"), Duration::from_secs(5));
+    // The supervisor publishes the PID before the child's first write completes.
+    let sibling_was_started = wait_for_file(&runtime_marker, Duration::from_secs(5));
     let source_was_started = launcher_marker.exists();
-    let sibling_was_started = runtime_marker.exists();
     drop(source_watch);
     let after = wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(10));
     stop_process(&mut daemon);
@@ -2149,6 +2150,52 @@ fn start_create_preserves_running_siblings_despite_caller_environment_drift() {
     );
 
     stop_process(&mut daemon);
+}
+
+#[test]
+fn service_policy_changes_preserve_unrelated_supervisor_child_specs() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-policy-preserves-supervisor-siblings");
+    let (cwd, mut env) = setup_service_fixture(&root);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    SupervisorService::new(&env, &cwd).sync().unwrap();
+    let sibling = persisted_child(&state_path, "prod");
+    env.insert(
+        "NODE_OPTIONS".to_string(),
+        "--max-old-space-size=2048".to_string(),
+    );
+
+    // Simulation repeats an already-disabled policy; that must remain target-scoped too.
+    for (enabled_option, running_option, enabled, running) in [
+        (Some(false), None, false, true),
+        (None, Some(false), false, false),
+        (Some(false), Some(false), false, false),
+        (Some(true), None, true, false),
+        (None, Some(true), true, true),
+        (Some(true), Some(true), true, true),
+    ] {
+        let service = EnvironmentService::new(&env, &cwd);
+        let changed = match (enabled_option, running_option) {
+            (Some(enabled), None) => service.set_service_enabled("demo", enabled),
+            (None, Some(running)) => service.set_service_running("demo", running),
+            _ => service.set_service_policy("demo", enabled_option, running_option),
+        }
+        .unwrap();
+        assert_eq!(changed.service_enabled, enabled);
+        assert_eq!(changed.service_running, running);
+        assert_eq!(
+            persisted_child(&state_path, "prod"),
+            sibling,
+            "changing one environment's service policy rebuilt a sibling definition"
+        );
+        let state = read_persisted_service_state(&state_path);
+        let target_present = state["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|child| child["envName"] == "demo");
+        assert_eq!(target_present, enabled && running);
+    }
 }
 
 #[test]
