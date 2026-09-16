@@ -250,6 +250,7 @@ fn rewrite_runtime_state_root_refs(
     let target_root = display_path(target_state_root);
     rewrite_runtime_state_root_refs_inner(
         root,
+        root,
         config_path,
         workspaces,
         &source_root,
@@ -260,6 +261,7 @@ fn rewrite_runtime_state_root_refs(
 }
 
 fn rewrite_runtime_state_root_refs_inner(
+    state_root: &Path,
     root: &Path,
     config_path: &Path,
     workspaces: &OpenClawWorkspaceInventory,
@@ -282,6 +284,7 @@ fn rewrite_runtime_state_root_refs_inner(
         let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
         if metadata.is_dir() {
             rewrite_runtime_state_root_refs_inner(
+                state_root,
                 &path,
                 config_path,
                 workspaces,
@@ -291,7 +294,7 @@ fn rewrite_runtime_state_root_refs_inner(
             )?;
             continue;
         }
-        if !metadata.is_file() {
+        if !metadata.is_file() || is_legacy_audit_history_path(state_root, &path) {
             continue;
         }
 
@@ -307,6 +310,57 @@ fn rewrite_runtime_state_root_refs_inner(
     }
 
     Ok(())
+}
+
+// OpenClaw validates these historical bytes against its audit checkpoints.
+// Paths in them are provenance, not runtime references to relocate or repair.
+fn is_legacy_audit_history_path(state_root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(state_root) else {
+        return false;
+    };
+    let basenames: &[&str] = match relative.parent() {
+        Some(parent) if parent == Path::new("logs") => &["config-audit.jsonl"],
+        Some(parent) if parent == Path::new("audit") => &["system-agent.jsonl", "crestodian.jsonl"],
+        _ => return false,
+    };
+    let Some(name) = relative.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    basenames.iter().any(|basename| {
+        if let Some(claim) = name.strip_prefix('.') {
+            return claim
+                .strip_prefix(basename)
+                .and_then(|suffix| suffix.strip_prefix(".doctor-importing"))
+                .is_some_and(is_legacy_audit_generation);
+        }
+        let Some(suffix) = name.strip_prefix(basename) else {
+            return false;
+        };
+        if suffix.is_empty() {
+            return true;
+        }
+        let Some(archive) = suffix.strip_prefix(".migrated") else {
+            return false;
+        };
+        let (generation, recovery) = archive.split_once(".raw").unwrap_or((archive, ""));
+        is_legacy_audit_generation(generation)
+            && matches!(
+                recovery,
+                "" | ".doctor-scrub-restore" | ".doctor-scrub-staging" | ".doctor-scrub-progress"
+            )
+    })
+}
+
+fn is_legacy_audit_generation(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(generation) = suffix.strip_prefix('.') else {
+        return false;
+    };
+    matches!(generation.as_bytes().first(), Some(b'1'..=b'9'))
+        && generation.bytes().all(|byte| byte.is_ascii_digit())
+        && (generation.len() > 1 || generation != "1")
 }
 
 #[derive(Clone, Copy)]
@@ -971,6 +1025,9 @@ fn collect_runtime_state_path_refs(
         &paths.config_path,
         workspaces,
         &mut |path| {
+            if is_legacy_audit_history_path(&paths.state_dir, path) {
+                return;
+            }
             let Ok(raw) = fs::read_to_string(path) else {
                 return;
             };
@@ -1127,6 +1184,21 @@ mod tests {
         let _ = fs::remove_dir_all(&temp);
         let source_root = temp.join("source");
         let target_root = temp.join("target");
+        let current = meta("target", &display_path(&target_root));
+        let known_envs = vec![meta("source", &display_path(&source_root)), current.clone()];
+        fs::create_dir_all(target_root.join(".openclaw/logs")).unwrap();
+        fs::write(
+            target_root.join(".openclaw/logs/config-audit.jsonl.migrated"),
+            format!(
+                "{}\n",
+                source_root.join(".openclaw/openclaw.json").display()
+            ),
+        )
+        .unwrap();
+        let audit = audit_openclaw_state(&current, &known_envs, &BTreeMap::new());
+        assert!(!audit.repair_runtime_state);
+        assert!(audit.issues.is_empty());
+
         fs::create_dir_all(target_root.join(".openclaw/agents/main/sessions")).unwrap();
         fs::write(
             target_root.join(".openclaw/agents/main/sessions/main.jsonl"),
@@ -1137,8 +1209,6 @@ mod tests {
         )
         .unwrap();
 
-        let current = meta("target", &display_path(&target_root));
-        let known_envs = vec![meta("source", &display_path(&source_root)), current.clone()];
         let audit = audit_openclaw_state(&current, &known_envs, &BTreeMap::new());
         assert!(audit.repair_runtime_state);
         assert!(audit.issues.iter().any(|issue| issue.contains(

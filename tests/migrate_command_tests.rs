@@ -1118,6 +1118,102 @@ fn adopt_import_preserves_history_and_logs_from_plain_openclaw_home() {
 }
 
 #[test]
+fn adopt_import_preserves_legacy_audit_history_bytes() {
+    let root = TestDir::new("adopt-audit-history");
+    let cwd = root.child("workspace");
+    let source_home = root.child("legacy-home/.openclaw");
+    fs::create_dir_all(&cwd).unwrap();
+    seed_plain_openclaw_home(&source_home);
+    let mut env = ocm_env(&root);
+    install_fake_openclaw_on_path(&root, &mut env);
+
+    let record = format!(
+        "{}\n",
+        serde_json::json!({ "configPath": source_home.join("openclaw.json") })
+    );
+    let mut audit_paths = Vec::new();
+    for (directory, basename) in [
+        ("logs", "config-audit.jsonl"),
+        ("audit", "system-agent.jsonl"),
+        ("audit", "crestodian.jsonl"),
+    ] {
+        for suffix in [
+            ".migrated",
+            "",
+            ".migrated.2",
+            ".migrated.184467440737095516160",
+            ".migrated.raw",
+            ".migrated.2.raw",
+            ".migrated.2.raw.doctor-scrub-restore",
+            ".migrated.2.raw.doctor-scrub-staging",
+            ".migrated.2.raw.doctor-scrub-progress",
+        ] {
+            audit_paths.push(format!("{directory}/{basename}{suffix}"));
+        }
+        for generation in ["", ".2"] {
+            audit_paths.push(format!(
+                "{directory}/.{basename}.doctor-importing{generation}"
+            ));
+        }
+    }
+    for relative in &audit_paths {
+        let path = source_home.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, &record).unwrap();
+    }
+    let ordinary_paths = [
+        "logs/config-audit.jsonl.migrated.01",
+        "audit/system-agent.jsonl.migrated.1",
+        "audit/crestodian.jsonl.migrated.2.raw.other",
+        "logs/other.jsonl.migrated",
+        "other/logs/config-audit.jsonl.migrated",
+    ];
+    for relative in ordinary_paths {
+        let path = source_home.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, &record).unwrap();
+    }
+
+    let output = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "adopt",
+            "import",
+            "--name",
+            "mira",
+            source_home.to_string_lossy().as_ref(),
+            "--json",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let imported_state = root.child("ocm-home/envs/mira/.openclaw");
+    assert_imported_plain_openclaw_home(&imported_state, &source_home);
+    for relative in &audit_paths {
+        assert_eq!(
+            fs::read(imported_state.join(relative)).unwrap(),
+            record.as_bytes(),
+            "import rewrote {relative}"
+        );
+        assert_eq!(
+            fs::read(source_home.join(relative)).unwrap(),
+            record.as_bytes()
+        );
+    }
+    let relocated = record.replace(
+        &source_home.display().to_string(),
+        &imported_state.display().to_string(),
+    );
+    for relative in ordinary_paths {
+        assert_eq!(
+            fs::read_to_string(imported_state.join(relative)).unwrap(),
+            relocated,
+            "ordinary runtime reference was not relocated: {relative}"
+        );
+    }
+}
+
+#[test]
 fn adopt_import_relocates_managed_plugin_install_records_into_the_imported_state() {
     let root = TestDir::new("adopt-import-plugin-records");
     let cwd = root.child("workspace");
