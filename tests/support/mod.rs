@@ -411,7 +411,7 @@ pub fn npm_fixture(package: &Path) -> Option<(PathBuf, PathBuf)> {
     );
     let binary = payload.join(format!("vendor/{target}/bin/ocm"));
     fs::create_dir_all(binary.parent().unwrap()).unwrap();
-    fs::hard_link(ocm_test_binary_path(), &binary).unwrap();
+    fs::copy(ocm_test_binary_path(), &binary).unwrap();
     let entrypoint = package.join("bin/ocm.cjs");
     write_executable_script(&entrypoint, include_str!("../../npm/ocm.cjs"));
     Some((entrypoint, binary))
