@@ -39,6 +39,7 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Reject mixed or malformed candidate preflight failures instead of treating an unsupported-check marker as success. Thanks @shakkernerd for the report and @goutamadwant for the fix (#128, #165).
 - Accept reformatted and binary macOS LaunchAgent plists for the same OCM store while still rejecting foreign or invalid owners. Thanks @TheAngryPit (#147, #149).
 - Reject linked environment archive roots and metadata before import or legacy snapshot restore can read files outside the extracted archive.
 - Keep npm-owned executable updates with npm, prevent temporary npx caches from

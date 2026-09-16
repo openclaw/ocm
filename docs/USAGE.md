@@ -496,6 +496,10 @@ the resolved target even when preparation fails or the upgrade rolls back.
 The version includes a named runtime's detected version; the channel remains
 `null` when the selected runtime's channel is unknown.
 
+An unsupported candidate Doctor check is a compatibility exception only when
+it is the sole failure. Mixed failures, malformed responses, and contradictory
+diagnostics stop the upgrade before finalization and binding publication.
+
 When candidate validation fails, the report keeps bounded, redacted Doctor
 findings and identifies candidate-provided hints as information captured before
 recovery. OCM's recovery guidance describes the current environment binding and
