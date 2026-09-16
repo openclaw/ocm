@@ -1794,6 +1794,7 @@ fn daemon_defers_a_saved_service_start_until_source_watch_releases_the_env() {
     let source_was_started = launcher_marker.exists();
     drop(source_watch);
     let after = wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(10));
+    let source_was_resumed = wait_for_file(&launcher_marker, Duration::from_secs(5));
     stop_process(&mut daemon);
 
     assert!(during.is_some(), "unwatched sibling should remain runnable");
@@ -1803,7 +1804,10 @@ fn daemon_defers_a_saved_service_start_until_source_watch_releases_the_env() {
         after.is_some(),
         "service did not resume after watch released"
     );
-    assert!(launcher_marker.exists());
+    assert!(
+        source_was_resumed,
+        "resumed child did not write its startup marker"
+    );
 }
 
 #[test]

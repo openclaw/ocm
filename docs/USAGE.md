@@ -741,6 +741,11 @@ ocm env import ./mira.tar --name rowan
 
 Imported environments get a fresh identity, have env-scoped OpenClaw config rewritten for the new root, and keep durable agent settings while clearing copied runtime residue like sessions, logs, and backup files.
 
+Environment archives must contain real `meta/` and `root/` directories and a
+regular `meta/env.json` file. Import and legacy snapshot restore reject symlinks
+at those entries before reading metadata or copying environment contents, so
+an archive cannot redirect those operations to files outside its extracted tree.
+
 ### Inspect and repair
 
 ```bash

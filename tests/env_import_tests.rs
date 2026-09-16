@@ -6,6 +6,82 @@ use serde_json::Value;
 
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout, write_text};
 
+#[cfg(unix)]
+#[test]
+fn env_import_rejects_linked_archive_structure_before_reading_external_files() {
+    for linked_entry in ["root", "meta", "meta/env.json"] {
+        let root = TestDir::new("env-import-linked-structure");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let external = root.child("external");
+        fs::create_dir_all(&external).unwrap();
+        write_text(&external.join("sentinel.txt"), "external fixture contents");
+        let metadata = serde_json::json!({
+            "kind": "ocm-env-archive",
+            "formatVersion": 1,
+            "exportedAt": "2026-09-15T00:00:00Z",
+            "env": {
+                "name": "source",
+                "gatewayPort": 19789,
+                "protected": false,
+                "createdAt": "2026-09-15T00:00:00Z",
+                "updatedAt": "2026-09-15T00:00:00Z"
+            }
+        });
+        let metadata = serde_json::to_vec(&metadata).unwrap();
+        fs::write(external.join("env.json"), &metadata).unwrap();
+        let archive_path = cwd.join("linked.tar");
+        let mut archive = tar::Builder::new(fs::File::create(&archive_path).unwrap());
+        if !linked_entry.starts_with("meta") {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(metadata.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "meta/env.json", metadata.as_slice())
+                .unwrap();
+        }
+        if linked_entry != "root" {
+            let empty_root = root.child("empty-root");
+            fs::create_dir_all(&empty_root).unwrap();
+            archive.append_dir("root", &empty_root).unwrap();
+        }
+        let target = if linked_entry == "meta/env.json" {
+            external.join("env.json")
+        } else {
+            external.clone()
+        };
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        archive
+            .append_link(&mut header, linked_entry, &target)
+            .unwrap();
+        archive.finish().unwrap();
+        drop(archive);
+
+        let imported = run_ocm(
+            &cwd,
+            &env,
+            &["env", "import", "linked.tar", "--name", "target"],
+        );
+        assert!(!imported.status.success(), "accepted linked {linked_entry}");
+        assert!(
+            stderr(&imported).contains("archive entry"),
+            "{}",
+            stderr(&imported)
+        );
+        assert!(!root.child("ocm-home/envs/target").exists());
+        assert_eq!(fs::read(external.join("env.json")).unwrap(), metadata);
+        assert_eq!(
+            fs::read_to_string(external.join("sentinel.txt")).unwrap(),
+            "external fixture contents"
+        );
+    }
+}
+
 #[test]
 fn env_import_restores_an_archive_with_a_new_name_and_root() {
     let root = TestDir::new("env-import");
