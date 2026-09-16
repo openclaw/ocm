@@ -39,6 +39,7 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Reject linked environment archive roots and metadata before import or legacy snapshot restore can read files outside the extracted archive.
 - Keep npm-owned executable updates with npm, prevent temporary npx caches from
   owning background services, and preserve process identity during npm-launched
   gateway refreshes. Protect managed and symlinked installer destinations even
