@@ -966,6 +966,11 @@ Background services:
 
 Windows service support is not implemented yet.
 
+On macOS, service ownership is read from `EnvironmentVariables.OCM_HOME` in
+the LaunchAgent plist. Plist-aware editors can reformat the definition or
+convert it to binary without changing ownership. A different, missing, or
+invalid owner still prevents OCM from replacing or controlling that service.
+
 ## Safety notes
 
 `ocm` keeps safety checks around destructive actions.

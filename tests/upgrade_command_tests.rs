@@ -1184,15 +1184,8 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
 
-    let health_server =
-        TestHttpServer::serve_bytes_times("/health", "application/json", br#"{"ok":true}"#, 8);
-    let health_url = health_server.url();
-    let health_port = health_url
-        .split(':')
-        .nth(2)
-        .and_then(|value| value.split('/').next())
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap();
+    let (health_port, health_requests, health_stop, health_handle) =
+        spawn_converging_health_server();
 
     let old_tarball =
         openclaw_package_tarball(&recording_openclaw_script("2026.3.24"), "2026.3.24");
@@ -1356,6 +1349,7 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo"]);
     observer_done.store(true, Ordering::Relaxed);
     let (stop_count, start_count, target_entered_backoff) = restart_observer.join().unwrap();
+    stop_converging_health_server(health_port, &health_stop, health_handle);
 
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
     let output = stdout(&upgrade);
@@ -1365,7 +1359,7 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
         output.contains("post-upgrade gateway readiness failed: gateway RPC is not ready"),
         "{output}"
     );
-    assert!(!health_server.requests().is_empty());
+    assert!(health_requests.load(Ordering::SeqCst) > 0);
     assert!(target_entered_backoff);
     assert!(stop_count >= 2, "stop_count={stop_count}");
     assert!(start_count >= 2, "start_count={start_count}");

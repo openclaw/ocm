@@ -716,6 +716,53 @@ fn service_stop_keeps_the_daemon_while_a_sibling_env_is_running() {
 }
 
 #[test]
+fn service_start_accepts_reformatted_same_store_plist() {
+    let root = TestDir::new("service-start-reformatted-owner");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = launchd_env(&root);
+    setup_launcher_env(&cwd, &env);
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+
+    let path = managed_service_definition_path(&env, &cwd, "ocm");
+    let original = fs::read_to_string(&path).unwrap();
+    let reformatted = original.replace("      <string>", "\t<string>");
+    assert_ne!(original, reformatted);
+    fs::write(&path, &reformatted).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let edited = Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Set :Comment reformatted-owner-fixture"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(edited.status.success(), "{}", stderr(&edited));
+    }
+    let restarted = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(restarted.status.success(), "{}", stderr(&restarted));
+
+    let mut foreign_env = env.clone();
+    foreign_env.insert(
+        "OCM_HOME".to_string(),
+        path_string(&root.child("foreign-store")),
+    );
+    setup_launcher_env(&cwd, &foreign_env);
+    let before = fs::read(&path).unwrap();
+    let rejected = run_ocm(&cwd, &foreign_env, &["service", "start", "demo"]);
+    assert!(!rejected.status.success());
+    assert!(
+        stderr(&rejected).contains("already bound to a different OCM_HOME"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+
+    let stopped = run_ocm(&cwd, &env, &["service", "stop", "demo"]);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+}
+
+#[test]
 fn service_start_rejects_a_daemon_owned_by_another_store() {
     let root = TestDir::new("service-start-other-store-owner");
     let first_cwd = root.child("first-workspace");
