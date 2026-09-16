@@ -374,11 +374,35 @@ pub fn extract_env_archive<T: DeserializeOwned>(
 
     let metadata_path = staging_dir.join(ENV_ARCHIVE_METADATA_PATH);
     let root_dir = staging_dir.join(ENV_ARCHIVE_ROOT_DIR);
-    if !metadata_path.exists() {
-        return Err("archive is missing meta/env.json".to_string());
-    }
-    if !root_dir.exists() {
-        return Err("archive is missing root/".to_string());
+    // Validate parents before inspecting children; archive symlinks may point
+    // outside staging even though tar safely contained their creation.
+    for (relative_path, directory) in [
+        ("meta", true),
+        (ENV_ARCHIVE_METADATA_PATH, false),
+        (ENV_ARCHIVE_ROOT_DIR, true),
+    ] {
+        let metadata = fs::symlink_metadata(staging_dir.join(relative_path)).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                format!("archive is missing {relative_path}")
+            } else {
+                format!("failed to inspect archive entry {relative_path}: {error}")
+            }
+        })?;
+        let valid = if directory {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        };
+        if !valid {
+            let expected = if directory {
+                "directory"
+            } else {
+                "regular file"
+            };
+            return Err(format!(
+                "archive entry {relative_path} must be a {expected}, not a symlink or other file type"
+            ));
+        }
     }
 
     let metadata_raw = fs::read_to_string(&metadata_path).map_err(|error| error.to_string())?;
@@ -462,6 +486,30 @@ mod tests {
         std::env::temp_dir()
             .join("ocm-archive-tests")
             .join(format!("{label}-{}-{id}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_archives_preserve_symlinks_inside_the_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("data.txt"), "fixture data").unwrap();
+        std::os::unix::fs::symlink("data.txt", source.join("alias.txt")).unwrap();
+        let archive = fixture.path().join("env.tar");
+        write_env_archive(&serde_json::json!({"fixture": true}), &source, &archive).unwrap();
+
+        let extracted =
+            extract_env_archive::<serde_json::Value>(&archive, &fixture.path().join("extracted"))
+                .unwrap();
+        assert_eq!(
+            fs::read_link(extracted.root_dir.join("alias.txt")).unwrap(),
+            Path::new("data.txt")
+        );
+        assert_eq!(
+            fs::read_to_string(extracted.root_dir.join("alias.txt")).unwrap(),
+            "fixture data"
+        );
     }
 
     fn remove_configured_path_before_archive(
