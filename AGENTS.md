@@ -3,7 +3,7 @@
 OCM is the Rust CLI for managing OpenClaw environments, runtimes, launchers, and
 services. Read [README.md](README.md) for the product workflow and
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and pull requests.
-`AGENTS.md` is canonical; `CLAUDE.md` is a relative symlink to this file.
+`AGENTS.md` is canonical; do not add `CLAUDE.md` aliases.
 
 ## Working in this repository
 
