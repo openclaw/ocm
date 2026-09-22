@@ -277,7 +277,7 @@ fn env_status_keeps_official_runtime_healthy_when_managed_fallback_is_available(
             .to_string_lossy()
             .to_string(),
     );
-    let _managed_node_server = install_fake_managed_node_archive(&root, &mut status_env, "24.15.0");
+    let _managed_node_server = install_fake_managed_node_archive(&root, &mut status_env, "24.21.0");
 
     let status = run_ocm(&cwd, &status_env, &["env", "status", "demo", "--json"]);
     assert!(status.status.success(), "{}", stderr(&status));

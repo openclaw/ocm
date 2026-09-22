@@ -306,7 +306,7 @@ fn setup_can_offer_git_install_before_using_managed_node_fallback() {
         "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
         packument_server.url(),
     );
-    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.15.0");
+    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.21.0");
     let log_path = install_fake_git_package_manager(&root, &mut env, "apt-get");
 
     let setup = run_ocm_with_stdin(&cwd, &env, &["setup"], "1\ny\n\nn\nn\n");
