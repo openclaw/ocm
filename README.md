@@ -92,7 +92,7 @@ Inside this repo, use the development wrapper:
 
 Published OpenClaw release flows in `ocm` prefer host Node.js `22.22.3+`,
 `24.15.0+`, or `25.9.0+` and `npm`.
-On supported platforms, `ocm` can manage a private copy for official release installs when those tools are missing.
+On supported platforms, `ocm` can manage a private Node.js 24.21.0 copy for official release installs when those tools are missing. Existing private 24.15.0 toolchains remain usable without a download when upgrading OCM.
 Interactive release setup can also offer to install `git` for repo-aware coding workflows when it is missing.
 Local checkout flows keep using whatever command and toolchain you choose.
 

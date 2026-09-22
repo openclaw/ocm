@@ -2169,7 +2169,7 @@ fn official_runtime_install_isolates_npm_lifecycle_from_caller_openclaw_state() 
         let mut env = ocm_env(&root);
         install_fake_node_and_npm(&root, &mut env, "22.22.3");
         let _managed_node_server =
-            managed_node.then(|| install_fake_managed_node_archive(&root, &mut env, "24.15.0"));
+            managed_node.then(|| install_fake_managed_node_archive(&root, &mut env, "24.21.0"));
         if managed_node {
             env.insert(
                 "OCM_INTERNAL_NPM_BIN".to_string(),
@@ -2256,7 +2256,7 @@ fn official_runtime_install_preserves_real_npm_configuration() {
         let mut env = ocm_env(&root);
         let home = PathBuf::from(&env["HOME"]);
         env.insert("USERPROFILE".to_string(), path_string(&home));
-        let managed_node = install_fake_managed_node_archive(&root, &mut env, "24.15.0");
+        let managed_node = install_fake_managed_node_archive(&root, &mut env, "24.21.0");
         let observation = root.child("npm-observation.json");
         env.insert(
             "OCM_TEST_NPM_OBSERVATION".to_string(),
@@ -2467,7 +2467,7 @@ fn official_runtime_install_stays_quiet_when_managed_node_fallback_is_available(
         "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
         packument_server.url(),
     );
-    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.15.0");
+    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.21.0");
 
     let install = run_ocm(&cwd, &env, &["runtime", "install", "--channel", "stable"]);
     assert!(install.status.success(), "{}", stderr(&install));
@@ -3065,6 +3065,16 @@ fn runtime_install_from_manifest_channel_selects_the_matching_release() {
 
 #[test]
 fn official_runtime_install_uses_managed_node_when_npm_is_missing() {
+    check_managed_node_install(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn official_runtime_install_reuses_previous_managed_node_offline() {
+    check_managed_node_install(true);
+}
+
+fn check_managed_node_install(previous_toolchain: bool) {
     let root = TestDir::new("runtime-install-official-missing-npm");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -3085,7 +3095,17 @@ fn official_runtime_install_uses_managed_node_when_npm_is_missing() {
         TestHttpServer::serve_bytes("/openclaw", "application/json", packument.as_bytes());
     let mut env = ocm_env(&root);
     install_fake_node_and_npm(&root, &mut env, "22.22.3");
-    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.15.0");
+    let managed_node = install_fake_managed_node_archive(&root, &mut env, "24.21.0");
+    if previous_toolchain {
+        let archive = root.child("previous-node.tar.gz");
+        fs::write(&archive, support::fake_managed_node_archive("24.15.0")).unwrap();
+        ocm::infra::archive::extract_tar_gz(&archive, &root.child("ocm-home/toolchains/node"))
+            .unwrap();
+        env.insert(
+            "OCM_INTERNAL_MANAGED_NODE_ARCHIVE_URL".into(),
+            format!("{}/unavailable", managed_node.url()),
+        );
+    }
     env.insert(
         "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
         packument_server.url(),
@@ -3107,6 +3127,9 @@ fn official_runtime_install_uses_managed_node_when_npm_is_missing() {
     assert!(install.status.success(), "{}", stderr(&install));
     assert!(root.child("ocm-home/runtimes/stable").exists());
 
+    let empty_path = root.child("empty-path");
+    fs::create_dir_all(&empty_path).unwrap();
+    env.insert("PATH".into(), path_string(&empty_path));
     let create = run_ocm(
         &cwd,
         &env,
@@ -3116,6 +3139,10 @@ fn official_runtime_install_uses_managed_node_when_npm_is_missing() {
     let run = run_ocm(&cwd, &env, &["env", "run", "managed", "--", "--version"]);
     assert!(run.status.success(), "{}", stderr(&run));
     assert_eq!(stdout(&run), "stable\n");
+    assert_eq!(
+        managed_node.requests().len(),
+        usize::from(!previous_toolchain)
+    );
 }
 
 #[test]
@@ -3140,7 +3167,7 @@ fn official_runtime_install_rejects_untrusted_managed_node_archive() {
         TestHttpServer::serve_bytes("/openclaw", "application/json", packument.as_bytes());
     let mut env = ocm_env(&root);
     install_fake_node_and_npm(&root, &mut env, "20.11.0");
-    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.15.0");
+    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.21.0");
     env.insert(
         "OCM_INTERNAL_MANAGED_NODE_ARCHIVE_SHA256".to_string(),
         "0".repeat(64),
@@ -3188,7 +3215,7 @@ fn official_runtime_install_uses_managed_node_when_host_node_is_unsupported() {
         TestHttpServer::serve_bytes("/openclaw", "application/json", packument.as_bytes());
     let mut env = ocm_env(&root);
     install_fake_node_and_npm(&root, &mut env, "23.11.0");
-    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.15.0");
+    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.21.0");
     env.insert(
         "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
         packument_server.url(),

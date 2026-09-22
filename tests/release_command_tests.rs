@@ -383,7 +383,7 @@ fn release_install_stays_quiet_when_managed_node_fallback_is_available() {
         "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
         packument_server.url(),
     );
-    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.15.0");
+    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.21.0");
 
     let install = run_ocm(&cwd, &env, &["release", "install", "--channel", "stable"]);
     assert!(install.status.success(), "{}", stderr(&install));

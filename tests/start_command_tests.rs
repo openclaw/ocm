@@ -389,7 +389,7 @@ fn start_uses_managed_node_fallback_without_host_doctor_noise() {
         "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
         packument_server.url(),
     );
-    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.15.0");
+    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.21.0");
 
     let start = run_ocm(&cwd, &env, &["start", "--no-service"]);
     assert!(start.status.success(), "{}", stderr(&start));
