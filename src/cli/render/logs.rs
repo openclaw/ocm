@@ -185,7 +185,7 @@ fn format_log_timestamp(raw: &str) -> String {
         .map(|value| {
             value
                 .format(
-                    &time::format_description::parse(
+                    &time::format_description::parse_borrowed::<1>(
                         "[hour]:[minute]:[second][offset_hour sign:mandatory]:[offset_minute]",
                     )
                     .unwrap(),
