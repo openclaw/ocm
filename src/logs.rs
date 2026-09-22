@@ -1033,7 +1033,7 @@ fn parse_log_timestamp(line: &[u8]) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(token, &time::format_description::well_known::Rfc3339)
         .ok()
         .or_else(|| {
-            time::format_description::parse(
+            time::format_description::parse_borrowed::<1>(
                 "[hour]:[minute]:[second][offset_hour sign:mandatory]:[offset_minute]",
             )
             .ok()
