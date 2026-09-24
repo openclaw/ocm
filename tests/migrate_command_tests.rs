@@ -5,6 +5,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout};
 
@@ -1211,6 +1212,150 @@ fn adopt_import_preserves_legacy_audit_history_bytes() {
             "ordinary runtime reference was not relocated: {relative}"
         );
     }
+}
+
+#[test]
+fn adopt_import_preserves_skill_workshop_proposal_integrity() {
+    let root = TestDir::new("adopt-workshop-integrity");
+    let cwd = root.child("workspace");
+    let source_home = root.child("legacy-home/.openclaw");
+    fs::create_dir_all(&cwd).unwrap();
+    seed_plain_openclaw_home(&source_home);
+    let mut env = ocm_env(&root);
+    install_fake_openclaw_on_path(&root, &mut env);
+
+    let draft = format!(
+        "# Proposed skill\nRead {}/workspace/notes.txt\n",
+        source_home.display()
+    );
+    let previous = format!(
+        "# Previous skill\nRead {}/workspace/old.txt\n",
+        source_home.display()
+    );
+    let support = format!(
+        "Reference: {}/workspace/reference.txt\n",
+        source_home.display()
+    );
+    let hash = |content: &str| {
+        Sha256::digest(content.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let proposal = serde_json::json!({
+        "schema": "openclaw.skill-workshop.proposal.v1",
+        "id": "example",
+        "kind": "update",
+        "status": "pending",
+        "title": "Update example",
+        "description": "Preserve reviewed content across adoption",
+        "createdAt": "2026-09-01T00:00:00Z",
+        "updatedAt": "2026-09-01T00:00:00Z",
+        "draftFile": "PROPOSAL.md",
+        "draftHash": hash(&draft),
+        "supportFiles": [{
+            "path": "references/example.md",
+            "hash": hash(&support),
+            "sizeBytes": support.len()
+        }],
+        "target": {
+            "skillName": "example",
+            "skillKey": "example",
+            "skillDir": source_home.join("workspace/skills/example"),
+            "skillFile": source_home.join("workspace/skills/example/SKILL.md")
+        },
+        "scan": {"state": "clean", "critical": 0, "warn": 0, "info": 0, "findings": []}
+    })
+    .to_string();
+    let rollback = serde_json::json!({
+        "schema": "openclaw.skill-workshop.rollback.v1",
+        "proposalId": "example",
+        "writtenAt": "2026-09-01T00:00:00Z",
+        "action": "update",
+        "targetSkillFile": source_home.join("workspace/skills/example/SKILL.md"),
+        "previousContent": previous,
+        "previousContentHash": hash(&previous)
+    })
+    .to_string();
+    let artifacts = [
+        ("proposals/example/PROPOSAL.md", draft.as_str()),
+        ("proposals/example/proposal.json", proposal.as_str()),
+        ("proposals/example/rollback.json", rollback.as_str()),
+        ("proposals/example/references/example.md", support.as_str()),
+        (
+            "recovery/proposals/example/rollback.json",
+            rollback.as_str(),
+        ),
+    ];
+    for (relative, content) in &artifacts {
+        let path = source_home.join("skill-workshop").join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    let output = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "adopt",
+            "import",
+            "--name",
+            "mira",
+            source_home.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let imported_state = root.child("ocm-home/envs/mira/.openclaw");
+    assert_imported_plain_openclaw_home(&imported_state, &source_home);
+    let imported_draft =
+        fs::read_to_string(imported_state.join("skill-workshop/proposals/example/PROPOSAL.md"))
+            .unwrap();
+    let imported_record: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(imported_state.join("skill-workshop/proposals/example/proposal.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        hash(&imported_draft),
+        imported_record["draftHash"].as_str().unwrap(),
+        "adoption invalidated the stored draftHash"
+    );
+    let imported_rollback: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(imported_state.join("skill-workshop/proposals/example/rollback.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        hash(imported_rollback["previousContent"].as_str().unwrap()),
+        imported_rollback["previousContentHash"].as_str().unwrap(),
+        "adoption invalidated the stored previousContentHash"
+    );
+    for (relative, content) in artifacts {
+        assert_eq!(
+            fs::read_to_string(imported_state.join("skill-workshop").join(relative)).unwrap(),
+            content,
+            "import rewrote integrity-protected Skill Workshop artifact {relative}"
+        );
+        assert_eq!(
+            fs::read_to_string(source_home.join("skill-workshop").join(relative)).unwrap(),
+            content,
+            "import changed source artifact {relative}"
+        );
+    }
+
+    let doctor = run_ocm(&cwd, &env, &["env", "doctor", "mira", "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let health: serde_json::Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert!(
+        health["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|issue| { !issue.as_str().unwrap().contains("OpenClaw runtime state") }),
+        "workshop provenance must not trigger destructive runtime-state cleanup: {}",
+        stdout(&doctor)
+    );
 }
 
 #[test]
