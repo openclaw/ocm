@@ -180,7 +180,12 @@ pub(crate) fn prepare_migrated_runtime_state(
         PluginPathRelocation::Imported,
     )?;
     changed |= plugin_paths.changed;
-    changed |= clear_volatile_runtime_state(&paths.state_dir, &paths.config_path, &workspaces)?;
+    changed |= clear_volatile_runtime_state(
+        &paths.state_dir,
+        &paths.state_dir,
+        &paths.config_path,
+        &workspaces,
+    )?;
     Ok(MigratedRuntimeStateResult {
         changed,
         external_plugin_ids: plugin_paths.external_plugin_ids,
@@ -210,6 +215,7 @@ pub(crate) fn clear_nonportable_runtime_state(
         if name == OsStr::new("openclaw.json")
             || is_durable_openclaw_state_root(&name)
             || workspaces.contains(&path)
+            || is_integrity_protected_history_path(&paths.state_dir, &path)
         {
             continue;
         }
@@ -294,7 +300,7 @@ fn rewrite_runtime_state_root_refs_inner(
             )?;
             continue;
         }
-        if !metadata.is_file() || is_legacy_audit_history_path(state_root, &path) {
+        if !metadata.is_file() || is_integrity_protected_history_path(state_root, &path) {
             continue;
         }
 
@@ -310,6 +316,15 @@ fn rewrite_runtime_state_root_refs_inner(
     }
 
     Ok(())
+}
+
+// Workshop drafts, support files, and rollback receipts share stored hashes.
+// OpenClaw owns their validation and target relocation; rewriting even embedded
+// path text can invalidate the bundle or change the content restored by rollback.
+fn is_integrity_protected_history_path(state_root: &Path, path: &Path) -> bool {
+    path.strip_prefix(state_root)
+        .is_ok_and(|relative| relative.starts_with("skill-workshop"))
+        || is_legacy_audit_history_path(state_root, path)
 }
 
 // OpenClaw validates these historical bytes against its audit checkpoints.
@@ -757,6 +772,7 @@ fn is_sqlite_database(path: &Path) -> Result<bool, String> {
 }
 
 fn clear_volatile_runtime_state(
+    state_root: &Path,
     root: &Path,
     config_path: &Path,
     workspaces: &OpenClawWorkspaceInventory,
@@ -770,13 +786,16 @@ fn clear_volatile_runtime_state(
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
-        if path == config_path || workspaces.contains(&path) {
+        if path == config_path
+            || workspaces.contains(&path)
+            || is_integrity_protected_history_path(state_root, &path)
+        {
             continue;
         }
 
         let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
         if metadata.is_dir() && workspaces.has_descendant(&path) {
-            changed |= clear_volatile_runtime_state(&path, config_path, workspaces)?;
+            changed |= clear_volatile_runtime_state(state_root, &path, config_path, workspaces)?;
             continue;
         }
         let file_name = entry.file_name();
@@ -787,7 +806,7 @@ fn clear_volatile_runtime_state(
         }
 
         if metadata.is_dir() {
-            changed |= clear_volatile_runtime_state(&path, config_path, workspaces)?;
+            changed |= clear_volatile_runtime_state(state_root, &path, config_path, workspaces)?;
         }
     }
 
@@ -1025,7 +1044,7 @@ fn collect_runtime_state_path_refs(
         &paths.config_path,
         workspaces,
         &mut |path| {
-            if is_legacy_audit_history_path(&paths.state_dir, path) {
+            if is_integrity_protected_history_path(&paths.state_dir, path) {
                 return;
             }
             let Ok(raw) = fs::read_to_string(path) else {

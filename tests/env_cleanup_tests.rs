@@ -238,6 +238,18 @@ fn env_cleanup_yes_clears_copied_openclaw_runtime_state() {
         format!("root={}\n", source_root.display()),
     )
     .unwrap();
+    let workshop_content = format!("Reviewed content from {}\n", source_root.display());
+    let workshop_artifacts = [
+        "skill-workshop/proposals/example/PROPOSAL.md",
+        "skill-workshop/proposals/example/references/tmp/proof.md",
+        "skill-workshop/proposals/example/scripts/package.lock",
+        "skill-workshop/recovery/proposals/example/rollback.json",
+    ];
+    for relative in workshop_artifacts {
+        let path = target_state.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, &workshop_content).unwrap();
+    }
 
     let doctor = run_ocm(&cwd, &env, &["env", "doctor", "target", "--json"]);
     assert!(doctor.status.success(), "{}", stderr(&doctor));
@@ -263,6 +275,14 @@ fn env_cleanup_yes_clears_copied_openclaw_runtime_state() {
     );
     assert!(!target_state.join("agents/main/sessions").exists());
     assert!(!target_state.join("logs").exists());
+    for relative in workshop_artifacts {
+        assert_eq!(
+            fs::read_to_string(target_state.join(relative)).unwrap_or_else(|error| panic!(
+                "cleanup lost Skill Workshop artifact {relative}: {error}"
+            )),
+            workshop_content
+        );
+    }
 }
 
 #[test]

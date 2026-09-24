@@ -455,6 +455,11 @@ bytes, including migrated archives and recovery files. Their historical paths st
 unchanged so OpenClaw can verify its existing audit checkpoints. OCM excludes these
 paths from copied-runtime-reference diagnostics. This also applies to `adopt import`.
 
+Skill Workshop bundles also retain their original bytes, including drafts, support
+files, proposal metadata, and rollback receipts. OpenClaw owns their stored hashes
+and target relocation; OCM preserves the historical paths and excludes them from
+copied-runtime-reference diagnostics.
+
 When a configured agent workspace is a repository checkout outside the plain
 OpenClaw home, including through a symlink, migration copies that workspace into
 the new environment and rewrites the imported config to use the copy. The source
