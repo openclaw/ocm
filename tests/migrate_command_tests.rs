@@ -1254,7 +1254,11 @@ fn adopt_import_preserves_skill_workshop_proposal_integrity() {
         "draftFile": "PROPOSAL.md",
         "draftHash": hash(&draft),
         "supportFiles": [{
-            "path": "references/example.md",
+            "path": "references/tmp/proof.md",
+            "hash": hash(&support),
+            "sizeBytes": support.len()
+        }, {
+            "path": "scripts/package.lock",
             "hash": hash(&support),
             "sizeBytes": support.len()
         }],
@@ -1281,7 +1285,11 @@ fn adopt_import_preserves_skill_workshop_proposal_integrity() {
         ("proposals/example/PROPOSAL.md", draft.as_str()),
         ("proposals/example/proposal.json", proposal.as_str()),
         ("proposals/example/rollback.json", rollback.as_str()),
-        ("proposals/example/references/example.md", support.as_str()),
+        (
+            "proposals/example/references/tmp/proof.md",
+            support.as_str(),
+        ),
+        ("proposals/example/scripts/package.lock", support.as_str()),
         (
             "recovery/proposals/example/rollback.json",
             rollback.as_str(),
@@ -1333,7 +1341,10 @@ fn adopt_import_preserves_skill_workshop_proposal_integrity() {
     );
     for (relative, content) in artifacts {
         assert_eq!(
-            fs::read_to_string(imported_state.join("skill-workshop").join(relative)).unwrap(),
+            fs::read_to_string(imported_state.join("skill-workshop").join(relative))
+                .unwrap_or_else(|error| panic!(
+                    "import lost Skill Workshop artifact {relative}: {error}"
+                )),
             content,
             "import rewrote integrity-protected Skill Workshop artifact {relative}"
         );
