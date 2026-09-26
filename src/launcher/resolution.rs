@@ -50,7 +50,12 @@ pub(crate) fn resolve_direct_launcher_command(
     openclaw_args: &[String],
     _fallback_cwd: &Path,
 ) -> Option<DirectLauncherCommand> {
-    let tokens = tokenize_simple_command(&launcher.command)?;
+    // Preserve the shell route for quoted recipes: literal words alone do not
+    // establish a directly executable program (for example, the `exec` builtin).
+    if launcher.command.contains(['\'', '"']) {
+        return None;
+    }
+    let tokens = parse_literal_launcher_command(&launcher.command)?;
 
     Some(DirectLauncherCommand {
         program: tokens.first()?.clone(),
@@ -62,7 +67,7 @@ pub(crate) fn resolve_direct_launcher_command(
     })
 }
 
-fn tokenize_simple_command(command: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_literal_launcher_command(command: &str) -> Option<Vec<String>> {
     let trimmed = command.trim();
     if trimmed.is_empty() || trimmed.contains(char::is_control) {
         return None;
@@ -115,7 +120,7 @@ fn tokenize_simple_command(command: &str) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_direct_launcher_command, tokenize_simple_command};
+    use super::{parse_literal_launcher_command, resolve_direct_launcher_command};
     use crate::launcher::LauncherMeta;
     use std::path::Path;
     use time::OffsetDateTime;
@@ -133,31 +138,31 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_simple_command_rejects_shell_syntax() {
-        assert!(tokenize_simple_command("FOO=bar openclaw").is_none());
-        assert!(tokenize_simple_command("pnpm openclaw | tee log").is_none());
-        assert!(tokenize_simple_command("openclaw 'gateway run").is_none());
-        assert!(tokenize_simple_command("openclaw \"$ENTRY\"").is_none());
-        assert!(tokenize_simple_command("openclaw \"$(entry)\"").is_none());
-        assert!(tokenize_simple_command("openclaw \"`entry`\"").is_none());
-        assert!(tokenize_simple_command("'' openclaw").is_none());
-        assert!(tokenize_simple_command("openclaw gateway\nopenclaw status").is_none());
-        assert!(tokenize_simple_command(r"openclaw foo\ bar").is_none());
-        assert!(tokenize_simple_command("openclaw --config ~/openclaw.json").is_none());
-        assert!(tokenize_simple_command("openclaw plugins/*.mjs").is_none());
-        assert!(tokenize_simple_command("openclaw plugin?.mjs").is_none());
-        assert!(tokenize_simple_command("openclaw plugins/[ab].mjs").is_none());
-        assert!(tokenize_simple_command("openclaw gateway # foreground").is_none());
-        assert!(tokenize_simple_command("openclaw %OPENCLAW_ARGS%").is_none());
-        assert!(tokenize_simple_command("openclaw ^&").is_none());
-        assert!(tokenize_simple_command("openclaw !OPENCLAW_ARGS!").is_none());
+    fn parse_literal_launcher_command_rejects_shell_syntax() {
+        assert!(parse_literal_launcher_command("FOO=bar openclaw").is_none());
+        assert!(parse_literal_launcher_command("pnpm openclaw | tee log").is_none());
+        assert!(parse_literal_launcher_command("openclaw 'gateway run").is_none());
+        assert!(parse_literal_launcher_command("openclaw \"$ENTRY\"").is_none());
+        assert!(parse_literal_launcher_command("openclaw \"$(entry)\"").is_none());
+        assert!(parse_literal_launcher_command("openclaw \"`entry`\"").is_none());
+        assert!(parse_literal_launcher_command("'' openclaw").is_none());
+        assert!(parse_literal_launcher_command("openclaw gateway\nopenclaw status").is_none());
+        assert!(parse_literal_launcher_command(r"openclaw foo\ bar").is_none());
+        assert!(parse_literal_launcher_command("openclaw --config ~/openclaw.json").is_none());
+        assert!(parse_literal_launcher_command("openclaw plugins/*.mjs").is_none());
+        assert!(parse_literal_launcher_command("openclaw plugin?.mjs").is_none());
+        assert!(parse_literal_launcher_command("openclaw plugins/[ab].mjs").is_none());
+        assert!(parse_literal_launcher_command("openclaw gateway # foreground").is_none());
+        assert!(parse_literal_launcher_command("openclaw %OPENCLAW_ARGS%").is_none());
+        assert!(parse_literal_launcher_command("openclaw ^&").is_none());
+        assert!(parse_literal_launcher_command("openclaw !OPENCLAW_ARGS!").is_none());
     }
 
     #[cfg(unix)]
     #[test]
-    fn tokenize_simple_command_preserves_literal_quoted_words() {
+    fn parse_literal_launcher_command_preserves_literal_quoted_words() {
         assert_eq!(
-            tokenize_simple_command(
+            parse_literal_launcher_command(
                 r#"'/path to/node' "/source tree/openclaw.mjs" '' pre"mid dle"post"#
             ),
             Some(vec![
@@ -169,16 +174,19 @@ mod tests {
         );
         let entry = "/source's tree/openclaw.mjs";
         assert_eq!(
-            tokenize_simple_command(&format!("node {}", crate::infra::shell::quote_posix(entry))),
+            parse_literal_launcher_command(&format!(
+                "node {}",
+                crate::infra::shell::quote_posix(entry)
+            )),
             Some(vec!["node".to_string(), entry.to_string()])
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn tokenize_simple_command_keeps_windows_quotes_opaque() {
-        assert!(tokenize_simple_command(r#"node "C:/source tree/openclaw.mjs""#).is_none());
-        assert!(tokenize_simple_command("node 'openclaw.mjs'").is_none());
+    fn parse_literal_launcher_command_keeps_windows_quotes_opaque() {
+        assert!(parse_literal_launcher_command(r#"node "C:/source tree/openclaw.mjs""#).is_none());
+        assert!(parse_literal_launcher_command("node 'openclaw.mjs'").is_none());
     }
 
     #[test]
@@ -193,6 +201,23 @@ mod tests {
 
         assert_eq!(command.program, "openclaw");
         assert_eq!(command.args, vec!["--profile", "dev", "gateway", "run"]);
+    }
+
+    #[test]
+    fn resolve_direct_launcher_command_preserves_quoted_shell_recipes() {
+        for recipe in [
+            "exec \"node\" 'openclaw.mjs'",
+            "node '/source tree/openclaw.mjs'",
+        ] {
+            assert!(
+                resolve_direct_launcher_command(
+                    &sample_launcher(recipe, None),
+                    &[],
+                    Path::new("/tmp")
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]

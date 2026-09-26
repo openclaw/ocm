@@ -500,6 +500,7 @@ Source launchers still return `local-command`; OCM does not yet upgrade their ch
 For an ordinary `pnpm openclaw` source launcher or `node <checkout>/openclaw.mjs`, the existing upgrade command also reports source observations without executing the launcher.
 On Unix, literal single- or double-quoted paths can contain spaces, including aliases to a source checkout.
 Commands requiring shell expansion, escaping, or operators remain opaque.
+Recognizing literal words for inspection does not change how launcher commands execute.
 This applies to normal, `--dry-run`, and `--all` output when no explicit runtime or release target is supplied.
 JSON includes `source` only for recognized source launchers, with the canonical `root`, Git `head`, `builtCommit` and `builtVersion` from `dist/build-info.json`, and nullable `buildMatchesHead` and `workingTreeClean` observations.
 A different built commit reveals source that has moved without a matching build; a matching commit alone does not prove a complete build, healthy dependencies, or the identity of a running Gateway.

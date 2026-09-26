@@ -270,6 +270,7 @@ fn source_inspection_recognizes_quoted_node_aliases_without_executing_them() {
             format!("node \"$(touch {})\"", path_string(&marker)),
         ),
         ("pipeline", format!("node '{entry}' | cat")),
+        ("builtin", format!("exec \"node\" '{entry}'")),
     ] {
         let output = run_ocm(
             root.path(),
@@ -299,13 +300,6 @@ fn source_inspection_recognizes_quoted_node_aliases_without_executing_them() {
                     .unwrap()
                     .contains(&json!("demo"))
             );
-            let status = run_ocm(root.path(), &env, &["service", "status", name, "--json"]);
-            assert!(status.status.success(), "{}", stderr(&status));
-            let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
-            assert_eq!(status["binaryPath"], "node");
-            assert_eq!(status["args"][0], entry);
-            assert_eq!(status["args"][1], "gateway");
-            assert_eq!(status["args"][2], "run");
         } else {
             assert!(result.get("source").is_none(), "{name}: {result}");
         }
