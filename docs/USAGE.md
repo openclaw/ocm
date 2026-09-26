@@ -624,7 +624,7 @@ No extra permanent service is installed.
 A job returns `up-to-date` without a checkpoint or restart when the requested package and binding are already current, package integrity and native configuration checks pass, and any running managed Gateway reports the same healthy build and the daemon confirms its actual launch specification matches the current desired settings.
 Unknown build or launch identity, configuration needing repair, changed launch settings, and unhealthy or mismatched serving state keep the ordinary checkpointed upgrade path.
 Older daemons without launch observations keep that existing behavior.
-Older runtime records without archive integrity use the normal checkpointed install path to establish it.
+When resolving an official release, older runtime records without archive integrity use the normal checkpointed install path to establish it.
 Explicit target or track changes still run the upgrade, and direct `ocm upgrade` commands retain their repair and finalization behavior.
 
 ```bash
