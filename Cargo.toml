@@ -1,6 +1,6 @@
 [package]
 name = "ocm"
-version = "0.2.48"
+version = "0.2.47"
 publish = false
 edition = "2024"
 rust-version = "1.88"
