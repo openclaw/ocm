@@ -1146,7 +1146,7 @@ impl Cli {
         } else {
             Some(lock_upgrade_transaction(env_name, &self.env, &self.cwd)?)
         };
-        let _operation_lock = if dry_run {
+        let operation_lock = if dry_run {
             None
         } else {
             Some(self.environment_service().lock_operation(env_name)?)
@@ -1156,7 +1156,7 @@ impl Cli {
                 .ensure_source_watch_allows_state_mutation_locked(env_name)?;
         }
         let plan = self.prepare_upgrade_rollback(env_name, transaction_id)?;
-        if dry_run {
+        let Some(operation_lock) = operation_lock.as_ref() else {
             return Ok(UpgradeRollbackSummary {
                 env_name: env_name.to_string(),
                 transaction_id: plan.record.id.clone(),
@@ -1174,9 +1174,9 @@ impl Cli {
                     "dry run: no runtime, env, service, snapshot, or history changed".to_string(),
                 ),
             });
-        }
+        };
 
-        self.execute_upgrade_rollback_locked(env_name, plan)
+        self.execute_upgrade_rollback_locked(env_name, plan, operation_lock)
     }
 
     fn prepare_upgrade_rollback(
@@ -1407,6 +1407,7 @@ impl Cli {
         &self,
         env_name: &str,
         plan: UpgradeRollbackPlan,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<UpgradeRollbackSummary, String> {
         let runtime_names = plan
             .recovery
@@ -1486,6 +1487,7 @@ impl Cli {
             env_name,
             plan.record.source.openclaw_version.as_deref(),
             plan.record.service_before.running,
+            operation_lock,
         ) {
             Ok(note) => note,
             Err(error) => {
@@ -2711,6 +2713,7 @@ impl Cli {
                 env_name,
                 prepared.meta.release_version.as_deref(),
                 service_action.is_some(),
+                operation_lock,
             ) {
                 Ok(note) => {
                     transaction.timings.finish(
@@ -3056,6 +3059,7 @@ impl Cli {
                 env_name,
                 prepared.meta.release_version.as_deref(),
                 service_action.is_some(),
+                operation_lock,
             ) {
                 Ok(note) => {
                     transaction.timings.finish(
@@ -3313,6 +3317,7 @@ impl Cli {
             env_name,
             updated.release_version.as_deref(),
             service_action.is_some(),
+            operation_lock,
         ) {
             Ok(note) => {
                 transaction.timings.finish(
@@ -3625,6 +3630,7 @@ impl Cli {
             env_name,
             prepared.meta.release_version.as_deref(),
             service_action.is_some(),
+            operation_lock,
         ) {
             Ok(note) => {
                 transaction.timings.finish(
@@ -4098,6 +4104,7 @@ impl Cli {
         env_name: &str,
         expected_version: Option<&str>,
         verify_gateway: bool,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<Option<String>, String> {
         let version = self.run_openclaw_command(env_name, "openclaw --version", &["--version"])?;
         let actual_version = version.first_line();
@@ -4112,10 +4119,13 @@ impl Cli {
 
         let mut build_note = None;
         if verify_gateway {
+            // Native CLI startup and exit can write diagnostic state even for
+            // status queries, so retain custody through the child's exit.
             let gateway_status = self.capture_openclaw_command(
                 env_name,
                 "openclaw gateway status",
                 &["gateway", "status", "--deep", "--json"],
+                Some(operation_lock),
             )?;
             let status =
                 verify_gateway_status_readiness(&gateway_status.stdout).map_err(|error| {
@@ -4149,7 +4159,7 @@ impl Cli {
         name: &str,
         args: &[&str],
     ) -> Result<SimulationCommandOutput, String> {
-        let output = self.capture_openclaw_command(env_name, name, args)?;
+        let output = self.capture_openclaw_command(env_name, name, args, None)?;
         if output.status.success() {
             Ok(output)
         } else {
@@ -4162,13 +4172,14 @@ impl Cli {
         env_name: &str,
         name: &str,
         args: &[&str],
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<SimulationCommandOutput, String> {
         let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
         let resolved = self
             .environment_service()
             .resolve(env_name, None, None, &args)
             .map_err(|error| format!("{name} failed: {error}"))?;
-        self.run_resolved_for_simulation(resolved, &[])
+        self.run_resolved_with_operation_lock(resolved, &[], operation_lock)
             .map_err(|error| format!("{name} failed: {error}"))
     }
 

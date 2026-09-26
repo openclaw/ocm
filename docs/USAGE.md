@@ -528,7 +528,8 @@ If writing recovery metadata also failed, preserve the original backup location 
 Keep the snapshot and retained files until operator recovery is complete, because snapshot removal also removes linked runtime recovery.
 Automatic recovery after abrupt process loss is not provided by this retention behavior.
 
-On Linux and macOS, upgrade commands keep the environment mutation lock in their native Doctor, finalizer, and completion-cache children.
+On Linux and macOS, upgrade commands keep the environment mutation lock in their native Doctor, finalizer, completion-cache, and final Gateway-status verification children.
+The same protection applies to final Gateway-status verification after an explicit rollback, because native diagnostic startup and exit can write environment state even for status queries.
 If the OCM parent is killed, competing environment mutations and upgrades wait until those children close the inherited lock or exit.
 Each fleet child retains only its own environment's lock.
 This is not crash recovery or proof that all descendants stopped: a program can close inherited descriptors before spawning further work, and Windows retains its existing locking behavior.
