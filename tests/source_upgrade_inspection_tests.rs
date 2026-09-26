@@ -1619,3 +1619,59 @@ fn source_child_retains_registry_exclusion_after_parent_loss() {
     assert!(bound.status.success(), "{}", stderr(&bound));
     assert!(root.child("gate.written").exists());
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_update_refuses_environment_inside_external_git_dir() {
+    let root = TestDir::new("source-git-dir-overlap");
+    let (env, _) = execution_fixture(&root, false);
+    let repo = root.child("source");
+    let worktree = root.child("source-wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            worktree.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let command = format!("node {}", path_string(&worktree.join("openclaw.mjs")));
+    for args in [
+        vec![
+            "launcher",
+            "add",
+            "linked-source",
+            "--command",
+            command.as_str(),
+        ],
+        vec!["env", "set-launcher", "demo", "linked-source"],
+    ] {
+        let output = run_ocm(root.path(), &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let nested = repo.join(".git/nested-env");
+    fs::create_dir_all(&nested).unwrap();
+    let created = run_ocm(
+        root.path(),
+        &env,
+        &["env", "create", "other", "--root", nested.to_str().unwrap()],
+    );
+    assert!(
+        created.status.success(),
+        "nested environment should be creatable before the linked checkout is the admission subject: {}",
+        stderr(&created)
+    );
+    let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("Git metadata overlaps environment \"other\""),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !root.child("native.json.calls").exists(),
+        "native updater ran despite Git directory overlap"
+    );
+}
