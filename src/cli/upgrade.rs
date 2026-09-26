@@ -1616,6 +1616,14 @@ impl Cli {
                 ),
             ),
         };
+        let recovery_note = if restored_pre_rollback_state {
+            None
+        } else {
+            self.retain_unresolved_runtime_recovery(env_name, &mut transaction)
+        };
+        transaction.cleanup_note =
+            join_optional_warnings(transaction.cleanup_note, recovery_note.clone());
+        let note = join_optional_warnings(Some(note), recovery_note).unwrap();
         let history_summary = UpgradeEnvSummary {
             env_name: env_name.to_string(),
             previous_binding_kind: plan.record.target.kind.clone(),
@@ -1661,7 +1669,7 @@ impl Cli {
         } else {
             None
         };
-        transaction.cleanup();
+        transaction.finish_failed(restored_pre_rollback_state);
 
         UpgradeRollbackSummary {
             env_name: env_name.to_string(),
@@ -4646,53 +4654,113 @@ impl Cli {
                 "runtime backup for in-place upgrade of \"{runtime_name}\" was not created"
             ));
         };
-        let Some(source_root) = backup.backup_root.take() else {
+        self.retain_runtime_backup(env_name, &transaction.id, &transaction.snapshot_id, backup)
+    }
+
+    fn retain_runtime_backup(
+        &self,
+        env_name: &str,
+        transaction_id: &str,
+        snapshot_id: &str,
+        backup: &mut RuntimeRollbackBackup,
+    ) -> Result<(), String> {
+        let runtime_name = backup.meta.name.clone();
+        let Some(source_root) = backup.backup_root.as_ref() else {
             return Err(format!(
                 "runtime \"{runtime_name}\" does not have installer-managed bytes to retain"
             ));
         };
         let transaction_recovery_root =
-            upgrade_history_recovery_dir(env_name, &transaction.id, &self.env, &self.cwd)?;
+            upgrade_history_recovery_dir(env_name, transaction_id, &self.env, &self.cwd)?;
         let recovery_root = upgrade_history_runtime_recovery_dir(
             env_name,
-            &transaction.id,
+            transaction_id,
             &runtime_name,
             &self.env,
             &self.cwd,
         )?;
-        if transaction_recovery_root.exists() {
-            backup.backup_root = Some(source_root);
+        if backup.retained_root.as_ref() == Some(&transaction_recovery_root) {
+            write_json(&recovery_root.join("runtime.json"), &backup.meta)?;
+            backup.backup_id = Some(runtime_name);
+            return Ok(());
+        }
+        if recovery_root.exists() {
             return Err(format!(
                 "runtime recovery path already exists: {}",
-                display_path(&transaction_recovery_root)
+                display_path(&recovery_root)
             ));
         }
-        fs::create_dir_all(&recovery_root).map_err(|error| error.to_string())?;
-        if let Err(error) = fs::write(
-            transaction_recovery_root.join("snapshot-id"),
-            &transaction.snapshot_id,
-        ) {
-            let _ = fs::remove_dir_all(&transaction_recovery_root);
-            backup.backup_root = Some(source_root);
-            return Err(format!(
-                "failed to record the recovery snapshot at {}: {error}",
-                display_path(&transaction_recovery_root)
-            ));
-        }
+        let created_transaction_root = !transaction_recovery_root.exists();
         let recovery_install_root = recovery_root.join("install-root");
-        if let Err(error) = fs::rename(&source_root, &recovery_install_root) {
-            let _ = fs::remove_dir_all(&transaction_recovery_root);
-            backup.backup_root = Some(source_root);
-            return Err(format!(
-                "failed to retain runtime recovery bytes at {}: {error}",
-                display_path(&recovery_install_root)
-            ));
+        let retention = (|| {
+            fs::create_dir_all(&recovery_root).map_err(|error| error.to_string())?;
+            let marker = transaction_recovery_root.join("snapshot-id");
+            if marker.exists() {
+                let recorded = fs::read_to_string(&marker).map_err(|error| error.to_string())?;
+                if recorded != snapshot_id {
+                    return Err("runtime recovery snapshot marker does not match".to_string());
+                }
+            } else {
+                fs::write(&marker, snapshot_id).map_err(|error| error.to_string())?;
+            }
+            // Persist metadata before moving bytes, and keep custody on every error.
+            write_json(&recovery_root.join("runtime.json"), &backup.meta)?;
+            fs::rename(source_root, &recovery_install_root).map_err(|error| {
+                format!(
+                    "failed to retain runtime recovery bytes at {}: {error}",
+                    display_path(&recovery_install_root)
+                )
+            })
+        })();
+        if let Err(error) = retention {
+            // The move did not complete. Remove only this attempt's metadata;
+            // never discard an existing transaction's other recovery material.
+            let _ = fs::remove_dir_all(&recovery_root);
+            if created_transaction_root {
+                let _ = fs::remove_dir_all(&transaction_recovery_root);
+            }
+            return Err(error);
         }
         backup.backup_root = Some(recovery_install_root);
         backup.retained_root = Some(transaction_recovery_root);
-        write_json(&recovery_root.join("runtime.json"), &backup.meta)?;
         backup.backup_id = Some(runtime_name);
         Ok(())
+    }
+
+    fn retain_unresolved_runtime_recovery(
+        &self,
+        env_name: &str,
+        transaction: &mut UpgradeTransaction,
+    ) -> Option<String> {
+        let mut notes = Vec::new();
+        for backup in &mut transaction.runtime_backups {
+            if !transaction
+                .mutated_runtime_names
+                .contains(&backup.meta.name)
+                || backup.backup_root.is_none()
+            {
+                continue;
+            }
+            if let Err(error) = self.retain_runtime_backup(
+                env_name,
+                &transaction.id,
+                &transaction.snapshot_id,
+                backup,
+            ) {
+                notes.push(format!(
+                    "Runtime recovery metadata requires attention: {error}."
+                ));
+            }
+            if let Some(path) = backup.backup_root.as_ref() {
+                notes.push(format!(
+                    "Previous runtime \"{}\" files retained at {}. Recovery remains unresolved; preserve these files and snapshot \"{}\" for operator recovery.",
+                    backup.meta.name,
+                    display_path(path),
+                    transaction.snapshot_id,
+                ));
+            }
+        }
+        (!notes.is_empty()).then(|| notes.join(" "))
     }
 
     fn record_upgrade_history(
@@ -4907,6 +4975,12 @@ impl Cli {
                 )),
             },
         };
+        if !rollback_restored {
+            let recovery_note = self.retain_unresolved_runtime_recovery(env_name, &mut transaction);
+            transaction.cleanup_note =
+                join_optional_warnings(transaction.cleanup_note, recovery_note.clone());
+            summary.note = join_optional_warnings(summary.note, recovery_note);
+        }
         if let Err(history_error) = self.record_upgrade_history(&transaction, &summary) {
             summary.note = join_optional_warnings(
                 summary.note,
@@ -4914,7 +4988,7 @@ impl Cli {
             );
         }
         self.append_candidate_recovery_note(&mut summary, &transaction, rollback_restored);
-        transaction.cleanup();
+        transaction.finish_failed(rollback_restored);
         Ok(summary)
     }
 
@@ -5447,6 +5521,19 @@ impl UpgradeTransaction {
     fn cleanup(self) {
         for runtime_backup in self.runtime_backups {
             runtime_backup.cleanup();
+        }
+    }
+
+    fn finish_failed(self, restored: bool) {
+        for mut backup in self.runtime_backups {
+            if !restored && self.mutated_runtime_names.contains(&backup.meta.name) {
+                // Failed recovery never makes the prior bytes disposable, even
+                // when recording or relocating recovery metadata also failed.
+                backup.backup_root.take();
+                backup.retained_root.take();
+            } else {
+                backup.cleanup();
+            }
         }
     }
 
