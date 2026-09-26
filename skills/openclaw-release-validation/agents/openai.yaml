@@ -1,4 +1,4 @@
 interface:
   display_name: "OpenClaw Release Validation"
-  short_description: "Run broad release scenario checks"
-  default_prompt: "Use $openclaw-release-validation to validate OpenClaw origin/main through the broad release scenario matrix and produce a concise pass/fail report."
+  short_description: "Guide one human beta validation run"
+  default_prompt: "Use $openclaw-release-validation to copy a gateway, upgrade it to a beta, and guide me through one worksheet-driven validation run."
