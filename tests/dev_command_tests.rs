@@ -5778,8 +5778,9 @@ fn dev_stop_acknowledgement_refuses_live_recorded_ownership() {
     let started = root.child("source-watch.started");
     let release = root.child("source-watch.release");
     let worker_path = root.child("source-watch-descendant.pid");
+    // Wait in the shell so killing the leader cannot orphan another polling sleep.
     let script = format!(
-        "#!/bin/sh\n(while [ ! -f \"{release}\" ]; do /bin/sleep 0.05; done) &\nprintf '%s\\n' \"$!\" > \"{worker}\"\nprintf ready > \"{started}\"\nwhile [ ! -f \"{release}\" ]; do /bin/sleep 0.05; done\n",
+        "#!/bin/sh\n(while [ ! -f \"{release}\" ]; do /bin/sleep 0.05; done) &\nprintf '%s\\n' \"$!\" > \"{worker}\"\nprintf ready > \"{started}\"\nwait \"$!\"\n",
         release = path_string(&release),
         worker = path_string(&worker_path),
         started = path_string(&started),
