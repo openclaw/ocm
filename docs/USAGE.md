@@ -609,6 +609,41 @@ Active plugin paths and copied databases must remain inside the cloned environme
 locations that escape through external paths or symlinks are rejected before publication. The
 same plugin isolation applies to upgrade simulation clones.
 
+### Asynchronous upgrades
+
+On Unix, an explicit operator request can run the ordinary packaged upgrade in a detached OCM worker.
+No extra permanent service is installed.
+
+```bash
+ocm upgrade job start mira --json
+ocm upgrade job start mira --runtime tested-build --json
+ocm upgrade job status mira --json
+ocm upgrade job status mira --request-id <id> --json
+```
+
+These commands always return JSON.
+`ocm upgrade job capabilities <env>` reports protocol version 1, platform support, selectors, and the environment's root, state directory, and config path.
+On Unix, OCM-launched OpenClaw processes with a complete absolute OCM executable and store binding receive `OPENCLAW_OCM_UPDATE_PROTOCOL=1` alongside their existing OCM environment identity.
+Clients must use their trusted OCM executable and environment binding, and preserve their own requester authorization before submitting an operation.
+Latest status returns `null` when that environment has no job; an unknown exact request ID is an error.
+`start --request-id <id>` lets a caller choose a correlation ID before submission; repeating the same ID and target returns that existing job without replaying it.
+Reusing an ID for a different target is refused.
+`start` accepts the same mutually exclusive `--version`, `--channel`, or `--runtime` selectors as a single-environment upgrade, with rollback enabled.
+It returns only after the worker accepts the request, and the worker starts upgrade work after the response is written.
+Existing environment and upgrade transaction locks still exclude conflicting mutations.
+A second asynchronous request for the same environment is refused while the first is active.
+
+Each response includes `id`, `envName`, `state`, `progress`, a monotonic `revision`, `createdAt`, a persisted `updatedAt` advancing at least one millisecond per revision, the requested `target`, and optional `result` or `error`.
+The terminal `result` is the ordinary upgrade summary, including its precise `outcome`, target version, snapshot, and rollback facts.
+A successful job can report an unchanged or skipped outcome; success alone does not mean a new release was installed.
+A failed upgrade or completed rollback is reported as `failed`, with the original result preserved.
+Request records live under the environment's upgrade-history directory and remain queryable by their original ID after later submissions.
+
+If the worker disappears without recording a result, status reports `interrupted` and recovery remains unresolved.
+OCM does not replay that request or accept another background job over it; inspect the environment and its recovery state before further operator action.
+An interrupted job does not establish that rollback succeeded or that retrying is safe.
+This command is an explicit local operator action; it does not supply authorization revalidation for a remote requester or UI client.
+
 ### Upgrade checkpoint scope
 
 By default, upgrade and rollback safety checkpoints cover the full environment.

@@ -1,3 +1,4 @@
+mod job;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
@@ -148,7 +149,7 @@ impl Drop for UpgradeInterruptFence {
 const UPGRADE_INTERRUPTED_ERROR: &str =
     "upgrade interrupted by SIGINT or SIGTERM; restoring the pre-upgrade state";
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UpgradeEnvSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,7 +265,7 @@ pub(crate) struct UpgradeSimulationBatchSummary {
     pub results: Vec<UpgradeSimulationSummary>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 struct UpgradeTarget {
     version: Option<String>,
     channel: Option<String>,
@@ -544,6 +545,9 @@ impl Cli {
     }
 
     pub(super) fn handle_upgrade_command(&self, args: Vec<String>) -> Result<i32, String> {
+        if args.first().map(String::as_str) == Some("job") {
+            return self.handle_upgrade_job(args[1..].to_vec());
+        }
         let (args, json_flag, profile) = self.consume_human_output_flags(args, "upgrade")?;
         if matches!(args.first().map(String::as_str), Some("batch")) {
             return self.handle_upgrade_batch(args[1..].to_vec(), json_flag, profile);
