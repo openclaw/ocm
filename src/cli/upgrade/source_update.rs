@@ -228,6 +228,7 @@ impl Cli {
         args: &[&str],
         operation: &EnvironmentOperationLock,
         registry: Option<&ExclusiveFileLock>,
+        spawned: Option<&mut bool>,
     ) -> Result<SimulationCommandOutput, String> {
         let recipe = self.launcher_service().show(launcher)?;
         let tokens = parse_literal_launcher_command(&recipe.command)
@@ -272,8 +273,15 @@ impl Cli {
         if let Some(registry) = registry {
             registry.retain_for_child(&mut command);
         }
-        operation
-            .output(command)
+        operation.retain_for_child(&mut command);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("source OpenClaw command failed: {error}"))?;
+        if let Some(spawned) = spawned {
+            *spawned = true;
+        }
+        child
+            .wait_with_output()
             .map(SimulationCommandOutput::from_output)
             .map_err(|error| format!("source OpenClaw command failed: {error}"))
     }
@@ -293,6 +301,7 @@ impl Cli {
             &["update", "status", "--json"],
             operation,
             registry,
+            None,
         )?;
         if !output.status.success() {
             return Err(format!(
@@ -328,6 +337,7 @@ impl Cli {
             source,
             &["status", "--json"],
             operation,
+            None,
             None,
         )?;
         if transaction.interrupted() != interrupted
@@ -403,6 +413,7 @@ impl Cli {
             source,
             &["gateway", "status", "--deep", "--json"],
             operation,
+            None,
             None,
         )?;
         let status = verify_gateway_status_readiness(&output.stdout)?;
@@ -574,7 +585,6 @@ impl Cli {
                         .to_string(),
                 );
             }
-            native_invoked = true;
             self.with_progress(format!("Updating source checkout for {name}"), || {
                 self.source_command(
                     name,
@@ -583,6 +593,7 @@ impl Cli {
                     &["update", "--no-restart", "--json"],
                     operation,
                     Some(&registry),
+                    Some(&mut native_invoked),
                 )
             })
         })();
