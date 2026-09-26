@@ -629,7 +629,7 @@ Latest status returns `null` when that environment has no job; an unknown exact 
 `start --request-id <id>` lets a caller choose a correlation ID before submission; repeating the same ID and target returns that existing job without replaying it.
 Reusing an ID for a different target or a recreated environment is refused.
 Latest status excludes completed jobs from an older environment instance; an exact ID still retrieves its original historical result.
-An unresolved prior-instance job still blocks new jobs, and latest status reports that blocker with its exact request ID.
+An active prior-instance worker still blocks new jobs, and latest status reports that blocker with its exact request ID.
 `start` accepts the same mutually exclusive `--version`, `--channel`, or `--runtime` selectors as a single-environment upgrade, with rollback enabled.
 It returns only after the worker accepts the request, and the worker starts upgrade work after the response is written.
 Existing environment and upgrade transaction locks still exclude conflicting mutations.
@@ -643,7 +643,10 @@ A failed upgrade or completed rollback is reported as `failed`, with the origina
 Request records live under the environment's upgrade-history directory and remain queryable by their original ID after later submissions.
 
 If the worker disappears without recording a result, status reports `interrupted` and recovery remains unresolved.
-OCM does not replay that request or accept another background job over it; inspect the environment and its recovery state before further operator action.
+That request is terminal and is never replayed.
+After inspecting or repairing the environment and its recovery state, an operator may explicitly submit a fresh request ID through the ordinary upgrade checks and locks.
+Known native writers that outlive the old worker retain environment exclusion, so the fresh operation waits for them to finish.
+A fresh request does not resume the old transaction or change its recorded result.
 An interrupted job does not establish that rollback succeeded or that retrying is safe.
 This command is an explicit local operator action; it does not supply authorization revalidation for a remote requester or UI client.
 

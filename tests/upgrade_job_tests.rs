@@ -241,7 +241,8 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
 }
 
 #[test]
-fn lost_worker_reports_unresolved_interruption_without_replay() {
+fn fresh_job_after_interruption_waits_for_surviving_native_writer() {
+    use fs2::FileExt;
     let root = TestDir::new("upgrade-job-interrupted");
     let env = setup(&root);
     let accepted = command(
@@ -257,45 +258,103 @@ fn lost_worker_reports_unresolved_interruption_without_replay() {
         .join(format!("{id}.json"));
     let record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let pid = i32::try_from(record["worker"]["pid"].as_u64().unwrap()).unwrap();
-    // SAFETY: this fixture owns the detached worker's entire process group.
-    assert_eq!(unsafe { libc::kill(-pid, libc::SIGKILL) }, 0);
-    let status = wait_for_result(&root, &env, id);
-    assert_eq!(status["state"], "interrupted");
-    assert!(status["result"].is_null());
+    // SAFETY: kill only this fixture's OCM worker, leaving its native writer alive.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    let interrupted = wait_for_result(&root, &env, id);
+    assert_eq!(interrupted["state"], "interrupted");
+    assert!(interrupted["result"].is_null());
     assert!(
-        status["error"]
+        interrupted["error"]
             .as_str()
             .unwrap()
             .contains("recovery is unresolved")
     );
-    let retry = run_ocm(
-        root.path(),
-        &env,
-        &["upgrade", "job", "start", "demo", "--runtime", "new"],
+    let operation = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.child("ocm-home/locks/environments/demo.lock"))
+        .unwrap();
+    assert_eq!(
+        operation.try_lock_exclusive().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "surviving native writer lost environment exclusion"
     );
-    assert!(!retry.status.success());
-    assert!(stderr(&retry).contains("Interrupted"), "{}", stderr(&retry));
-    let history = command(&root, &env, &["upgrade", "history", "demo", "--json"]);
-    assert!(history.as_array().unwrap().is_empty());
-    let removed = run_ocm(root.path(), &env, &["env", "destroy", "demo", "--yes"]);
-    assert!(removed.status.success(), "{}", stderr(&removed));
-    let recreated = run_ocm(
-        root.path(),
+    let calls = ["old", "new"]
+        .map(|name| fs::read(root.child(format!("{name}-calls"))).unwrap_or_default());
+    let replay = command(
+        &root,
         &env,
-        &["env", "create", "demo", "--runtime", "old"],
+        &[
+            "upgrade",
+            "job",
+            "start",
+            "demo",
+            "--runtime",
+            "new",
+            "--request-id",
+            id,
+        ],
     );
-    assert!(recreated.status.success(), "{}", stderr(&recreated));
-    let latest = run_ocm(root.path(), &env, &["upgrade", "job", "status", "demo"]);
-    assert!(!latest.status.success());
-    assert!(stderr(&latest).contains("prior environment instance has unresolved upgrade job"));
-    assert!(stderr(&latest).contains(id));
+    assert_eq!(replay, interrupted);
+    let fresh = command(
+        &root,
+        &env,
+        &[
+            "upgrade",
+            "job",
+            "start",
+            "demo",
+            "--runtime",
+            "new",
+            "--request-id",
+            "fresh-request",
+        ],
+    );
+    assert_ne!(fresh["id"], accepted["id"]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let waiting = command(
+            &root,
+            &env,
+            &[
+                "upgrade",
+                "job",
+                "status",
+                "demo",
+                "--request-id",
+                "fresh-request",
+            ],
+        );
+        assert_eq!(waiting["state"], "running", "{waiting}");
+        if waiting["progress"] == "Upgrading environment" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh worker never entered the upgrade owner"
+        );
+        sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        operation.try_lock_exclusive().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        calls,
+        ["old", "new"]
+            .map(|name| fs::read(root.child(format!("{name}-calls"))).unwrap_or_default()),
+        "fresh job performed runtime I/O while the previous writer retained the lock"
+    );
+    fs::write(root.child("release"), "").unwrap();
+    let result = wait_for_result(&root, &env, "fresh-request");
+    assert_eq!(result["state"], "succeeded", "{result}");
     assert_eq!(
         command(
             &root,
             &env,
             &["upgrade", "job", "status", "demo", "--request-id", id]
         ),
-        status
+        interrupted
     );
 }
 

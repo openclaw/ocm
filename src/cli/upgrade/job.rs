@@ -58,8 +58,8 @@ enum State {
 }
 
 impl State {
-    fn completed(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed)
+    fn terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Interrupted)
     }
 }
 
@@ -214,9 +214,9 @@ impl Cli {
                         let id: String = read_json(&latest)?;
                         let record = self.read_upgrade_job(name, &id)?;
                         if !record.matches_environment(&environment) {
-                            if !record.job.state.completed() {
+                            if !self.observe_upgrade_job(name, &id)?.state.terminal() {
                                 return Err(format!(
-                                    "prior environment instance has unresolved upgrade job {id}; inspect `ocm upgrade job status {name} --request-id {id}` before further changes"
+                                    "prior environment instance still has active upgrade job {id}; inspect `ocm upgrade job status {name} --request-id {id}` before further changes"
                                 ));
                             }
                             self.print_json(&Option::<Job>::None)?;
@@ -279,7 +279,7 @@ impl Cli {
         if root.join("latest").exists() {
             let id: String = read_json(&root.join("latest"))?;
             let previous = self.observe_upgrade_job(name, &id)?;
-            if !previous.state.completed() {
+            if !previous.state.terminal() {
                 return Err(format!(
                     "upgrade job {} is {:?}; inspect `ocm upgrade job status {name} --request-id {}` before further changes",
                     previous.id, previous.state, previous.id,
