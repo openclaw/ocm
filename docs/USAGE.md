@@ -621,6 +621,10 @@ same plugin isolation applies to upgrade simulation clones.
 On Unix, an explicit operator request can run the ordinary packaged upgrade in a detached OCM worker.
 No extra permanent service is installed.
 
+A job returns `up-to-date` without a checkpoint or restart when the requested package and binding are already current, package integrity and native configuration checks pass, and any running managed Gateway reports the same healthy build.
+Unknown build identity, configuration needing repair, and unhealthy or mismatched serving state keep the ordinary checkpointed upgrade path.
+Explicit target or track changes still run the upgrade, and direct `ocm upgrade` commands retain their repair and finalization behavior.
+
 ```bash
 ocm upgrade job start mira --json
 ocm upgrade job start mira --runtime tested-build --json

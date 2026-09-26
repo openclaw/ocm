@@ -1,4 +1,5 @@
 use super::{RuntimeMeta, RuntimeReleaseSelectorKind, RuntimeService};
+use crate::infra::download::normalize_file_integrity;
 use crate::runtime::releases::{
     OpenClawRelease, RuntimeRelease, is_official_openclaw_releases_url,
     load_official_openclaw_release_selection, normalize_openclaw_channel_selector,
@@ -309,7 +310,13 @@ impl<'a> RuntimeService<'a> {
             let healthy = runtime_integrity_issue(&existing, self.env).is_none();
             let same_release = existing.release_version.as_deref()
                 == Some(selected_release.version.as_str())
-                && existing.source_url.as_deref() == Some(selected_release.tarball_url.as_str());
+                && existing.source_url.as_deref() == Some(selected_release.tarball_url.as_str())
+                && existing.source_integrity.is_some()
+                && selected_release
+                    .integrity
+                    .as_deref()
+                    .and_then(|value| normalize_file_integrity(value).ok())
+                    == existing.source_integrity;
             let matches_requested_selector = match (version.as_deref(), channel.as_deref()) {
                 (Some(requested_version), None) => {
                     existing.release_version.as_deref() == Some(requested_version)
