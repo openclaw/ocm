@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod diagnostics;
+pub(super) mod source;
 use diagnostics::{CandidateFailure, CandidateFailureKind};
 
 use super::{Cli, render};
@@ -150,6 +151,8 @@ const UPGRADE_INTERRUPTED_ERROR: &str =
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UpgradeEnvSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<source::SourceInspection>,
     pub env_name: String,
     pub previous_binding_kind: String,
     pub previous_binding_name: String,
@@ -614,6 +617,7 @@ impl Cli {
                 match self.upgrade_env(&env.name, &target, options) {
                     Ok(summary) => results.push(summary),
                     Err(error) => results.push(UpgradeEnvSummary {
+                        source: None,
                         env_name: env.name,
                         previous_binding_kind: "unknown".to_string(),
                         previous_binding_name: "—".to_string(),
@@ -1502,6 +1506,7 @@ impl Cli {
         transaction.mark_post_update_not_needed();
 
         let history_summary = UpgradeEnvSummary {
+            source: None,
             env_name: env_name.to_string(),
             previous_binding_kind: plan.record.target.kind.clone(),
             previous_binding_name: plan.record.target.name.clone(),
@@ -1636,6 +1641,7 @@ impl Cli {
             join_optional_warnings(transaction.cleanup_note, recovery_note.clone());
         let note = join_optional_warnings(Some(note), recovery_note).unwrap();
         let history_summary = UpgradeEnvSummary {
+            source: None,
             env_name: env_name.to_string(),
             previous_binding_kind: plan.record.target.kind.clone(),
             previous_binding_name: plan.record.target.name.clone(),
@@ -2490,6 +2496,7 @@ impl Cli {
             if options.dry_run {
                 let binding_changed = target_runtime_name != current.name;
                 return Ok(UpgradeEnvSummary {
+                    source: None,
                     env_name: env_name.to_string(),
                     previous_binding_kind: "runtime".to_string(),
                     previous_binding_name,
@@ -2740,6 +2747,7 @@ impl Cli {
             );
 
             let summary = UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "runtime".to_string(),
                 previous_binding_name,
@@ -2762,6 +2770,7 @@ impl Cli {
 
         if current.source_manifest_url.is_none() {
             return Ok(UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "runtime".to_string(),
                 previous_binding_name: previous_binding_name.clone(),
@@ -2782,6 +2791,7 @@ impl Cli {
 
         if current.release_selector_kind == Some(RuntimeReleaseSelectorKind::Version) {
             return Ok(UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "runtime".to_string(),
                 previous_binding_name: previous_binding_name.clone(),
@@ -2823,6 +2833,7 @@ impl Cli {
             )?;
             if options.dry_run {
                 return Ok(UpgradeEnvSummary {
+                    source: None,
                     env_name: env_name.to_string(),
                     previous_binding_kind: "runtime".to_string(),
                     previous_binding_name: previous_binding_name.clone(),
@@ -3073,6 +3084,7 @@ impl Cli {
                 }
             };
             let summary = UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "runtime".to_string(),
                 previous_binding_name: previous_binding_name.clone(),
@@ -3111,6 +3123,7 @@ impl Cli {
         let service = self.upgrade_service_status(env_name)?;
         if options.dry_run {
             return Ok(UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "runtime".to_string(),
                 previous_binding_name: previous_binding_name.clone(),
@@ -3328,6 +3341,7 @@ impl Cli {
             }
         };
         let summary = UpgradeEnvSummary {
+            source: None,
             env_name: env_name.to_string(),
             previous_binding_kind: "runtime".to_string(),
             previous_binding_name: previous_binding_name.clone(),
@@ -3389,6 +3403,7 @@ impl Cli {
     ) -> Result<UpgradeEnvSummary, String> {
         if !target.is_explicit() {
             return Ok(UpgradeEnvSummary {
+                source: self.inspect_launcher_source(env_name, launcher_name)?,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "launcher".to_string(),
                 previous_binding_name: launcher_name.to_string(),
@@ -3422,6 +3437,7 @@ impl Cli {
         let service = self.upgrade_service_status(env_name)?;
         if options.dry_run {
             return Ok(UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "launcher".to_string(),
                 previous_binding_name: launcher_name.to_string(),
@@ -3637,6 +3653,7 @@ impl Cli {
             }
         };
         let summary = UpgradeEnvSummary {
+            source: None,
             env_name: env_name.to_string(),
             previous_binding_kind: "launcher".to_string(),
             previous_binding_name: launcher_name.to_string(),
@@ -4940,6 +4957,7 @@ impl Cli {
         error: String,
     ) -> Result<UpgradeEnvSummary, String> {
         Ok(UpgradeEnvSummary {
+            source: None,
             env_name: env_name.to_string(),
             previous_binding_kind: previous_binding_kind.to_string(),
             previous_binding_name,
@@ -4985,6 +5003,7 @@ impl Cli {
                 None
             };
             let mut summary = UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: previous_binding_kind.to_string(),
                 previous_binding_name,
@@ -5020,6 +5039,7 @@ impl Cli {
         let snapshot_id = transaction.snapshot_id.clone();
         let mut summary = match rollback_result {
             Ok(cleanup_warning) => UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: previous_binding_kind.to_string(),
                 previous_binding_name,
@@ -5039,6 +5059,7 @@ impl Cli {
                 ),
             },
             Err(rollback_error) => UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: previous_binding_kind.to_string(),
                 previous_binding_name,

@@ -678,6 +678,7 @@ pub fn upgrade_help(cmd: &str) -> String {
             "When current and target OpenClaw versions are known, older targets are rejected before snapshot creation or runtime mutation because config and SQLite state migrations cannot be reversed by switching binaries.",
             "An env upgrade will not replace runtime bytes shared with another env; use --runtime to reuse those bytes or an exact --version for an isolated target.",
             "Upgrades create a pre-upgrade snapshot before changing env state.",
+            "Recognized source launchers remain local-command: OCM reports checkout/build commits, local tracking refs, and known shared source users without fetching, building, or restarting. Matching commits do not prove a complete build or running Gateway identity.",
             "Batch upgrades create and verify a cold checkpoint for every selected environment before any runtime transition begins, then run bounded parallel per-environment upgrades under one coordinator lock.",
             "Batch failure policy `continue` leaves failed gateways stopped with both fleet checkpoints and per-environment upgrade history available for external recovery.",
             "When an env moves to a new runtime, upgrade runs OpenClaw update finalization inside the env before service restart.",
