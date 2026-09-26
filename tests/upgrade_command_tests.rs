@@ -19,9 +19,11 @@ use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
 use ocm::infra::download::file_sha256;
 use ocm::store::{env_registry_path, now_utc, supervisor_runtime_path, supervisor_state_path};
-use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
+use ocm::supervisor::{
+    SupervisorChildSpec, SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState,
+};
 use serde_json::Value;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use tar::{Builder, Header};
 
 use crate::support::{
@@ -113,6 +115,25 @@ fn write_running_supervisor_binding(
     let log_root = runtime_path.parent().unwrap();
     let stdout_path = path_string(&log_root.join("demo.stdout.log"));
     let stderr_path = path_string(&log_root.join("demo.stderr.log"));
+    // The fixture models a child spawned from the persisted plan, not a fresh
+    // desired plan built by a later job with changed launch settings.
+    let launch_spec_sha256 = fs::read(Path::new(ocm_home).join("supervisor/state.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|state| {
+            state["children"]
+                .as_array()?
+                .iter()
+                .find(|child| child["envName"] == "demo")
+                .cloned()
+        })
+        .and_then(|spec| serde_json::from_value::<SupervisorChildSpec>(spec).ok())
+        .map(|spec| {
+            Sha256::digest(serde_json::to_vec(&spec).unwrap())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        });
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
@@ -136,6 +157,7 @@ fn write_running_supervisor_binding(
             next_retry_at: None,
         }],
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256,
             env_name: "demo".to_string(),
             binding_kind: binding_kind.to_string(),
             binding_name: binding_name.to_string(),
@@ -1233,12 +1255,51 @@ fn assert_tracked_runtime_upgrade(status: Option<&str>) {
 
     #[cfg(unix)]
     if status.is_some() {
+        let job_ocm_home = env.get("OCM_HOME").unwrap().clone();
+        // Publish the completed fake spawn after its saved plan is available;
+        // the policy observer can see the registry transition before that write.
+        let publish_spawn = || {
+            write_running_supervisor_runtime(
+                &runtime_path,
+                &job_ocm_home,
+                "stable",
+                4244,
+                health_port,
+            )
+        };
+        publish_spawn();
         let before_runtime = fs::read(&runtime_path).unwrap();
         let current = finish_runtime_job(&cwd, &env, &[]);
         assert_eq!(current["state"], "succeeded", "{current}");
         assert!(current["result"]["snapshotId"].is_null(), "{current}");
         assert!(current["result"]["serviceAction"].is_null(), "{current}");
         assert_eq!(fs::read(&runtime_path).unwrap(), before_runtime);
+        let mut legacy: Value = serde_json::from_slice(&before_runtime).unwrap();
+        legacy["children"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("launchSpecSha256");
+        write_json_replacing_path(&runtime_path, &legacy);
+        let unknown_spec = finish_runtime_job(&cwd, &env, &[]);
+        assert!(
+            unknown_spec["result"]["snapshotId"].is_string(),
+            "{unknown_spec}"
+        );
+        publish_spawn();
+        env.insert("NODE_OPTIONS".into(), "--dns-result-order=ipv4first".into());
+        let launch_drift = finish_runtime_job(&cwd, &env, &[]);
+        assert!(
+            launch_drift["result"]["snapshotId"].is_string(),
+            "{launch_drift}"
+        );
+        publish_spawn();
+        env.remove("NODE_OPTIONS");
+        let restored_launch = finish_runtime_job(&cwd, &env, &[]);
+        assert!(
+            restored_launch["result"]["snapshotId"].is_string(),
+            "{restored_launch}"
+        );
+        publish_spawn();
         for observation in [
             r#"{"rpc":{"ok":true,"server":{}}}"#,
             r#"{"rpc":{"ok":true,"server":{"buildId":"other-build"}}}"#,

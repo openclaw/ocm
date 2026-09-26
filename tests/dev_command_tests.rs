@@ -4432,6 +4432,7 @@ fn dev_status_reports_dev_envs() {
         updated_at: now_utc(),
         services: vec![],
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256: None,
             env_name: "demo".to_string(),
             binding_kind: "dev".to_string(),
             binding_name: summary["worktreeRoot"].as_str().unwrap().to_string(),
@@ -7198,6 +7199,7 @@ fn dev_watch_aborts_and_restores_policy_when_service_stop_times_out() {
             next_retry_at: None,
         }],
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256: None,
             env_name: "demo".to_string(),
             binding_kind: "runtime".to_string(),
             binding_name: "stable".to_string(),

@@ -267,6 +267,7 @@ fn write_running_supervisor_runtime(
             next_retry_at: None,
         }],
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256: None,
             env_name: "demo".to_string(),
             binding_kind: "runtime".to_string(),
             binding_name: binding_name.to_string(),

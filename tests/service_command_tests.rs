@@ -126,6 +126,7 @@ fn setup_gateway_aware_restart_fixture(
             next_retry_at: None,
         }],
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256: None,
             env_name: "demo".to_string(),
             binding_kind: "launcher".to_string(),
             binding_name: "stable".to_string(),
@@ -1352,6 +1353,7 @@ fn service_status_ignores_stale_runtime_children_when_the_daemon_is_down() {
         updated_at: now_utc(),
         services: Vec::new(),
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256: None,
             env_name: "demo".to_string(),
             binding_kind: "launcher".to_string(),
             binding_name: "stable".to_string(),

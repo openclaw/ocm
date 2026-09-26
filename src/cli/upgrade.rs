@@ -3799,7 +3799,16 @@ impl Cli {
                 .services
                 .iter()
                 .find(|entry| entry.env_name == env_name)?;
-            if Some(child.pid) != service.child_pid
+            let desired = self
+                .supervisor_service()
+                .plan()
+                .ok()?
+                .children
+                .into_iter()
+                .find(|spec| spec.env_name == env_name)?;
+            let desired_digest = desired.launch_spec_sha256()?;
+            if child.launch_spec_sha256.as_deref() != Some(desired_digest.as_str())
+                || Some(child.pid) != service.child_pid
                 || child.binding_kind != "runtime"
                 || child.binding_name != prepared.name
                 || running.pid != service.child_pid

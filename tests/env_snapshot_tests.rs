@@ -62,6 +62,7 @@ fn write_running_snapshot_service(
             next_retry_at: None,
         }],
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256: None,
             env_name: "source".to_string(),
             binding_kind: "launcher".to_string(),
             binding_name: "stable".to_string(),
