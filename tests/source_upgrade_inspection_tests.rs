@@ -514,21 +514,134 @@ fn source_inspection_rejects_non_regular_metadata_and_submodule_status() {
     );
 }
 
+#[test]
+fn source_inspection_reports_staged_gitlink_removal_and_replacements() {
+    let root = TestDir::new("source-upgrade-staged-gitlink");
+    let (mut env, _) = fixture(&root);
+    let repo = root.child("source");
+    let nested = repo.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    git(&nested, &["init", "-b", "main"]);
+    write_text(&nested.join("tracked"), "nested content\n");
+    git(&nested, &["add", "."]);
+    git(&nested, &["commit", "-m", "nested source"]);
+    let nested_head = git(&nested, &["rev-parse", "HEAD"]);
+    write_text(&repo.join(".gitignore"), "dist/\nnested/\n");
+    write_text(
+        &repo.join(".gitmodules"),
+        "[submodule \"nested\"]\npath = nested\nurl = https://example.invalid/nested\nignore = all\n",
+    );
+    git(&repo, &["add", ".gitignore", ".gitmodules"]);
+    git(
+        &repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{nested_head},nested"),
+        ],
+    );
+    // Both a staged addition and an unchanged committed submodule stay unknown.
+    assert!(inspect(&root, &env)["source"]["workingTreeClean"].is_null());
+    git(&repo, &["commit", "-m", "record submodule"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    write_text(
+        &repo.join("dist/build-info.json"),
+        &json!({"version":"2026.9.3","commit":head}).to_string(),
+    );
+    git(&repo, &["config", "submodule.nested.ignore", "all"]);
+    git(&repo, &["config", "status.submoduleSummary", "true"]);
+    assert!(inspect(&root, &env)["source"]["workingTreeClean"].is_null());
+    write_text(&nested.join("tracked"), "modified nested content\n");
+    let trace = root.child("gitlink-trace.jsonl");
+    env.insert("GIT_TRACE2_EVENT".to_string(), path_string(&trace));
+    git(&repo, &["update-index", "--force-remove", "nested"]);
+    for replacement in [false, true] {
+        if replacement {
+            fs::remove_dir_all(&nested).unwrap();
+            write_text(&nested, "regular file replacement\n");
+            git(&repo, &["add", "--force", "nested"]);
+        }
+        let index = fs::read(repo.join(".git/index")).unwrap();
+        let before_env = run_ocm(root.path(), &env, &["env", "show", "demo", "--json"]);
+        let expected = inspect(&root, &env);
+        assert_eq!(expected["source"]["workingTreeClean"], false);
+        assert!(
+            expected["source"]["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| {
+                    issue
+                        .as_str()
+                        .unwrap()
+                        .contains("modified or untracked files")
+                })
+        );
+        let normal = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+        assert!(normal.status.success(), "{}", stderr(&normal));
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&normal)).unwrap(),
+            expected
+        );
+        let batch = run_ocm(root.path(), &env, &["upgrade", "--all", "--json"]);
+        assert!(batch.status.success(), "{}", stderr(&batch));
+        let batch: Value = serde_json::from_str(&stdout(&batch)).unwrap();
+        assert_eq!(batch["results"][0], expected);
+        #[cfg(unix)]
+        assert_eq!(source_job_result(&root, &env), expected);
+        assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+        let after_env = run_ocm(root.path(), &env, &["env", "show", "demo", "--json"]);
+        assert_eq!(stdout(&before_env), stdout(&after_env));
+        let history = run_ocm(root.path(), &env, &["upgrade", "history", "demo", "--json"]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&history)).unwrap(),
+            json!([])
+        );
+    }
+    for line in fs::read_to_string(&trace).unwrap().lines() {
+        let event: Value = serde_json::from_str(line).unwrap();
+        assert_ne!(
+            event["event"], "child_start",
+            "inspection started a Git child: {event}"
+        );
+    }
+    // Once the replacement is committed, stale submodule metadata is harmless.
+    git(&repo, &["commit", "-m", "replace submodule"]);
+    assert_eq!(inspect(&root, &env)["source"]["workingTreeClean"], true);
+}
+
 #[cfg(unix)]
 #[test]
 fn source_report_survives_the_asynchronous_job_result() {
-    use std::time::{Duration, Instant};
     let root = TestDir::new("source-job-result");
     let (env, _) = fixture(&root);
     let expected = inspect(&root, &env);
-    let accepted = run_ocm(root.path(), &env, &["upgrade", "job", "start", "demo"]);
+    assert_eq!(source_job_result(&root, &env), expected);
+}
+
+#[cfg(unix)]
+fn source_job_result(root: &TestDir, env: &BTreeMap<String, String>) -> Value {
+    use std::time::{Duration, Instant};
+    let accepted = run_ocm(
+        root.path(),
+        env,
+        &[
+            "upgrade",
+            "job",
+            "start",
+            "demo",
+            "--if-binding",
+            "launcher:source",
+        ],
+    );
     assert!(accepted.status.success(), "{}", stderr(&accepted));
     let accepted: Value = serde_json::from_str(&stdout(&accepted)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let status = run_ocm(
             root.path(),
-            &env,
+            env,
             &[
                 "upgrade",
                 "job",
@@ -541,8 +654,7 @@ fn source_report_survives_the_asynchronous_job_result() {
         assert!(status.status.success(), "{}", stderr(&status));
         let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
         if status["state"] == "succeeded" {
-            assert_eq!(status["result"], expected);
-            break;
+            return status["result"].clone();
         }
         assert_eq!(status["state"], "running", "{status}");
         assert!(
