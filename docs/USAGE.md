@@ -660,7 +660,7 @@ ocm upgrade job status mira --request-id <id> --json
 
 These commands always return JSON.
 `ocm upgrade job capabilities <env>` reports protocol version 1, platform support, selectors, the current `bindingKind` and `bindingName`, and the environment's root, state directory, and config path.
-On Unix, supervised Gateways receive `OPENCLAW_OCM_UPDATE_PROTOCOL=1` alongside their existing OCM environment identity.
+On Unix, supervised Gateways receive the spawning daemon's executable in `OCM_SELF` alongside their existing OCM environment identity; clients query capabilities to determine upgrade-job support.
 Clients must use their trusted OCM executable and environment binding, and preserve their own requester authorization before submitting an operation.
 Latest status returns `null` when that environment has no job; an unknown exact request ID is an error.
 `start --request-id <id>` lets a caller choose a correlation ID before submission; repeating the same ID and target returns that existing job without replaying it.

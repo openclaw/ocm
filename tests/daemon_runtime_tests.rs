@@ -2878,6 +2878,7 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
+    env.insert("OPENCLAW_OCM_UPDATE_PROTOCOL".into(), "stale".into());
     env.insert(
         "XDG_RUNTIME_DIR".into(),
         path_string(&root.child("daemon-session")),
@@ -2900,7 +2901,7 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
         write_legacy_openclaw_script(
             &runtime,
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$OCM_SELF\" \"$OCM_HOME\" \"$OPENCLAW_OCM_UPDATE_PROTOCOL\" \"$XDG_RUNTIME_DIR\" \"$DBUS_SESSION_BUS_ADDRESS\" > '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$OCM_SELF\" \"$OCM_HOME\" \"${{OPENCLAW_OCM_UPDATE_PROTOCOL-unset}}\" \"$XDG_RUNTIME_DIR\" \"$DBUS_SESSION_BUS_ADDRESS\" > '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
                 root.child(format!("{env_name}-scope")).display()
             ),
         );
@@ -2952,7 +2953,7 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
         fs::canonicalize(support::ocm_test_binary_path()).unwrap()
     );
     assert_eq!(scope[1], env["OCM_HOME"]);
-    assert_eq!(scope[2], "1");
+    assert_eq!(scope[2], "unset");
     #[cfg(target_os = "linux")]
     {
         assert_eq!(scope[3], env["XDG_RUNTIME_DIR"]);
