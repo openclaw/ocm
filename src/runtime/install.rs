@@ -308,15 +308,23 @@ impl<'a> RuntimeService<'a> {
             }
 
             let healthy = runtime_integrity_issue(&existing, self.env).is_none();
+            // Ordinary setup/install can reuse healthy legacy records without replacing
+            // a bound runtime. Deferred upgrades require recorded archive identity.
+            let archive_matches = match existing.source_integrity.as_deref() {
+                Some(integrity) => {
+                    selected_release
+                        .integrity
+                        .as_deref()
+                        .and_then(|value| normalize_file_integrity(value).ok())
+                        .as_deref()
+                        == Some(integrity)
+                }
+                None => require_unbound,
+            };
             let same_release = existing.release_version.as_deref()
                 == Some(selected_release.version.as_str())
                 && existing.source_url.as_deref() == Some(selected_release.tarball_url.as_str())
-                && existing.source_integrity.is_some()
-                && selected_release
-                    .integrity
-                    .as_deref()
-                    .and_then(|value| normalize_file_integrity(value).ok())
-                    == existing.source_integrity;
+                && archive_matches;
             let matches_requested_selector = match (version.as_deref(), channel.as_deref()) {
                 (Some(requested_version), None) => {
                     existing.release_version.as_deref() == Some(requested_version)
