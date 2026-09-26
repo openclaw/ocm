@@ -1155,7 +1155,8 @@ impl Cli {
             self.environment_service()
                 .ensure_source_watch_allows_state_mutation_locked(env_name)?;
         }
-        let plan = self.prepare_upgrade_rollback(env_name, transaction_id)?;
+        let plan =
+            self.prepare_upgrade_rollback(env_name, transaction_id, operation_lock.as_ref())?;
         let Some(operation_lock) = operation_lock.as_ref() else {
             return Ok(UpgradeRollbackSummary {
                 env_name: env_name.to_string(),
@@ -1183,6 +1184,7 @@ impl Cli {
         &self,
         env_name: &str,
         transaction_id: Option<&str>,
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<UpgradeRollbackPlan, String> {
         let history = list_upgrade_history(env_name, &self.env, &self.cwd)?;
         let record = match transaction_id {
@@ -1248,8 +1250,8 @@ impl Cli {
             .ensure_snapshot_restore_preserves_dev_sources_locked(&snapshot)?;
         self.environment_service()
             .ensure_upgrade_rollback_preserves_dev_sources_locked(&current)?;
-        self.verify_rollback_target_version(env_name, &record)?;
-        let recovery = self.verify_rollback_source(env_name, &record)?;
+        self.verify_rollback_target_version(env_name, &record, operation_lock)?;
+        let recovery = self.verify_rollback_source(env_name, &record, operation_lock)?;
         Ok(UpgradeRollbackPlan { record, recovery })
     }
 
@@ -1257,12 +1259,17 @@ impl Cli {
         &self,
         env_name: &str,
         record: &UpgradeHistoryRecord,
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<(), String> {
         let Some(expected_version) = record.target.openclaw_version.as_deref() else {
             return Ok(());
         };
-        let version =
-            self.run_openclaw_command(env_name, "current openclaw --version", &["--version"])?;
+        let version = self.run_openclaw_command(
+            env_name,
+            "current openclaw --version",
+            &["--version"],
+            operation_lock,
+        )?;
         if version_output_matches_expected(version.first_line().trim(), expected_version) {
             return Ok(());
         }
@@ -1278,6 +1285,7 @@ impl Cli {
         &self,
         env_name: &str,
         record: &UpgradeHistoryRecord,
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<Option<UpgradeRuntimeRecovery>, String> {
         match record.source.kind.as_str() {
             "runtime" => {
@@ -1353,6 +1361,7 @@ impl Cli {
                         &record.source.name,
                         "rollback source openclaw --version",
                         &["--version"],
+                        operation_lock,
                     )?;
                     if !version.status.success()
                         || !version_output_matches_expected(
@@ -1374,6 +1383,7 @@ impl Cli {
                     &record.source.name,
                     "rollback source openclaw --version",
                     &["--version"],
+                    operation_lock,
                 )?;
                 if !version.status.success() {
                     return Err(format!(
@@ -2486,7 +2496,8 @@ impl Cli {
         if target.is_explicit() {
             let resolved = self.resolve_upgrade_target(target)?;
             let target_runtime_name = resolved.name.clone();
-            let target_version = self.resolved_target_version(env_name, &resolved)?;
+            let target_version =
+                self.resolved_target_version(env_name, &resolved, operation_lock)?;
             let target_release_version = target_version
                 .clone()
                 .or_else(|| resolved.release_version.clone());
@@ -2495,6 +2506,7 @@ impl Cli {
                 env_name,
                 current.release_version.as_deref(),
                 target_version.as_deref(),
+                operation_lock,
             )?;
             if !target.is_named_runtime() {
                 self.ensure_runtime_upgrade_isolated(env_name, &target_runtime_name)?;
@@ -2840,7 +2852,8 @@ impl Cli {
             };
             let resolved = self.resolve_upgrade_target(&target)?;
             let target_runtime_name = resolved.name.clone();
-            let target_version = self.resolved_target_version(env_name, &resolved)?;
+            let target_version =
+                self.resolved_target_version(env_name, &resolved, operation_lock)?;
             let target_release_version = target_version
                 .clone()
                 .or_else(|| resolved.release_version.clone());
@@ -2849,6 +2862,7 @@ impl Cli {
                 env_name,
                 current.release_version.as_deref(),
                 target_version.as_deref(),
+                operation_lock,
             )?;
             if options.dry_run {
                 return Ok(UpgradeEnvSummary {
@@ -3150,6 +3164,7 @@ impl Cli {
             env_name,
             current.release_version.as_deref(),
             Some(&target_version),
+            operation_lock,
         )?;
         let service = self.upgrade_service_status(env_name)?;
         if options.dry_run {
@@ -3456,13 +3471,17 @@ impl Cli {
 
         let resolved = self.resolve_upgrade_target(target)?;
         let target_runtime_name = resolved.name.clone();
-        let target_version = self.resolved_target_version(env_name, &resolved)?;
+        let target_version = self.resolved_target_version(env_name, &resolved, operation_lock)?;
         let target_release_version = target_version
             .clone()
             .or_else(|| resolved.release_version.clone());
         let target_channel = resolved.release_channel.clone();
-        let source_version =
-            self.ensure_upgrade_is_not_downgrade(env_name, None, target_version.as_deref())?;
+        let source_version = self.ensure_upgrade_is_not_downgrade(
+            env_name,
+            None,
+            target_version.as_deref(),
+            operation_lock,
+        )?;
         if !target.is_named_runtime() {
             self.ensure_runtime_upgrade_isolated(env_name, &target_runtime_name)?;
         }
@@ -3840,6 +3859,7 @@ impl Cli {
         &self,
         env_name: &str,
         target: &ResolvedUpgradeTarget,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<Option<String>, String> {
         let version_hint = target
             .release_version
@@ -3854,6 +3874,7 @@ impl Cli {
             &target.name,
             "target openclaw --version",
             &["--version"],
+            Some(operation_lock),
         ) else {
             return Ok(version_hint.map(str::to_string));
         };
@@ -3871,18 +3892,20 @@ impl Cli {
         env_name: &str,
         current_version_hint: Option<&str>,
         target_version: Option<&str>,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<Option<String>, String> {
         let current_version_hint = current_version_hint
             .filter(|version| compare_runtime_release_versions(version, version).is_some());
-        let current_version =
-            match self.run_openclaw_command(env_name, "current openclaw --version", &["--version"])
-            {
-                Ok(current) => {
-                    release_version_from_output(&current.first_line(), current_version_hint)
-                        .or_else(|| current_version_hint.map(str::to_string))
-                }
-                Err(_) => current_version_hint.map(str::to_string),
-            };
+        let current_version = match self.run_openclaw_command(
+            env_name,
+            "current openclaw --version",
+            &["--version"],
+            Some(operation_lock),
+        ) {
+            Ok(current) => release_version_from_output(&current.first_line(), current_version_hint)
+                .or_else(|| current_version_hint.map(str::to_string)),
+            Err(_) => current_version_hint.map(str::to_string),
+        };
         let Some(target_version) = target_version else {
             return Ok(current_version);
         };
@@ -4246,7 +4269,13 @@ impl Cli {
         verify_gateway: bool,
         operation_lock: &EnvironmentOperationLock,
     ) -> Result<Option<String>, String> {
-        let version = self.run_openclaw_command(env_name, "openclaw --version", &["--version"])?;
+        // Node preloads and launcher arguments can write state before --version exits.
+        let version = self.run_openclaw_command(
+            env_name,
+            "openclaw --version",
+            &["--version"],
+            Some(operation_lock),
+        )?;
         let actual_version = version.first_line();
         if let Some(expected_version) = expected_version
             && !version_output_matches_expected(actual_version.trim(), expected_version)
@@ -4310,8 +4339,9 @@ impl Cli {
         env_name: &str,
         name: &str,
         args: &[&str],
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<SimulationCommandOutput, String> {
-        let output = self.capture_openclaw_command(env_name, name, args, None)?;
+        let output = self.capture_openclaw_command(env_name, name, args, operation_lock)?;
         if output.status.success() {
             Ok(output)
         } else {
@@ -4615,6 +4645,7 @@ impl Cli {
         runtime_name: &str,
         name: &str,
         args: &[&str],
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<SimulationCommandOutput, String> {
         self.run_update_mode_openclaw_command_output_with_env(
             env_name,
@@ -4622,7 +4653,7 @@ impl Cli {
             name,
             args,
             &[],
-            None,
+            operation_lock,
         )
     }
 
@@ -4658,13 +4689,14 @@ impl Cli {
         launcher_name: &str,
         name: &str,
         args: &[&str],
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<SimulationCommandOutput, String> {
         let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
         let resolved = self
             .environment_service()
             .resolve(env_name, None, Some(launcher_name.to_string()), &args)
             .map_err(|error| format!("{name} failed: {error}"))?;
-        self.run_resolved_for_simulation(resolved, &[])
+        self.run_resolved_with_operation_lock(resolved, &[], operation_lock)
             .map_err(|error| format!("{name} failed: {error}"))
     }
 

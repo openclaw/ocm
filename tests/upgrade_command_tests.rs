@@ -4656,18 +4656,35 @@ fn upgrade_holds_the_environment_operation_lock_until_completion() {
 #[test]
 fn upgrade_children_retain_exclusion_after_parent_death() {
     for phase in ["doctor", "finalize", "status", "rollback-status"] {
-        assert_upgrade_child_custody(phase, false);
+        assert_upgrade_child_custody(phase, false, false);
     }
 }
 
 #[cfg(unix)]
 #[test]
 fn upgrade_batch_children_retain_only_their_environment_exclusion() {
-    assert_upgrade_child_custody("finalize", true);
+    assert_upgrade_child_custody("finalize", true, false);
 }
 
 #[cfg(unix)]
-fn assert_upgrade_child_custody(phase: &str, batch: bool) {
+#[test]
+fn upgrade_version_children_retain_exclusion_after_parent_death() {
+    for (phase, launcher) in [
+        ("target-version", false),
+        ("current-version", false),
+        ("current-version", true),
+        ("version", false),
+        ("rollback-target-version", false),
+        ("rollback-source-version", false),
+        ("rollback-source-version", true),
+        ("rollback-version", true),
+    ] {
+        assert_upgrade_child_custody(phase, false, launcher);
+    }
+}
+
+#[cfg(unix)]
+fn assert_upgrade_child_custody(phase: &str, batch: bool, launcher: bool) {
     use std::os::unix::process::CommandExt;
 
     // Kill the entire fixture group on assertion failure, including the orphan
@@ -4728,12 +4745,24 @@ fn assert_upgrade_child_custody(phase: &str, batch: bool) {
     let mut status_service = None;
     let runtime = root.child("openclaw");
     let gate = r#"
-case "$OCM_CUSTODY_PHASE:$1:$2" in
-  doctor:doctor:--non-interactive|finalize:update:finalize|status:gateway:status|rollback-status:gateway:status)
+probe=""
+gate="$OCM_CUSTODY_GATES/$OCM_ACTIVE_ENV"
+if [ -n "$OCM_CUSTODY_PHASE" ] && [ "$1" = "--version" ]; then
+  count=0
+  [ ! -f "$gate.count" ] || count=$(cat "$gate.count")
+  count=$((count + 1))
+  printf '%s' "$count" > "$gate.count"
+  case "$OCM_CUSTODY_PHASE:$count" in
+    target-version:1|current-version:2|version:3|rollback-target-version:1|rollback-source-version:2|rollback-version:3) probe=version;;
+  esac
+fi
+case "$OCM_CUSTODY_PHASE:$1:$2:$probe" in
+  *:--version:*:version|doctor:doctor:--non-interactive:|finalize:update:finalize:|status:gateway:status:|rollback-status:gateway:status:)
   gate="$OCM_CUSTODY_GATES/$OCM_ACTIVE_ENV"
   printf '%s' "$$" > "$gate.started"
   while [ ! -e "$gate.release" ]; do sleep 0.05; done
   printf '%s\n' "$OCM_CUSTODY_PHASE" > "$gate.written"
+  [ "$probe" != version ] || printf '2026.8.1\n'
   exit 0;;
 esac
 "#;
@@ -4755,9 +4784,21 @@ esac
         let create = run_ocm(&cwd, &env, &["env", "create", name, "--runtime", "local"]);
         assert!(create.status.success(), "{}", stderr(&create));
     }
-    if phase.ends_with("status") {
-        if phase == "rollback-status" {
-            let add = run_ocm(
+    if launcher || phase.starts_with("rollback-") {
+        let add = if launcher {
+            run_ocm(
+                &cwd,
+                &env,
+                &[
+                    "launcher",
+                    "add",
+                    "previous",
+                    "--command",
+                    &path_string(&runtime),
+                ],
+            )
+        } else {
+            run_ocm(
                 &cwd,
                 &env,
                 &[
@@ -4767,11 +4808,18 @@ esac
                     "--path",
                     &path_string(&runtime),
                 ],
-            );
-            assert!(add.status.success(), "{}", stderr(&add));
-            let bind = run_ocm(&cwd, &env, &["env", "set-runtime", "demo", "previous"]);
-            assert!(bind.status.success(), "{}", stderr(&bind));
-        }
+            )
+        };
+        assert!(add.status.success(), "{}", stderr(&add));
+        let setter = if launcher {
+            "set-launcher"
+        } else {
+            "set-runtime"
+        };
+        let bind = run_ocm(&cwd, &env, &["env", setter, "demo", "previous"]);
+        assert!(bind.status.success(), "{}", stderr(&bind));
+    }
+    if phase.ends_with("status") {
         env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
         install_fake_launchctl(&root, &mut env);
         let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
@@ -4826,7 +4874,7 @@ esac
             observer: Some(observer),
         });
     }
-    if phase == "rollback-status" {
+    if phase.starts_with("rollback-") {
         let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "local"]);
         assert!(upgrade.status.success(), "{}", stderr(&upgrade));
     }
@@ -4861,7 +4909,7 @@ esac
             "2",
             "--accept-fleet-outage",
         ]);
-    } else if phase == "rollback-status" {
+    } else if phase.starts_with("rollback-") {
         command.args(["upgrade", "rollback", "demo"]);
     } else {
         command.args(["upgrade", "demo", "--runtime", "local"]);
@@ -4872,9 +4920,6 @@ esac
     if batch {
         wait_for(&root.child("other.started"));
     }
-    upgrade.kill().unwrap();
-    upgrade.wait().unwrap();
-
     let spawn_mutation = |name| {
         Command::new(env!("CARGO_BIN_EXE_ocm"))
             .current_dir(&cwd)
@@ -4888,6 +4933,13 @@ esac
             .unwrap()
     };
     let mut competing = spawn_mutation("demo");
+    sleep(Duration::from_millis(250));
+    assert!(
+        competing.try_wait().unwrap().is_none(),
+        "mutation entered while the OCM parent was alive"
+    );
+    upgrade.kill().unwrap();
+    upgrade.wait().unwrap();
     sleep(Duration::from_millis(250));
     assert!(
         competing.try_wait().unwrap().is_none(),
