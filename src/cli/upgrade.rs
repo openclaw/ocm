@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -30,7 +31,8 @@ use crate::runtime::releases::{
 };
 use crate::runtime::{
     InstallRuntimeFromOfficialReleaseOptions, OfficialRuntimePrepareAction, RuntimeMeta,
-    RuntimeReleaseSelectorKind, RuntimeService, StagedRuntimeInstall, resolve_runtime_launch,
+    RuntimeReleaseSelectorKind, RuntimeService, StagedRuntimeInstall, is_openclaw_package_runtime,
+    resolve_runtime_launch,
 };
 use crate::service::{ServiceSummary, wait_for_gateway_readiness};
 use crate::store::{
@@ -4019,24 +4021,36 @@ impl Cli {
             ));
         }
 
+        let mut build_note = None;
         if verify_gateway {
             let gateway_status = self.capture_openclaw_command(
                 env_name,
                 "openclaw gateway status",
                 &["gateway", "status", "--deep", "--json"],
             )?;
-            if let Err(error) = verify_gateway_status_readiness(&gateway_status.stdout) {
-                return if gateway_status.status.success() {
-                    Err(error)
-                } else {
-                    Err(format!("{error}; {}", gateway_status.failure_summary()))
-                };
+            let status =
+                verify_gateway_status_readiness(&gateway_status.stdout).map_err(|error| {
+                    if gateway_status.status.success() {
+                        error
+                    } else {
+                        format!("{error}; {}", gateway_status.failure_summary())
+                    }
+                })?;
+            let env = self.environment_service().get(env_name)?;
+            if let Some(runtime_name) = env.default_runtime.as_deref() {
+                let runtime = get_runtime(runtime_name, &self.env, &self.cwd)?;
+                if let Some(expected_build_id) = installed_openclaw_build_id(&runtime) {
+                    build_note = Some(verify_gateway_build_id(&status, &expected_build_id)?);
+                }
             }
         }
 
         Ok(Some(format!(
-            "post-upgrade verification completed for OpenClaw {}",
-            actual_version.trim()
+            "post-upgrade verification completed for OpenClaw {}{}",
+            actual_version.trim(),
+            build_note
+                .map(|note| format!("; {note}"))
+                .unwrap_or_default()
         )))
     }
 
@@ -5954,16 +5968,47 @@ fn join_optional_warnings(left: Option<String>, right: Option<String>) -> Option
     }
 }
 
-fn verify_gateway_status_readiness(stdout: &str) -> Result<(), String> {
+fn installed_openclaw_build_id(runtime: &RuntimeMeta) -> Option<String> {
+    if !is_openclaw_package_runtime(runtime) {
+        return None;
+    }
+    let path = Path::new(&runtime.binary_path)
+        .parent()?
+        .join("dist/build-info.json");
+    let info: Value = serde_json::from_reader(fs::File::open(path).ok()?.take(65536)).ok()?;
+    let build_id = info.get("buildId")?.as_str()?.trim();
+    // Match OpenClaw's optional build metadata contract; older packages omit it.
+    (!build_id.is_empty() && build_id.len() <= 96).then(|| build_id.to_string())
+}
+
+fn verify_gateway_build_id(status: &Value, expected: &str) -> Result<&'static str, String> {
+    let Some(actual) = status
+        .pointer("/rpc/server/buildId")
+        .and_then(Value::as_str)
+    else {
+        return Ok("running Gateway build identity unavailable");
+    };
+    if actual != expected {
+        return Err(
+            "post-upgrade gateway build verification failed: running Gateway build does not match the installed runtime"
+                .to_string(),
+        );
+    }
+    Ok("running Gateway build matches the installed runtime")
+}
+
+fn verify_gateway_status_readiness(stdout: &str) -> Result<Value, String> {
     let status: Value = serde_json::from_str(stdout.trim()).map_err(|error| {
         format!("post-upgrade gateway readiness failed: invalid status JSON ({error})")
     })?;
 
     if let Some(ready) = status.pointer("/rpc/ok").and_then(Value::as_bool) {
-        return gateway_readiness_result(ready, &status);
+        gateway_readiness_result(ready, &status)?;
+        return Ok(status);
     }
     if let Some(ready) = status.get("ok").and_then(Value::as_bool) {
-        return gateway_readiness_result(ready, &status);
+        gateway_readiness_result(ready, &status)?;
+        return Ok(status);
     }
     if let Some(targets) = status.get("targets").and_then(Value::as_array) {
         let ready = targets.iter().any(|target| {
@@ -5972,7 +6017,8 @@ fn verify_gateway_status_readiness(stdout: &str) -> Result<(), String> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
         });
-        return gateway_readiness_result(ready, &status);
+        gateway_readiness_result(ready, &status)?;
+        return Ok(status);
     }
 
     Err(
@@ -6062,7 +6108,7 @@ mod tests {
         UpgradeSimulationSummary, candidate_codex_preflight_is_unsupported,
         command_output_reports_unsupported_command, parse_openclaw_finalize_phases,
         record_simulation_cleanup_failure, release_version_from_output,
-        simulation_requires_attention, summarize_command_failure_text,
+        simulation_requires_attention, summarize_command_failure_text, verify_gateway_build_id,
         verify_gateway_status_readiness, version_output_matches_expected,
     };
 
@@ -6175,6 +6221,32 @@ mod tests {
             release_version_from_output("OpenClaw current-main", Some("2026.7.2")).as_deref(),
             None
         );
+    }
+
+    #[test]
+    fn gateway_build_identity_uses_build_id_instead_of_overridable_version() {
+        let status = serde_json::json!({"rpc": {"ok": true, "server": {
+            "version": "overridden-version", "buildId": "candidate-build"
+        }}});
+        assert_eq!(
+            verify_gateway_build_id(&status, "candidate-build").unwrap(),
+            "running Gateway build matches the installed runtime"
+        );
+        assert!(verify_gateway_build_id(&status, "another-build").is_err());
+    }
+
+    #[test]
+    fn gateway_build_identity_preserves_legacy_and_auth_only_status() {
+        for status in [
+            serde_json::json!({"rpc": {"ok": true}}),
+            serde_json::json!({"rpc": {"ok": false, "error": "device identity required"}}),
+            serde_json::json!({"rpc": {"ok": true, "server": {"buildId": null}}}),
+        ] {
+            assert_eq!(
+                verify_gateway_build_id(&status, "candidate-build").unwrap(),
+                "running Gateway build identity unavailable"
+            );
+        }
     }
 
     #[test]
