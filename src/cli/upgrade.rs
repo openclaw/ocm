@@ -2557,13 +2557,15 @@ impl Cli {
                 preparation_started,
                 "completed",
             );
-            if let Some(summary) = self.current_runtime_job_result(
+            if let Some(mut summary) = self.current_runtime_job_result(
                 env_name,
                 &current,
                 &prepared,
                 service.as_ref(),
                 operation_lock,
             ) {
+                summary.runtime_release_version = target_release_version;
+                summary.runtime_release_channel = target_channel;
                 return Ok(summary);
             }
             let target_changed = !matches!(prepared.action, OfficialRuntimePrepareAction::Reused);
@@ -2891,13 +2893,15 @@ impl Cli {
                 preparation_started,
                 "completed",
             );
-            if let Some(summary) = self.current_runtime_job_result(
+            if let Some(mut summary) = self.current_runtime_job_result(
                 env_name,
                 &current,
                 &prepared,
                 service.as_ref(),
                 operation_lock,
             ) {
+                summary.runtime_release_version = target_release_version;
+                summary.runtime_release_channel = target_channel;
                 return Ok(summary);
             }
             let changed = matches!(
