@@ -300,6 +300,84 @@ impl Cli {
         Ok(status)
     }
 
+    fn source_artifact_status(
+        &self,
+        name: &str,
+        launcher: &str,
+        source: &SourceInspection,
+        operation: &EnvironmentOperationLock,
+        transaction: &UpgradeTransaction,
+    ) -> Result<Value, String> {
+        // Recovery may already be handling an interrupt. A new interrupt during
+        // this observation must not turn into another discovery command.
+        let interrupted = transaction.interrupted();
+        let output = self.source_command(
+            name,
+            launcher,
+            source,
+            &["status", "--json"],
+            operation,
+            None,
+        )?;
+        if transaction.interrupted() != interrupted
+            || matches!(output.status.code(), None | Some(130 | 143))
+        {
+            return Err("native source observation was interrupted".to_string());
+        }
+        if let Ok(status) = serde_json::from_str::<Value>(output.stdout.trim()) {
+            // Ordinary status also scans optional services and sessions. Missing
+            // observations can use the canonical command, but facts that reject
+            // this installation or its readiness must not be overwritten.
+            if text(&status, "/update/root").is_some_and(|root| {
+                fs::canonicalize(root).ok().as_deref() != Some(Path::new(&source.root))
+            }) || text(&status, "/update/installKind")
+                .is_some_and(|kind| kind != "git" && kind != "unknown")
+            {
+                return Err("native source status resolved a different installation".to_string());
+            }
+            if status
+                .pointer("/update/git/artifacts/ready")
+                .and_then(Value::as_bool)
+                == Some(false)
+            {
+                return Err("native source artifacts are not ready".to_string());
+            }
+            if status
+                .pointer("/error/code")
+                .is_some_and(|code| !code.is_null())
+                || text(&status, "/update/error/status").as_deref() == Some("failed")
+            {
+                return Err(format!(
+                    "native source observation failed: {}",
+                    source_failure_summary(&output)
+                ));
+            }
+            if text(&status, "/update/git/sha")
+                .zip(text(&status, "/update/git/builtSha"))
+                .is_some_and(|(head, built)| head != built)
+            {
+                return Err("native source result does not match the resulting build".to_string());
+            }
+            if text(&status, "/update/root").is_some()
+                && text(&status, "/update/installKind").as_deref() == Some("git")
+                && text(&status, "/update/git/builtSha").is_some()
+                && artifact_identity(&status).is_some()
+                && status.pointer("/update/error").is_none_or(Value::is_null)
+            {
+                if !output.status.success() {
+                    return Err(format!(
+                        "native source observation failed: {}",
+                        source_failure_summary(&output)
+                    ));
+                }
+                return Ok(status);
+            }
+        }
+        // Older or unconfigured status commands can omit local update facts.
+        // This fallback retains the existing remote-discovery cost and guards.
+        self.source_status(name, launcher, source, operation, None)
+    }
+
     fn verify_source_gateway(
         &self,
         name: &str,
@@ -545,7 +623,8 @@ impl Cli {
             if transaction.interrupted() {
                 return Err("source update interrupted after native execution".to_string());
             }
-            let after = self.source_status(name, launcher, &source, operation, None)?;
+            let after =
+                self.source_artifact_status(name, launcher, &source, operation, &transaction)?;
             let identity = artifact_identity(&after)
                 .ok_or("native source artifacts could not be verified after update")?;
             if text(&native, "/mode").as_deref() != Some("git")
@@ -658,7 +737,7 @@ impl Cli {
                     && (retained || restored)
             })
             .and_then(|before| {
-                self.source_status(name, launcher, source, operation, None)
+                self.source_artifact_status(name, launcher, source, operation, &transaction)
                     .ok()
                     .and_then(|status| artifact_identity(&status))
                     .filter(|actual| {

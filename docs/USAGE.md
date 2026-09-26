@@ -511,6 +511,9 @@ Development source requires a freshly checked `main` upstream; configured stable
 Missing target observations remain unknown and cannot establish this shortcut.
 Otherwise, OCM captures an environment checkpoint, stops its managed service, and invokes the public native `update --no-restart` command with external service repair policy.
 Native OpenClaw owns source selection, staging, builds, Doctor, and source recovery; OCM restores its prior service policy only after verification.
+Post-update and recovery verification prefer fresh local artifact observations from ordinary OpenClaw status.
+When that command cannot supply complete observations, such as for an unconfigured environment, verification uses native update status and can still wait for remote discovery.
+An observed wrong installation or unready build remains a verification failure.
 Binding changes, service-policy writes, and new foreground source admission wait while the native source operation holds registry exclusion; environment and job-status reads remain available.
 Source preparation also refuses while an overlapping source environment is completing an operation, including service activation and recovery.
 Successful source execution records `source-updated`, which cannot be selected by `upgrade rollback`, including in older OCM readers.
