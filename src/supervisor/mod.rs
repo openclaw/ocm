@@ -653,7 +653,15 @@ impl<'a> SupervisorService<'a> {
         ensure_store(self.env, self.cwd)?;
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;
-        let env_service = EnvironmentService::new(self.env, self.cwd);
+        // Saved child specs are also built by ordinary CLI callers, which need
+        // not inherit the daemon's own executable/store environment.
+        let mut child_env = self.env.clone();
+        child_env.insert(
+            "OCM_SELF".into(),
+            display_path(&self.supervisor_executable_path()?),
+        );
+        child_env.insert("OCM_HOME".into(), display_path(&ocm_home));
+        let env_service = EnvironmentService::new(&child_env, self.cwd);
         let mut envs = list_environments(self.env, self.cwd)?;
         envs.sort_by(|left, right| left.name.cmp(&right.name));
         let envs = env_service.apply_effective_gateway_ports(envs)?;

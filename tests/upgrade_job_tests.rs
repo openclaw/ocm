@@ -119,7 +119,7 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
             "--runtime",
             "new",
             "--request-id",
-            "caller-request-1",
+            "admission",
             "--json",
         ],
     );
@@ -127,7 +127,7 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
     assert_eq!(accepted["state"], "running");
     assert!(accepted["result"].is_null());
     assert_eq!(accepted["envName"], "demo");
-    assert_eq!(accepted["id"], "caller-request-1");
+    assert_eq!(accepted["id"], "admission");
     let resumed = command(
         &root,
         &env,

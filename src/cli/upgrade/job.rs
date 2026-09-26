@@ -133,7 +133,9 @@ impl Cli {
                 || !observe_process(record.worker.pid)?
                     .is_some_and(|process| process.running && process.identity == record.worker))
             && let Some(_claim) = try_lock_file(
-                &self.upgrade_job_path(name, id)?.with_extension("lock"),
+                &self
+                    .upgrade_job_path(name, id)?
+                    .with_extension("worker.lock"),
                 "upgrade job worker",
             )?
         {
@@ -350,7 +352,7 @@ impl Cli {
         }
         // Claim once before publishing readiness, including duplicate internal invocations.
         let path = self.upgrade_job_path(name, id)?;
-        let _claim = try_lock_file(&path.with_extension("lock"), "upgrade job worker")?
+        let _claim = try_lock_file(&path.with_extension("worker.lock"), "upgrade job worker")?
             .ok_or("upgrade job already has a worker")?;
         record = self.read_upgrade_job(name, id)?;
         if record.job.state != State::Starting {
