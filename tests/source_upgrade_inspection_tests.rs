@@ -828,6 +828,7 @@ fn execution_fixture(root: &TestDir, current: bool) -> (BTreeMap<String, String>
         &repo.join("openclaw.mjs"),
         r#"
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 const file = process.env.OCM_TEST_SOURCE_STATE;
@@ -835,7 +836,36 @@ const state = JSON.parse(fs.readFileSync(file));
 const args = process.argv.slice(2);
 fs.appendFileSync(file + '.calls', JSON.stringify({args, repair: process.env.OPENCLAW_SERVICE_REPAIR_POLICY,
   supervisor: process.env.OPENCLAW_SUPERVISOR_MODE, cache: process.env.NODE_DISABLE_COMPILE_CACHE}) + '\n');
-if (args[0] === 'update' && args[1] === 'status') {
+if (args[0] === 'gateway' && args[1] === 'restart-handoff') {
+  process.exitCode = 64;
+} else if (args[0] === 'gateway' && args[1] === 'run') {
+  const build = JSON.parse(fs.readFileSync(path.join(state.status.update.root, 'dist/build-info.json')));
+  const identity = {rpc: {ok: true, server: {buildId: build.buildId}}, pid: process.pid};
+  const stop = () => {
+    fs.appendFileSync(file + '.stopped', String(process.pid) + '\n');
+    process.exit(0);
+  };
+  process.on('SIGTERM', stop);
+  process.on('SIGINT', stop);
+  http.createServer((request, response) => {
+    response.writeHead(request.url === '/health' ? 200 : 404);
+    response.end(JSON.stringify(identity));
+  }).listen(Number(process.env.OPENCLAW_GATEWAY_PORT), '127.0.0.1', () => {
+    fs.appendFileSync(file + '.started', String(process.pid) + '\n');
+  });
+} else if (args[0] === 'gateway' && args[1] === 'status') {
+  const response = await fetch(`http://127.0.0.1:${process.env.OPENCLAW_GATEWAY_PORT}/health`, {
+    signal: AbortSignal.timeout(2000)
+  });
+  if (!response.ok) throw new Error('fixture Gateway is unavailable');
+  const identity = await response.json();
+  fs.appendFileSync(file + '.verified', JSON.stringify(identity) + '\n');
+  if (state.interruptAfterVerification) {
+    process.kill(process.ppid, 'SIGINT');
+    await setTimeout(100);
+  }
+  console.log(JSON.stringify(identity));
+} else if (args[0] === 'update' && args[1] === 'status') {
   console.log(JSON.stringify(state.status));
 } else if (args[0] === 'status') {
   console.log(JSON.stringify(state.localStatus ?? state.status));
@@ -1623,21 +1653,141 @@ fn source_child_retains_registry_exclusion_after_parent_loss() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn history_write_failure_keeps_verified_source_update() {
+fn history_write_failure_reports_failure_and_keeps_verified_source_update() {
+    for running in [true, false] {
+        assert_source_history_write_failure(running, false);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_history_failure_does_not_bypass_interrupt_fence() {
+    assert_source_history_write_failure(true, true);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_source_history_write_failure(running: bool, interrupt: bool) {
     use std::os::unix::fs::PermissionsExt;
+    use std::process::{Child, Stdio};
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    struct FixtureCleanup {
+        daemon: Option<Child>,
+        history_dir: std::path::PathBuf,
+    }
+    impl Drop for FixtureCleanup {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.history_dir, fs::Permissions::from_mode(0o755));
+            if let Some(daemon) = &mut self.daemon {
+                unsafe { libc::kill(daemon.id() as i32, libc::SIGINT) };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while daemon.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                    sleep(Duration::from_millis(25));
+                }
+                let _ = daemon.kill();
+                let _ = daemon.wait();
+            }
+        }
+    }
+
     let root = TestDir::new("source-history-failure");
-    let (env, mut state) = execution_fixture(&root, false);
+    let (mut env, mut state) = execution_fixture(&root, false);
     let history_dir = root.child("ocm-home/upgrade-history");
     fs::create_dir_all(&history_dir).unwrap();
     state["historyDir"] = json!(path_string(&history_dir));
+    state["interruptAfterVerification"] = json!(interrupt);
     write_text(&root.child("native.json"), &state.to_string());
+    let mut cleanup = FixtureCleanup {
+        daemon: None,
+        history_dir: history_dir.clone(),
+    };
+    let initial_pid = if running {
+        support::install_fake_service_manager(&root, &mut env);
+        env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
+        env.insert(
+            "OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS".into(),
+            "5000".into(),
+        );
+        let installed = run_ocm(root.path(), &env, &["service", "install", "demo"]);
+        assert!(installed.status.success(), "{}", stderr(&installed));
+        let daemon = Command::new(support::ocm_test_binary_path())
+            .current_dir(root.path())
+            .env_clear()
+            .envs(&env)
+            .args(["__daemon", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let daemon_pid = daemon.id();
+        cleanup.daemon = Some(daemon);
+        env.insert("OCM_TEST_NATIVE_DAEMON_PID".into(), daemon_pid.to_string());
+        if cfg!(target_os = "macos") {
+            write_text(
+                &root.child("launchctl-print.txt"),
+                &format!(
+                    "state = running\npid = {daemon_pid}\npath = {}\n",
+                    path_string(&support::managed_service_definition_path(
+                        &env,
+                        root.path(),
+                        "demo"
+                    ))
+                ),
+            );
+        }
+        let runtime_path = ocm::store::supervisor_runtime_path(&env, root.path()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(raw) = fs::read(&runtime_path)
+                && let Ok(runtime) = serde_json::from_slice::<Value>(&raw)
+                && runtime["gatewayAdmission"]["process"]["pid"] == daemon_pid
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture daemon did not become ready"
+            );
+            sleep(Duration::from_millis(25));
+        }
+        let started = run_ocm(root.path(), &env, &["service", "start", "demo", "--json"]);
+        assert!(started.status.success(), "{}", stderr(&started));
+        let started: Value = serde_json::from_str(&stdout(&started)).unwrap();
+        assert_eq!(started["gatewayReady"], true);
+        let status = run_ocm(root.path(), &env, &["service", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+        Some(status["childPid"].as_u64().unwrap())
+    } else {
+        None
+    };
     let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
-    let mut permissions = fs::metadata(&history_dir).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&history_dir, permissions).unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
+    fs::set_permissions(&history_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!output.status.success(), "{}", stdout(&output));
     let value: Value = serde_json::from_str(&stdout(&output)).unwrap();
-    assert_eq!(value["outcome"], "source-updated");
+    assert_eq!(value["outcome"], "failed");
+    let snapshots = run_ocm(
+        root.path(),
+        &env,
+        &["env", "snapshot", "list", "demo", "--json"],
+    );
+    assert!(snapshots.status.success(), "{}", stderr(&snapshots));
+    let snapshots: Value = serde_json::from_str(&stdout(&snapshots)).unwrap();
+    assert!(
+        snapshots
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|snapshot| snapshot["id"] == value["snapshotId"])
+    );
+    let history = run_ocm(root.path(), &env, &["upgrade", "history", "demo", "--json"]);
+    assert!(history.status.success(), "{}", stderr(&history));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&history)).unwrap(),
+        json!([])
+    );
     assert!(
         value["note"]
             .as_str()
@@ -1646,18 +1796,80 @@ fn history_write_failure_keeps_verified_source_update() {
         "{}",
         value["note"]
     );
-    assert!(
-        !value["note"]
-            .as_str()
-            .unwrap_or("")
-            .contains("recovery is unresolved"),
-        "{}",
-        value["note"]
-    );
     assert_eq!(
         fs::read_to_string(root.child("ocm-home/envs/demo/.openclaw/source-witness")).unwrap(),
         "native-result"
     );
+    let shown = run_ocm(root.path(), &env, &["env", "show", "demo", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["serviceRunning"], running && !interrupt, "{value}");
+    if let Some(initial_pid) = initial_pid {
+        let verified: Value = serde_json::from_str(
+            fs::read_to_string(root.child("native.json.verified"))
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        let verified_pid = verified["pid"].as_u64().unwrap();
+        assert_ne!(
+            verified_pid, initial_pid,
+            "source update did not restart its Gateway"
+        );
+        assert_eq!(verified["rpc"]["server"]["buildId"], "new-source");
+        // Let the daemon reconcile once more; stale runtime metadata cannot
+        // substitute for the same verified process still answering health.
+        sleep(Duration::from_millis(400));
+        let status = run_ocm(root.path(), &env, &["service", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+        assert_eq!(status["running"], !interrupt);
+        if !interrupt {
+            assert_eq!(status["childPid"], verified_pid);
+            let health = Command::new("node")
+                .env_clear().envs(&env)
+                .args(["-e", "fetch(process.argv[1], {signal: AbortSignal.timeout(2000)}).then(r => r.json()).then(v => console.log(JSON.stringify(v)))"])
+                .arg(format!("http://127.0.0.1:{}/health", status["childPort"].as_u64().unwrap()))
+                .output().unwrap();
+            assert!(health.status.success(), "{}", stderr(&health));
+            assert_eq!(
+                serde_json::from_str::<Value>(&stdout(&health)).unwrap(),
+                verified
+            );
+            assert!(
+                !fs::read_to_string(root.child("native.json.stopped"))
+                    .unwrap()
+                    .lines()
+                    .any(|pid| pid == verified_pid.to_string())
+            );
+        } else {
+            assert!(
+                fs::read_to_string(root.child("native.json.stopped"))
+                    .unwrap()
+                    .lines()
+                    .any(|pid| pid == verified_pid.to_string())
+            );
+        }
+    }
+    if interrupt {
+        assert_eq!(value["rollback"], "native");
+        assert!(
+            value["note"]
+                .as_str()
+                .unwrap()
+                .contains("source update interrupted before completion")
+        );
+    } else {
+        assert!(value["rollback"].is_null());
+        assert!(
+            !value["note"]
+                .as_str()
+                .unwrap()
+                .contains("recovery is unresolved")
+        );
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
