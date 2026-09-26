@@ -1,3 +1,4 @@
+mod detached_worker;
 mod dev;
 mod doctor;
 mod env;
@@ -353,6 +354,7 @@ impl Cli {
         F: FnOnce() -> Result<T, String>,
     {
         let message = message.into();
+        self.upgrade_job_progress(&message)?;
         if !self.progress_output_enabled() {
             return run_with_non_interactive_progress(
                 message,

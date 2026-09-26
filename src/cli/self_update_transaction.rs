@@ -265,7 +265,6 @@ fn spawn_worker(cli: &Cli, previous: &Path, receipt: &Receipt) -> Result<Child, 
     }
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         let mut command = worker_command(previous, receipt)?;
         command
             .env_clear()
@@ -277,17 +276,6 @@ fn spawn_worker(cli: &Cli, previous: &Path, receipt: &Receipt) -> Result<Child, 
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // SAFETY: only async-signal-safe syscalls in the post-fork child. A new
-        // session also releases the controlling terminal and source process group.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                libc::signal(libc::SIGHUP, libc::SIG_IGN);
-                Ok(())
-            });
-        }
         command.spawn().map_err(|e| {
             format!("cannot detach self-update helper; no executable was replaced: {e}")
         })
@@ -296,27 +284,8 @@ fn spawn_worker(cli: &Cli, previous: &Path, receipt: &Receipt) -> Result<Child, 
 
 #[cfg(unix)]
 fn worker_command(previous: &Path, receipt: &Receipt) -> Result<Command, String> {
-    #[cfg(target_os = "linux")]
-    let in_service = fs::read_to_string("/proc/self/cgroup")
-        .map_err(|e| format!("cannot inspect helper containment: {e}"))?
-        .split('/')
-        .any(|component| component.trim_end() == "ai.openclaw.ocm.service");
-    #[cfg(not(target_os = "linux"))]
-    let in_service = false;
-
-    let mut command = if in_service {
-        // setsid cannot escape systemd KillMode=control-group. A transient user
-        // scope moves the helper out before exec, preserving its environment.
-        let mut scope = Command::new("systemd-run");
-        scope
-            .args(["--user", "--scope", "--quiet", "--collect"])
-            .arg(format!("--unit=ocm-self-update-{}", receipt.id))
-            .arg("--")
-            .arg(previous);
-        scope
-    } else {
-        Command::new(previous)
-    };
+    let mut command =
+        super::detached_worker::command(previous, &format!("ocm-self-update-{}", receipt.id))?;
     command
         .arg("__daemon")
         .arg("self-update")

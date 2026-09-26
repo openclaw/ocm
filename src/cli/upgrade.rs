@@ -1,3 +1,4 @@
+mod job;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
@@ -264,7 +265,7 @@ pub(crate) struct UpgradeSimulationBatchSummary {
     pub results: Vec<UpgradeSimulationSummary>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 struct UpgradeTarget {
     version: Option<String>,
     channel: Option<String>,
@@ -544,6 +545,9 @@ impl Cli {
     }
 
     pub(super) fn handle_upgrade_command(&self, args: Vec<String>) -> Result<i32, String> {
+        if args.first().map(String::as_str) == Some("job") {
+            return self.handle_upgrade_job(args[1..].to_vec());
+        }
         let (args, json_flag, profile) = self.consume_human_output_flags(args, "upgrade")?;
         if matches!(args.first().map(String::as_str), Some("batch")) {
             return self.handle_upgrade_batch(args[1..].to_vec(), json_flag, profile);
@@ -2424,6 +2428,7 @@ impl Cli {
     ) -> Result<UpgradeEnvSummary, String> {
         let _transaction_lock = lock_upgrade_transaction(name, &self.env, &self.cwd)?;
         let operation_lock = self.environment_service().lock_operation(name)?;
+        self.validate_upgrade_job_environment(name)?;
         self.upgrade_env_locked(name, target, options, &operation_lock)
     }
 

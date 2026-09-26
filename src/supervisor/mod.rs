@@ -96,7 +96,22 @@ pub struct SupervisorChildSpec {
     pub child_port: u32,
     pub stdout_path: String,
     pub stderr_path: String,
+    #[serde(deserialize_with = "deserialize_supervisor_child_env")]
     pub process_env: BTreeMap<String, String>,
+}
+
+fn deserialize_supervisor_child_env<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut env = BTreeMap::<String, String>::deserialize(deserializer)?;
+    // These fields are supplied by the spawning daemon, including when reading
+    // plans written by an older CLI; they do not describe desired Gateway state.
+    env.remove("OCM_SELF");
+    env.remove("OPENCLAW_OCM_UPDATE_PROTOCOL");
+    Ok(env)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -653,7 +668,9 @@ impl<'a> SupervisorService<'a> {
         ensure_store(self.env, self.cwd)?;
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;
-        let env_service = EnvironmentService::new(self.env, self.cwd);
+        let mut child_env = self.env.clone();
+        child_env.insert("OCM_HOME".into(), display_path(&ocm_home));
+        let env_service = EnvironmentService::new(&child_env, self.cwd);
         let mut envs = list_environments(self.env, self.cwd)?;
         envs.sort_by(|left, right| left.name.cmp(&right.name));
         let envs = env_service.apply_effective_gateway_ports(envs)?;
@@ -1322,6 +1339,15 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
             )
         })?;
     let mut process_env = spec.process_env.clone();
+    // Bind clients to the actual spawning daemon, not the CLI that last
+    // regenerated the desired spec (which must not restart a running Gateway).
+    #[cfg(unix)]
+    {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        process_env.insert("OCM_SELF".into(), display_path(&executable));
+        process_env.insert("OPENCLAW_OCM_UPDATE_PROTOCOL".into(), "1".into());
+    }
+
     process_env.insert(
         "TMPDIR".to_string(),
         display_path(&prepare_supervisor_child_tmpdir()?),
@@ -1336,6 +1362,15 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
         .env_clear()
         .envs(&process_env)
         .current_dir(Path::new(&spec.run_dir));
+    #[cfg(target_os = "linux")]
+    for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+        // Native user-service commands need the spawning daemon's session,
+        // not a caller's transient connection saved in the desired spec.
+        command.env_remove(key);
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
     #[cfg(unix)]
     {
         command.process_group(0);
@@ -2794,6 +2829,8 @@ fn build_supervised_openclaw_env(
     process_env: BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut process_env = stable_supervised_child_env(process_env);
+    process_env.remove("OCM_SELF");
+    process_env.remove("OPENCLAW_OCM_UPDATE_PROTOCOL");
     apply_external_supervision_hint(&mut process_env);
     process_env
 }

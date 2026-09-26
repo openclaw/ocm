@@ -307,3 +307,42 @@ fn source_inspection_rejects_non_regular_metadata_and_submodule_status() {
             .any(|issue| issue.as_str().unwrap().contains("submodules"))
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn source_report_survives_the_asynchronous_job_result() {
+    use std::time::{Duration, Instant};
+    let root = TestDir::new("source-job-result");
+    let (env, _) = fixture(&root);
+    let expected = inspect(&root, &env);
+    let accepted = run_ocm(root.path(), &env, &["upgrade", "job", "start", "demo"]);
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
+    let accepted: Value = serde_json::from_str(&stdout(&accepted)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "upgrade",
+                "job",
+                "status",
+                "demo",
+                "--request-id",
+                accepted["id"].as_str().unwrap(),
+            ],
+        );
+        assert!(status.status.success(), "{}", stderr(&status));
+        let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+        if status["state"] == "succeeded" {
+            assert_eq!(status["result"], expected);
+            break;
+        }
+        assert_eq!(status["state"], "running", "{status}");
+        assert!(
+            Instant::now() < deadline,
+            "source observation job did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}

@@ -576,6 +576,10 @@ pub fn upgrade_help(cmd: &str) -> String {
         "Upgrade environments",
         "Update OpenClaw for one environment or every environment with pre-upgrade snapshots and service rollback when needed.",
         vec![
+            format!(
+                "{cmd} upgrade job start <env> [--request-id <id>] [--version <version> | --channel <channel> | --runtime <runtime>] [--json]"
+            ),
+            format!("{cmd} upgrade job status <env> [--request-id <id>] [--json]"),
             format!("{cmd} upgrade history <env> [--raw] [--json]"),
             format!(
                 "{cmd} upgrade rollback <env> [--transaction <id>] [--dry-run] [--raw] [--json]"
@@ -662,6 +666,8 @@ pub fn upgrade_help(cmd: &str) -> String {
             format!("{cmd} upgrade --all"),
         ],
         &[
+            "On Unix, upgrade job start returns JSON after an independent OCM worker accepts the operation; status returns the latest job or one exact request id.",
+            "Jobs use the ordinary upgrade checks and rollback. An interrupted request is never replayed; after checking recovery state, an operator can explicitly start a fresh request.",
             "Simulations clone the source env, leave the real env untouched, and clean temporary envs and runtimes by default.",
             "Upgrade history lists completed transaction records newest first without reading config contents or credentials.",
             "Request shutdown of recorded ownership with dev stop <env> before upgrading or rolling back. Older watches without an unfinished ownership record require their original dev terminal; unreadable or unverified ownership requires verified operator recovery before mutation.",

@@ -210,6 +210,11 @@ ocm upgrade simulate mira --to beta --scenario all
 ocm upgrade simulate mira --to ./openclaw
 ```
 
+On Unix, `ocm upgrade job start mira --json` starts an independent OCM worker and returns its request ID before the upgrade runs.
+Use `ocm upgrade job status mira --request-id <id> --json` to reconnect to that exact request, or omit `--request-id` for the latest job.
+The worker uses the ordinary upgrade checks, checkpoint, service restoration, and rollback, and continues when the requesting terminal or managed Gateway exits.
+See [asynchronous upgrades](docs/USAGE.md#asynchronous-upgrades) for result and interruption behavior.
+
 Live upgrades and rollbacks require a completed foreground dev session. Request
 shutdown of recorded ownership with `ocm dev stop <env>`. Older watches without
 an unfinished ownership record must be stopped from their original dev terminal.
