@@ -853,6 +853,7 @@ if (args[0] === 'update' && args[1] === 'status') {
       commit: state.nextStatus.update.git.sha, version: '2026.9.3', buildId: 'new-source'
     }));
   }
+  if (state.historyDir) fs.chmodSync(state.historyDir, 0o555);
   fs.writeFileSync(path.join(process.env.OPENCLAW_STATE_DIR, 'source-witness'), 'native-result');
   if (state.gate) fs.writeFileSync(state.gate + '.written', 'done');
   console.log(JSON.stringify(state.result));
@@ -1618,6 +1619,45 @@ fn source_child_retains_registry_exclusion_after_parent_loss() {
     let bound = binding.wait_with_output().unwrap();
     assert!(bound.status.success(), "{}", stderr(&bound));
     assert!(root.child("gate.written").exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn history_write_failure_keeps_verified_source_update() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TestDir::new("source-history-failure");
+    let (env, mut state) = execution_fixture(&root, false);
+    let history_dir = root.child("ocm-home/upgrade-history");
+    fs::create_dir_all(&history_dir).unwrap();
+    state["historyDir"] = json!(path_string(&history_dir));
+    write_text(&root.child("native.json"), &state.to_string());
+    let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+    let mut permissions = fs::metadata(&history_dir).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&history_dir, permissions).unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["outcome"], "source-updated");
+    assert!(
+        value["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("upgrade history was not recorded"),
+        "{}",
+        value["note"]
+    );
+    assert!(
+        !value["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("recovery is unresolved"),
+        "{}",
+        value["note"]
+    );
+    assert_eq!(
+        fs::read_to_string(root.child("ocm-home/envs/demo/.openclaw/source-witness")).unwrap(),
+        "native-result"
+    );
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
