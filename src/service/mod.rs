@@ -141,7 +141,10 @@ impl<'a> ServiceService<'a> {
         }
     }
 
-    fn wait_for_runtime_mutation_quiescence_locked(&self, name: &str) -> Result<(), String> {
+    pub(crate) fn wait_for_runtime_mutation_quiescence_locked(
+        &self,
+        name: &str,
+    ) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let inspection =

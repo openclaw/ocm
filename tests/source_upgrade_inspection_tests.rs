@@ -129,10 +129,18 @@ fn source_upgrade_reports_built_identity_without_executing_or_mutating_source() 
         changed["source"]["head"],
         git(&repo, &["rev-parse", "HEAD"])
     );
-    let raw = run_ocm(root.path(), &env, &["upgrade", "demo", "--raw"]);
+    let raw = run_ocm(
+        root.path(),
+        &env,
+        &["upgrade", "demo", "--dry-run", "--raw"],
+    );
     assert!(raw.status.success(), "{}", stderr(&raw));
     assert!(stdout(&raw).contains("buildMatchesHead=false"));
-    let batch = run_ocm(root.path(), &env, &["upgrade", "--all", "--json"]);
+    let batch = run_ocm(
+        root.path(),
+        &env,
+        &["upgrade", "--all", "--dry-run", "--json"],
+    );
     let batch: Value = serde_json::from_str(&stdout(&batch)).unwrap();
     assert_eq!(batch["skipped"], 1);
     assert_eq!(batch["changed"], 0);
@@ -236,7 +244,11 @@ fn source_upgrade_recognizes_direct_node_but_does_not_infer_shell_wrappers() {
         assert!(output.status.success(), "{}", stderr(&output));
         let output = run_ocm(root.path(), &env, &["env", "set-launcher", "demo", name]);
         assert!(output.status.success(), "{}", stderr(&output));
-        let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+        let output = run_ocm(
+            root.path(),
+            &env,
+            &["upgrade", "demo", "--dry-run", "--json"],
+        );
         assert!(output.status.success(), "{}", stderr(&output));
         let result: Value = serde_json::from_str(&stdout(&output)).unwrap();
         assert_eq!(result.get("source").is_some(), recognized);
@@ -603,17 +615,34 @@ fn source_inspection_reports_staged_gitlink_removal_and_replacements() {
                 })
         );
         let normal = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
-        assert!(normal.status.success(), "{}", stderr(&normal));
-        assert_eq!(
-            serde_json::from_str::<Value>(&stdout(&normal)).unwrap(),
-            expected
-        );
         let batch = run_ocm(root.path(), &env, &["upgrade", "--all", "--json"]);
-        assert!(batch.status.success(), "{}", stderr(&batch));
-        let batch: Value = serde_json::from_str(&stdout(&batch)).unwrap();
-        assert_eq!(batch["results"][0], expected);
-        #[cfg(unix)]
-        assert_eq!(source_job_result(&root, &env), expected);
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(!normal.status.success());
+            assert!(stderr(&normal).contains("cannot update source"));
+            assert!(!batch.status.success());
+            let batch: Value = serde_json::from_str(&stdout(&batch)).unwrap();
+            assert_eq!(batch["failed"], 1);
+            assert_eq!(batch["results"][0]["outcome"], "failed");
+            assert!(batch["results"][0]["snapshotId"].is_null());
+        } else {
+            assert!(normal.status.success(), "{}", stderr(&normal));
+            assert_eq!(
+                serde_json::from_str::<Value>(&stdout(&normal)).unwrap(),
+                expected
+            );
+            assert!(batch.status.success(), "{}", stderr(&batch));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let job = source_job_refusal(&root, &env);
+            assert!(
+                job["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cannot update source")
+            );
+            assert!(job["result"].is_null());
+        }
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         let after_env = run_ocm(root.path(), &env, &["env", "show", "demo", "--json"]);
         assert_eq!(stdout(&before_env), stdout(&after_env));
@@ -635,17 +664,8 @@ fn source_inspection_reports_staged_gitlink_removal_and_replacements() {
     assert_eq!(inspect(&root, &env)["source"]["workingTreeClean"], true);
 }
 
-#[cfg(unix)]
-#[test]
-fn source_report_survives_the_asynchronous_job_result() {
-    let root = TestDir::new("source-job-result");
-    let (env, _) = fixture(&root);
-    let expected = inspect(&root, &env);
-    assert_eq!(source_job_result(&root, &env), expected);
-}
-
-#[cfg(unix)]
-fn source_job_result(root: &TestDir, env: &BTreeMap<String, String>) -> Value {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn source_job_refusal(root: &TestDir, env: &BTreeMap<String, String>) -> Value {
     use std::time::{Duration, Instant};
     let accepted = run_ocm(
         root.path(),
@@ -677,8 +697,8 @@ fn source_job_result(root: &TestDir, env: &BTreeMap<String, String>) -> Value {
         );
         assert!(status.status.success(), "{}", stderr(&status));
         let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
-        if status["state"] == "succeeded" {
-            return status["result"].clone();
+        if status["state"] == "failed" {
+            return status;
         }
         assert_eq!(status["state"], "running", "{status}");
         assert!(
@@ -687,4 +707,747 @@ fn source_job_result(root: &TestDir, env: &BTreeMap<String, String>) -> Value {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_report_survives_the_asynchronous_job_result() {
+    use std::time::{Duration, Instant};
+    let root = TestDir::new("source-job-result");
+    let (env, mut state) = execution_fixture(&root, false);
+    state["gate"] = json!(root.child("gate"));
+    write_text(&root.child("native.json"), &state.to_string());
+    for args in [
+        vec!["launcher", "add", "other", "--command", "echo other"],
+        vec!["env", "create", "other", "--launcher", "other"],
+    ] {
+        let output = run_ocm(root.path(), &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let accepted = run_ocm(root.path(), &env, &["upgrade", "job", "start", "demo"]);
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
+    let accepted: Value = serde_json::from_str(&stdout(&accepted)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !root.child("gate.started").exists() {
+        assert!(Instant::now() < deadline, "native child did not start");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let mut policy = Command::new(env!("CARGO_BIN_EXE_ocm"))
+        .current_dir(root.path())
+        .env_clear()
+        .envs(&env)
+        .args(["service", "stop", "other", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        policy.try_wait().unwrap().is_none(),
+        "service policy write bypassed source exclusion"
+    );
+    let read = run_ocm(root.path(), &env, &["env", "show", "other", "--json"]);
+    assert!(read.status.success(), "{}", stderr(&read));
+    // The native checkout may temporarily lack its entry/package during promotion.
+    // Accepted-job transport remains readable independently of current feasibility.
+    let entry = root.child("source/openclaw.mjs");
+    let package = root.child("source/package.json");
+    fs::rename(&entry, root.child("saved-entry")).unwrap();
+    fs::rename(&package, root.child("saved-package")).unwrap();
+    let capabilities = run_ocm(
+        root.path(),
+        &env,
+        &["upgrade", "job", "capabilities", "demo"],
+    );
+    assert!(capabilities.status.success(), "{}", stderr(&capabilities));
+    let capabilities: Value = serde_json::from_str(&stdout(&capabilities)).unwrap();
+    assert!(
+        capabilities["operations"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("packaged-upgrade"))
+    );
+    let mut observed_running = false;
+    loop {
+        let status = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "upgrade",
+                "job",
+                "status",
+                "demo",
+                "--request-id",
+                accepted["id"].as_str().unwrap(),
+            ],
+        );
+        assert!(status.status.success(), "{}", stderr(&status));
+        let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+        if status["state"] == "succeeded" {
+            assert!(observed_running);
+            assert_eq!(status["result"]["outcome"], "source-updated");
+            let current = run_ocm(
+                root.path(),
+                &env,
+                &["upgrade", "demo", "--dry-run", "--json"],
+            );
+            assert!(current.status.success(), "{}", stderr(&current));
+            let current: Value = serde_json::from_str(&stdout(&current)).unwrap();
+            assert_eq!(status["result"]["source"], current["source"]);
+            break;
+        }
+        assert_eq!(status["state"], "running", "{status}");
+        if !observed_running {
+            observed_running = true;
+            fs::rename(root.child("saved-entry"), &entry).unwrap();
+            fs::rename(root.child("saved-package"), &package).unwrap();
+            write_text(&root.child("gate.release"), "release");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "source observation job did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    while policy.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            policy.kill().unwrap();
+            panic!("service policy remained blocked after native exit");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let policy = policy.wait_with_output().unwrap();
+    assert!(policy.status.success(), "{}", stderr(&policy));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn execution_fixture(root: &TestDir, current: bool) -> (BTreeMap<String, String>, Value) {
+    let (mut env, _) = fixture(root);
+    let repo = root.child("source");
+    write_text(
+        &repo.join("openclaw.mjs"),
+        r#"
+import fs from 'node:fs';
+import path from 'node:path';
+import { setTimeout } from 'node:timers/promises';
+const file = process.env.OCM_TEST_SOURCE_STATE;
+const state = JSON.parse(fs.readFileSync(file));
+const args = process.argv.slice(2);
+fs.appendFileSync(file + '.calls', JSON.stringify({args, repair: process.env.OPENCLAW_SERVICE_REPAIR_POLICY,
+  supervisor: process.env.OPENCLAW_SUPERVISOR_MODE, cache: process.env.NODE_DISABLE_COMPILE_CACHE}) + '\n');
+if (args[0] === 'update' && args[1] === 'status') {
+  console.log(JSON.stringify(state.status));
+} else if (args[0] === 'update' && args.includes('--no-restart')) {
+  if (state.gate) {
+    fs.writeFileSync(state.gate + '.started', String(process.pid));
+    const deadline = Date.now() + 15000;
+    while (!fs.existsSync(state.gate + '.release') && Date.now() < deadline) await setTimeout(20);
+    if (!fs.existsSync(state.gate + '.release')) throw new Error('fixture gate expired');
+  }
+  if (state.nextStatus) {
+    fs.writeFileSync(file, JSON.stringify({...state, status: state.nextStatus}));
+    fs.writeFileSync(path.join(state.status.update.root, 'dist/build-info.json'), JSON.stringify({
+      commit: state.nextStatus.update.git.sha, version: '2026.9.3', buildId: 'new-source'
+    }));
+  }
+  fs.writeFileSync(path.join(process.env.OPENCLAW_STATE_DIR, 'source-witness'), 'native-result');
+  if (state.gate) fs.writeFileSync(state.gate + '.written', 'done');
+  console.log(JSON.stringify(state.result));
+  process.exitCode = state.exitCode ?? 0;
+} else if (args[0] === '--version') {
+  console.log('2026.9.3');
+} else {
+  throw new Error('unexpected native command: ' + args.join(' '));
+}
+"#,
+    );
+    git(&repo, &["add", "openclaw.mjs"]);
+    git(&repo, &["commit", "-m", "native command fixture"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let built = if current {
+        head.clone()
+    } else {
+        "b".repeat(40)
+    };
+    write_text(
+        &repo.join("dist/build-info.json"),
+        &json!({
+            "version":"2026.9.3", "commit":built, "buildId":"old-source"
+        })
+        .to_string(),
+    );
+    let command = format!("node {}", path_string(&repo.join("openclaw.mjs")));
+    for args in [
+        vec![
+            "launcher",
+            "add",
+            "built-source",
+            "--command",
+            command.as_str(),
+        ],
+        vec!["env", "set-launcher", "demo", "built-source"],
+    ] {
+        let output = run_ocm(root.path(), &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "unsupported".into());
+    env.insert(
+        "OCM_TEST_SOURCE_STATE".into(),
+        path_string(&root.child("native.json")),
+    );
+    let status = json!({
+        "channel":{"value":"dev"},
+        "update":{"root":repo,"installKind":"git","git":{
+            "sha":head,"builtSha":built,"upstreamSha":head,"branch":"main","fetchOk":true,"dirty":false,
+            "artifacts":{"ready":current,"version":"2026.9.3","buildId":"old-source"}
+        }}
+    });
+    let mut next = status.clone();
+    next["update"]["git"]["builtSha"] = json!(head);
+    next["update"]["git"]["artifacts"] =
+        json!({"ready":true,"version":"2026.9.3","buildId":"new-source"});
+    let state = json!({"status":status,"nextStatus":next,"result":{
+        "status":"ok","mode":"git","root":repo,
+        "before":{"sha":head,"version":"2026.9.3","buildId":"old-source"},
+        "after":{"sha":head,"version":"2026.9.3","buildId":"new-source"}
+    }});
+    write_text(&root.child("native.json"), &state.to_string());
+    write_text(
+        &root.child("ocm-home/envs/demo/.openclaw/source-witness"),
+        "original",
+    );
+    (env, state)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_current_and_legacy_native_support_leave_state_untouched() {
+    for supported in [true, false] {
+        let root = TestDir::new("source-current");
+        let (env, mut state) = execution_fixture(&root, true);
+        if !supported {
+            state["status"]["update"]["git"]
+                .as_object_mut()
+                .unwrap()
+                .remove("artifacts");
+            write_text(&root.child("native.json"), &state.to_string());
+        }
+        let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let value: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(
+            value["outcome"],
+            if supported {
+                "up-to-date"
+            } else {
+                "local-command"
+            }
+        );
+        assert!(value["snapshotId"].is_null());
+        assert_eq!(
+            fs::read_to_string(root.child("ocm-home/envs/demo/.openclaw/source-witness")).unwrap(),
+            "original"
+        );
+        let calls = fs::read_to_string(root.child("native.json.calls")).unwrap();
+        assert_eq!(calls.lines().count(), 1);
+        assert!(calls.contains("status"));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn stopped_source_upgrade_requires_a_confirmed_absent_managed_child() {
+    for observation in ["exiting", "missing", "stopped"] {
+        let root = TestDir::new("source-stopped-observation");
+        let (mut env, _) = execution_fixture(&root, true);
+        support::install_fake_service_manager(&root, &mut env);
+        support::enable_fake_daemon_gateway_admission(&root, &mut env);
+        let installed = run_ocm(root.path(), &env, &["service", "install", "demo", "--json"]);
+        assert!(installed.status.success(), "{}", stderr(&installed));
+        let runtime_path = ocm::store::supervisor_runtime_path(&env, root.path()).unwrap();
+        if observation == "missing" {
+            fs::remove_file(&runtime_path).unwrap();
+        } else if observation == "exiting" {
+            let mut runtime: Value =
+                serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+            runtime["children"] = json!([ocm::supervisor::SupervisorRuntimeChild {
+                env_name: "demo".to_string(),
+                binding_kind: "launcher".to_string(),
+                binding_name: "built-source".to_string(),
+                pid: std::process::id(),
+                launch_spec_sha256: None,
+                restart_count: 0,
+                child_port: 19445,
+                stdout_path: path_string(&root.child("child.out")),
+                stderr_path: path_string(&root.child("child.err")),
+            }]);
+            support::write_json_replacing_path(&runtime_path, &runtime);
+        }
+        let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+        if observation == "stopped" {
+            assert!(output.status.success(), "{}", stderr(&output));
+            assert_eq!(
+                serde_json::from_str::<Value>(&stdout(&output)).unwrap()["outcome"],
+                "up-to-date"
+            );
+        } else {
+            assert!(!output.status.success());
+            assert!(
+                stderr(&output).contains("cannot confirm the source Gateway is stopped"),
+                "{}",
+                stderr(&output)
+            );
+        }
+        let snapshots = run_ocm(
+            root.path(),
+            &env,
+            &["env", "snapshot", "list", "demo", "--json"],
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&snapshots)).unwrap(),
+            json!([])
+        );
+        let calls = fs::read_to_string(root.child("native.json.calls")).unwrap();
+        assert!(!calls.contains("--no-restart"));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_commands_resolve_relative_node_from_launcher_directory() {
+    let root = TestDir::new("source-relative-node");
+    let (env, _) = execution_fixture(&root, true);
+    let tools = root.child("tools");
+    support::write_executable_script(&tools.join("bin/node"), "#!/bin/sh\nexec node \"$@\"\n");
+    let command = format!(
+        "./bin/node {}",
+        path_string(&root.child("source/openclaw.mjs"))
+    );
+    for args in [
+        vec![
+            "launcher",
+            "add",
+            "relative-source",
+            "--command",
+            &command,
+            "--cwd",
+            tools.to_str().unwrap(),
+        ],
+        vec!["env", "set-launcher", "demo", "relative-source"],
+    ] {
+        let output = run_ocm(root.path(), &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let result: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(result["outcome"], "up-to-date");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn release_source_noop_requires_the_native_configured_target_fact() {
+    for scenario in [
+        "stable",
+        "beta",
+        "missing",
+        "older",
+        "mismatched-channel",
+        "extended-stable",
+    ] {
+        let root = TestDir::new("release-source-target");
+        let (env, mut state) = execution_fixture(&root, true);
+        let channel = if scenario == "beta" {
+            "beta"
+        } else if scenario == "extended-stable" {
+            "extended-stable"
+        } else {
+            "stable"
+        };
+        state["status"]["channel"] = json!({"value":channel,"config":channel});
+        state["status"]["update"]["git"]["fetchOk"] = json!(false);
+        let head = state["status"]["update"]["git"]["sha"].clone();
+        state["status"]["update"]["git"]["preferredTarget"] =
+            json!({"channel":channel,"tag":"v2026.9.3","sha":head});
+        match scenario {
+            "missing" => {
+                state["status"]["update"]["git"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("preferredTarget");
+            }
+            "older" => {
+                state["status"]["update"]["git"]["preferredTarget"]["sha"] = json!("a".repeat(40));
+            }
+            "mismatched-channel" => {
+                state["status"]["channel"]["config"] = json!("beta");
+            }
+            _ => {}
+        }
+        write_text(&root.child("native.json"), &state.to_string());
+        let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+        assert!(output.status.success(), "{scenario}: {}", stderr(&output));
+        let result: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(
+            result["outcome"],
+            if matches!(scenario, "stable" | "beta") {
+                "up-to-date"
+            } else {
+                "source-updated"
+            },
+            "{scenario}"
+        );
+        if matches!(scenario, "stable" | "beta") {
+            assert!(result["snapshotId"].is_null());
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn native_unfinished_updates_refuse_before_checkpoint_or_service_changes() {
+    for field in [
+        "activeRun",
+        "staleRun",
+        "abandonedRun",
+        "runStatusError",
+        "runReconciliationError",
+        "lastRun",
+    ] {
+        let root = TestDir::new("source-native-run");
+        let (env, mut state) = execution_fixture(&root, true);
+        state["status"][field] = json!({"status":"failed","runId":"native-fixture"});
+        write_text(&root.child("native.json"), &state.to_string());
+        let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+        assert_eq!(
+            output.status.success(),
+            field == "lastRun",
+            "{field}: {}",
+            stderr(&output)
+        );
+        if field != "lastRun" {
+            assert!(stderr(&output).contains("native update activity or recovery is unresolved"));
+        }
+        let snapshots = run_ocm(
+            root.path(),
+            &env,
+            &["env", "snapshot", "list", "demo", "--json"],
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&snapshots)).unwrap(),
+            json!([])
+        );
+        assert_eq!(
+            fs::read_to_string(root.child("native.json.calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_batch_update_preserves_binding_and_records_non_rollbackable_success() {
+    let root = TestDir::new("source-update");
+    let (env, _) = execution_fixture(&root, false);
+    let output = run_ocm(root.path(), &env, &["upgrade", "--all", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let batch: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(batch["changed"], 1);
+    assert_eq!(batch["failed"], 0);
+    let value = &batch["results"][0];
+    assert_eq!(value["outcome"], "source-updated");
+    assert_eq!(value["bindingKind"], "launcher");
+    assert_eq!(value["bindingName"], "built-source");
+    assert!(value["serviceAction"].is_null());
+    assert!(value["snapshotId"].is_string());
+    let shown = run_ocm(root.path(), &env, &["env", "show", "demo", "--json"]);
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["defaultLauncher"], "built-source");
+    assert!(shown["defaultRuntime"].is_null());
+    let calls: Vec<Value> = fs::read_to_string(root.child("native.json.calls"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(calls.iter().all(|call| call["repair"] == "external"
+        && call["cache"] == "1"
+        && call["supervisor"].is_null()));
+    let history = run_ocm(root.path(), &env, &["upgrade", "history", "demo", "--json"]);
+    let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
+    assert_eq!(history[0]["outcome"], "source-updated");
+    let rollback = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "upgrade",
+            "rollback",
+            "demo",
+            "--transaction",
+            history[0]["id"].as_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(!rollback.status.success());
+    assert!(
+        stderr(&rollback).contains("source-updated"),
+        "{}",
+        stderr(&rollback)
+    );
+    assert_eq!(
+        fs::read_to_string(root.child("ocm-home/envs/demo/.openclaw/source-witness")).unwrap(),
+        "native-result"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_failure_does_not_restore_old_state_over_unverified_source() {
+    let root = TestDir::new("source-uncertain-recovery");
+    let (env, mut state) = execution_fixture(&root, false);
+    state["exitCode"] = json!(1);
+    state["result"]["status"] = json!("error");
+    state["result"]["reason"] = json!("fixture native failure");
+    state["result"]["pluginData"] = json!({"token":"private-fixture-value"});
+    state["result"]["recovery"] =
+        json!({"serviceRestartSafe":false,"reason":"state-migration-started"});
+    write_text(&root.child("native.json"), &state.to_string());
+    let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["outcome"], "failed");
+    assert!(
+        value["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("recovery is unresolved")
+    );
+    assert!(
+        value["note"]
+            .as_str()
+            .unwrap()
+            .contains("fixture native failure")
+    );
+    assert!(!stdout(&output).contains("private-fixture-value"));
+    assert!(value["snapshotId"].is_string());
+    assert_eq!(
+        fs::read_to_string(root.child("ocm-home/envs/demo/.openclaw/source-witness")).unwrap(),
+        "native-result"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn native_refusal_is_not_source_success_even_with_current_artifacts() {
+    let root = TestDir::new("source-native-refusal");
+    let (env, mut state) = execution_fixture(&root, true);
+    state["status"]["update"]["git"]["fetchOk"] = json!(false);
+    state.as_object_mut().unwrap().remove("nextStatus");
+    state["result"]["status"] = json!("skipped");
+    state["result"]["reason"] = json!("no-upstream");
+    state["result"]["after"] = state["result"]["before"].clone();
+    state["result"]["recovery"] =
+        json!({"serviceRestartSafe":true,"version":"2026.9.3","buildId":"old-source"});
+    write_text(&root.child("native.json"), &state.to_string());
+    let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+    assert!(!output.status.success());
+    let result: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(result["outcome"], "failed");
+    assert!(result["note"].as_str().unwrap().contains("no-upstream"));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_admission_refuses_dirty_shared_and_unreadable_bindings_before_execution() {
+    for scenario in [
+        "dirty",
+        "shared",
+        "shared-quoted",
+        "unreadable",
+        "assume-unchanged",
+        "skip-worktree",
+        "staged-gitlink",
+    ] {
+        let root = TestDir::new("source-admission");
+        let (env, _) = execution_fixture(&root, false);
+        if scenario == "dirty" {
+            write_text(&root.child("source/operator-notes.txt"), "preserve");
+        } else if scenario == "staged-gitlink" {
+            let repo = root.child("source");
+            let head = git(&repo, &["rev-parse", "HEAD"]);
+            git(
+                &repo,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{head},nested"),
+                ],
+            );
+            git(&repo, &["commit", "-m", "record gitlink"]);
+            git(&repo, &["update-index", "--force-remove", "nested"]);
+        } else if matches!(scenario, "assume-unchanged" | "skip-worktree") {
+            git(
+                &root.child("source"),
+                &["update-index", &format!("--{scenario}"), "openclaw.mjs"],
+            );
+            let entry = root.child("source/openclaw.mjs");
+            let mut contents = fs::read_to_string(&entry).unwrap();
+            contents.push_str("\n// operator change hidden from ordinary Git status\n");
+            write_text(&entry, &contents);
+            assert!(git(&root.child("source"), &["status", "--porcelain"]).is_empty());
+        } else {
+            let peer_launcher = if scenario == "shared-quoted" {
+                let alias = root.child("Source #1 & Data");
+                std::os::unix::fs::symlink(root.child("source"), &alias).unwrap();
+                let command = format!("node \"{}\"", alias.join("openclaw.mjs").display());
+                let added = run_ocm(
+                    root.path(),
+                    &env,
+                    &["launcher", "add", "quoted-peer", "--command", &command],
+                );
+                assert!(added.status.success(), "{}", stderr(&added));
+                "quoted-peer"
+            } else {
+                "built-source"
+            };
+            let created = run_ocm(
+                root.path(),
+                &env,
+                &["env", "create", "other", "--launcher", peer_launcher],
+            );
+            assert!(created.status.success(), "{}", stderr(&created));
+            if scenario == "unreadable" {
+                let added = run_ocm(
+                    root.path(),
+                    &env,
+                    &["launcher", "add", "missing", "--command", "echo other"],
+                );
+                assert!(added.status.success(), "{}", stderr(&added));
+                let bound = run_ocm(
+                    root.path(),
+                    &env,
+                    &["env", "set-launcher", "other", "missing"],
+                );
+                assert!(bound.status.success(), "{}", stderr(&bound));
+                fs::remove_file(
+                    ocm::store::launcher_meta_path("missing", &env, root.path()).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+        assert!(!output.status.success(), "{scenario}: {}", stdout(&output));
+        assert!(
+            !root.child("native.json.calls").exists(),
+            "{scenario}: native command executed"
+        );
+        let snapshots = run_ocm(
+            root.path(),
+            &env,
+            &["env", "snapshot", "list", "demo", "--json"],
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&snapshots)).unwrap(),
+            json!([])
+        );
+        let capabilities = run_ocm(
+            root.path(),
+            &env,
+            &["upgrade", "job", "capabilities", "demo"],
+        );
+        assert!(
+            capabilities.status.success(),
+            "{scenario}: {}",
+            stderr(&capabilities)
+        );
+        let capabilities: Value = serde_json::from_str(&stdout(&capabilities)).unwrap();
+        assert!(
+            capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("packaged-upgrade"))
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_child_retains_registry_exclusion_after_parent_loss() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+    struct Group(u32);
+    impl Drop for Group {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-(self.0 as i32), libc::SIGKILL);
+            }
+        }
+    }
+    let root = TestDir::new("source-registry-custody");
+    let (env, mut state) = execution_fixture(&root, false);
+    state["gate"] = json!(root.child("gate"));
+    write_text(&root.child("native.json"), &state.to_string());
+    for args in [
+        vec!["launcher", "add", "other", "--command", "echo other"],
+        vec!["env", "create", "other", "--launcher", "other"],
+    ] {
+        let output = run_ocm(root.path(), &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let mut update = Command::new(env!("CARGO_BIN_EXE_ocm"))
+        .current_dir(root.path())
+        .env_clear()
+        .envs(&env)
+        .args(["upgrade", "demo", "--json"])
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(root.child("update.out")).unwrap())
+        .stderr(fs::File::create(root.child("update.err")).unwrap())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let _group = Group(update.id());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !root.child("gate.started").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "native child did not start: {:?}",
+            fs::read_to_string(root.child("update.err"))
+        );
+        sleep(Duration::from_millis(25));
+    }
+    update.kill().unwrap();
+    update.wait().unwrap();
+    let mut binding = Command::new(env!("CARGO_BIN_EXE_ocm"))
+        .current_dir(root.path())
+        .env_clear()
+        .envs(&env)
+        .args(["env", "set-launcher", "other", "built-source"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    sleep(Duration::from_millis(200));
+    assert!(
+        binding.try_wait().unwrap().is_none(),
+        "new source consumer was published while native could mutate it"
+    );
+    let read = run_ocm(root.path(), &env, &["env", "show", "other", "--json"]);
+    assert!(read.status.success(), "{}", stderr(&read));
+    write_text(&root.child("gate.release"), "release");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while binding.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            binding.kill().unwrap();
+            panic!("binding remained blocked after native exit");
+        }
+        sleep(Duration::from_millis(25));
+    }
+    let bound = binding.wait_with_output().unwrap();
+    assert!(bound.status.success(), "{}", stderr(&bound));
+    assert!(root.child("gate.written").exists());
 }

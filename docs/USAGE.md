@@ -496,13 +496,31 @@ the resolved target even when preparation fails or the upgrade rolls back.
 The version includes a named runtime's detected version; the channel remains
 `null` when the selected runtime's channel is unknown.
 
-Source launchers still return `local-command`; OCM does not yet upgrade their checkout in place.
-For an ordinary `pnpm openclaw` source launcher or `node <checkout>/openclaw.mjs`, the existing upgrade command also reports source observations without executing the launcher.
+On Linux and macOS, a no-target upgrade can update a recognized `pnpm openclaw` or `node <checkout>/openclaw.mjs` checkout in place while keeping its launcher binding.
 On Unix, literal single- or double-quoted paths can contain spaces, including aliases to a source checkout.
 Quoted characters such as `#` and `&` are recognized as path data, and single quotes also preserve literal `$` and backtick characters.
 Backslashes outside single quotes, active substitutions, and unquoted shell operators remain opaque.
 Recognizing literal words for inspection does not change how launcher commands execute.
-This applies to normal, `--dry-run`, and `--all` output when no explicit runtime or release target is supplied.
+This requires native source artifact observations from `openclaw update status --json`; older checkouts without that observation remain `local-command`, with support reported as unknown.
+OCM refuses dirty or unverified checkout status, known shared users, and active or unresolved foreground source ownership before source mutation.
+Source execution also refuses assume-unchanged or skip-worktree index entries, which can hide modified tracked files from ordinary Git status.
+Native update activity or unresolved run status must also be settled before OCM captures a checkpoint or changes the service.
+A no-op requires a current target and verified native artifacts; a running service also requires matching Gateway readiness, build identity, and applied launch settings.
+This leaves configuration and service untouched.
+Development source requires a freshly checked `main` upstream; configured stable or beta source requires the native `preferredTarget` observation, including its channel and commit.
+Missing target observations remain unknown and cannot establish this shortcut.
+Otherwise, OCM captures an environment checkpoint, stops its managed service, and invokes the public native `update --no-restart` command with external service repair policy.
+Native OpenClaw owns source selection, staging, builds, Doctor, and source recovery; OCM restores its prior service policy only after verification.
+Binding changes, service-policy writes, and new foreground source admission wait while the native source operation holds registry exclusion; environment and job-status reads remain available.
+Source preparation also refuses while an overlapping source environment is completing an operation, including service activation and recovery.
+Successful source execution records `source-updated`, which cannot be selected by `upgrade rollback`, including in older OCM readers.
+The checkpoint contains environment state, not the previous source bytes, so OCM never replays it over an unverified source runtime.
+When native recovery cannot prove compatible software and state, the report retains the checkpoint and identifies unresolved recovery or service shutdown instead of claiming restoration.
+Inspect the native recovery report before restarting through OCM.
+After forcibly terminating the native updater, inspect its run and process state before changing source bindings or restarting the checkout.
+Source execution rejects `--no-rollback` because that flag cannot disable native recovery; explicit runtime, version, and channel conversions retain their existing behavior.
+Job capabilities describe the recognized source command route without executing OpenClaw or testing current eligibility, so status remains readable throughout an update and recovery.
+Source `--dry-run` remains local inspection without executing OpenClaw or probing remote update support.
 JSON includes `source` only for recognized source launchers, with the canonical `root`, Git `head`, `builtCommit` and `builtVersion` from `dist/build-info.json`, and nullable `buildMatchesHead` and `workingTreeClean` observations.
 A different built commit reveals source that has moved without a matching build; a matching commit alone does not prove a complete build, healthy dependencies, or the identity of a running Gateway.
 Missing or invalid metadata remains unknown and is explained in `issues`.
@@ -620,7 +638,7 @@ same plugin isolation applies to upgrade simulation clones.
 
 ### Asynchronous upgrades
 
-On Unix, an explicit operator request can run the ordinary packaged upgrade in a detached OCM worker.
+On Unix, an explicit operator request can run the ordinary environment upgrade in a detached OCM worker.
 No extra permanent service is installed.
 
 A job returns `up-to-date` without a checkpoint or restart when the requested package and binding are already current, package integrity and native configuration checks pass, and any running managed Gateway reports the same healthy build and the daemon confirms its actual launch specification matches the current desired settings.
@@ -628,7 +646,7 @@ Unknown build or launch identity, configuration needing repair, changed launch s
 Older daemons without launch observations keep that existing behavior.
 When an upgrade resolves an official release, older runtime records without archive integrity use the normal checkpointed install path to establish it.
 Ordinary setup and repeat installation can still reuse a healthy matching legacy runtime, including one already bound to another environment.
-Explicit target or track changes still run the upgrade, and direct `ocm upgrade` commands retain their repair and finalization behavior.
+Explicit target or track changes still run the upgrade, and direct managed-runtime `ocm upgrade` commands retain their repair and finalization behavior.
 
 ```bash
 ocm upgrade job start mira --json

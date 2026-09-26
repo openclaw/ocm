@@ -892,7 +892,7 @@ fn upgrade_simulation_batch_raw(summary: &UpgradeSimulationBatchSummary) -> Vec<
 
 fn outcome_tone(outcome: &str) -> Tone {
     match outcome {
-        "updated" | "switched" => Tone::Success,
+        "updated" | "source-updated" | "switched" => Tone::Success,
         "would-update" | "would-switch" => Tone::Accent,
         "up-to-date" => Tone::Accent,
         "pinned" | "local-command" | "manual-runtime" => Tone::Warning,

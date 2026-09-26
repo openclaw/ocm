@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,7 +13,6 @@ use crate::infra::archive::{
     ArchivedEnvMeta, EnvArchiveMetadata, extract_env_archive, write_env_archive_with_options,
 };
 use crate::openclaw_repo::remove_openclaw_worktree;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
@@ -96,17 +95,8 @@ fn write_env_registry(
     write_json(&path, &registry)
 }
 
-pub(crate) struct EnvRegistryLock {
-    file: File,
-}
-
+pub(crate) type EnvRegistryLock = super::common::ExclusiveFileLock;
 pub(crate) type EnvironmentOperationLock = super::common::ExclusiveFileLock;
-
-impl Drop for EnvRegistryLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
-}
 
 pub(super) fn environment_operation_lock_path(
     name: &str,
@@ -134,7 +124,7 @@ pub(crate) fn lock_environment_operation(
     )
 }
 
-pub(super) fn try_lock_environment_operation(
+pub(crate) fn try_lock_environment_operation(
     name: &str,
     env: &BTreeMap<String, String>,
     cwd: &Path,
@@ -152,30 +142,10 @@ pub(crate) fn lock_env_registry(
     // Keep load/allocate/write under one cross-process lock. Locking only the
     // final rename loses concurrent entries and can assign duplicate ports.
     let registry_path = env_registry_path(env, cwd)?;
-    let parent = registry_path
-        .parent()
-        .ok_or_else(|| "environment registry has no parent directory".to_string())?;
-    ensure_dir(parent)?;
-    let lock_path = registry_path.with_extension("lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| {
-            format!(
-                "failed to open environment registry lock {}: {error}",
-                display_path(&lock_path)
-            )
-        })?;
-    file.lock_exclusive().map_err(|error| {
-        format!(
-            "failed to lock environment registry {}: {error}",
-            display_path(&lock_path)
-        )
-    })?;
-    Ok(EnvRegistryLock { file })
+    super::lock_file(
+        &registry_path.with_extension("lock"),
+        "environment registry",
+    )
 }
 
 fn normalize_environment(mut meta: EnvMeta) -> Result<EnvMeta, String> {

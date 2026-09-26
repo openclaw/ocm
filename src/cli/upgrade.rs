@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 mod diagnostics;
 pub(super) mod source;
+mod source_update;
 use diagnostics::{CandidateFailure, CandidateFailureKind};
 
 use super::{Cli, render};
@@ -3449,8 +3450,20 @@ impl Cli {
         operation_lock: &EnvironmentOperationLock,
     ) -> Result<UpgradeEnvSummary, String> {
         if !target.is_explicit() {
+            let source = self.inspect_launcher_source(env_name, launcher_name)?;
+            if let Some(source) = source.as_ref()
+                && source.head.is_some()
+            {
+                return self.upgrade_source_checkout(
+                    env_name,
+                    launcher_name,
+                    source.clone(),
+                    options,
+                    operation_lock,
+                );
+            }
             return Ok(UpgradeEnvSummary {
-                source: self.inspect_launcher_source(env_name, launcher_name)?,
+                source,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "launcher".to_string(),
                 previous_binding_name: launcher_name.to_string(),
@@ -3810,25 +3823,12 @@ impl Cli {
             {
                 return None;
             }
-        } else {
-            // A child may still be exiting after an operator stop, and a running
-            // daemon without observations cannot establish that it has stopped.
-            let observed = self.supervisor_service().live_runtime_state().ok()?;
-            if observed.is_none() && self.supervisor_service().daemon_status().ok()?.running {
-                return None;
-            }
-            if observed.is_some_and(|observed| {
-                observed
-                    .children
-                    .iter()
-                    .any(|child| child.env_name == env_name)
-                    || observed
-                        .services
-                        .iter()
-                        .any(|entry| entry.env_name == env_name && entry.pid.is_some())
-            }) {
-                return None;
-            }
+        } else if !self
+            .supervisor_service()
+            .stopped_launch_observed(env_name)
+            .ok()?
+        {
+            return None;
         }
         Some(UpgradeEnvSummary {
             source: None,
@@ -4312,9 +4312,9 @@ impl Cli {
                 let launcher = self.launcher_service().show(launcher_name)?;
                 // Read the current artifact only; identity verification must not inspect Git
                 // or rebuild source, and does not establish historical source recovery.
-                source::launcher_source_root(&launcher)
+                crate::launcher::launcher_source_root(&launcher)
                     .and_then(|root| {
-                        source::read_source_json(&root, "dist/build-info.json", 65536).ok()
+                        crate::launcher::read_source_json(&root, "dist/build-info.json", 65536).ok()
                     })
                     .and_then(|info| openclaw_build_id(&info))
             } else {
@@ -6334,7 +6334,7 @@ fn sort_batch_results(results: &mut [UpgradeEnvSummary], env_names: &[String]) {
 fn is_changed_upgrade_outcome(outcome: &str) -> bool {
     matches!(
         outcome,
-        "updated" | "switched" | "would-update" | "would-switch"
+        "updated" | "source-updated" | "switched" | "would-update" | "would-switch"
     )
 }
 

@@ -155,3 +155,5 @@ pub fn summarize_env(meta: &EnvMeta) -> EnvSummary {
         last_used_at: meta.last_used_at,
     }
 }
+
+pub(crate) use envs::try_lock_environment_operation;
