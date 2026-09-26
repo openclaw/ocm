@@ -627,7 +627,8 @@ On Unix, supervised Gateways receive `OPENCLAW_OCM_UPDATE_PROTOCOL=1` alongside 
 Clients must use their trusted OCM executable and environment binding, and preserve their own requester authorization before submitting an operation.
 Latest status returns `null` when that environment has no job; an unknown exact request ID is an error.
 `start --request-id <id>` lets a caller choose a correlation ID before submission; repeating the same ID and target returns that existing job without replaying it.
-Reusing an ID for a different target is refused.
+Reusing an ID for a different target or a recreated environment is refused.
+Latest status excludes jobs from an older environment instance; an exact ID still retrieves its original historical result.
 `start` accepts the same mutually exclusive `--version`, `--channel`, or `--runtime` selectors as a single-environment upgrade, with rollback enabled.
 It returns only after the worker accepts the request, and the worker starts upgrade work after the response is written.
 Existing environment and upgrade transaction locks still exclude conflicting mutations.

@@ -190,6 +190,54 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
     );
     let shown = command(&root, &env, &["env", "show", "demo", "--json"]);
     assert_eq!(shown["defaultRuntime"], "new");
+    let removed = run_ocm(root.path(), &env, &["env", "destroy", "demo", "--yes"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    let recreated = run_ocm(
+        root.path(),
+        &env,
+        &["env", "create", "demo", "--runtime", "old"],
+    );
+    assert!(recreated.status.success(), "{}", stderr(&recreated));
+    let before = ["old", "new"]
+        .map(|name| fs::read(root.child(format!("{name}-calls"))).unwrap_or_default());
+    let replay = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "upgrade",
+            "job",
+            "start",
+            "demo",
+            "--runtime",
+            "new",
+            "--request-id",
+            id,
+        ],
+    );
+    assert!(!replay.status.success());
+    assert!(
+        stderr(&replay).contains("different environment instance"),
+        "{}",
+        stderr(&replay)
+    );
+    assert!(command(&root, &env, &["upgrade", "job", "status", "demo"]).is_null());
+    assert_eq!(
+        command(
+            &root,
+            &env,
+            &["upgrade", "job", "status", "demo", "--request-id", id]
+        ),
+        result
+    );
+    assert_eq!(
+        command(&root, &env, &["env", "show", "demo", "--json"])["defaultRuntime"],
+        "old"
+    );
+    assert_eq!(
+        before,
+        ["old", "new"]
+            .map(|name| fs::read(root.child(format!("{name}-calls"))).unwrap_or_default())
+    );
 }
 
 #[test]

@@ -76,6 +76,14 @@ struct StoredJob {
     environment_created_at: OffsetDateTime,
 }
 
+impl StoredJob {
+    fn matches_environment(&self, environment: &crate::env::EnvMeta) -> bool {
+        self.job.env_name == environment.name
+            && self.environment_root == environment.root
+            && self.environment_created_at == environment.created_at
+    }
+}
+
 fn advance(job: &mut Job, progress: &str) {
     job.progress = progress.into();
     job.revision += 1;
@@ -197,13 +205,21 @@ impl Cli {
                 let id = match id {
                     Some(id) => id,
                     None => {
-                        self.environment_service().get(name)?;
+                        let environment = self.environment_service().get(name)?;
                         let latest = self.upgrade_jobs_dir(name)?.join("latest");
                         if !latest.try_exists().map_err(|error| error.to_string())? {
                             self.print_json(&Option::<Job>::None)?;
                             return Ok(0);
                         }
-                        read_json(&latest)?
+                        let id: String = read_json(&latest)?;
+                        if !self
+                            .read_upgrade_job(name, &id)?
+                            .matches_environment(&environment)
+                        {
+                            self.print_json(&Option::<Job>::None)?;
+                            return Ok(0);
+                        }
+                        id
                     }
                 };
                 self.print_json(&self.observe_upgrade_job(name, &id)?)?;
@@ -243,6 +259,11 @@ impl Cli {
                 .map_err(|error| error.to_string())?
         {
             let previous = self.read_upgrade_job(name, id)?;
+            if !previous.matches_environment(&environment) {
+                return Err(
+                    "upgrade request id belongs to a different environment instance".into(),
+                );
+            }
             if previous.job.target != target {
                 return Err("upgrade request id already belongs to a different target".into());
             }
@@ -424,10 +445,7 @@ impl Cli {
         };
         let record = self.read_upgrade_job(&job_env, &id)?;
         let current = self.environment_service().get(name)?;
-        if current.name != job_env
-            || current.root != record.environment_root
-            || current.created_at != record.environment_created_at
-        {
+        if !record.matches_environment(&current) {
             return Err(
                 "environment was replaced after upgrade job admission; no upgrade was started"
                     .into(),
