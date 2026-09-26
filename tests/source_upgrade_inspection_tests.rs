@@ -1675,3 +1675,63 @@ fn source_update_refuses_environment_inside_external_git_dir() {
         "native updater ran despite Git directory overlap"
     );
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_spawn_failure_does_not_record_native_execution() {
+    let root = TestDir::new("source-spawn-failure");
+    let (env, _) = execution_fixture(&root, false);
+    let tools = root.child("tools");
+    fs::create_dir_all(&tools).unwrap();
+    let node = tools.join("node");
+    write_text(
+        &node,
+        "#!/bin/sh\nif [ -f \"$OCM_TEST_SOURCE_STATE.use-real-node\" ]; then\n  exec /usr/bin/env node \"$@\"\nfi\ntouch \"$OCM_TEST_SOURCE_STATE.use-real-node\"\nmv \"$0\" \"$0.real\"\nmkdir \"$0\"\nexec \"$0.real\" \"$@\"\n",
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&node).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&node, permissions).unwrap();
+    }
+    let command = format!(
+        "{} {}",
+        path_string(&node),
+        path_string(&root.child("source/openclaw.mjs"))
+    );
+    for args in [
+        vec![
+            "launcher",
+            "add",
+            "vanishing-node",
+            "--command",
+            command.as_str(),
+        ],
+        vec!["env", "set-launcher", "demo", "vanishing-node"],
+    ] {
+        let output = run_ocm(root.path(), &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+    assert!(
+        !output.status.success(),
+        "status={} stdout={} stderr={}",
+        output.status,
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("source OpenClaw command failed"),
+        "{}",
+        stdout(&output)
+    );
+    let calls = fs::read_to_string(root.child("native.json.calls")).unwrap_or_default();
+    assert!(calls.contains("status"), "{calls}");
+    assert!(!calls.contains("--no-restart"), "{calls}");
+    let history = run_ocm(root.path(), &env, &["upgrade", "history", "demo", "--json"]);
+    assert!(history.status.success(), "{}", stderr(&history));
+    let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
+    assert_eq!(history[0]["migration"]["status"], "not-run");
+    assert_eq!(history[0]["finalization"]["status"], "not-run");
+}
