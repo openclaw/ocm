@@ -157,7 +157,7 @@ impl Cli {
     }
 }
 
-fn launcher_source_root(launcher: &LauncherMeta) -> Option<PathBuf> {
+pub(super) fn launcher_source_root(launcher: &LauncherMeta) -> Option<PathBuf> {
     let cwd = launcher.cwd.as_deref().map(Path::new);
     let words = parse_literal_launcher_command(&launcher.command)?;
     let (program, args) = words.split_first()?;
@@ -294,7 +294,7 @@ fn full_commit(value: &str) -> Option<String> {
         .then(|| value.to_ascii_lowercase())
 }
 
-fn read_source_json(root: &Path, relative: &str, limit: u64) -> Result<Value, String> {
+pub(super) fn read_source_json(root: &Path, relative: &str, limit: u64) -> Result<Value, String> {
     let path = fs::canonicalize(root.join(relative))
         .map_err(|_| format!("{relative} is missing or unreadable"))?;
     if !path.starts_with(root) {
