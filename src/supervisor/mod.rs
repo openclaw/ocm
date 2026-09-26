@@ -119,8 +119,8 @@ where
     D: serde::Deserializer<'de>,
 {
     let mut env = BTreeMap::<String, String>::deserialize(deserializer)?;
-    // These fields are supplied by the spawning daemon, including when reading
-    // plans written by an older CLI; they do not describe desired Gateway state.
+    // The executable is supplied by the spawning daemon; the retired capability
+    // advertisement must not survive plans written by an older CLI.
     env.remove("OCM_SELF");
     env.remove("OPENCLAW_OCM_UPDATE_PROTOCOL");
     Ok(env)
@@ -1423,7 +1423,6 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
     {
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         process_env.insert("OCM_SELF".into(), display_path(&executable));
-        process_env.insert("OPENCLAW_OCM_UPDATE_PROTOCOL".into(), "1".into());
     }
 
     process_env.insert(
