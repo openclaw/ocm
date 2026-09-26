@@ -212,10 +212,13 @@ impl Cli {
                             return Ok(0);
                         }
                         let id: String = read_json(&latest)?;
-                        if !self
-                            .read_upgrade_job(name, &id)?
-                            .matches_environment(&environment)
-                        {
+                        let record = self.read_upgrade_job(name, &id)?;
+                        if !record.matches_environment(&environment) {
+                            if !record.job.state.completed() {
+                                return Err(format!(
+                                    "prior environment instance has unresolved upgrade job {id}; inspect `ocm upgrade job status {name} --request-id {id}` before further changes"
+                                ));
+                            }
                             self.print_json(&Option::<Job>::None)?;
                             return Ok(0);
                         }

@@ -277,6 +277,26 @@ fn lost_worker_reports_unresolved_interruption_without_replay() {
     assert!(stderr(&retry).contains("Interrupted"), "{}", stderr(&retry));
     let history = command(&root, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(history.as_array().unwrap().is_empty());
+    let removed = run_ocm(root.path(), &env, &["env", "destroy", "demo", "--yes"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    let recreated = run_ocm(
+        root.path(),
+        &env,
+        &["env", "create", "demo", "--runtime", "old"],
+    );
+    assert!(recreated.status.success(), "{}", stderr(&recreated));
+    let latest = run_ocm(root.path(), &env, &["upgrade", "job", "status", "demo"]);
+    assert!(!latest.status.success());
+    assert!(stderr(&latest).contains("prior environment instance has unresolved upgrade job"));
+    assert!(stderr(&latest).contains(id));
+    assert_eq!(
+        command(
+            &root,
+            &env,
+            &["upgrade", "job", "status", "demo", "--request-id", id]
+        ),
+        status
+    );
 }
 
 #[test]

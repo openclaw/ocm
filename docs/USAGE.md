@@ -628,7 +628,8 @@ Clients must use their trusted OCM executable and environment binding, and prese
 Latest status returns `null` when that environment has no job; an unknown exact request ID is an error.
 `start --request-id <id>` lets a caller choose a correlation ID before submission; repeating the same ID and target returns that existing job without replaying it.
 Reusing an ID for a different target or a recreated environment is refused.
-Latest status excludes jobs from an older environment instance; an exact ID still retrieves its original historical result.
+Latest status excludes completed jobs from an older environment instance; an exact ID still retrieves its original historical result.
+An unresolved prior-instance job still blocks new jobs, and latest status reports that blocker with its exact request ID.
 `start` accepts the same mutually exclusive `--version`, `--channel`, or `--runtime` selectors as a single-environment upgrade, with rollback enabled.
 It returns only after the worker accepts the request, and the worker starts upgrade work after the response is written.
 Existing environment and upgrade transaction locks still exclude conflicting mutations.
