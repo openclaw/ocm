@@ -8428,6 +8428,7 @@ fn current_package_jobs_preserve_config_repair_and_candidate_failure() {
         "repair",
         "candidate",
         "unknown-build",
+        "legacy-integrity",
         "damaged",
         "unknown-service",
         "stopping",
@@ -8560,6 +8561,11 @@ fn assert_current_package_job(case: &str) {
     if case == "candidate" {
         env.insert("OCM_TEST_CODEX_PREFLIGHT".into(), "fail".into());
     }
+    if case == "legacy-integrity" {
+        let mut meta: Value = serde_json::from_slice(&before[2]).unwrap();
+        meta.as_object_mut().unwrap().remove("sourceIntegrity");
+        write_json_replacing_path(&runtime, &meta);
+    }
     if case == "damaged" {
         let meta: Value = serde_json::from_slice(&before[2]).unwrap();
         let build = Path::new(meta["binaryPath"].as_str().unwrap())
@@ -8604,11 +8610,15 @@ fn assert_current_package_job(case: &str) {
             assert!(!calls.contains("update finalize"), "{calls}");
         }
         "track-switch" => assert_eq!(job["result"]["bindingName"], "beta", "{job}"),
-        "different-build" | "damaged" => {
+        "different-build" | "damaged" | "legacy-integrity" => {
             assert_eq!(job["result"]["outcome"], "updated", "{job}");
             assert!(calls.contains("update finalize"), "{calls}");
             let meta: Value = serde_json::from_slice(&fs::read(runtime).unwrap()).unwrap();
             assert_eq!(meta["sourceIntegrity"], sha512_integrity(&replacement));
+            if case == "legacy-integrity" {
+                assert_eq!(fs::read(&config).unwrap(), before[0]);
+                assert_eq!(fs::read(&registry).unwrap(), before[1]);
+            }
         }
         _ => {}
     }
