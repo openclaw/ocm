@@ -6222,7 +6222,8 @@ fn assert_managed_rollback(source_case: Option<&str>) {
                 r#"{"buildId":"source-build"}"#
             },
         );
-        let command = format!("node {}", old_runtime.display());
+        // Login shells on macOS can put system Node ahead of the fixture PATH.
+        let command = format!("{} {}", bin.join("node").display(), old_runtime.display());
         let add = run_ocm(
             &cwd,
             &env,
@@ -6499,7 +6500,12 @@ fn assert_managed_rollback(source_case: Option<&str>) {
     observer_done.store(true, Ordering::Relaxed);
     let saw_source = service_observer.join().unwrap();
     stop_converging_health_server(health_port, &health_stop, health_handle);
-    assert!(saw_source, "rollback did not restart the source binding");
+    assert!(
+        saw_source,
+        "rollback did not restart the source binding; stdout: {}; stderr: {}",
+        stdout(&rollback),
+        stderr(&rollback)
+    );
     let output = stdout(&rollback);
     if mismatch {
         assert!(
