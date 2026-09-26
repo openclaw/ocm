@@ -306,6 +306,12 @@ safety snapshot and a linked history transaction before it stops a managed
 service or replaces runtime bytes. If restore or verification fails, OCM puts
 the pre-rollback runtime and environment state back. Rolling back the linked
 transaction safely reverses the rollback.
+If rollback itself fails, OCM retains the pre-operation runtime files and snapshot and reports recovery as unresolved.
+Use `ocm upgrade history <env> --json` to inspect the transaction, its snapshot, and retained runtime recovery metadata.
+Preserve the locations printed in the failure result when metadata could not be written.
+Do not remove those files or prune the snapshot until operator recovery is complete; retained files are evidence for recovery, not proof that the environment or service was restored.
+This does not add automatic recovery after abrupt process loss.
+
 Dev environments retain their current source binding during restore.
 Manual snapshot restore also keeps their current runtime/launcher binding;
 upgrade rollback restores the recorded runtime/launcher instead.

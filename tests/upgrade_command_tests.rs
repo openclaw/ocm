@@ -3552,15 +3552,20 @@ fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
 
 #[test]
 fn upgrade_rolls_back_runtime_when_service_restart_fails() {
-    assert_upgrade_rollback_restart_failure(false);
+    assert_upgrade_rollback_restart_failure(false, false);
 }
 
 #[test]
 fn candidate_failure_reports_failed_service_recovery() {
-    assert_upgrade_rollback_restart_failure(true);
+    assert_upgrade_rollback_restart_failure(true, false);
 }
 
-fn assert_upgrade_rollback_restart_failure(candidate_failure: bool) {
+#[test]
+fn failed_automatic_rollback_retains_in_place_runtime() {
+    assert_upgrade_rollback_restart_failure(false, true);
+}
+
+fn assert_upgrade_rollback_restart_failure(candidate_failure: bool, in_place: bool) {
     let root = TestDir::new("upgrade-service-rollback");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -3644,7 +3649,15 @@ fn assert_upgrade_rollback_restart_failure(candidate_failure: bool) {
     if candidate_failure {
         env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "fail".to_string());
     }
-    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--version", "2026.3.25"]);
+    let upgrade = run_ocm(
+        &cwd,
+        &env,
+        if in_place {
+            &["upgrade", "demo"]
+        } else {
+            &["upgrade", "demo", "--version", "2026.3.25"]
+        },
+    );
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
     let output = stdout(&upgrade);
     assert!(
@@ -3679,7 +3692,30 @@ fn assert_upgrade_rollback_restart_failure(candidate_failure: bool) {
     let runtime_json: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
     assert_eq!(runtime_json["releaseVersion"], "2026.3.24");
 
-    let target_runtime = run_ocm(&cwd, &env, &["runtime", "show", "2026.3.25", "--json"]);
+    if in_place {
+        assert!(output.contains("Recovery remains unresolved"), "{output}");
+        let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+        let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
+        assert_eq!(history[0]["outcome"], "rollback-failed");
+        assert_eq!(history[0]["runtimeRecovery"][0]["backupId"], "stable");
+        let retained = Path::new(env.get("OCM_HOME").unwrap())
+            .join("upgrade-history/demo")
+            .join(format!(
+                "{}.recovery/stable",
+                history[0]["id"].as_str().unwrap()
+            ));
+        let meta: Value =
+            serde_json::from_slice(&fs::read(retained.join("runtime.json")).unwrap()).unwrap();
+        let relative_binary = Path::new(meta["binaryPath"].as_str().unwrap())
+            .strip_prefix(meta["installRoot"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            fs::read(retained.join("install-root").join(relative_binary)).unwrap(),
+            recording_openclaw_script("2026.3.24").as_bytes()
+        );
+    }
+    let target_name = if in_place { "stable" } else { "2026.3.25" };
+    let target_runtime = run_ocm(&cwd, &env, &["runtime", "show", target_name, "--json"]);
     // Recovery has not been accepted. Preserve diagnostic/recovery state rather
     // than discarding it before the restored service can start.
     assert!(
@@ -5287,6 +5323,124 @@ fn upgrade_rollback_failure_restores_the_pre_rollback_state() {
     assert!(snapshots.status.success(), "{}", stderr(&snapshots));
     let snapshots_json: Value = serde_json::from_str(&stdout(&snapshots)).unwrap();
     assert_eq!(snapshots_json.as_array().unwrap().len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_rollback_retains_previous_runtime_and_snapshot() {
+    assert_failed_rollback_retains_runtime(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_rollback_retains_runtime_when_history_storage_is_unwritable() {
+    assert_failed_rollback_retains_runtime(true);
+}
+
+#[cfg(unix)]
+fn assert_failed_rollback_retains_runtime(block_history: bool) {
+    let root = TestDir::new("upgrade-unresolved-rollback-retention");
+    let fixture = seed_in_place_rollback(&root, "broken-recovery");
+    let home = Path::new(fixture.env.get("OCM_HOME").unwrap());
+    let runtime_root = home.join("runtimes/stable");
+    let history_root = home.join("upgrade-history/demo");
+    let original_bytes = fs::read(runtime_root.join("files/bin/openclaw")).unwrap();
+    let recovery_binary = fixture
+        .original_recovery_root
+        .join("stable/install-root/files/bin/openclaw");
+    let mut script = recording_openclaw_script("broken-recovery");
+    script = script.replace(
+        "printf 'broken-recovery\\n'",
+        &format!(
+            "chmod 500 \"$OCM_HOME/runtimes/stable\"\n{}printf 'broken-recovery\\n'",
+            if block_history {
+                "chmod 500 \"$OCM_HOME/upgrade-history/demo\"\n"
+            } else {
+                ""
+            },
+        ),
+    );
+    write_executable_script(&recovery_binary, &script);
+
+    let rollback = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["upgrade", "rollback", "demo", "--json"],
+    );
+    // Restore only fixture permissions before assertions or TestDir cleanup.
+    fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&history_root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!rollback.status.success());
+    let result: Value = serde_json::from_str(&stdout(&rollback)).unwrap();
+    assert_eq!(result["outcome"], "rollback-failed", "{result:#}");
+    assert!(fixture.original_recovery_root.exists());
+    let id = result["rollbackTransactionId"].as_str().unwrap();
+    let snapshot_id = result["safetySnapshotId"].as_str().unwrap();
+    let snapshots = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["env", "snapshot", "list", "demo", "--json"],
+    );
+    let snapshots: Value = serde_json::from_str(&stdout(&snapshots)).unwrap();
+    assert!(
+        snapshots
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|snapshot| snapshot["id"] == snapshot_id)
+    );
+    if block_history {
+        assert!(
+            result["note"]
+                .as_str()
+                .unwrap()
+                .contains("metadata requires attention")
+        );
+        let retained = fs::read_dir(home.join("tmp/upgrade-runtime-backups"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            fs::read(retained[0].join("files/bin/openclaw")).unwrap(),
+            original_bytes
+        );
+    } else {
+        let recovery = history_root.join(format!("{id}.recovery"));
+        assert_eq!(
+            fs::read(recovery.join("stable/install-root/files/bin/openclaw")).unwrap(),
+            original_bytes
+        );
+        let meta: Value =
+            serde_json::from_slice(&fs::read(recovery.join("stable/runtime.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["releaseVersion"], "2026.6.33");
+        assert_eq!(
+            fs::read_to_string(recovery.join("snapshot-id")).unwrap(),
+            snapshot_id
+        );
+        let history = run_ocm(
+            &fixture.cwd,
+            &fixture.env,
+            &["upgrade", "history", "demo", "--json"],
+        );
+        let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
+        assert_eq!(history[0]["outcome"], "rollback-failed");
+        assert_eq!(history[0]["runtimeRecovery"][0]["backupId"], "stable");
+        assert!(
+            history[0]["note"]
+                .as_str()
+                .unwrap()
+                .contains("Recovery remains unresolved")
+        );
+    }
+    assert!(
+        result["note"]
+            .as_str()
+            .unwrap()
+            .contains("Recovery remains unresolved"),
+        "{result:#}"
+    );
 }
 
 #[cfg(unix)]
