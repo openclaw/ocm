@@ -53,6 +53,8 @@ impl Cli {
         let top_level = inspect_git(&root, &["rev-parse", "--show-toplevel"])
             .and_then(|path| fs::canonicalize(path.trim()).ok());
         if top_level.as_ref() == Some(&root) {
+            // These fixed ref queries do not read object contents. Object-reading
+            // commands must stay behind inspect_working_tree's promisor guard.
             source.head = inspect_git(&root, &["rev-parse", "--verify", "HEAD"])
                 .and_then(|value| full_commit(value.trim()));
             source.working_tree_clean = inspect_working_tree(&root, &mut source.issues);
@@ -193,6 +195,9 @@ fn launcher_source_root(launcher: &LauncherMeta) -> Option<PathBuf> {
 fn inspection_git_command(root: &Path) -> Command {
     let mut command = git_command();
     command
+        .env("GIT_NO_LAZY_FETCH", "1")
+        // GIT_CONFIG redirects only `git config`, unlike the commands it guards.
+        .env_remove("GIT_CONFIG")
         .args([
             "--no-optional-locks",
             "-c",
@@ -207,6 +212,21 @@ fn inspection_git_command(root: &Path) -> Command {
     command
 }
 
+fn has_no_promisor_configuration(root: &Path) -> bool {
+    // Config inspection cannot load repository objects. Include filter-only remote
+    // configuration because older Git also treats that as a promisor remote.
+    inspection_git_command(root)
+        .args([
+            "config",
+            "--name-only",
+            "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$",
+        ])
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.code() == Some(1))
+}
+
 fn inspect_git(root: &Path, args: &[&str]) -> Option<String> {
     let output = inspection_git_command(root).args(args).output().ok()?;
     output
@@ -216,6 +236,15 @@ fn inspect_git(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn inspect_working_tree(root: &Path, issues: &mut Vec<String>) -> Option<bool> {
+    // Older Git ignores GIT_NO_LAZY_FETCH, and even --no-lazy-fetch does not
+    // suppress every rename prefetch path. Avoid object reads in partial clones.
+    if !has_no_promisor_configuration(root) {
+        issues.push(
+            "working-tree inspection skipped because Git cannot rule out fetching missing objects"
+                .to_string(),
+        );
+        return None;
+    }
     // Status may execute a configured clean/process filter, even without index writes.
     let filters = inspection_git_command(root)
         .args([

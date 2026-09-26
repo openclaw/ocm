@@ -503,6 +503,8 @@ JSON includes `source` only for recognized source launchers, with the canonical 
 A different built commit reveals source that has moved without a matching build; a matching commit alone does not prove a complete build, healthy dependencies, or the identity of a running Gateway.
 Missing or invalid metadata remains unknown and is explained in `issues`.
 Working-tree cleanliness also remains unknown when Git filters or submodules prevent inspection without potentially executing configured commands.
+Working-tree cleanliness remains unknown for repositories with partial-clone or promisor-remote configuration, because Git can fetch missing objects while checking status, including on older versions that ignore lazy-fetch safeguards.
+Locally recorded HEAD and tracking information remain available without loading those objects.
 `trackingRef` and `trackingHead` describe locally recorded Git tracking information, which may be stale; inspection does not fetch or contact a remote.
 `sharedEnvironments` lists other registered launcher, dev, or runtime bindings whose known paths overlap the checkout, including path aliases.
 An empty list does not establish exclusive ownership or exclude unmanaged processes.

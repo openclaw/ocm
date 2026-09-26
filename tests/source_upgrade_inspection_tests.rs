@@ -269,6 +269,134 @@ fn source_inspection_does_not_execute_git_filters() {
     assert!(result["source"]["workingTreeClean"].is_null());
 }
 
+#[test]
+fn source_inspection_does_not_fetch_missing_rename_objects() {
+    let root = TestDir::new("source-upgrade-partial-clone");
+    let (mut env, _) = fixture(&root);
+    let repo = root.child("source");
+    let content = (0..300)
+        .map(|line| format!("fixture line {line:05} common content\n"))
+        .collect::<String>();
+    write_text(&repo.join("docs/hidden.txt"), &content);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "hidden blob"]);
+    let blob = git(&repo, &["rev-parse", "HEAD:docs/hidden.txt"]);
+    let seed = root.child("seed");
+    fs::rename(&repo, &seed).unwrap();
+    git(&seed, &["config", "uploadpack.allowFilter", "true"]);
+    let origin = url::Url::from_directory_path(&seed).unwrap().to_string();
+    git(
+        root.path(),
+        &[
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            &origin,
+            repo.to_str().unwrap(),
+        ],
+    );
+    git(
+        &repo,
+        &[
+            "sparse-checkout",
+            "set",
+            "--no-cone",
+            "/package.json",
+            "/openclaw.mjs",
+            "/scripts/",
+        ],
+    );
+    git(&repo, &["checkout", "main"]);
+    git(&repo, &["rm", "--cached", "--sparse", "docs/hidden.txt"]);
+    write_text(
+        &repo.join("replacement.txt"),
+        &content.replace("fixture line 00000", "changed line 00000"),
+    );
+    git(&repo, &["add", "--sparse", "replacement.txt"]);
+    // Enumerating local objects does not fetch the missing blob to check it.
+    let objects = git(
+        &repo,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ],
+    );
+    assert!(!objects.lines().any(|oid| oid == blob));
+    let index = fs::read(repo.join(".git/index")).unwrap();
+    let before_env = run_ocm(root.path(), &env, &["env", "show", "demo", "--json"]);
+    let trace = root.child("git-trace.jsonl");
+    env.insert("GIT_TRACE2_EVENT".to_string(), path_string(&trace));
+    // The inspector must override callers that explicitly allow lazy fetching.
+    env.insert("GIT_NO_LAZY_FETCH".to_string(), "0".to_string());
+    let result = inspect(&root, &env);
+    assert!(result["source"]["workingTreeClean"].is_null());
+    assert_eq!(result["source"]["head"], git(&repo, &["rev-parse", "HEAD"]));
+    assert_eq!(result["source"]["trackingRef"], "refs/remotes/origin/main");
+    assert!(!result["source"]["issues"].as_array().unwrap().is_empty());
+    assert_eq!(
+        git(
+            &repo,
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)"
+            ],
+        ),
+        objects
+    );
+    assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+    for line in fs::read_to_string(&trace).unwrap().lines() {
+        let event: Value = serde_json::from_str(line).unwrap();
+        if event["event"] == "child_start" {
+            assert!(
+                !event["argv"].as_array().unwrap().iter().any(|arg| {
+                    arg.as_str()
+                        .is_some_and(|arg| arg == "fetch" || arg.contains("upload-pack"))
+                }),
+                "inspection started a fetch: {event}"
+            );
+        }
+    }
+    let after_env = run_ocm(root.path(), &env, &["env", "show", "demo", "--json"]);
+    assert_eq!(stdout(&before_env), stdout(&after_env));
+    let history = run_ocm(root.path(), &env, &["upgrade", "history", "demo", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&history)).unwrap(),
+        json!([])
+    );
+}
+
+#[test]
+fn source_inspection_recognizes_all_promisor_configuration_forms() {
+    let root = TestDir::new("source-upgrade-promisor-config");
+    let (mut env, head) = fixture(&root);
+    let config = root.child("gitconfig");
+    env.insert("GIT_CONFIG_GLOBAL".to_string(), path_string(&config));
+    let unrelated_config = root.child("unrelated-gitconfig");
+    write_text(&unrelated_config, "");
+    env.insert("GIT_CONFIG".to_string(), path_string(&unrelated_config));
+    for contents in [
+        "[extensions]\npartialClone = origin\n",
+        "[remote \"another\"]\npromisor = true\n",
+        "[remote \"another\"]\npartialCloneFilter = blob:none\n",
+    ] {
+        write_text(&config, contents);
+        let result = inspect(&root, &env);
+        assert_eq!(result["source"]["head"], head);
+        assert!(result["source"]["workingTreeClean"].is_null());
+        assert!(
+            result["source"]["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| { issue.as_str().unwrap().contains("fetching missing objects") })
+        );
+    }
+    write_text(&config, "");
+    assert_eq!(inspect(&root, &env)["source"]["workingTreeClean"], true);
+}
+
 #[cfg(unix)]
 #[test]
 fn source_inspection_rejects_non_regular_metadata_and_submodule_status() {
