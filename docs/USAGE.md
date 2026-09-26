@@ -516,6 +516,16 @@ If writing recovery metadata also failed, preserve the original backup location 
 Keep the snapshot and retained files until operator recovery is complete, because snapshot removal also removes linked runtime recovery.
 Automatic recovery after abrupt process loss is not provided by this retention behavior.
 
+On Linux and macOS, upgrade commands keep the environment mutation lock in their native Doctor, finalizer, and completion-cache children.
+If the OCM parent is killed, competing environment mutations and upgrades wait until those children close the inherited lock or exit.
+Each fleet child retains only its own environment's lock.
+This is not crash recovery or proof that all descendants stopped: a program can close inherited descriptors before spawning further work, and Windows retains its existing locking behavior.
+
+If a later mutation keeps waiting, use `lsof "${OCM_HOME:-$HOME/.ocm}/locks/environments/mira.lock"` to inspect processes with that environment's lock file open.
+Distinguish waiting OCM commands from surviving upgrade children, and let active update work finish.
+Stop an unintended holder only after verifying that interrupting its work is safe, then retry the mutation.
+Do not delete or replace the lock file to bypass a holder: a new file can admit another writer while the original holder is still running.
+
 ### Upgrade every environment that can be updated safely
 
 ```bash

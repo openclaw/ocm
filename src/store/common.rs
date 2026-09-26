@@ -24,13 +24,39 @@ pub(crate) fn ensure_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|error| error.to_string())
 }
 
+// Do not explicitly unlock: on flock platforms that would also release
+// the lock held by a surviving child with an inherited descriptor.
 pub(crate) struct ExclusiveFileLock {
-    file: File,
+    _file: File,
 }
 
-impl Drop for ExclusiveFileLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+impl ExclusiveFileLock {
+    pub(crate) fn output(
+        &self,
+        mut command: std::process::Command,
+    ) -> std::io::Result<std::process::Output> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let fd = self._file.as_raw_fd();
+            // Only this child's copy becomes inheritable, so concurrent fleet
+            // workers and service spawns cannot retain another environment's lock.
+            // SAFETY: self keeps fd open until output returns; fcntl is
+            // async-signal-safe and does not allocate after fork.
+            unsafe {
+                command.pre_exec(move || {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags == -1
+                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        command.output()
     }
 }
 
@@ -61,7 +87,7 @@ pub(crate) fn lock_file(path: &Path, label: &str) -> Result<ExclusiveFileLock, S
             path.display()
         )
     })?;
-    Ok(ExclusiveFileLock { file })
+    Ok(ExclusiveFileLock { _file: file })
 }
 
 pub(crate) fn try_lock_file(path: &Path, label: &str) -> Result<Option<ExclusiveFileLock>, String> {
@@ -76,7 +102,7 @@ pub(crate) fn try_lock_file(path: &Path, label: &str) -> Result<Option<Exclusive
         .open(path)
         .map_err(|error| format!("failed to open {label} lock at {}: {error}", path.display()))?;
     match FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(Some(ExclusiveFileLock { file })),
+        Ok(()) => Ok(Some(ExclusiveFileLock { _file: file })),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(format!(
             "failed to acquire {label} lock at {}: {error}",
@@ -281,6 +307,48 @@ mod tests {
         std::env::temp_dir()
             .join("ocm-copy-dir-tests")
             .join(format!("{label}-{}-{id}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_lock_survives_parent_guard_drop() {
+        use std::process::Command;
+        use std::thread::sleep;
+        use std::time::{Duration, Instant};
+
+        let root = temp_root("inherited-lock");
+        fs::create_dir_all(&root).unwrap();
+        let lock_path = root.join("lock");
+        let started = root.join("started");
+        let release = root.join("release");
+        struct ReleaseChild(PathBuf);
+        impl Drop for ReleaseChild {
+            fn drop(&mut self) {
+                let _ = fs::write(&self.0, "");
+            }
+        }
+        let _release_child = ReleaseChild(release.clone());
+        let lock = super::lock_file(&lock_path, "test").unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "(touch \"$1\"; count=0; while [ ! -e \"$2\" ] && [ $count -lt 100 ]; do sleep 0.05; count=$((count + 1)); done) </dev/null >/dev/null 2>&1 &", "sh"])
+            .arg(&started).arg(&release);
+        assert!(lock.output(command).unwrap().status.success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.exists() {
+            assert!(Instant::now() < deadline, "inheriting child did not start");
+            sleep(Duration::from_millis(10));
+        }
+        drop(lock);
+        assert!(super::try_lock_file(&lock_path, "test").unwrap().is_none());
+        fs::write(&release, "").unwrap();
+        loop {
+            if super::try_lock_file(&lock_path, "test").unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child did not release its lock");
+            sleep(Duration::from_millis(10));
+        }
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]

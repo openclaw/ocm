@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -36,11 +36,11 @@ use crate::runtime::{
 };
 use crate::service::{ServiceSummary, wait_for_gateway_readiness};
 use crate::store::{
-    InstallContext, RuntimeReleaseDetails, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming,
-    UpgradeHistoryRecord, UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState,
-    UpgradeHistoryStage, UpgradeRuntimeRecovery, clean_path, copy_dir_recursive, derive_env_paths,
-    display_path, ensure_minimum_local_openclaw_config, ensure_store, get_runtime,
-    get_upgrade_history_record, get_upgrade_runtime_recovery,
+    EnvironmentOperationLock, InstallContext, RuntimeReleaseDetails, UpgradeHistoryBinding,
+    UpgradeHistoryPhaseTiming, UpgradeHistoryRecord, UpgradeHistoryRuntimeRecovery,
+    UpgradeHistoryServiceState, UpgradeHistoryStage, UpgradeRuntimeRecovery, clean_path,
+    copy_dir_recursive, derive_env_paths, display_path, ensure_minimum_local_openclaw_config,
+    ensure_store, get_runtime, get_upgrade_history_record, get_upgrade_runtime_recovery,
     install_runtime_from_selected_official_openclaw_release, list_upgrade_history,
     lock_env_registry, lock_upgrade_batch, lock_upgrade_participant, lock_upgrade_transaction,
     remove_runtime, remove_upgrade_recovery, resolve_absolute_path, runtime_install_root,
@@ -711,10 +711,13 @@ impl Cli {
         let mut lock_names = options.env_names.clone();
         lock_names.sort();
         let mut transaction_locks = Vec::with_capacity(lock_names.len());
-        let mut operation_locks = Vec::with_capacity(lock_names.len());
+        let mut operation_locks = BTreeMap::new();
         for env_name in &lock_names {
             transaction_locks.push(lock_upgrade_transaction(env_name, &self.env, &self.cwd)?);
-            operation_locks.push(self.environment_service().lock_operation(env_name)?);
+            operation_locks.insert(
+                env_name.clone(),
+                self.environment_service().lock_operation(env_name)?,
+            );
             if !options.dry_run {
                 self.environment_service()
                     .ensure_source_watch_allows_state_mutation_locked(env_name)?;
@@ -731,7 +734,12 @@ impl Cli {
         };
         let mut preflight = Vec::with_capacity(options.env_names.len());
         for env_name in &options.env_names {
-            let result = self.upgrade_env_locked(env_name, &target, preflight_options)?;
+            let result = self.upgrade_env_locked(
+                env_name,
+                &target,
+                preflight_options,
+                &operation_locks[env_name],
+            )?;
             if is_failed_upgrade_outcome(&result.outcome) {
                 return Err(format!(
                     "upgrade batch preflight failed for env \"{env_name}\": {}",
@@ -830,6 +838,8 @@ impl Cli {
         summary.outcome = "snapshotted".to_string();
         self.save_upgrade_batch_journal(&journal_path, &summary)?;
 
+        let operation_locks = Arc::new(operation_locks);
+        let worker_operation_locks = Arc::clone(&operation_locks);
         let target_for_workers = target.clone();
         let failure_policy = options.failure_policy;
         let upgrade_results = self.run_parallel_batch_work(
@@ -843,6 +853,7 @@ impl Cli {
                         dry_run: false,
                         rollback_enabled: failure_policy == UpgradeFleetFailurePolicy::Rollback,
                     },
+                    &worker_operation_locks[env_name],
                 );
                 match result {
                     Ok(mut result)
@@ -2214,6 +2225,15 @@ impl Cli {
         resolved: crate::env::ResolvedExecution,
         extra_env: &[(&str, &str)],
     ) -> Result<SimulationCommandOutput, String> {
+        self.run_resolved_with_operation_lock(resolved, extra_env, None)
+    }
+
+    fn run_resolved_with_operation_lock(
+        &self,
+        resolved: crate::env::ResolvedExecution,
+        extra_env: &[(&str, &str)],
+        operation_lock: Option<&EnvironmentOperationLock>,
+    ) -> Result<SimulationCommandOutput, String> {
         let (mut command, env_meta, source_root, path_prepend) = match resolved {
             crate::env::ResolvedExecution::Launcher {
                 env,
@@ -2273,14 +2293,17 @@ impl Cli {
         for (key, value) in extra_env {
             process_env.insert((*key).to_string(), (*value).to_string());
         }
-        let output = command
+        command
             .env_clear()
             .envs(process_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| format!("failed to run simulation check: {error}"))?;
+            .stderr(Stdio::piped());
+        let output = match operation_lock {
+            Some(lock) => lock.output(command),
+            None => command.output(),
+        }
+        .map_err(|error| format!("failed to run simulation check: {error}"))?;
         Ok(SimulationCommandOutput::from_output(output))
     }
 
@@ -2394,8 +2417,8 @@ impl Cli {
         options: UpgradeOptions,
     ) -> Result<UpgradeEnvSummary, String> {
         let _transaction_lock = lock_upgrade_transaction(name, &self.env, &self.cwd)?;
-        let _operation_lock = self.environment_service().lock_operation(name)?;
-        self.upgrade_env_locked(name, target, options)
+        let operation_lock = self.environment_service().lock_operation(name)?;
+        self.upgrade_env_locked(name, target, options, &operation_lock)
     }
 
     fn upgrade_env_locked(
@@ -2403,6 +2426,7 @@ impl Cli {
         name: &str,
         target: &UpgradeTarget,
         options: UpgradeOptions,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<UpgradeEnvSummary, String> {
         if !options.dry_run {
             self.environment_service()
@@ -2411,11 +2435,23 @@ impl Cli {
         let env = self.environment_service().get(name)?;
 
         if let Some(runtime_name) = env.default_runtime.as_deref() {
-            return self.upgrade_runtime_bound_env(name, runtime_name, target, options);
+            return self.upgrade_runtime_bound_env(
+                name,
+                runtime_name,
+                target,
+                options,
+                operation_lock,
+            );
         }
 
         if let Some(launcher_name) = env.default_launcher.as_deref() {
-            return self.upgrade_launcher_bound_env(name, launcher_name, target, options);
+            return self.upgrade_launcher_bound_env(
+                name,
+                launcher_name,
+                target,
+                options,
+                operation_lock,
+            );
         }
 
         Err(format!(
@@ -2429,6 +2465,7 @@ impl Cli {
         runtime_name: &str,
         target: &UpgradeTarget,
         options: UpgradeOptions,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<UpgradeEnvSummary, String> {
         let current = self.runtime_service().show(runtime_name)?;
         let previous_binding_name = current.name.clone();
@@ -2560,28 +2597,31 @@ impl Cli {
                 }
             };
             let binding_changed = prepared.name != current.name;
-            let post_update =
-                match self.run_post_core_update(env_name, &prepared.meta, &mut transaction.timings)
-                {
-                    Ok(result) => {
-                        transaction.mark_post_update_completed(result.note.as_deref());
-                        result
-                    }
-                    Err(error) => {
-                        transaction.mark_post_update_failed(&error);
-                        return self.rollback_failed_upgrade(
-                            env_name,
-                            "runtime",
-                            previous_binding_name,
-                            "runtime",
-                            prepared.name,
-                            target_release_version,
-                            target_channel,
-                            transaction,
-                            error.to_string(),
-                        );
-                    }
-                };
+            let post_update = match self.run_post_core_update(
+                env_name,
+                &prepared.meta,
+                &mut transaction.timings,
+                operation_lock,
+            ) {
+                Ok(result) => {
+                    transaction.mark_post_update_completed(result.note.as_deref());
+                    result
+                }
+                Err(error) => {
+                    transaction.mark_post_update_failed(&error);
+                    return self.rollback_failed_upgrade(
+                        env_name,
+                        "runtime",
+                        previous_binding_name,
+                        "runtime",
+                        prepared.name,
+                        target_release_version,
+                        target_channel,
+                        transaction,
+                        error.to_string(),
+                    );
+                }
+            };
             let post_update_note = post_update.note;
             let completion_deferred = post_update.completion_deferred;
             let publish_started = transaction.timings.start();
@@ -2652,6 +2692,7 @@ impl Cli {
                 &prepared.name,
                 completion_deferred,
                 &mut transaction.timings,
+                operation_lock,
             );
             let verification_started = transaction.timings.start();
             let verification_note = match self.verify_upgraded_openclaw(
@@ -2879,8 +2920,12 @@ impl Cli {
                 }
             };
             let (post_update_note, completion_deferred) = if changed {
-                match self.run_post_core_update(env_name, &prepared.meta, &mut transaction.timings)
-                {
+                match self.run_post_core_update(
+                    env_name,
+                    &prepared.meta,
+                    &mut transaction.timings,
+                    operation_lock,
+                ) {
                     Ok(result) => {
                         transaction.mark_post_update_completed(result.note.as_deref());
                         (result.note, result.completion_deferred)
@@ -2905,6 +2950,7 @@ impl Cli {
                     env_name,
                     &prepared.meta,
                     &mut transaction.timings,
+                    operation_lock,
                 ) {
                     Ok(config_repaired) => config_repaired,
                     Err(error) => {
@@ -2987,6 +3033,7 @@ impl Cli {
                 &prepared.name,
                 completion_deferred,
                 &mut transaction.timings,
+                operation_lock,
             );
             let verification_started = transaction.timings.start();
             let verification_note = match self.verify_upgraded_openclaw(
@@ -3158,27 +3205,31 @@ impl Cli {
                 );
             }
         };
-        let post_update =
-            match self.run_post_core_update(env_name, &updated, &mut transaction.timings) {
-                Ok(result) => {
-                    transaction.mark_post_update_completed(result.note.as_deref());
-                    result
-                }
-                Err(error) => {
-                    transaction.mark_post_update_failed(&error);
-                    return self.rollback_failed_upgrade(
-                        env_name,
-                        "runtime",
-                        previous_binding_name,
-                        "runtime",
-                        updated.name,
-                        updated.release_version,
-                        updated.release_channel,
-                        transaction,
-                        error.to_string(),
-                    );
-                }
-            };
+        let post_update = match self.run_post_core_update(
+            env_name,
+            &updated,
+            &mut transaction.timings,
+            operation_lock,
+        ) {
+            Ok(result) => {
+                transaction.mark_post_update_completed(result.note.as_deref());
+                result
+            }
+            Err(error) => {
+                transaction.mark_post_update_failed(&error);
+                return self.rollback_failed_upgrade(
+                    env_name,
+                    "runtime",
+                    previous_binding_name,
+                    "runtime",
+                    updated.name,
+                    updated.release_version,
+                    updated.release_channel,
+                    transaction,
+                    error.to_string(),
+                );
+            }
+        };
         let post_update_note = post_update.note;
         let completion_deferred = post_update.completion_deferred;
         let publish_started = transaction.timings.start();
@@ -3237,6 +3288,7 @@ impl Cli {
             &updated.name,
             completion_deferred,
             &mut transaction.timings,
+            operation_lock,
         );
         let verification_started = transaction.timings.start();
         let verification_note = match self.verify_upgraded_openclaw(
@@ -3333,6 +3385,7 @@ impl Cli {
         launcher_name: &str,
         target: &UpgradeTarget,
         options: UpgradeOptions,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<UpgradeEnvSummary, String> {
         if !target.is_explicit() {
             return Ok(UpgradeEnvSummary {
@@ -3461,27 +3514,31 @@ impl Cli {
                 );
             }
         };
-        let post_update =
-            match self.run_post_core_update(env_name, &prepared.meta, &mut transaction.timings) {
-                Ok(result) => {
-                    transaction.mark_post_update_completed(result.note.as_deref());
-                    result
-                }
-                Err(error) => {
-                    transaction.mark_post_update_failed(&error);
-                    return self.rollback_failed_upgrade(
-                        env_name,
-                        "launcher",
-                        launcher_name.to_string(),
-                        "runtime",
-                        prepared.name,
-                        target_release_version,
-                        target_channel,
-                        transaction,
-                        error.to_string(),
-                    );
-                }
-            };
+        let post_update = match self.run_post_core_update(
+            env_name,
+            &prepared.meta,
+            &mut transaction.timings,
+            operation_lock,
+        ) {
+            Ok(result) => {
+                transaction.mark_post_update_completed(result.note.as_deref());
+                result
+            }
+            Err(error) => {
+                transaction.mark_post_update_failed(&error);
+                return self.rollback_failed_upgrade(
+                    env_name,
+                    "launcher",
+                    launcher_name.to_string(),
+                    "runtime",
+                    prepared.name,
+                    target_release_version,
+                    target_channel,
+                    transaction,
+                    error.to_string(),
+                );
+            }
+        };
         let post_update_note = post_update.note;
         let completion_deferred = post_update.completion_deferred;
         let publish_started = transaction.timings.start();
@@ -3540,6 +3597,7 @@ impl Cli {
             &prepared.name,
             completion_deferred,
             &mut transaction.timings,
+            operation_lock,
         );
         let verification_started = transaction.timings.start();
         let verification_note = match self.verify_upgraded_openclaw(
@@ -3789,6 +3847,7 @@ impl Cli {
         &self,
         env_name: &str,
         runtime: &RuntimeMeta,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<(), CandidateFailure> {
         let args = managed_codex_candidate_args();
         let launch = resolve_runtime_launch(runtime, &args, &self.env, &self.cwd, true).map_err(
@@ -3811,21 +3870,21 @@ impl Cli {
         })?;
         process_env.insert("OPENCLAW_UPDATE_IN_PROGRESS".to_string(), "1".to_string());
 
-        let output = Command::new(&launch.program)
+        let mut command = Command::new(&launch.program);
+        command
             .args(&launch.args)
             .current_dir(resolve_runtime_run_dir(&self.cwd))
             .env_clear()
             .envs(process_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| {
-                CandidateFailure::launch(format!(
-                    "candidate managed Codex preflight failed to start {}: {error}",
-                    display_path(Path::new(&launch.program))
-                ))
-            })?;
+            .stderr(Stdio::piped());
+        let output = operation_lock.output(command).map_err(|error| {
+            CandidateFailure::launch(format!(
+                "candidate managed Codex preflight failed to start {}: {error}",
+                display_path(Path::new(&launch.program))
+            ))
+        })?;
         let output = SimulationCommandOutput::from_output(output);
         if output.status.success() {
             return Ok(());
@@ -4096,10 +4155,12 @@ impl Cli {
         env_name: &str,
         runtime: &RuntimeMeta,
         timings: &mut UpgradeTimingRecorder,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<PostCoreUpdateResult, PostCoreUpdateFailure> {
         // Resolve the replacement explicitly while the previous binding remains published.
         // A failed finalizer can then roll back without ever activating the replacement.
-        let config_repaired = self.prepare_target_openclaw_update(env_name, runtime, timings)?;
+        let config_repaired =
+            self.prepare_target_openclaw_update(env_name, runtime, timings, operation_lock)?;
         let finalize_started = timings.start();
         let output = match self.run_update_mode_openclaw_command_output_with_env(
             env_name,
@@ -4107,6 +4168,7 @@ impl Cli {
             "openclaw update finalize",
             &["update", "finalize", "--json", "--yes", "--no-restart"],
             &[("OPENCLAW_UPDATE_POST_CORE", "1")],
+            Some(operation_lock),
         ) {
             Ok(output) => output,
             Err(error) => {
@@ -4167,12 +4229,14 @@ impl Cli {
         env_name: &str,
         runtime: &RuntimeMeta,
         timings: &mut UpgradeTimingRecorder,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<bool, PostCoreUpdateFailure> {
         let config_repaired = self
-            .repair_target_openclaw_config(env_name, &runtime.name, timings)
+            .repair_target_openclaw_config(env_name, &runtime.name, timings, operation_lock)
             .map_err(PostCoreUpdateFailure::Configuration)?;
         let candidate_started = timings.start();
-        let candidate_result = self.validate_committed_upgrade_target(env_name, runtime);
+        let candidate_result =
+            self.validate_committed_upgrade_target(env_name, runtime, operation_lock);
         timings.finish(
             "ocm",
             "managedCodexCandidate",
@@ -4197,6 +4261,7 @@ impl Cli {
         runtime_name: &str,
         deferred: bool,
         timings: &mut UpgradeTimingRecorder,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Option<String> {
         if !deferred {
             return None;
@@ -4207,6 +4272,7 @@ impl Cli {
             runtime_name,
             "openclaw completion cache refresh",
             &["completion", "--write-state"],
+            operation_lock,
         );
         timings.finish(
             "ocm",
@@ -4231,6 +4297,7 @@ impl Cli {
         env_name: &str,
         runtime_name: &str,
         timings: &mut UpgradeTimingRecorder,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<bool, String> {
         let validation_started = timings.start();
         let env = self
@@ -4249,11 +4316,13 @@ impl Cli {
             return Ok(false);
         }
 
-        let validation = match self.run_update_mode_openclaw_command_output(
+        let validation = match self.run_update_mode_openclaw_command_output_with_env(
             env_name,
             runtime_name,
             "openclaw config validate",
             &["config", "validate"],
+            &[],
+            Some(operation_lock),
         ) {
             Ok(validation) => validation,
             Err(error) => {
@@ -4295,6 +4364,7 @@ impl Cli {
             runtime_name,
             "openclaw doctor",
             &["doctor", "--non-interactive", "--fix"],
+            operation_lock,
         );
         timings.finish(
             "ocm",
@@ -4314,6 +4384,7 @@ impl Cli {
             runtime_name,
             "openclaw config validate after doctor",
             &["config", "validate"],
+            operation_lock,
         );
         timings.finish(
             "ocm",
@@ -4336,9 +4407,16 @@ impl Cli {
         runtime_name: &str,
         name: &str,
         args: &[&str],
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<(), String> {
-        let output =
-            self.run_update_mode_openclaw_command_output(env_name, runtime_name, name, args)?;
+        let output = self.run_update_mode_openclaw_command_output_with_env(
+            env_name,
+            runtime_name,
+            name,
+            args,
+            &[],
+            Some(operation_lock),
+        )?;
         if output.status.success() {
             Ok(())
         } else {
@@ -4359,6 +4437,7 @@ impl Cli {
             name,
             args,
             &[],
+            None,
         )
     }
 
@@ -4369,6 +4448,7 @@ impl Cli {
         name: &str,
         args: &[&str],
         extra_env: &[(&str, &str)],
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<SimulationCommandOutput, String> {
         let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
         let resolved = self
@@ -4383,7 +4463,7 @@ impl Cli {
             ("OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION", "0"),
         ];
         command_env.extend_from_slice(extra_env);
-        self.run_resolved_for_simulation(resolved, &command_env)
+        self.run_resolved_with_operation_lock(resolved, &command_env, operation_lock)
             .map_err(|error| format!("{name} failed: {error}"))
     }
 
