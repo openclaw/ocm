@@ -517,6 +517,8 @@ An observed wrong installation or unready build remains a verification failure.
 Binding changes, service-policy writes, and new foreground source admission wait while the native source operation holds registry exclusion; environment and job-status reads remain available.
 Source preparation also refuses while an overlapping source environment is completing an operation, including service activation and recovery.
 Successful source execution records `source-updated`, which cannot be selected by `upgrade rollback`, including in older OCM readers.
+If recording history fails after source and Gateway verification, the operation reports `failed` with a history-incomplete note and retains the checkpoint; the verified source and service remain in place.
+An interrupt before completion still follows the existing source recovery policy.
 The checkpoint contains environment state, not the previous source bytes, so OCM never replays it over an unverified source runtime.
 When native recovery cannot prove compatible software and state, the report retains the checkpoint and identifies unresolved recovery or service shutdown instead of claiming restoration.
 Inspect the native recovery report before restarting through OCM.

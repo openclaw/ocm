@@ -692,15 +692,17 @@ impl Cli {
         result.outcome = "source-updated".to_string();
         transaction.cleanup_note = Some("Source and runtime recovery belong to the native updater; this environment checkpoint does not restore source bytes.".to_string());
         if let Err(error) = self.record_upgrade_history(&transaction, &result) {
-            return self.finish_failed_source_update(
-                result,
-                transaction,
-                &Value::Null,
-                true,
-                None,
-                operation,
-                error,
+            // The native update and service verification already completed.
+            // History failure must fail the operation without invoking recovery
+            // over the verified source or stopping its Gateway.
+            result.outcome = "failed".to_string();
+            let history_note = format!(
+                "verified source update was retained, but upgrade history was not recorded: {error}; retain the environment checkpoint"
             );
+            result.note = Some(match result.note.take() {
+                Some(note) => format!("{note}\n{history_note}"),
+                None => history_note,
+            });
         }
         if !transaction.close_interrupt_fence_for_commit() {
             return self.finish_failed_source_update(
