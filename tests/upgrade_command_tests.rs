@@ -401,8 +401,11 @@ case "$1" in
           printf '{{"ok":false,"checksRun":1,"checksSkipped":0,"findings":[{{"checkId":"codex/managed-app-server","severity":"error","message":"Managed Codex app-server version mismatch: expected 0.147.0, detected 0.146.0.","path":"/candidate/codex","fixHint":"Repair or reinstall the staged OpenClaw package before cutover."}}]}}\n'
           exit 1
           ;;
-        unsupported)
+        unsupported|unsupported-with-stderr)
           printf '{{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{{"checkId":"core/doctor/lint-selection","severity":"error","message":"Unknown health check id selected by --only: codex/managed-app-server.","path":"codex/managed-app-server"}}]}}\n'
+          if [ "$OCM_TEST_CODEX_PREFLIGHT" = "unsupported-with-stderr" ]; then
+            printf 'Doctor lint error [core/doctor/lint-selection]: Unknown health check id selected by --only: codex/managed-app-server.\n' >&2
+          fi
           exit 1
           ;;
         mixed)
@@ -7194,6 +7197,30 @@ fn upgrade_validates_managed_codex_candidate_before_finalization() {
         .find("update finalize --json --yes --no-restart")
         .expect("target finalization must run");
     assert!(candidate < finalize, "{command_log}");
+}
+
+#[test]
+fn upgrade_accepts_unavailable_optional_codex_check_with_native_stderr() {
+    let root = TestDir::new("upgrade-codex-candidate-native-stderr");
+    let (cwd, mut env, env_root) = setup_named_runtime_candidate_fixture(&root);
+    env.insert(
+        "OCM_TEST_CODEX_PREFLIGHT".to_string(),
+        "unsupported-with-stderr".to_string(),
+    );
+
+    let upgrade = run_ocm(
+        &cwd,
+        &env,
+        &["upgrade", "demo", "--runtime", "new-local", "--json"],
+    );
+    assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+    let receipt: Value = serde_json::from_str(&stdout(&upgrade)).unwrap();
+    assert_eq!(receipt["outcome"], "switched", "{receipt}");
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    let env_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert_eq!(env_json["defaultRuntime"], "new-local");
+    let command_log = fs::read_to_string(env_root.join("sim-commands.log")).unwrap();
+    assert!(command_log.contains("update finalize --json --yes --no-restart"));
 }
 
 #[test]

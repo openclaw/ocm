@@ -5978,9 +5978,6 @@ fn command_output_reports_unsupported_command(stdout: &str, stderr: &str) -> boo
 
 fn candidate_codex_preflight_json_is_unsupported(value: &Value, stderr: &str) -> bool {
     const CHECK_ID: &str = "codex/managed-app-server";
-    if !stderr.trim().is_empty() {
-        return false;
-    }
     let Some(object) = value.as_object() else {
         return false;
     };
@@ -6009,6 +6006,13 @@ fn candidate_codex_preflight_json_is_unsupported(value: &Value, stderr: &str) ->
             .is_some_and(|message| {
                 message.trim().trim_end_matches('.')
                     == "Unknown health check id selected by --only: codex/managed-app-server"
+                    // Native Doctor mirrors findings to stderr during updates.
+                    // Accept only the same sole selection failure, never other diagnostics.
+                    && (stderr.trim().is_empty()
+                        || stderr.trim()
+                            == format!(
+                                "Doctor lint error [core/doctor/lint-selection]: {message}"
+                            ))
             })
 }
 
@@ -6578,6 +6582,23 @@ mod tests {
                 "message": "Unknown health check id selected by --only: codex/managed-app-server."
             }]
         });
+        let mirrored = "Doctor lint error [core/doctor/lint-selection]: Unknown health check id selected by --only: codex/managed-app-server.\n";
+        assert!(candidate_codex_preflight_is_unsupported(
+            &complete.to_string(),
+            mirrored
+        ));
+        for stderr in [
+            format!("{mirrored}fatal: staged runtime could not load its configuration"),
+            format!("fatal: staged runtime could not load its configuration\n{mirrored}"),
+            mirrored.replace("lint-selection", "final-config-validation"),
+            mirrored.replace("error", "warning"),
+        ] {
+            assert!(!candidate_codex_preflight_is_unsupported(
+                &complete.to_string(),
+                &stderr
+            ));
+        }
+        assert!(!candidate_codex_preflight_is_unsupported("", mirrored));
         for field in ["ok", "checksRun", "checksSkipped"] {
             let mut incomplete = complete.clone();
             incomplete.as_object_mut().unwrap().remove(field);
