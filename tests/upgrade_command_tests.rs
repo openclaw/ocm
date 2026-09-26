@@ -4477,7 +4477,7 @@ fn upgrade_holds_the_environment_operation_lock_until_completion() {
 #[cfg(unix)]
 #[test]
 fn upgrade_children_retain_exclusion_after_parent_death() {
-    for phase in ["doctor", "finalize"] {
+    for phase in ["doctor", "finalize", "status", "rollback-status"] {
         assert_upgrade_child_custody(phase, false);
     }
 }
@@ -4529,10 +4529,29 @@ fn assert_upgrade_child_custody(phase: &str, batch: bool) {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
+    // The existing service fixtures make the real upgrade and rollback paths
+    // reach final verification without starting a daemon or Gateway.
+    struct StatusService {
+        stop: Arc<AtomicBool>,
+        health: Option<thread::JoinHandle<()>>,
+        observer: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for StatusService {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            for handle in [self.observer.take(), self.health.take()]
+                .into_iter()
+                .flatten()
+            {
+                handle.join().unwrap();
+            }
+        }
+    }
+    let mut status_service = None;
     let runtime = root.child("openclaw");
     let gate = r#"
 case "$OCM_CUSTODY_PHASE:$1:$2" in
-  doctor:doctor:--non-interactive|finalize:update:finalize)
+  doctor:doctor:--non-interactive|finalize:update:finalize|status:gateway:status|rollback-status:gateway:status)
   gate="$OCM_CUSTODY_GATES/$OCM_ACTIVE_ENV"
   printf '%s' "$$" > "$gate.started"
   while [ ! -e "$gate.release" ]; do sleep 0.05; done
@@ -4557,6 +4576,81 @@ esac
     for name in ["demo", "other"] {
         let create = run_ocm(&cwd, &env, &["env", "create", name, "--runtime", "local"]);
         assert!(create.status.success(), "{}", stderr(&create));
+    }
+    if phase.ends_with("status") {
+        if phase == "rollback-status" {
+            let add = run_ocm(
+                &cwd,
+                &env,
+                &[
+                    "runtime",
+                    "add",
+                    "previous",
+                    "--path",
+                    &path_string(&runtime),
+                ],
+            );
+            assert!(add.status.success(), "{}", stderr(&add));
+            let bind = run_ocm(&cwd, &env, &["env", "set-runtime", "demo", "previous"]);
+            assert!(bind.status.success(), "{}", stderr(&bind));
+        }
+        env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+        install_fake_launchctl(&root, &mut env);
+        let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(start.status.success(), "{}", stderr(&start));
+        let (port, _, stop, health) = spawn_converging_health_server();
+        let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+        let ocm_home = env["OCM_HOME"].clone();
+        let initial_binding = if phase == "rollback-status" {
+            "previous"
+        } else {
+            "local"
+        };
+        write_running_supervisor_runtime(&runtime_path, &ocm_home, initial_binding, 4242, port);
+        let registry_path = env_registry_path(&env, &cwd).unwrap();
+        let observer_stop = Arc::clone(&stop);
+        let observer = thread::spawn(move || {
+            let mut running = true;
+            let mut pid = 4242;
+            while !observer_stop.load(Ordering::Relaxed) {
+                let current = fs::read(&registry_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|value| value["envs"].as_array().cloned())
+                    .and_then(|envs| envs.into_iter().find(|entry| entry["name"] == "demo"));
+                let desired = current
+                    .as_ref()
+                    .and_then(|entry| entry["serviceRunning"].as_bool())
+                    .unwrap_or(running);
+                if desired != running {
+                    if desired {
+                        pid += 1;
+                        write_running_supervisor_runtime(
+                            &runtime_path,
+                            &ocm_home,
+                            current.as_ref().unwrap()["defaultRuntime"]
+                                .as_str()
+                                .unwrap(),
+                            pid,
+                            port,
+                        );
+                    } else {
+                        write_empty_supervisor_runtime(&runtime_path, &ocm_home);
+                    }
+                    running = desired;
+                }
+                sleep(Duration::from_millis(5));
+            }
+        });
+        status_service = Some(StatusService {
+            stop,
+            health: Some(health),
+            observer: Some(observer),
+        });
+    }
+    if phase == "rollback-status" {
+        let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "local"]);
+        assert!(upgrade.status.success(), "{}", stderr(&upgrade));
     }
     env.insert("OCM_CUSTODY_PHASE".into(), phase.into());
     env.insert("OCM_CUSTODY_GATES".into(), path_string(root.path()));
@@ -4589,6 +4683,8 @@ esac
             "2",
             "--accept-fleet-outage",
         ]);
+    } else if phase == "rollback-status" {
+        command.args(["upgrade", "rollback", "demo"]);
     } else {
         command.args(["upgrade", "demo", "--runtime", "local"]);
     }
@@ -4633,6 +4729,7 @@ esac
     wait_for(&root.child("demo.written"));
     let competing = finish(competing);
     assert!(competing.status.success(), "{}", stderr(&competing));
+    drop(status_service);
 }
 
 #[cfg(unix)]
