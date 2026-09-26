@@ -496,6 +496,18 @@ the resolved target even when preparation fails or the upgrade rolls back.
 The version includes a named runtime's detected version; the channel remains
 `null` when the selected runtime's channel is unknown.
 
+Source launchers still return `local-command`; OCM does not yet upgrade their checkout in place.
+For an ordinary `pnpm openclaw` source launcher or `node <checkout>/openclaw.mjs`, the existing upgrade command also reports source observations without executing the launcher.
+This applies to normal, `--dry-run`, and `--all` output when no explicit runtime or release target is supplied.
+JSON includes `source` only for recognized source launchers, with the canonical `root`, Git `head`, `builtCommit` and `builtVersion` from `dist/build-info.json`, and nullable `buildMatchesHead` and `workingTreeClean` observations.
+A different built commit reveals source that has moved without a matching build; a matching commit alone does not prove a complete build, healthy dependencies, or the identity of a running Gateway.
+Missing or invalid metadata remains unknown and is explained in `issues`.
+Working-tree cleanliness also remains unknown when Git filters or submodules prevent inspection without potentially executing configured commands.
+`trackingRef` and `trackingHead` describe locally recorded Git tracking information, which may be stale; inspection does not fetch or contact a remote.
+`sharedEnvironments` lists other registered launcher, dev, or runtime bindings whose known paths overlap the checkout, including path aliases.
+An empty list does not establish exclusive ownership or exclude unmanaged processes.
+Opaque shell launchers retain their existing report without inferred source facts.
+
 An unsupported candidate Doctor check is a compatibility exception only when
 it is the sole failure. Mixed failures, malformed responses, and contradictory
 diagnostics stop the upgrade before finalization and binding publication.

@@ -1009,7 +1009,7 @@ fn git_worktree_backlink(path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn git_command() -> Command {
+pub(crate) fn git_command() -> Command {
     let mut command = Command::new("git");
     // Inspection and mutation must use the checkout and index selected by -C.
     command
