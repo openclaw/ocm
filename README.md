@@ -282,6 +282,10 @@ creating a snapshot, downloading the target, or changing runtime metadata.
 Switching only the binary cannot reverse newer OpenClaw config or SQLite state
 migrations; returning to an older release requires a checkpoint of its owned state captured
 while that release and its state schema were active.
+After restarting an installed OpenClaw package, OCM compares its build ID with the running Gateway's build ID when both are available.
+A mismatch fails verification and follows the upgrade's rollback policy, even when the reported versions match.
+Older packages and status responses remain supported; when the package has a build ID but the Gateway cannot report one, the verification note says that running build identity is unavailable.
+Launcher bindings retain their existing version and readiness checks.
 `ocm upgrade history <env>` lists completed upgrade transactions newest first,
 including source and target bindings and versions, the pre-upgrade snapshot,
 migration/finalization status, service state, and rollback outcome. History is

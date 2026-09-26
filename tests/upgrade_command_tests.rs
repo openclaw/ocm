@@ -44,6 +44,14 @@ fn append_tar_file(
 }
 
 fn openclaw_package_tarball(script_body: &str, version: &str) -> Vec<u8> {
+    openclaw_package_tarball_with_build_id(script_body, version, None)
+}
+
+fn openclaw_package_tarball_with_build_id(
+    script_body: &str,
+    version: &str,
+    build_id: Option<&str>,
+) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     {
         let mut builder = Builder::new(&mut encoder);
@@ -62,6 +70,16 @@ fn openclaw_package_tarball(script_body: &str, version: &str) -> Vec<u8> {
             .as_bytes(),
             0o644,
         );
+        if let Some(build_id) = build_id {
+            append_tar_file(
+                &mut builder,
+                "package/dist/build-info.json",
+                serde_json::json!({ "buildId": build_id })
+                    .to_string()
+                    .as_bytes(),
+                0o644,
+            );
+        }
         builder.finish().unwrap();
     }
     encoder.finish().unwrap()
@@ -448,6 +466,8 @@ case "$1" in
     elif [ "${{OCM_TEST_GATEWAY_AUTH_HANDSHAKE:-}}" = "1" ]; then
       printf '{{"rpc":{{"ok":false,"error":"device identity required"}}}}\n'
       exit "${{OCM_TEST_GATEWAY_STATUS_EXIT_CODE:-0}}"
+    elif [ -n "${{OCM_TEST_GATEWAY_STATUS_JSON:-}}" ]; then
+      printf '%s\n' "$OCM_TEST_GATEWAY_STATUS_JSON"
     elif [ "${{OCM_TEST_GATEWAY_UNREADY:-}}" = "1" ]; then
       printf '{{"rpc":{{"ok":false,"error":"gateway RPC is not ready"}}}}\n'
     else
@@ -896,6 +916,17 @@ exit 1
 
 #[test]
 fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
+    assert_tracked_runtime_upgrade(None);
+}
+
+#[test]
+fn upgrade_accepts_matching_gateway_build_despite_version_override() {
+    assert_tracked_runtime_upgrade(Some(
+        r#"{"rpc":{"ok":true,"server":{"version":"overridden-version","buildId":"candidate-build"}}}"#,
+    ));
+}
+
+fn assert_tracked_runtime_upgrade(status: Option<&str>) {
     let root = TestDir::new("upgrade-tracked-runtime");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -912,8 +943,11 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
         10,
     );
 
-    let new_tarball =
-        openclaw_package_tarball(&recording_openclaw_script("2026.3.25"), "2026.3.25");
+    let new_tarball = openclaw_package_tarball_with_build_id(
+        &recording_openclaw_script("2026.3.25"),
+        "2026.3.25",
+        Some("candidate-build"),
+    );
     let new_integrity = sha512_integrity(&new_tarball);
     let new_tarball_server = TestHttpServer::serve_bytes_times(
         "/openclaw-2026.3.25.tgz",
@@ -977,6 +1011,14 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
         "OCM_TEST_GATEWAY_STATUS_EXIT_CODE".to_string(),
         "1".to_string(),
     );
+    if let Some(status) = status {
+        env.remove("OCM_TEST_GATEWAY_AUTH_HANDSHAKE");
+        env.remove("OCM_TEST_GATEWAY_STATUS_EXIT_CODE");
+        env.insert(
+            "OCM_TEST_GATEWAY_STATUS_JSON".to_string(),
+            status.to_string(),
+        );
+    }
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
@@ -1030,6 +1072,12 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
     assert!(output.contains("service=started"), "{output}");
     assert!(output.contains("snapshot="), "{output}");
     assert!(output.contains("version=2026.3.25"), "{output}");
+    let build_note = if status.is_some() {
+        "running Gateway build matches the installed runtime"
+    } else {
+        "running Gateway build identity unavailable"
+    };
+    assert!(output.contains(build_note), "{output}");
 
     let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
     assert!(runtime.status.success(), "{}", stderr(&runtime));
@@ -1184,6 +1232,21 @@ fn upgrade_updates_a_tracked_runtime_and_refreshes_the_service() {
 
 #[test]
 fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
+    assert_gateway_verification_rollback(
+        r#"{"rpc":{"ok":false,"error":"gateway RPC is not ready"}}"#,
+        "post-upgrade gateway readiness failed: gateway RPC is not ready",
+    );
+}
+
+#[test]
+fn upgrade_rolls_back_when_ready_gateway_reports_a_different_build() {
+    assert_gateway_verification_rollback(
+        r#"{"rpc":{"ok":true,"server":{"version":"2026.3.25","buildId":"previous-build"}}}"#,
+        "post-upgrade gateway build verification failed",
+    );
+}
+
+fn assert_gateway_verification_rollback(status: &str, expected_error: &str) {
     let root = TestDir::new("upgrade-gateway-readiness-rollback");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -1200,8 +1263,11 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
         &old_tarball,
         10,
     );
-    let new_tarball =
-        openclaw_package_tarball(&recording_openclaw_script("2026.3.25"), "2026.3.25");
+    let new_tarball = openclaw_package_tarball_with_build_id(
+        &recording_openclaw_script("2026.3.25"),
+        "2026.3.25",
+        Some("candidate-build"),
+    );
     let new_integrity = sha512_integrity(&new_tarball);
     let new_tarball_server = TestHttpServer::serve_bytes_times(
         "/openclaw-2026.3.25.tgz",
@@ -1349,7 +1415,10 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
         "OCM_TEST_REQUIRE_STOP_MARKER_DURING_FINALIZE".to_string(),
         path_string(&stop_marker),
     );
-    env.insert("OCM_TEST_GATEWAY_UNREADY".to_string(), "1".to_string());
+    env.insert(
+        "OCM_TEST_GATEWAY_STATUS_JSON".to_string(),
+        status.to_string(),
+    );
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo"]);
     observer_done.store(true, Ordering::Relaxed);
     let (stop_count, start_count, target_entered_backoff) = restart_observer.join().unwrap();
@@ -1359,10 +1428,7 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
     let output = stdout(&upgrade);
     assert!(output.contains("outcome=rolled-back"), "{output}");
     assert!(output.contains("rollback=restored"), "{output}");
-    assert!(
-        output.contains("post-upgrade gateway readiness failed: gateway RPC is not ready"),
-        "{output}"
-    );
+    assert!(output.contains(expected_error), "{output}");
     assert!(health_requests.load(Ordering::SeqCst) > 0);
     assert!(target_entered_backoff);
     assert!(stop_count >= 2, "stop_count={stop_count}");
