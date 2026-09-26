@@ -26,6 +26,7 @@ fn setup(root: &TestDir) -> BTreeMap<String, String> {
             &binary,
             &format!(
                 r#"#!/bin/sh
+printf '%s\n' "$*" >> '{calls}'
 case "$1" in
   --version) echo '{version}';;
   doctor) echo '{{"ok":true,"checksRun":1,"checksSkipped":0,"findings":[]}}';;
@@ -42,6 +43,7 @@ case "$1" in
   *) echo '{{}}';;
 esac
 "#,
+                calls = root.child(format!("{name}-calls")).display(),
                 started = root.child("started").display(),
                 release = root.child("release").display()
             ),
@@ -268,6 +270,58 @@ fn failed_response_does_not_admit_an_upgrade() {
             .contains("no upgrade was started")
     );
     assert!(!root.child("started").exists());
+    assert_eq!(
+        command(&root, &env, &["env", "show", "demo", "--json"])["defaultRuntime"],
+        "old"
+    );
+    assert!(
+        command(&root, &env, &["upgrade", "history", "demo", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn admitted_job_cannot_upgrade_a_replacement_environment() {
+    use fs2::FileExt;
+    let root = TestDir::new("upgrade-job-replacement");
+    let env = setup(&root);
+    let locks = root.child("ocm-home/locks/upgrades");
+    fs::create_dir_all(&locks).unwrap();
+    let transaction = fs::File::create(locks.join("demo.lock")).unwrap();
+    transaction.lock_exclusive().unwrap();
+    let accepted = command(
+        &root,
+        &env,
+        &["upgrade", "job", "start", "demo", "--runtime", "new"],
+    );
+    let removed = run_ocm(root.path(), &env, &["env", "destroy", "demo", "--yes"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    let recreated = run_ocm(
+        root.path(),
+        &env,
+        &["env", "create", "demo", "--runtime", "old"],
+    );
+    assert!(recreated.status.success(), "{}", stderr(&recreated));
+    let original_calls = ["old", "new"]
+        .map(|name| fs::read(root.child(format!("{name}-calls"))).unwrap_or_default());
+    transaction.unlock().unwrap();
+    let result = wait_for_result(&root, &env, accepted["id"].as_str().unwrap());
+    assert_eq!(result["state"], "failed", "{result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("environment was replaced")
+    );
+    assert!(result["result"].is_null());
+    let final_calls = ["old", "new"]
+        .map(|name| fs::read(root.child(format!("{name}-calls"))).unwrap_or_default());
+    assert_eq!(
+        original_calls, final_calls,
+        "reassigned request executed runtime I/O"
+    );
     assert_eq!(
         command(&root, &env, &["env", "show", "demo", "--json"])["defaultRuntime"],
         "old"

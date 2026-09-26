@@ -623,7 +623,7 @@ ocm upgrade job status mira --request-id <id> --json
 
 These commands always return JSON.
 `ocm upgrade job capabilities <env>` reports protocol version 1, platform support, selectors, and the environment's root, state directory, and config path.
-On Unix, OCM-launched OpenClaw processes with a complete absolute OCM executable and store binding receive `OPENCLAW_OCM_UPDATE_PROTOCOL=1` alongside their existing OCM environment identity.
+On Unix, supervised Gateways receive `OPENCLAW_OCM_UPDATE_PROTOCOL=1` alongside their existing OCM environment identity.
 Clients must use their trusted OCM executable and environment binding, and preserve their own requester authorization before submitting an operation.
 Latest status returns `null` when that environment has no job; an unknown exact request ID is an error.
 `start --request-id <id>` lets a caller choose a correlation ID before submission; repeating the same ID and target returns that existing job without replaying it.
@@ -631,6 +631,7 @@ Reusing an ID for a different target is refused.
 `start` accepts the same mutually exclusive `--version`, `--channel`, or `--runtime` selectors as a single-environment upgrade, with rollback enabled.
 It returns only after the worker accepts the request, and the worker starts upgrade work after the response is written.
 Existing environment and upgrade transaction locks still exclude conflicting mutations.
+The worker verifies the admitted environment root and creation identity under the operation lock, before runtime or service I/O, and refuses a same-name replacement.
 A second asynchronous request for the same environment is refused while the first is active.
 
 Each response includes `id`, `envName`, `state`, `progress`, a monotonic `revision`, `createdAt`, a persisted `updatedAt` advancing at least one millisecond per revision, the requested `target`, and optional `result` or `error`.

@@ -71,6 +71,9 @@ struct StoredJob {
     worker: ProcessIdentity,
     process_scope: Option<String>,
     admitted: bool,
+    environment_root: String,
+    #[serde(with = "time::serde::rfc3339")]
+    environment_created_at: OffsetDateTime,
 }
 
 fn advance(job: &mut Job, progress: &str) {
@@ -225,9 +228,12 @@ impl Cli {
         target: UpgradeTarget,
         requested_id: Option<String>,
     ) -> Result<(), String> {
+        let requested_id = requested_id
+            .map(|id| validate_name(&id, "Upgrade job id"))
+            .transpose()?;
         let normalized = validate_name(name, "Environment name")?;
         let name = normalized.as_str();
-        self.environment_service().get(name)?;
+        let environment = self.environment_service().get(name)?;
         let root = self.upgrade_jobs_dir(name)?;
         let admission = try_lock_file(&root.join("admission.lock"), "upgrade job admission")?;
         if let Some(id) = requested_id.as_deref()
@@ -257,16 +263,13 @@ impl Cli {
             }
         }
         let created_at = now_utc();
-        let id = requested_id
-            .map(|id| validate_name(&id, "Upgrade job id"))
-            .transpose()?
-            .unwrap_or_else(|| {
-                format!(
-                    "{}-{}",
-                    std::process::id(),
-                    created_at.unix_timestamp_nanos()
-                )
-            });
+        let id = requested_id.unwrap_or_else(|| {
+            format!(
+                "{}-{}",
+                std::process::id(),
+                created_at.unix_timestamp_nanos()
+            )
+        });
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let mut command =
             crate::cli::detached_worker::command(&executable, &format!("ocm-upgrade-{id}"))?;
@@ -287,6 +290,8 @@ impl Cli {
             worker: current_process_identity()?,
             process_scope: process_scope_id()?,
             admitted: false,
+            environment_root: environment.root,
+            environment_created_at: environment.created_at,
         };
         let path = self.upgrade_job_path(name, &id)?;
         save_job(&path, &record)?;
@@ -308,6 +313,7 @@ impl Cli {
                 let mut record = record;
                 record.job.state = State::Failed;
                 record.job.error = Some(format!("cannot start upgrade worker: {error}"));
+                advance(&mut record.job, "Worker startup failed");
                 save_job(&path, &record)?;
                 return Err(record.job.error.unwrap());
             }
@@ -409,6 +415,25 @@ impl Cli {
         } else {
             1
         })
+    }
+
+    // Called by the ordinary upgrade owner while its environment operation lock is held.
+    pub(super) fn validate_upgrade_job_environment(&self, name: &str) -> Result<(), String> {
+        let Some((job_env, id)) = ACTIVE_JOB.with(|active| active.borrow().clone()) else {
+            return Ok(());
+        };
+        let record = self.read_upgrade_job(&job_env, &id)?;
+        let current = self.environment_service().get(name)?;
+        if current.name != job_env
+            || current.root != record.environment_root
+            || current.created_at != record.environment_created_at
+        {
+            return Err(
+                "environment was replaced after upgrade job admission; no upgrade was started"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     pub(in crate::cli) fn upgrade_job_progress(&self, message: &str) -> Result<(), String> {

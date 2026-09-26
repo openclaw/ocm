@@ -2891,7 +2891,10 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
         let runtime = root.child(format!("bin/{runtime_name}"));
         write_legacy_openclaw_script(
             &runtime,
-            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$OCM_SELF\" \"$OCM_HOME\" \"$OPENCLAW_OCM_UPDATE_PROTOCOL\" > '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+                root.child(format!("{env_name}-scope")).display()
+            ),
         );
         let add = run_ocm(
             &cwd,
@@ -2926,13 +2929,26 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
         .expect("daemon runtime state did not report both children");
     let target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
     let sibling_pid = runtime_child_pid(&initial_runtime, "sibling").unwrap();
+    let scope_path = root.child("target-scope");
+    assert!(wait_for_file(&scope_path, Duration::from_secs(5)));
+    let scope = fs::read_to_string(&scope_path).unwrap();
+    let scope: Vec<_> = scope.lines().collect();
+    assert_eq!(
+        fs::canonicalize(scope[0]).unwrap(),
+        fs::canonicalize(support::ocm_test_binary_path()).unwrap()
+    );
+    assert_eq!(scope[1], env["OCM_HOME"]);
+    assert_eq!(scope[2], "1");
 
     let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
     let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
     sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
     write_persisted_service_state(&sibling_meta_path, &sibling_meta);
 
-    let start = run_ocm(&cwd, &env, &["service", "start", "target", "--json"]);
+    let mut caller_env = env.clone();
+    caller_env.insert("OCM_SELF".into(), "/another/caller/ocm".into());
+    caller_env.insert("OPENCLAW_OCM_UPDATE_PROTOCOL".into(), "stale".into());
+    let start = run_ocm(&cwd, &caller_env, &["service", "start", "target", "--json"]);
     assert!(start.status.success(), "{}", stderr(&start));
     sleep(Duration::from_millis(800));
 

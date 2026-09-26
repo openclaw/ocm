@@ -88,14 +88,6 @@ pub fn build_openclaw_env(
     if meta.service_enabled && meta.service_running {
         apply_external_supervision_hint(&mut next);
     }
-    #[cfg(unix)]
-    if ["OCM_SELF", "OCM_HOME"].iter().all(|key| {
-        base_env
-            .get(*key)
-            .is_some_and(|value| Path::new(value).is_absolute())
-    }) {
-        next.insert("OPENCLAW_OCM_UPDATE_PROTOCOL".to_string(), "1".to_string());
-    }
     next.insert("OCM_ACTIVE_ENV".to_string(), meta.name.clone());
     next.insert(
         "OCM_ACTIVE_ENV_ROOT".to_string(),
@@ -398,21 +390,6 @@ mod tests {
         assert!(!env.contains_key("OPENCLAW_LAUNCHD_LABEL"));
         assert!(!env.contains_key("OPENCLAW_PROFILE"));
         assert!(!env.contains_key("OPENCLAW_RANDOM_USER_VALUE"));
-        assert!(!env.contains_key("OPENCLAW_OCM_UPDATE_PROTOCOL"));
-        #[cfg(unix)]
-        {
-            let mut bound = base.clone();
-            bound.insert("OCM_SELF".into(), "/opt/ocm".into());
-            bound.insert("OCM_HOME".into(), "/tmp/ocm".into());
-            assert_eq!(
-                build_openclaw_env(&meta, &bound)["OPENCLAW_OCM_UPDATE_PROTOCOL"],
-                "1"
-            );
-            bound.insert("OCM_SELF".into(), "ocm".into());
-            assert!(
-                !build_openclaw_env(&meta, &bound).contains_key("OPENCLAW_OCM_UPDATE_PROTOCOL")
-            );
-        }
     }
 
     #[test]

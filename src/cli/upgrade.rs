@@ -2428,6 +2428,7 @@ impl Cli {
     ) -> Result<UpgradeEnvSummary, String> {
         let _transaction_lock = lock_upgrade_transaction(name, &self.env, &self.cwd)?;
         let operation_lock = self.environment_service().lock_operation(name)?;
+        self.validate_upgrade_job_environment(name)?;
         self.upgrade_env_locked(name, target, options, &operation_lock)
     }
 

@@ -653,13 +653,7 @@ impl<'a> SupervisorService<'a> {
         ensure_store(self.env, self.cwd)?;
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;
-        // Saved child specs are also built by ordinary CLI callers, which need
-        // not inherit the daemon's own executable/store environment.
         let mut child_env = self.env.clone();
-        child_env.insert(
-            "OCM_SELF".into(),
-            display_path(&self.supervisor_executable_path()?),
-        );
         child_env.insert("OCM_HOME".into(), display_path(&ocm_home));
         let env_service = EnvironmentService::new(&child_env, self.cwd);
         let mut envs = list_environments(self.env, self.cwd)?;
@@ -1330,6 +1324,15 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
             )
         })?;
     let mut process_env = spec.process_env.clone();
+    // Bind clients to the actual spawning daemon, not the CLI that last
+    // regenerated the desired spec (which must not restart a running Gateway).
+    #[cfg(unix)]
+    {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        process_env.insert("OCM_SELF".into(), display_path(&executable));
+        process_env.insert("OPENCLAW_OCM_UPDATE_PROTOCOL".into(), "1".into());
+    }
+
     process_env.insert(
         "TMPDIR".to_string(),
         display_path(&prepare_supervisor_child_tmpdir()?),
@@ -2802,6 +2805,8 @@ fn build_supervised_openclaw_env(
     process_env: BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut process_env = stable_supervised_child_env(process_env);
+    process_env.remove("OCM_SELF");
+    process_env.remove("OPENCLAW_OCM_UPDATE_PROTOCOL");
     apply_external_supervision_hint(&mut process_env);
     process_env
 }
