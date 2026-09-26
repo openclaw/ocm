@@ -3454,6 +3454,44 @@ fn service_start_waits_for_slow_gateway_health() {
     stop_process(&mut daemon);
 }
 
+#[cfg(unix)]
+#[test]
+fn service_start_preserves_quoted_shell_builtin_launchers() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-readiness-quoted-builtin");
+    let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
+    let entry = root.child("Entrypoint With Spaces.mjs");
+    std::os::unix::fs::symlink(root.child("bin/readiness-openclaw.mjs"), &entry).unwrap();
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "quoted",
+            "--command",
+            &format!("exec \"node\" '{}'", path_string(&entry)),
+        ],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let bound = run_ocm(&cwd, &env, &["env", "set-launcher", "demo", "quoted"]);
+    assert!(bound.status.success(), "{}", stderr(&bound));
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+    // Reap the isolated supervisor and its child even if the readiness assertion fails.
+    stop_process(&mut daemon);
+    assert!(
+        started.status.success(),
+        "{}\n{}",
+        stdout(&started),
+        stderr(&started)
+    );
+    let body: Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(body["gatewayReady"], true);
+    assert_eq!(body["gatewayState"], "running");
+}
+
 #[test]
 fn service_start_reports_failed_backoff_with_the_child_error() {
     let _guard = daemon_runtime_test_lock();

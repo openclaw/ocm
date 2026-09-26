@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::Cli;
-use crate::launcher::{LauncherMeta, resolve_direct_launcher_command};
+use crate::launcher::{LauncherMeta, parse_literal_launcher_command};
 use crate::openclaw_repo::git_command;
 use crate::store::display_path;
 
@@ -159,9 +159,10 @@ impl Cli {
 
 fn launcher_source_root(launcher: &LauncherMeta) -> Option<PathBuf> {
     let cwd = launcher.cwd.as_deref().map(Path::new);
-    let direct = resolve_direct_launcher_command(launcher, &[], cwd.unwrap_or(Path::new("")))?;
-    let program = Path::new(&direct.program).file_name()?.to_str()?;
-    let root = match (program, direct.args.as_slice()) {
+    let words = parse_literal_launcher_command(&launcher.command)?;
+    let (program, args) = words.split_first()?;
+    let program = Path::new(program).file_name()?.to_str()?;
+    let root = match (program, args) {
         ("pnpm" | "pnpm.cmd", [script]) if script == "openclaw" => cwd?.to_path_buf(),
         ("node" | "node.exe", [entry]) => {
             let entry = Path::new(entry);
