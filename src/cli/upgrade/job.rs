@@ -165,7 +165,12 @@ impl Cli {
 
     fn read_upgrade_job(&self, name: &str, id: &str) -> Result<StoredJob, String> {
         let record: StoredJob = read_json(&self.upgrade_job_path(name, id)?)?;
-        if record.schema != 1 || record.job.id != id || record.job.env_name != name {
+        let expected_schema = if record.expected_binding.is_some() {
+            2
+        } else {
+            1
+        };
+        if record.schema != expected_schema || record.job.id != id || record.job.env_name != name {
             return Err("unsupported or mismatched upgrade job record".into());
         }
         Ok(record)
@@ -348,7 +353,8 @@ impl Cli {
         let mut command =
             crate::cli::detached_worker::command(&executable, &format!("ocm-upgrade-{id}"))?;
         let record = StoredJob {
-            schema: 1,
+            // Older workers reject guarded records instead of ignoring the condition.
+            schema: if expected_binding.is_some() { 2 } else { 1 },
             job: Job {
                 id: id.clone(),
                 env_name: name.into(),

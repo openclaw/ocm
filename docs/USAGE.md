@@ -633,6 +633,7 @@ OCM rejects a mismatched new request before recording it and rechecks the condit
 If the binding changes after admission while the worker waits, the accepted job fails without changing the binding, runtime, service, or upgrade history.
 Repeating an accepted request with the same ID, target, and binding condition returns its original job even if that binding has since changed; changing the condition for that ID is refused.
 Without `--if-binding`, explicit operator selectors retain their ordinary behavior, including conversion from a launcher to a packaged runtime.
+Guarded requests use job-record version 2 so older workers refuse them instead of ignoring the condition; unguarded records retain version 1.
 Latest status excludes completed jobs from an older environment instance; an exact ID still retrieves its original historical result.
 An active prior-instance worker still blocks new jobs, and latest status reports that blocker with its exact request ID.
 `start` accepts the same mutually exclusive `--version`, `--channel`, or `--runtime` selectors as a single-environment upgrade, with rollback enabled.

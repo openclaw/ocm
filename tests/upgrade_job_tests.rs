@@ -141,6 +141,19 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
     assert!(accepted["result"].is_null());
     assert_eq!(accepted["envName"], "demo");
     assert_eq!(accepted["id"], "admission");
+    let record: Value = serde_json::from_slice(
+        &fs::read(
+            ocm::store::upgrade_history_env_dir("demo", &env, root.path())
+                .unwrap()
+                .join("jobs/admission.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        record["schema"], 2,
+        "older workers must reject a guarded record"
+    );
     let resumed = command(
         &root,
         &env,
@@ -663,6 +676,17 @@ fn unconditional_job_preserves_explicit_launcher_conversion() {
     );
     let result = wait_for_result(&root, &env, accepted["id"].as_str().unwrap());
     assert_eq!(result["state"], "succeeded", "{result}");
+    let record: Value = serde_json::from_slice(
+        &fs::read(
+            ocm::store::upgrade_history_env_dir("demo", &env, root.path())
+                .unwrap()
+                .join(format!("jobs/{}.json", accepted["id"].as_str().unwrap())),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["schema"], 1);
+    assert!(record.get("expectedBinding").is_none());
     let final_env = command(&root, &env, &["env", "show", "demo", "--json"]);
     assert_eq!(final_env["defaultRuntime"], "new");
     assert!(final_env["defaultLauncher"].is_null());
