@@ -3698,6 +3698,9 @@ fn assert_upgrade_rollback_restart_failure(
     }
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
     let output = stdout(&upgrade);
+    if !candidate_failure {
+        assert_eq!(output.lines().count(), 1, "{output}");
+    }
     assert!(!output.contains("service-private-token"), "{output}");
     assert!(
         output.contains("outcome=rollback-failed"),
