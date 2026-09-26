@@ -149,7 +149,7 @@ impl Drop for UpgradeInterruptFence {
 const UPGRADE_INTERRUPTED_ERROR: &str =
     "upgrade interrupted by SIGINT or SIGTERM; restoring the pre-upgrade state";
 
-#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UpgradeEnvSummary {
     #[serde(skip_serializing_if = "Option::is_none")]

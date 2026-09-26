@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::{Cli, UpgradeEnvSummary, UpgradeOptions, UpgradeTarget, is_failed_upgrade_outcome};
+use super::{Cli, UpgradeOptions, UpgradeTarget, is_failed_upgrade_outcome};
 use crate::infra::process_identity::{
     ProcessIdentity, current_process_identity, observe_process, process_scope_id,
 };
@@ -43,7 +43,7 @@ struct Job {
     #[serde(with = "time::serde::rfc3339")]
     updated_at: OffsetDateTime,
     target: UpgradeTarget,
-    result: Option<UpgradeEnvSummary>,
+    result: Option<serde_json::Value>,
     error: Option<String>,
 }
 
@@ -425,7 +425,15 @@ impl Cli {
                 } else {
                     State::Succeeded
                 };
-                record.job.result = Some(summary);
+                match serde_json::to_value(summary) {
+                    Ok(result) => record.job.result = Some(result),
+                    Err(error) => {
+                        record.job.state = State::Failed;
+                        record.job.error = Some(format!(
+                            "upgrade finished but its result could not be encoded: {error}"
+                        ));
+                    }
+                }
             }
             Err(error) => {
                 record.job.state = State::Failed;
