@@ -2842,6 +2842,8 @@ fn bound_official_runtime_is_reused_but_not_refreshed() {
         "application/json",
         vec![
             stable_packument.as_bytes().to_vec(),
+            stable_packument.as_bytes().to_vec(),
+            stable_packument.as_bytes().to_vec(),
             stable_packument.into_bytes(),
             moved_packument.as_bytes().to_vec(),
             moved_packument.into_bytes(),
@@ -2867,6 +2869,31 @@ fn bound_official_runtime_is_reused_but_not_refreshed() {
     assert!(reuse.status.success(), "{}", stderr(&reuse));
     assert!(stdout(&reuse).contains("Using installed runtime stable"));
 
+    // Older installed runtimes remain reusable without rewriting their metadata.
+    let meta_path = runtime_meta_path("stable", &env, &cwd).unwrap();
+    let mut legacy: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("sourceIntegrity");
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+    fs::write(&meta_path, &legacy_bytes).unwrap();
+    let original_env =
+        serde_json::to_value(ocm::store::get_environment("demo", &env, &cwd).unwrap()).unwrap();
+
+    let reuse = run_ocm(&cwd, &env, &["runtime", "install", "--channel", "stable"]);
+    assert!(reuse.status.success(), "{}", stderr(&reuse));
+    assert!(stdout(&reuse).contains("Using installed runtime stable"));
+    let start = run_ocm(&cwd, &env, &["start", "second", "--no-service"]);
+    assert!(start.status.success(), "{}", stderr(&start));
+    let second = run_ocm(&cwd, &env, &["env", "show", "second", "--json"]);
+    assert!(second.status.success(), "{}", stderr(&second));
+    let second: Value = serde_json::from_str(&stdout(&second)).unwrap();
+    assert_eq!(second["defaultRuntime"], "stable");
+    assert_eq!(fs::read(&meta_path).unwrap(), legacy_bytes);
+    assert_eq!(
+        serde_json::to_value(ocm::store::get_environment("demo", &env, &cwd).unwrap()).unwrap(),
+        original_env
+    );
+    assert_eq!(stable_tarball_server.requests().len(), 1);
+
     let refresh = run_ocm(&cwd, &env, &["runtime", "install", "--channel", "stable"]);
     assert_eq!(refresh.status.code(), Some(1));
     let error = stderr(&refresh);
@@ -2879,7 +2906,7 @@ fn bound_official_runtime_is_reused_but_not_refreshed() {
     let create_on_moved_channel = run_ocm(
         &cwd,
         &env,
-        &["env", "create", "second", "--channel", "stable"],
+        &["env", "create", "third", "--channel", "stable"],
     );
     assert_eq!(create_on_moved_channel.status.code(), Some(1));
     assert!(
@@ -2895,7 +2922,7 @@ fn bound_official_runtime_is_reused_but_not_refreshed() {
     let list = run_ocm(&cwd, &env, &["env", "list", "--json"]);
     assert!(list.status.success(), "{}", stderr(&list));
     let environments: Value = serde_json::from_str(&stdout(&list)).unwrap();
-    assert_eq!(environments.as_array().unwrap().len(), 1);
+    assert_eq!(environments.as_array().unwrap().len(), 2);
 }
 
 #[test]

@@ -14,6 +14,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
@@ -98,6 +99,17 @@ pub struct SupervisorChildSpec {
     pub stderr_path: String,
     #[serde(deserialize_with = "deserialize_supervisor_child_env")]
     pub process_env: BTreeMap<String, String>,
+}
+
+impl SupervisorChildSpec {
+    pub(crate) fn launch_spec_sha256(&self) -> Option<String> {
+        serde_json::to_vec(self).ok().map(|bytes| {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        })
+    }
 }
 
 fn deserialize_supervisor_child_env<'de, D>(
@@ -208,6 +220,8 @@ pub struct SupervisorRunSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupervisorRuntimeChild {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_spec_sha256: Option<String>,
     pub env_name: String,
     pub binding_kind: String,
     pub binding_name: String,
@@ -430,6 +444,49 @@ impl<'a> SupervisorService<'a> {
             updated_at: runtime.updated_at,
             children: runtime.children,
         })
+    }
+
+    /// Compare the applied child with the canonical current plan.
+    /// Mutation decisions must retain their environment operation lock.
+    pub(crate) fn running_launch_matches(&self, env_name: &str, pid: u32) -> Result<bool, String> {
+        let Some(observed) = self.live_runtime_state()? else {
+            return Ok(false);
+        };
+        let Some(child) = observed
+            .children
+            .iter()
+            .find(|child| child.env_name == env_name)
+        else {
+            return Ok(false);
+        };
+        let Some(running) = observed
+            .services
+            .iter()
+            .find(|entry| entry.env_name == env_name)
+        else {
+            return Ok(false);
+        };
+        let Some(desired) = self
+            .plan()?
+            .children
+            .into_iter()
+            .find(|spec| spec.env_name == env_name)
+        else {
+            return Ok(false);
+        };
+        let Some(desired_digest) = desired.launch_spec_sha256() else {
+            return Ok(false);
+        };
+        Ok(
+            child.launch_spec_sha256.as_deref() == Some(desired_digest.as_str())
+                && child.pid == pid
+                && child.binding_kind == desired.binding_kind
+                && child.binding_name == desired.binding_name
+                && running.pid == Some(pid)
+                && running.binding_kind == desired.binding_kind
+                && running.binding_name == desired.binding_name
+                && running.gateway_state == "running",
+        )
     }
 
     pub fn inspect(&self) -> Result<SupervisorInspection, String> {
@@ -1227,6 +1284,7 @@ fn try_lock_supervisor_state(
 
 struct RunningSupervisorChild {
     spec: SupervisorChildSpec,
+    launch_spec_sha256: Option<String>,
     child: Child,
     restart_count: usize,
     quick_clean_restart_count: usize,
@@ -1296,6 +1354,7 @@ fn spawn_running_child(
     );
     Ok(RunningSupervisorChild {
         child: spawn_supervisor_child(&prepared_spec)?,
+        launch_spec_sha256: spec.launch_spec_sha256(),
         spec,
         restart_count,
         quick_clean_restart_count,
@@ -2950,6 +3009,7 @@ fn write_supervisor_runtime_state(
 
 fn supervisor_runtime_child(running_child: &RunningSupervisorChild) -> SupervisorRuntimeChild {
     SupervisorRuntimeChild {
+        launch_spec_sha256: running_child.launch_spec_sha256.clone(),
         env_name: running_child.spec.env_name.clone(),
         binding_kind: running_child.spec.binding_kind.clone(),
         binding_name: running_child.spec.binding_name.clone(),
@@ -3748,6 +3808,7 @@ mod tests {
             let mut running = RunningFixture(BTreeMap::from([(
                 "demo".to_string(),
                 RunningSupervisorChild {
+                    launch_spec_sha256: original.launch_spec_sha256(),
                     spec: original.clone(),
                     child,
                     restart_count: 0,
@@ -3793,6 +3854,14 @@ mod tests {
             let owner = running.0.get_mut("demo").unwrap();
             assert_eq!(owner.child.id(), pid);
             assert!(owner.child.try_wait().unwrap().is_none());
+            let observed = supervisor_runtime_child(owner);
+            assert_eq!(observed.launch_spec_sha256, original.launch_spec_sha256());
+            if change == "changed" {
+                assert_ne!(
+                    observed.launch_spec_sha256,
+                    next.children[0].launch_spec_sha256()
+                );
+            }
             let saved: SupervisorState = read_json(&state_path).unwrap();
             assert!(supervisor_state_equivalent(&saved, &next));
             drop(state_lock);

@@ -19,9 +19,11 @@ use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
 use ocm::infra::download::file_sha256;
 use ocm::store::{env_registry_path, now_utc, supervisor_runtime_path, supervisor_state_path};
-use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
+use ocm::supervisor::{
+    SupervisorChildSpec, SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState,
+};
 use serde_json::Value;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use tar::{Builder, Header};
 
 use crate::support::{
@@ -113,6 +115,25 @@ fn write_running_supervisor_binding(
     let log_root = runtime_path.parent().unwrap();
     let stdout_path = path_string(&log_root.join("demo.stdout.log"));
     let stderr_path = path_string(&log_root.join("demo.stderr.log"));
+    // The fixture models a child spawned from the persisted plan, not a fresh
+    // desired plan built by a later job with changed launch settings.
+    let launch_spec_sha256 = fs::read(Path::new(ocm_home).join("supervisor/state.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|state| {
+            state["children"]
+                .as_array()?
+                .iter()
+                .find(|child| child["envName"] == "demo")
+                .cloned()
+        })
+        .and_then(|spec| serde_json::from_value::<SupervisorChildSpec>(spec).ok())
+        .map(|spec| {
+            Sha256::digest(serde_json::to_vec(&spec).unwrap())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        });
     let runtime = SupervisorRuntimeState {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
@@ -136,6 +157,7 @@ fn write_running_supervisor_binding(
             next_retry_at: None,
         }],
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256,
             env_name: "demo".to_string(),
             binding_kind: binding_kind.to_string(),
             binding_name: binding_name.to_string(),
@@ -987,6 +1009,11 @@ fn assert_tracked_runtime_upgrade(status: Option<&str>) {
             updated_packument.as_bytes().to_vec(),
             updated_packument.as_bytes().to_vec(),
             updated_packument.as_bytes().to_vec(),
+            updated_packument.as_bytes().to_vec(),
+            updated_packument.as_bytes().to_vec(),
+            updated_packument.as_bytes().to_vec(),
+            updated_packument.as_bytes().to_vec(),
+            updated_packument.as_bytes().to_vec(),
         ],
     );
 
@@ -1225,6 +1252,79 @@ fn assert_tracked_runtime_upgrade(status: Option<&str>) {
     );
     assert!(stdout(&prune_snapshot).contains("Pruned 1 snapshot(s)."));
     assert!(!recovery_root.exists());
+
+    #[cfg(unix)]
+    if status.is_some() {
+        let job_ocm_home = env.get("OCM_HOME").unwrap().clone();
+        // Publish the completed fake spawn after its saved plan is available;
+        // the policy observer can see the registry transition before that write.
+        let publish_spawn = || {
+            write_running_supervisor_runtime(
+                &runtime_path,
+                &job_ocm_home,
+                "stable",
+                4244,
+                health_port,
+            )
+        };
+        publish_spawn();
+        let before_runtime = fs::read(&runtime_path).unwrap();
+        let current = finish_runtime_job(&cwd, &env, &[]);
+        assert_eq!(current["state"], "succeeded", "{current}");
+        assert!(current["result"]["snapshotId"].is_null(), "{current}");
+        assert!(current["result"]["serviceAction"].is_null(), "{current}");
+        assert_eq!(fs::read(&runtime_path).unwrap(), before_runtime);
+        let mut legacy: Value = serde_json::from_slice(&before_runtime).unwrap();
+        legacy["children"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("launchSpecSha256");
+        write_json_replacing_path(&runtime_path, &legacy);
+        let unknown_spec = finish_runtime_job(&cwd, &env, &[]);
+        assert!(
+            unknown_spec["result"]["snapshotId"].is_string(),
+            "{unknown_spec}"
+        );
+        publish_spawn();
+        env.insert("NODE_OPTIONS".into(), "--dns-result-order=ipv4first".into());
+        let launch_drift = finish_runtime_job(&cwd, &env, &[]);
+        assert!(
+            launch_drift["result"]["snapshotId"].is_string(),
+            "{launch_drift}"
+        );
+        publish_spawn();
+        env.remove("NODE_OPTIONS");
+        let restored_launch = finish_runtime_job(&cwd, &env, &[]);
+        assert!(
+            restored_launch["result"]["snapshotId"].is_string(),
+            "{restored_launch}"
+        );
+        publish_spawn();
+        for observation in [
+            r#"{"rpc":{"ok":true,"server":{}}}"#,
+            r#"{"rpc":{"ok":true,"server":{"buildId":"other-build"}}}"#,
+            r#"{"rpc":{"ok":false,"server":{"buildId":"candidate-build"}}}"#,
+        ] {
+            env.insert("OCM_TEST_GATEWAY_STATUS_JSON".into(), observation.into());
+            let fallback = finish_runtime_job(&cwd, &env, &[]);
+            assert!(fallback["result"]["snapshotId"].is_string(), "{fallback}");
+        }
+        env.insert(
+            "OCM_TEST_GATEWAY_STATUS_JSON".into(),
+            status.unwrap().into(),
+        );
+        // Planned binding is stable, while the observed child still belongs to
+        // another runtime that could serve the same native build.
+        write_running_supervisor_runtime(
+            &runtime_path,
+            env.get("OCM_HOME").unwrap(),
+            "stale",
+            4244,
+            health_port,
+        );
+        let stale = finish_runtime_job(&cwd, &env, &[]);
+        assert!(stale["result"]["snapshotId"].is_string(), "{stale}");
+    }
 
     let reuse = run_ocm(&cwd, &env, &["upgrade", "demo"]);
     snapshot_observer_done.store(true, Ordering::Relaxed);
@@ -8284,5 +8384,242 @@ fn candidate_batch_journal_keeps_bounded_redacted_notes_out_of_environment_histo
         assert!(!history_text.contains("private-token"));
         let history: Value = serde_json::from_str(&history_text).unwrap();
         assert!(history[0]["note"].is_null());
+    }
+}
+
+#[cfg(unix)]
+fn finish_runtime_job(cwd: &Path, env: &BTreeMap<String, String>, target: &[&str]) -> Value {
+    let mut args = vec!["upgrade", "job", "start", "demo"];
+    args.extend_from_slice(target);
+    let started = run_ocm(cwd, env, &args);
+    assert!(started.status.success(), "{}", stderr(&started));
+    let started: Value = serde_json::from_str(&stdout(&started)).unwrap();
+    let id = started["id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = run_ocm(
+            cwd,
+            env,
+            &["upgrade", "job", "status", "demo", "--request-id", id],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+        let job: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        if matches!(
+            job["state"].as_str(),
+            Some("succeeded" | "failed" | "interrupted")
+        ) {
+            return job;
+        }
+        assert!(Instant::now() < deadline, "job did not finish: {job}");
+        sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn current_package_jobs_preserve_state_and_operator_upgrades_still_finalize() {
+    assert_current_package_job("current");
+}
+
+#[cfg(unix)]
+#[test]
+fn current_package_jobs_preserve_config_repair_and_candidate_failure() {
+    for case in [
+        "repair",
+        "candidate",
+        "unknown-build",
+        "legacy-integrity",
+        "damaged",
+        "unknown-service",
+        "stopping",
+    ] {
+        assert_current_package_job(case);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn package_jobs_apply_track_and_same_version_artifact_changes() {
+    for case in ["track-switch", "different-build"] {
+        assert_current_package_job(case);
+    }
+}
+
+#[cfg(unix)]
+fn assert_current_package_job(case: &str) {
+    let root = TestDir::new(&format!("managed-job-{case}"));
+    let version = "2026.3.25";
+    let original = openclaw_package_tarball_with_build_id(
+        &recording_openclaw_script(version),
+        version,
+        (case != "unknown-build").then_some("current-build"),
+    );
+    let replacement = if case == "different-build" {
+        openclaw_package_tarball_with_build_id(
+            &recording_openclaw_script(version),
+            version,
+            Some("replacement-build"),
+        )
+    } else {
+        original.clone()
+    };
+    // A changed artifact at the same URL/version must not qualify as reuse.
+    let packages = TestHttpServer::serve_bytes_sequence(
+        "/openclaw.tgz",
+        "application/octet-stream",
+        vec![original.clone(), replacement.clone()],
+    );
+    let catalog = |bytes: &[u8]| {
+        serde_json::json!({
+            "dist-tags": { "latest": version, "beta": version },
+            "versions": { version: { "version": version, "dist": {
+                "tarball": packages.url(), "integrity": sha512_integrity(bytes)
+            } } }
+        })
+        .to_string()
+        .into_bytes()
+    };
+    let catalog = TestHttpServer::serve_bytes_sequence(
+        "/openclaw",
+        "application/json",
+        vec![
+            catalog(&original),
+            catalog(&replacement),
+            catalog(&replacement),
+            catalog(&replacement),
+            catalog(&replacement),
+        ],
+    );
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "unsupported".into());
+    env.insert("OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(), catalog.url());
+    env.insert("OCM_TEST_CODEX_PREFLIGHT".into(), "pass".into());
+    let start = run_ocm(root.path(), &env, &["start", "demo", "--no-service"]);
+    assert!(start.status.success(), "{}", stderr(&start));
+    let config = root.child("ocm-home/envs/demo/.openclaw/openclaw.json");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "{\"gateway\":{\"mode\":\"local\"}}\n").unwrap();
+    let registry = env_registry_path(&env, root.path()).unwrap();
+    let runtime = root.child("ocm-home/runtimes/stable.json");
+    let before = [&config, &registry, &runtime].map(|path| fs::read(path).unwrap());
+    if case == "current" {
+        for target in [
+            vec![],
+            vec!["--channel", "stable"],
+            vec!["--runtime", "stable"],
+        ] {
+            let job = finish_runtime_job(root.path(), &env, &target);
+            assert_eq!(job["state"], "succeeded", "{job}");
+            assert_eq!(job["result"]["outcome"], "up-to-date", "{job}");
+            assert!(job["result"]["snapshotId"].is_null(), "{job}");
+            assert!(job["result"]["serviceAction"].is_null(), "{job}");
+            assert_eq!(
+                before,
+                [&config, &registry, &runtime].map(|path| fs::read(path).unwrap())
+            );
+            let history = run_ocm(root.path(), &env, &["upgrade", "history", "demo", "--json"]);
+            assert!(history.status.success(), "{}", stderr(&history));
+            assert_eq!(
+                serde_json::from_str::<Value>(&stdout(&history)).unwrap(),
+                serde_json::json!([])
+            );
+        }
+        let calls = fs::read_to_string(root.child("ocm-home/envs/demo/sim-commands.log")).unwrap();
+        assert!(!calls.contains("update finalize"), "{calls}");
+        assert!(!calls.contains("doctor --non-interactive --fix"), "{calls}");
+        let ordinary = run_ocm(
+            root.path(),
+            &env,
+            &["upgrade", "demo", "--runtime", "stable", "--json"],
+        );
+        assert!(ordinary.status.success(), "{}", stderr(&ordinary));
+        let ordinary: Value = serde_json::from_str(&stdout(&ordinary)).unwrap();
+        assert!(ordinary["snapshotId"].is_string(), "{ordinary}");
+        let calls = fs::read_to_string(root.child("ocm-home/envs/demo/sim-commands.log")).unwrap();
+        assert!(calls.contains("update finalize"), "{calls}");
+        return;
+    }
+    if matches!(case, "unknown-service" | "stopping") {
+        env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+        install_fake_launchctl(&root, &mut env);
+        let output = run_ocm(root.path(), &env, &["service", "install", "demo"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        if case == "stopping" {
+            write_running_supervisor_runtime(
+                &supervisor_runtime_path(&env, root.path()).unwrap(),
+                env.get("OCM_HOME").unwrap(),
+                "stale",
+                4244,
+                18789,
+            );
+        }
+    }
+    if case == "repair" {
+        env.insert("OCM_TEST_INVALID_CONFIG_UNTIL_DOCTOR".into(), "1".into());
+    }
+    if case == "candidate" {
+        env.insert("OCM_TEST_CODEX_PREFLIGHT".into(), "fail".into());
+    }
+    if case == "legacy-integrity" {
+        let mut meta: Value = serde_json::from_slice(&before[2]).unwrap();
+        meta.as_object_mut().unwrap().remove("sourceIntegrity");
+        write_json_replacing_path(&runtime, &meta);
+    }
+    if case == "damaged" {
+        let meta: Value = serde_json::from_slice(&before[2]).unwrap();
+        let build = Path::new(meta["binaryPath"].as_str().unwrap())
+            .parent()
+            .unwrap()
+            .join("dist/build-info.json");
+        fs::write(build, "{}\n").unwrap();
+    }
+    let target = if case == "track-switch" {
+        vec!["--channel", "beta"]
+    } else {
+        vec![]
+    };
+    let job = finish_runtime_job(root.path(), &env, &target);
+    if case == "stopping" {
+        assert_eq!(job["state"], "failed", "{job}");
+        assert!(
+            job["error"]
+                .as_str()
+                .unwrap()
+                .contains("did not acknowledge quiescence"),
+            "{job}"
+        );
+        assert!(job["result"].is_null(), "{job}");
+        return;
+    }
+    assert_eq!(
+        job["state"],
+        if case == "candidate" {
+            "failed"
+        } else {
+            "succeeded"
+        },
+        "{case}: {job}"
+    );
+    assert!(job["result"]["snapshotId"].is_string(), "{case}: {job}");
+    let calls = fs::read_to_string(root.child("ocm-home/envs/demo/sim-commands.log")).unwrap();
+    match case {
+        "repair" => assert!(calls.contains("doctor --non-interactive --fix"), "{calls}"),
+        "candidate" => {
+            assert_eq!(job["result"]["outcome"], "rolled-back", "{job}");
+            assert!(!calls.contains("update finalize"), "{calls}");
+        }
+        "track-switch" => assert_eq!(job["result"]["bindingName"], "beta", "{job}"),
+        "different-build" | "damaged" | "legacy-integrity" => {
+            assert_eq!(job["result"]["outcome"], "updated", "{job}");
+            assert!(calls.contains("update finalize"), "{calls}");
+            let meta: Value = serde_json::from_slice(&fs::read(runtime).unwrap()).unwrap();
+            assert_eq!(meta["sourceIntegrity"], sha512_integrity(&replacement));
+            if case == "legacy-integrity" {
+                assert_eq!(fs::read(&config).unwrap(), before[0]);
+                assert_eq!(fs::read(&registry).unwrap(), before[1]);
+            }
+        }
+        _ => {}
     }
 }

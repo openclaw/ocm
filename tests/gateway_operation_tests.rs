@@ -96,6 +96,7 @@ fn gateway_owned_operation_waits_for_pid_publication(snapshot: bool) {
             children: pid
                 .into_iter()
                 .map(|pid| SupervisorRuntimeChild {
+                    launch_spec_sha256: None,
                     env_name: spec.env_name.clone(),
                     binding_kind: spec.binding_kind.clone(),
                     binding_name: spec.binding_name.clone(),

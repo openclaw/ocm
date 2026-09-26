@@ -507,6 +507,10 @@ impl Cli {
     }
 
     // Called by the ordinary upgrade owner while its environment operation lock is held.
+    pub(super) fn is_upgrade_job(&self, name: &str) -> bool {
+        ACTIVE_JOB.with(|active| active.borrow().as_ref().is_some_and(|(env, _)| env == name))
+    }
+
     pub(super) fn validate_upgrade_job_environment(&self, name: &str) -> Result<(), String> {
         let Some((job_env, id)) = ACTIVE_JOB.with(|active| active.borrow().clone()) else {
             return Ok(());

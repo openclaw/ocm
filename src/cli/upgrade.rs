@@ -2557,6 +2557,17 @@ impl Cli {
                 preparation_started,
                 "completed",
             );
+            if let Some(mut summary) = self.current_runtime_job_result(
+                env_name,
+                &current,
+                &prepared,
+                service.as_ref(),
+                operation_lock,
+            ) {
+                summary.runtime_release_version = target_release_version;
+                summary.runtime_release_channel = target_channel;
+                return Ok(summary);
+            }
             let target_changed = !matches!(prepared.action, OfficialRuntimePrepareAction::Reused);
             let mut transaction = self.begin_upgrade_transaction_locked(
                 env_name,
@@ -2882,6 +2893,17 @@ impl Cli {
                 preparation_started,
                 "completed",
             );
+            if let Some(mut summary) = self.current_runtime_job_result(
+                env_name,
+                &current,
+                &prepared,
+                service.as_ref(),
+                operation_lock,
+            ) {
+                summary.runtime_release_version = target_release_version;
+                summary.runtime_release_channel = target_channel;
+                return Ok(summary);
+            }
             let changed = matches!(
                 prepared.action,
                 OfficialRuntimePrepareAction::Installed | OfficialRuntimePrepareAction::Updated
@@ -3686,6 +3708,124 @@ impl Cli {
             ),
         };
         self.finish_successful_upgrade(summary, transaction)
+    }
+
+    fn current_runtime_job_result(
+        &self,
+        env_name: &str,
+        current: &RuntimeMeta,
+        prepared: &PreparedUpgradeTarget,
+        service: Option<&ServiceSummary>,
+        operation_lock: &EnvironmentOperationLock,
+    ) -> Option<UpgradeEnvSummary> {
+        // Ordinary operator upgrades retain their repair/finalization behavior.
+        // Reuse already verified the installed tree and requested release/selector.
+        if !self.is_upgrade_job(env_name)
+            || !matches!(prepared.action, OfficialRuntimePrepareAction::Reused)
+            || prepared.name != current.name
+            || prepared.meta.runtime_sha256.is_none()
+        {
+            return None;
+        }
+        let build_id = installed_openclaw_build_id(&prepared.meta)?;
+        let environment = self.environment_service().get(env_name).ok()?;
+        if !derive_env_paths(Path::new(&environment.root))
+            .config_path
+            .is_file()
+        {
+            return None;
+        }
+        let validation = self
+            .run_update_mode_openclaw_command_output_with_env(
+                env_name,
+                &prepared.name,
+                "openclaw config validate",
+                &["config", "validate"],
+                &[],
+                Some(operation_lock),
+            )
+            .ok()?;
+        if !validation.status.success()
+            || self
+                .validate_committed_upgrade_target(env_name, &prepared.meta, operation_lock)
+                .is_err()
+        {
+            // Unknown or repairable state belongs to the checkpointed upgrade path.
+            return None;
+        }
+        if let Some(service) = service {
+            if !service.running
+                || service.child_pid.is_none()
+                || service.binding_kind.as_deref() != Some("runtime")
+                || service.binding_name.as_deref() != Some(prepared.name.as_str())
+                || service.issue.is_some()
+            {
+                return None;
+            }
+            let gateway = self
+                .run_update_mode_openclaw_command_output_with_env(
+                    env_name,
+                    &prepared.name,
+                    "openclaw gateway status",
+                    &["gateway", "status", "--deep", "--json"],
+                    &[],
+                    Some(operation_lock),
+                )
+                .ok()?;
+            let status: Value = serde_json::from_str(gateway.stdout.trim()).ok()?;
+            if !gateway.status.success()
+                || status.pointer("/rpc/ok").and_then(Value::as_bool) != Some(true)
+                || status
+                    .pointer("/rpc/server/buildId")
+                    .and_then(Value::as_str)
+                    != Some(build_id.as_str())
+            {
+                return None;
+            }
+        }
+        if let Some(service) = service {
+            if !self
+                .supervisor_service()
+                .running_launch_matches(env_name, service.child_pid?)
+                .ok()?
+            {
+                return None;
+            }
+        } else {
+            // A child may still be exiting after an operator stop, and a running
+            // daemon without observations cannot establish that it has stopped.
+            let observed = self.supervisor_service().live_runtime_state().ok()?;
+            if observed.is_none() && self.supervisor_service().daemon_status().ok()?.running {
+                return None;
+            }
+            if observed.is_some_and(|observed| {
+                observed
+                    .children
+                    .iter()
+                    .any(|child| child.env_name == env_name)
+                    || observed
+                        .services
+                        .iter()
+                        .any(|entry| entry.env_name == env_name && entry.pid.is_some())
+            }) {
+                return None;
+            }
+        }
+        Some(UpgradeEnvSummary {
+            source: None,
+            env_name: env_name.to_string(),
+            previous_binding_kind: "runtime".to_string(),
+            previous_binding_name: current.name.clone(),
+            binding_kind: "runtime".to_string(),
+            binding_name: prepared.name.clone(),
+            outcome: "up-to-date".to_string(),
+            runtime_release_version: prepared.meta.release_version.clone(),
+            runtime_release_channel: prepared.meta.release_channel.clone(),
+            service_action: None,
+            snapshot_id: None,
+            rollback: None,
+            note: Some("requested runtime is current; config and service unchanged".to_string()),
+        })
     }
 
     fn upgrade_service_status(&self, env_name: &str) -> Result<Option<ServiceSummary>, String> {
