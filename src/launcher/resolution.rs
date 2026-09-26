@@ -67,19 +67,47 @@ fn tokenize_simple_command(command: &str) -> Option<Vec<String>> {
     if trimmed.is_empty() || trimmed.contains(char::is_control) {
         return None;
     }
+    // Only recognize literal words. Leave expansion, escapes and operators to the shell.
     if trimmed.contains([
-        '\'', '"', '`', '$', '|', '&', ';', '<', '>', '(', ')', '{', '}', '\\', '*', '?', '[', ']',
-        '~', '#', '%', '^', '!',
-    ]) {
+        '`', '$', '|', '&', ';', '<', '>', '(', ')', '{', '}', '\\', '*', '?', '[', ']', '~', '#',
+        '%', '^', '!',
+    ]) || (cfg!(windows) && trimmed.contains(['\'', '"']))
+    {
         return None;
     }
 
-    let tokens = trimmed
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut started = false;
+    for ch in trimmed.chars() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            } else {
+                word.push(ch);
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            started = true;
+        } else if ch == ' ' {
+            if started {
+                tokens.push(std::mem::take(&mut word));
+                started = false;
+            }
+        } else {
+            word.push(ch);
+            started = true;
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        tokens.push(word);
+    }
     let first = tokens.first()?;
-    if first.contains('=') {
+    if first.is_empty() || first.contains('=') {
         return None;
     }
     Some(tokens)
@@ -108,7 +136,11 @@ mod tests {
     fn tokenize_simple_command_rejects_shell_syntax() {
         assert!(tokenize_simple_command("FOO=bar openclaw").is_none());
         assert!(tokenize_simple_command("pnpm openclaw | tee log").is_none());
-        assert!(tokenize_simple_command("openclaw 'gateway run'").is_none());
+        assert!(tokenize_simple_command("openclaw 'gateway run").is_none());
+        assert!(tokenize_simple_command("openclaw \"$ENTRY\"").is_none());
+        assert!(tokenize_simple_command("openclaw \"$(entry)\"").is_none());
+        assert!(tokenize_simple_command("openclaw \"`entry`\"").is_none());
+        assert!(tokenize_simple_command("'' openclaw").is_none());
         assert!(tokenize_simple_command("openclaw gateway\nopenclaw status").is_none());
         assert!(tokenize_simple_command(r"openclaw foo\ bar").is_none());
         assert!(tokenize_simple_command("openclaw --config ~/openclaw.json").is_none());
@@ -119,6 +151,34 @@ mod tests {
         assert!(tokenize_simple_command("openclaw %OPENCLAW_ARGS%").is_none());
         assert!(tokenize_simple_command("openclaw ^&").is_none());
         assert!(tokenize_simple_command("openclaw !OPENCLAW_ARGS!").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tokenize_simple_command_preserves_literal_quoted_words() {
+        assert_eq!(
+            tokenize_simple_command(
+                r#"'/path to/node' "/source tree/openclaw.mjs" '' pre"mid dle"post"#
+            ),
+            Some(vec![
+                "/path to/node".to_string(),
+                "/source tree/openclaw.mjs".to_string(),
+                "".to_string(),
+                "premid dlepost".to_string(),
+            ])
+        );
+        let entry = "/source's tree/openclaw.mjs";
+        assert_eq!(
+            tokenize_simple_command(&format!("node {}", crate::infra::shell::quote_posix(entry))),
+            Some(vec!["node".to_string(), entry.to_string()])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tokenize_simple_command_keeps_windows_quotes_opaque() {
+        assert!(tokenize_simple_command(r#"node "C:/source tree/openclaw.mjs""#).is_none());
+        assert!(tokenize_simple_command("node 'openclaw.mjs'").is_none());
     }
 
     #[test]

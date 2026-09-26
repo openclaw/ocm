@@ -246,6 +246,90 @@ fn source_upgrade_recognizes_direct_node_but_does_not_infer_shell_wrappers() {
 
 #[cfg(unix)]
 #[test]
+fn source_inspection_recognizes_quoted_node_aliases_without_executing_them() {
+    let root = TestDir::new("source-upgrade-quoted");
+    let (env, head) = fixture(&root);
+    let repo = root.child("source");
+    let alias = root.child("Source With Spaces");
+    std::os::unix::fs::symlink(&repo, &alias).unwrap();
+    let entry = path_string(&alias.join("openclaw.mjs"));
+    let marker = root.child("launcher-executed");
+    write_text(
+        &repo.join("openclaw.mjs"),
+        &format!(
+            "import fs from 'node:fs'; fs.writeFileSync({}, 'executed'); console.log('quoted-fixture-version');\n",
+            json!(path_string(&marker))
+        ),
+    );
+    for (name, command) in [
+        ("single", format!("node '{entry}'")),
+        ("double", format!("\"node\" \"{entry}\"")),
+        ("variable", "node \"$ENTRY\"".to_string()),
+        (
+            "substitution",
+            format!("node \"$(touch {})\"", path_string(&marker)),
+        ),
+        ("pipeline", format!("node '{entry}' | cat")),
+    ] {
+        let output = run_ocm(
+            root.path(),
+            &env,
+            &["launcher", "add", name, "--command", &command],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+        let output = run_ocm(
+            root.path(),
+            &env,
+            &["env", "create", name, "--launcher", name],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+        let output = run_ocm(root.path(), &env, &["upgrade", name, "--dry-run", "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let result: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(result["outcome"], "local-command");
+        if name == "single" || name == "double" {
+            assert_eq!(
+                result["source"]["root"],
+                path_string(&fs::canonicalize(&repo).unwrap())
+            );
+            assert_eq!(result["source"]["head"], head);
+            assert!(
+                result["source"]["sharedEnvironments"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("demo"))
+            );
+            let status = run_ocm(root.path(), &env, &["service", "status", name, "--json"]);
+            assert!(status.status.success(), "{}", stderr(&status));
+            let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+            assert_eq!(status["binaryPath"], "node");
+            assert_eq!(status["args"][0], entry);
+            assert_eq!(status["args"][1], "gateway");
+            assert_eq!(status["args"][2], "run");
+        } else {
+            assert!(result.get("source").is_none(), "{name}: {result}");
+        }
+    }
+    assert_eq!(
+        inspect(&root, &env)["source"]["sharedEnvironments"],
+        json!(["double", "single"])
+    );
+    assert!(
+        !marker.exists(),
+        "inspection executed a launcher or substitution"
+    );
+    // The same literal launchers must remain executable through the real command path.
+    for name in ["single", "double"] {
+        let output = run_ocm(root.path(), &env, &["env", "run", name, "--", "--version"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(stdout(&output).trim(), "quoted-fixture-version");
+        assert!(marker.exists());
+        fs::remove_file(&marker).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn source_inspection_does_not_execute_git_filters() {
     let root = TestDir::new("source-upgrade-filter");
     let (env, _) = fixture(&root);
