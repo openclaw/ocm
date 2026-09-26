@@ -1453,6 +1453,70 @@ fn process_command_line(pid: u32) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_gateway_admission_releases_while_unrelated_child_waits_for_exec() {
+        use std::collections::BTreeMap;
+        use std::os::unix::net::UnixStream;
+
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([
+            (
+                "OCM_HOME".to_string(),
+                root.path().join("ocm").display().to_string(),
+            ),
+            ("HOME".to_string(), root.path().display().to_string()),
+        ]);
+        let service = EnvironmentService::new(&env, root.path());
+        let admission = service.lock_gateway_admission("demo").unwrap();
+        let (mut parent_ready, child_ready) = UnixStream::pair().unwrap();
+        let (mut parent_release, child_release) = UnixStream::pair().unwrap();
+        parent_ready
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let child = thread::spawn(move || {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "exit 0"]);
+            // SAFETY: the captured sockets stay alive through spawn; the
+            // post-fork callback uses only raw, async-signal-safe syscalls.
+            unsafe {
+                command.pre_exec(move || {
+                    let mut byte = 1u8;
+                    if libc::write(child_ready.as_raw_fd(), (&byte as *const u8).cast(), 1) != 1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let mut poll = libc::pollfd {
+                        fd: child_release.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if libc::poll(&mut poll, 1, 5000) != 1 {
+                        return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                    }
+                    if libc::read(child_release.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) != 1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.spawn().unwrap().wait().unwrap()
+        });
+        let mut ready = [0u8];
+        parent_ready.read_exact(&mut ready).unwrap();
+        drop(admission);
+        let admitted = service
+            .try_lock_gateway_admission("demo")
+            .unwrap()
+            .is_some();
+        parent_release.write_all(&[1]).unwrap();
+        assert!(child.join().unwrap().success());
+        assert!(
+            admitted,
+            "gateway admission for env demo remains busy after ordinary guard drop while unrelated child is paused before exec"
+        );
+    }
+
     #[test]
     fn source_watch_override_labels_the_built_entry() {
         let meta = SourceWatchOverride {

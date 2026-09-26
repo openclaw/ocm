@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -24,10 +25,19 @@ pub(crate) fn ensure_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|error| error.to_string())
 }
 
-// Do not explicitly unlock: on flock platforms that would also release
-// the lock held by a surviving child with an inherited descriptor.
 pub(crate) struct ExclusiveFileLock {
-    _file: File,
+    file: File,
+    child_custody: AtomicBool,
+}
+
+impl Drop for ExclusiveFileLock {
+    fn drop(&mut self) {
+        // An unrelated fork can retain CLOEXEC descriptors until it execs.
+        // Only deliberate child custody may extend this guard's lock lifetime.
+        if !self.child_custody.load(Ordering::Relaxed) {
+            let _ = FileExt::unlock(&self.file);
+        }
+    }
 }
 
 impl ExclusiveFileLock {
@@ -39,9 +49,12 @@ impl ExclusiveFileLock {
         {
             use std::os::fd::AsRawFd;
             use std::os::unix::process::CommandExt;
-            let fd = self._file.as_raw_fd();
+            // Set this before spawning and keep it on output errors too:
+            // an already-started child or descendant may still hold the lock.
+            self.child_custody.store(true, Ordering::Relaxed);
+            let fd = self.file.as_raw_fd();
             // Only this child's copy becomes inheritable, so concurrent fleet
-            // workers and service spawns cannot retain another environment's lock.
+            // workers and service spawns cannot retain another environment's lock across exec.
             // SAFETY: self keeps fd open until output returns; fcntl is
             // async-signal-safe and does not allocate after fork.
             unsafe {
@@ -87,7 +100,10 @@ pub(crate) fn lock_file(path: &Path, label: &str) -> Result<ExclusiveFileLock, S
             path.display()
         )
     })?;
-    Ok(ExclusiveFileLock { _file: file })
+    Ok(ExclusiveFileLock {
+        file,
+        child_custody: AtomicBool::new(false),
+    })
 }
 
 pub(crate) fn try_lock_file(path: &Path, label: &str) -> Result<Option<ExclusiveFileLock>, String> {
@@ -102,7 +118,10 @@ pub(crate) fn try_lock_file(path: &Path, label: &str) -> Result<Option<Exclusive
         .open(path)
         .map_err(|error| format!("failed to open {label} lock at {}: {error}", path.display()))?;
     match FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(Some(ExclusiveFileLock { _file: file })),
+        Ok(()) => Ok(Some(ExclusiveFileLock {
+            file,
+            child_custody: AtomicBool::new(false),
+        })),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(format!(
             "failed to acquire {label} lock at {}: {error}",
