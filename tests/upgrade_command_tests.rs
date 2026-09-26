@@ -8363,7 +8363,14 @@ fn current_package_jobs_preserve_state_and_operator_upgrades_still_finalize() {
 #[cfg(unix)]
 #[test]
 fn current_package_jobs_preserve_config_repair_and_candidate_failure() {
-    for case in ["repair", "candidate", "unknown-build", "damaged"] {
+    for case in [
+        "repair",
+        "candidate",
+        "unknown-build",
+        "damaged",
+        "unknown-service",
+        "stopping",
+    ] {
         assert_current_package_job(case);
     }
 }
@@ -8471,6 +8478,21 @@ fn assert_current_package_job(case: &str) {
         assert!(calls.contains("update finalize"), "{calls}");
         return;
     }
+    if matches!(case, "unknown-service" | "stopping") {
+        env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+        install_fake_launchctl(&root, &mut env);
+        let output = run_ocm(root.path(), &env, &["service", "install", "demo"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        if case == "stopping" {
+            write_running_supervisor_runtime(
+                &supervisor_runtime_path(&env, root.path()).unwrap(),
+                env.get("OCM_HOME").unwrap(),
+                "stale",
+                4244,
+                18789,
+            );
+        }
+    }
     if case == "repair" {
         env.insert("OCM_TEST_INVALID_CONFIG_UNTIL_DOCTOR".into(), "1".into());
     }
@@ -8491,6 +8513,18 @@ fn assert_current_package_job(case: &str) {
         vec![]
     };
     let job = finish_runtime_job(root.path(), &env, &target);
+    if case == "stopping" {
+        assert_eq!(job["state"], "failed", "{job}");
+        assert!(
+            job["error"]
+                .as_str()
+                .unwrap()
+                .contains("did not acknowledge quiescence"),
+            "{job}"
+        );
+        assert!(job["result"].is_null(), "{job}");
+        return;
+    }
     assert_eq!(
         job["state"],
         if case == "candidate" {

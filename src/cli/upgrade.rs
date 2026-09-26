@@ -3786,6 +3786,9 @@ impl Cli {
         // Summary bindings describe the plan, so verify the observed supervisor
         // child as well, including a child still exiting after an operator stop.
         let observed = self.supervisor_service().live_runtime_state().ok()?;
+        if observed.is_none() && self.supervisor_service().daemon_status().ok()?.running {
+            return None;
+        }
         if let Some(service) = service {
             let observed = observed?;
             let child = observed
