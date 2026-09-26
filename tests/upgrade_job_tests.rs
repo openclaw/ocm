@@ -9,7 +9,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use support::{TestDir, ocm_env, path_string, run_ocm, stderr, stdout, write_executable_script};
+use support::{
+    TestDir, TestHttpServer, ocm_env, path_string, run_ocm, stderr, stdout, write_executable_script,
+};
 
 fn command(root: &TestDir, env: &BTreeMap<String, String>, args: &[&str]) -> Value {
     let output = run_ocm(root.path(), env, args);
@@ -104,6 +106,13 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
     assert_eq!(capabilities["protocolVersion"], 1);
     assert_eq!(capabilities["supported"], true);
     assert_eq!(capabilities["envName"], "demo");
+    assert_eq!(capabilities["bindingKind"], "runtime");
+    assert_eq!(capabilities["bindingName"], "old");
+    let binding = format!(
+        "{}:{}",
+        capabilities["bindingKind"].as_str().unwrap(),
+        capabilities["bindingName"].as_str().unwrap()
+    );
     assert_eq!(
         capabilities["envRoot"],
         path_string(&root.child("ocm-home/envs/demo"))
@@ -122,6 +131,8 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
             "new",
             "--request-id",
             "admission",
+            "--if-binding",
+            &binding,
             "--json",
         ],
     );
@@ -130,6 +141,19 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
     assert!(accepted["result"].is_null());
     assert_eq!(accepted["envName"], "demo");
     assert_eq!(accepted["id"], "admission");
+    let record: Value = serde_json::from_slice(
+        &fs::read(
+            ocm::store::upgrade_history_env_dir("demo", &env, root.path())
+                .unwrap()
+                .join("jobs/admission.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        record["schema"], 2,
+        "older workers must reject a guarded record"
+    );
     let resumed = command(
         &root,
         &env,
@@ -142,6 +166,8 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
             "new",
             "--request-id",
             id,
+            "--if-binding",
+            &binding,
         ],
     );
     assert_eq!(resumed["id"], accepted["id"]);
@@ -167,6 +193,33 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
     let history = command(&root, &env, &["upgrade", "history", "demo", "--json"]);
     assert_eq!(history.as_array().unwrap().len(), 1);
 
+    let stale = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "upgrade",
+            "job",
+            "start",
+            "demo",
+            "--runtime",
+            "new",
+            "--request-id",
+            "stale",
+            "--if-binding",
+            &binding,
+        ],
+    );
+    assert!(!stale.status.success());
+    assert!(stderr(&stale).contains("environment binding changed"));
+    assert_eq!(
+        command(&root, &env, &["upgrade", "job", "status", "demo"]),
+        result
+    );
+    assert_eq!(
+        command(&root, &env, &["upgrade", "history", "demo", "--json"]),
+        history
+    );
+
     let second = command(
         &root,
         &env,
@@ -190,6 +243,28 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
     );
     let shown = command(&root, &env, &["env", "show", "demo", "--json"]);
     assert_eq!(shown["defaultRuntime"], "new");
+    let replay_args = [
+        "upgrade",
+        "job",
+        "start",
+        "demo",
+        "--runtime",
+        "new",
+        "--request-id",
+        id,
+        "--if-binding",
+        &binding,
+    ];
+    assert_eq!(command(&root, &env, &replay_args), result);
+    let mut changed_condition = replay_args;
+    changed_condition[9] = "runtime:new";
+    let changed = run_ocm(root.path(), &env, &changed_condition);
+    assert!(!changed.status.success());
+    assert!(
+        stderr(&changed).contains("different binding condition"),
+        "{}",
+        stderr(&changed)
+    );
     let removed = run_ocm(root.path(), &env, &["env", "destroy", "demo", "--yes"]);
     assert!(removed.status.success(), "{}", stderr(&removed));
     let recreated = run_ocm(
@@ -212,6 +287,8 @@ fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
             "new",
             "--request-id",
             id,
+            "--if-binding",
+            &binding,
         ],
     );
     assert!(!replay.status.success());
@@ -459,4 +536,158 @@ fn admitted_job_cannot_upgrade_a_replacement_environment() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn conditional_job_rejects_rebinding_after_probe_and_while_waiting() {
+    use fs2::FileExt;
+    for queued in [false, true] {
+        // Check both identity components: another runtime, and a same-name launcher.
+        for (kind, name) in [("runtime", "new"), ("launcher", "old")] {
+            let root = TestDir::new("upgrade-job-binding");
+            let mut env = setup(&root);
+            let releases = TestHttpServer::serve_bytes("/openclaw", "application/json", b"{}");
+            env.insert("OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(), releases.url());
+            command(
+                &root,
+                &env,
+                &[
+                    "launcher",
+                    "add",
+                    "old",
+                    "--command",
+                    &path_string(&root.child("old")),
+                    "--json",
+                ],
+            );
+            let capability = command(&root, &env, &["upgrade", "job", "capabilities", "demo"]);
+            let binding = format!(
+                "{}:{}",
+                capability["bindingKind"].as_str().unwrap(),
+                capability["bindingName"].as_str().unwrap()
+            );
+            let args = [
+                "upgrade",
+                "job",
+                "start",
+                "demo",
+                "--channel",
+                "stable",
+                "--request-id",
+                "conditional",
+                "--if-binding",
+                &binding,
+            ];
+            let locks = root.child("ocm-home/locks/upgrades");
+            fs::create_dir_all(&locks).unwrap();
+            let transaction = fs::File::create(locks.join("demo.lock")).unwrap();
+            transaction.lock_exclusive().unwrap();
+            if queued {
+                assert_eq!(command(&root, &env, &args)["state"], "running");
+            }
+            if kind == "runtime" {
+                // An explicit runtime transition itself uses the transaction lock.
+                // Clear then bind through the ordinary metadata commands instead.
+                command(
+                    &root,
+                    &env,
+                    &["env", "set-runtime", "demo", "none", "--json"],
+                );
+            }
+            let rebind = format!("set-{kind}");
+            command(&root, &env, &["env", &rebind, "demo", name, "--json"]);
+            let rebound = fs::read(root.child("ocm-home/envs.json")).unwrap();
+            let original_calls = ["old", "new"]
+                .map(|name| fs::read(root.child(format!("{name}-calls"))).unwrap_or_default());
+            if !queued {
+                let rejected = run_ocm(root.path(), &env, &args);
+                assert!(!rejected.status.success());
+                assert!(
+                    stderr(&rejected).contains("environment binding changed"),
+                    "{}",
+                    stderr(&rejected)
+                );
+                assert!(command(&root, &env, &["upgrade", "job", "status", "demo"]).is_null());
+                let jobs = ocm::store::upgrade_history_env_dir("demo", &env, root.path())
+                    .unwrap()
+                    .join("jobs");
+                assert!(!jobs.join("conditional.json").exists());
+            }
+            transaction.unlock().unwrap();
+            if queued {
+                let result = wait_for_result(&root, &env, "conditional");
+                assert_eq!(result["state"], "failed", "{result}");
+                assert!(
+                    result["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("environment binding changed"),
+                    "{result}"
+                );
+                assert!(result["result"].is_null());
+                assert_eq!(command(&root, &env, &args), result);
+            }
+            assert_eq!(fs::read(root.child("ocm-home/envs.json")).unwrap(), rebound);
+            assert!(
+                releases.requests().is_empty(),
+                "rejected job resolved a package channel"
+            );
+            assert_eq!(
+                original_calls,
+                ["old", "new"]
+                    .map(|name| fs::read(root.child(format!("{name}-calls"))).unwrap_or_default())
+            );
+            assert!(
+                command(&root, &env, &["upgrade", "history", "demo", "--json"])
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn unconditional_job_preserves_explicit_launcher_conversion() {
+    let root = TestDir::new("upgrade-job-conversion");
+    let env = setup(&root);
+    command(
+        &root,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "source",
+            "--command",
+            &path_string(&root.child("old")),
+            "--json",
+        ],
+    );
+    command(
+        &root,
+        &env,
+        &["env", "set-launcher", "demo", "source", "--json"],
+    );
+    fs::write(root.child("release"), "").unwrap();
+    let accepted = command(
+        &root,
+        &env,
+        &["upgrade", "job", "start", "demo", "--runtime", "new"],
+    );
+    let result = wait_for_result(&root, &env, accepted["id"].as_str().unwrap());
+    assert_eq!(result["state"], "succeeded", "{result}");
+    let record: Value = serde_json::from_slice(
+        &fs::read(
+            ocm::store::upgrade_history_env_dir("demo", &env, root.path())
+                .unwrap()
+                .join(format!("jobs/{}.json", accepted["id"].as_str().unwrap())),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["schema"], 1);
+    assert!(record.get("expectedBinding").is_none());
+    let final_env = command(&root, &env, &["env", "show", "demo", "--json"]);
+    assert_eq!(final_env["defaultRuntime"], "new");
+    assert!(final_env["defaultLauncher"].is_null());
 }

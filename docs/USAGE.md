@@ -622,12 +622,18 @@ ocm upgrade job status mira --request-id <id> --json
 ```
 
 These commands always return JSON.
-`ocm upgrade job capabilities <env>` reports protocol version 1, platform support, selectors, and the environment's root, state directory, and config path.
+`ocm upgrade job capabilities <env>` reports protocol version 1, platform support, selectors, the current `bindingKind` and `bindingName`, and the environment's root, state directory, and config path.
 On Unix, supervised Gateways receive `OPENCLAW_OCM_UPDATE_PROTOCOL=1` alongside their existing OCM environment identity.
 Clients must use their trusted OCM executable and environment binding, and preserve their own requester authorization before submitting an operation.
 Latest status returns `null` when that environment has no job; an unknown exact request ID is an error.
 `start --request-id <id>` lets a caller choose a correlation ID before submission; repeating the same ID and target returns that existing job without replaying it.
 Reusing an ID for a different target or a recreated environment is refused.
+Clients acting on an observed binding can pass `start --if-binding <kind>:<name>`, copying `bindingKind` and `bindingName` from capabilities.
+OCM rejects a mismatched new request before recording it and rechecks the condition under the environment operation lock before runtime or service I/O.
+If the binding changes after admission while the worker waits, the accepted job fails without changing the binding, runtime, service, or upgrade history.
+Repeating an accepted request with the same ID, target, and binding condition returns its original job even if that binding has since changed; changing the condition for that ID is refused.
+Without `--if-binding`, explicit operator selectors retain their ordinary behavior, including conversion from a launcher to a packaged runtime.
+Guarded requests use job-record version 2 so older workers refuse them instead of ignoring the condition; unguarded records retain version 1.
 Latest status excludes completed jobs from an older environment instance; an exact ID still retrieves its original historical result.
 An active prior-instance worker still blocks new jobs, and latest status reports that blocker with its exact request ID.
 `start` accepts the same mutually exclusive `--version`, `--channel`, or `--runtime` selectors as a single-environment upgrade, with rollback enabled.
