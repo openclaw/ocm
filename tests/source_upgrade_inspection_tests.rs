@@ -837,6 +837,9 @@ fs.appendFileSync(file + '.calls', JSON.stringify({args, repair: process.env.OPE
   supervisor: process.env.OPENCLAW_SUPERVISOR_MODE, cache: process.env.NODE_DISABLE_COMPILE_CACHE}) + '\n');
 if (args[0] === 'update' && args[1] === 'status') {
   console.log(JSON.stringify(state.status));
+} else if (args[0] === 'status') {
+  console.log(JSON.stringify(state.localStatus ?? state.status));
+  process.exitCode = state.localExitCode ?? 0;
 } else if (args[0] === 'update' && args.includes('--no-restart')) {
   if (state.gate) {
     fs.writeFileSync(state.gate + '.started', String(process.pid));
@@ -950,7 +953,8 @@ fn source_current_and_legacy_native_support_leave_state_untouched() {
         );
         let calls = fs::read_to_string(root.child("native.json.calls")).unwrap();
         assert_eq!(calls.lines().count(), 1);
-        assert!(calls.contains("status"));
+        let call: Value = serde_json::from_str(calls.trim()).unwrap();
+        assert_eq!(call["args"], json!(["update", "status", "--json"]));
     }
 }
 
@@ -1175,6 +1179,14 @@ fn source_batch_update_preserves_binding_and_records_non_rollbackable_success() 
     assert!(calls.iter().all(|call| call["repair"] == "external"
         && call["cache"] == "1"
         && call["supervisor"].is_null()));
+    assert_eq!(
+        calls.iter().map(|call| &call["args"]).collect::<Vec<_>>(),
+        vec![
+            &json!(["update", "status", "--json"]),
+            &json!(["update", "--no-restart", "--json"]),
+            &json!(["status", "--json"]),
+        ]
+    );
     let history = run_ocm(root.path(), &env, &["upgrade", "history", "demo", "--json"]);
     let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
     assert_eq!(history[0]["outcome"], "source-updated");
@@ -1236,6 +1248,162 @@ fn source_failure_does_not_restore_old_state_over_unverified_source() {
         fs::read_to_string(root.child("ocm-home/envs/demo/.openclaw/source-witness")).unwrap(),
         "native-result"
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_verification_falls_back_only_for_inconclusive_local_status() {
+    for scenario in [
+        "cold",
+        "legacy",
+        "scan-failure",
+        "unknown-probe",
+        "failed-probe",
+        "canonical-mismatch",
+        "unready",
+        "wrong-root",
+        "wrong-kind",
+        "stale-build",
+        "wrong-build-id",
+        "refusal",
+        "interrupted",
+    ] {
+        let root = TestDir::new("source-local-verification");
+        let (env, mut state) = execution_fixture(&root, false);
+        state["localStatus"] = state["nextStatus"].clone();
+        match scenario {
+            "cold" => {
+                state["localStatus"] = json!({"update":{"root":null,"installKind":"unknown"}})
+            }
+            "legacy" => {
+                state["localStatus"]["update"]["git"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("artifacts");
+            }
+            "scan-failure" => {
+                state["localStatus"] = json!({"ok":false,"error":{"type":"cli_error","message":"optional session scan unavailable"}});
+                state["localExitCode"] = json!(1);
+            }
+            "unknown-probe" | "failed-probe" => {
+                state["localStatus"]["update"]["error"] = json!({"status":
+                    if scenario == "unknown-probe" { "unknown" } else { "failed" }
+                });
+            }
+            "canonical-mismatch" => {
+                state["localStatus"] = json!({"update":{"root":null,"installKind":"unknown"}});
+                state["nextStatus"]["update"]["root"] = json!(root.path());
+            }
+            "unready" => state["localStatus"]["update"]["git"]["artifacts"]["ready"] = json!(false),
+            "wrong-root" => state["localStatus"]["update"]["root"] = json!(root.path()),
+            "wrong-kind" => state["localStatus"]["update"]["installKind"] = json!("npm"),
+            "stale-build" => {
+                state["localStatus"]["update"]["git"]["builtSha"] = json!("a".repeat(40))
+            }
+            "wrong-build-id" => {
+                state["localStatus"]["update"]["git"]["artifacts"]["buildId"] =
+                    json!("unexpected-build")
+            }
+            "refusal" => {
+                state["localStatus"] =
+                    json!({"ok":false,"error":{"type":"cli_error","code":"schema-refusal"}});
+                state["localExitCode"] = json!(1);
+            }
+            "interrupted" => state["localExitCode"] = json!(130),
+            _ => unreachable!(),
+        }
+        write_text(&root.child("native.json"), &state.to_string());
+        let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+        let fallback = matches!(
+            scenario,
+            "cold" | "legacy" | "scan-failure" | "unknown-probe" | "canonical-mismatch"
+        );
+        assert_eq!(
+            output.status.success(),
+            fallback && scenario != "canonical-mismatch",
+            "{scenario}: {}",
+            stdout(&output)
+        );
+        let calls: Vec<Value> = fs::read_to_string(root.child("native.json.calls"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["args"].clone())
+            .collect();
+        let mut expected = vec![
+            json!(["update", "status", "--json"]),
+            json!(["update", "--no-restart", "--json"]),
+            json!(["status", "--json"]),
+        ];
+        if fallback {
+            expected.push(json!(["update", "status", "--json"]));
+        }
+        assert_eq!(calls, expected, "{scenario}");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_recovery_requires_fresh_local_identity_or_canonical_fallback() {
+    for scenario in [
+        "retained",
+        "cold",
+        "wrong-build-id",
+        "wrong-commit",
+        "unready",
+    ] {
+        let root = TestDir::new("source-local-recovery");
+        let (env, mut state) = execution_fixture(&root, true);
+        state["status"]["update"]["git"]["fetchOk"] = json!(false);
+        state.as_object_mut().unwrap().remove("nextStatus");
+        state["exitCode"] = json!(1);
+        state["result"]["status"] = json!("error");
+        state["result"]["reason"] = json!("native refusal");
+        state["result"]["recovery"] =
+            json!({"serviceRestartSafe":true,"version":"2026.9.3","buildId":"old-source"});
+        state["localStatus"] = state["status"].clone();
+        match scenario {
+            "cold" => {
+                state["localStatus"] = json!({"update":{"root":null,"installKind":"unknown"}})
+            }
+            "wrong-build-id" => {
+                state["localStatus"]["update"]["git"]["artifacts"]["buildId"] =
+                    json!("unexpected-build")
+            }
+            "wrong-commit" => {
+                state["localStatus"]["update"]["git"]["sha"] = json!("a".repeat(40));
+                state["localStatus"]["update"]["git"]["builtSha"] = json!("a".repeat(40));
+            }
+            "unready" => state["localStatus"]["update"]["git"]["artifacts"]["ready"] = json!(false),
+            _ => {}
+        }
+        write_text(&root.child("native.json"), &state.to_string());
+        let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+        assert!(!output.status.success());
+        let result: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        let recovered = matches!(scenario, "retained" | "cold");
+        assert_eq!(
+            result["note"]
+                .as_str()
+                .unwrap()
+                .starts_with("native recovery verified"),
+            recovered,
+            "{scenario}: {result}"
+        );
+        let calls: Vec<Value> = fs::read_to_string(root.child("native.json.calls"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["args"].clone())
+            .collect();
+        assert_eq!(calls[2], json!(["status", "--json"]));
+        assert_eq!(
+            calls.len(),
+            if scenario == "cold" { 4 } else { 3 },
+            "{scenario}"
+        );
+        if scenario == "cold" {
+            assert_eq!(calls[3], json!(["update", "status", "--json"]));
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
