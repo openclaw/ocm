@@ -192,8 +192,19 @@ impl Cli {
                     env.name
                 )
             })?;
+            let environment_inside_git_dir =
+                footprint
+                    .content_roots
+                    .iter()
+                    .try_fold(false, |found, path| {
+                        if found {
+                            return Ok(true);
+                        }
+                        crate::store::dev_sources::contains_existing(path, &env_root)
+                    })?;
             if root.starts_with(&env_root)
                 || env_root.starts_with(root)
+                || environment_inside_git_dir
                 || footprint
                     .entries
                     .iter()
