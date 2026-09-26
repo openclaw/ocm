@@ -446,6 +446,49 @@ impl<'a> SupervisorService<'a> {
         })
     }
 
+    /// Compare the applied child with the canonical current plan.
+    /// Mutation decisions must retain their environment operation lock.
+    pub(crate) fn running_launch_matches(&self, env_name: &str, pid: u32) -> Result<bool, String> {
+        let Some(observed) = self.live_runtime_state()? else {
+            return Ok(false);
+        };
+        let Some(child) = observed
+            .children
+            .iter()
+            .find(|child| child.env_name == env_name)
+        else {
+            return Ok(false);
+        };
+        let Some(running) = observed
+            .services
+            .iter()
+            .find(|entry| entry.env_name == env_name)
+        else {
+            return Ok(false);
+        };
+        let Some(desired) = self
+            .plan()?
+            .children
+            .into_iter()
+            .find(|spec| spec.env_name == env_name)
+        else {
+            return Ok(false);
+        };
+        let Some(desired_digest) = desired.launch_spec_sha256() else {
+            return Ok(false);
+        };
+        Ok(
+            child.launch_spec_sha256.as_deref() == Some(desired_digest.as_str())
+                && child.pid == pid
+                && child.binding_kind == desired.binding_kind
+                && child.binding_name == desired.binding_name
+                && running.pid == Some(pid)
+                && running.binding_kind == desired.binding_kind
+                && running.binding_name == desired.binding_name
+                && running.gateway_state == "running",
+        )
+    }
+
     pub fn inspect(&self) -> Result<SupervisorInspection, String> {
         let state = self.build_state()?;
         let daemon = self.daemon_status()?;

@@ -3783,52 +3783,33 @@ impl Cli {
                 return None;
             }
         }
-        // Summary bindings describe the plan, so verify the observed supervisor
-        // child as well, including a child still exiting after an operator stop.
-        let observed = self.supervisor_service().live_runtime_state().ok()?;
-        if observed.is_none() && self.supervisor_service().daemon_status().ok()?.running {
-            return None;
-        }
         if let Some(service) = service {
-            let observed = observed?;
-            let child = observed
-                .children
-                .iter()
-                .find(|child| child.env_name == env_name)?;
-            let running = observed
-                .services
-                .iter()
-                .find(|entry| entry.env_name == env_name)?;
-            let desired = self
+            if !self
                 .supervisor_service()
-                .plan()
+                .running_launch_matches(env_name, service.child_pid?)
                 .ok()?
-                .children
-                .into_iter()
-                .find(|spec| spec.env_name == env_name)?;
-            let desired_digest = desired.launch_spec_sha256()?;
-            if child.launch_spec_sha256.as_deref() != Some(desired_digest.as_str())
-                || Some(child.pid) != service.child_pid
-                || child.binding_kind != "runtime"
-                || child.binding_name != prepared.name
-                || running.pid != service.child_pid
-                || running.binding_kind != "runtime"
-                || running.binding_name != prepared.name
-                || running.gateway_state != "running"
             {
                 return None;
             }
-        } else if observed.is_some_and(|observed| {
-            observed
-                .children
-                .iter()
-                .any(|child| child.env_name == env_name)
-                || observed
-                    .services
+        } else {
+            // A child may still be exiting after an operator stop, and a running
+            // daemon without observations cannot establish that it has stopped.
+            let observed = self.supervisor_service().live_runtime_state().ok()?;
+            if observed.is_none() && self.supervisor_service().daemon_status().ok()?.running {
+                return None;
+            }
+            if observed.is_some_and(|observed| {
+                observed
+                    .children
                     .iter()
-                    .any(|entry| entry.env_name == env_name && entry.pid.is_some())
-        }) {
-            return None;
+                    .any(|child| child.env_name == env_name)
+                    || observed
+                        .services
+                        .iter()
+                        .any(|entry| entry.env_name == env_name && entry.pid.is_some())
+            }) {
+                return None;
+            }
         }
         Some(UpgradeEnvSummary {
             source: None,
