@@ -2879,6 +2879,14 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
     env.insert(
+        "XDG_RUNTIME_DIR".into(),
+        path_string(&root.child("daemon-session")),
+    );
+    env.insert(
+        "DBUS_SESSION_BUS_ADDRESS".into(),
+        "unix:path=/daemon-session/bus".into(),
+    );
+    env.insert(
         "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
         "launchd".to_string(),
     );
@@ -2892,7 +2900,7 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
         write_legacy_openclaw_script(
             &runtime,
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$OCM_SELF\" \"$OCM_HOME\" \"$OPENCLAW_OCM_UPDATE_PROTOCOL\" > '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$OCM_SELF\" \"$OCM_HOME\" \"$OPENCLAW_OCM_UPDATE_PROTOCOL\" \"$XDG_RUNTIME_DIR\" \"$DBUS_SESSION_BUS_ADDRESS\" > '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
                 root.child(format!("{env_name}-scope")).display()
             ),
         );
@@ -2945,6 +2953,11 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
     );
     assert_eq!(scope[1], env["OCM_HOME"]);
     assert_eq!(scope[2], "1");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(scope[3], env["XDG_RUNTIME_DIR"]);
+        assert_eq!(scope[4], env["DBUS_SESSION_BUS_ADDRESS"]);
+    }
 
     let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
     let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
@@ -2954,6 +2967,11 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
     let mut caller_env = env.clone();
     caller_env.insert("OCM_SELF".into(), "/another/caller/ocm".into());
     caller_env.insert("OPENCLAW_OCM_UPDATE_PROTOCOL".into(), "stale".into());
+    caller_env.insert("XDG_RUNTIME_DIR".into(), "/another/caller/session".into());
+    caller_env.insert(
+        "DBUS_SESSION_BUS_ADDRESS".into(),
+        "unix:path=/another/caller/bus".into(),
+    );
     let start = run_ocm(&cwd, &caller_env, &["service", "start", "target", "--json"]);
     assert!(start.status.success(), "{}", stderr(&start));
     sleep(Duration::from_millis(800));
