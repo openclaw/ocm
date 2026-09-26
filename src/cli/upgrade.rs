@@ -4136,11 +4136,23 @@ impl Cli {
                     }
                 })?;
             let env = self.environment_service().get(env_name)?;
-            if let Some(runtime_name) = env.default_runtime.as_deref() {
+            let expected_build_id = if let Some(runtime_name) = env.default_runtime.as_deref() {
                 let runtime = get_runtime(runtime_name, &self.env, &self.cwd)?;
-                if let Some(expected_build_id) = installed_openclaw_build_id(&runtime) {
-                    build_note = Some(verify_gateway_build_id(&status, &expected_build_id)?);
-                }
+                installed_openclaw_build_id(&runtime)
+            } else if let Some(launcher_name) = env.default_launcher.as_deref() {
+                let launcher = self.launcher_service().show(launcher_name)?;
+                // Read the current artifact only; identity verification must not inspect Git
+                // or rebuild source, and does not establish historical source recovery.
+                source::launcher_source_root(&launcher)
+                    .and_then(|root| {
+                        source::read_source_json(&root, "dist/build-info.json", 65536).ok()
+                    })
+                    .and_then(|info| openclaw_build_id(&info))
+            } else {
+                None
+            };
+            if let Some(expected_build_id) = expected_build_id {
+                build_note = Some(verify_gateway_build_id(&status, &expected_build_id)?);
             }
         }
 
@@ -6202,6 +6214,10 @@ fn installed_openclaw_build_id(runtime: &RuntimeMeta) -> Option<String> {
         .parent()?
         .join("dist/build-info.json");
     let info: Value = serde_json::from_reader(fs::File::open(path).ok()?.take(65536)).ok()?;
+    openclaw_build_id(&info)
+}
+
+fn openclaw_build_id(info: &Value) -> Option<String> {
     let build_id = info.get("buildId")?.as_str()?.trim();
     // Match OpenClaw's optional build metadata contract; older packages omit it.
     (!build_id.is_empty() && build_id.len() <= 96).then(|| build_id.to_string())
@@ -6216,11 +6232,11 @@ fn verify_gateway_build_id(status: &Value, expected: &str) -> Result<&'static st
     };
     if actual != expected {
         return Err(
-            "post-upgrade gateway build verification failed: running Gateway build does not match the installed runtime"
+            "post-upgrade gateway build verification failed: running Gateway build does not match the selected OpenClaw artifact"
                 .to_string(),
         );
     }
-    Ok("running Gateway build matches the installed runtime")
+    Ok("running Gateway build matches the selected OpenClaw artifact")
 }
 
 fn verify_gateway_status_readiness(stdout: &str) -> Result<Value, String> {
@@ -6456,7 +6472,7 @@ mod tests {
         }}});
         assert_eq!(
             verify_gateway_build_id(&status, "candidate-build").unwrap(),
-            "running Gateway build matches the installed runtime"
+            "running Gateway build matches the selected OpenClaw artifact"
         );
         assert!(verify_gateway_build_id(&status, "another-build").is_err());
     }

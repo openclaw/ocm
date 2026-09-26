@@ -1081,7 +1081,7 @@ fn assert_tracked_runtime_upgrade(status: Option<&str>) {
     assert!(output.contains("snapshot="), "{output}");
     assert!(output.contains("version=2026.3.25"), "{output}");
     let build_note = if status.is_some() {
-        "running Gateway build matches the installed runtime"
+        "running Gateway build matches the selected OpenClaw artifact"
     } else {
         "running Gateway build identity unavailable"
     };
@@ -6147,13 +6147,48 @@ fn upgrade_rollback_skips_newer_automatic_failure_rollback_history() {
 
 #[test]
 fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
+    assert_managed_rollback(None);
+}
+
+#[test]
+fn upgrade_rollback_rejects_a_mismatched_source_gateway_build() {
+    assert_managed_rollback(Some("mismatch"));
+}
+
+#[test]
+fn upgrade_rollback_accepts_a_matching_source_gateway_build() {
+    assert_managed_rollback(Some("match"));
+}
+
+#[test]
+fn upgrade_rollback_preserves_legacy_source_gateway_status() {
+    assert_managed_rollback(Some("legacy"));
+}
+
+#[test]
+fn upgrade_rollback_preserves_auth_only_source_gateway_status() {
+    assert_managed_rollback(Some("auth"));
+}
+
+#[test]
+fn upgrade_rollback_keeps_missing_source_build_identity_optional() {
+    assert_managed_rollback(Some("missing"));
+}
+
+fn assert_managed_rollback(source_case: Option<&str>) {
+    let source_kind = if source_case.is_some() {
+        "launcher"
+    } else {
+        "runtime"
+    };
+    let mismatch = source_case == Some("mismatch");
     let root = TestDir::new("upgrade-explicit-rollback-service");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let (health_port, health_requests, health_stop, health_handle) =
         spawn_converging_health_server();
 
-    let old_runtime = root.child("old-openclaw");
+    let old_runtime = root.child("source/openclaw.mjs");
     let new_runtime = root.child("new-openclaw");
     write_executable_script(&old_runtime, &recording_openclaw_script("2026.6.11"));
     write_executable_script(&new_runtime, &recording_openclaw_script("2026.6.33"));
@@ -6164,7 +6199,49 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
         "launchd".to_string(),
     );
     install_fake_launchctl(&root, &mut env);
+    if source_case.is_some() {
+        let bin = root.child("source-bin");
+        write_executable_script(&bin.join("node"), "#!/bin/sh\nexec sh \"$@\"\n");
+        write_executable_script(
+            &bin.join("git"),
+            "#!/bin/sh\ntouch \"$OCM_TEST_GIT_LOG\"\nexit 1\n",
+        );
+        prepend_fake_bin(&mut env, &bin);
+        env.insert(
+            "OCM_TEST_GIT_LOG".to_string(),
+            path_string(&root.child("git-invoked")),
+        );
+        let source = old_runtime.parent().unwrap();
+        write_text(&source.join("package.json"), r#"{"name":"openclaw"}"#);
+        write_text(&source.join("scripts/run-node.mjs"), "must not be executed");
+        write_text(
+            &source.join("dist/build-info.json"),
+            if source_case == Some("missing") {
+                r#"{"commit":"stale-build","version":"2026.6.11"}"#
+            } else {
+                r#"{"buildId":"source-build"}"#
+            },
+        );
+        let command = format!("node {}", old_runtime.display());
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "launcher",
+                "add",
+                "old",
+                "--command",
+                &command,
+                "--cwd",
+                &path_string(source),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
     for (name, runtime) in [("old", &old_runtime), ("new", &new_runtime)] {
+        if name == "old" && source_case.is_some() {
+            continue;
+        }
         let add = run_ocm(
             &cwd,
             &env,
@@ -6185,7 +6262,11 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
         &[
             "start",
             "demo",
-            "--runtime",
+            if source_case.is_some() {
+                "--launcher"
+            } else {
+                "--runtime"
+            },
             "old",
             "--port",
             &health_port.to_string(),
@@ -6195,7 +6276,14 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
-    write_running_supervisor_runtime(&runtime_path, &ocm_home, "old", 4241, health_port);
+    write_running_supervisor_binding(
+        &runtime_path,
+        &ocm_home,
+        source_kind,
+        "old",
+        4241,
+        health_port,
+    );
     let state_path = supervisor_state_path(&env, &cwd).unwrap();
     let env_show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(env_show.status.success(), "{}", stderr(&env_show));
@@ -6222,9 +6310,10 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
                 .is_some_and(|children| children.iter().any(|child| child["envName"] == "demo"));
             if desired_running != observed_running {
                 if desired_running {
-                    write_running_supervisor_runtime(
+                    write_running_supervisor_binding(
                         &snapshot_runtime_path,
                         &snapshot_ocm_home,
+                        source_kind,
                         "old",
                         4242,
                         health_port,
@@ -6254,7 +6343,14 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
     );
     let snapshot_json: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
     let snapshot_id = snapshot_json["id"].as_str().unwrap();
-    write_running_supervisor_runtime(&runtime_path, &ocm_home, "old", 4242, health_port);
+    write_running_supervisor_binding(
+        &runtime_path,
+        &ocm_home,
+        source_kind,
+        "old",
+        4242,
+        health_port,
+    );
     let bind_observer_done = Arc::new(AtomicBool::new(false));
     let bind_observer_done_thread = Arc::clone(&bind_observer_done);
     let bind_runtime_path = runtime_path.clone();
@@ -6317,7 +6413,7 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
         "id": transaction_id,
         "envName": "demo",
         "source": {
-            "kind": "runtime",
+            "kind": source_kind,
             "name": "old",
             "openclawVersion": "2026.6.11"
         },
@@ -6344,57 +6440,121 @@ fn upgrade_rollback_restarts_and_verifies_a_managed_service() {
     )
     .unwrap();
 
-    let observed_runtime_path = runtime_path.clone();
-    let observed_ocm_home = ocm_home.clone();
+    if let Some(case) = source_case {
+        let status = match case {
+            "mismatch" | "missing" => {
+                r#"{"rpc":{"ok":true,"server":{"version":"2026.6.11","buildId":"stale-build"}}}"#
+            }
+            "auth" => r#"{"rpc":{"ok":false,"error":"device identity required"}}"#,
+            "match" => {
+                r#"{"rpc":{"ok":true,"server":{"version":"overridden","buildId":"source-build"}}}"#
+            }
+            _ => r#"{"rpc":{"ok":true}}"#,
+        };
+        env.insert(
+            "OCM_TEST_GATEWAY_STATUS_JSON".to_string(),
+            status.to_string(),
+        );
+    }
+    let observer_done = Arc::new(AtomicBool::new(false));
+    let observer_done_thread = Arc::clone(&observer_done);
     let service_observer = thread::spawn(move || {
-        let mut saw_stop = false;
-        for _ in 0..400 {
+        let mut observed_binding = Some("new".to_string());
+        let mut saw_source = false;
+        while !observer_done_thread.load(Ordering::Relaxed) {
             let state = fs::read_to_string(&state_path).unwrap_or_default();
             let parsed: Value = serde_json::from_str(&state).unwrap_or(Value::Null);
-            let children = parsed["children"].as_array().cloned().unwrap_or_default();
-            if !saw_stop && children.is_empty() {
-                write_empty_supervisor_runtime(&observed_runtime_path, &observed_ocm_home);
-                saw_stop = true;
-            } else if saw_stop
-                && children
-                    .iter()
-                    .any(|child| child["envName"] == "demo" && child["bindingName"] == "old")
-            {
-                write_running_supervisor_runtime(
-                    &observed_runtime_path,
-                    &observed_ocm_home,
-                    "old",
-                    4243,
-                    health_port,
-                );
-                return;
+            let desired = parsed["children"]
+                .as_array()
+                .and_then(|children| children.iter().find(|child| child["envName"] == "demo"))
+                .and_then(|child| child["bindingName"].as_str())
+                .map(str::to_string);
+            if desired != observed_binding {
+                if let Some(binding) = desired.as_deref() {
+                    let kind = if binding == "old" {
+                        source_kind
+                    } else {
+                        "runtime"
+                    };
+                    write_running_supervisor_binding(
+                        &runtime_path,
+                        &ocm_home,
+                        kind,
+                        binding,
+                        4243,
+                        health_port,
+                    );
+                    saw_source |= binding == "old";
+                } else {
+                    write_empty_supervisor_runtime(&runtime_path, &ocm_home);
+                }
+                observed_binding = desired;
             }
-            sleep(Duration::from_millis(25));
+            sleep(Duration::from_millis(5));
         }
-        panic!("rollback did not stop and restart the managed service");
+        saw_source
     });
 
     let rollback = run_ocm(&cwd, &env, &["upgrade", "rollback", "demo", "--raw"]);
-    service_observer.join().unwrap();
+    observer_done.store(true, Ordering::Relaxed);
+    let saw_source = service_observer.join().unwrap();
     stop_converging_health_server(health_port, &health_stop, health_handle);
-    assert!(
-        rollback.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        stdout(&rollback),
-        stderr(&rollback)
-    );
+    assert!(saw_source, "rollback did not restart the source binding");
     let output = stdout(&rollback);
-    assert!(output.contains("outcome=rolled-back"), "{output}");
-    assert!(output.contains("service=started"), "{output}");
-    assert!(output.contains("to=runtime:old"), "{output}");
-    assert_eq!(fs::read_to_string(&marker).unwrap(), "before-upgrade");
+    if mismatch {
+        assert!(
+            !rollback.status.success(),
+            "mismatched source build accepted: {output}"
+        );
+        assert!(
+            output.contains("gateway build verification failed"),
+            "{output}"
+        );
+        assert!(
+            output.contains("restored the pre-rollback state"),
+            "{output}"
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "after-upgrade");
+    } else {
+        assert!(
+            rollback.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            stdout(&rollback),
+            stderr(&rollback)
+        );
+        let output = stdout(&rollback);
+        assert!(output.contains("outcome=rolled-back"), "{output}");
+        assert!(output.contains("service=started"), "{output}");
+        assert!(
+            output.contains(&format!("to={source_kind}:old")),
+            "{output}"
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "before-upgrade");
+        if matches!(source_case, Some("legacy" | "auth")) {
+            assert!(
+                output.contains("running Gateway build identity unavailable"),
+                "{output}"
+            );
+        } else if source_case == Some("match") {
+            assert!(output.contains("running Gateway build matches"), "{output}");
+        } else if source_case == Some("missing") {
+            assert!(
+                !output.contains("running Gateway build matches"),
+                "{output}"
+            );
+        }
+    }
+    assert!(!root.child("git-invoked").exists());
     assert!(health_requests.load(Ordering::SeqCst) >= 2);
 
     let service = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
     assert!(service.status.success(), "{}", stderr(&service));
     let service_json: Value = serde_json::from_str(&stdout(&service)).unwrap();
     assert_eq!(service_json["running"], true);
-    assert_eq!(service_json["bindingName"], "old");
+    assert_eq!(
+        service_json["bindingName"],
+        if mismatch { "new" } else { "old" }
+    );
 }
 
 #[test]
