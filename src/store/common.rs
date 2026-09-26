@@ -311,6 +311,48 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn inherited_lock_survives_parent_guard_drop() {
+        use std::process::Command;
+        use std::thread::sleep;
+        use std::time::{Duration, Instant};
+
+        let root = temp_root("inherited-lock");
+        fs::create_dir_all(&root).unwrap();
+        let lock_path = root.join("lock");
+        let started = root.join("started");
+        let release = root.join("release");
+        struct ReleaseChild(PathBuf);
+        impl Drop for ReleaseChild {
+            fn drop(&mut self) {
+                let _ = fs::write(&self.0, "");
+            }
+        }
+        let _release_child = ReleaseChild(release.clone());
+        let lock = super::lock_file(&lock_path, "test").unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "(touch \"$1\"; count=0; while [ ! -e \"$2\" ] && [ $count -lt 100 ]; do sleep 0.05; count=$((count + 1)); done) </dev/null >/dev/null 2>&1 &", "sh"])
+            .arg(&started).arg(&release);
+        assert!(lock.output(command).unwrap().status.success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.exists() {
+            assert!(Instant::now() < deadline, "inheriting child did not start");
+            sleep(Duration::from_millis(10));
+        }
+        drop(lock);
+        assert!(super::try_lock_file(&lock_path, "test").unwrap().is_none());
+        fs::write(&release, "").unwrap();
+        loop {
+            if super::try_lock_file(&lock_path, "test").unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child did not release its lock");
+            sleep(Duration::from_millis(10));
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn copy_dir_recursive_preserves_broken_symlinks() {
         let root = temp_root("broken-symlink");
         let source = root.join("source");
