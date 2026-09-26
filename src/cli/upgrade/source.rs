@@ -281,7 +281,9 @@ fn inspect_working_tree(root: &Path, issues: &mut Vec<String>) -> Option<bool> {
             "status",
             "--porcelain=v1",
             "--untracked-files=normal",
-            "--ignore-submodules=all",
+            // Keep staged gitlink removals/type changes visible without scanning
+            // nested worktrees. Any gitlink still in the index was rejected above.
+            "--ignore-submodules=dirty",
         ],
     )
     .map(|status| status.is_empty())
