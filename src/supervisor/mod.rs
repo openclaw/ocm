@@ -96,7 +96,22 @@ pub struct SupervisorChildSpec {
     pub child_port: u32,
     pub stdout_path: String,
     pub stderr_path: String,
+    #[serde(deserialize_with = "deserialize_supervisor_child_env")]
     pub process_env: BTreeMap<String, String>,
+}
+
+fn deserialize_supervisor_child_env<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut env = BTreeMap::<String, String>::deserialize(deserializer)?;
+    // These fields are supplied by the spawning daemon, including when reading
+    // plans written by an older CLI; they do not describe desired Gateway state.
+    env.remove("OCM_SELF");
+    env.remove("OPENCLAW_OCM_UPDATE_PROTOCOL");
+    Ok(env)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

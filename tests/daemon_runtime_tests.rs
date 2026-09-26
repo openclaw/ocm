@@ -2924,6 +2924,12 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
         "fixture must report the managed daemon as running: {daemon_status:?}"
     );
 
+    let mut legacy_state = read_persisted_service_state(&state_path);
+    for child in legacy_state["children"].as_array_mut().unwrap() {
+        child["processEnv"]["OCM_SELF"] = Value::String("/retired/caller/ocm".into());
+        child["processEnv"]["OPENCLAW_OCM_UPDATE_PROTOCOL"] = Value::String("stale".into());
+    }
+    write_persisted_service_state(&state_path, &legacy_state);
     let mut daemon = spawn_daemon_process(&cwd, &env);
     let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
         .expect("daemon runtime state did not report both children");
