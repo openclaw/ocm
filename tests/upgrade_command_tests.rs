@@ -398,6 +398,11 @@ case "$1" in
           exit 0
           ;;
         fail)
+          if [ "${{OCM_TEST_CANDIDATE_BLOCK_HISTORY:-}}" = "1" ]; then
+            mkdir -p "$OCM_HOME/upgrade-history/demo"
+            chmod 500 "$OCM_HOME/upgrade-history/demo"
+          fi
+          printf '%s\n' "${{OCM_TEST_CANDIDATE_STDERR:-}}" >&2
           printf '{{"ok":false,"checksRun":1,"checksSkipped":0,"findings":[{{"checkId":"codex/managed-app-server","severity":"error","message":"Managed Codex app-server version mismatch: expected 0.147.0, detected 0.146.0.","path":"/candidate/codex","fixHint":"Repair or reinstall the staged OpenClaw package before cutover."}}]}}\n'
           exit 1
           ;;
@@ -3555,20 +3560,32 @@ fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
 
 #[test]
 fn upgrade_rolls_back_runtime_when_service_restart_fails() {
-    assert_upgrade_rollback_restart_failure(false, false);
+    assert_upgrade_rollback_restart_failure(false, false, false);
 }
 
 #[test]
 fn candidate_failure_reports_failed_service_recovery() {
-    assert_upgrade_rollback_restart_failure(true, false);
+    assert_upgrade_rollback_restart_failure(true, false, false);
 }
 
 #[test]
 fn failed_automatic_rollback_retains_in_place_runtime() {
-    assert_upgrade_rollback_restart_failure(false, true);
+    assert_upgrade_rollback_restart_failure(false, true, false);
 }
 
-fn assert_upgrade_rollback_restart_failure(candidate_failure: bool, in_place: bool) {
+#[cfg(unix)]
+#[test]
+fn candidate_failure_keeps_recovery_paths_when_history_cannot_be_written() {
+    for block_history in [false, true] {
+        assert_upgrade_rollback_restart_failure(true, true, block_history);
+    }
+}
+
+fn assert_upgrade_rollback_restart_failure(
+    candidate_failure: bool,
+    in_place: bool,
+    block_history: bool,
+) {
     let root = TestDir::new("upgrade-service-rollback");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -3644,13 +3661,23 @@ fn assert_upgrade_rollback_restart_failure(candidate_failure: bool, in_place: bo
     write_executable_script(
         std::path::Path::new(launchctl_bin),
         &format!(
-            "#!/bin/sh\nmarker='{}'\ncase \"$1\" in\n  managername)\n    exit 0\n    ;;\n  print)\n    if [ -e \"$marker\" ]; then\n      printf 'Could not find service \\\"%s\\\" in domain for user gui\\n' \"$2\" >&2\n      exit 1\n    fi\n    printf 'state = waiting\\n'\n    exit 0\n    ;;\n  bootout|unload)\n    : > \"$marker\"\n    exit 0\n    ;;\n  bootstrap)\n    echo 'forced bootstrap failure' >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
+            "#!/bin/sh\nmarker='{}'\ncase \"$1\" in\n  managername)\n    exit 0\n    ;;\n  print)\n    if [ -e \"$marker\" ]; then\n      printf 'Could not find service \\\"%s\\\" in domain for user gui\\n' \"$2\" >&2\n      exit 1\n    fi\n    printf 'state = waiting\\n'\n    exit 0\n    ;;\n  bootout|unload)\n    : > \"$marker\"\n    exit 0\n    ;;\n  bootstrap)\n    echo 'forced bootstrap failure' >&2\n    if [ \"${{OCM_TEST_CODEX_PREFLIGHT:-}}\" = fail ]; then\n      echo 'Authorization: Bearer service-private-token' >&2\n    fi\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
             stopped_marker.display()
         ),
     );
 
     if candidate_failure {
         env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "fail".to_string());
+        env.insert(
+            "OCM_TEST_CANDIDATE_STDERR".to_string(),
+            "Authorization: Bearer diagnostic-private-token".to_string(),
+        );
+    }
+    if block_history {
+        env.insert(
+            "OCM_TEST_CANDIDATE_BLOCK_HISTORY".to_string(),
+            "1".to_string(),
+        );
     }
     let upgrade = run_ocm(
         &cwd,
@@ -3661,8 +3688,17 @@ fn assert_upgrade_rollback_restart_failure(candidate_failure: bool, in_place: bo
             &["upgrade", "demo", "--version", "2026.3.25"]
         },
     );
+    #[cfg(unix)]
+    if block_history {
+        fs::set_permissions(
+            Path::new(env.get("OCM_HOME").unwrap()).join("upgrade-history/demo"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
     let output = stdout(&upgrade);
+    assert!(!output.contains("service-private-token"), "{output}");
     assert!(
         output.contains("outcome=rollback-failed"),
         "stdout:\n{output}\nstderr:\n{}",
@@ -3677,12 +3713,21 @@ fn assert_upgrade_rollback_restart_failure(candidate_failure: bool, in_place: bo
     );
     assert!(output.contains("snapshot="), "{output}");
     if candidate_failure {
+        assert!(!output.contains("diagnostic-private-token"), "{output}");
+        assert!(output.contains("authorization:<redacted>"), "{output}");
         assert!(
             output.contains("expected 0.147.0, detected 0.146.0"),
             "{output}"
         );
         let recovery = output.split("OCM recovery result:").nth(1).unwrap();
-        assert!(recovery.contains("was retained"), "{output}");
+        assert!(
+            recovery.contains(if in_place {
+                "The previous runtime was restored"
+            } else {
+                "was retained"
+            }),
+            "{output}"
+        );
         assert!(
             recovery.contains("resolve the recovery or cleanup errors before retrying"),
             "{output}"
@@ -3695,7 +3740,33 @@ fn assert_upgrade_rollback_restart_failure(candidate_failure: bool, in_place: bo
     let runtime_json: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
     assert_eq!(runtime_json["releaseVersion"], "2026.3.24");
 
-    if in_place {
+    if block_history {
+        assert!(
+            output.contains("upgrade history was not recorded"),
+            "{output}"
+        );
+        assert!(output.contains("Recovery remains unresolved"), "{output}");
+        let home = Path::new(env.get("OCM_HOME").unwrap());
+        let backups = fs::read_dir(home.join("tmp/upgrade-runtime-backups"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        let relative_binary = Path::new(runtime_json["binaryPath"].as_str().unwrap())
+            .strip_prefix(runtime_json["installRoot"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            fs::read(backups[0].join(relative_binary)).unwrap(),
+            recording_openclaw_script("2026.3.24").as_bytes()
+        );
+        assert!(output.contains(&path_string(&backups[0])), "{output}");
+        assert_eq!(
+            fs::read_dir(home.join("upgrade-history/demo"))
+                .unwrap()
+                .count(),
+            0
+        );
+    } else if in_place {
         assert!(output.contains("Recovery remains unresolved"), "{output}");
         let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
         let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
@@ -3707,6 +3778,10 @@ fn assert_upgrade_rollback_restart_failure(candidate_failure: bool, in_place: bo
                 "{}.recovery/stable",
                 history[0]["id"].as_str().unwrap()
             ));
+        assert!(
+            output.contains(&path_string(&retained.join("install-root"))),
+            "{output}"
+        );
         let meta: Value =
             serde_json::from_slice(&fs::read(retained.join("runtime.json")).unwrap()).unwrap();
         let relative_binary = Path::new(meta["binaryPath"].as_str().unwrap())
@@ -7540,7 +7615,11 @@ fn managed_codex_candidate_failure_rolls_back_repaired_state_before_publication(
     assert!(!command_log.contains("update finalize"), "{command_log}");
 }
 
-fn assert_candidate_configuration_diagnostics(stderr_text: &str) -> String {
+fn assert_candidate_configuration_diagnostics(
+    stderr_text: &str,
+    block_history: bool,
+    rollback: bool,
+) -> String {
     let root = TestDir::new("ocm125-config-diagnostic");
     let (cwd, mut env, env_root) = setup_named_runtime_candidate_fixture(&root);
     let finding = serde_json::json!({
@@ -7565,15 +7644,23 @@ fn assert_candidate_configuration_diagnostics(stderr_text: &str) -> String {
     write_executable_script(&root.child("new-openclaw"), &target);
     env.insert("OCM_TEST_CODEX_PREFLIGHT".to_string(), "pass".to_string());
     let before = fs::read(env_root.join(".openclaw/openclaw.json")).unwrap();
-    let out = run_ocm(
-        &cwd,
-        &env,
-        &["upgrade", "demo", "--runtime", "new-local", "--json"],
-    );
+    let history_dir = root.child("ocm-home/upgrade-history/demo");
+    if block_history {
+        fs::create_dir_all(history_dir.parent().unwrap()).unwrap();
+        fs::write(&history_dir, "history storage unavailable").unwrap();
+    }
+    let mut args = vec!["upgrade", "demo", "--runtime", "new-local", "--json"];
+    if !rollback {
+        args.push("--no-rollback");
+    }
+    let out = run_ocm(&cwd, &env, &args);
     assert!(!out.status.success(), "{}", stdout(&out));
     let receipt: Value = serde_json::from_str(&stdout(&out)).unwrap();
     let note = receipt["note"].as_str().unwrap();
-    assert_eq!(receipt["outcome"], "rolled-back");
+    assert_eq!(
+        receipt["outcome"],
+        if rollback { "rolled-back" } else { "failed" }
+    );
     assert!(
         note.contains("Correct the reported target-configuration finding"),
         "{note}"
@@ -7590,6 +7677,14 @@ fn assert_candidate_configuration_diagnostics(stderr_text: &str) -> String {
     let retained = root.child("new-openclaw").exists()
         && root.child("ocm-home/runtimes/new-local.json").exists();
     assert!(retained);
+    if block_history {
+        assert!(note.contains("upgrade history was not recorded"), "{note}");
+        assert_eq!(
+            fs::read_to_string(&history_dir).unwrap(),
+            "history storage unavailable"
+        );
+        return note.to_string();
+    }
     let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(history.status.success(), "{}", stderr(&history));
     let history_text = stdout(&history);
@@ -7622,18 +7717,24 @@ fn assert_candidate_configuration_diagnostics(stderr_text: &str) -> String {
 
 #[test]
 fn candidate_configuration_diagnostics_identify_the_repair_owner() {
-    assert_candidate_configuration_diagnostics("");
+    assert_candidate_configuration_diagnostics("", false, true);
 }
 
 #[test]
 fn candidate_diagnostics_keep_findings_when_stderr_is_present() {
-    assert_candidate_configuration_diagnostics("Warning: optional diagnostic hook unavailable");
+    assert_candidate_configuration_diagnostics(
+        "Warning: optional diagnostic hook unavailable",
+        false,
+        true,
+    );
 }
 
 #[test]
 fn candidate_recovery_guidance_survives_authorization_redaction() {
     let note = assert_candidate_configuration_diagnostics(
         "Authorization: Bearer diagnostic-private-token",
+        false,
+        true,
     );
     assert!(note.contains("authorization:<redacted>"), "{note}");
     assert!(!note.contains("diagnostic-private-token"), "{note}");
@@ -7642,6 +7743,20 @@ fn candidate_recovery_guidance_survives_authorization_redaction() {
         note.contains("Candidate runtime \"new-local\" was retained"),
         "{note}"
     );
+}
+
+#[test]
+fn candidate_history_failure_survives_authorization_redaction() {
+    for rollback in [true, false] {
+        let note = assert_candidate_configuration_diagnostics(
+            "Authorization: Bearer diagnostic-private-token",
+            true,
+            rollback,
+        );
+        assert!(!note.contains("diagnostic-private-token"), "{note}");
+        assert!(note.contains("authorization:<redacted>"), "{note}");
+        assert!(note.contains("OCM recovery result:"), "{note}");
+    }
 }
 
 #[test]

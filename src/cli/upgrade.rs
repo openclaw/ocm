@@ -1479,7 +1479,7 @@ impl Cli {
         {
             Ok(action) => action,
             Err(error) => {
-                let error = format!("{error}; {}", restore.retained_operation_note());
+                let error = format!("{error}\n{}", restore.retained_operation_note());
                 return Ok(self.fail_upgrade_rollback_locked(env_name, &plan, transaction, error));
             }
         };
@@ -1634,7 +1634,7 @@ impl Cli {
                 "rollback-failed".to_string(),
                 "failed".to_string(),
                 format!(
-                    "rollback failed ({error}); restoring the pre-rollback state also failed: {restore_error}"
+                    "rollback failed: {error}\nrestoring the pre-rollback state also failed: {restore_error}"
                 ),
             ),
         };
@@ -5088,7 +5088,7 @@ impl Cli {
                 snapshot_id: Some(snapshot_id),
                 rollback: Some("failed".to_string()),
                 note: Some(format!(
-                    "upgrade failed ({error}); rollback also failed: {rollback_error}"
+                    "upgrade failed: {error}\nrollback also failed: {rollback_error}"
                 )),
             },
         };
@@ -5247,7 +5247,7 @@ impl Cli {
             }
             Ok::<(), String>(())
         })();
-        acceptance.map_err(|error| format!("{error}; {}", restore.retained_operation_note()))?;
+        acceptance.map_err(|error| format!("{error}\n{}", restore.retained_operation_note()))?;
         let mut restored = self
             .environment_service()
             .commit_snapshot_restore_locked(restore);
@@ -6167,9 +6167,11 @@ fn join_warnings(warnings: &[String]) -> Option<String> {
     }
 }
 
+// Keep independent OCM guidance off child diagnostic lines: Authorization
+// redaction deliberately consumes the remainder of each such line.
 fn join_optional_warnings(left: Option<String>, right: Option<String>) -> Option<String> {
     match (left, right) {
-        (Some(left), Some(right)) => Some(format!("{left} {right}")),
+        (Some(left), Some(right)) => Some(format!("{left}\n{right}")),
         (Some(left), None) => Some(left),
         (None, Some(right)) => Some(right),
         (None, None) => None,
