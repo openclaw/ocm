@@ -45,6 +45,13 @@ impl ExclusiveFileLock {
         &self,
         mut command: std::process::Command,
     ) -> std::io::Result<std::process::Output> {
+        self.retain_for_child(&mut command);
+        command.output()
+    }
+
+    pub(crate) fn retain_for_child(&self, command: &mut std::process::Command) {
+        #[cfg(not(unix))]
+        let _ = command;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -69,7 +76,6 @@ impl ExclusiveFileLock {
                 });
             }
         }
-        command.output()
     }
 }
 

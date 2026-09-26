@@ -219,6 +219,22 @@ impl Cli {
                     return Err("upgrade job capabilities requires <env>".into());
                 };
                 let meta = self.environment_service().get(name)?;
+                let mut operations = vec!["packaged-upgrade"];
+                // Capabilities describe command routes, not transaction admission.
+                // Status polling must stay readable while a job owns mutation locks.
+                if cfg!(any(target_os = "linux", target_os = "macos"))
+                    && meta.dev.is_none()
+                    && meta.default_runtime.is_none()
+                    && meta.default_launcher.is_some()
+                    && meta
+                        .default_launcher
+                        .as_deref()
+                        .and_then(|name| self.launcher_service().show(name).ok())
+                        .and_then(|launcher| crate::launcher::launcher_source_root(&launcher))
+                        .is_some_and(|root| root.join(".git").exists())
+                {
+                    operations.push("source-upgrade");
+                }
                 let paths = crate::store::derive_env_paths(&meta.root);
                 let (binding_kind, binding_name) = super::source_binding(&meta);
                 self.print_json(&serde_json::json!({
@@ -230,7 +246,7 @@ impl Cli {
                     "stateDir": paths.state_dir,
                     "configPath": paths.config_path,
                     "selectors": ["version", "channel", "runtime"],
-                    "operations": ["packaged-upgrade"],
+                    "operations": operations,
                     "bindingKind": binding_kind,
                     "bindingName": binding_name,
                 }))?;

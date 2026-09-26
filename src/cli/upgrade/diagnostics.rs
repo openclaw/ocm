@@ -114,7 +114,7 @@ fn finding_lines(finding: &Value) -> Vec<String> {
     lines
 }
 
-fn readable_command_detail(text: &str) -> Option<String> {
+pub(super) fn readable_command_detail(text: &str) -> Option<String> {
     if let Some(error) = structured_error_message(text) {
         return bounded_summary(error.lines());
     }

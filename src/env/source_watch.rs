@@ -630,20 +630,23 @@ impl<'a> EnvironmentService<'a> {
     pub(crate) fn acquire_source_watch_lease(
         &self,
         env_name: &str,
+        source_root: &Path,
         allow_service_takeover: bool,
         mode: SourceWatchMode,
     ) -> Result<SourceWatchLease, String> {
-        self.acquire_foreground_lease(env_name, allow_service_takeover, mode, false)
+        self.acquire_foreground_lease(env_name, source_root, allow_service_takeover, mode, false)
     }
 
     pub(crate) fn acquire_source_ui_lease(
         &self,
         env_name: &str,
+        source_root: &Path,
         allow_service_takeover: bool,
         watching: bool,
     ) -> Result<SourceWatchLease, String> {
         self.acquire_foreground_lease(
             env_name,
+            source_root,
             allow_service_takeover,
             SourceWatchMode::Foreground { watching },
             true,
@@ -653,6 +656,7 @@ impl<'a> EnvironmentService<'a> {
     fn acquire_foreground_lease(
         &self,
         env_name: &str,
+        source_root: &Path,
         allow_service_takeover: bool,
         mode: SourceWatchMode,
         ui: bool,
@@ -675,7 +679,46 @@ impl<'a> EnvironmentService<'a> {
             .transpose()?;
         let _admission_lock = self.lock_gateway_admission(&env_name)?;
         supervisor.ensure_source_watch_daemon_compatible()?;
+        // Source upgrades exclude new users before any watch preparation begins.
+        // Publish the starting lease under that same registry exclusion.
+        let _registry_lock = crate::store::lock_env_registry(self.env, self.cwd)?;
+        // An upgrade keeps its environment operation lock through activation,
+        // after releasing registry exclusion so service policy can be restored.
+        // Try, never wait for, peer locks while holding the registry lock.
+        let source_root = fs::canonicalize(source_root).map_err(|error| error.to_string())?;
         let meta = self.get(&env_name)?;
+        if let Some(dev) = meta.dev.as_ref() {
+            let current = fs::canonicalize(dev.execution_source_root()?)
+                .map_err(|error| error.to_string())?;
+            if !crate::store::dev_sources::contains_existing(&current, &source_root)?
+                || !crate::store::dev_sources::contains_existing(&source_root, &current)?
+            {
+                return Err(
+                    "dev source changed before lease admission; retry with the current checkout"
+                        .to_string(),
+                );
+            }
+        }
+        let launchers = crate::launcher::LauncherService::new(self.env, self.cwd);
+        let mut peer_operations = Vec::new();
+        for peer in self.list()? {
+            if peer.name == env_name {
+                continue;
+            }
+            let Some(launcher) = peer.default_launcher.as_deref() else {
+                continue;
+            };
+            let Some(root) = crate::launcher::launcher_source_root(&launchers.show(launcher)?)
+            else {
+                continue;
+            };
+            if crate::store::dev_sources::contains_existing(&root, &source_root)?
+                || crate::store::dev_sources::contains_existing(&source_root, &root)?
+            {
+                peer_operations.push(crate::store::try_lock_environment_operation(&peer.name, self.env, self.cwd)?
+                    .ok_or_else(|| format!("cannot prepare source while environment {:?} has an operation in progress; retry after it finishes", peer.name))?);
+            }
+        }
         let service_preparation_revision = mode
             .is_service_preparation()
             .then(|| {
@@ -1452,6 +1495,134 @@ fn process_command_line(pid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_exclusion_precedes_source_watch_lease_publication() {
+        use std::collections::BTreeMap;
+        use std::sync::mpsc;
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([
+            (
+                "OCM_HOME".to_string(),
+                root.path().join("ocm").display().to_string(),
+            ),
+            ("HOME".to_string(), root.path().display().to_string()),
+            (
+                "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+                "unsupported".to_string(),
+            ),
+        ]);
+        let service = EnvironmentService::new(&env, root.path());
+        service
+            .create(crate::env::CreateEnvironmentOptions {
+                name: "demo".to_string(),
+                root: None,
+                gateway_port: Some(19445),
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: None,
+                dev: None,
+                protected: false,
+            })
+            .unwrap();
+        let registry = crate::store::lock_env_registry(&env, root.path()).unwrap();
+        let (send, receive) = mpsc::channel();
+        let worker_env = env.clone();
+        let worker_root = root.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            let service = EnvironmentService::new(&worker_env, &worker_root);
+            send.send(service.acquire_source_watch_lease(
+                "demo",
+                &worker_root,
+                false,
+                SourceWatchMode::Foreground { watching: true },
+            ))
+            .unwrap();
+        });
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(service.source_watch_session("demo").unwrap().is_none());
+        drop(registry);
+        let mut lease = receive
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            service.observe_source_watch("demo").unwrap(),
+            SourceWatchState::Starting
+        ));
+        lease.acknowledge_stopped_processes().unwrap();
+        drop(lease);
+        worker.join().unwrap();
+
+        // Registry custody has ended, but an overlapping source operation still
+        // excludes preparation until its activation or recovery has settled.
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("scripts")).unwrap();
+        fs::write(source.join("openclaw.mjs"), "").unwrap();
+        fs::write(source.join("scripts/run-node.mjs"), "").unwrap();
+        fs::write(source.join("package.json"), r#"{"name":"openclaw"}"#).unwrap();
+        crate::launcher::LauncherService::new(&env, root.path())
+            .add(crate::launcher::AddLauncherOptions {
+                name: "source".to_string(),
+                command: format!("node {}", source.join("openclaw.mjs").display()),
+                cwd: None,
+                description: None,
+            })
+            .unwrap();
+        service
+            .create(crate::env::CreateEnvironmentOptions {
+                name: "owner".to_string(),
+                root: None,
+                gateway_port: Some(19446),
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: Some("source".to_string()),
+                dev: None,
+                protected: false,
+            })
+            .unwrap();
+        let owner = service.lock_operation("owner").unwrap();
+        let error = service
+            .acquire_source_watch_lease(
+                "demo",
+                &source,
+                false,
+                SourceWatchMode::Foreground { watching: true },
+            )
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("owner") && error.contains("operation in progress"),
+            "{error}"
+        );
+        assert!(
+            service
+                .source_watch_session("demo")
+                .unwrap()
+                .unwrap()
+                .closed
+        );
+        drop(owner);
+        let mut lease = service
+            .acquire_source_watch_lease(
+                "demo",
+                &source,
+                false,
+                SourceWatchMode::Foreground { watching: true },
+            )
+            .unwrap();
+        assert!(matches!(
+            service.observe_source_watch("demo").unwrap(),
+            SourceWatchState::Starting
+        ));
+        lease.acknowledge_stopped_processes().unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

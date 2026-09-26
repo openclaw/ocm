@@ -213,8 +213,13 @@ ocm upgrade simulate mira --to ./openclaw
 On Unix, `ocm upgrade job start mira --json` starts an independent OCM worker and returns its request ID before the upgrade runs.
 Use `ocm upgrade job status mira --request-id <id> --json` to reconnect to that exact request, or omit `--request-id` for the latest job.
 Clients can copy `bindingKind:bindingName` from `ocm upgrade job capabilities mira` into `start --if-binding <kind>:<name>` to reject a binding change before the upgrade runs.
-The worker uses the ordinary upgrade checks, checkpoint, service restoration, and rollback, and continues when the requesting terminal or managed Gateway exits.
+The worker uses the ordinary upgrade checks, checkpoints, and recovery for the environment's binding, and continues when the requesting terminal or managed Gateway exits.
 See [asynchronous upgrades](docs/USAGE.md#asynchronous-upgrades) for result and interruption behavior.
+
+Supported source launchers can update their checkout in place through the same no-target command on Linux and macOS.
+OCM preserves the source binding and uses native source artifact reporting, update execution, and recovery.
+Older checkouts without native source observations remain `local-command`, with support reported as unknown.
+See [source upgrade behavior and recovery](docs/USAGE.md#upgrade-one-environment) for compatibility and checkpoint limits.
 
 Live upgrades and rollbacks require a completed foreground dev session. Request
 shutdown of recorded ownership with `ocm dev stop <env>`. Older watches without

@@ -686,14 +686,15 @@ pub fn upgrade_help(cmd: &str) -> String {
             "When current and target OpenClaw versions are known, older targets are rejected before snapshot creation or runtime mutation because config and SQLite state migrations cannot be reversed by switching binaries.",
             "An env upgrade will not replace runtime bytes shared with another env; use --runtime to reuse those bytes or an exact --version for an isolated target.",
             "Upgrades create a pre-upgrade snapshot before changing env state.",
-            "Recognized source launchers remain local-command: OCM reports checkout/build commits, local tracking refs, and known shared source users without fetching, building, or restarting. Matching commits do not prove a complete build or running Gateway identity.",
+            "No-target source upgrades keep the launcher binding and use native update --no-restart on Linux/macOS when native source artifact observations are available; older or opaque launchers remain local-command.",
+            "Source dry-runs inspect only local facts; matching commits alone do not prove build completeness or running Gateway identity. Source updates use native recovery and reject --no-rollback; their environment checkpoints cannot restore source bytes through upgrade rollback.",
             "Batch upgrades create and verify a cold checkpoint for every selected environment before any runtime transition begins, then run bounded parallel per-environment upgrades under one coordinator lock.",
             "Batch failure policy `continue` leaves failed gateways stopped with both fleet checkpoints and per-environment upgrade history available for external recovery.",
             "When an env moves to a new runtime, upgrade runs OpenClaw update finalization inside the env before service restart.",
             "Managed-service upgrades require both HTTP health and OpenClaw gateway reachability before reporting success.",
-            "If service restart/start fails, ocm restores the snapshot and previous runtime unless --no-rollback is set.",
+            "For managed-runtime upgrades, if service restart/start fails, ocm restores the snapshot and previous runtime unless --no-rollback is set.",
             "Pinned runtimes stay pinned unless you pass --version, --channel, or --runtime explicitly.",
-            "Local-command environments are reported clearly instead of being changed behind your back.",
+            "Opaque or unsupported local-command environments are reported without attempting an update.",
         ],
     )
 }

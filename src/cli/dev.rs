@@ -539,6 +539,7 @@ impl Cli {
     fn acquire_dev_lease(
         &self,
         name: &str,
+        source_root: &Path,
         force: bool,
         mode: SourceWatchMode,
         ui: bool,
@@ -546,10 +547,13 @@ impl Cli {
         match (mode, ui) {
             (SourceWatchMode::Foreground { watching }, true) => self
                 .environment_service()
-                .acquire_source_ui_lease(name, force, watching),
-            (_, false) => self
-                .environment_service()
-                .acquire_source_watch_lease(name, force, mode),
+                .acquire_source_ui_lease(name, source_root, force, watching),
+            (_, false) => self.environment_service().acquire_source_watch_lease(
+                name,
+                source_root,
+                force,
+                mode,
+            ),
             (SourceWatchMode::ServicePreparation, true) => {
                 Err("dev cannot combine --ui with --service".to_string())
             }
@@ -661,8 +665,17 @@ impl Cli {
         } else {
             SourceWatchMode::Foreground { watching: watch }
         };
-        let mut source_watch_lease =
-            Some(match self.acquire_dev_lease(&meta.name, force, mode, ui) {
+        let mut source_watch_lease = Some(
+            match self.acquire_dev_lease(
+                &meta.name,
+                meta.dev
+                    .as_ref()
+                    .ok_or("dev source is missing")?
+                    .execution_source_root()?,
+                force,
+                mode,
+                ui,
+            ) {
                 Ok(lease) => lease,
                 Err(error) => {
                     // A competing invocation may have claimed the lease after the first lookup.
@@ -683,7 +696,8 @@ impl Cli {
                     }
                     return Err(error);
                 }
-            });
+            },
+        );
         // Preparation belongs to the lease owner, including a newly created env.
         // A losing invocation must not rewrite config before returning the winner's status.
         let prepared = (|| {
@@ -992,6 +1006,7 @@ impl Cli {
         let mut source_watch_lease = Some(
             match self.acquire_dev_lease(
                 &meta.name,
+                &repo_root,
                 true,
                 SourceWatchMode::Foreground { watching: true },
                 ui,

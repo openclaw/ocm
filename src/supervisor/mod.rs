@@ -489,6 +489,25 @@ impl<'a> SupervisorService<'a> {
         )
     }
 
+    /// Confirm absence through the owned daemon's observations, not desired flags.
+    /// Mutation decisions must retain the environment operation lock.
+    pub(crate) fn stopped_launch_observed(&self, env_name: &str) -> Result<bool, String> {
+        let observed = self.live_runtime_state()?;
+        if observed.is_none() && self.daemon_status()?.running {
+            return Ok(false);
+        }
+        Ok(observed.is_none_or(|observed| {
+            !observed
+                .children
+                .iter()
+                .any(|child| child.env_name == env_name)
+                && !observed
+                    .services
+                    .iter()
+                    .any(|entry| entry.env_name == env_name && entry.pid.is_some())
+        }))
+    }
+
     pub fn inspect(&self) -> Result<SupervisorInspection, String> {
         let state = self.build_state()?;
         let daemon = self.daemon_status()?;
@@ -3871,10 +3890,12 @@ mod tests {
                 let (started_tx, started_rx) = std::sync::mpsc::channel();
                 let (lease_tx, lease_rx) = std::sync::mpsc::channel();
                 let service = &service;
+                let source_root = root.path();
                 let worker = scope.spawn(move || {
                     started_tx.send(()).unwrap();
                     let lease = service.acquire_source_watch_lease(
                         "demo",
+                        source_root,
                         false,
                         crate::env::SourceWatchMode::ServicePreparation,
                     );
