@@ -1572,19 +1572,29 @@ mod tests {
             .open(&path)
             .unwrap();
         FileExt::lock_shared(&reader).unwrap();
-        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let release_flag = std::sync::Arc::clone(&released);
+        assert_eq!(
+            try_lock_source_watch_file(&contender, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
         let release = thread::spawn(move || {
             thread::sleep(Duration::from_millis(30));
             FileExt::unlock(&reader).unwrap();
-            release_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            reader
         });
 
         try_lock_source_watch_exclusive(&contender).unwrap();
 
-        assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+        let reader = release.join().unwrap();
+        assert_eq!(
+            try_lock_source_watch_file(&reader, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
         unlock_source_watch_file(&contender).unwrap();
-        release.join().unwrap();
+        drop(reader);
         fs::remove_file(path).unwrap();
     }
 
