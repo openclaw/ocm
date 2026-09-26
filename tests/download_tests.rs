@@ -5,8 +5,8 @@ use std::io::Write;
 
 use flate2::{Compression, write::GzEncoder};
 use ocm::infra::download::{
-    artifact_file_name_from_url, download_to_file, fetch_json, fetch_json_with_accept, file_sha256,
-    normalize_sha256, verify_file_sha256,
+    MAX_JSON_BYTES, artifact_file_name_from_url, download_to_file, fetch_json,
+    fetch_json_with_accept, file_sha256, normalize_sha256, verify_file_sha256,
 };
 use serde_json::Value;
 
@@ -154,6 +154,27 @@ fn fetch_json_requests_and_decodes_gzip_responses() {
             .to_ascii_lowercase()
             .contains("accept-encoding: gzip")
     );
+}
+
+#[test]
+fn fetch_json_rejects_a_gzip_decoded_body_past_the_byte_cap() {
+    // One byte past the decoded JSON cap. Compressed on the wire this is a few KB.
+    let mut json = Vec::from(&b"{\"pad\":\""[..]);
+    json.extend(std::iter::repeat(b'x').take(MAX_JSON_BYTES as usize + 1));
+    json.extend_from_slice(b"\"}");
+    let encoded = gzip_bytes(&json);
+    let server = TestHttpServer::serve_bytes_with_headers(
+        "/manifests/releases.json",
+        "application/json",
+        &encoded,
+        &[("Content-Encoding", "gzip")],
+    );
+
+    let error = match fetch_json::<Value>(&server.url()) {
+        Err(error) => error,
+        Ok(_) => panic!("gzip-decoded JSON past the byte cap must be rejected"),
+    };
+    assert!(error.contains("exceeded"), "unexpected error: {error}");
 }
 
 #[test]
