@@ -5004,6 +5004,17 @@ impl Cli {
         mut transaction: UpgradeTransaction,
         error: String,
     ) -> Result<UpgradeEnvSummary, String> {
+        // Candidate diagnostics are redacted again below. Keep independent OCM
+        // details off Authorization lines without changing ordinary warning output.
+        let separator = if transaction.candidate_failure.is_some() {
+            "\n"
+        } else {
+            " "
+        };
+        let join_notes = |left: Option<String>, right: Option<String>| match (left, right) {
+            (Some(left), Some(right)) => Some(format!("{left}{separator}{right}")),
+            (left, right) => left.or(right),
+        };
         if !transaction.rollback_enabled {
             let snapshot_id = transaction.snapshot_id.clone();
             let service_restore_warning = if transaction.service_before.enabled
@@ -5031,13 +5042,13 @@ impl Cli {
                 service_action: None,
                 snapshot_id: Some(snapshot_id),
                 rollback: Some("disabled".to_string()),
-                note: join_optional_warnings(
+                note: join_notes(
                     Some(format!("upgrade failed and rollback was disabled: {error}")),
                     service_restore_warning,
                 ),
             };
             if let Err(history_error) = self.record_upgrade_history(&transaction, &summary) {
-                summary.note = join_optional_warnings(
+                summary.note = join_notes(
                     summary.note,
                     Some(format!("upgrade history was not recorded: {history_error}")),
                 );
@@ -5067,7 +5078,7 @@ impl Cli {
                 service_action: None,
                 snapshot_id: Some(snapshot_id),
                 rollback: Some("restored".to_string()),
-                note: join_optional_warnings(
+                note: join_notes(
                     Some(format!(
                         "upgrade failed, so ocm restored the pre-upgrade snapshot: {error}"
                     )),
@@ -5088,7 +5099,7 @@ impl Cli {
                 snapshot_id: Some(snapshot_id),
                 rollback: Some("failed".to_string()),
                 note: Some(format!(
-                    "upgrade failed ({error}); rollback also failed: {rollback_error}"
+                    "upgrade failed ({error});{separator}rollback also failed: {rollback_error}"
                 )),
             },
         };
@@ -5096,10 +5107,10 @@ impl Cli {
             let recovery_note = self.retain_unresolved_runtime_recovery(env_name, &mut transaction);
             transaction.cleanup_note =
                 join_optional_warnings(transaction.cleanup_note, recovery_note.clone());
-            summary.note = join_optional_warnings(summary.note, recovery_note);
+            summary.note = join_notes(summary.note, recovery_note);
         }
         if let Err(history_error) = self.record_upgrade_history(&transaction, &summary) {
-            summary.note = join_optional_warnings(
+            summary.note = join_notes(
                 summary.note,
                 Some(format!("upgrade history was not recorded: {history_error}")),
             );
@@ -5247,7 +5258,14 @@ impl Cli {
             }
             Ok::<(), String>(())
         })();
-        acceptance.map_err(|error| format!("{error}; {}", restore.retained_operation_note()))?;
+        acceptance.map_err(|error| {
+            let separator = if transaction.candidate_failure.is_some() {
+                "\n"
+            } else {
+                "; "
+            };
+            format!("{error}{separator}{}", restore.retained_operation_note())
+        })?;
         let mut restored = self
             .environment_service()
             .commit_snapshot_restore_locked(restore);
