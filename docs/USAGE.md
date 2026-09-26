@@ -508,9 +508,9 @@ Working-tree cleanliness also remains unknown when Git filters or submodules pre
 An empty list does not establish exclusive ownership or exclude unmanaged processes.
 Opaque shell launchers retain their existing report without inferred source facts.
 
-An unsupported candidate Doctor check is a compatibility exception only when
-it is the sole failure. Mixed failures, malformed responses, and contradictory
-diagnostics stop the upgrade before finalization and binding publication.
+An unavailable optional candidate Doctor check is a compatibility exception only when it is the sole failure, including when native Doctor repeats that same finding on stderr during an update.
+This preserves upgrades when the selected plugin check is disabled or absent from an older runtime.
+Mixed failures, malformed responses, and additional or contradictory diagnostics stop the upgrade before finalization and binding publication.
 
 When candidate validation fails, the report keeps bounded, redacted Doctor
 findings and identifies candidate-provided hints as information captured before
