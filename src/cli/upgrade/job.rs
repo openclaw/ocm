@@ -74,6 +74,40 @@ struct StoredJob {
     environment_root: String,
     #[serde(with = "time::serde::rfc3339")]
     environment_created_at: OffsetDateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_binding: Option<ExpectedBinding>,
+}
+
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+struct ExpectedBinding {
+    kind: String,
+    name: String,
+}
+
+impl ExpectedBinding {
+    fn parse(value: String) -> Result<Self, String> {
+        let (kind, name) = value
+            .split_once(':')
+            .ok_or("--if-binding requires <kind>:<name>")?;
+        if !matches!(kind, "runtime" | "launcher" | "dev" | "none") {
+            return Err("--if-binding kind must be runtime, launcher, dev, or none".into());
+        }
+        Ok(Self {
+            kind: kind.into(),
+            name: validate_name(name, "Binding name")?,
+        })
+    }
+
+    fn validate(&self, environment: &crate::env::EnvMeta) -> Result<(), String> {
+        let (kind, name) = super::source_binding(environment);
+        if self.kind != kind || self.name != name {
+            return Err(format!(
+                "environment binding changed: expected {}:{}, found {kind}:{name}; no upgrade was started",
+                self.kind, self.name,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl StoredJob {
@@ -181,6 +215,7 @@ impl Cli {
                 };
                 let meta = self.environment_service().get(name)?;
                 let paths = crate::store::derive_env_paths(&meta.root);
+                let (binding_kind, binding_name) = super::source_binding(&meta);
                 self.print_json(&serde_json::json!({
                     "protocol": "ocm.upgrade-job",
                     "protocolVersion": 1,
@@ -191,7 +226,8 @@ impl Cli {
                     "configPath": paths.config_path,
                     "selectors": ["version", "channel", "runtime"],
                     "operations": ["packaged-upgrade"],
-                    "bindingKind": super::source_binding(&meta).0,
+                    "bindingKind": binding_kind,
+                    "bindingName": binding_name,
                 }))?;
             }
             "status" => {
@@ -230,11 +266,15 @@ impl Cli {
             "start" => {
                 let (args, id) = Self::consume_option(args[1..].to_vec(), "--request-id")?;
                 let id = Self::require_option_value(id, "--request-id")?;
+                let (args, binding) = Self::consume_option(args, "--if-binding")?;
+                let binding = Self::require_option_value(binding, "--if-binding")?
+                    .map(ExpectedBinding::parse)
+                    .transpose()?;
                 let (args, target) = UpgradeTarget::parse(args)?;
                 let [name] = args.as_slice() else {
                     return Err("upgrade job start requires <env> [--version <version> | --channel <channel> | --runtime <runtime>]".into());
                 };
-                self.start_upgrade_job(name, target, id)?;
+                self.start_upgrade_job(name, target, id, binding)?;
             }
             _ => return Err(format!("unknown upgrade job action: {action}")),
         }
@@ -246,6 +286,7 @@ impl Cli {
         name: &str,
         target: UpgradeTarget,
         requested_id: Option<String>,
+        expected_binding: Option<ExpectedBinding>,
     ) -> Result<(), String> {
         let requested_id = requested_id
             .map(|id| validate_name(&id, "Upgrade job id"))
@@ -270,12 +311,21 @@ impl Cli {
             if previous.job.target != target {
                 return Err("upgrade request id already belongs to a different target".into());
             }
+            if previous.expected_binding != expected_binding {
+                return Err(
+                    "upgrade request id already belongs to a different binding condition".into(),
+                );
+            }
             self.print_json(&self.observe_upgrade_job(name, id)?)?;
             return Ok(());
         }
         let _admission = admission.ok_or_else(|| {
             format!("an upgrade job is active for {name}; inspect `ocm upgrade job status {name}`")
         })?;
+        let environment = self.environment_service().get(name)?;
+        if let Some(binding) = &expected_binding {
+            binding.validate(&environment)?;
+        }
         if root.join("latest").exists() {
             let id: String = read_json(&root.join("latest"))?;
             let previous = self.observe_upgrade_job(name, &id)?;
@@ -316,6 +366,7 @@ impl Cli {
             admitted: false,
             environment_root: environment.root,
             environment_created_at: environment.created_at,
+            expected_binding,
         };
         let path = self.upgrade_job_path(name, &id)?;
         save_job(&path, &record)?;
@@ -461,6 +512,9 @@ impl Cli {
                 "environment was replaced after upgrade job admission; no upgrade was started"
                     .into(),
             );
+        }
+        if let Some(binding) = &record.expected_binding {
+            binding.validate(&current)?;
         }
         Ok(())
     }

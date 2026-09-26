@@ -212,6 +212,7 @@ ocm upgrade simulate mira --to ./openclaw
 
 On Unix, `ocm upgrade job start mira --json` starts an independent OCM worker and returns its request ID before the upgrade runs.
 Use `ocm upgrade job status mira --request-id <id> --json` to reconnect to that exact request, or omit `--request-id` for the latest job.
+Clients can copy `bindingKind:bindingName` from `ocm upgrade job capabilities mira` into `start --if-binding <kind>:<name>` to reject a binding change before the upgrade runs.
 The worker uses the ordinary upgrade checks, checkpoint, service restoration, and rollback, and continues when the requesting terminal or managed Gateway exits.
 See [asynchronous upgrades](docs/USAGE.md#asynchronous-upgrades) for result and interruption behavior.
 
