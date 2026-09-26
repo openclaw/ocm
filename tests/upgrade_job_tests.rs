@@ -9,7 +9,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use support::{TestDir, ocm_env, path_string, run_ocm, stderr, stdout, write_executable_script};
+use support::{
+    TestDir, TestHttpServer, ocm_env, path_string, run_ocm, stderr, stdout, write_executable_script,
+};
 
 fn command(root: &TestDir, env: &BTreeMap<String, String>, args: &[&str]) -> Value {
     let output = run_ocm(root.path(), env, args);
@@ -530,7 +532,9 @@ fn conditional_job_rejects_rebinding_after_probe_and_while_waiting() {
         // Check both identity components: another runtime, and a same-name launcher.
         for (kind, name) in [("runtime", "new"), ("launcher", "old")] {
             let root = TestDir::new("upgrade-job-binding");
-            let env = setup(&root);
+            let mut env = setup(&root);
+            let releases = TestHttpServer::serve_bytes("/openclaw", "application/json", b"{}");
+            env.insert("OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(), releases.url());
             command(
                 &root,
                 &env,
@@ -611,6 +615,10 @@ fn conditional_job_rejects_rebinding_after_probe_and_while_waiting() {
                 assert_eq!(command(&root, &env, &args), result);
             }
             assert_eq!(fs::read(root.child("ocm-home/envs.json")).unwrap(), rebound);
+            assert!(
+                releases.requests().is_empty(),
+                "rejected job resolved a package channel"
+            );
             assert_eq!(
                 original_calls,
                 ["old", "new"]
