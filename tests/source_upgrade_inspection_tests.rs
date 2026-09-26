@@ -220,23 +220,19 @@ fn source_upgrade_reports_shared_aliases_and_refuses_external_build_metadata() {
 fn source_upgrade_recognizes_direct_node_but_does_not_infer_shell_wrappers() {
     let root = TestDir::new("source-upgrade-launcher");
     let (env, _) = fixture(&root);
-    for (name, command, recognized) in [
-        ("direct", "node openclaw.mjs", true),
-        ("opaque", "echo wrapper && pnpm openclaw", false),
+    let repo = path_string(&root.child("source"));
+    let absolute = format!("node {}", path_string(&root.child("source/openclaw.mjs")));
+    for (name, command, with_cwd, recognized) in [
+        ("direct", "node openclaw.mjs", true, true),
+        ("absolute", absolute.as_str(), false, true),
+        ("relative", "node openclaw.mjs", false, false),
+        ("opaque", "echo wrapper && pnpm openclaw", true, false),
     ] {
-        let output = run_ocm(
-            root.path(),
-            &env,
-            &[
-                "launcher",
-                "add",
-                name,
-                "--command",
-                command,
-                "--cwd",
-                &path_string(&root.child("source")),
-            ],
-        );
+        let mut args = vec!["launcher", "add", name, "--command", command];
+        if with_cwd {
+            args.extend(["--cwd", &repo]);
+        }
+        let output = run_ocm(root.path(), &env, &args);
         assert!(output.status.success(), "{}", stderr(&output));
         let output = run_ocm(root.path(), &env, &["env", "set-launcher", "demo", name]);
         assert!(output.status.success(), "{}", stderr(&output));
