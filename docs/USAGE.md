@@ -521,6 +521,11 @@ If the OCM parent is killed, competing environment mutations and upgrades wait u
 Each fleet child retains only its own environment's lock.
 This is not crash recovery or proof that all descendants stopped: a program can close inherited descriptors before spawning further work, and Windows retains its existing locking behavior.
 
+If a later mutation keeps waiting, use `lsof "${OCM_HOME:-$HOME/.ocm}/locks/environments/mira.lock"` to identify processes holding that environment's lock.
+Confirm that each reported process belongs to the interrupted upgrade and let active update work finish.
+Stop an unintended holder only after verifying that interrupting its work is safe, then retry the mutation.
+Do not delete or replace the lock file to bypass a holder: a new file can admit another writer while the original holder is still running.
+
 ### Upgrade every environment that can be updated safely
 
 ```bash
