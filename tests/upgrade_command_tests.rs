@@ -4472,6 +4472,167 @@ fn upgrade_holds_the_environment_operation_lock_until_completion() {
 }
 
 #[cfg(unix)]
+#[test]
+fn upgrade_children_retain_exclusion_after_parent_death() {
+    for phase in ["doctor", "finalize"] {
+        assert_upgrade_child_custody(phase, false);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_batch_children_retain_only_their_environment_exclusion() {
+    assert_upgrade_child_custody("finalize", true);
+}
+
+#[cfg(unix)]
+fn assert_upgrade_child_custody(phase: &str, batch: bool) {
+    use std::os::unix::process::CommandExt;
+
+    // Kill the entire fixture group on assertion failure, including the orphan
+    // deliberately left alive when only the OCM parent is killed.
+    struct ProcessGroup(u32);
+    impl Drop for ProcessGroup {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) };
+        }
+    }
+    fn wait_for(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "missing {}; output: {:?}; error: {:?}",
+                path.display(),
+                fs::read_to_string(path.parent().unwrap().join("upgrade.out")),
+                fs::read_to_string(path.parent().unwrap().join("upgrade.err"))
+            );
+            sleep(Duration::from_millis(25));
+        }
+    }
+    fn finish(mut child: std::process::Child) -> std::process::Output {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                panic!("competing command remained blocked after child exit");
+            }
+            sleep(Duration::from_millis(25));
+        }
+        child.wait_with_output().unwrap()
+    }
+
+    let root = TestDir::new("upgrade-child-custody");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let runtime = root.child("openclaw");
+    let gate = r#"
+case "$OCM_CUSTODY_PHASE:$1:$2" in
+  doctor:doctor:--non-interactive|finalize:update:finalize)
+  gate="$OCM_CUSTODY_GATES/$OCM_ACTIVE_ENV"
+  printf '%s' "$$" > "$gate.started"
+  while [ ! -e "$gate.release" ]; do sleep 0.05; done
+  printf '%s\n' "$OCM_CUSTODY_PHASE" > "$gate.written"
+  exit 0;;
+esac
+"#;
+    write_executable_script(
+        &runtime,
+        &recording_openclaw_script("2026.8.1").replacen(
+            "case \"$1\" in",
+            &format!("{gate}\ncase \"$1\" in"),
+            1,
+        ),
+    );
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "local", "--path", &path_string(&runtime)],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    for name in ["demo", "other"] {
+        let create = run_ocm(&cwd, &env, &["env", "create", name, "--runtime", "local"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
+    env.insert("OCM_CUSTODY_PHASE".into(), phase.into());
+    env.insert("OCM_CUSTODY_GATES".into(), path_string(root.path()));
+    if phase == "doctor" {
+        env.insert("OCM_TEST_INVALID_CONFIG_UNTIL_DOCTOR".into(), "1".into());
+        fs::write(
+            root.child("ocm-home/envs/demo/.openclaw/openclaw.json"),
+            "{}",
+        )
+        .unwrap();
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ocm"));
+    command
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(&env)
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(root.child("upgrade.out")).unwrap())
+        .stderr(fs::File::create(root.child("upgrade.err")).unwrap())
+        .process_group(0);
+    if batch {
+        command.args([
+            "upgrade",
+            "batch",
+            "--envs",
+            "demo,other",
+            "--runtime",
+            "local",
+            "--parallel",
+            "2",
+            "--accept-fleet-outage",
+        ]);
+    } else {
+        command.args(["upgrade", "demo", "--runtime", "local"]);
+    }
+    let mut upgrade = command.spawn().unwrap();
+    let _group = ProcessGroup(upgrade.id());
+    wait_for(&root.child("demo.started"));
+    if batch {
+        wait_for(&root.child("other.started"));
+    }
+    upgrade.kill().unwrap();
+    upgrade.wait().unwrap();
+
+    let spawn_mutation = |name| {
+        Command::new(env!("CARGO_BIN_EXE_ocm"))
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .args(["env", "protect", name, "on"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let mut competing = spawn_mutation("demo");
+    sleep(Duration::from_millis(250));
+    assert!(
+        competing.try_wait().unwrap().is_none(),
+        "mutation entered while orphan child could still write"
+    );
+    assert!(!root.child("demo.written").exists());
+    if batch {
+        // Releasing one finalizer must admit that env without waiting for the
+        // other orphan. This catches leaking every fleet descriptor to each child.
+        fs::write(root.child("other.release"), "").unwrap();
+        wait_for(&root.child("other.written"));
+    }
+    let unrelated = finish(spawn_mutation("other"));
+    assert!(unrelated.status.success(), "{}", stderr(&unrelated));
+    assert!(competing.try_wait().unwrap().is_none());
+    fs::write(root.child("demo.release"), "").unwrap();
+    wait_for(&root.child("demo.written"));
+    let competing = finish(competing);
+    assert!(competing.status.success(), "{}", stderr(&competing));
+}
+
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum EarlyUpgradeTarget {
     Named(Option<&'static str>),
