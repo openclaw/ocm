@@ -72,12 +72,7 @@ pub(crate) fn parse_literal_launcher_command(command: &str) -> Option<Vec<String
     if trimmed.is_empty() || trimmed.contains(char::is_control) {
         return None;
     }
-    // Only recognize literal words. Leave expansion, escapes and operators to the shell.
-    if trimmed.contains([
-        '`', '$', '|', '&', ';', '<', '>', '(', ')', '{', '}', '\\', '*', '?', '[', ']', '~', '#',
-        '%', '^', '!',
-    ]) || (cfg!(windows) && trimmed.contains(['\'', '"']))
-    {
+    if cfg!(windows) && trimmed.contains(['\'', '"']) {
         return None;
     }
 
@@ -89,12 +84,40 @@ pub(crate) fn parse_literal_launcher_command(command: &str) -> Option<Vec<String
         if let Some(delimiter) = quote {
             if ch == delimiter {
                 quote = None;
+            } else if delimiter == '"' && matches!(ch, '$' | '`' | '\\') {
+                // Double quotes still permit expansion and escapes.
+                return None;
             } else {
                 word.push(ch);
             }
         } else if ch == '\'' || ch == '"' {
             quote = Some(ch);
             started = true;
+        } else if matches!(
+            ch,
+            '`' | '$'
+                | '|'
+                | '&'
+                | ';'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '\\'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '~'
+                | '#'
+                | '%'
+                | '^'
+                | '!'
+        ) {
+            // Keep unquoted shell syntax opaque; quoted data is literal.
+            return None;
         } else if ch == ' ' {
             if started {
                 tokens.push(std::mem::take(&mut word));
@@ -145,6 +168,7 @@ mod tests {
         assert!(parse_literal_launcher_command("openclaw \"$ENTRY\"").is_none());
         assert!(parse_literal_launcher_command("openclaw \"$(entry)\"").is_none());
         assert!(parse_literal_launcher_command("openclaw \"`entry`\"").is_none());
+        assert!(parse_literal_launcher_command(r#"openclaw "foo\ bar""#).is_none());
         assert!(parse_literal_launcher_command("'' openclaw").is_none());
         assert!(parse_literal_launcher_command("openclaw gateway\nopenclaw status").is_none());
         assert!(parse_literal_launcher_command(r"openclaw foo\ bar").is_none());
@@ -179,6 +203,18 @@ mod tests {
                 crate::infra::shell::quote_posix(entry)
             )),
             Some(vec!["node".to_string(), entry.to_string()])
+        );
+        let symbols = "/source #1 & data (copy) [x] {a,b} * ? ~ % ^ !/openclaw.mjs";
+        for delimiter in ['\'', '"'] {
+            assert_eq!(
+                parse_literal_launcher_command(&format!("node {delimiter}{symbols}{delimiter}")),
+                Some(vec!["node".to_string(), symbols.to_string()])
+            );
+        }
+        let literal = r"/source $(entry) `entry` \ data/openclaw.mjs";
+        assert_eq!(
+            parse_literal_launcher_command(&format!("node '{literal}'")),
+            Some(vec!["node".to_string(), literal.to_string()])
         );
     }
 

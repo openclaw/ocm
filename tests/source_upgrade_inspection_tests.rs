@@ -253,6 +253,12 @@ fn source_inspection_recognizes_quoted_node_aliases_without_executing_them() {
     let alias = root.child("Source With Spaces");
     std::os::unix::fs::symlink(&repo, &alias).unwrap();
     let entry = path_string(&alias.join("openclaw.mjs"));
+    let symbols = root.child("Source #1 & Data");
+    std::os::unix::fs::symlink(&repo, &symbols).unwrap();
+    let symbols_entry = path_string(&symbols.join("openclaw.mjs"));
+    let literal = root.child("Literal $(touch expanded) `touch expanded`");
+    std::os::unix::fs::symlink(&repo, &literal).unwrap();
+    let literal_entry = path_string(&literal.join("openclaw.mjs"));
     let marker = root.child("launcher-executed");
     write_text(
         &repo.join("openclaw.mjs"),
@@ -261,16 +267,27 @@ fn source_inspection_recognizes_quoted_node_aliases_without_executing_them() {
             json!(path_string(&marker))
         ),
     );
-    for (name, command) in [
-        ("single", format!("node '{entry}'")),
-        ("double", format!("\"node\" \"{entry}\"")),
-        ("variable", "node \"$ENTRY\"".to_string()),
+    let mut recognized_names = Vec::new();
+    for (name, command, recognized) in [
+        ("single", format!("node '{entry}'"), true),
+        ("double", format!("\"node\" \"{entry}\""), true),
+        ("symbols-single", format!("node '{symbols_entry}'"), true),
+        ("symbols-double", format!("node \"{symbols_entry}\""), true),
+        ("literal-single", format!("node '{literal_entry}'"), true),
+        // This path exists literally, so rejecting it cannot rely on a missing file.
+        (
+            "literal-expanded",
+            format!("node \"{literal_entry}\""),
+            false,
+        ),
+        ("variable", "node \"$ENTRY\"".to_string(), false),
         (
             "substitution",
             format!("node \"$(touch {})\"", path_string(&marker)),
+            false,
         ),
-        ("pipeline", format!("node '{entry}' | cat")),
-        ("builtin", format!("exec \"node\" '{entry}'")),
+        ("pipeline", format!("node '{entry}' | cat"), false),
+        ("builtin", format!("exec \"node\" '{entry}'"), false),
     ] {
         let output = run_ocm(
             root.path(),
@@ -288,7 +305,8 @@ fn source_inspection_recognizes_quoted_node_aliases_without_executing_them() {
         assert!(output.status.success(), "{}", stderr(&output));
         let result: Value = serde_json::from_str(&stdout(&output)).unwrap();
         assert_eq!(result["outcome"], "local-command");
-        if name == "single" || name == "double" {
+        if recognized {
+            recognized_names.push(name);
             assert_eq!(
                 result["source"]["root"],
                 path_string(&fs::canonicalize(&repo).unwrap())
@@ -304,22 +322,28 @@ fn source_inspection_recognizes_quoted_node_aliases_without_executing_them() {
             assert!(result.get("source").is_none(), "{name}: {result}");
         }
     }
+    recognized_names.sort();
     assert_eq!(
         inspect(&root, &env)["source"]["sharedEnvironments"],
-        json!(["double", "single"])
+        json!(recognized_names)
     );
     assert!(
         !marker.exists(),
         "inspection executed a launcher or substitution"
     );
+    assert!(!root.child("expanded").exists());
     // The same literal launchers must remain executable through the real command path.
-    for name in ["single", "double"] {
+    for name in recognized_names {
         let output = run_ocm(root.path(), &env, &["env", "run", name, "--", "--version"]);
         assert!(output.status.success(), "{}", stderr(&output));
         assert_eq!(stdout(&output).trim(), "quoted-fixture-version");
         assert!(marker.exists());
         fs::remove_file(&marker).unwrap();
     }
+    assert!(
+        !root.child("expanded").exists(),
+        "single-quoted data expanded"
+    );
 }
 
 #[cfg(unix)]

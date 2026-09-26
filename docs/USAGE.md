@@ -499,7 +499,8 @@ The version includes a named runtime's detected version; the channel remains
 Source launchers still return `local-command`; OCM does not yet upgrade their checkout in place.
 For an ordinary `pnpm openclaw` source launcher or `node <checkout>/openclaw.mjs`, the existing upgrade command also reports source observations without executing the launcher.
 On Unix, literal single- or double-quoted paths can contain spaces, including aliases to a source checkout.
-Commands requiring shell expansion, escaping, or operators remain opaque.
+Quoted characters such as `#` and `&` are recognized as path data, and single quotes also preserve literal `$` and backtick characters.
+Backslashes outside single quotes, active substitutions, and unquoted shell operators remain opaque.
 Recognizing literal words for inspection does not change how launcher commands execute.
 This applies to normal, `--dry-run`, and `--all` output when no explicit runtime or release target is supplied.
 JSON includes `source` only for recognized source launchers, with the canonical `root`, Git `head`, `builtCommit` and `builtVersion` from `dist/build-info.json`, and nullable `buildMatchesHead` and `workingTreeClean` observations.
