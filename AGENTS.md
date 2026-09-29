@@ -14,9 +14,11 @@ services. Read [README.md](README.md) for the product workflow and
   live in their corresponding `src/` modules.
 - Use Cargo and the Rust version declared in `Cargo.toml`. Keep `Cargo.lock`
   changes scoped to intentional dependency or version changes.
-- Use `cargo fmt --check`, `cargo check --workspace --all-targets --locked`, and
-  focused tests such as `cargo test --locked --test cli_invocation_tests`.
-  [CI](.github/workflows/ci.yml) defines the full platform checks.
+- Follow the ordered [remote development checks](CONTRIBUTING.md#development-and-checks)
+  before publishing a change. Use that procedure for prerequisites, commands,
+  conditional platform checks, and evidence; do not replace it with a hand-picked
+  test command. Keep formatting, compilation, and test workloads on the remote
+  worker from the first check.
 - Reuse `TestDir`, `ocm_env`, and the service fixtures in
   [tests/support/mod.rs](tests/support/mod.rs). Keep test homes, OCM state, and
   subprocesses isolated from installed environments and services.
