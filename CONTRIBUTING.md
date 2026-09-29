@@ -87,8 +87,17 @@ supported stop operation; deleting the checkout does not release a lease.
 
 ### Run the baseline in order
 
-Run this sequence on the remote worker before publishing a coherent change.
-`set -eu` stops on the first failed command, leaving later checks unrun.
+For Rust, dependency, installer, or other executable changes, run this sequence
+on the remote worker before publishing a coherent change. `set -eu` stops on
+the first failed command, leaving later checks unrun.
+
+For a change confined to prose in Markdown files, run `git diff --check HEAD`
+remotely and review the affected links and command descriptions against their
+current source and CI owners. If a documented shell recipe changes, exercise
+that recipe on the remote worker. Reuse qualified checks whose executable,
+test, dependency, and configuration inputs are unchanged; editing this guide
+alone does not require recompiling or rerunning the Rust suites. A mixed or
+unclassified executable change keeps the full baseline below.
 
 ```sh
 set -eu
