@@ -29,6 +29,7 @@ All notable changes to OCM are documented here.
 
 ### Changed
 
+- Define ordered remote development checks, isolated checkout transfer, and proof reuse in the contributor guide. Thanks @shakkernerd (#290).
 - Update fresh managed Node.js installs and CI to 24.21.0 while preserving cached 24.15.0 toolchains across OCM upgrades.
 - Document live npm and Homebrew availability in v0.2.40, observed one-time
   bootstrap recovery, and the manual ARM payload's provenance exception.
