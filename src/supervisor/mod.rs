@@ -1427,7 +1427,7 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
 
     process_env.insert(
         "TMPDIR".to_string(),
-        display_path(&prepare_supervisor_child_tmpdir()?),
+        display_path(&prepare_supervisor_child_tmpdir(spec)?),
     );
 
     let mut command = Command::new(program);
@@ -1461,21 +1461,19 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
     })
 }
 
-fn prepare_supervisor_child_tmpdir() -> Result<PathBuf, String> {
-    let preferred = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute() && path.is_dir());
-    if let Some(preferred) = preferred
-        && let Ok(path) = ensure_supervisor_child_tmpdir(&preferred)
-    {
-        return Ok(path);
-    }
-
-    #[cfg(unix)]
-    let fallback = PathBuf::from("/tmp");
-    #[cfg(not(unix))]
-    let fallback = std::env::temp_dir();
-    ensure_supervisor_child_tmpdir(&fallback)
+fn prepare_supervisor_child_tmpdir(spec: &SupervisorChildSpec) -> Result<PathBuf, String> {
+    let state_dir = spec
+        .process_env
+        .get("OPENCLAW_STATE_DIR")
+        .map(String::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "service child env \"{}\" is missing OPENCLAW_STATE_DIR",
+                spec.env_name
+            )
+        })?;
+    ensure_supervisor_child_tmpdir(Path::new(state_dir))
 }
 
 fn ensure_supervisor_child_tmpdir(base: &Path) -> Result<PathBuf, String> {
@@ -1486,7 +1484,7 @@ fn ensure_supervisor_child_tmpdir(base: &Path) -> Result<PathBuf, String> {
         ));
     }
 
-    let path = base.join(format!("ocm-supervisor-{}", std::process::id()));
+    let path = base.join("tmp");
     match fs::create_dir(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -3125,6 +3123,44 @@ mod tests {
     }
 
     #[test]
+    fn supervised_children_use_their_environment_temp_root() {
+        let root = tempfile::tempdir().unwrap();
+        let first_state = root.path().join("first/.openclaw");
+        let second_state = root.path().join("second/.openclaw");
+        fs::create_dir_all(&first_state).unwrap();
+        fs::create_dir_all(&second_state).unwrap();
+
+        let mut first = child_spec("first", 19_999);
+        first
+            .process_env
+            .insert("OPENCLAW_STATE_DIR".to_string(), display_path(&first_state));
+        let mut second = child_spec("second", 20_000);
+        second.process_env.insert(
+            "OPENCLAW_STATE_DIR".to_string(),
+            display_path(&second_state),
+        );
+
+        let first_tmp = prepare_supervisor_child_tmpdir(&first).unwrap();
+        let second_tmp = prepare_supervisor_child_tmpdir(&second).unwrap();
+        assert_eq!(first_tmp, first_state.join("tmp"));
+        assert_eq!(second_tmp, second_state.join("tmp"));
+        assert_ne!(first_tmp, second_tmp);
+        assert!(first_tmp.is_dir());
+        assert!(second_tmp.is_dir());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(first_tmp).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn supervised_child_temp_root_requires_managed_state_dir() {
+        let error = prepare_supervisor_child_tmpdir(&child_spec("demo", 19_999)).unwrap_err();
+        assert!(error.contains("missing OPENCLAW_STATE_DIR"));
+    }
+
+    #[test]
     fn targeted_state_merge_preserves_unrelated_children_skips_and_requests() {
         let mut persisted = supervisor_state(vec![SupervisorRestartRequest {
             env_name: "sibling".to_string(),
@@ -3616,6 +3652,8 @@ mod tests {
             now_millis()
         ));
         fs::create_dir_all(&test_dir).unwrap();
+        let state_dir = test_dir.join(".openclaw");
+        fs::create_dir(&state_dir).unwrap();
         let descendant_pid_path = test_dir.join("descendant.pid");
         let mut spec = child_spec("process-group-cleanup", 19_999);
         spec.command = Some(
@@ -3630,6 +3668,8 @@ mod tests {
             "OCM_TEST_DESCENDANT_PID_FILE".to_string(),
             descendant_pid_path.to_string_lossy().into_owned(),
         );
+        spec.process_env
+            .insert("OPENCLAW_STATE_DIR".to_string(), display_path(&state_dir));
 
         let support = probe_restart_handoff_support(&spec);
         let mut running_child = spawn_running_child(spec, 0, 0, support).unwrap();
@@ -3673,12 +3713,16 @@ mod tests {
             now_millis()
         ));
         fs::create_dir_all(&test_dir).unwrap();
+        let state_dir = test_dir.join(".openclaw");
+        fs::create_dir(&state_dir).unwrap();
         let mut spec = child_spec("process-group-leader-reap", 19_998);
         spec.command = Some("trap 'exit 0' TERM; while :; do sleep 1; done".to_string());
         spec.binary_path = None;
         spec.run_dir = test_dir.to_string_lossy().into_owned();
         spec.stdout_path = test_dir.join("stdout.log").to_string_lossy().into_owned();
         spec.stderr_path = test_dir.join("stderr.log").to_string_lossy().into_owned();
+        spec.process_env
+            .insert("OPENCLAW_STATE_DIR".to_string(), display_path(&state_dir));
 
         let support = probe_restart_handoff_support(&spec);
         let mut running_child = spawn_running_child(spec, 0, 0, support).unwrap();
