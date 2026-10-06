@@ -5411,13 +5411,16 @@ fn dev_stop_restores_service_and_preserves_the_env_and_borrowed_source() {
 #[cfg(unix)]
 #[test]
 fn dev_stop_keeps_dotted_environment_watch_ownership_separate() {
-    for suffix in ["session", "stop", "admission"] {
-        let root = TestDir::new(&format!("dev-stop-dotted-{suffix}"));
+    for (suffix, stop_dotted_first) in ["session", "stop", "admission"]
+        .into_iter()
+        .flat_map(|suffix| [(suffix, false), (suffix, true)])
+    {
+        let root = TestDir::new(&format!("dev-stop-dotted-{suffix}-{stop_dotted_first}"));
         let repo = init_openclaw_repo(&root);
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
         let mut env = ocm_env(&root);
-        let _ = install_blocking_fake_dev_runners(&root, &mut env);
+        let (started, _, _) = install_blocking_fake_dev_runners(&root, &mut env);
         create_runtime_backed_env(&cwd, &env);
         let other_name = format!("demo.{suffix}");
         let created = run_ocm(
@@ -5434,7 +5437,7 @@ fn dev_stop_keeps_dotted_environment_watch_ownership_separate() {
             ],
         );
         assert!(created.status.success(), "{}", stderr(&created));
-        let mut other = DevWatchFixture::spawn(
+        let other = DevWatchFixture::spawn(
             &root,
             &cwd,
             &env,
@@ -5453,7 +5456,12 @@ fn dev_stop_keeps_dotted_environment_watch_ownership_separate() {
             wait_for_path(&other_override, Duration::from_secs(30)),
             "{other_name} did not start"
         );
-        let before = fs::read(&other_override).unwrap();
+        // Ownership is published before the source command starts. Wait until
+        // its TERM handler is installed, then consume this runner's marker so
+        // the second watch must publish its own readiness.
+        assert!(wait_for_path(&started, Duration::from_secs(30)));
+        fs::remove_file(&started).unwrap();
+        let other_before = fs::read(&other_override).unwrap();
         let demo = DevWatchFixture::spawn(
             &root,
             &cwd,
@@ -5475,28 +5483,77 @@ fn dev_stop_keeps_dotted_environment_watch_ownership_separate() {
             ),
             "demo could not start alongside {other_name}",
         );
-        let stopped = run_dev_stop(&cwd, &env);
-        let other_survived = other.child.as_mut().unwrap().try_wait().unwrap().is_none();
-        let metadata_preserved = fs::read(&other_override).ok() == Some(before);
-        let status = run_ocm(&cwd, &env, &["dev", "status", &other_name, "--json"]);
-        let other_stopped = run_named_dev_stop(&cwd, &env, &other_name);
-        let demo = demo.finish();
-        let other = other.finish();
+        assert!(wait_for_path(&started, Duration::from_secs(30)));
+        let demo_override = source_watch_override_path(&root, "demo");
+        let (stopped_name, surviving_name, surviving_override, before, mut first, mut survivor) =
+            if stop_dotted_first {
+                (
+                    other_name.as_str(),
+                    "demo",
+                    demo_override.clone(),
+                    fs::read(&demo_override).unwrap(),
+                    other,
+                    demo,
+                )
+            } else {
+                (
+                    "demo",
+                    other_name.as_str(),
+                    other_override,
+                    other_before,
+                    demo,
+                    other,
+                )
+            };
+        let source_pid = serde_json::from_slice::<Value>(&before).unwrap()["watchPid"]
+            .as_u64()
+            .unwrap() as u32;
+        let stopped = run_named_dev_stop(&cwd, &env, stopped_name);
+        let controller_survived = survivor
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none();
+        let source_survived = process_is_alive(source_pid);
+        let metadata_preserved = fs::read(&surviving_override).ok() == Some(before);
+        let status = run_ocm(&cwd, &env, &["dev", "status", surviving_name, "--json"]);
+        let survivor_stopped = run_named_dev_stop(&cwd, &env, surviving_name);
+        // Require both named stops to finish without the fixture's shared
+        // release file allowing either source command to exit independently.
+        let first = first.wait_without_release();
+        let survivor = survivor.wait_without_release();
 
-        assert!(stopped.status.success(), "{suffix}: {}", stderr(&stopped));
-        assert!(other_survived, "stop demo also stopped {other_name}");
+        assert!(
+            stopped.status.success(),
+            "{stopped_name}: {}",
+            stderr(&stopped)
+        );
+        assert!(
+            controller_survived,
+            "stop {stopped_name} also stopped {surviving_name}"
+        );
+        assert!(
+            source_survived,
+            "stop {stopped_name} also stopped {surviving_name}'s source"
+        );
         assert!(
             metadata_preserved,
-            "stop demo replaced {other_name}'s watch metadata"
+            "stop {stopped_name} replaced {surviving_name}'s watch metadata"
         );
         assert!(status.status.success(), "{}", stderr(&status));
         assert_eq!(
             serde_json::from_str::<Value>(&stdout(&status)).unwrap()["sourceWatch"]["state"],
             "active"
         );
-        assert!(other_stopped.status.success(), "{}", stderr(&other_stopped));
-        assert_eq!(demo.status.code(), Some(130), "{}", stderr(&demo));
-        assert_eq!(other.status.code(), Some(130), "{}", stderr(&other));
+        assert!(
+            survivor_stopped.status.success(),
+            "{}",
+            stderr(&survivor_stopped)
+        );
+        assert_eq!(first.status.code(), Some(130), "{}", stderr(&first));
+        assert_eq!(survivor.status.code(), Some(130), "{}", stderr(&survivor));
     }
 }
 
