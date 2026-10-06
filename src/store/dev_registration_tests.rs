@@ -211,3 +211,46 @@ fn publication_rechecks_late_owners_and_replaced_source_without_taking_locks() {
     assert!(error.contains("changed during registration"), "{error}");
     assert!(get_environment("child", &env, cwd).unwrap().dev.is_none());
 }
+
+#[test]
+fn rebind_publication_rechecks_environment_and_target_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path();
+    let env = BTreeMap::from([
+        ("HOME".to_string(), display_path(&cwd.join("home"))),
+        ("OCM_HOME".to_string(), display_path(&cwd.join("ocm"))),
+    ]);
+    let old = owned_source(&cwd.join("old"));
+    let target = owned_source(&cwd.join("target"));
+    let borrowed = |source: &EnvDevMeta| EnvDevMeta::Borrowed {
+        source_root: display_path(&fs::canonicalize(source.repo_root()).unwrap()),
+    };
+    let old = borrowed(&old);
+    let target = borrowed(&target);
+    let expected = create_environment(options("demo", Some(old)), &env, cwd).unwrap();
+    let registration = DevSourceRegistration::lock_source(
+        &target,
+        &list_environments(&env, cwd).unwrap(),
+        &env,
+        cwd,
+    )
+    .unwrap();
+    let mut concurrent = expected.clone();
+    concurrent.service_enabled = true;
+    save_environment(concurrent, &env, cwd).unwrap();
+    let error =
+        crate::store::rebind_environment_dev(&expected, target.clone(), &registration, &env, cwd)
+            .unwrap_err();
+    assert!(error.contains("environment changed"), "{error}");
+    let expected = get_environment("demo", &env, cwd).unwrap();
+    let before = fs::read(crate::store::env_registry_path(&env, cwd).unwrap()).unwrap();
+    fs::rename(target.source_root(), cwd.join("previous-target")).unwrap();
+    owned_source(Path::new(target.source_root()));
+    let error = crate::store::rebind_environment_dev(&expected, target, &registration, &env, cwd)
+        .unwrap_err();
+    assert!(error.contains("changed during registration"), "{error}");
+    assert_eq!(
+        fs::read(crate::store::env_registry_path(&env, cwd).unwrap()).unwrap(),
+        before
+    );
+}

@@ -253,6 +253,10 @@ pub fn dev_help(cmd: &str) -> String {
             &[
                 ("status", "Show dev envs and active foreground sessions"),
                 (
+                    "rebind",
+                    "Select a new checkout for a stopped borrowed dev env",
+                ),
+                (
                     "stop",
                     "Stop owned dev processes, including service preparation, and restore any taken-over service",
                 ),
@@ -275,6 +279,7 @@ pub fn dev_help(cmd: &str) -> String {
         vec![
             format!("{cmd} help dev status"),
             format!("{cmd} help dev stop"),
+            format!("{cmd} help dev rebind"),
             format!("{cmd} help service refresh-daemon"),
         ],
     )
@@ -282,6 +287,38 @@ pub fn dev_help(cmd: &str) -> String {
 
 pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
     match action {
+        "rebind" => Some(render_leaf(
+            "Rebind a stopped development source",
+            "Bind an existing borrowed dev environment to an explicitly selected OpenClaw checkout, even when its previous checkout is gone. Preserve environment data, configuration, credentials, workspace, reserved ports and service policy. Start nothing and leave both checkouts untouched.",
+            vec![format!(
+                "{cmd} dev rebind <env> --repo <checkout> [--raw] [--json]"
+            )],
+            &[
+                ("<env>", "Existing borrowed dev environment"),
+                (
+                    "--repo <checkout>",
+                    "Required new OpenClaw Git checkout root",
+                ),
+                ("--raw", "Print plain output"),
+                (
+                    "--json",
+                    "Print envName, previousSourceRoot, sourceRoot and changed",
+                ),
+            ],
+            vec![
+                format!("{cmd} dev stop shaks"),
+                format!("{cmd} dev rebind shaks --repo /path/to/openclaw"),
+                format!("{cmd} dev shaks --repo /path/to/openclaw"),
+            ],
+            &[
+                "Stop foreground ownership first. If dev stop restores a background service, stop it separately with service stop before rebinding.",
+                "Active, starting, restoring, unfinished or unverified ownership, a running service policy, occupied Gateway ports and concurrent operations are refused. Rebind never stops or recovers processes for you.",
+                "Only borrowed-to-borrowed transitions are supported; legacy OCM-owned sources and runtime or launcher bindings are refused.",
+                "Validation or registry-publication failure leaves the previous binding intact. Repeating the same canonical target validates it and returns changed=false without rewriting the registry.",
+                "Prepare the target checkout's dependencies and artifacts explicitly before ordinary dev startup. Rebind does not install, build, onboard, seed or rewrite plugin settings. External plugin paths in user configuration remain user-owned.",
+                "Ordinary dev and --force do not change the source binding. A later explicit service start resolves a fresh source plan; an old captured plan cannot launch the previous checkout.",
+            ],
+        )),
         "stop" => Some(render_leaf(
             "Stop foreground dev session",
             "Ask the recorded dev controller to stop its setup, Gateway and optional UI processes, including --service preparation. Preserve the env, source checkout, dependencies, and configuration; report unverified completion without discarding ownership.",

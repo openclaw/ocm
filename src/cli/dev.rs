@@ -218,8 +218,39 @@ impl Cli {
             "" | "help" | "--help" | "-h" => self.dispatch_help_command(vec!["dev".to_string()]),
             "status" => self.handle_dev_status(args[1..].to_vec()),
             "stop" => self.handle_dev_stop(args[1..].to_vec()),
+            "rebind" if args.get(1).is_some_and(|arg| !arg.starts_with('-')) => {
+                self.handle_dev_rebind(args[1..].to_vec())
+            }
             _ => self.handle_dev_run(args),
         }
+    }
+
+    fn handle_dev_rebind(&self, args: Vec<String>) -> Result<i32, String> {
+        let (args, repo) = Self::consume_option(args, "--repo")?;
+        let (args, json, _profile) = self.consume_human_output_flags(args, "dev rebind")?;
+        let name = args
+            .first()
+            .ok_or("dev rebind requires an environment name")?;
+        let name = validate_name(name, "Environment name")?;
+        Self::assert_no_extra_args(&args[1..])?;
+        let repo = repo.ok_or("dev rebind requires an explicit --repo <checkout>")?;
+        let source = resolve_absolute_path(&repo, &self.env, &self.cwd)?;
+        let summary = self.environment_service().rebind_dev(&name, &source)?;
+        if json {
+            self.print_json(&summary)?;
+        } else {
+            self.stdout_line(format!(
+                "{} {} to {}. No processes were started.",
+                if summary.changed {
+                    "Rebound"
+                } else {
+                    "Already bound"
+                },
+                summary.env_name,
+                summary.source_root
+            ));
+        }
+        Ok(0)
     }
 
     fn handle_dev_stop(&self, args: Vec<String>) -> Result<i32, String> {
