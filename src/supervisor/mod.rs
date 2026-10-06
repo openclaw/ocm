@@ -1186,6 +1186,7 @@ impl<'a> SupervisorService<'a> {
         queue_missing_children(
             &mut pending,
             &running,
+            &inactive,
             &active_state.children,
             0,
             Instant::now(),
@@ -1813,6 +1814,16 @@ fn reconcile_running_children(
     let desired = child_map(&desired_state.children);
     let mut runtime_dirty = false;
 
+    // A terminal decision belongs to this exact launch definition. Sibling
+    // changes must preserve it; removal or a new definition retires it.
+    inactive.retain(|env_name, child| {
+        let retain = desired
+            .get(env_name)
+            .is_some_and(|spec| *spec == child.spec);
+        runtime_dirty |= !retain;
+        retain
+    });
+
     let pending_names = pending.keys().cloned().collect::<Vec<_>>();
     for env_name in pending_names {
         match desired.get(&env_name) {
@@ -1872,7 +1883,14 @@ fn reconcile_running_children(
             runtime_dirty = true;
         }
     }
-    queue_missing_children(pending, running, &desired_state.children, 0, Instant::now());
+    queue_missing_children(
+        pending,
+        running,
+        inactive,
+        &desired_state.children,
+        0,
+        Instant::now(),
+    );
     runtime_dirty
 }
 
@@ -2058,15 +2076,6 @@ fn process_exited_children(
             exited_child.exit_code,
             exited_child.restart_count,
         ));
-        runtime_dirty |= refresh_active_state(
-            state_path,
-            env_service,
-            active_state,
-            managed_child_count,
-            running,
-            pending,
-            inactive,
-        );
         let next_spec = active_child_spec(active_state, &exited_child.env_name).cloned();
         let decision = exited_child_restart_decision(
             &exited_child,
@@ -2158,6 +2167,17 @@ fn process_exited_children(
                 ),
             );
         }
+        // Publish the exit decision in the child collections before reconciling
+        // a concurrent plan update, so the target never looks missing in between.
+        runtime_dirty |= refresh_active_state(
+            state_path,
+            env_service,
+            active_state,
+            managed_child_count,
+            running,
+            pending,
+            inactive,
+        );
     }
 
     Ok(runtime_dirty)
@@ -2274,12 +2294,16 @@ fn supervisor_restart_request_id(name: &str) -> String {
 fn queue_missing_children(
     pending: &mut BTreeMap<String, PendingSupervisorChild>,
     running: &BTreeMap<String, RunningSupervisorChild>,
+    inactive: &BTreeMap<String, InactiveSupervisorChild>,
     desired_children: &[SupervisorChildSpec],
     restart_count: usize,
     retry_at: Instant,
 ) {
     for next_spec in desired_children {
-        if running.contains_key(&next_spec.env_name) || pending.contains_key(&next_spec.env_name) {
+        if running.contains_key(&next_spec.env_name)
+            || pending.contains_key(&next_spec.env_name)
+            || inactive.contains_key(&next_spec.env_name)
+        {
             continue;
         }
         pending.insert(
@@ -4162,6 +4186,58 @@ mod tests {
         assert_eq!(pending.get("rescue").unwrap().spec, next_rescue);
         assert_eq!(pending.get("main").unwrap().spec, main);
         assert_eq!(pending.get("main").unwrap().restart_count, 7);
+    }
+
+    #[test]
+    fn inactive_children_follow_their_own_desired_definition() {
+        for changed in [false, true] {
+            let mut desired = supervisor_state(Vec::new());
+            let original = desired.children[0].clone();
+            let stopped = inactive_supervisor_child(
+                original.clone(),
+                "stopped",
+                None,
+                2,
+                Some(0),
+                Some("terminal exit".to_string()),
+                None,
+            );
+            let event = stopped.last_event_at;
+            let mut inactive = BTreeMap::from([("demo".to_string(), stopped)]);
+            let mut running = BTreeMap::new();
+            let mut pending = BTreeMap::new();
+            desired.children.push(child_spec("sibling", 20000));
+            if changed {
+                desired.children[0]
+                    .process_env
+                    .insert("REVISION".to_string(), "next".to_string());
+            }
+            let dirty =
+                reconcile_running_children(&mut running, &mut pending, &mut inactive, &desired);
+            assert!(pending.contains_key("sibling"));
+            assert_eq!(pending.contains_key("demo"), changed);
+            assert_eq!(inactive.contains_key("demo"), !changed);
+            if changed {
+                assert!(dirty, "the obsolete terminal record must be republished");
+                assert_eq!(pending["demo"].spec, desired.children[0]);
+            } else {
+                assert_eq!(inactive["demo"].spec, original);
+                assert_eq!(inactive["demo"].last_event_at, event);
+                assert_eq!(
+                    inactive["demo"].last_error.as_deref(),
+                    Some("terminal exit")
+                );
+                desired.children.retain(|child| child.env_name != "demo");
+                assert!(reconcile_running_children(
+                    &mut running,
+                    &mut pending,
+                    &mut inactive,
+                    &desired
+                ));
+                assert!(!inactive.contains_key("demo"));
+                assert!(!pending.contains_key("demo"));
+            }
+        }
     }
 
     #[test]
