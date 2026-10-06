@@ -144,6 +144,31 @@ owning its source, worktree path, or required Git metadata is busy with another 
 This also applies to local upgrade simulations; retry after that operation finishes.
 Unchanged source bindings remain writable during restore and recovery.
 
+To keep a borrowed dev environment while explicitly changing its source checkout:
+
+```bash
+ocm dev stop shaks
+ocm dev rebind shaks --repo /path/to/next-openclaw
+ocm dev shaks --repo /path/to/next-openclaw
+```
+
+If stopping the foreground session restores a background service, also run
+`ocm service stop shaks` before rebinding. Rebind requires completed foreground
+ownership and stopped background ownership; it never stops processes itself.
+It works even if the previous checkout is missing, preserves conversations,
+configuration, credentials, workspace, reserved Gateway/UI ports and service
+policy, and starts or installs nothing. Both checkouts remain untouched. Prepare
+the selected checkout's dependencies and artifacts explicitly before starting dev.
+User and plugin settings, including external plugin paths, remain unchanged.
+
+Only existing borrowed dev environments are supported; legacy OCM-owned sources
+and runtime or launcher bindings are refused. Validation or publication failure
+preserves the old binding. Repeating the same canonical target is a validated
+no-op. `--json` reports `envName`, `previousSourceRoot`, `sourceRoot` and `changed`.
+Ordinary `dev` and `--force` retain their existing meanings and cannot switch a
+binding. A later explicit service start resolves the new source; stale captured
+service plans cannot start the old checkout.
+
 New dev environments receive a private Gateway token in their initial config before
 the environment is registered. The token remains stable through restarts and
 source rebuilds, so paired clients can reconnect. Initialization never replaces an

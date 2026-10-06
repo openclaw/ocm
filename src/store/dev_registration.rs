@@ -184,7 +184,7 @@ impl DevSourceRegistration {
         Self::lock_source(dev, &envs, env, cwd)
     }
 
-    fn lock_source(
+    pub(crate) fn lock_source(
         dev: &EnvDevMeta,
         envs: &[EnvMeta],
         env: &BTreeMap<String, String>,
@@ -247,7 +247,7 @@ impl DevSourceRegistration {
         self.recheck_source(dev.ok_or("missing dev source")?, envs)
     }
 
-    fn recheck_source(&self, dev: &EnvDevMeta, envs: &[EnvMeta]) -> Result<(), String> {
+    pub(crate) fn recheck_source(&self, dev: &EnvDevMeta, envs: &[EnvMeta]) -> Result<(), String> {
         if dev.borrowed_source_root().is_some() {
             dev.execution_source_root()?;
         }

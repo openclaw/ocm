@@ -272,6 +272,31 @@ pub(crate) fn save_environment_with_dev_registration(
     Ok(meta)
 }
 
+/// The caller retains the environment operation and Gateway admission locks.
+pub(crate) fn rebind_environment_dev(
+    expected: &EnvMeta,
+    dev: crate::env::EnvDevMeta,
+    registration: &DevSourceRegistration,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
+    let _lock = lock_env_registry(env, cwd)?;
+    let mut registry = load_env_registry(env, cwd)?;
+    let current = find_environment(&registry, &expected.name)
+        .filter(|current| current == expected)
+        .ok_or("environment changed during dev rebind; retry the command")?;
+    // Even a repeated target must still be the checkout inspected before admission.
+    registration.recheck_source(&dev, &registry.envs)?;
+    if current.dev.as_ref() == Some(&dev) {
+        return Ok(current);
+    }
+    let mut changed = current;
+    changed.dev = Some(dev);
+    let changed = upsert_environment(&mut registry, changed)?;
+    write_env_registry(&mut registry, env, cwd)?;
+    Ok(changed)
+}
+
 pub(crate) fn save_environment_with_validated_launcher(
     mut meta: EnvMeta,
     env: &BTreeMap<String, String>,

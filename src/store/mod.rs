@@ -32,7 +32,7 @@ pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
 pub(crate) use dev_ui_ports::reserve as reserve_dev_ui_port;
 pub(crate) use envs::{
     EnvironmentOperationLock, lock_env_registry, lock_environment_operation,
-    remove_environment_locked,
+    rebind_environment_dev, remove_environment_locked,
 };
 pub(crate) use envs::{
     EnvironmentServicePolicyChange, environment_service_policy_revision,

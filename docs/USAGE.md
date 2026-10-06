@@ -872,6 +872,39 @@ regular `meta/env.json` file. Import and legacy snapshot restore reject symlinks
 at those entries before reading metadata or copying environment contents, so
 an archive cannot redirect those operations to files outside its extracted tree.
 
+### Rebind a borrowed development source
+
+Use an explicit target to retain a stopped preview's data while changing its code:
+
+```bash
+ocm dev stop luna
+ocm dev rebind luna --repo /path/to/next-openclaw
+ocm dev luna --repo /path/to/next-openclaw
+```
+
+Stop any restored or independently running background service with
+`ocm service stop luna` before rebind. The old checkout need not exist. The new
+target must be a valid main or registered linked OpenClaw Git checkout, isolated
+from the environment's deletable state and Git metadata. Concurrent mutations,
+active or unfinished foreground ownership, unsafe background ownership and
+occupied Gateway ports are refused without changing the binding.
+
+Rebind only updates the source binding of an existing borrowed dev environment.
+It preserves conversations, configuration, workspace, credentials, reserved
+Gateway/UI ports and service policy; it does not install, start, stop, clone, seed
+or edit either checkout or user state. Prepare dependencies and build artifacts
+in the selected checkout before normal dev startup. User/plugin-owned settings
+and external plugin paths are preserved, not relocated. Legacy OCM-owned sources
+and runtime or launcher environments cannot be converted by this command.
+
+`--json` returns `envName`, `previousSourceRoot`, `sourceRoot` and `changed`.
+Repeating the same canonical target validates ownership and checkout identity
+but leaves registry bytes unchanged and returns `changed: false`. A validation
+or atomic-publication failure preserves the previous binding. Ordinary `dev`
+and `--force` never switch sources. One-shot execution and status use the new
+binding immediately; the next explicit service start rebuilds its launch plan,
+and admission rejects a saved plan that still names the old source.
+
 ### Inspect and repair
 
 ```bash

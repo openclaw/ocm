@@ -1,3 +1,5 @@
+#[path = "support/dev_rebind.rs"]
+mod dev_rebind;
 mod support;
 
 use std::fs;

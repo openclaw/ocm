@@ -508,6 +508,57 @@ impl<'a> SupervisorService<'a> {
         }))
     }
 
+    /// Admission excludes new children; retain uncertain or unacknowledged ownership,
+    /// including records left behind by an exited daemon.
+    pub(crate) fn ensure_dev_rebind_quiescent(&self, env_name: &str) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let Some(runtime) = self.read_runtime_state()? else {
+                return Ok(());
+            };
+            if runtime.kind != SUPERVISOR_RUNTIME_KIND
+                || runtime.ocm_home != display_path(&resolve_ocm_home(self.env, self.cwd)?)
+            {
+                return Err(
+                    "cannot verify background service ownership before dev rebind".to_string(),
+                );
+            }
+            let has_child = runtime
+                .children
+                .iter()
+                .any(|child| child.env_name == env_name);
+            let services = runtime
+                .services
+                .iter()
+                .filter(|service| service.env_name == env_name)
+                .collect::<Vec<_>>();
+            if !has_child && services.is_empty() {
+                return Ok(());
+            }
+            if has_child
+                || services.iter().any(|service| {
+                    service.pid.is_some()
+                        || service.gateway_state != "stopped"
+                        || service.next_retry_at.is_some()
+                })
+            {
+                return Err(format!(
+                    "background ownership for env {env_name} has not stopped; stop its service and verify shutdown before rebinding"
+                ));
+            }
+            // Service stop may return before the next daemon reconciliation.
+            // Wait only for a current daemon's terminal record to be retired;
+            // stale records and unknown processes never establish quiescence.
+            self.ensure_gateway_admission_compatible("rebind dev source")?;
+            if self.live_runtime_state()?.is_none() || Instant::now() >= deadline {
+                return Err(format!(
+                    "background ownership for env {env_name} has not been retired; verify service shutdown before rebinding"
+                ));
+            }
+            sleep(Duration::from_millis(25));
+        }
+    }
+
     pub fn inspect(&self) -> Result<SupervisorInspection, String> {
         let state = self.build_state()?;
         let daemon = self.daemon_status()?;
