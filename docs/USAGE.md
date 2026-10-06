@@ -468,6 +468,13 @@ Forced restart explicitly replaces the supervised child directly. It bypasses
 OpenClaw's restart-recovery handoff and can lose in-flight work, so it is
 intentionally an emergency override rather than a compatibility requirement.
 
+A Gateway that exits cleanly without an accepted restart handoff stays stopped
+while its saved launch definition remains unchanged. Starting or restarting a
+sibling environment does not revive it. An explicit restart of that environment,
+a changed launch definition, or a new daemon run can start it again. Stopping the
+service removes its inactive runtime record so snapshot maintenance can verify
+that the environment is quiescent.
+
 Recovery is limited to work OpenClaw knows how to persist and resume. It does
 not make arbitrary child processes or non-idempotent external side effects
 transactional.

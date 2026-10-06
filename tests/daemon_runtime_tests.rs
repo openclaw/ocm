@@ -3355,6 +3355,333 @@ fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child(
     stop_process(&mut daemon);
 }
 
+// Own cleanup even when a regression assertion fails while a sibling stays live.
+struct InactiveGatewayFixture {
+    daemon: Child,
+    root: TestDir,
+    cwd: std::path::PathBuf,
+    env: BTreeMap<String, String>,
+    runtime_path: std::path::PathBuf,
+    sibling: Value,
+}
+
+impl Drop for InactiveGatewayFixture {
+    fn drop(&mut self) {
+        let _ = fs::write(self.root.child("release-consume"), "release");
+        stop_process(&mut self.daemon);
+    }
+}
+
+impl InactiveGatewayFixture {
+    fn new() -> Self {
+        let fixture = Self::running(false);
+        fixture.exit_target();
+        fixture
+    }
+
+    fn running(block_consume: bool) -> Self {
+        let root = TestDir::new("inactive-gateway-reconcile");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
+        install_fake_systemd_tools(&root, &mut env);
+        for name in ["target", "sibling"] {
+            let runtime = root.child(format!("bin/{name}/openclaw.mjs"));
+            write_upgrade_aware_gateway_script(
+                &runtime,
+                "2026.8.1",
+                &root.child(format!("{name}-started")),
+                &root.child(format!("{name}-stopped")),
+                false,
+            );
+            if name == "target" && block_consume {
+                let protocol = format!(
+                    r#"if [ "${{3:-}}" = "capabilities" ]; then
+  printf '%s\n' '{{"ok":true,"protocol":"openclaw.gateway.restart-handoff","protocolVersion":1,"operations":["consume"]}}'
+  exit 0
+fi
+printf 'waiting\n' > '{}'
+for attempt in $(seq 1 200); do
+  if [ -f '{}' ]; then
+    printf '%s\n' '{{"ok":true,"protocol":"openclaw.gateway.restart-handoff","protocolVersion":1,"status":"none","reason":"missing"}}'
+    exit 0
+  fi
+  sleep 0.025
+done
+exit 65"#,
+                    path_string(&root.child("consume-waiting")),
+                    path_string(&root.child("release-consume")),
+                );
+                let script = fs::read_to_string(&runtime)
+                    .unwrap()
+                    .replacen("exit 64", &protocol, 1);
+                write_executable_script(&runtime, &script);
+            }
+            let added = run_ocm(
+                &cwd,
+                &env,
+                &["runtime", "add", name, "--path", &path_string(&runtime)],
+            );
+            assert!(added.status.success(), "{}", stderr(&added));
+            let created = run_ocm(&cwd, &env, &["env", "create", name, "--runtime", name]);
+            assert!(created.status.success(), "{}", stderr(&created));
+        }
+        let service = SupervisorService::new(&env, &cwd);
+        service.sync().unwrap();
+        service.install_daemon().unwrap();
+        let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+        let daemon = spawn_daemon_process(&cwd, &env);
+        let mut fixture = Self {
+            daemon,
+            root,
+            cwd,
+            env,
+            runtime_path,
+            sibling: Value::Null,
+        };
+        for name in ["target", "sibling"] {
+            let started = run_ocm(
+                &fixture.cwd,
+                &fixture.env,
+                &["service", "start", name, "--json"],
+            );
+            assert!(started.status.success(), "{}", stderr(&started));
+        }
+        let initial = read_persisted_service_state(&fixture.runtime_path);
+        fixture.sibling = runtime_child(&initial, "sibling");
+        fixture
+    }
+
+    fn signal_target(&self) {
+        let runtime = read_persisted_service_state(&self.runtime_path);
+        let pid = runtime_child_pid(&runtime, "target").unwrap();
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn exit_target(&self) {
+        // Snapshot restoration publishes the child before its signal handlers
+        // and HTTP listener are ready. Wait through the public health contract.
+        let ready = run_ocm(
+            &self.cwd,
+            &self.env,
+            &["service", "start", "target", "--json"],
+        );
+        assert!(ready.status.success(), "{}", stderr(&ready));
+        self.signal_target();
+        let stopped = wait_for_runtime_service_state(
+            &self.runtime_path,
+            "target",
+            "stopped",
+            Duration::from_secs(5),
+        )
+        .expect("clean exit must reach the terminal inactive state");
+        assert_eq!(stopped["pid"], Value::Null);
+        assert_eq!(stopped["lastExitCode"], 0);
+    }
+}
+
+#[test]
+fn sibling_restart_preserves_inactive_target_until_explicit_restart() {
+    let _guard = daemon_runtime_test_lock();
+    let fixture = InactiveGatewayFixture::new();
+    let target_state = wait_for_runtime_service_state(
+        &fixture.runtime_path,
+        "target",
+        "stopped",
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let state_path = fixture.root.child("ocm-home/supervisor/state.json");
+    let target_spec = persisted_child(&state_path, "target");
+    let restart = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["service", "restart", "sibling", "--force", "--json"],
+    );
+    assert!(restart.status.success(), "{}", stderr(&restart));
+    let runtime = read_persisted_service_state(&fixture.runtime_path);
+    assert_ne!(
+        runtime_child(&runtime, "sibling")["pid"],
+        fixture.sibling["pid"]
+    );
+    assert!(runtime_child_pid(&runtime, "target").is_none());
+    assert_eq!(persisted_child(&state_path, "target"), target_spec);
+    assert_eq!(
+        runtime["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["envName"] == "target"),
+        Some(&target_state)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.child("target-started"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    let restart = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["service", "restart", "target", "--force", "--json"],
+    );
+    assert!(restart.status.success(), "{}", stderr(&restart));
+    let restarted = read_persisted_service_state(&fixture.runtime_path);
+    assert!(runtime_child_pid(&restarted, "target").is_some());
+    assert_eq!(
+        runtime_child(&restarted, "sibling"),
+        runtime_child(&runtime, "sibling")
+    );
+}
+
+#[test]
+fn snapshot_retires_inactive_target_and_preserves_running_sibling() {
+    let _guard = daemon_runtime_test_lock();
+    let fixture = InactiveGatewayFixture::new();
+    let snapshot = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &[
+            "env", "snapshot", "create", "target", "--label", "inactive", "--json",
+        ],
+    );
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+    let runtime = read_persisted_service_state(&fixture.runtime_path);
+    assert_eq!(runtime_child(&runtime, "sibling"), fixture.sibling);
+    assert!(
+        runtime_child_pid(&runtime, "target").is_some(),
+        "snapshot must restore the target's running policy"
+    );
+
+    fixture.exit_target();
+    let stopped = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["service", "stop", "target", "--json"],
+    );
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let runtime = read_persisted_service_state(&fixture.runtime_path);
+        assert_eq!(runtime_child(&runtime, "sibling"), fixture.sibling);
+        if runtime["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["envName"] != "target")
+        {
+            assert!(runtime_child_pid(&runtime, "target").is_none());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stopped target retained inactive ownership metadata"
+        );
+        sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn inactive_exit_decision_survives_concurrent_sibling_restart() {
+    assert_inactive_exit_reconciliation(false);
+}
+
+#[test]
+fn inactive_exit_decision_is_retired_after_concurrent_stop() {
+    assert_inactive_exit_reconciliation(true);
+}
+
+fn assert_inactive_exit_reconciliation(remove_target: bool) {
+    let _guard = daemon_runtime_test_lock();
+    let fixture = InactiveGatewayFixture::running(true);
+    fixture.signal_target();
+    assert!(wait_for_file(
+        &fixture.root.child("consume-waiting"),
+        Duration::from_secs(5)
+    ));
+    let cwd = fixture.cwd.clone();
+    let env = fixture.env.clone();
+    let operation = std::thread::spawn(move || {
+        let args = if remove_target {
+            vec!["service", "stop", "target", "--json"]
+        } else {
+            vec!["service", "restart", "sibling", "--force", "--json"]
+        };
+        run_ocm(&cwd, &env, &args)
+    });
+    let state_path = fixture.root.child("ocm-home/supervisor/state.json");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let state = read_persisted_service_state(&state_path);
+        let published = if remove_target {
+            state["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["envName"] != "target")
+        } else {
+            state["restartRequests"].as_array().is_some_and(|requests| {
+                requests
+                    .iter()
+                    .any(|request| request["envName"] == "sibling")
+            })
+        };
+        if published {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CLI did not publish its desired-state update"
+        );
+        sleep(Duration::from_millis(25));
+    }
+    fs::write(fixture.root.child("release-consume"), "release").unwrap();
+    let result = operation.join().unwrap();
+    assert!(result.status.success(), "{}", stderr(&result));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let runtime = read_persisted_service_state(&fixture.runtime_path);
+        let target = runtime["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["envName"] == "target");
+        let reconciled = if remove_target {
+            target.is_none()
+        } else {
+            target.is_some_and(|entry| entry["gatewayState"] == "stopped" && entry["pid"].is_null())
+        };
+        if reconciled {
+            assert!(runtime_child_pid(&runtime, "target").is_none());
+            if remove_target {
+                assert_eq!(runtime_child(&runtime, "sibling"), fixture.sibling);
+            }
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "concurrent plan update lost the terminal exit decision: {runtime}"
+        );
+        sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.root.child("target-started"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn service_restart_requeues_a_stopped_desired_child() {
     let _guard = daemon_runtime_test_lock();
