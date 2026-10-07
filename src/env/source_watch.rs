@@ -115,7 +115,7 @@ pub(crate) struct SourceWatchLease {
     lease_id: String,
     lock_file: File,
     service_was_running: bool,
-    service_preparation_revision: Option<u64>,
+    service_policy_revision: Option<u64>,
     watching: bool,
     session_paths: SourceWatchSessionPaths,
     session: Option<SourceWatchSession>,
@@ -143,8 +143,17 @@ impl SourceWatchLease {
         self.service_was_running
     }
 
-    pub(crate) fn service_preparation_revision(&self) -> Option<u64> {
-        self.service_preparation_revision
+    pub(crate) fn service_policy_revision(&self) -> Option<u64> {
+        self.service_policy_revision
+    }
+
+    pub(crate) fn record_service_policy_revision(&mut self, revision: u64) -> Result<(), String> {
+        self.service_policy_revision = Some(revision);
+        if let Some(session) = &mut self.session {
+            session.restore_service_policy_revision = Some(revision);
+            self.session_paths.save_session(session)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn session(&self) -> Option<&SourceWatchSession> {
@@ -299,17 +308,18 @@ impl SourceWatchLease {
         self.session_paths.save_session(session)
     }
 
-    pub(crate) fn begin_service_takeover(&mut self) -> Result<(), String> {
+    pub(crate) fn begin_service_takeover(&mut self, revision: u64) -> Result<(), String> {
         if let Some(session) = &mut self.session {
             session.restore_service = self.service_was_running;
-            self.session_paths.save_session(session)?;
         }
-        Ok(())
+        self.record_service_policy_revision(revision)
     }
 
     pub(crate) fn discard_service_restore(&mut self) -> Result<(), String> {
+        self.service_policy_revision = None;
         if let Some(session) = &mut self.session {
             session.restore_service = false;
+            session.restore_service_policy_revision = None;
             self.session_paths.save_session(session)?;
         }
         Ok(())
@@ -517,7 +527,7 @@ impl<'a> EnvironmentService<'a> {
             lease_id: session.lease_id.clone(),
             lock_file,
             service_was_running: session.restore_service,
-            service_preparation_revision: None,
+            service_policy_revision: session.restore_service_policy_revision,
             watching: session.is_watching(),
             session_paths,
             session: Some(session),
@@ -719,12 +729,9 @@ impl<'a> EnvironmentService<'a> {
                     .ok_or_else(|| format!("cannot prepare source while environment {:?} has an operation in progress; retry after it finishes", peer.name))?);
             }
         }
-        let service_preparation_revision = mode
-            .is_service_preparation()
-            .then(|| {
-                crate::store::environment_service_policy_revision(&env_name, self.env, self.cwd)
-            })
-            .transpose()?;
+        let service_policy_revision = Some(crate::store::environment_service_policy_revision(
+            &env_name, self.env, self.cwd,
+        )?);
         if meta.service_running && !allow_service_takeover && !mode.is_service_preparation() {
             return Err(format!(
                 "dev env {env_name} is already running in the background; stop it first or rerun with --watch --force to take it over temporarily"
@@ -803,7 +810,7 @@ impl<'a> EnvironmentService<'a> {
             lease_id,
             lock_file,
             service_was_running: meta.service_running && !mode.is_service_preparation(),
-            service_preparation_revision,
+            service_policy_revision,
             watching: mode.is_watching(),
             session_paths,
             session,

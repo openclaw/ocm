@@ -500,10 +500,16 @@ impl Cli {
             let restore = if should_restore {
                 self.restore_source_watch_service(env_name, &mut lease)
             } else {
-                Ok(())
+                Ok(false)
             };
-            let restored = should_restore && restore.is_ok();
-            finish_source_watch_session(env_name, &mut lease, Ok(0), restore, restored)?;
+            let restored = matches!(restore, Ok(true));
+            finish_source_watch_session(
+                env_name,
+                &mut lease,
+                Ok(0),
+                restore.map(|_| ()),
+                restored,
+            )?;
             return Ok(DevStopSummary {
                 env_name: env_name.to_string(),
                 stopped: true,
@@ -833,7 +839,7 @@ impl Cli {
             let lease = source_watch_lease
                 .as_mut()
                 .ok_or_else(|| "service preparation ownership is missing".to_string())?;
-            let service_policy_revision = lease.service_preparation_revision();
+            let service_policy_revision = lease.service_policy_revision();
             let cancelled = source_watch_cancelled(lease, watch_stop.as_deref().unwrap())?;
             let code = finish_source_watch_session(
                 &meta.name,
@@ -891,7 +897,7 @@ impl Cli {
                 self.stderr_lines(render_dev_run_step(
                     "Takeover",
                     format!(
-                        "Stopping background service for {} while watch takes over; OCM will restore it when watch exits",
+                        "Stopping background service for {} while watch takes over; OCM will restore it when watch exits if its service policy is unchanged",
                         meta.name
                     ),
                     stderr_profile,
@@ -939,27 +945,29 @@ impl Cli {
                         .as_mut()
                         .ok_or_else(|| "source watch lease is missing".to_string())?,
                 ) {
-                    Ok(()) => {
-                        self.stdout_lines(render_dev_service_restored(
-                            &meta,
-                            &self.command_example(),
-                            self.dev_stdout_profile(),
-                        ));
-                        Ok(())
+                    Ok(restored) => {
+                        if restored {
+                            self.stdout_lines(render_dev_service_restored(
+                                &meta,
+                                &self.command_example(),
+                                self.dev_stdout_profile(),
+                            ));
+                        }
+                        Ok(restored)
                     }
                     Err(error) => Err(error),
                 }
             } else {
-                Ok(())
+                Ok(false)
             };
-            let restored = should_restore && restore_result.is_ok();
+            let restored = matches!(restore_result, Ok(true));
             return finish_source_watch_session(
                 &meta.name,
                 source_watch_lease
                     .as_mut()
                     .ok_or_else(|| "source watch lease is missing".to_string())?,
                 watch_result,
-                restore_result,
+                restore_result.map(|_| ()),
                 restored,
             );
         }
@@ -1129,7 +1137,7 @@ impl Cli {
             self.stderr_lines(render_dev_run_step(
                 "Takeover",
                 format!(
-                    "Stopping background service for {} while source watch takes over; OCM will restore it when watch exits",
+                    "Stopping background service for {} while source watch takes over; OCM will restore it when watch exits if its service policy is unchanged",
                     meta.name
                 ),
                 stderr_profile,
@@ -1178,28 +1186,30 @@ impl Cli {
                     .as_mut()
                     .ok_or_else(|| "source watch lease is missing".to_string())?,
             ) {
-                Ok(()) => {
-                    self.stdout_lines(render_source_watch_service_restored(
-                        &meta,
-                        &repo_root,
-                        &self.command_example(),
-                        self.dev_stdout_profile(),
-                    ));
-                    Ok(())
+                Ok(restored) => {
+                    if restored {
+                        self.stdout_lines(render_source_watch_service_restored(
+                            &meta,
+                            &repo_root,
+                            &self.command_example(),
+                            self.dev_stdout_profile(),
+                        ));
+                    }
+                    Ok(restored)
                 }
                 Err(error) => Err(error),
             }
         } else {
-            Ok(())
+            Ok(false)
         };
-        let restored = should_restore && restore_result.is_ok();
+        let restored = matches!(restore_result, Ok(true));
         finish_source_watch_session(
             &meta.name,
             source_watch_lease
                 .as_mut()
                 .ok_or_else(|| "source watch lease is missing".to_string())?,
             watch_result,
-            restore_result,
+            restore_result.map(|_| ()),
             restored,
         )
     }
@@ -1212,8 +1222,29 @@ impl Cli {
         let env_service = self.environment_service();
         let _operation = env_service.lock_operation(env_name)?;
         self.ensure_source_watch_env_matches(env_name, lease)?;
-        lease.begin_service_takeover()?;
+        let revision =
+            crate::store::environment_service_policy_revision(env_name, &self.env, &self.cwd)?;
+        if lease.service_policy_revision() != Some(revision) {
+            // A policy request during preparation supersedes the borrowed intent,
+            // but a timed-out or rolled-back request may leave the Gateway alive.
+            lease.discard_service_restore()?;
+            let status = self.service_service().status(env_name)?;
+            if status.running || status.desired_running {
+                return Err(format!(
+                    "background service for {env_name} is still running or requested after the policy changed during preparation; source watch was not started"
+                ));
+            }
+            return Ok(());
+        }
+        // Persist only an observed revision. Predicting Stop's next revision
+        // could mistake a later operator request for our write after a crash.
+        lease.begin_service_takeover(revision)?;
         let stop_result = self.service_service().stop_locked(env_name);
+        // Capture the stop's revision under the operation lock, including when
+        // stopping timed out and the original policy needs to be restored.
+        lease.record_service_policy_revision(crate::store::environment_service_policy_revision(
+            env_name, &self.env, &self.cwd,
+        )?)?;
         match stop_result {
             Ok(summary) if !summary.running => Ok(()),
             Ok(summary) => Err(source_watch_stop_timeout_error(&summary)),
@@ -1249,19 +1280,51 @@ impl Cli {
         &self,
         env_name: &str,
         lease: &mut SourceWatchLease,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let env_service = self.environment_service();
         let _operation = env_service.lock_operation(env_name)?;
         self.ensure_source_watch_env_matches(env_name, lease)?;
+        if lease
+            .session()
+            .is_some_and(|session| !session.restore_service)
+        {
+            return Ok(false);
+        }
+        // Older session records have no revision and retain their recovery
+        // behavior; their historical policy observation cannot be reconstructed.
+        if let Some(revision) = lease.service_policy_revision()
+            && revision
+                != crate::store::environment_service_policy_revision(
+                    env_name, &self.env, &self.cwd,
+                )?
+        {
+            lease.discard_service_restore()?;
+            return Ok(false);
+        }
         lease.begin_service_restore()?;
         self.stderr_lines(render_dev_run_step(
             "Restore",
             format!("Starting background service for {env_name}"),
             self.dev_stderr_profile(),
         ));
-        self.service_service()
-            .start_action_locked(env_name)?
-            .ensure_gateway_ready()
+        let restore = self
+            .service_service()
+            .start_action_locked(env_name)
+            .and_then(|summary| summary.ensure_gateway_ready());
+        if let Err(error) = restore {
+            // The operation lock still excludes policy requests. Retain our
+            // own Start/rollback result so a later stop can retry restoration.
+            let recorded =
+                crate::store::environment_service_policy_revision(env_name, &self.env, &self.cwd)
+                    .and_then(|revision| lease.record_service_policy_revision(revision));
+            return Err(match recorded {
+                Ok(()) => error,
+                Err(record_error) => format!(
+                    "{error}; failed recording the service policy for restoration retry: {record_error}"
+                ),
+            });
+        }
+        Ok(true)
     }
 
     fn restore_service_policy_after_failed_takeover(
@@ -1271,11 +1334,15 @@ impl Cli {
         source_watch_lease: &mut SourceWatchLease,
     ) -> (String, bool) {
         match self.restore_source_watch_service(env_name, source_watch_lease) {
-            Ok(()) => (
+            Ok(true) => (
                 format!(
                     "{stop_error}; restored the background service policy and did not start source watch"
                 ),
                 true,
+            ),
+            Ok(false) => (
+                format!("{stop_error}; the current service policy was preserved"),
+                false,
             ),
             Err(restore_error) => (
                 format!(
