@@ -192,11 +192,35 @@ pub(crate) fn prepare_migrated_runtime_state(
     })
 }
 
+pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Result<(), String> {
+    // Check parents before descendants, including dangling links. These are the
+    // directories cleanup opens directly rather than reaching via typed entries.
+    for path in [
+        paths.state_dir.clone(),
+        paths.state_dir.join("agents"),
+        paths.state_dir.join("extensions"),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "cannot clear copied OpenClaw runtime state: expected a real directory, not a symlink or other file: {}",
+                    display_path(&path)
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn clear_nonportable_runtime_state(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<bool, String> {
+    validate_nonportable_runtime_state_paths(paths)?;
     if !path_exists(&paths.state_dir) {
         return Ok(false);
     }
@@ -1235,6 +1259,67 @@ mod tests {
         )));
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_state_cleanup_rejects_linked_parents_before_removing_any_entries() {
+        for relative in [".openclaw", ".openclaw/agents", ".openclaw/extensions"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = derive_env_paths(temp.path().join("target"));
+            fs::create_dir_all(paths.state_dir.join("agents/main/sessions")).unwrap();
+            fs::create_dir_all(paths.state_dir.join("extensions/demo/node_modules")).unwrap();
+            fs::write(
+                paths.state_dir.join("agents/main/sessions/session.jsonl"),
+                "session",
+            )
+            .unwrap();
+            fs::write(
+                paths
+                    .state_dir
+                    .join("extensions/demo/node_modules/index.js"),
+                "dependency",
+            )
+            .unwrap();
+            fs::write(
+                paths
+                    .state_dir
+                    .join("extensions/demo/.openclaw-runtime-deps.json"),
+                "{}",
+            )
+            .unwrap();
+            fs::write(paths.state_dir.join("gateway.pid"), "123").unwrap();
+            let linked = paths.root.join(relative);
+            let external = temp.path().join("external");
+            fs::rename(&linked, &external).unwrap();
+            std::os::unix::fs::symlink(&external, &linked).unwrap();
+
+            let error = clear_nonportable_runtime_state(
+                &paths,
+                &BTreeMap::new(),
+                OpenClawWorkspaceRuntime::default(),
+            )
+            .unwrap_err();
+            assert!(error.contains("expected a real directory"), "{error}");
+            assert_eq!(
+                fs::read_to_string(paths.state_dir.join("agents/main/sessions/session.jsonl"))
+                    .unwrap(),
+                "session"
+            );
+            assert_eq!(
+                fs::read_to_string(
+                    paths
+                        .state_dir
+                        .join("extensions/demo/node_modules/index.js")
+                )
+                .unwrap(),
+                "dependency"
+            );
+            assert_eq!(
+                fs::read_to_string(paths.state_dir.join("gateway.pid")).unwrap(),
+                "123"
+            );
+        }
     }
 
     #[test]

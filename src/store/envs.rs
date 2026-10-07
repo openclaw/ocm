@@ -31,6 +31,7 @@ use super::layout::{
     resolve_absolute_path, resolve_store_paths, validate_name,
 };
 use super::now_utc;
+use super::openclaw_state::validate_nonportable_runtime_state_paths;
 use super::{
     DevSourceRegistration, OpenClawWorkspaceRuntime, clear_nonportable_runtime_state,
     normalize_new_environment_sandbox_origin, openclaw_config_include_paths,
@@ -667,6 +668,7 @@ fn clone_environment_with_policy(
             display_path(&source_paths.root)
         ));
     }
+    validate_nonportable_runtime_state_paths(&source_paths)?;
     if matches!(policy, CloneEnvironmentPolicy::Standard) {
         reject_include_owned_sandbox_origin(&source_paths.config_path)?;
         reject_include_owned_agent_workspaces(&source_paths.config_path)?;
@@ -679,6 +681,7 @@ fn clone_environment_with_policy(
     source_workspaces.archive_relative_roots(&source_paths.root)?;
     let result = (|| {
         copy_dir_recursive(&source_paths.root, &target_paths.root)?;
+        validate_nonportable_runtime_state_paths(&target_paths)?;
         let created_at = now_utc();
         let gateway_port = choose_cloned_gateway_port(&source, &registry.envs, env);
         let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
@@ -1047,6 +1050,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
             return Err("archive is missing root/".to_string());
         }
         let extracted_paths = derive_env_paths(&extracted.root_dir);
+        validate_nonportable_runtime_state_paths(&extracted_paths)?;
         reject_include_owned_sandbox_origin(&extracted_paths.config_path)?;
         reject_include_owned_agent_workspaces(&extracted_paths.config_path)?;
         let extracted_workspaces = resolve_env_openclaw_workspaces(
@@ -1064,6 +1068,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 choose_available_gateway_port(preferred_gateway_port, &registry.envs, env);
             let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
             copy_dir_recursive(&extracted.root_dir, &target_paths.root)?;
+            validate_nonportable_runtime_state_paths(&target_paths)?;
             reject_include_owned_sandbox_origin(&target_paths.config_path)?;
             let config_rewrite = rewrite_openclaw_config_for_new_environment(
                 &target_paths,
