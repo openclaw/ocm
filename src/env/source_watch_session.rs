@@ -108,6 +108,8 @@ pub(crate) struct SourceWatchSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ui: Option<SourceUiSession>,
     pub(crate) restore_service: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restore_service_policy_revision: Option<u64>,
     #[serde(default)]
     pub(crate) closed: bool,
     #[serde(default)]
@@ -214,6 +216,7 @@ impl SourceWatchSessionPaths {
             service_preparation: mode.is_service_preparation(),
             ui: ui.then(SourceUiSession::default),
             restore_service: false,
+            restore_service_policy_revision: None,
             closed: false,
             completion: None,
         };
@@ -792,6 +795,7 @@ mod tests {
             service_preparation: false,
             ui: None,
             restore_service: false,
+            restore_service_policy_revision: None,
             closed: false,
             completion: None,
         };
@@ -905,6 +909,7 @@ mod tests {
             service_preparation: false,
             ui: None,
             restore_service: false,
+            restore_service_policy_revision: None,
             closed: false,
             completion: None,
         };

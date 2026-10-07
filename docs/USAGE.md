@@ -955,9 +955,12 @@ tree is inspected after the watch stops.
 For new Unix foreground generations, unverified output or process completion keeps
 ownership recorded. A controller crash, raw signal, or missing output EOF cannot
 be cleared by repeating stop, starting another watch/service, or destroying the
-env. Normal acknowledged errors remain retryable; released legacy watch records
-and Windows process-job recovery retain their existing rules. Use a compatible
-OCM CLI and refresh an older running daemon before creating a new generation.
+env.
+Normal acknowledged errors remain retryable; released legacy watch records and Windows process-job recovery retain their process cleanup rules.
+Recovery compares the takeover revision saved by newer sessions before restoring the service; a later Stop or Uninstall remains authoritative.
+If a controller dies during takeover before its resulting policy revision is saved, recovery preserves the current policy.
+Older session records without that revision retain their existing recovery behavior because their historical policy observation is unavailable.
+Use a compatible OCM CLI and refresh an older running daemon before creating a new generation.
 
 If a stopped controller retained a cleanup failure, first independently verify
 that every source process, including detached workers, has stopped. Then run
@@ -977,9 +980,10 @@ the Gateway; `--no-ui` disables Vite. `dev stop <env>` stops the recorded sessio
 without removing its environment or source. Repeating the same source, launch
 endpoint and effective backend watching/UI choices reuses the session; changing
 those choices requires stopping it first. `dev status --json` reports active
-ownership separately from `sourceWatch.watching`. `--force` temporarily takes
-over a running background service while backend watching is enabled and restores
-it on exit; it rejects `--no-watch` or `--service`.
+ownership separately from `sourceWatch.watching`.
+`--force` temporarily takes over a running background service while backend watching is enabled and restores it on exit only if no later service policy request supersedes the takeover; it rejects `--no-watch` or `--service`.
+A successful `service stop` or `service uninstall` during preparation or the foreground session remains authoritative after cleanup, including a Stop that repeats the temporarily stopped state.
+In that case, `dev stop --json` reports `serviceRestored: false`; an unchanged takeover still restores the running service, and an initially stopped environment remains stopped.
 
 Named `dev status` and JSON/raw output also report Gateway `/health` responses
 and the captured UI process and HTML document separately. JSON includes

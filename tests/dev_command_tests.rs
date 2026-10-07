@@ -5411,6 +5411,166 @@ fn dev_stop_restores_service_and_preserves_the_env_and_borrowed_source() {
 }
 
 #[cfg(unix)]
+fn assert_foreground_cleanup_preserves_current_policy(registered: bool) {
+    for action in ["stop", "uninstall", "unchanged", "initially-stopped"] {
+        let root = TestDir::new(&format!("dev-policy-{registered}-{action}"));
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env_with_gateway_admission(&root);
+        install_fake_dev_runners(&root, &mut env);
+        if registered {
+            let created = run_ocm(
+                &cwd,
+                &env,
+                &[
+                    "dev",
+                    "demo",
+                    "--repo",
+                    &path_string(&repo),
+                    "--no-watch",
+                    "--no-ui",
+                ],
+            );
+            assert!(created.status.success(), "{}", stderr(&created));
+        } else {
+            create_runtime_backed_env(&cwd, &env);
+        }
+        let initial_action = if action == "initially-stopped" {
+            "stop"
+        } else {
+            "start"
+        };
+        let initial = run_ocm(&cwd, &env, &["service", initial_action, "demo"]);
+        assert!(initial.status.success(), "{}", stderr(&initial));
+        let before = get_environment("demo", &env, &cwd).unwrap();
+        let (started, _, _) = install_blocking_fake_dev_runners(&root, &mut env);
+        let mut watch = DevWatchFixture::spawn(
+            &root,
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--watch",
+                "--force",
+                "--no-ui",
+            ],
+        );
+        assert!(
+            wait_for_path(&started, Duration::from_secs(30)),
+            "watch did not start"
+        );
+        let revision = || {
+            let registry: Value =
+                serde_json::from_slice(&fs::read(root.child("ocm-home/envs.json")).unwrap())
+                    .unwrap();
+            registry["servicePolicyRevisions"]["demo"].as_u64().unwrap()
+        };
+        let takeover_revision = revision();
+        let session = read_source_watch_session(&root);
+        assert!(!get_environment("demo", &env, &cwd).unwrap().service_running);
+        if action != "unchanged" {
+            let request = if action == "uninstall" {
+                "uninstall"
+            } else {
+                "stop"
+            };
+            let changed = run_ocm(&cwd, &env, &["service", request, "demo"]);
+            assert!(changed.status.success(), "{}", stderr(&changed));
+            assert!(revision() > takeover_revision);
+            assert_eq!(
+                read_source_watch_session(&root)["leaseId"],
+                session["leaseId"]
+            );
+        }
+        let current_revision = revision();
+        let stopped = run_dev_stop(&cwd, &env);
+        let watched = watch.wait_without_release();
+        assert!(stopped.status.success(), "{}", stderr(&stopped));
+        assert_eq!(watched.status.code(), Some(130), "{}", stderr(&watched));
+        let restored = action == "unchanged";
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&stopped)).unwrap(),
+            serde_json::json!({"envName": "demo", "stopped": true, "serviceRestored": restored}),
+        );
+        assert_eq!(
+            stdout(&watched).contains("service restored for demo"),
+            restored
+        );
+        let after = get_environment("demo", &env, &cwd).unwrap();
+        assert_eq!(after.service_enabled, action != "uninstall");
+        assert_eq!(after.service_running, restored);
+        assert_eq!(revision(), current_revision + u64::from(restored));
+        assert_eq!(after.root, before.root);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.dev, before.dev);
+        assert_eq!(after.default_runtime, before.default_runtime);
+        assert_eq!(read_source_watch_session(&root)["closed"], true);
+        assert!(!source_watch_override_path(&root, "demo").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_preparation_preserves_newer_service_policy() {
+    for action in ["stop", "uninstall"] {
+        let root = TestDir::new(&format!("dev-preparation-policy-{action}"));
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env_with_gateway_admission(&root);
+        install_fake_dev_runners(&root, &mut env);
+        let created = run_ocm(
+            &cwd,
+            &env,
+            &["dev", "demo", "--repo", &path_string(&repo), "--service"],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        let (started, _, _) = install_blocking_fake_dev_runners(&root, &mut env);
+        let preparation = DevWatchFixture::spawn(
+            &root,
+            &cwd,
+            &env,
+            &["dev", "demo", "--force", "--onboard", "--no-ui"],
+        );
+        assert!(wait_for_path(&started, Duration::from_secs(30)));
+        assert!(
+            !read_source_watch_session(&root)["restoreService"]
+                .as_bool()
+                .unwrap()
+        );
+        let changed = run_ocm(&cwd, &env, &["service", action, "demo"]);
+        assert!(changed.status.success(), "{}", stderr(&changed));
+        let registry = fs::read(root.child("ocm-home/envs.json")).unwrap();
+        let output = preparation.finish();
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(!stdout(&output).contains("service restored for demo"));
+        assert_eq!(
+            fs::read(root.child("ocm-home/envs.json")).unwrap(),
+            registry
+        );
+        let session = read_source_watch_session(&root);
+        assert_eq!(session["closed"], true);
+        assert_eq!(session["completion"]["serviceRestored"], false);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn temporary_foreground_cleanup_preserves_current_service_policy() {
+    assert_foreground_cleanup_preserves_current_policy(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn registered_foreground_cleanup_preserves_current_service_policy() {
+    assert_foreground_cleanup_preserves_current_policy(true);
+}
+
+#[cfg(unix)]
 #[test]
 fn dev_stop_keeps_dotted_environment_watch_ownership_separate() {
     for (suffix, stop_dotted_first) in ["session", "stop", "admission"]
@@ -6350,77 +6510,212 @@ fn dev_stop_cancels_owned_preparation_before_gateway_start() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn dev_takeover_revision_survives_controller_loss_around_policy_write() {
+    for phase in ["before", "after"] {
+        for action in ["unchanged", "stop", "uninstall"] {
+            let root = TestDir::new(&format!("dev-takeover-write-{phase}-{action}"));
+            let repo = init_openclaw_repo(&root);
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let mut env = service_env_with_gateway_admission(&root);
+            install_fake_dev_runners(&root, &mut env);
+            create_runtime_backed_env(&cwd, &env);
+            let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+            assert!(start.status.success(), "{}", stderr(&start));
+            let marker = root.child("interrupted-policy.json");
+            let wrapper = root.child("interrupt-launchctl");
+            write_executable_script(
+                &wrapper,
+                &format!(
+                    r#"#!/usr/bin/env python3
+import json, os, signal, sys
+from pathlib import Path
+session_path = Path({session_path:?})
+marker = Path({marker:?})
+if session_path.exists() and not marker.exists():
+    session = json.loads(session_path.read_text())
+    revision = session.get('restoreServicePolicyRevision')
+    if session['restoreService'] and revision is not None:
+        registry = json.loads(Path({registry:?}).read_text())
+        current = registry['servicePolicyRevisions']['demo']
+        at_boundary = current == revision if '{phase}' == 'before' else current == revision + 1
+        if at_boundary:
+            assert os.getppid() == session['controller']['pid']
+            marker.write_text(json.dumps([current, revision]))
+            os.kill(os.getppid(), signal.SIGKILL)
+            sys.exit(1)
+os.execv({manager:?}, [{manager:?}, *sys.argv[1:]])
+"#,
+                    session_path = path_string(
+                        &source_watch_override_path(&root, "demo").with_extension("session")
+                    ),
+                    marker = path_string(&marker),
+                    registry = path_string(&root.child("ocm-home/envs.json")),
+                    manager = env["OCM_INTERNAL_LAUNCHCTL_BIN"],
+                ),
+            );
+            env.insert(
+                "OCM_INTERNAL_LAUNCHCTL_BIN".to_string(),
+                path_string(&wrapper),
+            );
+            let mut watch = DevWatchFixture::spawn(
+                &root,
+                &cwd,
+                &env,
+                &[
+                    "dev",
+                    "demo",
+                    "--repo",
+                    &path_string(&repo),
+                    "--watch",
+                    "--force",
+                    "--no-ui",
+                ],
+            );
+            assert!(
+                wait_for_path(&marker, Duration::from_secs(30)),
+                "takeover did not reach {phase} policy write"
+            );
+            assert!(!watch.wait_without_release().status.success());
+            let boundary: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+            assert_eq!(
+                boundary[0],
+                boundary[1].as_u64().unwrap() + u64::from(phase == "after")
+            );
+            assert_eq!(
+                read_source_watch_session(&root)["restoreServicePolicyRevision"],
+                boundary[1]
+            );
+            assert!(
+                !root.child("node.log").exists(),
+                "source started before takeover completed"
+            );
+            if action != "unchanged" {
+                let changed = run_ocm(&cwd, &env, &["service", action, "demo"]);
+                assert!(changed.status.success(), "{}", stderr(&changed));
+            }
+            let before_recovery = fs::read(root.child("ocm-home/envs.json")).unwrap();
+            let stopped = run_dev_stop(&cwd, &env);
+            assert!(stopped.status.success(), "{}", stderr(&stopped));
+            let restored = phase == "before" && action == "unchanged";
+            assert_eq!(
+                serde_json::from_slice::<Value>(&stopped.stdout).unwrap()["serviceRestored"],
+                restored
+            );
+            let after = get_environment("demo", &env, &cwd).unwrap();
+            assert_eq!(after.service_enabled, action != "uninstall");
+            assert_eq!(after.service_running, restored);
+            if !restored {
+                assert_eq!(
+                    fs::read(root.child("ocm-home/envs.json")).unwrap(),
+                    before_recovery
+                );
+            }
+            assert_eq!(read_source_watch_session(&root)["closed"], true);
+            drop(watch);
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
-fn dev_stop_recovers_a_crashed_controller_and_its_stubborn_tree_before_restoration() {
-    let root = TestDir::new("dev-stop-crashed-tree");
-    let repo = init_openclaw_repo(&root);
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let mut env = service_env_with_gateway_admission(&root);
-    install_fake_dev_runners(&root, &mut env);
-    create_runtime_backed_env(&cwd, &env);
-    let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
-    assert!(start.status.success(), "{}", stderr(&start));
-    let started = root.child("source-watch.started");
-    let descendant_pid = root.child("source-watch-descendant.pid");
-    let release = root.child("source-watch.release");
-    let node = format!(
-        "#!/bin/sh\ntrap '' TERM\n/bin/sleep 300 &\nowned_child=$!\nprintf '%s\\n' \"$owned_child\" > '{}'\nprintf 'ready\\n' > '{}'\nwhile [ ! -f '{}' ]; do /bin/sleep 0.05; done\nkill -KILL \"$owned_child\"\nwait \"$owned_child\"\n",
-        path_string(&descendant_pid),
-        path_string(&started),
-        path_string(&release),
-    );
-    write_fake_dev_node(&root, &node);
-    let mut watch = DevWatchFixture::spawn(
-        &root,
-        &cwd,
-        &env,
-        &[
-            "dev",
-            "demo",
-            "--repo",
-            &path_string(&repo),
-            "--watch",
-            "--force",
-            "--no-ui",
-        ],
-    );
-    assert!(
-        wait_for_path(&started, Duration::from_secs(30)),
-        "watch did not start"
-    );
-    let pid = read_source_watch_session(&root)["child"]["pid"]
-        .as_u64()
-        .unwrap() as u32;
-    let descendant = fs::read_to_string(&descendant_pid)
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap();
-    encode_legacy_watch_session(&root);
-    watch.crash_controller();
-    assert!(process_is_alive(pid));
-    assert!(!get_environment("demo", &env, &cwd).unwrap().service_running);
-    let stopped = run_dev_stop(&cwd, &env);
-    drop(watch);
+fn dev_stop_recovers_a_crashed_controller_and_preserves_current_policy() {
+    for action in ["unchanged", "stop", "uninstall", "older-record"] {
+        let root = TestDir::new(&format!("dev-stop-crashed-tree-{action}"));
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env_with_gateway_admission(&root);
+        install_fake_dev_runners(&root, &mut env);
+        create_runtime_backed_env(&cwd, &env);
+        let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(start.status.success(), "{}", stderr(&start));
+        let started = root.child("source-watch.started");
+        let descendant_pid = root.child("source-watch-descendant.pid");
+        let release = root.child("source-watch.release");
+        let node = format!(
+            "#!/bin/sh\ntrap '' TERM\n/bin/sleep 300 &\nowned_child=$!\nprintf '%s\\n' \"$owned_child\" > '{}'\nprintf 'ready\\n' > '{}'\nwhile [ ! -f '{}' ]; do /bin/sleep 0.05; done\nkill -KILL \"$owned_child\"\nwait \"$owned_child\"\n",
+            path_string(&descendant_pid),
+            path_string(&started),
+            path_string(&release),
+        );
+        write_fake_dev_node(&root, &node);
+        let mut watch = DevWatchFixture::spawn(
+            &root,
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--watch",
+                "--force",
+                "--no-ui",
+            ],
+        );
+        assert!(
+            wait_for_path(&started, Duration::from_secs(30)),
+            "watch did not start"
+        );
+        let pid = read_source_watch_session(&root)["child"]["pid"]
+            .as_u64()
+            .unwrap() as u32;
+        let descendant = fs::read_to_string(&descendant_pid)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        if matches!(action, "stop" | "uninstall") {
+            let changed = run_ocm(&cwd, &env, &["service", action, "demo"]);
+            assert!(changed.status.success(), "{}", stderr(&changed));
+        }
+        let policy = fs::read(root.child("ocm-home/envs.json")).unwrap();
+        encode_legacy_watch_session(&root);
+        if action == "older-record" {
+            let mut session = read_source_watch_session(&root);
+            session
+                .as_object_mut()
+                .unwrap()
+                .remove("restoreServicePolicyRevision");
+            fs::write(
+                source_watch_override_path(&root, "demo").with_extension("session"),
+                serde_json::to_vec(&session).unwrap(),
+            )
+            .unwrap();
+        }
+        watch.crash_controller();
+        assert!(process_is_alive(pid));
+        assert!(!get_environment("demo", &env, &cwd).unwrap().service_running);
+        let stopped = run_dev_stop(&cwd, &env);
 
-    assert!(stopped.status.success(), "{}", stderr(&stopped));
-    assert_eq!(
-        serde_json::from_str::<Value>(&stdout(&stopped)).unwrap()["serviceRestored"],
-        true
-    );
-    assert!(
-        wait_for_process_exit(pid, Duration::from_secs(3)),
-        "watch survived stop"
-    );
-    assert!(
-        wait_for_process_exit(descendant, Duration::from_secs(3)),
-        "descendant survived stop"
-    );
-    assert!(get_environment("demo", &env, &cwd).unwrap().service_running);
-    assert_eq!(read_source_watch_session(&root)["closed"], true);
-    assert!(!source_watch_override_path(&root, "demo").exists());
+        assert!(stopped.status.success(), "{}", stderr(&stopped));
+        let restored = matches!(action, "unchanged" | "older-record");
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&stopped)).unwrap()["serviceRestored"],
+            restored
+        );
+        assert!(
+            wait_for_process_exit(pid, Duration::from_secs(3)),
+            "watch survived stop"
+        );
+        assert!(
+            wait_for_process_exit(descendant, Duration::from_secs(3)),
+            "descendant survived stop"
+        );
+        assert_eq!(
+            get_environment("demo", &env, &cwd).unwrap().service_running,
+            restored
+        );
+        if !restored {
+            assert_eq!(fs::read(root.child("ocm-home/envs.json")).unwrap(), policy);
+        }
+        assert_eq!(read_source_watch_session(&root)["closed"], true);
+        assert!(!source_watch_override_path(&root, "demo").exists());
+        drop(watch);
+    }
 }
 
 #[cfg(unix)]
