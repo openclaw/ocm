@@ -1225,8 +1225,16 @@ impl Cli {
         let revision =
             crate::store::environment_service_policy_revision(env_name, &self.env, &self.cwd)?;
         if lease.service_policy_revision() != Some(revision) {
-            // A policy request during preparation supersedes the borrowed intent.
-            return lease.discard_service_restore();
+            // A policy request during preparation supersedes the borrowed intent,
+            // but a timed-out or rolled-back request may leave the Gateway alive.
+            lease.discard_service_restore()?;
+            let status = self.service_service().status(env_name)?;
+            if status.running || status.desired_running {
+                return Err(format!(
+                    "background service for {env_name} is still running or requested after the policy changed during preparation; source watch was not started"
+                ));
+            }
+            return Ok(());
         }
         // Persist only an observed revision. Predicting Stop's next revision
         // could mistake a later operator request for our write after a crash.

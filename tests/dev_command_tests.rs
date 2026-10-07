@@ -5516,45 +5516,162 @@ fn assert_foreground_cleanup_preserves_current_policy(registered: bool) {
 #[cfg(unix)]
 #[test]
 fn foreground_preparation_preserves_newer_service_policy() {
-    for action in ["stop", "uninstall"] {
-        let root = TestDir::new(&format!("dev-preparation-policy-{action}"));
-        let repo = init_openclaw_repo(&root);
-        let cwd = root.child("workspace");
-        fs::create_dir_all(&cwd).unwrap();
-        let mut env = service_env_with_gateway_admission(&root);
-        install_fake_dev_runners(&root, &mut env);
-        let created = run_ocm(
-            &cwd,
-            &env,
-            &["dev", "demo", "--repo", &path_string(&repo), "--service"],
-        );
-        assert!(created.status.success(), "{}", stderr(&created));
-        let (started, _, _) = install_blocking_fake_dev_runners(&root, &mut env);
-        let preparation = DevWatchFixture::spawn(
-            &root,
-            &cwd,
-            &env,
-            &["dev", "demo", "--force", "--onboard", "--no-ui"],
-        );
-        assert!(wait_for_path(&started, Duration::from_secs(30)));
-        assert!(
-            !read_source_watch_session(&root)["restoreService"]
-                .as_bool()
-                .unwrap()
-        );
-        let changed = run_ocm(&cwd, &env, &["service", action, "demo"]);
-        assert!(changed.status.success(), "{}", stderr(&changed));
-        let registry = fs::read(root.child("ocm-home/envs.json")).unwrap();
-        let output = preparation.finish();
-        assert!(output.status.success(), "{}", stderr(&output));
-        assert!(!stdout(&output).contains("service restored for demo"));
-        assert_eq!(
-            fs::read(root.child("ocm-home/envs.json")).unwrap(),
-            registry
-        );
-        let session = read_source_watch_session(&root);
-        assert_eq!(session["closed"], true);
-        assert_eq!(session["completion"]["serviceRestored"], false);
+    for registered in [false, true] {
+        for (action, background) in [
+            ("stop", "stopped"),
+            ("uninstall", "stopped"),
+            ("stop", "timeout"),
+            ("uninstall", "timeout"),
+            ("stop", "rollback"),
+        ] {
+            let root = TestDir::new(&format!(
+                "dev-preparation-{registered}-{action}-{background}"
+            ));
+            let repo = init_openclaw_repo(&root);
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let mut env = service_env_with_gateway_admission(&root);
+            install_probe_aware_fake_dev_runners(&root, &mut env);
+            if registered {
+                let created = run_ocm(
+                    &cwd,
+                    &env,
+                    &["dev", "demo", "--repo", &path_string(&repo), "--service"],
+                );
+                assert!(created.status.success(), "{}", stderr(&created));
+            } else {
+                create_runtime_backed_env(&cwd, &env);
+                let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+                assert!(start.status.success(), "{}", stderr(&start));
+            }
+            if background == "timeout" {
+                // Reuse the compatible fake daemon, with a live managed child
+                // that cannot acknowledge Stop. No real Gateway is signaled.
+                let path = supervisor_runtime_path(&env, &cwd).unwrap();
+                let mut runtime: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                let (kind, name) = if registered {
+                    ("dev", "demo")
+                } else {
+                    ("runtime", "stable")
+                };
+                let port = get_environment("demo", &env, &cwd)
+                    .unwrap()
+                    .gateway_port
+                    .unwrap();
+                let child = serde_json::json!({
+                    "envName": "demo", "bindingKind": kind, "bindingName": name,
+                    "pid": std::process::id(), "restartCount": 0, "childPort": port,
+                    "stdoutPath": path_string(&root.child("gateway.stdout")),
+                    "stderrPath": path_string(&root.child("gateway.stderr")),
+                });
+                runtime["children"] = serde_json::json!([child.clone()]);
+                let mut service = child;
+                service["gatewayState"] = "running".into();
+                runtime["services"] = serde_json::json!([service]);
+                fs::write(path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+            }
+            declare_source_tooling(&repo);
+            for tool in ["tsx", "tsdown", "chokidar"] {
+                write_resolvable_source_tool(&repo, tool);
+            }
+            let started = root.child("probe.started");
+            let release = root.child("source-watch.release");
+            let node = root.child("fake-dev-bin/node");
+            let script = fs::read_to_string(&node).unwrap();
+            let marker = "if [ \"$6\" = ocm-source-dependencies ]; then";
+            assert!(script.contains(marker));
+            write_executable_script(&node, &script.replacen(marker, &format!(
+                "{marker}\nprintf ready > '{}'\nwhile [ ! -f '{}' ]; do /bin/sleep 0.05; done\n",
+                path_string(&started), path_string(&release),
+            ), 1));
+            let source_log = root.child("node.log");
+            if source_log.exists() {
+                fs::remove_file(&source_log).unwrap();
+            }
+            let preparation = DevWatchFixture::spawn(
+                &root,
+                &cwd,
+                &env,
+                &[
+                    "dev",
+                    "demo",
+                    "--repo",
+                    &path_string(&repo),
+                    "--watch",
+                    "--force",
+                    "--no-ui",
+                ],
+            );
+            assert!(
+                wait_for_path(&started, Duration::from_secs(30)),
+                "dependency probe did not start"
+            );
+            assert_eq!(read_source_watch_session(&root)["restoreService"], false);
+            let registry_path = root.child("ocm-home/envs.json");
+            let before: Value = serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+            let state_path = root.child("ocm-home/supervisor/state.json");
+            let saved_state = fs::read(&state_path).unwrap();
+            if background == "rollback" {
+                fs::remove_file(&state_path).unwrap();
+                fs::create_dir(&state_path).unwrap();
+            }
+            let changed = run_ocm(&cwd, &env, &["service", action, "demo", "--json"]);
+            if background == "rollback" {
+                assert!(
+                    !changed.status.success(),
+                    "Stop should fail and roll policy back"
+                );
+                assert!(get_environment("demo", &env, &cwd).unwrap().service_running);
+                fs::remove_dir(&state_path).unwrap();
+                fs::write(&state_path, saved_state).unwrap();
+                let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+                assert!(status.status.success(), "{}", stderr(&status));
+                let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+                assert_eq!(status["running"], false);
+                assert_eq!(status["desiredRunning"], true);
+            } else {
+                assert!(changed.status.success(), "{}", stderr(&changed));
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&changed.stdout).unwrap()["running"],
+                    background == "timeout"
+                );
+            }
+            let registry = fs::read(&registry_path).unwrap();
+            let after_request: Value = serde_json::from_slice(&registry).unwrap();
+            assert!(
+                after_request["servicePolicyRevisions"]["demo"]
+                    .as_u64()
+                    .unwrap()
+                    > before["servicePolicyRevisions"]["demo"].as_u64().unwrap()
+            );
+            let output = preparation.finish();
+            if background == "stopped" {
+                assert!(output.status.success(), "{}", stderr(&output));
+                assert!(
+                    source_log.exists(),
+                    "stopped service should permit foreground startup"
+                );
+            } else {
+                assert!(
+                    !output.status.success(),
+                    "foreground started while background service remained running"
+                );
+                assert!(
+                    stderr(&output).contains("source watch was not started"),
+                    "{}",
+                    stderr(&output)
+                );
+                assert!(
+                    !source_log.exists(),
+                    "foreground source executed before background shutdown"
+                );
+            }
+            assert!(!stdout(&output).contains("service restored for demo"));
+            assert_eq!(fs::read(&registry_path).unwrap(), registry);
+            let session = read_source_watch_session(&root);
+            assert_eq!(session["closed"], true);
+            assert_eq!(session["completion"]["serviceRestored"], false);
+        }
     }
 }
 
