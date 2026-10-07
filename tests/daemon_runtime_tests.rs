@@ -3766,6 +3766,112 @@ fn service_start_and_restart_wait_for_gateway_health() {
 }
 
 #[test]
+fn service_restart_collects_native_helper_rejection_before_readiness() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-restart-helper-result");
+    let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
+    let script = root.child("bin/readiness-openclaw.mjs");
+    let control = root.child("restart-control.json");
+    let raw = fs::read_to_string(&script).unwrap();
+    // Keep the real health endpoint and daemon, replacing only the native
+    // OpenClaw protocol with controlled acceptance and rejection responses.
+    let raw = raw.replace(
+        "import http from 'node:http';",
+        &format!(
+            "import http from 'node:http';\nimport fs from 'node:fs';\nconst control = {};",
+            serde_json::to_string(&path_string(&control)).unwrap()
+        ),
+    );
+    let raw = raw.replace(
+        "  process.exit(64);",
+        r#"  const protocol = {ok: true, protocol: 'openclaw.gateway.restart-handoff', protocolVersion: 1};
+  if (args[2] === 'capabilities') {
+    console.log(JSON.stringify({...protocol, operations: ['consume']}));
+  } else {
+    const handoff = JSON.parse(fs.readFileSync(control, 'utf8'));
+    console.log(JSON.stringify({...protocol, status: 'accepted', handoff: {pid: handoff.pid, supervisorMode: 'external'}}));
+  }
+  process.exit(0);"#,
+    );
+    let raw = raw.replace(
+        "const portIndex = args.indexOf('--port');",
+        r#"if (args[0] === 'gateway' && args[1] === 'restart') {
+  const request = JSON.parse(fs.readFileSync(control, 'utf8'));
+  setTimeout(() => {
+    if (request.replace) process.kill(request.pid, 'SIGTERM');
+    process.exit(request.code);
+  }, request.delay);
+  await new Promise(() => {});
+}
+process.on('SIGTERM', () => process.exit(0));
+const portIndex = args.indexOf('--port');"#,
+    );
+    let native_script = root.child("bin/openclaw.mjs");
+    write_executable_script(&native_script, &raw);
+    for args in [
+        vec![
+            "launcher",
+            "add",
+            "native",
+            "--command",
+            native_script.to_str().unwrap(),
+        ],
+        vec!["env", "set-launcher", "demo", "native"],
+    ] {
+        let configured = run_ocm(&cwd, &env, &args);
+        assert!(configured.status.success(), "{}", stderr(&configured));
+    }
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    // Always settle the owned daemon, including on a failed assertion.
+    let result = std::panic::catch_unwind(|| {
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+        assert!(started.status.success(), "{}", stderr(&started));
+        let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+        let initial = read_persisted_service_state(&runtime_path);
+        let original_pid = runtime_child_pid(&initial, "demo").unwrap();
+        assert_eq!(initial["services"][0]["restartHandoff"], "protocol-v1");
+        for delay in [0, 1000] {
+            fs::write(
+                &control,
+                serde_json::json!({"delay": delay, "code": 23, "replace": false}).to_string(),
+            )
+            .unwrap();
+            let rejected = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+            assert!(!rejected.status.success(), "{}", stdout(&rejected));
+            assert!(stderr(&rejected).contains("rejected the recovery-aware restart"));
+            assert!(stderr(&rejected).contains("exit code 23"));
+            let current = read_persisted_service_state(&runtime_path);
+            assert_eq!(
+                runtime_child(&current, "demo"),
+                runtime_child(&initial, "demo")
+            );
+            let ready = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+            assert!(ready.status.success(), "{}", stderr(&ready));
+            let body: Value = serde_json::from_slice(&ready.stdout).unwrap();
+            assert_eq!(body["gatewayReady"], true);
+        }
+        fs::write(
+            &control,
+            serde_json::json!({"delay": 1000, "code": 0, "replace": true, "pid": original_pid})
+                .to_string(),
+        )
+        .unwrap();
+        let accepted = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+        assert!(accepted.status.success(), "{}", stderr(&accepted));
+        let body: Value = serde_json::from_slice(&accepted.stdout).unwrap();
+        assert_eq!(body["gatewayReady"], true);
+        assert_ne!(
+            runtime_child_pid(&read_persisted_service_state(&runtime_path), "demo"),
+            Some(original_pid)
+        );
+    });
+    stop_process(&mut daemon);
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
 fn service_start_waits_for_slow_gateway_health() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("service-readiness-slow");
