@@ -501,7 +501,7 @@ fn env_clone_rejects_database_links_without_writing_source() {
             assert!(!clone.status.success(), "case={case}: {}", stdout(&clone));
             if case == "state-root-explicit-workspace" {
                 assert!(
-                    stderr(&clone).contains("outside the environment root"),
+                    stderr(&clone).contains("expected a real directory"),
                     "{}",
                     stderr(&clone)
                 );

@@ -521,6 +521,9 @@ environment does not share active runtime state with its source. New clones also
 clear copied agent database process leases while keeping the state database,
 durable rows, and source leases unchanged.
 
+Clone and import reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
+Individual agent directory links are removed from the copy without changing their linked source data.
+
 Cloned plugin registrations use the clone's managed files. Copied local projects
 and archives retain their original source information, and missing managed
 payloads retain clone-owned records for independent diagnosis or repair.

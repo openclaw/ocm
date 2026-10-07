@@ -648,6 +648,10 @@ Active plugin paths and copied databases must remain inside the cloned environme
 locations that escape through external paths or symlinks are rejected before publication. The
 same plugin isolation applies to upgrade simulation clones.
 
+Clone (including upgrade simulation) and import require real directories at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` when those entries exist.
+Symlinks, including dangling links, and other file types at those traversal boundaries are refused before copied-state rewrites or cleanup; the source stays unchanged and no target is registered.
+Individual agent directory links are still removed from the copy without changing the linked data.
+
 ### Asynchronous upgrades
 
 On Unix, an explicit operator request can run the ordinary environment upgrade in a detached OCM worker.
