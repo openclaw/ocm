@@ -6512,6 +6512,118 @@ fn dev_stop_cancels_owned_preparation_before_gateway_start() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn dev_stop_retries_failed_restoration_without_overriding_newer_policy() {
+    for (failure_kind, action) in [
+        ("bootstrap", "unchanged"),
+        ("bootstrap", "stop"),
+        ("bootstrap", "uninstall"),
+        ("readiness", "unchanged"),
+    ] {
+        let root = TestDir::new(&format!("dev-restore-retry-{failure_kind}-{action}"));
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env_with_gateway_admission(&root);
+        let (started, _, _) = install_blocking_fake_dev_runners(&root, &mut env);
+        create_runtime_backed_env(&cwd, &env);
+        let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(start.status.success(), "{}", stderr(&start));
+        let failure = root.child("fail-bootstrap");
+        let wrapper = root.child("failing-launchctl");
+        write_executable_script(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = bootstrap ] && [ -f '{}' ]; then echo 'fixture bootstrap failed' >&2; exit 23; fi\nexec '{}' \"$@\"\n",
+                path_string(&failure),
+                env["OCM_INTERNAL_LAUNCHCTL_BIN"],
+            ),
+        );
+        env.insert(
+            "OCM_INTERNAL_LAUNCHCTL_BIN".to_string(),
+            path_string(&wrapper),
+        );
+        if failure_kind == "readiness" {
+            env.insert(
+                "OCM_INTERNAL_SKIP_SERVICE_READINESS".to_string(),
+                "0".to_string(),
+            );
+            env.insert(
+                "OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS".to_string(),
+                "1".to_string(),
+            );
+        }
+        let mut watch = DevWatchFixture::spawn(
+            &root,
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--watch",
+                "--force",
+                "--no-ui",
+            ],
+        );
+        assert!(wait_for_path(&started, Duration::from_secs(30)));
+        if failure_kind == "bootstrap" {
+            fs::write(&failure, "fail").unwrap();
+        }
+        let failed = run_dev_stop(&cwd, &env);
+        let watched = watch.wait_without_release();
+        assert!(!failed.status.success());
+        let expected_error = if failure_kind == "bootstrap" {
+            "fixture bootstrap failed"
+        } else {
+            "gateway did not become ready"
+        };
+        assert!(
+            stderr(&failed).contains(expected_error),
+            "{}",
+            stderr(&failed)
+        );
+        assert!(!watched.status.success());
+        assert_eq!(
+            get_environment("demo", &env, &cwd).unwrap().service_running,
+            failure_kind == "readiness",
+        );
+        let retained = read_source_watch_session(&root);
+        assert_eq!(retained["closed"], false);
+        assert_eq!(retained["restoreService"], true);
+        assert!(retained["child"].is_null());
+        if failure_kind == "bootstrap" {
+            fs::remove_file(&failure).unwrap();
+        }
+        env.insert(
+            "OCM_INTERNAL_SKIP_SERVICE_READINESS".to_string(),
+            "1".to_string(),
+        );
+        if action != "unchanged" {
+            let changed = run_ocm(&cwd, &env, &["service", action, "demo"]);
+            assert!(changed.status.success(), "{}", stderr(&changed));
+        }
+        let policy = fs::read(root.child("ocm-home/envs.json")).unwrap();
+        let retry = run_dev_stop(&cwd, &env);
+        assert!(retry.status.success(), "{}", stderr(&retry));
+        let restored = action == "unchanged";
+        assert_eq!(
+            serde_json::from_slice::<Value>(&retry.stdout).unwrap()["serviceRestored"],
+            restored
+        );
+        let after = get_environment("demo", &env, &cwd).unwrap();
+        assert_eq!(after.service_running, restored);
+        assert_eq!(after.service_enabled, action != "uninstall");
+        if !restored {
+            assert_eq!(fs::read(root.child("ocm-home/envs.json")).unwrap(), policy);
+        }
+        assert_eq!(read_source_watch_session(&root)["closed"], true);
+        drop(watch);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn dev_takeover_revision_survives_controller_loss_around_policy_write() {
     for phase in ["before", "after"] {
         for action in ["unchanged", "stop", "uninstall"] {

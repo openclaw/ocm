@@ -1299,9 +1299,23 @@ impl Cli {
             format!("Starting background service for {env_name}"),
             self.dev_stderr_profile(),
         ));
-        self.service_service()
-            .start_action_locked(env_name)?
-            .ensure_gateway_ready()?;
+        let restore = self
+            .service_service()
+            .start_action_locked(env_name)
+            .and_then(|summary| summary.ensure_gateway_ready());
+        if let Err(error) = restore {
+            // The operation lock still excludes policy requests. Retain our
+            // own Start/rollback result so a later stop can retry restoration.
+            let recorded =
+                crate::store::environment_service_policy_revision(env_name, &self.env, &self.cwd)
+                    .and_then(|revision| lease.record_service_policy_revision(revision));
+            return Err(match recorded {
+                Ok(()) => error,
+                Err(record_error) => format!(
+                    "{error}; failed recording the service policy for restoration retry: {record_error}"
+                ),
+            });
+        }
         Ok(true)
     }
 
