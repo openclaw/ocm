@@ -43,6 +43,11 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Limit runtime metadata to 64 MiB of decoded JSON, including gzip expansion, and preserve installed runtime files and metadata when an oversized update source is rejected. Thanks @SebTardif (#117).
+- Preserve newer Stop and Uninstall requests after foreground development sessions, and refuse foreground startup while a superseding request leaves the background Gateway running or requested. Thanks @shakkernerd (#299, #310).
+- Keep runtime binding admission isolated through upgrade finalization and rollback so a newly attached sibling cannot receive another environment's uncheckpointed downgrade. Thanks @shakkernerd (#296, #309).
+- Preserve Unix shell `exec` semantics for unquoted managed-service launcher recipes. Thanks @shakkernerd (#300, #308).
+- Report delayed native restart rejection as a failed service action even while the original Gateway remains healthy. Thanks @shakkernerd (#298, #307).
 - Preserve Skill Workshop proposal hashes, support files, and rollback evidence during home import and runtime cleanup. Thanks @Patrick-Erichsen (#245).
 - Reject mixed or malformed candidate preflight failures instead of treating an unsupported-check marker as success. Thanks @shakkernerd for the report and @goutamadwant for the fix (#128, #165).
 - Accept reformatted and binary macOS LaunchAgent plists for the same OCM store while still rejecting foreign or invalid owners. Thanks @TheAngryPit (#147, #149).

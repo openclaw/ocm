@@ -157,6 +157,43 @@ fn fetch_json_requests_and_decodes_gzip_responses() {
 }
 
 #[test]
+fn fetch_json_rejects_a_gzip_decoded_body_past_the_byte_cap() {
+    const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
+    // One byte past the decoded JSON cap. Compressed on the wire this is a few KB.
+    let mut json = Vec::from(&b"{\"pad\":\""[..]);
+    json.resize(MAX_JSON_BYTES as usize - 1, b'x');
+    json.extend_from_slice(b"\"}");
+    let encoded = gzip_bytes(&json);
+    let server = TestHttpServer::serve_bytes_with_headers(
+        "/manifests/releases.json",
+        "application/json",
+        &encoded,
+        &[("Content-Encoding", "gzip")],
+    );
+
+    let error = match fetch_json::<Value>(&server.url()) {
+        Err(error) => error,
+        Ok(_) => panic!("gzip-decoded JSON past the byte cap must be rejected"),
+    };
+    assert!(error.contains("exceeded"), "unexpected error: {error}");
+}
+
+#[test]
+fn fetch_json_accepts_a_gzip_decoded_body_at_the_byte_cap() {
+    let mut body = br#"{"releases":[]}"#.to_vec();
+    body.resize(64 * 1024 * 1024, b' ');
+    let encoded = gzip_bytes(&body);
+    let server = TestHttpServer::serve_bytes_with_headers(
+        "/manifests/releases.json",
+        "application/json",
+        &encoded,
+        &[("Content-Encoding", "gzip")],
+    );
+    let manifest: Value = fetch_json_with_accept(&server.url(), "application/json").unwrap();
+    assert_eq!(manifest, serde_json::json!({"releases": []}));
+}
+
+#[test]
 fn file_sha256_and_verify_file_sha256_report_the_expected_digest() {
     let root = TestDir::new("download-helper-sha256");
     let artifact = root.child("downloads/openclaw");
