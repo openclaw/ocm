@@ -8,13 +8,16 @@ use crate::runtime::releases::{
 };
 use crate::store::{
     BuildLocalRuntimeOptions as StoreBuildLocalRuntimeOptions, InstallContext,
-    PreparedRuntimeInstall, RuntimeReleaseDetails, get_runtime, install_runtime,
-    install_runtime_from_local_openclaw_build, install_runtime_from_official_openclaw_release,
-    install_runtime_from_release, install_runtime_from_url, list_runtimes,
+    PreparedRuntimeInstall, RuntimeMutationGuard, RuntimeReleaseDetails, get_runtime,
+    install_runtime_from_local_openclaw_build,
+    install_runtime_from_official_openclaw_release_with_context,
+    install_runtime_from_release_with_context, install_runtime_from_url_with_context,
+    install_runtime_with_context, list_runtimes,
     prepare_runtime_from_selected_official_openclaw_release, prepare_runtime_from_selected_release,
     runtime_integrity_issue,
 };
 use serde::Serialize;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct InstallRuntimeOptions {
@@ -179,17 +182,27 @@ impl<'a> RuntimeService<'a> {
         version: Option<String>,
         channel: Option<String>,
     ) -> Result<RuntimeMeta, String> {
+        let name =
+            Self::canonical_official_openclaw_runtime_name(version.as_deref(), channel.as_deref())?;
+        // This route prepares a new binding. Refuse unfinished upgrades before
+        // release lookup or installation, including targets not yet published.
+        let guard = Arc::new(crate::store::try_lock_runtime_mutation(
+            &name, self.env, self.cwd,
+        )?);
         Ok(self
-            .prepare_official_openclaw_runtime(InstallRuntimeFromOfficialReleaseOptions {
-                name: Self::canonical_official_openclaw_runtime_name(
-                    version.as_deref(),
-                    channel.as_deref(),
-                )?,
-                version,
-                channel,
-                description: None,
-                force: false,
-            })?
+            .prepare_official_openclaw_runtime_with_refresh(
+                InstallRuntimeFromOfficialReleaseOptions {
+                    name,
+                    version,
+                    channel,
+                    description: None,
+                    force: false,
+                },
+                true,
+                true,
+                None,
+                Some(&guard),
+            )?
             .0)
     }
 
@@ -197,15 +210,21 @@ impl<'a> RuntimeService<'a> {
         &self,
         options: InstallRuntimeFromOfficialReleaseOptions,
     ) -> Result<(RuntimeMeta, OfficialRuntimePrepareAction), String> {
-        self.prepare_official_openclaw_runtime_with_refresh(options, true, true, None)
+        self.prepare_official_openclaw_runtime_with_refresh(options, true, true, None, None)
     }
 
     pub(crate) fn prepare_selected_official_openclaw_runtime_deferred(
         &self,
         options: InstallRuntimeFromOfficialReleaseOptions,
         selected_release: OpenClawRelease,
+        runtime_guard: &Arc<RuntimeMutationGuard>,
     ) -> Result<StagedRuntimeInstall, String> {
-        self.prepare_official_openclaw_runtime_staged(options, false, Some(selected_release))
+        self.prepare_official_openclaw_runtime_staged(
+            options,
+            false,
+            Some(selected_release),
+            Some(runtime_guard),
+        )
     }
 
     fn prepare_official_openclaw_runtime_with_refresh(
@@ -214,11 +233,13 @@ impl<'a> RuntimeService<'a> {
         refresh_supervisor: bool,
         require_unbound: bool,
         selected_release: Option<OpenClawRelease>,
+        runtime_guard: Option<&Arc<RuntimeMutationGuard>>,
     ) -> Result<(RuntimeMeta, OfficialRuntimePrepareAction), String> {
         let prepared = self.prepare_official_openclaw_runtime_staged(
             options,
             require_unbound,
             selected_release,
+            runtime_guard,
         )?;
         let action = prepared.action();
         let meta = prepared.commit()?;
@@ -233,6 +254,7 @@ impl<'a> RuntimeService<'a> {
         options: InstallRuntimeFromOfficialReleaseOptions,
         require_unbound: bool,
         selected_release: Option<OpenClawRelease>,
+        runtime_guard: Option<&Arc<RuntimeMutationGuard>>,
     ) -> Result<StagedRuntimeInstall, String> {
         let version = options
             .version
@@ -355,7 +377,7 @@ impl<'a> RuntimeService<'a> {
                 .as_ref()
                 .and_then(|meta| meta.description.clone())
         });
-        let install = || {
+        let install = |runtime_guard: Option<&Arc<RuntimeMutationGuard>>| {
             prepare_runtime_from_selected_official_openclaw_release(
                 runtime_name.clone(),
                 options.force || existing_meta.is_some(),
@@ -377,13 +399,19 @@ impl<'a> RuntimeService<'a> {
                 InstallContext {
                     env: self.env,
                     cwd: self.cwd,
+                    runtime_guard,
                 },
             )
         };
         let install = if require_unbound {
-            self.with_unbound_runtime(&runtime_name, install)?
+            match runtime_guard {
+                Some(guard) => self.with_unbound_runtime_guard(&runtime_name, guard, |guard| {
+                    install(Some(guard))
+                })?,
+                None => self.with_unbound_runtime(&runtime_name, |guard| install(Some(guard)))?,
+            }
         } else {
-            install()?
+            install(runtime_guard)?
         };
         let action = if install.reused() {
             OfficialRuntimePrepareAction::Reused
@@ -400,8 +428,16 @@ impl<'a> RuntimeService<'a> {
 
     pub fn install(&self, options: InstallRuntimeOptions) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        let meta =
-            self.with_unbound_runtime(&name, || install_runtime(options, self.env, self.cwd))?;
+        let meta = self.with_unbound_runtime(&name, |guard| {
+            install_runtime_with_context(
+                options,
+                InstallContext {
+                    env: self.env,
+                    cwd: self.cwd,
+                    runtime_guard: Some(guard),
+                },
+            )
+        })?;
         self.refresh_supervisor_if_present(&name)?;
         Ok(meta)
     }
@@ -411,8 +447,15 @@ impl<'a> RuntimeService<'a> {
         options: InstallRuntimeFromUrlOptions,
     ) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        let meta = self.with_unbound_runtime(&name, || {
-            install_runtime_from_url(options, self.env, self.cwd)
+        let meta = self.with_unbound_runtime(&name, |guard| {
+            install_runtime_from_url_with_context(
+                options,
+                InstallContext {
+                    env: self.env,
+                    cwd: self.cwd,
+                    runtime_guard: Some(guard),
+                },
+            )
         })?;
         self.refresh_supervisor_if_present(&name)?;
         Ok(meta)
@@ -423,8 +466,15 @@ impl<'a> RuntimeService<'a> {
         options: InstallRuntimeFromReleaseOptions,
     ) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        let meta = self.with_unbound_runtime(&name, || {
-            install_runtime_from_release(options, self.env, self.cwd)
+        let meta = self.with_unbound_runtime(&name, |guard| {
+            install_runtime_from_release_with_context(
+                options,
+                InstallContext {
+                    env: self.env,
+                    cwd: self.cwd,
+                    runtime_guard: Some(guard),
+                },
+            )
         })?;
         self.refresh_supervisor_if_present(&name)?;
         Ok(meta)
@@ -435,8 +485,15 @@ impl<'a> RuntimeService<'a> {
         options: InstallRuntimeFromOfficialReleaseOptions,
     ) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        let meta = self.with_unbound_runtime(&name, || {
-            install_runtime_from_official_openclaw_release(options, self.env, self.cwd)
+        let meta = self.with_unbound_runtime(&name, |guard| {
+            install_runtime_from_official_openclaw_release_with_context(
+                options,
+                InstallContext {
+                    env: self.env,
+                    cwd: self.cwd,
+                    runtime_guard: Some(guard),
+                },
+            )
         })?;
         self.refresh_supervisor_if_present(&name)?;
         Ok(meta)
@@ -444,7 +501,7 @@ impl<'a> RuntimeService<'a> {
 
     pub fn build_local(&self, options: BuildLocalRuntimeOptions) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        let meta = self.with_unbound_runtime(&name, || {
+        let meta = self.with_unbound_runtime(&name, |guard| {
             install_runtime_from_local_openclaw_build(
                 StoreBuildLocalRuntimeOptions {
                     name: options.name,
@@ -458,6 +515,7 @@ impl<'a> RuntimeService<'a> {
                 InstallContext {
                     env: self.env,
                     cwd: self.cwd,
+                    runtime_guard: Some(guard),
                 },
             )
         })?;
@@ -470,9 +528,9 @@ impl<'a> RuntimeService<'a> {
         options: UpdateRuntimeFromReleaseOptions,
     ) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        self.with_unbound_runtime(&name, || {
+        self.with_unbound_runtime(&name, |guard| {
             let resolved = self.resolve_update_from_release(options)?;
-            self.apply_resolved_update(resolved, true)
+            self.apply_resolved_update(resolved, true, Some(guard))
         })
     }
 
@@ -544,8 +602,9 @@ impl<'a> RuntimeService<'a> {
         &self,
         resolved: ResolvedRuntimeUpdate,
         refresh_supervisor: bool,
+        runtime_guard: Option<&Arc<RuntimeMutationGuard>>,
     ) -> Result<RuntimeMeta, String> {
-        let prepared = self.prepare_resolved_update(resolved)?;
+        let prepared = self.prepare_resolved_update(resolved, runtime_guard)?;
         let meta = prepared.commit()?;
         if refresh_supervisor {
             self.refresh_supervisor_if_present(&meta.name)?;
@@ -556,6 +615,7 @@ impl<'a> RuntimeService<'a> {
     pub(crate) fn prepare_resolved_update(
         &self,
         resolved: ResolvedRuntimeUpdate,
+        runtime_guard: Option<&Arc<RuntimeMutationGuard>>,
     ) -> Result<StagedRuntimeInstall, String> {
         let selector_kind = Some(resolved.selector_kind);
         let selector_value = Some(resolved.selector_value);
@@ -571,6 +631,7 @@ impl<'a> RuntimeService<'a> {
                     InstallContext {
                         env: self.env,
                         cwd: self.cwd,
+                        runtime_guard,
                     },
                 )?
             }
@@ -585,6 +646,7 @@ impl<'a> RuntimeService<'a> {
                     resolved.existing.description,
                     self.env,
                     self.cwd,
+                    runtime_guard,
                 )?
             }
         };

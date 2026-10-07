@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::store::{
-    add_runtime, get_runtime_verified, list_runtimes, remove_runtime, with_locked_environments,
+    InstallContext, RuntimeMutationGuard, add_runtime_with_context, get_runtime_verified,
+    list_runtimes, remove_runtime_with_guard, with_locked_environments,
 };
 use crate::supervisor::sync_supervisor_binding_if_present;
 
@@ -111,8 +113,23 @@ impl<'a> RuntimeService<'a> {
     pub(super) fn with_unbound_runtime<T>(
         &self,
         name: &str,
-        action: impl FnOnce() -> Result<T, String>,
+        action: impl FnOnce(&Arc<RuntimeMutationGuard>) -> Result<T, String>,
     ) -> Result<T, String> {
+        // Wait outside the registry: an upgrade may need it to publish its
+        // binding or finish recovery before releasing runtime ownership.
+        let runtime_guard = Arc::new(crate::store::lock_runtime_mutation(
+            name, self.env, self.cwd,
+        )?);
+        self.with_unbound_runtime_guard(name, &runtime_guard, action)
+    }
+
+    pub(super) fn with_unbound_runtime_guard<T>(
+        &self,
+        name: &str,
+        runtime_guard: &Arc<RuntimeMutationGuard>,
+        action: impl FnOnce(&Arc<RuntimeMutationGuard>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        runtime_guard.check(name, self.env, self.cwd)?;
         with_locked_environments(self.env, self.cwd, |envs| {
             let bound_envs = envs
                 .iter()
@@ -125,7 +142,7 @@ impl<'a> RuntimeService<'a> {
                     bound_envs.join(", ")
                 ));
             }
-            action()
+            action(runtime_guard)
         })
     }
 
@@ -140,7 +157,16 @@ impl<'a> RuntimeService<'a> {
 
     pub fn add(&self, options: AddRuntimeOptions) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        let meta = self.with_unbound_runtime(&name, || add_runtime(options, self.env, self.cwd))?;
+        let meta = self.with_unbound_runtime(&name, |guard| {
+            add_runtime_with_context(
+                options,
+                InstallContext {
+                    env: self.env,
+                    cwd: self.cwd,
+                    runtime_guard: Some(guard),
+                },
+            )
+        })?;
         self.refresh_supervisor_if_present(&name)?;
         Ok(meta)
     }
@@ -154,7 +180,9 @@ impl<'a> RuntimeService<'a> {
     }
 
     pub fn remove(&self, name: &str) -> Result<RuntimeMeta, String> {
-        let meta = self.with_unbound_runtime(name, || remove_runtime(name, self.env, self.cwd))?;
+        let meta = self.with_unbound_runtime(name, |guard| {
+            remove_runtime_with_guard(name, guard, self.env, self.cwd)
+        })?;
         self.refresh_supervisor_if_present(name)?;
         Ok(meta)
     }

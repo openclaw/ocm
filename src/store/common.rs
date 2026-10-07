@@ -25,6 +25,7 @@ pub(crate) fn ensure_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|error| error.to_string())
 }
 
+#[derive(Debug)]
 pub(crate) struct ExclusiveFileLock {
     file: File,
     child_custody: AtomicBool,
@@ -154,6 +155,30 @@ pub(crate) fn lock_file_shared(path: &Path, label: &str) -> Result<SharedFileLoc
         )
     })?;
     Ok(SharedFileLock { file })
+}
+
+pub(crate) fn try_lock_file_shared(
+    path: &Path,
+    label: &str,
+) -> Result<Option<SharedFileLock>, String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("failed to open {label} lock at {}: {error}", path.display()))?;
+    match FileExt::try_lock_shared(&file) {
+        Ok(()) => Ok(Some(SharedFileLock { file })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(format!(
+            "failed to acquire shared {label} lock at {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {

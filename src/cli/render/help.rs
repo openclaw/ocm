@@ -722,6 +722,7 @@ pub fn upgrade_help(cmd: &str) -> String {
             "Channel-tracked runtimes move forward automatically.",
             "When current and target OpenClaw versions are known, older targets are rejected before snapshot creation or runtime mutation because config and SQLite state migrations cannot be reversed by switching binaries.",
             "An env upgrade will not replace runtime bytes shared with another env; use --runtime to reuse those bytes or an exact --version for an isolated target.",
+            "New bindings to a runtime being upgraded are busy until finalization, verification, and recovery finish; retry afterward. Unrelated runtimes remain usable.",
             "Upgrades create a pre-upgrade snapshot before changing env state.",
             "No-target source upgrades keep the launcher binding and use native update --no-restart on Linux/macOS when native source artifact observations are available; older or opaque launchers remain local-command.",
             "Source dry-runs inspect only local facts; matching commits alone do not prove build completeness or running Gateway identity. Source updates use native recovery and reject --no-rollback; their environment checkpoints cannot restore source bytes through upgrade rollback.",

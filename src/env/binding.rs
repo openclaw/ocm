@@ -5,7 +5,7 @@ use serde::Serialize;
 use super::{EnvDevMeta, EnvMeta, EnvironmentService};
 use crate::store::{
     get_environment, save_environment, save_environment_with_validated_launcher,
-    save_environment_with_validated_runtime,
+    save_environment_with_validated_runtime, save_environment_with_validated_runtime_guard,
 };
 use crate::supervisor::sync_supervisor_env_if_present;
 
@@ -105,6 +105,15 @@ impl<'a> EnvironmentService<'a> {
         name: &str,
         runtime_name: &str,
     ) -> Result<EnvMeta, String> {
+        self.set_runtime_with_guard(name, runtime_name, None)
+    }
+
+    pub(crate) fn set_runtime_with_guard(
+        &self,
+        name: &str,
+        runtime_name: &str,
+        runtime_guard: Option<&crate::store::RuntimeMutationGuard>,
+    ) -> Result<EnvMeta, String> {
         let mut meta = get_environment(name, self.env, self.cwd)?;
         if runtime_name.eq_ignore_ascii_case("none") {
             meta.default_runtime = None;
@@ -113,7 +122,15 @@ impl<'a> EnvironmentService<'a> {
             meta.default_launcher = None;
         }
         let meta = if meta.default_runtime.is_some() {
-            save_environment_with_validated_runtime(meta, self.env, self.cwd)?
+            match runtime_guard {
+                Some(guard) => save_environment_with_validated_runtime_guard(
+                    meta,
+                    Some(guard),
+                    self.env,
+                    self.cwd,
+                )?,
+                None => save_environment_with_validated_runtime(meta, self.env, self.cwd)?,
+            }
         } else {
             save_environment(meta, self.env, self.cwd)?
         };

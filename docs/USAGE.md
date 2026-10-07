@@ -659,6 +659,11 @@ Clone (including upgrade simulation) and import require real directories at `.op
 Symlinks, including dangling links, and other file types at those traversal boundaries are refused before copied-state rewrites or cleanup; the source stays unchanged and no target is registered.
 Individual agent directory links are still removed from the copy without changing the linked data.
 
+While an environment upgrade can still replace or restore a runtime, new bindings to that runtime fail with a busy/retry error.
+This includes environment creation, rebinding, cloning, importing, and restoring a snapshot with a different runtime binding.
+Retry after the upgrade finishes finalization, verification, and any rollback; unrelated runtimes remain usable.
+On Unix, native upgrade children retain runtime ownership if the OCM parent exits, and release it when the children exit.
+
 ### Asynchronous upgrades
 
 On Unix, an explicit operator request can run the ordinary environment upgrade in a detached OCM worker.

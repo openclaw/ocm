@@ -599,20 +599,22 @@ pub(crate) fn prepare_env_snapshot_restore(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvSnapshotRestoreTransaction, String> {
-    prepare_env_snapshot_restore_with_binding(options, true, env, cwd)
+    prepare_env_snapshot_restore_with_binding(options, true, None, env, cwd)
 }
 
 pub(crate) fn prepare_upgrade_snapshot_restore(
     options: RestoreEnvSnapshotOptions,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvSnapshotRestoreTransaction, String> {
-    prepare_env_snapshot_restore_with_binding(options, false, env, cwd)
+    prepare_env_snapshot_restore_with_binding(options, false, runtime_guard, env, cwd)
 }
 
 fn prepare_env_snapshot_restore_with_binding(
     options: RestoreEnvSnapshotOptions,
     preserve_current_dev_execution: bool,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvSnapshotRestoreTransaction, String> {
@@ -714,6 +716,16 @@ fn prepare_env_snapshot_restore_with_binding(
             restored.default_launcher = current.default_launcher.clone();
         }
 
+        // Refuse new bindings before replacing the environment tree. Keep
+        // admission through publication or its existing restore compensation.
+        let _admitted =
+            super::envs::lock_environment_runtime_binding(&restored, runtime_guard, env, cwd)?;
+        let runtime_guard = runtime_guard.filter(|guard| {
+            restored
+                .default_runtime
+                .as_deref()
+                .is_some_and(|runtime| guard.check(runtime, env, cwd).is_ok())
+        });
         let mut renamed = false;
         if !independent.is_empty() {
             super::checkpoint_scope::replace_owned_entries(
@@ -752,7 +764,8 @@ fn prepare_env_snapshot_restore_with_binding(
                     preserve_current_excluded_openclaw_state(&backup_root, &current_paths.root)?;
                 }
             }
-            restored = save_environment(restored, env, cwd)?;
+            restored =
+                super::save_environment_with_runtime_guard(restored, runtime_guard, env, cwd)?;
             Ok(restored.clone())
         })();
 
