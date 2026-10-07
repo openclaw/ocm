@@ -3388,6 +3388,89 @@ fn runtime_update_reinstalls_a_manifest_backed_runtime_with_a_new_version() {
 }
 
 #[test]
+fn runtime_update_rejects_oversized_metadata_without_changing_the_installed_runtime() {
+    let root = TestDir::new("runtime-update-oversized-metadata");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    let stable_body = b"runtime-v0.2.0";
+    let next_body = b"runtime-v0.3.0";
+    fs::write(root.child("stable.bin"), stable_body).unwrap();
+    fs::write(root.child("next.bin"), next_body).unwrap();
+    let stable_server = TestHttpServer::serve_bytes(
+        "/artifacts/openclaw-0.2.0",
+        "application/octet-stream",
+        stable_body,
+    );
+    let next_server = TestHttpServer::serve_bytes(
+        "/artifacts/openclaw-0.3.0",
+        "application/octet-stream",
+        next_body,
+    );
+    let manifest = |version: &str, url: String, digest_path: PathBuf| {
+        serde_json::to_vec(&serde_json::json!({"releases": [{
+            "version": version,
+            "channel": "stable",
+            "url": url,
+            "sha256": file_sha256(&digest_path).unwrap(),
+        }]}))
+        .unwrap()
+    };
+    let initial = manifest("0.2.0", stable_server.url(), root.child("stable.bin"));
+    let mut oversized = manifest("0.3.0", next_server.url(), root.child("next.bin"));
+    // Valid metadata with trailing whitespace still exceeds the decoded-byte contract.
+    oversized.resize(64 * 1024 * 1024 + 1, b' ');
+    let manifest_server = TestHttpServer::serve_bytes_sequence(
+        "/manifests/releases.json",
+        "application/json",
+        vec![initial, oversized],
+    );
+    let install = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "stable",
+            "--manifest-url",
+            &manifest_server.url(),
+            "--version",
+            "0.2.0",
+        ],
+    );
+    assert!(install.status.success(), "{}", stderr(&install));
+    let install_root = runtime_install_root("stable", &env, &cwd).unwrap();
+    let binary = install_root.join("files/openclaw-0.2.0");
+    let meta_path = runtime_meta_path("stable", &env, &cwd).unwrap();
+    let metadata_before = fs::read(&meta_path).unwrap();
+    assert_eq!(fs::read(&binary).unwrap(), stable_body);
+
+    let update = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "update", "stable", "--version", "0.3.0"],
+    );
+    assert!(
+        !update.status.success(),
+        "oversized metadata was accepted: {}",
+        stdout(&update)
+    );
+    assert!(
+        stderr(&update).contains("download exceeded 67108864 bytes"),
+        "{}",
+        stderr(&update)
+    );
+    assert_eq!(fs::read(&meta_path).unwrap(), metadata_before);
+    assert_eq!(fs::read(&binary).unwrap(), stable_body);
+    assert!(!install_root.join("files/openclaw-0.3.0").exists());
+    assert!(
+        next_server.requests().is_empty(),
+        "candidate artifact was fetched before metadata validation"
+    );
+}
+
+#[test]
 fn runtime_update_rejects_a_bound_runtime_without_fetching_the_replacement() {
     let root = TestDir::new("runtime-update-bound");
     let cwd = root.child("workspace");

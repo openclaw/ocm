@@ -312,6 +312,12 @@ Use a runtime when you want:
 - stable naming like `stable` or `2026.3.24`
 - verification and updates
 
+Runtime release JSON, including official registry metadata and custom manifests,
+is limited to 64 MiB after gzip decoding. Custom sources larger than this limit
+now fail with a size-limit error. Rejection happens before runtime replacement
+and preserves the installed runtime's files and metadata; reduce the manifest
+size before retrying an update.
+
 ### Use `launcher` when you want a command recipe
 
 Examples:
