@@ -558,6 +558,10 @@ sessions and subagents before exiting, OCM starts the replacement gateway, and
 OpenClaw resumes that recoverable work after startup. This does not wait for an
 in-flight turn to finish before replacing the gateway process.
 
+External restart requests collect the native helper result while observing replacement for up to 30 seconds; a rejection fails the command even if the original Gateway remains healthy.
+A pending helper or unobserved replacement produces a warning without forcing a supervisor restart.
+Requests made inside the target Gateway remain asynchronous so the caller cannot block its own restart.
+
 Package-manager, shell, host-Node, and other wrapper-backed bindings run in
 legacy compatibility mode without OCM's native service identity or detached
 respawn. `ocm service restart <env>` preserves their existing direct-supervisor

@@ -453,6 +453,10 @@ hands the fresh-process restart back to OCM immediately, and resumes recoverable
 work after the replacement gateway starts. The old gateway process does not wait
 for an in-flight turn to finish.
 
+External restart requests collect the native helper result while observing replacement for up to 30 seconds; a rejection fails the command even if the original Gateway remains healthy.
+A pending helper or unobserved replacement produces a warning without forcing a supervisor restart.
+Requests made inside the target Gateway remain asynchronous so the caller cannot block its own restart.
+
 When a binding cannot negotiate the restart handoff, OCM preserves the existing
 direct-supervisor restart behavior and prints a warning that in-flight work may
 have been interrupted. Existing restart commands therefore remain compatible.
