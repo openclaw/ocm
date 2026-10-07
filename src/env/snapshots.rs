@@ -260,9 +260,11 @@ impl<'a> EnvironmentService<'a> {
     pub(crate) fn prepare_upgrade_snapshot_restore_locked(
         &self,
         options: RestoreEnvSnapshotOptions,
+        runtime_guard: Option<&crate::store::RuntimeMutationGuard>,
     ) -> Result<EnvSnapshotRestoreTransaction, String> {
         let env_name = options.env_name.clone();
-        let transaction = prepare_upgrade_snapshot_restore(options, self.env, self.cwd)?;
+        let transaction =
+            prepare_upgrade_snapshot_restore(options, runtime_guard, self.env, self.cwd)?;
         sync_supervisor_env_if_present(self.env, self.cwd, &env_name)?;
         Ok(transaction)
     }

@@ -169,7 +169,21 @@ fn canonicalize_launcher_binding(
     Ok(meta)
 }
 
-fn upsert_environment(registry: &mut EnvRegistry, meta: EnvMeta) -> Result<EnvMeta, String> {
+fn upsert_environment(
+    registry: &mut EnvRegistry,
+    meta: EnvMeta,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(EnvMeta, Option<super::SharedFileLock>), String> {
+    let admission = admit_runtime_binding(
+        registry,
+        &meta.name,
+        meta.default_runtime.as_deref(),
+        runtime_guard,
+        env,
+        cwd,
+    )?;
     let meta = normalize_environment(meta)?;
     if registry
         .envs
@@ -188,7 +202,50 @@ fn upsert_environment(registry: &mut EnvRegistry, meta: EnvMeta) -> Result<EnvMe
     }
     registry.envs.retain(|entry| entry.name != meta.name);
     registry.envs.push(meta.clone());
-    Ok(meta)
+    Ok((meta, admission))
+}
+
+fn admit_runtime_binding(
+    registry: &EnvRegistry,
+    name: &str,
+    runtime: Option<&str>,
+    held: Option<&super::RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<Option<super::SharedFileLock>, String> {
+    let Some(runtime) = runtime else {
+        return Ok(None);
+    };
+    if registry
+        .envs
+        .iter()
+        .any(|current| current.name == name && current.default_runtime.as_deref() == Some(runtime))
+    {
+        return Ok(None);
+    }
+    if held.is_some_and(|guard| guard.check(runtime, env, cwd).is_ok()) {
+        return Ok(None);
+    }
+    // Never wait on a runtime while holding the registry: its owner needs the
+    // registry to publish its own binding or complete recovery.
+    super::try_lock_runtime_binding(runtime, env, cwd).map(Some)
+}
+
+pub(crate) fn lock_environment_runtime_binding(
+    meta: &EnvMeta,
+    held: Option<&super::RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<Option<super::SharedFileLock>, String> {
+    let _registry = lock_env_registry(env, cwd)?;
+    admit_runtime_binding(
+        &load_env_registry(env, cwd)?,
+        &meta.name,
+        meta.default_runtime.as_deref(),
+        held,
+        env,
+        cwd,
+    )
 }
 
 fn find_environment(registry: &EnvRegistry, name: &str) -> Option<EnvMeta> {
@@ -242,13 +299,32 @@ pub fn save_environment(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
+    save_environment_with_runtime_guard(meta, None, env, cwd)
+}
+
+pub(crate) fn save_environment_with_runtime_guard(
+    meta: EnvMeta,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
     let registration = DevSourceRegistration::acquire(&meta.name, meta.dev.as_ref(), env, cwd)?;
-    save_environment_with_dev_registration(meta, &registration, env, cwd)
+    save_environment_registered(meta, &registration, runtime_guard, env, cwd)
 }
 
 pub(crate) fn save_environment_with_dev_registration(
-    mut meta: EnvMeta,
+    meta: EnvMeta,
     registration: &DevSourceRegistration,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
+    save_environment_registered(meta, registration, None, env, cwd)
+}
+
+fn save_environment_registered(
+    meta: EnvMeta,
+    registration: &DevSourceRegistration,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
@@ -264,7 +340,7 @@ pub(crate) fn save_environment_with_dev_registration(
     if policy_changed && meta.service_enabled && meta.service_running {
         service.ensure_source_watch_allows_service(&meta.name)?;
     }
-    meta = upsert_environment(&mut registry, meta)?;
+    let (meta, _admission) = upsert_environment(&mut registry, meta, runtime_guard, env, cwd)?;
     if policy_changed {
         bump_service_policy_revision(&mut registry, &meta.name);
     }
@@ -293,7 +369,7 @@ pub(crate) fn rebind_environment_dev(
     }
     let mut changed = current;
     changed.dev = Some(dev);
-    let changed = upsert_environment(&mut registry, changed)?;
+    let (changed, _admission) = upsert_environment(&mut registry, changed, None, env, cwd)?;
     write_env_registry(&mut registry, env, cwd)?;
     Ok(changed)
 }
@@ -308,14 +384,23 @@ pub(crate) fn save_environment_with_validated_launcher(
     let mut registry = load_env_registry(env, cwd)?;
     registration.recheck(&meta.name, meta.dev.as_ref(), &registry.envs)?;
     meta = canonicalize_launcher_binding(meta, env, cwd)?;
-    meta = upsert_environment(&mut registry, meta)?;
+    let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
     write_env_registry(&mut registry, env, cwd)?;
 
     Ok(meta)
 }
 
 pub(crate) fn save_environment_with_validated_runtime(
+    meta: EnvMeta,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
+    save_environment_with_validated_runtime_guard(meta, None, env, cwd)
+}
+
+pub(crate) fn save_environment_with_validated_runtime_guard(
     mut meta: EnvMeta,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
@@ -323,11 +408,19 @@ pub(crate) fn save_environment_with_validated_runtime(
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     registration.recheck(&meta.name, meta.dev.as_ref(), &registry.envs)?;
+    let _admitted = admit_runtime_binding(
+        &registry,
+        &meta.name,
+        meta.default_runtime.as_deref(),
+        runtime_guard,
+        env,
+        cwd,
+    )?;
     if let Some(runtime_name) = meta.default_runtime.as_deref() {
         meta.default_runtime =
             Some(super::runtimes::get_runtime_verified(runtime_name, env, cwd)?.name);
     }
-    meta = upsert_environment(&mut registry, meta)?;
+    let (meta, _admission) = upsert_environment(&mut registry, meta, runtime_guard, env, cwd)?;
     write_env_registry(&mut registry, env, cwd)?;
 
     Ok(meta)
@@ -486,6 +579,14 @@ fn create_environment_with_runtime_validation(
         return Err(format!("environment \"{name}\" already exists"));
     }
     registration.recheck(&name, options.dev.as_ref(), &registry.envs)?;
+    let _runtime_admission = admit_runtime_binding(
+        &registry,
+        &name,
+        options.default_runtime.as_deref(),
+        None,
+        env,
+        cwd,
+    )?;
     let default_runtime = if validate_runtime {
         options
             .default_runtime
@@ -577,7 +678,7 @@ fn create_environment_with_runtime_validation(
             display_path(&paths.config_path)
         ));
     }
-    let meta = upsert_environment(&mut registry, meta)?;
+    let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
     write_env_registry(&mut registry, env, cwd)?;
     Ok(meta)
 }
@@ -643,6 +744,14 @@ fn clone_environment_with_policy(
         return Err(format!("environment \"{name}\" already exists"));
     }
 
+    let _runtime_admission = admit_runtime_binding(
+        &registry,
+        &name,
+        source.default_runtime.as_deref(),
+        None,
+        env,
+        cwd,
+    )?;
     let root = if let Some(root) = options.root.as_deref() {
         resolve_absolute_path(root, env, cwd)?
     } else {
@@ -784,7 +893,7 @@ fn clone_environment_with_policy(
             updated_at: created_at,
             last_used_at: None,
         };
-        let meta = upsert_environment(&mut registry, meta)?;
+        let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
         write_env_registry(&mut registry, env, cwd)?;
         Ok(CloneEnvironmentResult {
             meta,
@@ -1027,6 +1136,14 @@ pub(crate) fn import_environment_with_sandbox_origin(
             return Err(format!("environment \"{name}\" already exists"));
         }
 
+        let _runtime_admission = admit_runtime_binding(
+            &registry,
+            &name,
+            extracted.metadata.env.default_runtime.as_deref(),
+            None,
+            env,
+            cwd,
+        )?;
         let root = if let Some(root) = options.root.as_deref() {
             resolve_absolute_path(root, env, cwd)?
         } else {
@@ -1110,7 +1227,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 updated_at: created_at,
                 last_used_at: None,
             };
-            let meta = upsert_environment(&mut registry, meta)?;
+            let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
             write_env_registry(&mut registry, env, cwd)?;
             Ok((meta, config_rewrite))
         })();

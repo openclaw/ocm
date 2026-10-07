@@ -8675,3 +8675,634 @@ fn assert_current_package_job(case: &str) {
         _ => {}
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn upgrade_runtime_ownership_refuses_late_bindings_through_completion_and_recovery() {
+    for (kind, failure) in [
+        ("manifest", false),
+        ("manifest", true),
+        ("package", true),
+        ("new-package", true),
+        ("new-package", false),
+        ("new-version", true),
+    ] {
+        assert_upgrade_runtime_ownership(kind, failure, "");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_runtime_ownership_survives_parent_death_until_finalizer_exit() {
+    for phase in ["finalize", "doctor", "version"] {
+        assert_upgrade_runtime_ownership("manifest", false, phase);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_runtime_ownership_releases_after_interrupted_recovery() {
+    assert_upgrade_runtime_ownership("manifest", false, "interrupt");
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_runtime_ownership_covers_explicit_recovery_and_its_surviving_child() {
+    for phase in ["rollback", "rollback-kill"] {
+        assert_upgrade_runtime_ownership("manifest", false, phase);
+    }
+}
+
+#[cfg(unix)]
+fn assert_upgrade_runtime_ownership(kind: &str, failure: bool, interruption: &str) {
+    let kill_parent = matches!(interruption, "finalize" | "doctor" | "version");
+    let rolled_back = failure || interruption == "interrupt";
+    let target_runtime = if kind == "new-version" {
+        "2026.8.1"
+    } else {
+        "stable"
+    };
+    use std::os::unix::process::CommandExt;
+    // On assertion failure, settle the intentionally orphaned finalizer too.
+    struct ProcessGroup(u32);
+    impl Drop for ProcessGroup {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) };
+        }
+    }
+    fn finish(mut child: std::process::Child) -> std::process::Output {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!("command remained blocked: {}", stderr(&output));
+            }
+            sleep(Duration::from_millis(20));
+        }
+        child.wait_with_output().unwrap()
+    }
+    let root = TestDir::new("upgrade-runtime-ownership");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let run = |env: &BTreeMap<String, String>, args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ocm"));
+        command
+            .current_dir(&cwd)
+            .args(args)
+            .env_clear()
+            .envs(env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        finish(command.spawn().unwrap())
+    };
+    let ok = |args: &[&str]| {
+        let output = run(&env, args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {} {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        output
+    };
+    let old_script = recording_openclaw_script("2026.7.1").replacen(
+        "case \"$1\" in",
+        r#"
+if [ "$OCM_RUNTIME_CUSTODY_PHASE:$1" = "rollback:--version" ]; then
+  printf '%s' "$$" > "$OCM_TEST_UPDATE_FINALIZE_STARTED"
+  while [ ! -e "$OCM_TEST_UPDATE_FINALIZE_RELEASE" ]; do sleep 0.05; done
+fi
+case "$1" in"#,
+        1,
+    );
+    let new_script = recording_openclaw_script("2026.8.1").replace(
+        ": > \"$OCM_TEST_UPDATE_FINALIZE_STARTED\"",
+        "printf '%s' \"$$\" > \"$OCM_TEST_UPDATE_FINALIZE_STARTED\"",
+    );
+    let new_script = new_script.replace(
+        "if [ -n \"${OCM_TEST_UPDATE_FINALIZE_STARTED:-}\" ]; then",
+        "if [ -z \"${OCM_RUNTIME_CUSTODY_PHASE:-}\" ] || [ \"$OCM_RUNTIME_CUSTODY_PHASE\" = finalize ] || [ \"$OCM_RUNTIME_CUSTODY_PHASE\" = interrupt ]; then",
+    ).replace(
+        "if [ -n \"${OCM_TEST_UPDATE_FINALIZE_RELEASE:-}\" ]; then",
+        "if [ -z \"${OCM_RUNTIME_CUSTODY_PHASE:-}\" ] || [ \"$OCM_RUNTIME_CUSTODY_PHASE\" = finalize ] || [ \"$OCM_RUNTIME_CUSTODY_PHASE\" = interrupt ]; then",
+    );
+    let new_script = new_script.replacen(
+        "case \"$1\" in",
+        r#"
+case "$OCM_RUNTIME_CUSTODY_PHASE:$1" in
+  doctor:doctor|version:--version)
+    printf '%s' "$$" > "$OCM_TEST_UPDATE_FINALIZE_STARTED"
+    while [ ! -e "$OCM_TEST_UPDATE_FINALIZE_RELEASE" ]; do sleep 0.05; done
+    ;;
+esac
+case "$1" in"#,
+        1,
+    );
+    let package = kind != "manifest";
+    let old_bytes = if package {
+        openclaw_package_tarball(&old_script, "2026.7.1")
+    } else {
+        old_script.as_bytes().to_vec()
+    };
+    let new_bytes = if package {
+        openclaw_package_tarball(&new_script, "2026.8.1")
+    } else {
+        new_script.as_bytes().to_vec()
+    };
+    let old_server = TestHttpServer::serve_bytes("/old", "application/octet-stream", &old_bytes);
+    let new_server = TestHttpServer::serve_bytes("/new", "application/octet-stream", &new_bytes);
+    let release = |version: &str, url: String, bytes: &[u8]| {
+        if package {
+            serde_json::json!({"dist-tags":{"latest":version},"versions":{version:{"version":version,"dist":{"tarball":url,"integrity":sha512_integrity(bytes)}}}}).to_string()
+        } else {
+            let digest = Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            serde_json::json!({"releases":[{"version":version,"channel":"stable","url":url,"sha256":digest}]}).to_string()
+        }
+    };
+    let releases = TestHttpServer::serve_bytes_sequence(
+        "/releases",
+        "application/json",
+        if kind == "new-version" {
+            vec![release("2026.8.1", new_server.url(), &new_bytes).into_bytes()]
+        } else {
+            vec![
+                release("2026.7.1", old_server.url(), &old_bytes).into_bytes(),
+                release("2026.8.1", new_server.url(), &new_bytes).into_bytes(),
+            ]
+        },
+    );
+    let other = root.child("other-openclaw");
+    write_executable_script(&other, &old_script);
+    ok(&["runtime", "add", "other", "--path", &path_string(&other)]);
+    // Drop the borrow of env before installing the package test toolchain.
+    if package {
+        install_fake_node_and_npm(&root, &mut env, "22.22.3");
+        env.insert("OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(), releases.url());
+    }
+    let install = if kind == "new-version" {
+        run(
+            &env,
+            &[
+                "runtime",
+                "add",
+                target_runtime,
+                "--path",
+                &path_string(&other),
+            ],
+        )
+    } else if package {
+        run(
+            &env,
+            &["runtime", "install", target_runtime, "--channel", "stable"],
+        )
+    } else {
+        run(
+            &env,
+            &[
+                "runtime",
+                "install",
+                target_runtime,
+                "--manifest-url",
+                &releases.url(),
+                "--channel",
+                "stable",
+            ],
+        )
+    };
+    assert!(install.status.success(), "{}", stderr(&install));
+    let ok = |args: &[&str]| {
+        let output = run(&env, args);
+        assert!(
+            output.status.success(),
+            "{kind} {args:?}: {} {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        output
+    };
+    for (name, runtime) in [
+        ("primary", target_runtime),
+        ("rebind", target_runtime),
+        ("sibling", "other"),
+    ] {
+        ok(&["env", "create", name, "--runtime", runtime]);
+    }
+    {
+        // Hold a compatible reader across real CLI admission and named reuse.
+        // An exclusive probe would reject these despite no byte-changing owner.
+        let lock_path = ocm::store::runtime_install_root(target_runtime, &env, &cwd)
+            .unwrap()
+            .with_file_name(format!(".{target_runtime}.lock"));
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        fs2::FileExt::lock_shared(&reader).unwrap();
+        ok(&[
+            "env",
+            "create",
+            "read-admission",
+            "--runtime",
+            target_runtime,
+        ]);
+        ok(&[
+            "upgrade",
+            "primary",
+            "--runtime",
+            target_runtime,
+            "--dry-run",
+            "--json",
+        ]);
+        ok(&["env", "set-runtime", "read-admission", "other"]);
+        fs2::FileExt::unlock(&reader).unwrap();
+    }
+    let archive = root.child("before.ocm-env.tar");
+    ok(&[
+        "env",
+        "export",
+        "rebind",
+        "--output",
+        &path_string(&archive),
+    ]);
+    let snapshot = ok(&["env", "snapshot", "create", "rebind", "--json"]);
+    let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    let snapshot_id = snapshot["id"].as_str().unwrap();
+    ok(&["env", "set-runtime", "rebind", "other"]);
+    let marker = root.child("ocm-home/envs/rebind/retained.txt");
+    write_text(&marker, "preserve on refused restore");
+    if kind.starts_with("new-") {
+        ok(&["env", "set-runtime", "primary", "other"]);
+        ok(&["runtime", "remove", target_runtime]);
+    }
+    let prepare_started = root.child("prepare.started");
+    let prepare_release = root.child("prepare.release");
+    if kind.starts_with("new-") {
+        let npm = root.child("pause-npm");
+        write_executable_script(
+            &npm,
+            &format!(
+                "#!/bin/sh\n: > \"$OCM_TEST_PREPARE_STARTED\"\nwhile [ ! -e \"$OCM_TEST_PREPARE_RELEASE\" ]; do sleep 0.05; done\nexec '{}' \"$@\"\n",
+                root.child("fake-node-bin/npm").display()
+            ),
+        );
+        env.insert("OCM_INTERNAL_NPM_BIN".into(), path_string(&npm));
+        env.insert(
+            "OCM_TEST_PREPARE_STARTED".into(),
+            path_string(&prepare_started),
+        );
+        env.insert(
+            "OCM_TEST_PREPARE_RELEASE".into(),
+            path_string(&prepare_release),
+        );
+    }
+    let started = root.child("finalize.started");
+    let release_gate = root.child("finalize.release");
+    env.insert(
+        "OCM_RUNTIME_CUSTODY_PHASE".into(),
+        if interruption.starts_with("rollback") {
+            ""
+        } else {
+            interruption
+        }
+        .into(),
+    );
+    env.insert(
+        "OCM_TEST_UPDATE_FINALIZE_STARTED".into(),
+        path_string(&started),
+    );
+    env.insert(
+        "OCM_TEST_UPDATE_FINALIZE_RELEASE".into(),
+        path_string(&release_gate),
+    );
+    if failure {
+        env.insert("OCM_TEST_FAIL_UPDATE_FINALIZE".into(), "1".into());
+    }
+    let args = if kind == "new-version" {
+        vec!["upgrade", "primary", "--version", "2026.8.1", "--json"]
+    } else if kind.starts_with("new-") {
+        vec!["upgrade", "primary", "--channel", "stable", "--json"]
+    } else {
+        vec!["upgrade", "primary", "--json"]
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ocm"));
+    command
+        .current_dir(&cwd)
+        .args(args)
+        .env_clear()
+        .envs(&env)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            fs::File::create(root.child("upgrade.out")).unwrap(),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(root.child("upgrade.err")).unwrap(),
+        ));
+    let mut upgrade = command.spawn().unwrap();
+    let _group = ProcessGroup(upgrade.id());
+    if kind.starts_with("new-") {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !prepare_started.exists() {
+            assert!(
+                upgrade.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "preparation never paused: {:?} {:?}",
+                fs::read_to_string(root.child("upgrade.out")),
+                fs::read_to_string(root.child("upgrade.err"))
+            );
+            sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !ocm::store::runtime_meta_path(target_runtime, &env, &cwd)
+                .unwrap()
+                .exists()
+        );
+        let selector = if kind == "new-version" {
+            "--version"
+        } else {
+            "--channel"
+        };
+        let selection = if kind == "new-version" {
+            "2026.8.1"
+        } else {
+            "stable"
+        };
+        let denied = run(
+            &env,
+            &["env", "create", "during-preparation", selector, selection],
+        );
+        assert!(
+            !denied.status.success()
+                && stderr(&denied).contains("busy")
+                && stderr(&denied).contains("retry"),
+            "{}",
+            stderr(&denied)
+        );
+        let unrelated = run(
+            &env,
+            &[
+                "env",
+                "create",
+                "preparation-unrelated",
+                "--runtime",
+                "other",
+            ],
+        );
+        assert!(unrelated.status.success(), "{}", stderr(&unrelated));
+        fs::write(&prepare_release, "").unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !started.exists() {
+        assert!(
+            upgrade.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "{kind} never finalized: {:?} {:?}",
+            fs::read_to_string(root.child("upgrade.out")),
+            fs::read_to_string(root.child("upgrade.err"))
+        );
+        sleep(Duration::from_millis(20));
+    }
+    if kill_parent {
+        upgrade.kill().unwrap();
+        upgrade.wait().unwrap();
+    } else if interruption == "interrupt" {
+        unsafe { libc::kill(upgrade.id() as i32, libc::SIGTERM) };
+    }
+    let denied = |args: &[&str]| {
+        let output = run(&env, args);
+        assert!(
+            !output.status.success(),
+            "{kind} admitted {args:?}: {}",
+            stdout(&output)
+        );
+        assert!(
+            stderr(&output).contains("busy") && stderr(&output).contains("retry"),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    };
+    denied(&["env", "create", "late", "--runtime", target_runtime]);
+    denied(&["env", "set-runtime", "rebind", target_runtime]);
+    denied(&[
+        "env",
+        "import",
+        &path_string(&archive),
+        "--name",
+        "imported",
+    ]);
+    denied(&["env", "snapshot", "restore", "rebind", snapshot_id]);
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "preserve on refused restore"
+    );
+    if !kind.starts_with("new-") {
+        denied(&["env", "clone", "primary", "cloned"]);
+    }
+    let removal = if kind.starts_with("new-") {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ocm"));
+        command
+            .current_dir(&cwd)
+            .args(["runtime", "remove", target_runtime])
+            .env_clear()
+            .envs(&env)
+            .process_group(upgrade.id() as i32)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        sleep(Duration::from_millis(100));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "removal did not wait for runtime ownership"
+        );
+        Some(child)
+    } else {
+        None
+    };
+    let mut rebind = ocm::store::get_environment("rebind", &env, &cwd).unwrap();
+    rebind.default_runtime = Some(target_runtime.into());
+    assert!(
+        ocm::store::save_environment(rebind, &env, &cwd)
+            .unwrap_err()
+            .contains("busy")
+    );
+    let primary = ocm::store::get_environment("primary", &env, &cwd).unwrap();
+    ocm::store::save_environment(primary, &env, &cwd).unwrap();
+    for args in [
+        vec!["env", "create", "unrelated", "--runtime", "other"],
+        vec!["@sibling", "--", "--version"],
+        vec!["service", "stop", "sibling"],
+    ] {
+        let output = run(&env, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+    for name in ["late", "imported", "cloned"] {
+        assert!(ocm::store::get_environment(name, &env, &cwd).is_err());
+        assert!(!root.child(&format!("ocm-home/envs/{name}")).exists());
+    }
+    fs::write(&release_gate, "").unwrap();
+    if !kill_parent {
+        let output = finish(upgrade);
+        assert_eq!(
+            output.status.success(),
+            !rolled_back,
+            "{kind}: {:?} {:?}",
+            fs::read_to_string(root.child("upgrade.out")),
+            fs::read_to_string(root.child("upgrade.err"))
+        );
+        let summary: Value =
+            serde_json::from_str(&fs::read_to_string(root.child("upgrade.out")).unwrap()).unwrap();
+        if rolled_back {
+            assert_eq!(summary["outcome"], "rolled-back");
+        }
+        if interruption == "interrupt" {
+            assert!(summary["note"].as_str().unwrap().contains("interrupted"));
+        }
+    }
+    if let Some(removal) = removal {
+        let output = finish(removal);
+        assert!(
+            !output.status.success(),
+            "removal must recheck binding/existence after waiting"
+        );
+    }
+    if interruption.starts_with("rollback") {
+        // In-place recovery checks retained metadata before mutation; its
+        // old-runtime version command verifies the restored bytes afterward.
+        fs::remove_file(&started).unwrap();
+        fs::remove_file(&release_gate).unwrap();
+        env.insert("OCM_RUNTIME_CUSTODY_PHASE".into(), "rollback".into());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ocm"));
+        command
+            .current_dir(&cwd)
+            .args(["upgrade", "rollback", "primary", "--json"])
+            .env_clear()
+            .envs(&env)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                fs::File::create(root.child("rollback.out")).unwrap(),
+            ))
+            .stderr(Stdio::from(
+                fs::File::create(root.child("rollback.err")).unwrap(),
+            ));
+        let mut rollback = command.spawn().unwrap();
+        let _recovery_group = ProcessGroup(rollback.id());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !started.exists() {
+            assert!(
+                rollback.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "recovery verification never paused: {:?} {:?}",
+                fs::read_to_string(root.child("rollback.out")),
+                fs::read_to_string(root.child("rollback.err"))
+            );
+            sleep(Duration::from_millis(20));
+        }
+        if interruption == "rollback-kill" {
+            rollback.kill().unwrap();
+            rollback.wait().unwrap();
+        }
+        let refused = run(
+            &env,
+            &[
+                "env",
+                "create",
+                "during-recovery",
+                "--runtime",
+                target_runtime,
+            ],
+        );
+        assert!(
+            !refused.status.success() && stderr(&refused).contains("busy"),
+            "{}",
+            stderr(&refused)
+        );
+        fs::write(&release_gate, "").unwrap();
+        if interruption != "rollback-kill" {
+            assert!(
+                finish(rollback).status.success(),
+                "{:?} {:?}",
+                fs::read_to_string(root.child("rollback.out")),
+                fs::read_to_string(root.child("rollback.err"))
+            );
+        } else {
+            // Admission proves the surviving child released ownership before
+            // fixture cleanup can terminate any leftover descendants.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let admitted = run(
+                    &env,
+                    &[
+                        "env",
+                        "create",
+                        "recovery-complete",
+                        "--runtime",
+                        target_runtime,
+                    ],
+                );
+                if admitted.status.success() {
+                    break;
+                }
+                assert!(
+                    stderr(&admitted).contains("busy") && Instant::now() < deadline,
+                    "{}",
+                    stderr(&admitted)
+                );
+                sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    // The child may outlive its killed parent briefly; require lock release,
+    // not a time-based assumption about when the orphan exits.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = run(
+            &env,
+            &["env", "create", "after", "--runtime", target_runtime],
+        );
+        if !stderr(&output).contains("busy") {
+            assert_eq!(
+                output.status.success(),
+                !(kind.starts_with("new-") && rolled_back),
+                "{}",
+                stderr(&output)
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime remained permanently busy"
+        );
+        sleep(Duration::from_millis(20));
+    }
+    let sibling = run(&env, &["@sibling", "--", "--version"]);
+    assert_eq!(stdout(&sibling).trim(), "2026.7.1");
+    if !kind.starts_with("new-") || !rolled_back {
+        let after = run(&env, &["@after", "--", "--version"]);
+        assert_eq!(
+            stdout(&after).trim(),
+            if rolled_back || interruption.starts_with("rollback") {
+                "2026.7.1"
+            } else {
+                "2026.8.1"
+            }
+        );
+    } else {
+        assert!(
+            !root
+                .child(&format!("ocm-home/runtimes/{target_runtime}"))
+                .exists()
+        );
+        assert!(
+            !root
+                .child(&format!("ocm-home/runtimes/{target_runtime}.json"))
+                .exists()
+        );
+    }
+}

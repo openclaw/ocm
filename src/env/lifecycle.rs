@@ -317,6 +317,8 @@ impl<'a> EnvironmentService<'a> {
         }
 
         if let Some(runtime_name) = runtime_name {
+            let _admission =
+                crate::store::try_lock_runtime_binding(&runtime_name, self.env, self.cwd)?;
             get_runtime_verified(&runtime_name, self.env, self.cwd)?;
             return Ok(Some(runtime_name));
         }

@@ -5,6 +5,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use crate::host::verify_official_openclaw_runtime_host;
 use crate::infra::download::{
@@ -29,8 +30,8 @@ use crate::runtime::{
 };
 
 use super::common::{
-    ExclusiveFileLock, copy_dir_recursive, copy_path, ensure_dir, load_json_files, lock_file,
-    path_exists, read_json, write_json,
+    ExclusiveFileLock, copy_dir_recursive, copy_path, ensure_dir, load_json_files, path_exists,
+    read_json, write_json,
 };
 use super::envs::get_environment;
 use super::layout::{
@@ -295,7 +296,7 @@ struct RuntimeInstallTarget {
     final_install_root: PathBuf,
     install_root: PathBuf,
     install_files: PathBuf,
-    _lock: ExclusiveFileLock,
+    _lock: Arc<RuntimeMutationGuard>,
 }
 
 pub(crate) struct PreparedRuntimeInstall {
@@ -356,6 +357,19 @@ impl Drop for RuntimeInstallTarget {
 pub(crate) struct InstallContext<'a> {
     pub env: &'a BTreeMap<String, String>,
     pub cwd: &'a Path,
+    pub runtime_guard: Option<&'a Arc<RuntimeMutationGuard>>,
+}
+
+impl InstallContext<'_> {
+    fn lock_runtime(&self, name: &str) -> Result<Arc<RuntimeMutationGuard>, String> {
+        match self.runtime_guard {
+            Some(guard) => {
+                guard.check(name, self.env, self.cwd)?;
+                Ok(Arc::clone(guard))
+            }
+            None => lock_runtime_mutation(name, self.env, self.cwd).map(Arc::new),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2061,11 +2075,16 @@ fn prepare_runtime_at_path(
 fn prepare_runtime_install_target(
     name: String,
     replace_existing: bool,
-    env: &BTreeMap<String, String>,
-    cwd: &Path,
+    context: InstallContext<'_>,
 ) -> Result<RuntimeInstallTarget, String> {
-    let lock = lock_runtime(&name, env, cwd)?;
-    prepare_runtime_install_target_with_lock(name, replace_existing, env, cwd, lock)
+    let guard = context.lock_runtime(&name)?;
+    prepare_runtime_install_target_with_lock(
+        name,
+        replace_existing,
+        context.env,
+        context.cwd,
+        guard,
+    )
 }
 
 fn prepare_runtime_install_target_with_lock(
@@ -2073,7 +2092,7 @@ fn prepare_runtime_install_target_with_lock(
     replace_existing: bool,
     env: &BTreeMap<String, String>,
     cwd: &Path,
-    lock: ExclusiveFileLock,
+    lock: Arc<RuntimeMutationGuard>,
 ) -> Result<RuntimeInstallTarget, String> {
     let final_meta_path = runtime_meta_path(&name, env, cwd)?;
     let final_install_root = runtime_install_root(&name, env, cwd)?;
@@ -2107,7 +2126,7 @@ fn prepare_official_runtime_install_target(
     release: &RuntimeReleaseDetails,
     context: InstallContext<'_>,
 ) -> Result<OfficialRuntimeInstallTarget, String> {
-    let lock = lock_runtime(&name, context.env, context.cwd)?;
+    let lock = context.lock_runtime(&name)?;
     let meta_path = runtime_meta_path(&name, context.env, context.cwd)?;
     if path_exists(&meta_path) && !force {
         let existing = get_runtime(&name, context.env, context.cwd)?;
@@ -2133,15 +2152,80 @@ fn lock_runtime(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<ExclusiveFileLock, String> {
-    let install_root = runtime_install_root(name, env, cwd)?;
+    super::lock_file(&runtime_lock_path(name, env, cwd)?, "runtime installation")
+}
+
+pub(crate) fn lock_runtime_mutation(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<RuntimeMutationGuard, String> {
+    Ok(RuntimeMutationGuard {
+        path: runtime_lock_path(name, env, cwd)?,
+        lock: lock_runtime(name, env, cwd)?,
+    })
+}
+
+fn runtime_lock_path(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
+    let name = validate_name(name, "Runtime name")?;
+    let install_root = runtime_install_root(&name, env, cwd)?;
     let parent = install_root
         .parent()
         .ok_or_else(|| format!("runtime install root has no parent: {name}"))?;
-    ensure_dir(parent)?;
-    lock_file(
-        &parent.join(format!(".{name}.lock")),
-        "runtime installation",
-    )
+    Ok(parent.join(format!(".{name}.lock")))
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeMutationGuard {
+    path: PathBuf,
+    lock: ExclusiveFileLock,
+}
+
+impl RuntimeMutationGuard {
+    pub(crate) fn check(
+        &self,
+        name: &str,
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> Result<(), String> {
+        if self.path != runtime_lock_path(name, env, cwd)? {
+            return Err(format!("runtime mutation guard does not cover {name:?}"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retain_for_child(&self, command: &mut std::process::Command) {
+        self.lock.retain_for_child(command);
+    }
+}
+
+pub(crate) fn try_lock_runtime_mutation(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<RuntimeMutationGuard, String> {
+    let path = runtime_lock_path(name, env, cwd)?;
+    let lock = super::try_lock_file(&path, "runtime mutation")?.ok_or_else(|| {
+        format!("runtime {name:?} is busy with another operation; retry after it finishes")
+    })?;
+    Ok(RuntimeMutationGuard { path, lock })
+}
+
+pub(crate) fn try_lock_runtime_binding(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<super::common::SharedFileLock, String> {
+    // Bindings and named-runtime reads may overlap. Only a byte-changing
+    // owner's exclusive lock excludes them; this guard cannot authorize writes.
+    super::common::try_lock_file_shared(&runtime_lock_path(name, env, cwd)?, "runtime binding")?
+        .ok_or_else(|| {
+            format!("runtime {name:?} is busy with another operation; retry after it finishes")
+        })
 }
 
 fn prepare_runtime_from_openclaw_package(
@@ -2361,8 +2445,23 @@ pub fn add_runtime(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<RuntimeMeta, String> {
+    add_runtime_with_context(
+        options,
+        InstallContext {
+            env,
+            cwd,
+            runtime_guard: None,
+        },
+    )
+}
+
+pub(crate) fn add_runtime_with_context(
+    options: AddRuntimeOptions,
+    context: InstallContext<'_>,
+) -> Result<RuntimeMeta, String> {
+    let InstallContext { env, cwd, .. } = context;
     let name = validate_name(&options.name, "Runtime name")?;
-    let _lock = lock_runtime(&name, env, cwd)?;
+    let _lock = context.lock_runtime(&name)?;
     let meta_path = runtime_meta_path(&name, env, cwd)?;
     if path_exists(&meta_path) {
         return Err(format!("runtime \"{name}\" already exists"));
@@ -2424,7 +2523,25 @@ pub fn remove_runtime(
 ) -> Result<RuntimeMeta, String> {
     let name = validate_name(name, "Runtime name")?;
     let _lock = lock_runtime(&name, env, cwd)?;
-    let meta = get_runtime(&name, env, cwd)?;
+    remove_runtime_files(&name, env, cwd)
+}
+
+pub(crate) fn remove_runtime_with_guard(
+    name: &str,
+    guard: &RuntimeMutationGuard,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<RuntimeMeta, String> {
+    guard.check(name, env, cwd)?;
+    remove_runtime_files(name, env, cwd)
+}
+
+fn remove_runtime_files(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<RuntimeMeta, String> {
+    let meta = get_runtime(name, env, cwd)?;
     let path = runtime_meta_path(&meta.name, env, cwd)?;
     if let Some(install_root) = meta.install_root.as_deref() {
         let expected_root = runtime_install_root(&meta.name, env, cwd)?;
@@ -2441,8 +2558,23 @@ pub fn install_runtime(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<RuntimeMeta, String> {
+    install_runtime_with_context(
+        options,
+        InstallContext {
+            env,
+            cwd,
+            runtime_guard: None,
+        },
+    )
+}
+
+pub(crate) fn install_runtime_with_context(
+    options: InstallRuntimeOptions,
+    context: InstallContext<'_>,
+) -> Result<RuntimeMeta, String> {
+    let InstallContext { env, cwd, .. } = context;
     let name = validate_name(&options.name, "Runtime name")?;
-    let target = prepare_runtime_install_target(name, options.force, env, cwd)?;
+    let target = prepare_runtime_install_target(name, options.force, context)?;
 
     let raw_path = options.path.trim();
     if raw_path.is_empty() {
@@ -2489,8 +2621,22 @@ pub fn install_runtime_from_url(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<RuntimeMeta, String> {
+    install_runtime_from_url_with_context(
+        options,
+        InstallContext {
+            env,
+            cwd,
+            runtime_guard: None,
+        },
+    )
+}
+
+pub(crate) fn install_runtime_from_url_with_context(
+    options: InstallRuntimeFromUrlOptions,
+    context: InstallContext<'_>,
+) -> Result<RuntimeMeta, String> {
     let name = validate_name(&options.name, "Runtime name")?;
-    let target = prepare_runtime_install_target(name, options.force, env, cwd)?;
+    let target = prepare_runtime_install_target(name, options.force, context)?;
 
     let file_name = artifact_file_name_from_url(&options.url)?;
     prepare_runtime_at_path(
@@ -2610,7 +2756,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
             .into_values()
             .map(|spec| pack_local_openclaw_companion(&repo_path, &pack_dir, spec, context.env))
             .collect::<Result<Vec<_>, _>>()?;
-        let target = prepare_runtime_install_target(name, options.force, context.env, context.cwd)?;
+        let target = prepare_runtime_install_target(name, options.force, context)?;
         if path_exists(&target.install_root) {
             return Err(format!(
                 "runtime install root already exists: {}",
@@ -2661,6 +2807,21 @@ pub fn install_runtime_from_release(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<RuntimeMeta, String> {
+    install_runtime_from_release_with_context(
+        options,
+        InstallContext {
+            env,
+            cwd,
+            runtime_guard: None,
+        },
+    )
+}
+
+pub(crate) fn install_runtime_from_release_with_context(
+    options: InstallRuntimeFromReleaseOptions,
+    context: InstallContext<'_>,
+) -> Result<RuntimeMeta, String> {
+    let InstallContext { env, cwd, .. } = context;
     let manifest = load_release_manifest(&options.manifest_url)?;
     let release = select_release(
         &manifest,
@@ -2679,7 +2840,7 @@ pub fn install_runtime_from_release(
             ),
             _ => (None, None),
         };
-    install_runtime_from_selected_release(
+    prepare_runtime_from_selected_release(
         options.name,
         options.force,
         options.manifest_url,
@@ -2689,31 +2850,7 @@ pub fn install_runtime_from_release(
         options.description,
         env,
         cwd,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn install_runtime_from_selected_release(
-    name: String,
-    force: bool,
-    manifest_url: String,
-    release: RuntimeRelease,
-    selector_kind: Option<RuntimeReleaseSelectorKind>,
-    selector_value: Option<String>,
-    description: Option<String>,
-    env: &BTreeMap<String, String>,
-    cwd: &Path,
-) -> Result<RuntimeMeta, String> {
-    prepare_runtime_from_selected_release(
-        name,
-        force,
-        manifest_url,
-        release,
-        selector_kind,
-        selector_value,
-        description,
-        env,
-        cwd,
+        context.runtime_guard,
     )?
     .commit()
 }
@@ -2729,6 +2866,7 @@ pub(crate) fn prepare_runtime_from_selected_release(
     description: Option<String>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
+    runtime_guard: Option<&Arc<RuntimeMutationGuard>>,
 ) -> Result<PreparedRuntimeInstall, String> {
     let name = validate_name(&name, "Runtime name")?;
     let source_sha256 = release
@@ -2741,7 +2879,15 @@ pub(crate) fn prepare_runtime_from_selected_release(
             )
         })
         .and_then(normalize_sha256)?;
-    let target = prepare_runtime_install_target(name, force, env, cwd)?;
+    let target = prepare_runtime_install_target(
+        name,
+        force,
+        InstallContext {
+            env,
+            cwd,
+            runtime_guard,
+        },
+    )?;
     let release_details = RuntimeReleaseDetails {
         version: Some(release.version.clone()),
         channel: release.channel.clone(),
@@ -2771,6 +2917,21 @@ pub fn install_runtime_from_official_openclaw_release(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<RuntimeMeta, String> {
+    install_runtime_from_official_openclaw_release_with_context(
+        options,
+        InstallContext {
+            env,
+            cwd,
+            runtime_guard: None,
+        },
+    )
+}
+
+pub(crate) fn install_runtime_from_official_openclaw_release_with_context(
+    options: InstallRuntimeFromOfficialReleaseOptions,
+    context: InstallContext<'_>,
+) -> Result<RuntimeMeta, String> {
+    let env = context.env;
     let name = validate_name(&options.name, "Runtime name")?;
     let channel = options
         .channel
@@ -2816,7 +2977,7 @@ pub fn install_runtime_from_official_openclaw_release(
             ..RuntimeReleaseDetails::default()
         },
         description,
-        InstallContext { env, cwd },
+        context,
     )
     .map(|result| result.meta)
 }
