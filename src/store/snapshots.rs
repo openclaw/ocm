@@ -978,6 +978,16 @@ fn preserve_current_excluded_openclaw_state(
 }
 
 fn should_discard_current_openclaw_restore_entry(name: &OsStr, is_dir: bool) -> bool {
+    // Legacy archives omitted socket-like names regardless of entry type.
+    is_snapshot_process_residue(name, is_dir)
+        || matches!(
+            Path::new(name).extension().and_then(OsStr::to_str),
+            Some("sock") | Some("socket")
+        )
+        || matches!(name.to_str(), Some("sock") | Some("socket"))
+}
+
+fn is_snapshot_process_residue(name: &OsStr, is_dir: bool) -> bool {
     if is_dir
         && matches!(
             name.to_str(),
@@ -989,14 +999,10 @@ fn should_discard_current_openclaw_restore_entry(name: &OsStr, is_dir: bool) -> 
 
     matches!(
         Path::new(name).extension().and_then(OsStr::to_str),
-        Some("pid") | Some("lock") | Some("sock") | Some("socket")
+        Some("pid") | Some("lock")
     ) || matches!(
         name.to_str(),
-        Some("pid")
-            | Some("lock")
-            | Some("sock")
-            | Some("socket")
-            | Some("gateway-supervisor-restart-handoff.json")
+        Some("pid") | Some("lock") | Some("gateway-supervisor-restart-handoff.json")
     )
 }
 
@@ -1028,7 +1034,14 @@ fn clear_snapshot_runtime_residue(root: &Path) -> Result<(), String> {
     for entry in entries {
         let entry_path = entry.path();
         let metadata = fs::symlink_metadata(&entry_path).map_err(|error| error.to_string())?;
-        if should_discard_current_openclaw_restore_entry(&entry.file_name(), metadata.is_dir()) {
+        #[cfg(unix)]
+        let is_socket = {
+            use std::os::unix::fs::FileTypeExt;
+            metadata.file_type().is_socket()
+        };
+        #[cfg(not(unix))]
+        let is_socket = false;
+        if is_socket || is_snapshot_process_residue(&entry.file_name(), metadata.is_dir()) {
             remove_path_if_present(&entry_path)?;
         }
     }
