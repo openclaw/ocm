@@ -56,6 +56,11 @@ pub(crate) fn resolve_direct_launcher_command(
         return None;
     }
     let tokens = parse_literal_launcher_command(&launcher.command)?;
+    // Unix exec is a shell builtin even when every word is literal. Keep this
+    // execution constraint separate from parsing words for source inspection.
+    if cfg!(unix) && tokens.first()?.as_str() == "exec" {
+        return None;
+    }
 
     Some(DirectLauncherCommand {
         program: tokens.first()?.clone(),
@@ -254,6 +259,39 @@ mod tests {
                 .is_none()
             );
         }
+    }
+
+    #[test]
+    fn resolve_direct_launcher_command_keeps_exec_shell_semantics_on_unix() {
+        let recipe = "exec openclaw --profile dev";
+        assert_eq!(
+            parse_literal_launcher_command(recipe).unwrap(),
+            vec!["exec", "openclaw", "--profile", "dev"]
+        );
+        let command = resolve_direct_launcher_command(
+            &sample_launcher(recipe, None),
+            &["gateway".to_string()],
+            Path::new("/tmp"),
+        );
+        if cfg!(unix) {
+            assert!(command.is_none());
+        } else {
+            let command = command.unwrap();
+            assert_eq!(command.program, "exec");
+            assert_eq!(
+                command.args,
+                vec!["openclaw", "--profile", "dev", "gateway"]
+            );
+        }
+
+        let command = resolve_direct_launcher_command(
+            &sample_launcher("./exec openclaw", None),
+            &[],
+            Path::new("/tmp"),
+        )
+        .unwrap();
+        assert_eq!(command.program, "./exec");
+        assert_eq!(command.args, vec!["openclaw"]);
     }
 
     #[test]

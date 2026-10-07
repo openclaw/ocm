@@ -3890,40 +3890,74 @@ fn service_start_waits_for_slow_gateway_health() {
 
 #[cfg(unix)]
 #[test]
-fn service_start_preserves_quoted_shell_builtin_launchers() {
+fn service_start_preserves_exec_and_plain_executable_launchers() {
     let _guard = daemon_runtime_test_lock();
-    let root = TestDir::new("service-readiness-quoted-builtin");
-    let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
-    let entry = root.child("Entrypoint With Spaces.mjs");
-    std::os::unix::fs::symlink(root.child("bin/readiness-openclaw.mjs"), &entry).unwrap();
-    let launcher = run_ocm(
-        &cwd,
-        &env,
-        &[
-            "launcher",
-            "add",
-            "quoted",
-            "--command",
-            &format!("exec \"node\" '{}'", path_string(&entry)),
-        ],
-    );
-    assert!(launcher.status.success(), "{}", stderr(&launcher));
-    let bound = run_ocm(&cwd, &env, &["env", "set-launcher", "demo", "quoted"]);
-    assert!(bound.status.success(), "{}", stderr(&bound));
+    for mode in ["quoted", "unquoted", "plain"] {
+        let root = TestDir::new("service-readiness-exec");
+        let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
+        let script = root.child("bin/readiness-openclaw.mjs");
+        let entry = root.child("Entrypoint With Spaces.mjs");
+        std::os::unix::fs::symlink(&script, &entry).unwrap();
+        let recipe = match mode {
+            "quoted" => format!("exec \"node\" '{}'", path_string(&entry)),
+            "unquoted" => format!("exec {}", path_string(&script)),
+            _ => path_string(&script),
+        };
+        let launcher = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "launcher",
+                "add",
+                "candidate",
+                "--command",
+                &recipe,
+                "--cwd",
+                &path_string(&cwd),
+            ],
+        );
+        assert!(launcher.status.success(), "{}", stderr(&launcher));
+        let bound = run_ocm(&cwd, &env, &["env", "set-launcher", "demo", "candidate"]);
+        assert!(bound.status.success(), "{}", stderr(&bound));
 
-    let mut daemon = spawn_daemon_process(&cwd, &env);
-    let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
-    // Reap the isolated supervisor and its child even if the readiness assertion fails.
-    stop_process(&mut daemon);
-    assert!(
-        started.status.success(),
-        "{}\n{}",
-        stdout(&started),
-        stderr(&started)
-    );
-    let body: Value = serde_json::from_slice(&started.stdout).unwrap();
-    assert_eq!(body["gatewayReady"], true);
-    assert_eq!(body["gatewayState"], "running");
+        let mut daemon = spawn_daemon_process(&cwd, &env);
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+        let runtime: Value = serde_json::from_slice(
+            &fs::read(root.child("ocm-home/supervisor/runtime.json")).unwrap_or_default(),
+        )
+        .unwrap_or(Value::Null);
+        let pid = runtime["children"][0]["pid"].as_u64().map(|pid| pid as u32);
+        let child_was_alive = pid.is_some_and(process_exists);
+        // Reap the isolated supervisor and its child even if readiness failed.
+        stop_process(&mut daemon);
+        assert!(
+            started.status.success(),
+            "{mode}: {}\n{}",
+            stdout(&started),
+            stderr(&started)
+        );
+        let body: Value = serde_json::from_slice(&started.stdout).unwrap();
+        assert_eq!(body["gatewayReady"], true, "{mode}");
+        assert_eq!(body["gatewayState"], "running", "{mode}");
+        assert!(child_was_alive, "{mode}: no live supervised Gateway PID");
+        assert!(
+            !process_exists(pid.unwrap()),
+            "{mode}: Gateway survived stop"
+        );
+
+        let child = persisted_child(&root.child("ocm-home/supervisor/state.json"), "demo");
+        assert_eq!(child["runDir"], path_string(&cwd));
+        assert!(
+            std::env::split_paths(child["processEnv"]["PATH"].as_str().unwrap())
+                .all(|path| !path.join("exec").is_file()),
+            "fixture must not provide an external exec command"
+        );
+        if mode == "plain" {
+            assert_eq!(child["binaryPath"], path_string(&script));
+        } else {
+            assert!(child["binaryPath"].is_null(), "{mode}");
+        }
+    }
 }
 
 #[test]
