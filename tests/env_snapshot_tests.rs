@@ -770,6 +770,123 @@ fn accepted_snapshot_restore_reports_cleanup_failure_without_failing() {
 
 #[cfg(unix)]
 #[test]
+fn env_snapshot_restores_socket_named_data_and_discards_process_residue() {
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
+
+    let root = TestDir::new("snapshot-entry-types");
+    // Unix socket paths must fit macOS's sockaddr_un, even with a long TMPDIR.
+    let short_root = tempfile::Builder::new()
+        .prefix("ocms-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert("OCM_HOME".to_string(), path_string(short_root.path()));
+    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let env_root = short_root.path().join("envs/source");
+    let files = [
+        ".openclaw/regular.sock",
+        ".openclaw/regular.socket",
+        ".openclaw/sock",
+        ".openclaw/socket",
+        ".openclaw/regular.txt",
+        ".openclaw/nested/regular.sock",
+        ".openclaw/nested/regular.socket",
+        ".openclaw/directory.sock/state.txt",
+        "regular.sock",
+    ];
+    for relative in files {
+        write_text(&env_root.join(relative), relative);
+    }
+    let external = root.child("external.txt");
+    write_text(&external, "external target");
+    let links = [
+        (".openclaw/link.sock", Path::new("regular.txt")),
+        (".openclaw/link.socket", Path::new("regular.txt")),
+        (".openclaw/dangling.sock", Path::new("missing")),
+        (".openclaw/external.socket", external.as_path()),
+        (".openclaw/endpoint.sock", Path::new("endpoint")),
+    ];
+    for (relative, target) in links {
+        symlink(target, env_root.join(relative)).unwrap();
+    }
+    let residues = [
+        "gateway.pid",
+        "gateway.lock",
+        "pid",
+        "lock",
+        "gateway-supervisor-restart-handoff.json",
+        "run/state",
+        "tmp/state",
+        "temp/state",
+        "locks/state",
+    ];
+    for relative in residues {
+        write_text(&env_root.join(".openclaw").join(relative), "residue");
+    }
+    let endpoint = env_root.join(".openclaw/endpoint");
+    let listener = UnixListener::bind(&endpoint).unwrap();
+    let stale_endpoint = env_root.join(".openclaw/stale.socket");
+    drop(UnixListener::bind(&stale_endpoint).unwrap());
+
+    let snapshot = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "create", "source", "--json"],
+    );
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+    let snapshot_json: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    let snapshot_id = snapshot_json["id"].as_str().unwrap();
+    let checkpoint = Path::new(snapshot_json["archivePath"].as_str().unwrap());
+    for relative in files {
+        assert_eq!(
+            fs::read_to_string(checkpoint.join(relative)).unwrap(),
+            relative
+        );
+        write_text(&env_root.join(relative), "changed");
+    }
+    for (relative, target) in links {
+        assert_eq!(fs::read_link(checkpoint.join(relative)).unwrap(), target);
+        fs::remove_file(env_root.join(relative)).unwrap();
+    }
+    assert!(!checkpoint.join(".openclaw/endpoint").exists());
+    assert!(!checkpoint.join(".openclaw/stale.socket").exists());
+    drop(listener);
+
+    let restore = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "restore", "source", snapshot_id],
+    );
+    assert!(restore.status.success(), "{}", stderr(&restore));
+    for saved_root in [&env_root, &checkpoint.to_path_buf()] {
+        for relative in files {
+            assert_eq!(
+                fs::read_to_string(saved_root.join(relative)).unwrap(),
+                relative
+            );
+        }
+        for (relative, target) in links {
+            assert_eq!(fs::read_link(saved_root.join(relative)).unwrap(), target);
+        }
+        assert!(!saved_root.join(".openclaw/endpoint").exists());
+        assert!(!saved_root.join(".openclaw/stale.socket").exists());
+    }
+    for relative in residues {
+        assert!(!env_root.join(".openclaw").join(relative).exists());
+        assert_eq!(
+            fs::read_to_string(checkpoint.join(".openclaw").join(relative)).unwrap(),
+            "residue"
+        );
+    }
+    assert_eq!(fs::read_to_string(external).unwrap(), "external target");
+}
+
+#[cfg(unix)]
+#[test]
 fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
@@ -1101,6 +1218,19 @@ fn env_snapshot_restore_remains_compatible_with_legacy_tar_metadata() {
         ],
     );
     assert!(export.status.success(), "{}", stderr(&export));
+    let openclaw_root = root.child("ocm-home/envs/source/.openclaw");
+    let excluded = [
+        "current.sock",
+        "current.socket",
+        "sock",
+        "socket",
+        "current.pid",
+        "current.lock",
+    ];
+    for name in excluded {
+        write_text(&openclaw_root.join(name), "current residue");
+    }
+    write_text(&openclaw_root.join("current.txt"), "preserved current data");
     let metadata = serde_json::json!({
         "kind": "ocm-env-snapshot",
         "id": snapshot_id,
@@ -1130,6 +1260,13 @@ fn env_snapshot_restore_remains_compatible_with_legacy_tar_metadata() {
     );
     assert!(restore.status.success(), "{}", stderr(&restore));
     assert_eq!(fs::read_to_string(&notes).unwrap(), "legacy-snapshot\n");
+    for name in excluded {
+        assert!(!openclaw_root.join(name).exists());
+    }
+    assert_eq!(
+        fs::read_to_string(openclaw_root.join("current.txt")).unwrap(),
+        "preserved current data"
+    );
 
     let mut current = get_environment("source", &env, &cwd).unwrap();
     current.dev = Some(EnvDevMeta::Owned {
