@@ -29,6 +29,7 @@ All notable changes to OCM are documented here.
 
 ### Changed
 
+- Update `libc` to 0.2.190 and the pinned Rust installer action to retry transient official-server checksum failures, retaining Rust 1.88 support.
 - Update `cc` to 1.5.1, `find-msvc-tools` to 0.1.14, and `smallvec` to 1.16.2 while retaining Rust 1.88 support.
 - Define ordered remote development checks, isolated checkout transfer, and proof reuse in the contributor guide. Thanks @shakkernerd (#290).
 - Update fresh managed Node.js installs and CI to 24.21.0 while preserving cached 24.15.0 toolchains across OCM upgrades.
