@@ -421,6 +421,42 @@ class MacosTeamIdTests(unittest.TestCase):
                                 smoke(missing, expected_macos_team_id=value)
 
 
+def report_notarization_lookup_errors():
+    # Disclose only numeric lookup errors, preserving the verification failure.
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/log", "show", "--last", "2m", "--style", "json",
+                "--predicate",
+                'process == "codesign" AND subsystem == "com.apple.securityd" '
+                'AND eventMessage CONTAINS "Error checking with notarization daemon:"',
+            ],
+            text=True, capture_output=True, timeout=15,
+        )
+        if result.returncode:
+            print(f"Notarization diagnostic unavailable: log exit {result.returncode}")
+            return
+        entries = json.loads(result.stdout)
+        if not isinstance(entries, list):
+            raise ValueError("unexpected log response")
+        errors = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            message = entry.get("eventMessage")
+            if not isinstance(message, str):
+                continue
+            match = re.fullmatch(
+                r"Error checking with notarization daemon: (-?\d+)",
+                message.strip(),
+            )
+            if match:
+                errors.append(int(match.group(1)))
+        print(f"Apple notarization lookup error codes: {errors}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        print("Notarization diagnostic unavailable")
+
+
 def smoke(directory, *, expected_macos_team_id=None):
     signature_command = None
     if sys.platform == "darwin":
@@ -462,16 +498,20 @@ def smoke(directory, *, expected_macos_team_id=None):
                 )
             run([str(entrypoint), "--help"], root, env)
             if signature_command is not None:
-                run(
-                    [
-                        str(release.ROOT / "scripts/verify-macos-release.sh"),
-                        "--binary",
-                        str(binary),
-                        *signature_command,
-                    ],
-                    root,
-                    env,
-                )
+                try:
+                    run(
+                        [
+                            str(release.ROOT / "scripts/verify-macos-release.sh"),
+                            "--binary",
+                            str(binary),
+                            *signature_command,
+                        ],
+                        root,
+                        env,
+                    )
+                except AssertionError:
+                    report_notarization_lookup_errors()
+                    raise
                 print("Verified macOS signature and notarization after npm installation")
             print(
                 f"Verified npm install, CLI, and unchanged native bytes on {platform.platform()}"
