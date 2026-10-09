@@ -435,6 +435,74 @@ impl SourceWatchOverride {
 }
 
 impl<'a> EnvironmentService<'a> {
+    // Caller holds registry exclusion, which fences new leases and dev rebinding.
+    // Resolve ownership without asking whether its controller completed cleanup.
+    pub(crate) fn source_watch_source_root(
+        &self,
+        env: &super::EnvMeta,
+    ) -> Result<Option<PathBuf>, String> {
+        let session = self.source_watch_session(&env.name)?;
+        if session
+            .as_ref()
+            .is_some_and(|session| !session.restore_target_matches(env))
+        {
+            return Ok(None);
+        }
+        let lease = self.observe_source_watch_lease(&env.name)?;
+        if let (Some(session), Some(lease)) = (&session, &lease)
+            && session.lease_id != lease.lease_id
+        {
+            return Ok(None);
+        }
+        let path = source_watch_override_path(&env.name, self.env, self.cwd)?;
+        let watch = if source_watch_metadata_exists(&path)? {
+            let watch = read_json::<SourceWatchOverride>(&path)?;
+            if !is_valid_source_watch_structure(&watch, &env.name)
+                || !lease.as_ref().is_some_and(|lease| {
+                    !lease.lease_id.is_empty()
+                        && source_watch_matches_lease(&watch, &lease.lease_id)
+                })
+            {
+                return Ok(None);
+            }
+            Some(watch)
+        } else {
+            None
+        };
+        if session.as_ref().is_none_or(|session| session.closed)
+            && lease.as_ref().is_none_or(|lease| !lease.held)
+            && watch.is_none()
+        {
+            return Ok(None);
+        }
+        if let Some(dev) = &env.dev {
+            // Registered dev leases must use this source even before override
+            // publication and after it is removed during restoration.
+            let root = fs::canonicalize(dev.execution_source_root()?)
+                .map_err(|error| error.to_string())?;
+            if let Some(watch) = watch {
+                let watched =
+                    fs::canonicalize(watch.repo_root).map_err(|error| error.to_string())?;
+                if crate::store::dev_sources::path_identity(&root)?
+                    != crate::store::dev_sources::path_identity(&watched)?
+                {
+                    return Ok(None);
+                }
+            }
+            return Ok(Some(root));
+        }
+        // A temporary takeover retains its ordinary binding. Only the matching
+        // unfinished generation can establish which source it actually owns.
+        if session.as_ref().is_some_and(|session| !session.closed)
+            && let Some(watch) = watch
+        {
+            return fs::canonicalize(watch.repo_root)
+                .map(Some)
+                .map_err(|error| error.to_string());
+        }
+        Ok(None)
+    }
+
     pub(crate) fn observe_source_watch_lease(
         &self,
         env_name: &str,
