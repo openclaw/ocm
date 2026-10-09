@@ -954,6 +954,246 @@ if (args[0] === 'gateway' && args[1] === 'restart-handoff') {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unfinished_source_session(root: &TestDir, env: &BTreeMap<String, String>, name: &str) -> Value {
+    let meta = ocm::store::get_environment(name, env, root.path()).unwrap();
+    let session = json!({
+        "kind":"ocm-source-foreground-session-v1", "envName":name,
+        "leaseId":"fixture-generation", "envRoot":meta.root,
+        "envCreatedAt":serde_json::to_value(&meta).unwrap()["createdAt"],
+        "processScope":null, "controller":{"pid":std::process::id(),"startedAt":"absent"},
+        "child":null, "childSpawnPending":true, "watching":true,
+        "restoreService":false, "closed":false
+    });
+    let path = ocm::store::source_watch_override_path(name, env, root.path()).unwrap();
+    write_text(&path.with_extension("session"), &session.to_string());
+    write_text(&path.with_extension("lock"), "fixture-generation");
+    session
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn source_session_peer(
+    root: &TestDir,
+    env: &BTreeMap<String, String>,
+    registered: bool,
+    shared_git: bool,
+) -> std::path::PathBuf {
+    let peer = root.child("independent");
+    if shared_git {
+        git(
+            &root.child("source"),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                peer.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+    } else {
+        git(
+            root.path(),
+            &[
+                "clone",
+                root.child("source").to_str().unwrap(),
+                peer.to_str().unwrap(),
+            ],
+        );
+    }
+    let peer = fs::canonicalize(peer).unwrap();
+    fs::create_dir_all(peer.join("extensions")).unwrap();
+    let created = run_ocm(root.path(), env, &["env", "create", "preview"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    if registered {
+        let mut meta = ocm::store::get_environment("preview", env, root.path()).unwrap();
+        meta.dev = Some(ocm::env::EnvDevMeta::Borrowed {
+            source_root: path_string(&peer),
+        });
+        ocm::store::save_environment(meta, env, root.path()).unwrap();
+    }
+    peer
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn source_session_override(root: &TestDir, env: &BTreeMap<String, String>, source: &Path) -> Value {
+    let watch = json!({
+        "kind":"ocm-source-watch-override", "envName":"preview", "repoRoot":source,
+        "watchPid":std::process::id(), "watching":true,
+        "token":"lease:fixture-generation:child", "startedAt":"2026-01-01T00:00:00Z"
+    });
+    let path = ocm::store::source_watch_override_path("preview", env, root.path()).unwrap();
+    write_text(&path, &watch.to_string());
+    watch
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_update_ignores_independent_unfinished_dev_session() {
+    use fs2::FileExt;
+    for mode in [
+        "dead-controller",
+        "inactive",
+        "starting",
+        "before-session",
+        "restoring",
+        "takeover",
+        "job",
+    ] {
+        let root = TestDir::new("source-independent-session");
+        let (env, _) = execution_fixture(&root, false);
+        let peer = source_session_peer(&root, &env, mode != "takeover", false);
+        let mut session = unfinished_source_session(&root, &env, "preview");
+        let path = ocm::store::source_watch_override_path("preview", &env, root.path()).unwrap();
+        if matches!(mode, "inactive" | "starting" | "restoring") {
+            session["kind"] = json!("ocm-source-watch-session");
+            session["childSpawnPending"] = json!(false);
+            write_text(&path.with_extension("session"), &session.to_string());
+        }
+        let lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        if matches!(mode, "starting" | "before-session" | "restoring") {
+            if mode == "restoring" {
+                write_text(&path.with_extension("lock"), "restoring:fixture-generation");
+            }
+            lease.lock_exclusive().unwrap();
+        }
+        if mode == "before-session" {
+            fs::remove_file(path.with_extension("session")).unwrap();
+        }
+        let session_before = fs::read(path.with_extension("session")).ok();
+        let lease_before = fs::read(path.with_extension("lock")).unwrap();
+        if mode == "takeover" {
+            source_session_override(&root, &env, &peer);
+        }
+        let result = if mode == "job" {
+            source_job_result(&root, &env)
+        } else {
+            let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+            assert!(output.status.success(), "{mode}: {}", stderr(&output));
+            serde_json::from_str::<Value>(&stdout(&output)).unwrap()
+        };
+        assert_eq!(result["outcome"], "source-updated", "{mode}: {result}");
+        assert_eq!(
+            fs::read(path.with_extension("session")).ok(),
+            session_before,
+            "{mode}"
+        );
+        assert_eq!(
+            fs::read(path.with_extension("lock")).unwrap(),
+            lease_before,
+            "{mode}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.child("ocm-home/envs/demo/.openclaw/source-witness")).unwrap(),
+            "native-result"
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn source_job_result(root: &TestDir, env: &BTreeMap<String, String>) -> Value {
+    use std::time::{Duration, Instant};
+    let output = run_ocm(root.path(), env, &["upgrade", "job", "start", "demo"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let accepted: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = run_ocm(
+            root.path(),
+            env,
+            &[
+                "upgrade",
+                "job",
+                "status",
+                "demo",
+                "--request-id",
+                accepted["id"].as_str().unwrap(),
+            ],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+        let status: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        if status["state"] == "succeeded" {
+            return status["result"].clone();
+        }
+        assert_eq!(status["state"], "running", "{status}");
+        assert!(Instant::now() < deadline, "source job did not finish");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn source_update_retains_relevant_and_unknown_foreground_protection() {
+    for mode in [
+        "target",
+        "shared-git",
+        "takeover-shared",
+        "takeover-alias",
+        "unknown-takeover",
+        "stale-override",
+        "stale-lease",
+        "stale-env",
+    ] {
+        let root = TestDir::new("source-relevant-session");
+        let (env, _) = execution_fixture(&root, false);
+        let registered = matches!(mode, "shared-git" | "stale-env");
+        let peer = source_session_peer(&root, &env, registered, mode == "shared-git");
+        let name = if mode == "target" { "demo" } else { "preview" };
+        let mut session = unfinished_source_session(&root, &env, name);
+        let path = ocm::store::source_watch_override_path(name, &env, root.path()).unwrap();
+        match mode {
+            "takeover-shared" | "takeover-alias" => {
+                fs::create_dir_all(root.child("source/extensions")).unwrap();
+                // Keep the target clean while allowing valid source metadata.
+                write_text(&root.child("source/.git/info/exclude"), "extensions/\n");
+                let source = if mode == "takeover-alias" {
+                    let alias = root.child("source-alias");
+                    std::os::unix::fs::symlink(root.child("source"), &alias).unwrap();
+                    alias
+                } else {
+                    root.child("source")
+                };
+                source_session_override(&root, &env, &source);
+            }
+            "stale-override" => {
+                let mut watch = source_session_override(&root, &env, &peer);
+                watch["token"] = json!("lease:old-generation:child");
+                write_text(&path, &watch.to_string());
+            }
+            "stale-lease" => {
+                source_session_override(&root, &env, &peer);
+                write_text(&path.with_extension("lock"), "new-generation");
+            }
+            "stale-env" => {
+                session["envCreatedAt"] = json!("2025-01-01T00:00:00Z");
+                write_text(&path.with_extension("session"), &session.to_string());
+            }
+            _ => {}
+        }
+        let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+        assert!(!output.status.success(), "{mode}: {}", stdout(&output));
+        assert!(
+            stderr(&output).contains("source controller"),
+            "{mode}: {}",
+            stderr(&output)
+        );
+        assert!(
+            !root.child("native.json.calls").exists(),
+            "{mode}: native source command ran"
+        );
+        assert!(
+            !root.child("ocm-home/snapshots/demo").exists(),
+            "{mode}: checkpoint created"
+        );
+        let retained: Value =
+            serde_json::from_slice(&fs::read(path.with_extension("session")).unwrap()).unwrap();
+        assert_eq!(retained, session, "{mode}");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn source_current_and_legacy_native_support_leave_state_untouched() {
     for supported in [true, false] {

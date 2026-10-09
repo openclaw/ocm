@@ -522,7 +522,9 @@ Quoted characters such as `#` and `&` are recognized as path data, and single qu
 Backslashes outside single quotes, active substitutions, and unquoted shell operators remain opaque.
 Recognizing literal words for inspection does not change how launcher commands execute.
 This requires native source artifact observations from `openclaw update status --json`; older checkouts without that observation remain `local-command`, with support reported as unknown.
-OCM refuses dirty or unverified checkout status, known shared users, and active or unresolved foreground source ownership before source mutation.
+OCM refuses dirty or unverified checkout status, known shared users, and relevant active or unresolved foreground source ownership before source mutation.
+An unfinished session in another environment does not block the update when its recorded source is provably independent of the checkout and its Git metadata.
+The target's own unfinished ownership still blocks updates, and temporary takeovers with unknown or mismatched source generations remain protected.
 Source execution also refuses assume-unchanged or skip-worktree index entries, which can hide modified tracked files from ordinary Git status.
 Native update activity or unresolved run status must also be settled before OCM captures a checkpoint or changes the service.
 A no-op requires a current target and verified native artifacts; a running service also requires matching Gateway readiness, build identity, and applied launch settings.

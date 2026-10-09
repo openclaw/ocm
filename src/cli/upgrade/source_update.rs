@@ -86,6 +86,24 @@ fn summary(name: &str, launcher: &str, source: SourceInspection) -> UpgradeEnvSu
     }
 }
 
+fn source_footprints_overlap(
+    footprint: &crate::store::dev_sources::SourceFootprint,
+    watched: &Path,
+) -> Result<bool, String> {
+    let mut other = crate::store::dev_sources::inspect_source_footprint(watched)?;
+    other.content_roots.insert(watched.to_path_buf());
+    for left in footprint.entries.iter().chain(&footprint.content_roots) {
+        for right in other.entries.iter().chain(&other.content_roots) {
+            if crate::store::dev_sources::contains_existing(left, right)?
+                || crate::store::dev_sources::contains_existing(right, left)?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 impl Cli {
     fn admit_source_update(&self, name: &str, source: &SourceInspection) -> Result<(), String> {
         if source.working_tree_clean != Some(true) || !source.shared_environments.is_empty() {
@@ -112,40 +130,54 @@ impl Cli {
         {
             return Err("cannot establish source cleanliness with unreadable, assume-unchanged, or skip-worktree index entries; inspect the checkout before upgrading".to_string());
         }
-        let footprint = crate::store::dev_sources::inspect_source_footprint(root)?;
+        let mut footprint = crate::store::dev_sources::inspect_source_footprint(root)?;
+        footprint.content_roots.insert(root.to_path_buf());
         for env in self.environment_service().list()? {
             // A temporary takeover keeps its old binding, so its live source
             // cannot be inferred from launcher/runtime registration alone.
             if env.name != name {
                 let service = self.environment_service();
-                match service.observe_source_watch(&env.name)? {
-                    crate::env::SourceWatchState::Active(watch) => {
-                        let watched = fs::canonicalize(&watch.repo_root).map_err(|error| {
-                            format!("cannot inspect source owned by env {:?}: {error}", env.name)
-                        })?;
-                        if watched.starts_with(root) || root.starts_with(&watched) {
+                let owned_source = service.source_watch_source_root(&env)?;
+                let independent = owned_source
+                    .as_deref()
+                    .map(|watched| {
+                        source_footprints_overlap(&footprint, watched).map(|overlap| !overlap)
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                if !independent {
+                    match service.observe_source_watch(&env.name)? {
+                        crate::env::SourceWatchState::Active(watch) => {
+                            let watched = fs::canonicalize(&watch.repo_root).map_err(|error| {
+                                format!(
+                                    "cannot inspect source owned by env {:?}: {error}",
+                                    env.name
+                                )
+                            })?;
+                            if source_footprints_overlap(&footprint, &watched)? {
+                                return Err(format!(
+                                    "cannot update source for env {name:?}: env {:?} has a foreground source session on this checkout",
+                                    env.name
+                                ));
+                            }
+                        }
+                        crate::env::SourceWatchState::Starting
+                        | crate::env::SourceWatchState::Restoring => {
                             return Err(format!(
-                                "cannot update source for env {name:?}: env {:?} has a foreground source session on this checkout",
+                                "cannot establish source isolation while env {:?} is starting or restoring its dev session",
                                 env.name
                             ));
                         }
-                    }
-                    crate::env::SourceWatchState::Starting
-                    | crate::env::SourceWatchState::Restoring => {
-                        return Err(format!(
-                            "cannot establish source isolation while env {:?} is starting or restoring its dev session",
-                            env.name
-                        ));
-                    }
-                    crate::env::SourceWatchState::Inactive => {
-                        if service
-                            .source_watch_session(&env.name)?
-                            .is_some_and(|session| !session.closed)
-                        {
-                            return Err(format!(
-                                "cannot establish source isolation while env {:?} has unfinished dev ownership",
-                                env.name
-                            ));
+                        crate::env::SourceWatchState::Inactive => {
+                            if service
+                                .source_watch_session(&env.name)?
+                                .is_some_and(|session| !session.closed)
+                            {
+                                return Err(format!(
+                                    "cannot establish source isolation while env {:?} has unfinished dev ownership",
+                                    env.name
+                                ));
+                            }
                         }
                     }
                 }
