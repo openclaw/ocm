@@ -53,11 +53,12 @@ use crate::store::{
     with_prepared_dev_source, write_json,
 };
 
-const UPGRADE_DRY_RUN_NOTE: &str = concat!(
-    "dry run: no runtime, env, service, or snapshot changed; ",
-    "candidate preparation and validation not run; config migration not run; ",
-    "use ocm upgrade simulate for isolated checks"
-);
+pub(super) const UPGRADE_DRY_RUN_NOTES: [&str; 4] = [
+    "dry run: no runtime, env, service, or snapshot changed",
+    "candidate preparation and validation not run",
+    "config migration not run",
+    "use ocm upgrade simulate for isolated checks",
+];
 
 struct UpgradeCommandLocks<'a> {
     environment: &'a EnvironmentOperationLock,
@@ -2598,7 +2599,7 @@ impl Cli {
                     ),
                     snapshot_id: None,
                     rollback: None,
-                    note: Some(UPGRADE_DRY_RUN_NOTE.to_string()),
+                    note: Some(UPGRADE_DRY_RUN_NOTES.join("; ")),
                 });
             }
             let runtime_names = if target.is_named_runtime() {
@@ -2946,7 +2947,7 @@ impl Cli {
                     service_action: service_action_for_dry_run(service.as_ref(), false, true),
                     snapshot_id: None,
                     rollback: None,
-                    note: Some(UPGRADE_DRY_RUN_NOTE.to_string()),
+                    note: Some(UPGRADE_DRY_RUN_NOTES.join("; ")),
                 });
             }
             let mut timings = UpgradeTimingRecorder::new();
@@ -3250,7 +3251,7 @@ impl Cli {
                 service_action: service_action_for_dry_run(service.as_ref(), false, true),
                 snapshot_id: None,
                 rollback: None,
-                note: Some(UPGRADE_DRY_RUN_NOTE.to_string()),
+                note: Some(UPGRADE_DRY_RUN_NOTES.join("; ")),
             });
         }
         let mut timings = UpgradeTimingRecorder::new();
@@ -3586,7 +3587,7 @@ impl Cli {
                 service_action: service_action_for_dry_run(service.as_ref(), true, true),
                 snapshot_id: None,
                 rollback: None,
-                note: Some(UPGRADE_DRY_RUN_NOTE.to_string()),
+                note: Some(UPGRADE_DRY_RUN_NOTES.join("; ")),
             });
         }
 
