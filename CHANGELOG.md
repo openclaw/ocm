@@ -43,6 +43,7 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Disclose skipped candidate preparation and validation in upgrade dry-run text and JSON, including batch previews, and point operators to isolated simulation. Thanks @shakkernerd (#124).
 - Limit runtime metadata to 64 MiB of decoded JSON, including gzip expansion, and preserve installed runtime files and metadata when an oversized update source is rejected. Thanks @SebTardif (#117).
 - Preserve newer Stop and Uninstall requests after foreground development sessions, and refuse foreground startup while a superseding request leaves the background Gateway running or requested. Thanks @shakkernerd (#299, #310).
 - Keep runtime binding admission isolated through upgrade finalization and rollback so a newly attached sibling cannot receive another environment's uncheckpointed downgrade. Thanks @shakkernerd (#296, #309).

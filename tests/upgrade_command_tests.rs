@@ -2837,6 +2837,13 @@ fn upgrade_manifest_backed_runtime_repairs_config_before_candidate_validation() 
     let preview: Value = serde_json::from_str(&stdout(&preview)).unwrap();
     assert_eq!(preview["runtimeReleaseVersion"], target_version);
     assert_eq!(preview["runtimeReleaseChannel"], "stable");
+    assert!(
+        preview["note"]
+            .as_str()
+            .unwrap()
+            .contains("candidate preparation and validation not run"),
+        "{preview}"
+    );
     let failed = run_ocm(&cwd, &env, &["upgrade", "demo", "--json"]);
     assert!(!failed.status.success(), "{}", stdout(&failed));
     let failed: Value = serde_json::from_str(&stdout(&failed)).unwrap();
@@ -2894,7 +2901,7 @@ fn upgrade_dry_run_reports_without_changing_runtime_or_creating_snapshot() {
         old_integrity
     );
     let packument_server =
-        TestHttpServer::serve_bytes_times("/openclaw", "application/json", packument.as_bytes(), 2);
+        TestHttpServer::serve_bytes_times("/openclaw", "application/json", packument.as_bytes(), 4);
 
     let mut env = ocm_env(&root);
     install_fake_node_and_npm(&root, &mut env, "22.22.3");
@@ -2911,7 +2918,30 @@ fn upgrade_dry_run_reports_without_changing_runtime_or_creating_snapshot() {
     let output = stdout(&dry_run);
     assert!(output.contains("outcome=would-update"), "{output}");
     assert!(output.contains("dry run"), "{output}");
+    assert!(
+        output.contains("candidate preparation and validation not run"),
+        "{output}"
+    );
+    assert!(output.contains("upgrade simulate"), "{output}");
     assert!(!output.contains("snapshot="), "{output}");
+
+    let mut pretty_env = env.clone();
+    pretty_env.insert("COLUMNS".to_string(), "80".to_string());
+    for target in ["demo", "--all"] {
+        let pretty = run_ocm(
+            &cwd,
+            &pretty_env,
+            &["upgrade", target, "--dry-run", "--color", "always"],
+        );
+        assert!(pretty.status.success(), "{}", stderr(&pretty));
+        let output = stdout(&pretty);
+        assert!(output.contains('┌'), "{output}");
+        assert!(
+            output.contains("candidate preparation and validation not run"),
+            "{output}"
+        );
+        assert!(output.contains("config migration not run"), "{output}");
+    }
 
     let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
     assert!(runtime.status.success(), "{}", stderr(&runtime));
@@ -7242,8 +7272,45 @@ fn upgrade_batch_dry_run_creates_no_journal_snapshot_or_runtime_change() {
     assert!(batch.status.success(), "{}", stderr(&batch));
     let summary: Value = serde_json::from_str(&stdout(&batch)).unwrap();
     assert_eq!(summary["outcome"], "dry-run");
+    for result in summary["results"].as_array().unwrap() {
+        assert!(
+            result["note"]
+                .as_str()
+                .unwrap()
+                .contains("candidate preparation and validation not run"),
+            "{result}"
+        );
+    }
     assert!(summary["journalPath"].is_null());
     assert!(!root.child("ocm-home/upgrade-batches").exists());
+
+    let mut pretty_env = env.clone();
+    pretty_env.insert("COLUMNS".to_string(), "80".to_string());
+    for args in [
+        vec!["upgrade", "alpha", "--runtime", "new", "--dry-run"],
+        vec![
+            "upgrade",
+            "batch",
+            "--runtime",
+            "new",
+            "--envs",
+            "alpha,beta",
+            "--dry-run",
+        ],
+    ] {
+        let mut args = args;
+        args.extend(["--color", "always"]);
+        let pretty = run_ocm(&cwd, &pretty_env, &args);
+        assert!(pretty.status.success(), "{}", stderr(&pretty));
+        let output = stdout(&pretty);
+        assert!(output.contains('┌'), "{output}");
+        assert!(
+            output.contains("candidate preparation and validation not run"),
+            "{output}"
+        );
+        assert!(output.contains("config migration not run"), "{output}");
+        assert!(output.contains("upgrade simulate"), "{output}");
+    }
 
     let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "--all", "--json"]);
     assert!(snapshots.status.success(), "{}", stderr(&snapshots));

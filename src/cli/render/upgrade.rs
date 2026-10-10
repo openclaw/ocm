@@ -1,6 +1,6 @@
 use crate::cli::upgrade::{
-    UpgradeBatchSummary, UpgradeEnvSummary, UpgradeFleetBatchSummary, UpgradeRollbackSummary,
-    UpgradeSimulationBatchSummary, UpgradeSimulationSummary,
+    UPGRADE_DRY_RUN_NOTES, UpgradeBatchSummary, UpgradeEnvSummary, UpgradeFleetBatchSummary,
+    UpgradeRollbackSummary, UpgradeSimulationBatchSummary, UpgradeSimulationSummary,
 };
 use crate::infra::terminal::{
     Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table, terminal_width,
@@ -139,11 +139,15 @@ pub fn upgrade_env(
 
     if let Some(note) = summary.note.as_deref() {
         lines.push(String::new());
-        lines.extend(render_key_value_card(
-            "Next",
-            &[KeyValueRow::muted("Note", note)],
-            profile.color,
-        ));
+        if is_upgrade_preview(summary) {
+            lines.extend(upgrade_preview_notice(profile));
+        } else {
+            lines.extend(render_key_value_card(
+                "Next",
+                &[KeyValueRow::muted("Note", note)],
+                profile.color,
+            ));
+        }
     } else if matches!(
         summary.outcome.as_str(),
         "pinned" | "local-command" | "manual-runtime"
@@ -310,6 +314,10 @@ pub fn upgrade_batch(
         ],
         profile.color,
     ));
+    if summary.results.iter().any(is_upgrade_preview) {
+        lines.push(String::new());
+        lines.extend(upgrade_preview_notice(profile));
+    }
     for result in &summary.results {
         if let Some(source) = &result.source {
             let rows = source_fields(source)
@@ -657,6 +665,18 @@ pub fn upgrade_simulation_batch(
     }
 
     lines
+}
+
+fn is_upgrade_preview(summary: &UpgradeEnvSummary) -> bool {
+    matches!(summary.outcome.as_str(), "would-switch" | "would-update")
+}
+
+fn upgrade_preview_notice(profile: RenderProfile) -> Vec<String> {
+    // Essential preview limits must survive narrow cards and omitted table columns.
+    UPGRADE_DRY_RUN_NOTES
+        .iter()
+        .map(|note| paint(note, Tone::Warning, profile.color))
+        .collect()
 }
 
 fn upgrade_env_raw(summary: &UpgradeEnvSummary) -> Vec<String> {
