@@ -233,9 +233,7 @@ mod tests {
             root.path(),
         )
         .unwrap();
-        let socket = (30000..30100)
-            .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
-            .unwrap();
+        let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = u32::from(socket.local_addr().unwrap().port());
         drop(socket);
         // Seed a high retained port so the Gateway allocation control would
