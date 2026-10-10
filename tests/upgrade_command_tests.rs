@@ -2837,6 +2837,13 @@ fn upgrade_manifest_backed_runtime_repairs_config_before_candidate_validation() 
     let preview: Value = serde_json::from_str(&stdout(&preview)).unwrap();
     assert_eq!(preview["runtimeReleaseVersion"], target_version);
     assert_eq!(preview["runtimeReleaseChannel"], "stable");
+    assert!(
+        preview["note"]
+            .as_str()
+            .unwrap()
+            .contains("candidate preparation and validation not run"),
+        "{preview}"
+    );
     let failed = run_ocm(&cwd, &env, &["upgrade", "demo", "--json"]);
     assert!(!failed.status.success(), "{}", stdout(&failed));
     let failed: Value = serde_json::from_str(&stdout(&failed)).unwrap();
@@ -2911,6 +2918,11 @@ fn upgrade_dry_run_reports_without_changing_runtime_or_creating_snapshot() {
     let output = stdout(&dry_run);
     assert!(output.contains("outcome=would-update"), "{output}");
     assert!(output.contains("dry run"), "{output}");
+    assert!(
+        output.contains("candidate preparation and validation not run"),
+        "{output}"
+    );
+    assert!(output.contains("upgrade simulate"), "{output}");
     assert!(!output.contains("snapshot="), "{output}");
 
     let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
@@ -7242,6 +7254,15 @@ fn upgrade_batch_dry_run_creates_no_journal_snapshot_or_runtime_change() {
     assert!(batch.status.success(), "{}", stderr(&batch));
     let summary: Value = serde_json::from_str(&stdout(&batch)).unwrap();
     assert_eq!(summary["outcome"], "dry-run");
+    for result in summary["results"].as_array().unwrap() {
+        assert!(
+            result["note"]
+                .as_str()
+                .unwrap()
+                .contains("candidate preparation and validation not run"),
+            "{result}"
+        );
+    }
     assert!(summary["journalPath"].is_null());
     assert!(!root.child("ocm-home/upgrade-batches").exists());
 

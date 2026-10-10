@@ -510,6 +510,13 @@ ocm upgrade mira
 
 This is the normal command when `mira` tracks a channel like `stable` or `beta`.
 Use `--dry-run` to preview the transaction without writing snapshots, runtimes, envs, or services.
+This is a plan, not a readiness check: candidate preparation, configuration
+migration, and candidate validation do not run. The text output and JSON `note`
+identify these limits, including for batch previews. A `would-switch` or
+`would-update` outcome can still be followed by a preparation failure during the
+real upgrade. Use `ocm upgrade simulate mira --to <version|channel|local-repo>`
+for deeper checks against an isolated copy; simulation does not guarantee a
+successful live upgrade.
 
 In `--json` output, `runtimeReleaseVersion` and `runtimeReleaseChannel` describe
 the resolved target even when preparation fails or the upgrade rolls back.
