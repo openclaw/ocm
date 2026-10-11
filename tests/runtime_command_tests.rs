@@ -4243,6 +4243,40 @@ fn runtime_mutations_preserve_bound_aliases_and_allow_unrelated_or_idle_aliases(
     assert!(peer_after.status.success(), "{}", stderr(&peer_after));
     assert_eq!(stdout(&peer_after), stdout(&peer_before));
 
+    // A completely external cycle is unhealthy, but has no managed owner.
+    std::os::unix::fs::symlink("peer", &original).unwrap();
+    std::os::unix::fs::symlink("openclaw", original.with_file_name("peer")).unwrap();
+    let other = run(&["runtime", "install", "other", "--path", &replacement_path]);
+    assert!(other.status.success(), "{}", stderr(&other));
+    let remove_other = run(&["runtime", "remove", "other"]);
+    assert!(remove_other.status.success(), "{}", stderr(&remove_other));
+    let invalid_binding = run(&["env", "create", "invalid", "--runtime", "stale"]);
+    assert!(!invalid_binding.status.success());
+    let peer_after = run(&["env", "show", "peer", "--json"]);
+    assert!(peer_after.status.success(), "{}", stderr(&peer_after));
+    assert_eq!(stdout(&peer_after), stdout(&peer_before));
+
+    // A cycle inside the managed tree must still protect that owner.
+    fs::remove_file(executable).unwrap();
+    std::os::unix::fs::symlink("cycle", executable).unwrap();
+    let managed_cycle = executable.with_file_name("cycle");
+    std::os::unix::fs::symlink("openclaw", &managed_cycle).unwrap();
+    let remove = run(&["runtime", "remove", "backing"]);
+    assert!(!remove.status.success());
+    assert!(
+        stderr(&remove).contains("still used by environment(s): \"demo\""),
+        "{}",
+        stderr(&remove)
+    );
+    assert_eq!(fs::read_link(executable).unwrap(), Path::new("cycle"));
+    assert_eq!(
+        fs::read(runtime_meta_path("backing", &env, &cwd).unwrap()).unwrap(),
+        runtime_before
+    );
+    fs::remove_file(executable).unwrap();
+    fs::remove_file(managed_cycle).unwrap();
+    write_executable_script(executable, std::str::from_utf8(&original_bytes).unwrap());
+
     let clear = run(&["env", "set-runtime", "demo", "none"]);
     assert!(clear.status.success(), "{}", stderr(&clear));
     let replace = run(&[
