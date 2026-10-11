@@ -27,11 +27,56 @@ struct SourceIdentity {
     preparation_paths: BTreeSet<PathBuf>,
 }
 
+pub(super) struct RegistrationPath {
+    // None is a completely observed terminal cycle, never unknown ownership.
+    pub(super) location: Option<PathBuf>,
+    pub(super) entries: BTreeSet<PathBuf>,
+}
+
+pub(super) fn is_symlink_loop(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    let code = libc::ELOOP;
+    #[cfg(windows)]
+    let code = windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME as i32;
+    #[cfg(any(unix, windows))]
+    return error.raw_os_error() == Some(code);
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 pub(super) fn registration_path(path: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), String> {
+    let observed = inspect_registration_path_inner(path, false)?;
+    let location = observed
+        .location
+        .ok_or("dev source contains a symlink cycle")?;
+    Ok((location, observed.entries))
+}
+
+pub(super) fn inspect_registration_path(path: &Path) -> Result<RegistrationPath, String> {
+    inspect_registration_path_inner(path, true)
+}
+
+fn inspect_registration_path_inner(
+    path: &Path,
+    observe_cycles: bool,
+) -> Result<RegistrationPath, String> {
     let mut pending = path.to_path_buf();
     let mut entries = BTreeSet::new();
-    loop {
+    let mut targets: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut traversals = 0;
+    'resolve: loop {
+        traversals += 1;
+        if traversals > 256 {
+            return Err(
+                "cannot establish registration path ownership within the symlink resolution limit"
+                    .to_string(),
+            );
+        }
         let mut existing = pending.as_path();
+        let mut unresolved_loop = false;
         loop {
             match fs::canonicalize(existing) {
                 Ok(resolved) => {
@@ -44,44 +89,71 @@ pub(super) fn registration_path(path: &Path) -> Result<(PathBuf, BTreeSet<PathBu
                     } else {
                         resolved.join(suffix)
                     };
-                    return Ok((location, entries));
+                    if unresolved_loop && !suffix.as_os_str().is_empty() {
+                        // An existing prefix can collapse enough links to make
+                        // progress below the kernel limit. The suffix is not a
+                        // missing location: finish observing it before returning.
+                        pending = location;
+                        continue 'resolve;
+                    }
+                    if let Some((_, suffix)) = targets.pop() {
+                        pending = if suffix.as_os_str().is_empty() {
+                            location
+                        } else {
+                            location.join(suffix)
+                        };
+                        continue 'resolve;
+                    }
+                    return Ok(RegistrationPath {
+                        location: Some(location),
+                        entries,
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if observe_cycles && is_symlink_loop(&error) => {
+                    unresolved_loop = true;
+                }
                 Err(error) => return Err(error.to_string()),
             }
-            // A registered symlink root may outlive its target during restore.
-            // Follow only this known link, retaining its own entry as a dependency.
+            // Follow the known link target before consuming the path suffix.
+            // This retains missing locations and terminal-cycle entries without
+            // requiring the executable to be healthy for raw binding custody.
             match fs::read_link(existing) {
                 Ok(target) => {
                     let parent = existing.parent().ok_or("source link has no parent")?;
                     entries.extend(existing_source_path_entries(parent)?);
-                    let entry = fs::canonicalize(parent)
-                        .map_err(|error| error.to_string())?
-                        .join(existing.file_name().ok_or("source link has no name")?);
-                    if !entries.insert(entry) {
-                        return Err("dev source contains a symlink cycle".to_string());
+                    let parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+                    let entry = parent.join(existing.file_name().ok_or("source link has no name")?);
+                    entries.insert(entry.clone());
+                    // Only recursion through an unfinished target is a cycle.
+                    // Reusing a resolved directory link in a later suffix is valid.
+                    if targets.iter().any(|(active, _)| active == &entry) {
+                        return Ok(RegistrationPath {
+                            location: None,
+                            entries,
+                        });
                     }
-                    let target = if target.is_absolute() {
+                    targets.push((
+                        entry,
+                        pending
+                            .strip_prefix(existing)
+                            .map_err(|error| error.to_string())?
+                            .to_path_buf(),
+                    ));
+                    pending = if target.is_absolute() {
                         target
                     } else {
                         parent.join(target)
                     };
-                    let suffix = pending
-                        .strip_prefix(existing)
-                        .map_err(|error| error.to_string())?;
-                    pending = if suffix.as_os_str().is_empty() {
-                        target
-                    } else {
-                        target.join(suffix)
-                    };
-                    break;
+                    continue 'resolve;
                 }
                 Err(error)
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-                    ) =>
+                    ) || (observe_cycles && is_symlink_loop(&error)) =>
                 {
+                    unresolved_loop |= is_symlink_loop(&error);
                     existing = existing
                         .parent()
                         .ok_or("dev source has no existing ancestor")?;

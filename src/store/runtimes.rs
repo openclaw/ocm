@@ -2240,25 +2240,27 @@ impl RuntimeBindingGuard {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeBindingDependencies {
     pub(crate) owners: BTreeSet<String>,
-    binary: PathBuf,
+    binary: Option<PathBuf>,
     entries: BTreeMap<PathBuf, (u64, u64)>,
 }
 
 // Query only the executable path and its symlink entries, never packages or a
-// reverse registration graph. Missing locations still belong to their managed
-// owner while it stages or recovers its tree.
+// reverse registration graph. Missing locations and terminal cycles retain
+// their observed owners; validated callers separately check executable health.
 pub(crate) fn runtime_binding_dependencies(
     runtime: &RuntimeMeta,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<RuntimeBindingDependencies, String> {
     use super::dev_sources::{path_identity, projected_path_relative};
-    let (binary, entries) =
-        super::dev_registration::registration_path(Path::new(&runtime.binary_path))?;
+    let observed =
+        super::dev_registration::inspect_registration_path(Path::new(&runtime.binary_path))?;
+    let binary = observed.location;
+    let entries = observed.entries;
     let root = super::layout::resolve_store_paths(env, cwd)?.runtimes_dir;
     let (root, _) = super::dev_registration::registration_path(&root)?;
     let mut owners = BTreeSet::from([validate_name(&runtime.name, "Runtime name")?]);
-    for entry in entries.iter().chain(std::iter::once(&binary)) {
+    for entry in entries.iter().chain(binary.iter()) {
         if let Some(relative) = projected_path_relative(&root, entry)?
             && let Some(Component::Normal(owner)) = relative.components().next()
             && let Some(owner) = owner.to_str()
@@ -2268,8 +2270,11 @@ pub(crate) fn runtime_binding_dependencies(
                 && owner.ends_with(".json")
                 && match fs::metadata(entry) {
                     Ok(metadata) => !metadata.is_dir(),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        // A displaced .json entry can be either a managed tree
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            || super::dev_registration::is_symlink_loop(&error) =>
+                    {
+                        // A displaced or cyclic .json entry can be either a managed tree
                         // (including a directory symlink) or a registration.
                         // Keep both possible owners until its type is known.
                         owners.insert(validate_name(owner, "Runtime name")?);
@@ -3521,6 +3526,78 @@ mod tests {
             drop(writer);
             drop(super::try_lock_runtime_binding("selected", &env, cwd).unwrap());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_binding_cycles_retain_only_observed_owners_and_keep_unknown_errors() {
+        let (root, env, binary) = binding_fixture();
+        let cwd = root.path();
+        let first = cwd.join("first");
+        let second = cwd.join("second");
+        std::os::unix::fs::symlink(&second, &first).unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+        let mut meta = super::get_runtime("selected", &env, cwd).unwrap();
+        meta.binary_path = first.display().to_string();
+        super::write_json(
+            &super::runtime_meta_path("selected", &env, cwd).unwrap(),
+            &meta,
+        )
+        .unwrap();
+        let external = super::runtime_binding_dependencies(&meta, &env, cwd).unwrap();
+        assert!(external.binary.is_none());
+        assert_eq!(external.owners, BTreeSet::from(["selected".into()]));
+        assert!(super::super::dev_registration::registration_path(&first).is_err());
+        let guard = super::try_lock_runtime_binding("selected", &env, cwd).unwrap();
+        drop(super::try_lock_runtime_mutation("backing", &env, cwd).unwrap());
+        drop(guard);
+
+        // The registered path begins outside the store but the cycle enters it.
+        std::fs::remove_file(&second).unwrap();
+        std::os::unix::fs::symlink(&binary, &second).unwrap();
+        std::fs::remove_file(&binary).unwrap();
+        std::os::unix::fs::symlink(&first, &binary).unwrap();
+        let managed = super::runtime_binding_dependencies(&meta, &env, cwd).unwrap();
+        assert!(managed.binary.is_none());
+        assert_eq!(
+            managed.owners,
+            BTreeSet::from(["selected".into(), "backing".into()])
+        );
+        let writer = super::try_lock_runtime_mutation("backing", &env, cwd).unwrap();
+        assert!(super::try_lock_runtime_binding("selected", &env, cwd).is_err());
+        drop(writer);
+        let guard = super::try_lock_runtime_binding("selected", &env, cwd).unwrap();
+        assert!(super::try_lock_runtime_mutation("backing", &env, cwd).is_err());
+        drop(guard);
+
+        // Recursive expansion need not repeat the entire unresolved path.
+        std::fs::remove_file(&first).unwrap();
+        std::os::unix::fs::symlink(first.join("child"), &first).unwrap();
+        let growing = super::runtime_binding_dependencies(&meta, &env, cwd).unwrap();
+        assert!(growing.binary.is_none());
+        assert_eq!(growing.owners, BTreeSet::from(["selected".into()]));
+
+        // Non-loop resolution failures remain errors rather than empty owners.
+        let not_directory = cwd.join("file");
+        std::fs::write(&not_directory, "file").unwrap();
+        meta.binary_path = not_directory.join("child").display().to_string();
+        assert!(super::runtime_binding_dependencies(&meta, &env, cwd).is_err());
+
+        // Repeated uses of one directory link can consume their suffix and
+        // terminate, even when the original spelling exceeds kernel depth.
+        let repeated = cwd.join("again");
+        std::os::unix::fs::symlink(".", &repeated).unwrap();
+        let mut path = cwd.to_path_buf();
+        for _ in 0..80 {
+            path.push("again");
+        }
+        path.push("file");
+        let observed = super::super::dev_registration::inspect_registration_path(&path).unwrap();
+        assert_eq!(
+            observed.location,
+            Some(std::fs::canonicalize(not_directory).unwrap())
+        );
+        assert!(super::super::dev_registration::registration_path(&path).is_err());
     }
 
     #[test]
