@@ -720,12 +720,8 @@ fn prepare_env_snapshot_restore_with_binding(
         // admission through publication or its existing restore compensation.
         let _admitted =
             super::envs::lock_environment_runtime_binding(&restored, runtime_guard, env, cwd)?;
-        let runtime_guard = runtime_guard.filter(|guard| {
-            restored
-                .default_runtime
-                .as_deref()
-                .is_some_and(|runtime| guard.check(runtime, env, cwd).is_ok())
-        });
+        // Retain an admitted backing owner as well as a direct-name owner for
+        // the binding writer's second admission. It checks each covered name.
         let mut renamed = false;
         if !independent.is_empty() {
             super::checkpoint_scope::replace_owned_entries(

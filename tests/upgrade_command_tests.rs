@@ -4148,6 +4148,15 @@ fn upgrade_fails_runtime_preparation_before_cutover() {
 
 #[test]
 fn upgrade_rolls_back_when_post_upgrade_version_verification_fails() {
+    assert_post_upgrade_verification_rollback(false);
+}
+
+#[test]
+fn upgrade_rolls_back_to_alias_with_its_backing_runtime_guard() {
+    assert_post_upgrade_verification_rollback(true);
+}
+
+fn assert_post_upgrade_verification_rollback(alias: bool) {
     let root = TestDir::new("upgrade-version-verification-rollback");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -4203,6 +4212,18 @@ fn upgrade_rolls_back_when_post_upgrade_version_verification_fails() {
     let start = run_ocm(&cwd, &env, &["start", "demo", "--no-service"]);
     assert!(start.status.success(), "{}", stderr(&start));
 
+    if alias {
+        let stable = ocm::store::get_runtime("stable", &env, &cwd).unwrap();
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", "alias", "--path", &stable.binary_path],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let bind = run_ocm(&cwd, &env, &["env", "set-runtime", "demo", "alias"]);
+        assert!(bind.status.success(), "{}", stderr(&bind));
+    }
+
     let state_root = root.child("ocm-home/envs/demo/.openclaw");
     let plugin_payloads = [
         (
@@ -4224,7 +4245,12 @@ fn upgrade_rolls_back_when_post_upgrade_version_verification_fails() {
         fs::write(path, contents).unwrap();
     }
 
-    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo"]);
+    let args = if alias {
+        vec!["upgrade", "demo", "--channel", "stable"]
+    } else {
+        vec!["upgrade", "demo"]
+    };
+    let upgrade = run_ocm(&cwd, &env, &args);
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
     let output = stdout(&upgrade);
     assert!(output.contains("outcome=rolled-back"), "{output}");
@@ -4238,6 +4264,16 @@ fn upgrade_rolls_back_when_post_upgrade_version_verification_fails() {
     assert!(runtime.status.success(), "{}", stderr(&runtime));
     let runtime_json: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
     assert_eq!(runtime_json["releaseVersion"], "2026.3.24");
+    assert_eq!(
+        ocm::store::get_environment("demo", &env, &cwd)
+            .unwrap()
+            .default_runtime
+            .as_deref(),
+        Some(if alias { "alias" } else { "stable" })
+    );
+    let restored = run_ocm(&cwd, &env, &["@demo", "--", "--version"]);
+    assert!(restored.status.success(), "{}", stderr(&restored));
+    assert_eq!(stdout(&restored).trim(), "2026.3.24");
     for (path, contents) in plugin_payloads {
         assert_eq!(
             fs::read_to_string(state_root.join(path)).unwrap(),

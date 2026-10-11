@@ -2266,9 +2266,15 @@ pub(crate) fn runtime_binding_dependencies(
             // Registrations and managed trees share the same mutation owner.
             let registration_file = relative.components().count() == 1
                 && owner.ends_with(".json")
-                && match fs::symlink_metadata(entry) {
+                && match fs::metadata(entry) {
                     Ok(metadata) => !metadata.is_dir(),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // A displaced .json entry can be either a managed tree
+                        // (including a directory symlink) or a registration.
+                        // Keep both possible owners until its type is known.
+                        owners.insert(validate_name(owner, "Runtime name")?);
+                        true
+                    }
                     Err(error) => return Err(error.to_string()),
                 };
             let owner = if registration_file {
@@ -3448,10 +3454,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn runtime_binding_tracks_symlink_entries_and_targets_without_prefix_neighbors() {
+        for directory_link in [false, true] {
+            assert_binding_path_owners(directory_link);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_binding_path_owners(directory_link: bool) {
         let (root, env, binary) = binding_fixture();
         let cwd = root.path();
         let backing = cwd.join("store/runtimes/backing.json");
         std::fs::rename(cwd.join("store/runtimes/backing"), &backing).unwrap();
+        let moved = cwd.join("moved-tree");
+        if directory_link {
+            std::fs::rename(&backing, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &backing).unwrap();
+        }
         let binary = backing.join(
             binary
                 .strip_prefix(cwd.join("store/runtimes/backing"))
@@ -3494,6 +3512,15 @@ mod tests {
                 .owners,
             dependencies.owners
         );
+        if directory_link {
+            std::fs::remove_dir_all(&moved).unwrap();
+            let missing = super::runtime_binding_dependencies(&meta, &env, cwd).unwrap();
+            assert!(missing.owners.contains("backing.json"));
+            let writer = super::try_lock_runtime_mutation("backing.json", &env, cwd).unwrap();
+            assert!(super::try_lock_runtime_binding("selected", &env, cwd).is_err());
+            drop(writer);
+            drop(super::try_lock_runtime_binding("selected", &env, cwd).unwrap());
+        }
     }
 
     #[test]
