@@ -24,8 +24,8 @@ use crate::env::EnvMeta;
 use crate::env::EnvSummary;
 pub(crate) use checkpoints::CheckpointCleanup;
 pub(crate) use common::{
-    ExclusiveFileLock, SharedFileLock, copy_dir_recursive, ensure_dir, lock_file, read_json,
-    try_lock_file, write_json,
+    ExclusiveFileLock, copy_dir_recursive, ensure_dir, lock_file, read_json, try_lock_file,
+    write_json,
 };
 pub(crate) use dev_registration::{DevSourceRegistration, with_prepared_dev_source};
 pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
@@ -86,14 +86,14 @@ pub(crate) use openclaw_workspaces::{
 pub(crate) use runtimes::install_runtime_from_local_openclaw_build;
 pub(crate) use runtimes::install_runtime_from_selected_official_openclaw_release;
 pub(crate) use runtimes::{
-    BuildLocalRuntimeOptions, InstallContext, PreparedRuntimeInstall, RuntimeMutationGuard,
-    RuntimeReleaseDetails, add_runtime_with_context,
+    BuildLocalRuntimeOptions, InstallContext, PreparedRuntimeInstall, RuntimeBindingGuard,
+    RuntimeMutationGuard, RuntimeReleaseDetails, add_runtime_with_context,
     install_runtime_from_official_openclaw_release_with_context,
     install_runtime_from_release_with_context, install_runtime_from_url_with_context,
     install_runtime_with_context, lock_runtime_mutation,
     prepare_runtime_from_selected_official_openclaw_release, prepare_runtime_from_selected_release,
     remove_runtime_with_guard, runtime_operational_issue, try_lock_runtime_binding,
-    try_lock_runtime_mutation,
+    try_lock_runtime_binding_with_guard, try_lock_runtime_mutation,
 };
 pub use runtimes::{
     add_runtime, get_runtime, get_runtime_verified, install_runtime,

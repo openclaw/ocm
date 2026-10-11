@@ -9630,12 +9630,25 @@ fn upgrade_previous_runtime_custody_covers_recovery_and_terminal_release() {
         (true, true, "kill"),
         (true, false, "rollback"),
     ] {
-        assert_upgrade_previous_runtime_custody(installed, replacement, outcome);
+        assert_upgrade_previous_runtime_custody(installed, replacement, outcome, false);
     }
 }
 
 #[cfg(unix)]
-fn assert_upgrade_previous_runtime_custody(installed: bool, replacement: bool, outcome: &str) {
+#[test]
+fn upgrade_previous_alias_custody_retains_backing_through_native_child_exit() {
+    for (replacement, outcome) in [(false, "success"), (true, "kill"), (false, "rollback")] {
+        assert_upgrade_previous_runtime_custody(true, replacement, outcome, true);
+    }
+}
+
+#[cfg(unix)]
+fn assert_upgrade_previous_runtime_custody(
+    installed: bool,
+    replacement: bool,
+    outcome: &str,
+    alias: bool,
+) {
     use std::os::unix::process::CommandExt;
     struct ProcessGroup(u32);
     impl Drop for ProcessGroup {
@@ -9737,7 +9750,14 @@ fn assert_upgrade_previous_runtime_custody(installed: bool, replacement: bool, o
     };
     let verb = if installed { "install" } else { "add" };
     for (name, path) in [("old", &old), ("selected", &selected)] {
-        ok(&["runtime", verb, name, "--path", &path_string(path)]);
+        if alias {
+            let backing = format!("{name}-backing");
+            ok(&["runtime", verb, &backing, "--path", &path_string(path)]);
+            let meta = ocm::store::get_runtime(&backing, &env, &cwd).unwrap();
+            ok(&["runtime", "add", name, "--path", &meta.binary_path]);
+        } else {
+            ok(&["runtime", verb, name, "--path", &path_string(path)]);
+        }
     }
     ok(&["env", "create", "demo", "--runtime", "old"]);
     let rollback = outcome == "rollback";
@@ -9796,17 +9816,22 @@ fn assert_upgrade_previous_runtime_custody(installed: bool, replacement: bool, o
     } else if outcome == "interrupt" {
         unsafe { libc::kill(upgrade.id() as i32, libc::SIGTERM) };
     }
+    let mutation_owner = if alias {
+        format!("{source}-backing")
+    } else {
+        source.to_string()
+    };
     let mutation_args = if replacement {
         vec![
             "runtime",
             "install",
-            source,
+            &mutation_owner,
             "--path",
             replacement_binary.to_str().unwrap(),
             "--force",
         ]
     } else {
-        vec!["runtime", "remove", source]
+        vec!["runtime", "remove", &mutation_owner]
     };
     let mut mutation_command = command(&mutation_args);
     mutation_command.process_group(upgrade.id() as i32);
@@ -9859,6 +9884,6 @@ fn assert_upgrade_previous_runtime_custody(installed: bool, replacement: bool, o
         let output = ok(&["@demo", "--", "--version"]);
         assert_eq!(stdout(&output).trim(), "2026.6.1");
     } else if !replacement {
-        assert!(ocm::store::get_runtime(source, &env, &cwd).is_err());
+        assert!(ocm::store::get_runtime(&mutation_owner, &env, &cwd).is_err());
     }
 }

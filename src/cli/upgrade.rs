@@ -39,8 +39,8 @@ use crate::runtime::{
 };
 use crate::service::{ServiceSummary, wait_for_gateway_readiness};
 use crate::store::{
-    EnvironmentOperationLock, InstallContext, RuntimeMutationGuard, RuntimeReleaseDetails,
-    SharedFileLock, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming, UpgradeHistoryRecord,
+    EnvironmentOperationLock, InstallContext, RuntimeBindingGuard, RuntimeMutationGuard,
+    RuntimeReleaseDetails, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming, UpgradeHistoryRecord,
     UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState, UpgradeHistoryStage,
     UpgradeRuntimeRecovery, clean_path, copy_dir_recursive, derive_env_paths, display_path,
     ensure_minimum_local_openclaw_config, ensure_store, get_runtime, get_upgrade_history_record,
@@ -63,7 +63,7 @@ pub(super) const UPGRADE_DRY_RUN_NOTES: [&str; 4] = [
 struct UpgradeCommandLocks<'a> {
     environment: &'a EnvironmentOperationLock,
     runtime: Option<Arc<RuntimeMutationGuard>>,
-    source_runtime: Option<Arc<SharedFileLock>>,
+    source_runtime: Option<Arc<RuntimeBindingGuard>>,
 }
 
 impl<'a> UpgradeCommandLocks<'a> {
@@ -81,15 +81,12 @@ impl<'a> UpgradeCommandLocks<'a> {
         env: &BTreeMap<String, String>,
         cwd: &Path,
     ) -> Result<Self, String> {
-        // In-place work already holds exclusive custody of the source.
-        // Taking another shared lock there would conflict with our own guard.
-        if !self
-            .runtime
-            .as_ref()
-            .is_some_and(|guard| guard.check(name, env, cwd).is_ok())
-        {
-            self.source_runtime = Some(Arc::new(try_lock_runtime_binding(name, env, cwd)?));
-        }
+        self.source_runtime = Some(Arc::new(crate::store::try_lock_runtime_binding_with_guard(
+            name,
+            self.runtime.as_deref(),
+            env,
+            cwd,
+        )?));
         Ok(self)
     }
 
@@ -5985,7 +5982,7 @@ struct UpgradeTransaction {
     snapshot_id: String,
     runtime_backups: Vec<RuntimeRollbackBackup>,
     runtime_guard: Option<Arc<RuntimeMutationGuard>>,
-    _source_runtime_guard: Option<Arc<SharedFileLock>>,
+    _source_runtime_guard: Option<Arc<RuntimeBindingGuard>>,
     created_runtime_names: Vec<String>,
     rollback_enabled: bool,
     started_at: time::OffsetDateTime,

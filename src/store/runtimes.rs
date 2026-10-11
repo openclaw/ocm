@@ -2162,7 +2162,7 @@ pub(crate) fn lock_runtime_mutation(
 ) -> Result<RuntimeMutationGuard, String> {
     Ok(RuntimeMutationGuard {
         path: runtime_lock_path(name, env, cwd)?,
-        lock: lock_runtime(name, env, cwd)?,
+        lock: Arc::new(lock_runtime(name, env, cwd)?),
     })
 }
 
@@ -2182,7 +2182,7 @@ fn runtime_lock_path(
 #[derive(Debug)]
 pub(crate) struct RuntimeMutationGuard {
     path: PathBuf,
-    lock: ExclusiveFileLock,
+    lock: Arc<ExclusiveFileLock>,
 }
 
 impl RuntimeMutationGuard {
@@ -2212,20 +2212,164 @@ pub(crate) fn try_lock_runtime_mutation(
     let lock = super::try_lock_file(&path, "runtime mutation")?.ok_or_else(|| {
         format!("runtime {name:?} is busy with another operation; retry after it finishes")
     })?;
-    Ok(RuntimeMutationGuard { path, lock })
+    Ok(RuntimeMutationGuard {
+        path,
+        lock: Arc::new(lock),
+    })
+}
+
+/// The selected registration and every managed path owner needed to use it.
+/// Shared custody never grants authority to mutate a registration or its bytes.
+#[derive(Debug)]
+pub(crate) struct RuntimeBindingGuard {
+    locks: Vec<super::common::SharedFileLock>,
+    held: Option<Arc<ExclusiveFileLock>>,
+}
+
+impl RuntimeBindingGuard {
+    pub(crate) fn retain_for_child(&self, command: &mut Command) {
+        for lock in &self.locks {
+            lock.retain_for_child(command);
+        }
+        if let Some(held) = &self.held {
+            held.retain_for_child(command);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeBindingDependencies {
+    pub(crate) owners: BTreeSet<String>,
+    binary: PathBuf,
+    entries: BTreeMap<PathBuf, (u64, u64)>,
+}
+
+// Query only the executable path and its symlink entries, never packages or a
+// reverse registration graph. Missing locations still belong to their managed
+// owner while it stages or recovers its tree.
+pub(crate) fn runtime_binding_dependencies(
+    runtime: &RuntimeMeta,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<RuntimeBindingDependencies, String> {
+    use super::dev_sources::{path_identity, projected_path_relative};
+    let (binary, entries) =
+        super::dev_registration::registration_path(Path::new(&runtime.binary_path))?;
+    let root = super::layout::resolve_store_paths(env, cwd)?.runtimes_dir;
+    let (root, _) = super::dev_registration::registration_path(&root)?;
+    let mut owners = BTreeSet::from([validate_name(&runtime.name, "Runtime name")?]);
+    for entry in entries.iter().chain(std::iter::once(&binary)) {
+        if let Some(relative) = projected_path_relative(&root, entry)?
+            && let Some(Component::Normal(owner)) = relative.components().next()
+            && let Some(owner) = owner.to_str()
+        {
+            // Registrations and managed trees share the same mutation owner.
+            let registration_file = relative.components().count() == 1
+                && owner.ends_with(".json")
+                && match fs::symlink_metadata(entry) {
+                    Ok(metadata) => !metadata.is_dir(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(error) => return Err(error.to_string()),
+                };
+            let owner = if registration_file {
+                owner.strip_suffix(".json").unwrap()
+            } else {
+                owner
+            };
+            if let Ok(owner) = validate_name(owner, "Runtime name") {
+                owners.insert(owner);
+            }
+        }
+    }
+    let entries = entries
+        .into_iter()
+        .map(|path| {
+            let identity = path_identity(&path)?;
+            Ok((path, identity))
+        })
+        .collect::<Result<_, String>>()?;
+    Ok(RuntimeBindingDependencies {
+        owners,
+        binary,
+        entries,
+    })
 }
 
 pub(crate) fn try_lock_runtime_binding(
     name: &str,
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> Result<super::common::SharedFileLock, String> {
-    // Bindings and named-runtime reads may overlap. Only a byte-changing
-    // owner's exclusive lock excludes them; this guard cannot authorize writes.
-    super::common::try_lock_file_shared(&runtime_lock_path(name, env, cwd)?, "runtime binding")?
-        .ok_or_else(|| {
-            format!("runtime {name:?} is busy with another operation; retry after it finishes")
-        })
+) -> Result<RuntimeBindingGuard, String> {
+    try_lock_runtime_binding_with_guard(name, None, env, cwd)
+}
+
+pub(crate) fn try_lock_runtime_binding_with_guard(
+    name: &str,
+    held: Option<&RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<RuntimeBindingGuard, String> {
+    try_lock_runtime_binding_rechecked(name, held, env, cwd, || {})
+}
+
+fn try_lock_runtime_binding_rechecked(
+    name: &str,
+    held: Option<&RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    before_backing_locks: impl FnOnce(),
+) -> Result<RuntimeBindingGuard, String> {
+    let name = validate_name(name, "Runtime name")?;
+    let mut guard = RuntimeBindingGuard {
+        locks: Vec::new(),
+        held: None,
+    };
+    let mut acquire = |owner: &str| -> Result<(), String> {
+        if let Some(held) = held.filter(|held| held.check(owner, env, cwd).is_ok()) {
+            guard.held = Some(held.lock.clone());
+        } else {
+            let lock = super::common::try_lock_file_shared(
+                &runtime_lock_path(owner, env, cwd)?,
+                "runtime binding",
+            )?
+            .ok_or_else(|| {
+                format!("runtime {owner:?} is busy with another operation; retry after it finishes")
+            })?;
+            guard.locks.push(lock);
+        }
+        Ok(())
+    };
+    // Protect the registration before discovering its executable dependencies.
+    // Every acquisition is nonblocking: callers may hold the env registry.
+    acquire(&name)?;
+    let registration = runtime_meta_path(&name, env, cwd)?;
+    match fs::symlink_metadata(&registration) {
+        // Raw archive/store restoration can preserve a name whose runtime is
+        // absent. Its name lock still excludes registration; validated callers
+        // retain their existing missing-runtime check after this admission.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(guard),
+        Err(error) => return Err(error.to_string()),
+        Ok(_) => {}
+    }
+    let registration_identity = super::dev_sources::path_identity(&registration)?;
+    let runtime = get_runtime(&name, env, cwd)?;
+    let dependencies = runtime_binding_dependencies(&runtime, env, cwd)?;
+    before_backing_locks();
+    for owner in &dependencies.owners {
+        if owner != &name {
+            acquire(owner)?;
+        }
+    }
+    let current = get_runtime(&name, env, cwd)?;
+    if super::dev_sources::path_identity(&registration)? != registration_identity
+        || current.binary_path != runtime.binary_path
+        || runtime_binding_dependencies(&current, env, cwd)? != dependencies
+    {
+        return Err(format!(
+            "runtime {name:?} changed during binding admission; retry"
+        ));
+    }
+    Ok(guard)
 }
 
 fn prepare_runtime_from_openclaw_package(
@@ -3238,6 +3382,152 @@ mod tests {
         SourcePluginDefinition, SourcePluginInventory, collect_explicit_plugin_references,
         source_plugin_dependency_closure, source_plugin_inventory, summarize_command_output,
     };
+
+    fn binding_fixture() -> (
+        tempfile::TempDir,
+        BTreeMap<String, String>,
+        std::path::PathBuf,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([
+            ("HOME".into(), root.path().display().to_string()),
+            (
+                "OCM_HOME".into(),
+                root.path().join("store").display().to_string(),
+            ),
+        ]);
+        let binary = root.path().join("store/runtimes/backing/files/openclaw");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, "fixture").unwrap();
+        super::add_runtime(
+            crate::runtime::AddRuntimeOptions {
+                name: "selected".into(),
+                path: binary.display().to_string(),
+                description: None,
+            },
+            &env,
+            root.path(),
+        )
+        .unwrap();
+        (root, env, binary)
+    }
+
+    #[test]
+    fn runtime_binding_retains_managed_owners_and_reuses_exclusive_custody() {
+        let (root, env, _) = binding_fixture();
+        let cwd = root.path();
+        let writer = super::try_lock_runtime_mutation("backing", &env, cwd).unwrap();
+        assert!(super::try_lock_runtime_binding("selected", &env, cwd).is_err());
+        // Failed admission must release its already-acquired registration lock.
+        drop(super::try_lock_runtime_mutation("selected", &env, cwd).unwrap());
+        let guard =
+            super::try_lock_runtime_binding_with_guard("selected", Some(&writer), &env, cwd)
+                .unwrap();
+        drop(writer);
+        assert!(super::try_lock_runtime_mutation("backing", &env, cwd).is_err());
+        assert!(super::try_lock_runtime_mutation("selected", &env, cwd).is_err());
+        drop(guard);
+        let first = super::try_lock_runtime_binding("selected", &env, cwd).unwrap();
+        let second = super::try_lock_runtime_binding("selected", &env, cwd).unwrap();
+        drop(super::try_lock_runtime_mutation("unrelated", &env, cwd).unwrap());
+        drop(first);
+        assert!(super::try_lock_runtime_mutation("backing", &env, cwd).is_err());
+        drop(second);
+        drop(super::try_lock_runtime_mutation("backing", &env, cwd).unwrap());
+        let selected = super::try_lock_runtime_mutation("selected", &env, cwd).unwrap();
+        let guard =
+            super::try_lock_runtime_binding_with_guard("selected", Some(&selected), &env, cwd)
+                .unwrap();
+        assert!(super::try_lock_runtime_mutation("backing", &env, cwd).is_err());
+        drop(selected);
+        assert!(super::try_lock_runtime_mutation("selected", &env, cwd).is_err());
+        drop(guard);
+        drop(super::try_lock_runtime_mutation("selected", &env, cwd).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_binding_tracks_symlink_entries_and_targets_without_prefix_neighbors() {
+        let (root, env, binary) = binding_fixture();
+        let cwd = root.path();
+        let backing = cwd.join("store/runtimes/backing.json");
+        std::fs::rename(cwd.join("store/runtimes/backing"), &backing).unwrap();
+        let binary = backing.join(
+            binary
+                .strip_prefix(cwd.join("store/runtimes/backing"))
+                .unwrap(),
+        );
+        let bridge = cwd.join("store/runtimes/bridge/files");
+        std::fs::create_dir_all(&bridge).unwrap();
+        let link = bridge.join("openclaw");
+        std::os::unix::fs::symlink(&backing, &link).unwrap();
+        let outside = cwd.join("store/runtimes-neighbor");
+        std::fs::create_dir_all(&outside).unwrap();
+        let outer = outside.join("openclaw");
+        std::os::unix::fs::symlink(&link, &outer).unwrap();
+        let mut meta = super::get_runtime("selected", &env, cwd).unwrap();
+        meta.binary_path = outer.join("files/openclaw").display().to_string();
+        super::write_json(
+            &super::runtime_meta_path("selected", &env, cwd).unwrap(),
+            &meta,
+        )
+        .unwrap();
+        let dependencies = super::runtime_binding_dependencies(&meta, &env, cwd).unwrap();
+        assert_eq!(
+            dependencies.owners,
+            BTreeSet::from(["selected".into(), "bridge".into(), "backing.json".into()])
+        );
+        let guard = super::try_lock_runtime_binding("selected", &env, cwd).unwrap();
+        for owner in ["selected", "bridge", "backing.json"] {
+            assert!(super::try_lock_runtime_mutation(owner, &env, cwd).is_err());
+        }
+        drop(super::try_lock_runtime_mutation("backing-other", &env, cwd).unwrap());
+        drop(guard);
+        for owner in ["selected", "bridge", "backing.json"] {
+            drop(super::try_lock_runtime_mutation(owner, &env, cwd).unwrap());
+        }
+        // A removed target keeps the path owner discoverable for recovery policy.
+        std::fs::remove_file(&binary).unwrap();
+        assert_eq!(
+            super::runtime_binding_dependencies(&meta, &env, cwd)
+                .unwrap()
+                .owners,
+            dependencies.owners
+        );
+    }
+
+    #[test]
+    fn runtime_binding_revalidates_executable_and_registration_identity() {
+        let (root, env, binary) = binding_fixture();
+        let cwd = root.path();
+        let error = super::try_lock_runtime_binding_rechecked("selected", None, &env, cwd, || {
+            let _writer = super::try_lock_runtime_mutation("backing", &env, cwd).unwrap();
+            let replacement = binary.with_extension("new");
+            std::fs::write(&replacement, "replacement").unwrap();
+            std::fs::rename(replacement, &binary).unwrap();
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("changed during binding admission"),
+            "{error}"
+        );
+        drop(super::try_lock_runtime_mutation("backing", &env, cwd).unwrap());
+        let writer = super::try_lock_runtime_mutation("selected", &env, cwd).unwrap();
+        let error =
+            super::try_lock_runtime_binding_rechecked("selected", Some(&writer), &env, cwd, || {
+                let path = super::runtime_meta_path("selected", &env, cwd).unwrap();
+                let replacement = path.with_extension("replacement");
+                std::fs::copy(&path, &replacement).unwrap();
+                std::fs::rename(replacement, path).unwrap();
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("changed during binding admission"),
+            "{error}"
+        );
+        drop(writer);
+        drop(super::try_lock_runtime_mutation("selected", &env, cwd).unwrap());
+    }
 
     #[test]
     fn target_plugin_references_ignore_arbitrary_matching_config_values() {

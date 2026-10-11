@@ -175,7 +175,7 @@ fn upsert_environment(
     runtime_guard: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> Result<(EnvMeta, Option<super::SharedFileLock>), String> {
+) -> Result<(EnvMeta, Option<super::RuntimeBindingGuard>), String> {
     let admission = admit_runtime_binding(
         registry,
         &meta.name,
@@ -212,7 +212,7 @@ fn admit_runtime_binding(
     held: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> Result<Option<super::SharedFileLock>, String> {
+) -> Result<Option<super::RuntimeBindingGuard>, String> {
     let Some(runtime) = runtime else {
         return Ok(None);
     };
@@ -223,12 +223,9 @@ fn admit_runtime_binding(
     {
         return Ok(None);
     }
-    if held.is_some_and(|guard| guard.check(runtime, env, cwd).is_ok()) {
-        return Ok(None);
-    }
     // Never wait on a runtime while holding the registry: its owner needs the
     // registry to publish its own binding or complete recovery.
-    super::try_lock_runtime_binding(runtime, env, cwd).map(Some)
+    super::runtimes::try_lock_runtime_binding_with_guard(runtime, held, env, cwd).map(Some)
 }
 
 pub(crate) fn lock_environment_runtime_binding(
@@ -236,7 +233,7 @@ pub(crate) fn lock_environment_runtime_binding(
     held: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> Result<Option<super::SharedFileLock>, String> {
+) -> Result<Option<super::RuntimeBindingGuard>, String> {
     let _registry = lock_env_registry(env, cwd)?;
     admit_runtime_binding(
         &load_env_registry(env, cwd)?,

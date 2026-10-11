@@ -683,6 +683,8 @@ Individual agent directory links are still removed from the copy without changin
 
 While an environment upgrade can still replace or restore a runtime, new bindings to that runtime fail with a busy/retry error.
 This includes environment creation, rebinding, cloning, importing, and restoring a snapshot with a different runtime binding.
+Registered aliases also retain shared custody of the managed executable and symlink entries they depend on during binding admission and retained runtime reads.
+Shared readers and unrelated runtime operations can proceed together; incompatible backing replacement or removal waits for that custody to end.
 Retry after the upgrade finishes finalization, verification, and any rollback; unrelated runtimes remain usable.
 On Unix, native upgrade children retain runtime ownership if the OCM parent exits, and release it when the children exit.
 

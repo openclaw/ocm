@@ -39,7 +39,12 @@ pub(super) fn registration_path(path: &Path) -> Result<(PathBuf, BTreeSet<PathBu
                     let suffix = pending
                         .strip_prefix(existing)
                         .map_err(|error| error.to_string())?;
-                    return Ok((resolved.join(suffix), entries));
+                    let location = if suffix.as_os_str().is_empty() {
+                        resolved
+                    } else {
+                        resolved.join(suffix)
+                    };
+                    return Ok((location, entries));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.to_string()),
@@ -61,11 +66,14 @@ pub(super) fn registration_path(path: &Path) -> Result<(PathBuf, BTreeSet<PathBu
                     } else {
                         parent.join(target)
                     };
-                    pending = target.join(
-                        pending
-                            .strip_prefix(existing)
-                            .map_err(|error| error.to_string())?,
-                    );
+                    let suffix = pending
+                        .strip_prefix(existing)
+                        .map_err(|error| error.to_string())?;
+                    pending = if suffix.as_os_str().is_empty() {
+                        target
+                    } else {
+                        target.join(suffix)
+                    };
                     break;
                 }
                 Err(error)
