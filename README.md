@@ -518,6 +518,11 @@ the new environment and rewrites the imported config to use the copy. The source
 home and repository remain unchanged. Config `$include` files still must remain
 inside the plain home because OCM does not take ownership of external config.
 
+If migration reports a `copied destination symlink`, it refuses the workspace copy and removes the partial import.
+The diagnostic names a destination inside that removed import; inspect the matching `workspaces/...` path in the original plain home to locate the conflicting link.
+Retry from a separate copy of the plain home whose conflicting destination paths are real directories, keeping its configured external workspace paths pointed at the intended source workspaces.
+Keep the original home and linked external data intact; do not remove the link's target directory or its contents.
+
 Environment clone, export, and import flows preserve managed OpenClaw plugin
 payloads under the legacy, extension, npm, and Git install roots. Clone and
 import still clear live sessions, logs, backups, and process residue so the new
