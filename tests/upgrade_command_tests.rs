@@ -10044,6 +10044,8 @@ fn upgrade_named_target_custody_spans_admission_settlement_and_native_children()
 #[test]
 fn upgrade_named_alias_target_custody_survives_admission_finalizer_and_parent_exit() {
     for (launcher, phase, outcome) in [
+        (false, "version", "success"),
+        (true, "finalize", "success"),
         (false, "version", "dry-run"),
         (false, "version", "kill"),
         (true, "finalize", "kill"),
