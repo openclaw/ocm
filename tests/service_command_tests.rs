@@ -585,13 +585,26 @@ fn service_start_preflight_failure_preserves_daemon_registration() {
 fn service_start_refuses_failed_or_unknown_manager_observations() {
     for systemd in [false, true] {
         for ordinal in [1, 2] {
-            for reply in [
-                "exit 1",
-                "exit 0",
-                "printf 'unexpected manager reply\\n'; exit 0",
-                "printf 'LoadState=not-found\\nActiveState=active\\nMainPID=999\\nstate = running\\n'; exit 4",
-                "printf 'LoadState=loaded\\nActiveState=activating\\nMainPID=0\\nstate = running\\n'; exit 0",
-            ] {
+            let replies = if systemd {
+                [
+                    "exit 1",
+                    "exit 0",
+                    "printf 'unexpected manager reply\\n'; exit 0",
+                    "printf 'LoadState=not-found\\nActiveState=active\\nMainPID=999\\n'; exit 4",
+                    "printf 'LoadState=loaded\\nActiveState=activating\\nMainPID=0\\n'; exit 0",
+                    "printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nMainPID=invalid\\n'; exit 0",
+                ]
+            } else {
+                [
+                    "exit 1",
+                    "exit 0",
+                    "printf 'unexpected manager reply\\n'; exit 0",
+                    "printf 'state = running\\npid = 999\\n'; exit 1",
+                    "printf 'state = running\\n'; exit 0",
+                    "printf 'state = not running\\npid = invalid\\n'; exit 0",
+                ]
+            };
+            for reply in replies {
                 let root = TestDir::new("service-observation-failure");
                 let cwd = root.child("workspace");
                 fs::create_dir_all(&cwd).unwrap();

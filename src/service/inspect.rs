@@ -37,6 +37,9 @@ pub(crate) struct LaunchdJobStatus {
     pub(crate) running: bool,
     pub(crate) enablement: Option<ManagedServiceEnablement>,
     pub(crate) pid: Option<u32>,
+    // Best-effort display keeps an unknown PID empty, but activation must not
+    // mistake a present malformed value for an absent PID on a stopped job.
+    pid_parse_failed: bool,
     pub(crate) state: Option<String>,
     pub(crate) definition_path: Option<String>,
 }
@@ -584,7 +587,9 @@ fn inspect_job_inner(
                     status.state.as_deref(),
                     Some("not running" | "stopped" | "waiting" | "exited")
                 );
-                if !(status.running && status.pid.is_some() || stopped && status.pid.is_none()) {
+                if status.pid_parse_failed
+                    || !(status.running && status.pid.is_some() || stopped && status.pid.is_none())
+                {
                     return Err(unknown());
                 }
             }
@@ -772,7 +777,9 @@ fn parse_launchctl_print(raw: &str, status: &mut LaunchdJobStatus) {
             continue;
         }
         if let Some(value) = trimmed.strip_prefix("pid = ") {
-            status.pid = value.trim().parse::<u32>().ok();
+            let pid = value.trim().parse::<u32>();
+            status.pid_parse_failed |= pid.is_err();
+            status.pid = pid.ok();
             continue;
         }
         if trimmed.starts_with("OPENCLAW_CONFIG_PATH => ") {

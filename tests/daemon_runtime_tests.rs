@@ -1691,19 +1691,24 @@ fn failed_upgrade_rollback_preserves_running_sibling_despite_unrelated_drift() {
 #[cfg(unix)]
 #[test]
 fn service_start_preflight_failure_preserves_live_sibling() {
-    service_start_failure_preserves_live_sibling(0);
+    service_start_failure_preserves_live_sibling(0, "exit 1");
 }
 
 #[cfg(unix)]
 #[test]
 fn service_start_observation_failure_preserves_live_sibling() {
     for ordinal in [1, 2] {
-        service_start_failure_preserves_live_sibling(ordinal);
+        for reply in [
+            "exit 1",
+            "printf 'state = not running\\npid = invalid\\n'; exit 0",
+        ] {
+            service_start_failure_preserves_live_sibling(ordinal, reply);
+        }
     }
 }
 
 #[cfg(unix)]
-fn service_start_failure_preserves_live_sibling(ordinal: usize) {
+fn service_start_failure_preserves_live_sibling(ordinal: usize, reply: &str) {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("service-preflight-live-sibling");
     let cwd = root.child("workspace");
@@ -1764,7 +1769,7 @@ fn service_start_failure_preserves_live_sibling(ordinal: usize) {
             )
         } else {
             format!(
-                "if [ \"$1\" = \"print\" ]; then\n n=0; [ ! -f '{marker}' ] || n=$(/bin/cat '{marker}')\n n=$((n + 1)); echo $n > '{marker}'\n [ $n -ne {ordinal} ] || exit 1\nfi",
+                "if [ \"$1\" = \"print\" ]; then\n n=0; [ ! -f '{marker}' ] || n=$(/bin/cat '{marker}')\n n=$((n + 1)); echo $n > '{marker}'\n if [ $n -eq {ordinal} ]; then {reply}; fi\nfi",
                 marker = path_string(&marker)
             )
         };
@@ -1779,7 +1784,7 @@ fn service_start_failure_preserves_live_sibling(ordinal: usize) {
             stderr(&started).contains(if ordinal == 0 {
                 "usable launchctl session"
             } else {
-                "failed to inspect managed service"
+                "managed service"
             }),
             "{}",
             stderr(&started)
