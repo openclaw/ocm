@@ -333,6 +333,10 @@ managed runtime retains the previous runtime files beside its transaction
 record. Removing or pruning the corresponding pre-upgrade snapshot removes
 those retained files; switching to a different runtime does not duplicate the
 source runtime.
+During an active upgrade or rollback, OCM also retains the previous runtime's lock until recovery or successful completion settles.
+Concurrent runtime removal or replacement waits, then rechecks current bindings; a runtime restored by rollback remains protected, while an unbound previous runtime becomes removable after successful completion.
+On macOS and Linux, native upgrade commands retain this protection if they outlive the OCM process.
+This temporary custody does not preserve unbound historical runtimes after the transaction and its native commands have ended.
 `ocm upgrade rollback <env>` restores the newest completed upgrade or rollback
 transition that has not already been reversed. Use `--transaction <id>` to
 select a specific transaction and `--dry-run` to validate it without mutation.

@@ -40,7 +40,7 @@ use crate::runtime::{
 use crate::service::{ServiceSummary, wait_for_gateway_readiness};
 use crate::store::{
     EnvironmentOperationLock, InstallContext, RuntimeMutationGuard, RuntimeReleaseDetails,
-    UpgradeHistoryBinding, UpgradeHistoryPhaseTiming, UpgradeHistoryRecord,
+    SharedFileLock, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming, UpgradeHistoryRecord,
     UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState, UpgradeHistoryStage,
     UpgradeRuntimeRecovery, clean_path, copy_dir_recursive, derive_env_paths, display_path,
     ensure_minimum_local_openclaw_config, ensure_store, get_runtime, get_upgrade_history_record,
@@ -63,19 +63,42 @@ pub(super) const UPGRADE_DRY_RUN_NOTES: [&str; 4] = [
 struct UpgradeCommandLocks<'a> {
     environment: &'a EnvironmentOperationLock,
     runtime: Option<Arc<RuntimeMutationGuard>>,
+    source_runtime: Option<Arc<SharedFileLock>>,
 }
 
-impl UpgradeCommandLocks<'_> {
-    fn with_runtime(&self, runtime: Option<Arc<RuntimeMutationGuard>>) -> UpgradeCommandLocks<'_> {
+impl<'a> UpgradeCommandLocks<'a> {
+    fn with_runtime(&self, runtime: Option<Arc<RuntimeMutationGuard>>) -> UpgradeCommandLocks<'a> {
         UpgradeCommandLocks {
             environment: self.environment,
             runtime,
+            source_runtime: self.source_runtime.clone(),
         }
+    }
+
+    fn with_source_runtime(
+        mut self,
+        name: &str,
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> Result<Self, String> {
+        // In-place work already holds exclusive custody of the source.
+        // Taking another shared lock there would conflict with our own guard.
+        if !self
+            .runtime
+            .as_ref()
+            .is_some_and(|guard| guard.check(name, env, cwd).is_ok())
+        {
+            self.source_runtime = Some(Arc::new(try_lock_runtime_binding(name, env, cwd)?));
+        }
+        Ok(self)
     }
 
     fn output(&self, mut command: Command) -> std::io::Result<std::process::Output> {
         if let Some(runtime) = &self.runtime {
             runtime.retain_for_child(&mut command);
+        }
+        if let Some(source_runtime) = &self.source_runtime {
+            source_runtime.retain_for_child(&mut command);
         }
         self.environment.output(command)
     }
@@ -1190,6 +1213,7 @@ impl Cli {
             .map(|environment| UpgradeCommandLocks {
                 environment,
                 runtime: None,
+                source_runtime: None,
             });
         let plan =
             self.prepare_upgrade_rollback(env_name, transaction_id, command_locks.as_ref())?;
@@ -1460,7 +1484,14 @@ impl Cli {
             .as_ref()
             .map(|recovery| self.lock_isolated_runtime_mutation(env_name, &recovery.meta.name))
             .transpose()?;
-        let command_locks = operation_lock.with_runtime(runtime_guard);
+        let mut command_locks = operation_lock.with_runtime(runtime_guard);
+        if plan.record.target.kind == "runtime" {
+            command_locks = command_locks.with_source_runtime(
+                &plan.record.target.name,
+                &self.env,
+                &self.cwd,
+            )?;
+        }
         let operation_lock = &command_locks;
         let runtime_names = plan
             .recovery
@@ -1480,6 +1511,7 @@ impl Cli {
             UpgradeTimingRecorder::new(),
         )?;
         transaction.runtime_guard = operation_lock.runtime.clone();
+        transaction._source_runtime_guard = operation_lock.source_runtime.clone();
         if transaction.interrupted() {
             return Ok(self.fail_upgrade_rollback_locked(
                 env_name,
@@ -2513,6 +2545,7 @@ impl Cli {
         let command_locks = UpgradeCommandLocks {
             environment: operation_lock,
             runtime: None,
+            source_runtime: None,
         };
         let operation_lock = &command_locks;
         if !options.dry_run {
@@ -2624,7 +2657,9 @@ impl Cli {
                     );
                 }
             };
-            let command_locks = operation_lock.with_runtime(prepared.runtime_guard.clone());
+            let command_locks = operation_lock
+                .with_runtime(prepared.runtime_guard.clone())
+                .with_source_runtime(&current.name, &self.env, &self.cwd)?;
             let operation_lock = &command_locks;
             timings.finish(
                 "ocm",
@@ -2666,6 +2701,7 @@ impl Cli {
                 timings,
             )?;
             transaction.runtime_guard = operation_lock.runtime.clone();
+            transaction._source_runtime_guard = operation_lock.source_runtime.clone();
             if transaction.interrupted() {
                 return self.rollback_failed_upgrade(
                     env_name,
@@ -2967,7 +3003,9 @@ impl Cli {
                     );
                 }
             };
-            let command_locks = operation_lock.with_runtime(prepared.runtime_guard.clone());
+            let command_locks = operation_lock
+                .with_runtime(prepared.runtime_guard.clone())
+                .with_source_runtime(&current.name, &self.env, &self.cwd)?;
             let operation_lock = &command_locks;
             timings.finish(
                 "ocm",
@@ -3012,6 +3050,7 @@ impl Cli {
                 timings,
             )?;
             transaction.runtime_guard = operation_lock.runtime.clone();
+            transaction._source_runtime_guard = operation_lock.source_runtime.clone();
             if transaction.interrupted() {
                 return self.rollback_failed_upgrade(
                     env_name,
@@ -3279,7 +3318,9 @@ impl Cli {
                 }
             };
         let (prepared, runtime_guard) = prepared;
-        let command_locks = operation_lock.with_runtime(Some(runtime_guard));
+        let command_locks = operation_lock
+            .with_runtime(Some(runtime_guard))
+            .with_source_runtime(&current.name, &self.env, &self.cwd)?;
         let operation_lock = &command_locks;
         timings.finish(
             "ocm",
@@ -3309,6 +3350,7 @@ impl Cli {
             timings,
         )?;
         transaction.runtime_guard = operation_lock.runtime.clone();
+        transaction._source_runtime_guard = operation_lock.source_runtime.clone();
         if transaction.interrupted() {
             return self.rollback_failed_upgrade(
                 env_name,
@@ -3639,6 +3681,7 @@ impl Cli {
             timings,
         )?;
         transaction.runtime_guard = operation_lock.runtime.clone();
+        transaction._source_runtime_guard = operation_lock.source_runtime.clone();
         if transaction.interrupted() {
             return self.rollback_failed_upgrade(
                 env_name,
@@ -4927,6 +4970,7 @@ impl Cli {
             snapshot_id: snapshot.id,
             runtime_backups,
             runtime_guard: None,
+            _source_runtime_guard: None,
             created_runtime_names,
             rollback_enabled,
             started_at,
@@ -5876,6 +5920,7 @@ struct UpgradeTransaction {
     snapshot_id: String,
     runtime_backups: Vec<RuntimeRollbackBackup>,
     runtime_guard: Option<Arc<RuntimeMutationGuard>>,
+    _source_runtime_guard: Option<Arc<SharedFileLock>>,
     created_runtime_names: Vec<String>,
     rollback_enabled: bool,
     started_at: time::OffsetDateTime,

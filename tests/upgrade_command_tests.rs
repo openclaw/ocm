@@ -9373,3 +9373,248 @@ case "$1" in"#,
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn upgrade_previous_runtime_custody_covers_recovery_and_terminal_release() {
+    for (installed, replacement, outcome) in [
+        (false, false, "failure"),
+        (true, true, "failure"),
+        (true, false, "success"),
+        (false, true, "success"),
+        (true, false, "interrupt"),
+        (true, true, "kill"),
+        (true, false, "rollback"),
+    ] {
+        assert_upgrade_previous_runtime_custody(installed, replacement, outcome);
+    }
+}
+
+#[cfg(unix)]
+fn assert_upgrade_previous_runtime_custody(installed: bool, replacement: bool, outcome: &str) {
+    use std::os::unix::process::CommandExt;
+    struct ProcessGroup(u32);
+    impl Drop for ProcessGroup {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) };
+        }
+    }
+    fn finish(mut child: std::process::Child) -> std::process::Output {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                // Every command in this fixture owns or joins a task group.
+                // Settle descendants before reading their inherited output pipes.
+                let group = unsafe { libc::getpgid(child.id() as i32) };
+                if group > 0 {
+                    unsafe { libc::kill(-group, libc::SIGKILL) };
+                }
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!("custody did not settle: {}", stderr(&output));
+            }
+            sleep(Duration::from_millis(20));
+        }
+        child.wait_with_output().unwrap()
+    }
+    let root = TestDir::new("upgrade-previous-runtime-custody");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let started = root.child("version.started");
+    let release = root.child("version.release");
+    let finalized = root.child("finalized");
+    let old = root.child("old-openclaw");
+    let selected = root.child("selected-openclaw");
+    let replacement_binary = root.child("replacement-openclaw");
+    let old_script = recording_openclaw_script("2026.6.1").replace(
+        "  --version)\n",
+        r#"  --version)
+    if [ "$OCM_TEST_SOURCE_OUTCOME" = rollback ] && [ -e "$OCM_TEST_SOURCE_FINALIZED" ] &&
+       grep -q '"defaultRuntime": "old"' "$OCM_TEST_SOURCE_REGISTRY"; then
+      printf '%s' "$$" > "$OCM_TEST_SOURCE_STARTED"
+      while [ ! -e "$OCM_TEST_SOURCE_RELEASE" ]; do sleep 0.05; done
+    fi
+"#,
+    );
+    write_executable_script(&old, &old_script);
+    write_executable_script(&replacement_binary, &recording_openclaw_script("2026.8.1"));
+    // The version probe after binding publication exercises the gap where the
+    // previous runtime is unbound but remains necessary for automatic recovery.
+    let script = recording_openclaw_script("2026.7.1")
+        .replace(
+            "if [ \"$2\" = \"finalize\" ]; then",
+            "if [ \"$2\" = \"finalize\" ]; then\n      : > \"$OCM_TEST_SOURCE_FINALIZED\"",
+        )
+        .replace(
+            "  --version)\n",
+            r#"  --version)
+    if [ "$OCM_TEST_SOURCE_OUTCOME" != rollback ] && [ -e "$OCM_TEST_SOURCE_FINALIZED" ]; then
+      printf '%s' "$$" > "$OCM_TEST_SOURCE_STARTED"
+      while [ ! -e "$OCM_TEST_SOURCE_RELEASE" ]; do sleep 0.05; done
+      if [ "$OCM_TEST_SOURCE_OUTCOME" = failure ]; then
+        echo 'forced final version failure' >&2
+        exit 42
+      fi
+    fi
+"#,
+        );
+    write_executable_script(&selected, &script);
+    env.insert("OCM_TEST_SOURCE_FINALIZED".into(), path_string(&finalized));
+    env.insert("OCM_TEST_SOURCE_STARTED".into(), path_string(&started));
+    env.insert("OCM_TEST_SOURCE_RELEASE".into(), path_string(&release));
+    env.insert("OCM_TEST_SOURCE_OUTCOME".into(), outcome.into());
+    env.insert(
+        "OCM_TEST_SOURCE_REGISTRY".into(),
+        path_string(&env_registry_path(&env, &cwd).unwrap()),
+    );
+    let command = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ocm"));
+        command
+            .current_dir(&cwd)
+            .args(args)
+            .env_clear()
+            .envs(&env)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    };
+    let ok = |args: &[&str]| {
+        let output = finish(command(args).spawn().unwrap());
+        assert!(
+            output.status.success(),
+            "{outcome} {args:?}: {} {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        output
+    };
+    let verb = if installed { "install" } else { "add" };
+    for (name, path) in [("old", &old), ("selected", &selected)] {
+        ok(&["runtime", verb, name, "--path", &path_string(path)]);
+    }
+    ok(&["env", "create", "demo", "--runtime", "old"]);
+    let rollback = outcome == "rollback";
+    if rollback {
+        ok(&["upgrade", "demo", "--runtime", "selected", "--json"]);
+    }
+    let source = if rollback { "selected" } else { "old" };
+    let target = if rollback { "old" } else { "selected" };
+    let source_meta = ocm::store::get_runtime(source, &env, &cwd).unwrap();
+    let source_bytes = fs::read(&source_meta.binary_path).unwrap();
+    // A compatible reader spans admission. It cannot be held across settlement,
+    // otherwise that reader would mask a missing upgrade guard in the race.
+    let lock_path = ocm::store::runtime_install_root(source, &env, &cwd)
+        .unwrap()
+        .with_file_name(format!(".{source}.lock"));
+    let reader = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    fs2::FileExt::lock_shared(&reader).unwrap();
+    let args = if rollback {
+        vec!["upgrade", "rollback", "demo", "--json"]
+    } else {
+        vec!["upgrade", "demo", "--runtime", "selected", "--json"]
+    };
+    let mut upgrade_command = command(&args);
+    upgrade_command
+        .process_group(0)
+        .stdout(fs::File::create(root.child("upgrade.out")).unwrap())
+        .stderr(fs::File::create(root.child("upgrade.err")).unwrap());
+    let mut upgrade = upgrade_command.spawn().unwrap();
+    let _group = ProcessGroup(upgrade.id());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !started.exists() {
+        assert!(
+            upgrade.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "{outcome} did not reach final verification: {:?} {:?}",
+            fs::read_to_string(root.child("upgrade.out")),
+            fs::read_to_string(root.child("upgrade.err"))
+        );
+        sleep(Duration::from_millis(20));
+    }
+    fs2::FileExt::unlock(&reader).unwrap();
+    drop(reader);
+    assert_eq!(
+        ocm::store::get_environment("demo", &env, &cwd)
+            .unwrap()
+            .default_runtime
+            .as_deref(),
+        Some(target)
+    );
+    if outcome == "kill" {
+        upgrade.kill().unwrap();
+        upgrade.wait().unwrap();
+    } else if outcome == "interrupt" {
+        unsafe { libc::kill(upgrade.id() as i32, libc::SIGTERM) };
+    }
+    let mutation_args = if replacement {
+        vec![
+            "runtime",
+            "install",
+            source,
+            "--path",
+            replacement_binary.to_str().unwrap(),
+            "--force",
+        ]
+    } else {
+        vec!["runtime", "remove", source]
+    };
+    let mut mutation_command = command(&mutation_args);
+    mutation_command.process_group(upgrade.id() as i32);
+    let mut mutation = mutation_command.spawn().unwrap();
+    sleep(Duration::from_millis(200));
+    assert!(
+        mutation.try_wait().unwrap().is_none(),
+        "{outcome}: source mutation did not wait"
+    );
+    assert_eq!(fs::read(&source_meta.binary_path).unwrap(), source_bytes);
+    // Shared binding admission and unrelated mutation must not be serialized.
+    ok(&[
+        "runtime",
+        "install",
+        "unrelated",
+        "--path",
+        replacement_binary.to_str().unwrap(),
+    ]);
+    ok(&["env", "create", "reader", "--runtime", source]);
+    ok(&["env", "set-runtime", "reader", "unrelated"]);
+    fs::write(&release, "").unwrap();
+    if outcome != "kill" {
+        let output = finish(upgrade);
+        let restored = matches!(outcome, "failure" | "interrupt");
+        assert_eq!(
+            output.status.success(),
+            !restored,
+            "{outcome}: {:?} {:?}",
+            fs::read_to_string(root.child("upgrade.out")),
+            fs::read_to_string(root.child("upgrade.err"))
+        );
+        if restored {
+            let summary: Value =
+                serde_json::from_slice(&fs::read(root.child("upgrade.out")).unwrap()).unwrap();
+            assert_eq!(summary["rollback"], "restored");
+        }
+    }
+    let mutation = finish(mutation);
+    let restored = matches!(outcome, "failure" | "interrupt");
+    assert_eq!(
+        mutation.status.success(),
+        !restored,
+        "{outcome}: {} {}",
+        stdout(&mutation),
+        stderr(&mutation)
+    );
+    if restored {
+        assert!(stderr(&mutation).contains("still used by environment"));
+        assert_eq!(fs::read(&source_meta.binary_path).unwrap(), source_bytes);
+        let output = ok(&["@demo", "--", "--version"]);
+        assert_eq!(stdout(&output).trim(), "2026.6.1");
+    } else if !replacement {
+        assert!(ocm::store::get_runtime(source, &env, &cwd).is_err());
+    }
+}

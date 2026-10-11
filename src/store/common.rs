@@ -51,42 +51,58 @@ impl ExclusiveFileLock {
     }
 
     pub(crate) fn retain_for_child(&self, command: &mut std::process::Command) {
-        #[cfg(not(unix))]
-        let _ = command;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            use std::os::unix::process::CommandExt;
-            // Set this before spawning and keep it on output errors too:
-            // an already-started child or descendant may still hold the lock.
-            self.child_custody.store(true, Ordering::Relaxed);
-            let fd = self.file.as_raw_fd();
-            // Only this child's copy becomes inheritable, so concurrent fleet
-            // workers and service spawns cannot retain another environment's lock across exec.
-            // SAFETY: self keeps fd open until output returns; fcntl is
-            // async-signal-safe and does not allocate after fork.
-            unsafe {
-                command.pre_exec(move || {
-                    let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags == -1
-                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
+        retain_lock_for_child(&self.file, &self.child_custody, command);
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct SharedFileLock {
     file: File,
+    child_custody: AtomicBool,
 }
 
 impl Drop for SharedFileLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        if !self.child_custody.load(Ordering::Relaxed) {
+            let _ = FileExt::unlock(&self.file);
+        }
+    }
+}
+
+impl SharedFileLock {
+    pub(crate) fn retain_for_child(&self, command: &mut std::process::Command) {
+        retain_lock_for_child(&self.file, &self.child_custody, command);
+    }
+}
+
+fn retain_lock_for_child(
+    file: &File,
+    child_custody: &AtomicBool,
+    command: &mut std::process::Command,
+) {
+    #[cfg(not(unix))]
+    let _ = (file, child_custody, command);
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        // Keep this set on output errors too: a started child or descendant
+        // may still hold the lock, which must then release on last close.
+        child_custody.store(true, Ordering::Relaxed);
+        let fd = file.as_raw_fd();
+        // Only this child's copy becomes inheritable, so concurrent fleet
+        // workers and service spawns cannot retain another operation's lock across exec.
+        // SAFETY: the caller keeps file open through command execution; fcntl
+        // is async-signal-safe and does not allocate after fork.
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 }
 
@@ -154,7 +170,10 @@ pub(crate) fn lock_file_shared(path: &Path, label: &str) -> Result<SharedFileLoc
             path.display()
         )
     })?;
-    Ok(SharedFileLock { file })
+    Ok(SharedFileLock {
+        file,
+        child_custody: AtomicBool::new(false),
+    })
 }
 
 pub(crate) fn try_lock_file_shared(
@@ -172,7 +191,10 @@ pub(crate) fn try_lock_file_shared(
         .open(path)
         .map_err(|error| format!("failed to open {label} lock at {}: {error}", path.display()))?;
     match FileExt::try_lock_shared(&file) {
-        Ok(()) => Ok(Some(SharedFileLock { file })),
+        Ok(()) => Ok(Some(SharedFileLock {
+            file,
+            child_custody: AtomicBool::new(false),
+        })),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(format!(
             "failed to acquire shared {label} lock at {}: {error}",
@@ -362,6 +384,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn inherited_lock_survives_parent_guard_drop() {
+        assert_inherited_lock_survives_parent_guard_drop(false);
+        assert_inherited_lock_survives_parent_guard_drop(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_inherited_lock_survives_parent_guard_drop(shared: bool) {
         use std::process::Command;
         use std::thread::sleep;
         use std::time::{Duration, Instant};
@@ -378,17 +406,32 @@ mod tests {
             }
         }
         let _release_child = ReleaseChild(release.clone());
-        let lock = super::lock_file(&lock_path, "test").unwrap();
+        let exclusive_lock = (!shared).then(|| super::lock_file(&lock_path, "test").unwrap());
+        let shared_lock = shared.then(|| super::lock_file_shared(&lock_path, "test").unwrap());
         let mut command = Command::new("sh");
         command.args(["-c", "(touch \"$1\"; count=0; while [ ! -e \"$2\" ] && [ $count -lt 100 ]; do sleep 0.05; count=$((count + 1)); done) </dev/null >/dev/null 2>&1 &", "sh"])
             .arg(&started).arg(&release);
-        assert!(lock.output(command).unwrap().status.success());
+        if let Some(lock) = &exclusive_lock {
+            lock.retain_for_child(&mut command);
+        }
+        if let Some(lock) = &shared_lock {
+            lock.retain_for_child(&mut command);
+        }
+        assert!(command.output().unwrap().status.success());
         let deadline = Instant::now() + Duration::from_secs(5);
         while !started.exists() {
             assert!(Instant::now() < deadline, "inheriting child did not start");
             sleep(Duration::from_millis(10));
         }
-        drop(lock);
+        drop((exclusive_lock, shared_lock));
+        if shared {
+            // Dropping a compatible reader must not release the child's lock.
+            assert!(
+                super::try_lock_file_shared(&lock_path, "reader")
+                    .unwrap()
+                    .is_some()
+            );
+        }
         assert!(super::try_lock_file(&lock_path, "test").unwrap().is_none());
         fs::write(&release, "").unwrap();
         loop {
