@@ -4181,47 +4181,57 @@ fn runtime_mutations_preserve_bound_aliases_and_allow_unrelated_or_idle_aliases(
     let version = run(&["@demo", "--", "--version"]);
     assert!(version.status.success(), "{}", stderr(&version));
     assert_eq!(stdout(&version).trim(), "2026.7.1");
-    let before = run(&["env", "show", "demo", "--json"]);
-    assert!(before.status.success(), "{}", stderr(&before));
     let runtime_before = fs::read(runtime_meta_path("backing", &env, &cwd).unwrap()).unwrap();
     let original_bytes = fs::read(executable).unwrap();
     let replacement_path = path_string(&replacement);
-    for args in [
-        vec![
-            "runtime",
-            "install",
-            "backing",
-            "--path",
-            &replacement_path,
-            "--force",
-        ],
-        vec!["runtime", "remove", "backing"],
-        vec!["runtime", "update", "backing"],
-        vec![
-            "runtime",
-            "build-local",
-            "backing",
-            "--repo",
-            "missing-repo",
-            "--force",
-        ],
+    for (binding, target) in [
+        ("selected", "backing"),
+        ("selected", " backing "),
+        (" selected ", "backing"),
     ] {
-        let mutation = run(&args);
-        assert_eq!(mutation.status.code(), Some(1), "{args:?}");
-        assert!(
-            stderr(&mutation)
-                .contains("runtime \"backing\" is still used by environment(s): \"demo\""),
-            "{}",
-            stderr(&mutation)
-        );
-        assert_eq!(fs::read(executable).unwrap(), original_bytes);
-        assert_eq!(
-            fs::read(runtime_meta_path("backing", &env, &cwd).unwrap()).unwrap(),
-            runtime_before
-        );
-        let after = run(&["env", "show", "demo", "--json"]);
-        assert!(after.status.success(), "{}", stderr(&after));
-        assert_eq!(stdout(&after), stdout(&before));
+        // Raw store/import bindings retain accepted noncanonical spellings.
+        let mut meta = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+        meta.default_runtime = Some(binding.to_string());
+        let saved = ocm::store::save_environment(meta, &env, &cwd).unwrap();
+        assert_eq!(saved.default_runtime.as_deref(), Some(binding));
+        let before = run(&["env", "show", "demo", "--json"]);
+        assert!(before.status.success(), "{}", stderr(&before));
+        for args in [
+            vec![
+                "runtime",
+                "install",
+                target,
+                "--path",
+                &replacement_path,
+                "--force",
+            ],
+            vec!["runtime", "remove", target],
+            vec!["runtime", "update", target],
+            vec![
+                "runtime",
+                "build-local",
+                target,
+                "--repo",
+                "missing-repo",
+                "--force",
+            ],
+        ] {
+            let mutation = run(&args);
+            assert_eq!(mutation.status.code(), Some(1), "{args:?}");
+            assert!(
+                stderr(&mutation).contains("still used by environment(s): \"demo\""),
+                "{}",
+                stderr(&mutation)
+            );
+            assert_eq!(fs::read(executable).unwrap(), original_bytes);
+            assert_eq!(
+                fs::read(runtime_meta_path("backing", &env, &cwd).unwrap()).unwrap(),
+                runtime_before
+            );
+            let after = run(&["env", "show", "demo", "--json"]);
+            assert!(after.status.success(), "{}", stderr(&after));
+            assert_eq!(stdout(&after), stdout(&before));
+        }
     }
     let version = run(&["@demo", "--", "--version"]);
     assert!(version.status.success(), "{}", stderr(&version));

@@ -9,7 +9,7 @@ use crate::env::EnvMeta;
 use crate::store::{
     InstallContext, RuntimeMutationGuard, add_runtime_with_context, get_runtime,
     get_runtime_verified, list_runtimes, remove_runtime_with_guard, runtime_binding_dependencies,
-    runtime_meta_path, with_locked_environments,
+    runtime_meta_path, validate_name, with_locked_environments,
 };
 use crate::supervisor::sync_supervisor_binding_if_present;
 
@@ -153,30 +153,32 @@ impl<'a> RuntimeService<'a> {
         name: &str,
         environments: &[EnvMeta],
     ) -> Result<Vec<String>, String> {
+        let name = validate_name(name, "Runtime name")?;
         let mut dependencies = BTreeMap::new();
         let mut users = Vec::new();
         for environment in environments {
             let Some(selected) = environment.default_runtime.as_deref() else {
                 continue;
             };
+            let selected = validate_name(selected, "Runtime name")?;
             let uses_runtime = if selected == name {
                 true
-            } else if let Some(uses_runtime) = dependencies.get(selected) {
+            } else if let Some(uses_runtime) = dependencies.get(&selected) {
                 *uses_runtime
             } else {
-                let registration = runtime_meta_path(selected, self.env, self.cwd)?;
+                let registration = runtime_meta_path(&selected, self.env, self.cwd)?;
                 let uses_runtime = match std::fs::symlink_metadata(registration) {
                     // Raw archive bindings may name an absent registration.
                     // There is no known indirect dependency to inspect yet.
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                     Err(error) => return Err(error.to_string()),
                     Ok(_) => runtime_binding_dependencies(
-                        &get_runtime(selected, self.env, self.cwd)?,
+                        &get_runtime(&selected, self.env, self.cwd)?,
                         self.env,
                         self.cwd,
                     )?
                     .owners
-                    .contains(name),
+                    .contains(&name),
                 };
                 dependencies.insert(selected, uses_runtime);
                 uses_runtime
