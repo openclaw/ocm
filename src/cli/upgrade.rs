@@ -1514,6 +1514,7 @@ impl Cli {
         transaction._source_runtime_guard = operation_lock.source_runtime.clone();
         if transaction.interrupted() {
             return Ok(self.fail_upgrade_rollback_locked(
+                operation_lock,
                 env_name,
                 &plan,
                 transaction,
@@ -1530,6 +1531,7 @@ impl Cli {
                 .quiesce_for_runtime_mutation_locked(env_name)
         {
             return Ok(self.fail_upgrade_rollback_locked(
+                operation_lock,
                 env_name,
                 &plan,
                 transaction,
@@ -1546,7 +1548,13 @@ impl Cli {
                     .as_deref()
                     .ok_or("missing runtime recovery guard")?,
             ) {
-                return Ok(self.fail_upgrade_rollback_locked(env_name, &plan, transaction, error));
+                return Ok(self.fail_upgrade_rollback_locked(
+                    operation_lock,
+                    env_name,
+                    &plan,
+                    transaction,
+                    error,
+                ));
             }
         }
 
@@ -1562,6 +1570,7 @@ impl Cli {
             Ok(restore) => restore,
             Err(error) => {
                 return Ok(self.fail_upgrade_rollback_locked(
+                    operation_lock,
                     env_name,
                     &plan,
                     transaction,
@@ -1575,7 +1584,13 @@ impl Cli {
             Ok(action) => action,
             Err(error) => {
                 let error = format!("{error}; {}", restore.retained_operation_note());
-                return Ok(self.fail_upgrade_rollback_locked(env_name, &plan, transaction, error));
+                return Ok(self.fail_upgrade_rollback_locked(
+                    operation_lock,
+                    env_name,
+                    &plan,
+                    transaction,
+                    error,
+                ));
             }
         };
         let verification_note = match self.verify_upgraded_openclaw(
@@ -1587,6 +1602,7 @@ impl Cli {
             Ok(note) => note,
             Err(error) => {
                 return Ok(self.fail_upgrade_rollback_locked(
+                    operation_lock,
                     env_name,
                     &plan,
                     transaction,
@@ -1623,6 +1639,7 @@ impl Cli {
         };
         if let Err(error) = self.retain_required_runtime_recovery(env_name, &mut transaction) {
             return Ok(self.fail_upgrade_rollback_locked(
+                operation_lock,
                 env_name,
                 &plan,
                 transaction,
@@ -1631,6 +1648,7 @@ impl Cli {
         }
         if let Err(error) = self.record_upgrade_history(&transaction, &history_summary) {
             return Ok(self.fail_upgrade_rollback_locked(
+                operation_lock,
                 env_name,
                 &plan,
                 transaction,
@@ -1639,6 +1657,7 @@ impl Cli {
         }
         if !transaction.close_interrupt_fence_for_commit() {
             return Ok(self.fail_upgrade_rollback_locked(
+                operation_lock,
                 env_name,
                 &plan,
                 transaction,
@@ -1706,6 +1725,7 @@ impl Cli {
 
     fn fail_upgrade_rollback_locked(
         &self,
+        operation_lock: &UpgradeCommandLocks<'_>,
         env_name: &str,
         plan: &UpgradeRollbackPlan,
         mut transaction: UpgradeTransaction,
@@ -1713,7 +1733,8 @@ impl Cli {
     ) -> UpgradeRollbackSummary {
         let rollback_transaction_id = transaction.id.clone();
         let safety_snapshot_id = transaction.snapshot_id.clone();
-        let restore_result = self.rollback_upgrade_locked(env_name, &mut transaction);
+        let restore_result =
+            self.rollback_upgrade_locked(operation_lock, env_name, &mut transaction);
         if let Ok(cleanup_note) = &restore_result {
             transaction.cleanup_note = cleanup_note.clone();
         }
@@ -2704,6 +2725,7 @@ impl Cli {
             transaction._source_runtime_guard = operation_lock.source_runtime.clone();
             if transaction.interrupted() {
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "runtime",
                     previous_binding_name,
@@ -2722,6 +2744,7 @@ impl Cli {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return self.rollback_failed_upgrade(
+                        operation_lock,
                         env_name,
                         "runtime",
                         previous_binding_name,
@@ -2748,6 +2771,7 @@ impl Cli {
                 Err(error) => {
                     transaction.mark_post_update_failed(&error);
                     return self.rollback_failed_upgrade(
+                        operation_lock,
                         env_name,
                         "runtime",
                         previous_binding_name,
@@ -2788,6 +2812,7 @@ impl Cli {
             );
             if let Err(error) = publish_result {
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "runtime",
                     previous_binding_name,
@@ -2810,6 +2835,7 @@ impl Cli {
                 Ok(result) => result,
                 Err(error) => {
                     return self.rollback_failed_upgrade(
+                        operation_lock,
                         env_name,
                         "runtime",
                         previous_binding_name,
@@ -2862,6 +2888,7 @@ impl Cli {
                         "failed",
                     );
                     return self.rollback_failed_upgrade(
+                        operation_lock,
                         env_name,
                         "runtime",
                         previous_binding_name,
@@ -2901,7 +2928,7 @@ impl Cli {
                 rollback: None,
                 note,
             };
-            return self.finish_successful_upgrade(summary, transaction);
+            return self.finish_successful_upgrade(operation_lock, summary, transaction);
         }
 
         if current.source_manifest_url.is_none() {
@@ -3053,6 +3080,7 @@ impl Cli {
             transaction._source_runtime_guard = operation_lock.source_runtime.clone();
             if transaction.interrupted() {
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "runtime",
                     previous_binding_name,
@@ -3071,6 +3099,7 @@ impl Cli {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return self.rollback_failed_upgrade(
+                        operation_lock,
                         env_name,
                         "runtime",
                         previous_binding_name,
@@ -3097,6 +3126,7 @@ impl Cli {
                     Err(error) => {
                         transaction.mark_post_update_failed(&error);
                         return self.rollback_failed_upgrade(
+                            operation_lock,
                             env_name,
                             "runtime",
                             previous_binding_name,
@@ -3120,6 +3150,7 @@ impl Cli {
                     Err(error) => {
                         transaction.mark_post_update_failed(&error);
                         return self.rollback_failed_upgrade(
+                            operation_lock,
                             env_name,
                             "runtime",
                             previous_binding_name,
@@ -3158,6 +3189,7 @@ impl Cli {
             );
             if let Err(error) = publish_result {
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "runtime",
                     previous_binding_name,
@@ -3180,6 +3212,7 @@ impl Cli {
                 Ok(result) => result,
                 Err(error) => {
                     return self.rollback_failed_upgrade(
+                        operation_lock,
                         env_name,
                         "runtime",
                         previous_binding_name,
@@ -3225,6 +3258,7 @@ impl Cli {
                         "failed",
                     );
                     return self.rollback_failed_upgrade(
+                        operation_lock,
                         env_name,
                         "runtime",
                         previous_binding_name,
@@ -3258,7 +3292,7 @@ impl Cli {
                     verification_note,
                 ),
             };
-            return self.finish_successful_upgrade(summary, transaction);
+            return self.finish_successful_upgrade(operation_lock, summary, transaction);
         }
 
         let resolved_update = self.runtime_service().resolve_update_from_release(
@@ -3353,6 +3387,7 @@ impl Cli {
         transaction._source_runtime_guard = operation_lock.source_runtime.clone();
         if transaction.interrupted() {
             return self.rollback_failed_upgrade(
+                operation_lock,
                 env_name,
                 "runtime",
                 previous_binding_name,
@@ -3369,6 +3404,7 @@ impl Cli {
             Ok(updated) => updated,
             Err(error) => {
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "runtime",
                     previous_binding_name,
@@ -3394,6 +3430,7 @@ impl Cli {
             Err(error) => {
                 transaction.mark_post_update_failed(&error);
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "runtime",
                     previous_binding_name,
@@ -3425,6 +3462,7 @@ impl Cli {
         );
         if let Err(error) = publish_result {
             return self.rollback_failed_upgrade(
+                operation_lock,
                 env_name,
                 "runtime",
                 previous_binding_name,
@@ -3447,6 +3485,7 @@ impl Cli {
             Ok(result) => result,
             Err(error) => {
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "runtime",
                     previous_binding_name,
@@ -3492,6 +3531,7 @@ impl Cli {
                     "failed",
                 );
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "runtime",
                     previous_binding_name,
@@ -3525,7 +3565,7 @@ impl Cli {
                 verification_note,
             ),
         };
-        self.finish_successful_upgrade(summary, transaction)
+        self.finish_successful_upgrade(operation_lock, summary, transaction)
     }
 
     fn ensure_runtime_upgrade_isolated(
@@ -3684,6 +3724,7 @@ impl Cli {
         transaction._source_runtime_guard = operation_lock.source_runtime.clone();
         if transaction.interrupted() {
             return self.rollback_failed_upgrade(
+                operation_lock,
                 env_name,
                 "launcher",
                 launcher_name.to_string(),
@@ -3702,6 +3743,7 @@ impl Cli {
             Ok(prepared) => prepared,
             Err(error) => {
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "launcher",
                     launcher_name.to_string(),
@@ -3727,6 +3769,7 @@ impl Cli {
             Err(error) => {
                 transaction.mark_post_update_failed(&error);
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "launcher",
                     launcher_name.to_string(),
@@ -3760,6 +3803,7 @@ impl Cli {
         );
         if let Err(error) = publish_result {
             return self.rollback_failed_upgrade(
+                operation_lock,
                 env_name,
                 "launcher",
                 launcher_name.to_string(),
@@ -3782,6 +3826,7 @@ impl Cli {
             Ok(result) => result,
             Err(error) => {
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "launcher",
                     launcher_name.to_string(),
@@ -3827,6 +3872,7 @@ impl Cli {
                     "failed",
                 );
                 return self.rollback_failed_upgrade(
+                    operation_lock,
                     env_name,
                     "launcher",
                     launcher_name.to_string(),
@@ -3861,7 +3907,7 @@ impl Cli {
                 verification_note,
             ),
         };
-        self.finish_successful_upgrade(summary, transaction)
+        self.finish_successful_upgrade(operation_lock, summary, transaction)
     }
 
     fn current_runtime_job_result(
@@ -5000,11 +5046,13 @@ impl Cli {
 
     fn finish_successful_upgrade(
         &self,
+        operation_lock: &UpgradeCommandLocks<'_>,
         summary: UpgradeEnvSummary,
         mut transaction: UpgradeTransaction,
     ) -> Result<UpgradeEnvSummary, String> {
         if transaction.interrupted() {
             return self.rollback_failed_upgrade(
+                operation_lock,
                 &summary.env_name,
                 &summary.previous_binding_kind,
                 summary.previous_binding_name.clone(),
@@ -5020,6 +5068,7 @@ impl Cli {
             self.retain_required_runtime_recovery(&summary.env_name, &mut transaction)
         {
             return self.rollback_failed_upgrade(
+                operation_lock,
                 &summary.env_name,
                 &summary.previous_binding_kind,
                 summary.previous_binding_name.clone(),
@@ -5033,6 +5082,7 @@ impl Cli {
         }
         if let Err(error) = self.record_upgrade_history(&transaction, &summary) {
             return self.rollback_failed_upgrade(
+                operation_lock,
                 &summary.env_name,
                 &summary.previous_binding_kind,
                 summary.previous_binding_name.clone(),
@@ -5046,6 +5096,7 @@ impl Cli {
         }
         if !transaction.close_interrupt_fence_for_commit() {
             return self.rollback_failed_upgrade(
+                operation_lock,
                 &summary.env_name,
                 &summary.previous_binding_kind,
                 summary.previous_binding_name.clone(),
@@ -5311,6 +5362,7 @@ impl Cli {
     #[allow(clippy::too_many_arguments)]
     fn rollback_failed_upgrade(
         &self,
+        operation_lock: &UpgradeCommandLocks<'_>,
         env_name: &str,
         previous_binding_kind: &str,
         previous_binding_name: String,
@@ -5375,7 +5427,8 @@ impl Cli {
             return Ok(summary);
         }
 
-        let rollback_result = self.rollback_upgrade_locked(env_name, &mut transaction);
+        let rollback_result =
+            self.rollback_upgrade_locked(operation_lock, env_name, &mut transaction);
         let rollback_restored = rollback_result.is_ok();
         if let Ok(cleanup_note) = &rollback_result {
             transaction.cleanup_note = cleanup_note.clone();
@@ -5523,6 +5576,7 @@ impl Cli {
 
     fn rollback_upgrade_locked(
         &self,
+        operation_lock: &UpgradeCommandLocks<'_>,
         env_name: &str,
         transaction: &mut UpgradeTransaction,
     ) -> Result<Option<String>, String> {
@@ -5565,8 +5619,8 @@ impl Cli {
                 },
                 transaction.runtime_guard.as_deref(),
             )?;
-        // Keep displaced state until the restored service has recovered. Slow or
-        // failed discard-only cleanup must not extend the outage.
+        // Keep displaced state until the restored binding and service are verified.
+        // Slow or failed discard-only cleanup must not extend the outage.
         let acceptance = (|| {
             if changes_runtime_trees {
                 self.service_service().wait_for_binding_convergence_locked(
@@ -5582,6 +5636,13 @@ impl Cli {
                     .map_err(|error| format!("failed to restart the restored service: {error}"))?;
                 self.wait_for_restarted_gateway_health(env_name, started.desired_running)?;
             }
+            self.verify_upgraded_openclaw(
+                env_name,
+                transaction.source.openclaw_version.as_deref(),
+                transaction.service_before.enabled && transaction.service_before.running,
+                operation_lock,
+            )
+            .map_err(|error| format!("post-rollback verification failed: {error}"))?;
             Ok::<(), String>(())
         })();
         acceptance.map_err(|error| {

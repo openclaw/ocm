@@ -1362,8 +1362,13 @@ fn assert_gateway_verification_rollback(status: &str, expected_error: &str) {
     let (health_port, health_requests, health_stop, health_handle) =
         spawn_converging_health_server();
 
-    let old_tarball =
-        openclaw_package_tarball(&recording_openclaw_script("2026.3.24"), "2026.3.24");
+    // Only the rejected target reports the injected Gateway failure.
+    let source_script = recording_openclaw_script("2026.3.24").replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\nunset OCM_TEST_GATEWAY_STATUS_JSON\n",
+        1,
+    );
+    let old_tarball = openclaw_package_tarball(&source_script, "2026.3.24");
     let old_integrity = sha512_integrity(&old_tarball);
     let old_tarball_server = TestHttpServer::serve_bytes_times(
         "/openclaw-2026.3.24.tgz",
@@ -1918,8 +1923,13 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
 
     let source_version = "2026.8.1";
     let target_version = "2026.8.2";
-    let source_tarball =
-        openclaw_package_tarball(&recording_openclaw_script(source_version), source_version);
+    // The source Gateway is healthy after restoring its binding.
+    let source_script = recording_openclaw_script(source_version).replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\nunset OCM_TEST_GATEWAY_UNREADY\n",
+        1,
+    );
+    let source_tarball = openclaw_package_tarball(&source_script, source_version);
     let source_integrity = sha512_integrity(&source_tarball);
     let source_server = TestHttpServer::serve_bytes_times(
         "/openclaw-2026.8.1.tgz",
@@ -4237,6 +4247,145 @@ fn upgrade_rolls_back_when_post_upgrade_version_verification_fails() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn automatic_rollback_verifies_restored_binding_before_discarding_displaced_state() {
+    for launcher in [false, true] {
+        for failure in ["missing", "unusable", "mismatch", "healthy"] {
+            let root = TestDir::new("automatic-rollback-verification");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let mut env = ocm_env(&root);
+            env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+            install_fake_launchctl(&root, &mut env);
+            let finalized = root.child("finalized");
+            let source = root.child("source-openclaw");
+            let target = root.child("target-openclaw");
+            let changed_source = match failure {
+                "unusable" => "echo 'source unavailable' >&2; exit 42",
+                "mismatch" => "echo 2026.5.1; exit 0",
+                _ => ":",
+            };
+            write_executable_script(
+                &source,
+                &format!(
+                    "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  if [ -e '{}' ]; then {changed_source}; fi\n  echo 2026.6.1\nfi\n",
+                    finalized.display()
+                ),
+            );
+            let remove_source = if failure == "missing" {
+                format!("rm '{}'", source.display())
+            } else {
+                ":".to_string()
+            };
+            write_executable_script(
+                &target,
+                &format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  --version) echo 2026.7.1;;\n  update)\n    if [ \"$2\" = finalize ]; then\n      printf 'candidate state' > \"$OPENCLAW_HOME/recovery-marker\"\n      touch '{}'\n      {remove_source}\n      echo 'forced finalization failure' >&2\n      exit 41\n    fi;;\nesac\n",
+                    finalized.display()
+                ),
+            );
+            let add_source = if launcher {
+                run_ocm(
+                    &cwd,
+                    &env,
+                    &[
+                        "launcher",
+                        "add",
+                        "source",
+                        "--command",
+                        &path_string(&source),
+                    ],
+                )
+            } else {
+                run_ocm(
+                    &cwd,
+                    &env,
+                    &["runtime", "add", "source", "--path", &path_string(&source)],
+                )
+            };
+            assert!(add_source.status.success(), "{}", stderr(&add_source));
+            let add_target = run_ocm(
+                &cwd,
+                &env,
+                &["runtime", "add", "target", "--path", &path_string(&target)],
+            );
+            assert!(add_target.status.success(), "{}", stderr(&add_target));
+            let selector = if launcher { "--launcher" } else { "--runtime" };
+            let create = run_ocm(
+                &cwd,
+                &env,
+                &["env", "create", "demo", selector, "source", "--json"],
+            );
+            assert!(create.status.success(), "{}", stderr(&create));
+            let created: Value = serde_json::from_str(&stdout(&create)).unwrap();
+            let env_root = Path::new(created["root"].as_str().unwrap());
+            write_text(&env_root.join("recovery-marker"), "original state");
+
+            let upgrade = run_ocm(
+                &cwd,
+                &env,
+                &["upgrade", "demo", "--runtime", "target", "--json"],
+            );
+            assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
+            let result: Value = serde_json::from_str(&stdout(&upgrade)).unwrap();
+            let note = result["note"].as_str().unwrap();
+            assert!(note.contains("forced finalization failure"), "{result}");
+            assert_eq!(
+                fs::read_to_string(env_root.join("recovery-marker")).unwrap(),
+                "original state"
+            );
+            let restored = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+            assert!(!restored.service_enabled && !restored.service_running);
+            assert_eq!(
+                if launcher {
+                    restored.default_launcher
+                } else {
+                    restored.default_runtime
+                }
+                .as_deref(),
+                Some("source")
+            );
+            let retained = fs::read_dir(env_root.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"));
+            if failure == "healthy" {
+                assert_eq!(result["outcome"], "rolled-back", "{result}");
+                assert_eq!(result["rollback"], "restored", "{result}");
+                assert!(retained.is_none());
+                let version = run_ocm(&cwd, &env, &["@demo", "--", "--version"]);
+                assert!(version.status.success(), "{}", stderr(&version));
+                assert_eq!(stdout(&version).trim(), "2026.6.1");
+            } else {
+                assert_eq!(result["outcome"], "rollback-failed", "{result}");
+                assert_eq!(result["rollback"], "failed", "{result}");
+                assert!(
+                    note.contains("post-rollback verification failed"),
+                    "{result}"
+                );
+                if failure == "mismatch" {
+                    assert!(note.contains("expected 2026.6.1, got 2026.5.1"), "{result}");
+                }
+                let retained = retained.expect("unaccepted restore must retain displaced state");
+                assert!(note.contains("restore operation retained at"), "{result}");
+                assert_eq!(
+                    fs::read_to_string(retained.path().join("displaced/recovery-marker")).unwrap(),
+                    "candidate state"
+                );
+                let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "demo", "--json"]);
+                assert!(snapshots.status.success(), "{}", stderr(&snapshots));
+                assert!(stdout(&snapshots).contains(result["snapshotId"].as_str().unwrap()));
+            }
+            let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+            assert!(history.status.success(), "{}", stderr(&history));
+            let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
+            assert_eq!(history[0]["outcome"], result["outcome"]);
+            assert_eq!(history[0]["rollback"], result["rollback"]);
+        }
+    }
+}
+
 #[test]
 fn upgrade_reports_pinned_envs_without_moving_them() {
     let root = TestDir::new("upgrade-pinned");
@@ -4708,6 +4857,8 @@ fn upgrade_version_children_retain_exclusion_after_parent_death() {
         ("rollback-source-version", false),
         ("rollback-source-version", true),
         ("rollback-version", true),
+        ("automatic-rollback-version", false),
+        ("automatic-rollback-version", true),
     ] {
         assert_upgrade_child_custody(phase, false, launcher);
     }
@@ -4783,10 +4934,11 @@ if [ -n "$OCM_CUSTODY_PHASE" ] && [ "$1" = "--version" ]; then
   count=$((count + 1))
   printf '%s' "$count" > "$gate.count"
   case "$OCM_CUSTODY_PHASE:$count" in
-    target-version:1|current-version:2|version:3|rollback-target-version:1|rollback-source-version:2|rollback-version:3) probe=version;;
+    target-version:1|current-version:2|version:3|rollback-target-version:1|rollback-source-version:2|rollback-version:3|automatic-rollback-version:3) probe=version;;
   esac
 fi
 case "$OCM_CUSTODY_PHASE:$1:$2:$probe" in
+  automatic-rollback-version:update:finalize:) echo 'forced finalization failure' >&2; exit 41;;
   *:--version:*:version|doctor:doctor:--non-interactive:|finalize:update:finalize:|status:gateway:status:|rollback-status:gateway:status:)
   gate="$OCM_CUSTODY_GATES/$OCM_ACTIVE_ENV"
   printf '%s' "$$" > "$gate.started"

@@ -580,6 +580,10 @@ the environment. Per-environment upgrade history records only cleanup diagnostic
 excluding general child output. Fleet batch journals retain the same bounded,
 redacted result notes shown by the batch command.
 
+Automatic rollback verifies that the restored binding executes and, when the original version is known, reports that version before accepting recovery.
+Previously running services must also pass Gateway verification; stopped services remain stopped.
+A failed verification retains the displaced environment state and reports its restore-operation location.
+
 If automatic rollback or recovery from a failed explicit rollback cannot finish, OCM preserves the previous managed runtime files along with the existing safety snapshot.
 The result remains `rollback-failed` and prints the retained file location; it does not certify restored configuration, runtime, or service health.
 Inspect `ocm upgrade history <env> --json` for the transaction's snapshot and runtime recovery metadata.
