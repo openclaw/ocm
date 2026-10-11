@@ -928,18 +928,19 @@ fn adopt_import_copies_an_external_workspace_into_the_disposable_environment() {
     let cwd = root.child("workspace");
     let source_home = root.child("legacy-home/.openclaw");
     let external = root.child("external-workspace");
+    let agent_external = root.child("agent-workspace");
+    fs::create_dir_all(&agent_external).unwrap();
+    fs::write(agent_external.join("notes.txt"), "agent data\n").unwrap();
     fs::create_dir_all(&cwd).unwrap();
     fs::create_dir_all(&source_home).unwrap();
     fs::create_dir_all(&external).unwrap();
     fs::write(external.join("notes.txt"), "external data\n").unwrap();
-    fs::write(
-        source_home.join("openclaw.json"),
-        format!(
-            r#"{{"agents":{{"defaults":{{"workspace":"{}"}}}}}}"#,
-            external.display()
-        ),
-    )
-    .unwrap();
+    let source_config = serde_json::json!({"agents": {
+        "defaults": {"workspace": external},
+        "list": [{"id": "ops", "workspace": agent_external}]
+    }})
+    .to_string();
+    fs::write(source_home.join("openclaw.json"), &source_config).unwrap();
     let mut env = ocm_env(&root);
     install_fake_openclaw_on_path(&root, &mut env);
 
@@ -975,11 +976,151 @@ fn adopt_import_copies_an_external_workspace_into_the_disposable_environment() {
     );
     assert_eq!(
         fs::read_to_string(source_home.join("openclaw.json")).unwrap(),
-        format!(
-            r#"{{"agents":{{"defaults":{{"workspace":"{}"}}}}}}"#,
-            external.display()
-        )
+        source_config
     );
+    let imported_agent = root.child("ocm-home/envs/mira/.openclaw/workspaces/agents/ops");
+    assert_eq!(
+        fs::read_to_string(imported_agent.join("notes.txt")).unwrap(),
+        "agent data\n"
+    );
+    assert_eq!(
+        imported_config["agents"]["list"][0]["workspace"].as_str(),
+        Some(imported_agent.to_str().unwrap())
+    );
+    fs::write(imported_workspace.join("notes.txt"), "target changed\n").unwrap();
+    fs::write(imported_agent.join("notes.txt"), "target agent changed\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(external.join("notes.txt")).unwrap(),
+        "external data\n"
+    );
+    assert_eq!(
+        fs::read_to_string(agent_external.join("notes.txt")).unwrap(),
+        "agent data\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_rejects_copied_workspace_destination_links_without_changing_originals() {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    fn inventory(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, path: &Path, result: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            let value = if metadata.file_type().is_symlink() {
+                format!("link:{}", fs::read_link(path).unwrap().display()).into_bytes()
+            } else if metadata.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    visit(root, &entry.unwrap().path(), result);
+                }
+                b"directory".to_vec()
+            } else {
+                fs::read(path).unwrap()
+            };
+            result.insert(path.strip_prefix(root).unwrap().to_path_buf(), value);
+        }
+        let mut result = BTreeMap::new();
+        visit(root, root, &mut result);
+        result
+    }
+
+    for agent in [false, true] {
+        for layout in ["parent", "workspace", "nested", "file", "dangling"] {
+            let root = TestDir::new("migrate-copied-workspace-destination-link");
+            let cwd = root.child("cwd");
+            let source = root.child("plain-home");
+            let selected = root.child("selected");
+            let unrelated = root.child("unrelated");
+            for path in [
+                &cwd,
+                &source.join("workspace"),
+                &selected.join("nested"),
+                &unrelated,
+            ] {
+                fs::create_dir_all(path).unwrap();
+            }
+            fs::write(selected.join("notes.txt"), "selected payload\n").unwrap();
+            fs::write(
+                selected.join("nested/notes.txt"),
+                "nested selected payload\n",
+            )
+            .unwrap();
+            fs::write(unrelated.join("notes.txt"), "unrelated payload\n").unwrap();
+            let destination = if agent {
+                "workspaces/agents/ops"
+            } else {
+                "workspaces/default"
+            };
+            let link = source.join(match layout {
+                "parent" => {
+                    if agent {
+                        "workspaces/agents"
+                    } else {
+                        "workspaces"
+                    }
+                }
+                _ => destination,
+            });
+            let link = match layout {
+                "nested" => link.join("nested"),
+                "file" | "dangling" => link.join("notes.txt"),
+                _ => link,
+            };
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            let link_target = match layout {
+                "file" => unrelated.join("notes.txt"),
+                "dangling" => unrelated.join("missing.txt"),
+                _ => unrelated.clone(),
+            };
+            std::os::unix::fs::symlink(&link_target, &link).unwrap();
+            let config = if agent {
+                serde_json::json!({"agents": {"defaults": {"workspace": source.join("workspace")}, "list": [{"id": "ops", "workspace": selected}]}})
+            } else {
+                serde_json::json!({"agents": {"defaults": {"workspace": selected}}})
+            };
+            fs::write(
+                source.join("openclaw.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let before = [
+                inventory(&source),
+                inventory(&selected),
+                inventory(&unrelated),
+            ];
+            let env = ocm_env(&root);
+            let output = run_ocm(
+                &cwd,
+                &env,
+                &["migrate", "mira", source.to_str().unwrap(), "--json"],
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "agent={agent}, layout={layout}"
+            );
+            assert!(
+                stderr(&output).contains("copied destination symlink"),
+                "{}",
+                stderr(&output)
+            );
+            assert_eq!(
+                before,
+                [
+                    inventory(&source),
+                    inventory(&selected),
+                    inventory(&unrelated)
+                ],
+                "agent={agent}, layout={layout}"
+            );
+            assert!(!root.child("ocm-home/envs/mira").exists());
+            let registry: serde_json::Value =
+                serde_json::from_slice(&fs::read(root.child("ocm-home/envs.json")).unwrap())
+                    .unwrap();
+            assert_eq!(registry["envs"], serde_json::json!([]));
+        }
+    }
 }
 
 #[cfg(unix)]

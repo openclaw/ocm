@@ -123,6 +123,28 @@ impl ExternalWorkspaceCopyPlan {
     }
 
     fn copy_and_rewrite_config(&self, config_path: &Path) -> Result<(), String> {
+        // The home copy preserves symlinks. Admit every overlay before any workspace
+        // copy can follow a link copied into one of its destinations.
+        let state_dir = config_path
+            .parent()
+            .ok_or("missing imported state directory")?;
+        for workspace in self
+            .default_workspace
+            .iter()
+            .chain(self.agent_workspaces.values())
+        {
+            let relative = workspace
+                .target
+                .strip_prefix(state_dir)
+                .map_err(|error| error.to_string())?;
+            let mut parent = state_dir.to_path_buf();
+            reject_workspace_destination_link(&parent)?;
+            for component in relative.components() {
+                parent.push(component);
+                reject_workspace_destination_link(&parent)?;
+            }
+            reject_workspace_copy_destination_links(&workspace.source, &workspace.target)?;
+        }
         remove_copied_external_default_workspace_link(config_path)?;
         if let Some(workspace) = &self.default_workspace {
             copy_dir_recursive(&workspace.source, &workspace.target)?;
@@ -144,6 +166,38 @@ impl ExternalWorkspaceCopyPlan {
         )?;
         Ok(())
     }
+}
+
+fn reject_workspace_destination_link(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "cannot copy external OpenClaw workspace through a copied destination symlink: {}",
+            display_path(path)
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to inspect imported workspace destination {}: {error}",
+            display_path(path)
+        )),
+    }
+}
+
+fn reject_workspace_copy_destination_links(source: &Path, target: &Path) -> Result<(), String> {
+    reject_workspace_destination_link(target)?;
+    // A missing destination has no copied entries for this overlay to follow.
+    if !target.is_dir()
+        || !fs::symlink_metadata(source)
+            .map_err(|error| error.to_string())?
+            .is_dir()
+    {
+        return Ok(());
+    }
+    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        reject_workspace_copy_destination_links(&entry.path(), &target.join(entry.file_name()))?;
+    }
+    Ok(())
 }
 
 fn remove_copied_external_default_workspace_link(config_path: &Path) -> Result<(), String> {
