@@ -359,9 +359,11 @@ Manual snapshot restore also keeps their current runtime/launcher binding;
 upgrade rollback restores the recorded runtime/launcher instead.
 Once an environment is bound to a runtime, direct `runtime update`,
 `runtime install --force`, `runtime build-local --force`, and `runtime remove`
-operations reject that runtime. Use `ocm upgrade <env>` so the environment gets
-the snapshot, OpenClaw migration, rollback, and verification path, or clear the
-binding first when intentionally managing an unused runtime.
+operations reject that runtime.
+This also protects managed files used through a registered runtime alias, even while the environment is stopped.
+An in-place upgrade or rollback refuses when another environment depends on those files through an alias.
+Use `ocm upgrade <env>` so the environment gets the snapshot, OpenClaw migration, rollback, and verification path, or clear the binding first when intentionally managing an unused runtime.
+An idle alias with no environment binding still permits replacement or removal of its backing runtime.
 
 Runtime package and companion installation preserves the caller's npm settings,
 including script policy and home-relative configuration. OpenClaw lifecycle

@@ -4145,6 +4145,124 @@ fn runtime_install_force_rejects_replacing_a_bound_runtime() {
     assert!(!install_root.join("files/openclaw-replacement").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn runtime_mutations_preserve_bound_aliases_and_allow_unrelated_or_idle_aliases() {
+    let root = TestDir::new("runtime-bound-alias");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let original = root.child("original/openclaw");
+    let replacement = root.child("replacement/openclaw");
+    write_executable_script(&original, "#!/bin/sh\nprintf '2026.7.1\\n'\n");
+    write_executable_script(&replacement, "#!/bin/sh\nprintf '2026.8.1\\n'\n");
+    let env = ocm_env(&root);
+    let run = |args: &[&str]| run_ocm(&cwd, &env, args);
+    let install = run(&[
+        "runtime",
+        "install",
+        "backing",
+        "--path",
+        &path_string(&original),
+        "--json",
+    ]);
+    assert!(install.status.success(), "{}", stderr(&install));
+    let meta: Value = serde_json::from_str(&stdout(&install)).unwrap();
+    let executable = Path::new(meta["binaryPath"].as_str().unwrap());
+    let add = run(&[
+        "runtime",
+        "add",
+        "selected",
+        "--path",
+        &path_string(executable),
+    ]);
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run(&["env", "create", "demo", "--runtime", "selected"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let version = run(&["@demo", "--", "--version"]);
+    assert!(version.status.success(), "{}", stderr(&version));
+    assert_eq!(stdout(&version).trim(), "2026.7.1");
+    let before = run(&["env", "show", "demo", "--json"]);
+    assert!(before.status.success(), "{}", stderr(&before));
+    let runtime_before = fs::read(runtime_meta_path("backing", &env, &cwd).unwrap()).unwrap();
+    let original_bytes = fs::read(executable).unwrap();
+    let replacement_path = path_string(&replacement);
+    for args in [
+        vec![
+            "runtime",
+            "install",
+            "backing",
+            "--path",
+            &replacement_path,
+            "--force",
+        ],
+        vec!["runtime", "remove", "backing"],
+        vec!["runtime", "update", "backing"],
+        vec![
+            "runtime",
+            "build-local",
+            "backing",
+            "--repo",
+            "missing-repo",
+            "--force",
+        ],
+    ] {
+        let mutation = run(&args);
+        assert_eq!(mutation.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr(&mutation)
+                .contains("runtime \"backing\" is still used by environment(s): \"demo\""),
+            "{}",
+            stderr(&mutation)
+        );
+        assert_eq!(fs::read(executable).unwrap(), original_bytes);
+        assert_eq!(
+            fs::read(runtime_meta_path("backing", &env, &cwd).unwrap()).unwrap(),
+            runtime_before
+        );
+        let after = run(&["env", "show", "demo", "--json"]);
+        assert!(after.status.success(), "{}", stderr(&after));
+        assert_eq!(stdout(&after), stdout(&before));
+    }
+    let version = run(&["@demo", "--", "--version"]);
+    assert!(version.status.success(), "{}", stderr(&version));
+    assert_eq!(stdout(&version).trim(), "2026.7.1");
+
+    // A stale external registration must not prevent unrelated mutations.
+    let stale = run(&["runtime", "add", "stale", "--path", &path_string(&original)]);
+    assert!(stale.status.success(), "{}", stderr(&stale));
+    let peer = run(&["env", "create", "peer", "--runtime", "stale"]);
+    assert!(peer.status.success(), "{}", stderr(&peer));
+    let peer_before = run(&["env", "show", "peer", "--json"]);
+    assert!(peer_before.status.success(), "{}", stderr(&peer_before));
+    fs::remove_file(&original).unwrap();
+    let other = run(&["runtime", "install", "other", "--path", &replacement_path]);
+    assert!(other.status.success(), "{}", stderr(&other));
+    let remove_other = run(&["runtime", "remove", "other"]);
+    assert!(remove_other.status.success(), "{}", stderr(&remove_other));
+    let peer_after = run(&["env", "show", "peer", "--json"]);
+    assert!(peer_after.status.success(), "{}", stderr(&peer_after));
+    assert_eq!(stdout(&peer_after), stdout(&peer_before));
+
+    let clear = run(&["env", "set-runtime", "demo", "none"]);
+    assert!(clear.status.success(), "{}", stderr(&clear));
+    let replace = run(&[
+        "runtime",
+        "install",
+        "backing",
+        "--path",
+        &replacement_path,
+        "--force",
+    ]);
+    assert!(replace.status.success(), "{}", stderr(&replace));
+    assert_eq!(
+        fs::read(executable).unwrap(),
+        fs::read(&replacement).unwrap()
+    );
+    let remove = run(&["runtime", "remove", "backing"]);
+    assert!(remove.status.success(), "{}", stderr(&remove));
+    assert!(!executable.exists());
+}
+
 #[test]
 fn runtime_install_force_preserves_existing_runtime_when_replacement_fails() {
     let root = TestDir::new("runtime-install-force-rollback");

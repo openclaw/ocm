@@ -721,7 +721,7 @@ pub fn upgrade_help(cmd: &str) -> String {
             "Post-update checks run update-mode doctor, plugin update dry-run, and gateway status.",
             "Channel-tracked runtimes move forward automatically.",
             "When current and target OpenClaw versions are known, older targets are rejected before snapshot creation or runtime mutation because config and SQLite state migrations cannot be reversed by switching binaries.",
-            "An env upgrade will not replace runtime bytes shared with another env; use --runtime to reuse those bytes or an exact --version for an isolated target.",
+            "An env upgrade will not replace runtime bytes used by another env, including through a registered alias; use --runtime to reuse those bytes or an exact --version for an isolated target.",
             "New bindings to a runtime being upgraded are busy until finalization, verification, and recovery finish; retry afterward. This also covers registered aliases of managed executable paths. Unrelated runtimes remain usable.",
             "Upgrades create a pre-upgrade snapshot before changing env state.",
             "No-target source upgrades keep the launcher binding and use native update --no-restart on Linux/macOS when native source artifact observations are available; older or opaque launchers remain local-command.",
@@ -2152,7 +2152,7 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
                 "Each `--companion` uses OpenClaw's package-local plugin release build, requires exact host-version parity, installs dependencies in an isolated plugin tree, and records artifact and entrypoint hashes.",
                 "The resulting runtime is installed under OCM's package runtime layout: files/node_modules/openclaw/openclaw.mjs.",
                 "Use this when testing release and upgrade behavior from a local checkout without source/Jiti execution paths.",
-                "A runtime bound to an environment cannot be replaced directly. Clear the binding first or use `ocm upgrade <env>` for published OpenClaw releases.",
+                "A runtime used by an environment, directly or through a registered alias, cannot be replaced directly. Clear dependent bindings first or use `ocm upgrade <env>` for published OpenClaw releases.",
             ],
         ),
         "update" => render_leaf(
@@ -2183,7 +2183,7 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} runtime update --all"),
             ],
             &[
-                "Direct updates are limited to unbound runtimes because they do not snapshot or migrate environment state.",
+                "Direct updates refuse runtimes used by environments, including through registered aliases, because they do not snapshot or migrate environment state.",
                 "Use `ocm upgrade <env>` to update OpenClaw for a bound environment. `--all` reports bound runtimes as failed without changing them.",
             ],
         ),
@@ -2294,7 +2294,9 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
                 ("--json", "Print the removed runtime record as JSON"),
             ],
             vec![format!("{cmd} runtime remove stable")],
-            &["Clear every environment binding before removing a runtime."],
+            &[
+                "Clear every environment binding that uses the runtime or a registered alias to its managed files before removal.",
+            ],
         ),
         _ => return None,
     })

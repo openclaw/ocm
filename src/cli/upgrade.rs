@@ -3572,15 +3572,11 @@ impl Cli {
         env_name: &str,
         runtime_name: &str,
     ) -> Result<(), String> {
+        let mut environments = self.environment_service().list()?;
+        environments.retain(|env| env.name != env_name);
         let mut siblings = self
-            .environment_service()
-            .list()?
-            .into_iter()
-            .filter(|env| {
-                env.name != env_name && env.default_runtime.as_deref() == Some(runtime_name)
-            })
-            .map(|env| env.name)
-            .collect::<Vec<_>>();
+            .runtime_service()
+            .bound_environment_names(runtime_name, &environments)?;
         if siblings.is_empty() {
             return Ok(());
         }

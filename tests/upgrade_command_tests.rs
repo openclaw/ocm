@@ -2276,6 +2276,15 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
 
 #[test]
 fn upgrade_rejects_mutating_a_runtime_shared_with_another_env() {
+    assert_shared_runtime_upgrade_refused(false);
+}
+
+#[test]
+fn upgrade_rejects_mutating_a_runtime_used_through_a_sibling_alias() {
+    assert_shared_runtime_upgrade_refused(true);
+}
+
+fn assert_shared_runtime_upgrade_refused(alias: bool) {
     let root = TestDir::new("upgrade-shared-runtime");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -2328,16 +2337,51 @@ fn upgrade_rejects_mutating_a_runtime_shared_with_another_env() {
         packument_server.url(),
     );
 
-    for name in ["primary", "sibling"] {
-        let start = run_ocm(&cwd, &env, &["start", name, "--no-service"]);
+    let start = run_ocm(&cwd, &env, &["start", "primary", "--no-service"]);
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    if alias {
+        let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
+        assert!(runtime.status.success(), "{}", stderr(&runtime));
+        let meta: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                "selected",
+                "--path",
+                meta["binaryPath"].as_str().unwrap(),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "sibling", "--runtime", "selected"],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+    } else {
+        let start = run_ocm(&cwd, &env, &["start", "sibling", "--no-service"]);
         assert!(start.status.success(), "{}", stderr(&start));
     }
+    let sibling_before = run_ocm(&cwd, &env, &["env", "show", "sibling", "--json"]);
+    assert!(
+        sibling_before.status.success(),
+        "{}",
+        stderr(&sibling_before)
+    );
 
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "primary"]);
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
     let error = stderr(&upgrade);
     assert!(error.contains("runtime \"stable\" is shared"), "{error}");
     assert!(error.contains("\"sibling\""), "{error}");
+
+    let sibling_after = run_ocm(&cwd, &env, &["env", "show", "sibling", "--json"]);
+    assert!(sibling_after.status.success(), "{}", stderr(&sibling_after));
+    assert_eq!(stdout(&sibling_after), stdout(&sibling_before));
 
     let runtime = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
     assert!(runtime.status.success(), "{}", stderr(&runtime));
@@ -6425,14 +6469,60 @@ fn upgrade_rollback_refuses_drifted_target_version_before_mutation() {
 
 #[test]
 fn upgrade_rollback_refuses_to_replace_a_runtime_shared_after_upgrade() {
+    assert_shared_runtime_rollback_refused(false);
+}
+
+#[test]
+fn upgrade_rollback_refuses_to_replace_a_runtime_used_through_a_sibling_alias() {
+    assert_shared_runtime_rollback_refused(true);
+}
+
+fn assert_shared_runtime_rollback_refused(alias: bool) {
     let root = TestDir::new("upgrade-explicit-rollback-shared-runtime");
     let fixture = seed_in_place_rollback(&root, "2026.6.11");
+    if alias {
+        let runtime = run_ocm(
+            &fixture.cwd,
+            &fixture.env,
+            &["runtime", "show", "stable", "--json"],
+        );
+        assert!(runtime.status.success(), "{}", stderr(&runtime));
+        let meta: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
+        let add = run_ocm(
+            &fixture.cwd,
+            &fixture.env,
+            &[
+                "runtime",
+                "add",
+                "selected",
+                "--path",
+                meta["binaryPath"].as_str().unwrap(),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
     let sibling = run_ocm(
         &fixture.cwd,
         &fixture.env,
-        &["env", "create", "sibling", "--runtime", "stable"],
+        &[
+            "env",
+            "create",
+            "sibling",
+            "--runtime",
+            if alias { "selected" } else { "stable" },
+        ],
     );
     assert!(sibling.status.success(), "{}", stderr(&sibling));
+    let sibling_before = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["env", "show", "sibling", "--json"],
+    );
+    assert!(
+        sibling_before.status.success(),
+        "{}",
+        stderr(&sibling_before)
+    );
 
     let rollback = run_ocm(
         &fixture.cwd,
@@ -6445,6 +6535,14 @@ fn upgrade_rollback_refuses_to_replace_a_runtime_shared_after_upgrade() {
         "{}",
         stderr(&rollback)
     );
+    let sibling_after = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["env", "show", "sibling", "--json"],
+    );
+    assert!(sibling_after.status.success(), "{}", stderr(&sibling_after));
+    assert_eq!(stdout(&sibling_after), stdout(&sibling_before));
+
     assert_eq!(
         fs::read_to_string(&fixture.marker).unwrap(),
         "after-upgrade"

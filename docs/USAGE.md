@@ -318,6 +318,12 @@ now fail with a size-limit error. Rejection happens before runtime replacement
 and preserves the installed runtime's files and metadata; reduce the manifest
 size before retrying an update.
 
+Direct runtime replacement, update, local rebuild, and removal refuse when an environment uses that runtime or a registered alias to its managed files.
+The environment can be stopped: its persistent binding still protects the executable.
+Per-environment upgrades and rollbacks apply the same dependency check to sibling environments before changing runtime bytes.
+Use an isolated release for an independent upgrade, or clear dependent bindings before intentionally replacing an unused runtime.
+An idle unbound alias does not prevent mutation, and unrelated runtimes remain usable even when another registered executable is missing.
+
 ### Use `launcher` when you want a command recipe
 
 Examples:
