@@ -6,11 +6,8 @@ use std::fs;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(unix)]
 use std::process::Stdio;
-#[cfg(unix)]
 use std::thread::sleep;
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use ocm::env::{EnvDevMeta, EnvMeta};
@@ -18,8 +15,8 @@ use ocm::store::{get_environment, save_environment};
 
 use crate::support::{
     TestDir, create_owned_dev_env, create_owned_dev_env_at_root, dev_plain,
-    managed_service_definition_path, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script,
+    hold_environment_operation, managed_service_definition_path, ocm_env, path_string, run_ocm,
+    stderr, stdout, write_executable_script,
 };
 
 fn install_fake_launchctl(root: &TestDir, env: &mut BTreeMap<String, String>) {
@@ -231,6 +228,161 @@ fn wait_for_listener_port(
     }
     let log = fs::read_to_string(log_path).unwrap_or_default();
     panic!("listener did not report a bound port in time; {log}");
+}
+
+#[test]
+fn env_prune_revalidates_candidates_after_waiting_for_operation_locks() {
+    struct PendingPrune(Option<std::process::Child>);
+    impl Drop for PendingPrune {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    for case in [
+        "used",
+        "recreated-same-root",
+        "recreated-other-root",
+        "recreated-still-old",
+        "unchanged",
+        "protected",
+        "removed",
+    ] {
+        let root = TestDir::new(&format!("env-prune-revalidate-{case}"));
+        let cwd = root.path();
+        let env = ocm_env(&root);
+        for name in ["a-progress", "b-blocker", "c-target"] {
+            let created = run_ocm(cwd, &env, &["env", "create", name]);
+            assert!(created.status.success(), "{case}: {}", stderr(&created));
+            let mut meta = get_environment(name, &env, cwd).unwrap();
+            meta.created_at -= time::Duration::days(30);
+            save_environment(meta, &env, cwd).unwrap();
+        }
+        let original = get_environment("c-target", &env, cwd).unwrap();
+        let lock = hold_environment_operation(&root, "b-blocker");
+        let mut prune = PendingPrune(Some(
+            Command::new(env!("CARGO_BIN_EXE_ocm"))
+                .current_dir(cwd)
+                .env_clear()
+                .envs(&env)
+                .args(["env", "prune", "--older-than", "14", "--yes", "--json"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        ));
+        // The first removal proves selection completed before the mutation.
+        // The second candidate's held lock keeps prune from reaching the target.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while get_environment("a-progress", &env, cwd).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "{case}: prune never reached the blocker"
+            );
+            assert!(prune.0.as_mut().unwrap().try_wait().unwrap().is_none());
+            sleep(Duration::from_millis(20));
+        }
+        assert!(prune.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert!(get_environment("b-blocker", &env, cwd).is_ok());
+
+        let mut target_root = PathBuf::from(&original.root);
+        match case {
+            "used" => {
+                let used = run_ocm(cwd, &env, &["env", "use", "c-target", "--shell", "bash"]);
+                assert!(used.status.success(), "{}", stderr(&used));
+            }
+            "recreated-same-root" | "recreated-other-root" | "recreated-still-old" | "removed" => {
+                let removed = run_ocm(cwd, &env, &["env", "remove", "c-target"]);
+                assert!(removed.status.success(), "{}", stderr(&removed));
+                if case != "removed" {
+                    if case == "recreated-other-root" {
+                        target_root = root.child("replacement");
+                    }
+                    let created = run_ocm(
+                        cwd,
+                        &env,
+                        &[
+                            "env",
+                            "create",
+                            "c-target",
+                            "--root",
+                            &path_string(&target_root),
+                        ],
+                    );
+                    assert!(created.status.success(), "{}", stderr(&created));
+                    if case == "recreated-still-old" {
+                        // Isolate identity from age: even an eligible replacement
+                        // must not inherit the previous instance's admission.
+                        let mut replacement = get_environment("c-target", &env, cwd).unwrap();
+                        replacement.created_at = original.created_at + time::Duration::seconds(1);
+                        save_environment(replacement, &env, cwd).unwrap();
+                    }
+                }
+            }
+            "protected" => {
+                let protected = run_ocm(cwd, &env, &["env", "protect", "c-target", "on"]);
+                assert!(protected.status.success(), "{}", stderr(&protected));
+            }
+            "unchanged" => {}
+            _ => unreachable!(),
+        }
+        let canary = target_root.join("canary.txt");
+        if case != "removed" {
+            fs::write(&canary, "current environment data").unwrap();
+        }
+        fs2::FileExt::unlock(&lock).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while prune.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "{case}: prune did not finish");
+            sleep(Duration::from_millis(20));
+        }
+        let output = prune.0.take().unwrap().wait_with_output().unwrap();
+        if case == "protected" || case == "removed" {
+            assert!(!output.status.success(), "{case}: {}", stdout(&output));
+            let expected = if case == "protected" {
+                "is protected"
+            } else {
+                "does not exist"
+            };
+            assert!(
+                stderr(&output).contains(expected),
+                "{case}: {}",
+                stderr(&output)
+            );
+        } else {
+            assert!(output.status.success(), "{case}: {}", stderr(&output));
+            let result: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+            let expected = if case == "unchanged" {
+                vec!["a-progress", "b-blocker", "c-target"]
+            } else {
+                vec!["a-progress", "b-blocker"]
+            };
+            let names: Vec<_> = result["removed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, expected, "{case}");
+            assert_eq!(result["count"], expected.len(), "{case}");
+        }
+        assert!(get_environment("b-blocker", &env, cwd).is_err());
+        if case == "unchanged" || case == "removed" {
+            assert!(get_environment("c-target", &env, cwd).is_err());
+            assert!(!target_root.exists());
+        } else {
+            assert!(get_environment("c-target", &env, cwd).is_ok());
+            assert_eq!(
+                fs::read_to_string(canary).unwrap(),
+                "current environment data",
+                "{case}"
+            );
+        }
+    }
 }
 
 #[test]

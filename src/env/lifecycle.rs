@@ -537,9 +537,19 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn prune(&self, older_than_days: i64) -> Result<Vec<EnvMeta>, String> {
         let candidates = self.prune_candidates(older_than_days)?;
+        let cutoff = now_utc() - Duration::days(older_than_days);
         let mut removed = Vec::with_capacity(candidates.len());
         for meta in candidates {
             let _lock = self.lock_operation(&meta.name)?;
+            let current = self.get(&meta.name)?;
+            // Waiting for an earlier candidate can outlive use or replacement
+            // of this name. Keep admission and removal under the same lock.
+            if current.root != meta.root
+                || current.created_at != meta.created_at
+                || current.last_used_at.unwrap_or(current.created_at) >= cutoff
+            {
+                continue;
+            }
             removed.push(self.remove_locked(&meta.name, false)?);
         }
         Ok(removed)
