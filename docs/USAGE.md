@@ -542,6 +542,10 @@ Final verification compares the running command with the named runtime version d
 A mismatch fails the upgrade.
 When automatic rollback is enabled, recovery is reported as restored only after the previous binding passes verification.
 
+A named target remains protected from OCM runtime replacement or removal from resolution through upgrade completion or recovery.
+Existing shared readers and unrelated runtime mutations can continue.
+On Unix, native upgrade commands retain this protection if they outlive the OCM parent, until those commands exit.
+
 On Linux and macOS, a no-target upgrade can update a recognized `pnpm openclaw` or `node <checkout>/openclaw.mjs` checkout in place while keeping its launcher binding.
 On Unix, literal single- or double-quoted paths can contain spaces, including aliases to a source checkout.
 Quoted characters such as `#` and `&` are recognized as path data, and single quotes also preserve literal `$` and backtick characters.

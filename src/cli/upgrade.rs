@@ -60,19 +60,28 @@ pub(super) const UPGRADE_DRY_RUN_NOTES: [&str; 4] = [
     "use ocm upgrade simulate for isolated checks",
 ];
 
+#[derive(Clone)]
 struct UpgradeCommandLocks<'a> {
     environment: &'a EnvironmentOperationLock,
     runtime: Option<Arc<RuntimeMutationGuard>>,
     source_runtime: Option<Arc<RuntimeBindingGuard>>,
+    target_runtime: Option<Arc<RuntimeBindingGuard>>,
 }
 
 impl<'a> UpgradeCommandLocks<'a> {
     fn with_runtime(&self, runtime: Option<Arc<RuntimeMutationGuard>>) -> UpgradeCommandLocks<'a> {
-        UpgradeCommandLocks {
-            environment: self.environment,
-            runtime,
-            source_runtime: self.source_runtime.clone(),
-        }
+        let mut locks = self.clone();
+        locks.runtime = runtime;
+        locks
+    }
+
+    fn with_target_runtime(
+        &self,
+        runtime: Option<Arc<RuntimeBindingGuard>>,
+    ) -> UpgradeCommandLocks<'a> {
+        let mut locks = self.clone();
+        locks.target_runtime = runtime;
+        locks
     }
 
     fn with_source_runtime(
@@ -96,6 +105,9 @@ impl<'a> UpgradeCommandLocks<'a> {
         }
         if let Some(source_runtime) = &self.source_runtime {
             source_runtime.retain_for_child(&mut command);
+        }
+        if let Some(target_runtime) = &self.target_runtime {
+            target_runtime.retain_for_child(&mut command);
         }
         self.environment.output(command)
     }
@@ -334,6 +346,7 @@ struct ResolvedUpgradeTarget {
     release_version: Option<String>,
     release_channel: Option<String>,
     kind: ResolvedUpgradeTargetKind,
+    named_runtime_guard: Option<Arc<RuntimeBindingGuard>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1211,6 +1224,7 @@ impl Cli {
                 environment,
                 runtime: None,
                 source_runtime: None,
+                target_runtime: None,
             });
         let plan =
             self.prepare_upgrade_rollback(env_name, transaction_id, command_locks.as_ref())?;
@@ -1509,6 +1523,7 @@ impl Cli {
         )?;
         transaction.runtime_guard = operation_lock.runtime.clone();
         transaction._source_runtime_guard = operation_lock.source_runtime.clone();
+        transaction._target_runtime_guard = operation_lock.target_runtime.clone();
         if transaction.interrupted() {
             return Ok(self.fail_upgrade_rollback_locked(
                 operation_lock,
@@ -2564,6 +2579,7 @@ impl Cli {
             environment: operation_lock,
             runtime: None,
             source_runtime: None,
+            target_runtime: None,
         };
         let operation_lock = &command_locks;
         if !options.dry_run {
@@ -2610,6 +2626,9 @@ impl Cli {
 
         if target.is_explicit() {
             let resolved = self.resolve_upgrade_target(target)?;
+            let command_locks =
+                operation_lock.with_target_runtime(resolved.named_runtime_guard.clone());
+            let operation_lock = &command_locks;
             let target_runtime_name = resolved.name.clone();
             let target_version =
                 self.resolved_target_version(env_name, &resolved, operation_lock)?;
@@ -2677,6 +2696,7 @@ impl Cli {
             };
             let command_locks = operation_lock
                 .with_runtime(prepared.runtime_guard.clone())
+                .with_target_runtime(prepared.named_runtime_guard.clone())
                 .with_source_runtime(&current.name, &self.env, &self.cwd)?;
             let operation_lock = &command_locks;
             timings.finish(
@@ -2720,6 +2740,7 @@ impl Cli {
             )?;
             transaction.runtime_guard = operation_lock.runtime.clone();
             transaction._source_runtime_guard = operation_lock.source_runtime.clone();
+            transaction._target_runtime_guard = operation_lock.target_runtime.clone();
             if transaction.interrupted() {
                 return self.rollback_failed_upgrade(
                     operation_lock,
@@ -3031,6 +3052,7 @@ impl Cli {
             };
             let command_locks = operation_lock
                 .with_runtime(prepared.runtime_guard.clone())
+                .with_target_runtime(prepared.named_runtime_guard.clone())
                 .with_source_runtime(&current.name, &self.env, &self.cwd)?;
             let operation_lock = &command_locks;
             timings.finish(
@@ -3077,6 +3099,7 @@ impl Cli {
             )?;
             transaction.runtime_guard = operation_lock.runtime.clone();
             transaction._source_runtime_guard = operation_lock.source_runtime.clone();
+            transaction._target_runtime_guard = operation_lock.target_runtime.clone();
             if transaction.interrupted() {
                 return self.rollback_failed_upgrade(
                     operation_lock,
@@ -3384,6 +3407,7 @@ impl Cli {
         )?;
         transaction.runtime_guard = operation_lock.runtime.clone();
         transaction._source_runtime_guard = operation_lock.source_runtime.clone();
+        transaction._target_runtime_guard = operation_lock.target_runtime.clone();
         if transaction.interrupted() {
             return self.rollback_failed_upgrade(
                 operation_lock,
@@ -3634,6 +3658,9 @@ impl Cli {
         }
 
         let resolved = self.resolve_upgrade_target(target)?;
+        let command_locks =
+            operation_lock.with_target_runtime(resolved.named_runtime_guard.clone());
+        let operation_lock = &command_locks;
         let target_runtime_name = resolved.name.clone();
         let target_version = self.resolved_target_version(env_name, &resolved, operation_lock)?;
         let target_release_version = target_version
@@ -3685,7 +3712,9 @@ impl Cli {
                 );
             }
         };
-        let command_locks = operation_lock.with_runtime(prepared.runtime_guard.clone());
+        let command_locks = operation_lock
+            .with_runtime(prepared.runtime_guard.clone())
+            .with_target_runtime(prepared.named_runtime_guard.clone());
         let operation_lock = &command_locks;
         timings.finish(
             "ocm",
@@ -3717,6 +3746,7 @@ impl Cli {
         )?;
         transaction.runtime_guard = operation_lock.runtime.clone();
         transaction._source_runtime_guard = operation_lock.source_runtime.clone();
+        transaction._target_runtime_guard = operation_lock.target_runtime.clone();
         if transaction.interrupted() {
             return self.rollback_failed_upgrade(
                 operation_lock,
@@ -4099,7 +4129,13 @@ impl Cli {
     ) -> Result<ResolvedUpgradeTarget, String> {
         let runtime_name = target.canonical_runtime_name()?;
         if target.is_named_runtime() {
-            let _admission = try_lock_runtime_binding(&runtime_name, &self.env, &self.cwd)?;
+            // Protect the identity before its first metadata or version read,
+            // and keep the same shared lease through preparation and settlement.
+            let admission = Arc::new(try_lock_runtime_binding(
+                &runtime_name,
+                &self.env,
+                &self.cwd,
+            )?);
             let meta = self.runtime_service().show(&runtime_name)?;
             if let Some(issue) = runtime_integrity_issue(&meta, &self.env) {
                 return Err(format!(
@@ -4111,6 +4147,7 @@ impl Cli {
                 release_version: meta.release_version.clone(),
                 release_channel: meta.release_channel.clone(),
                 kind: ResolvedUpgradeTargetKind::Named(Box::new(meta)),
+                named_runtime_guard: Some(admission),
             });
         }
 
@@ -4125,6 +4162,7 @@ impl Cli {
             release_version: Some(release.version.clone()),
             release_channel: release.channel.clone(),
             kind: ResolvedUpgradeTargetKind::Official(release),
+            named_runtime_guard: None,
         })
     }
 
@@ -4143,6 +4181,7 @@ impl Cli {
                 action: OfficialRuntimePrepareAction::Reused,
                 staged: None,
                 runtime_guard: None,
+                named_runtime_guard: resolved.named_runtime_guard,
             }),
             ResolvedUpgradeTargetKind::Official(release) => {
                 let staged = self.with_progress(
@@ -4174,6 +4213,7 @@ impl Cli {
                     action,
                     staged: Some(staged),
                     runtime_guard,
+                    named_runtime_guard: None,
                 })
             }
         }
@@ -4186,9 +4226,7 @@ impl Cli {
         resolved: ResolvedUpgradeTarget,
     ) -> Result<PreparedUpgradeTarget, String> {
         let runtime_guard = if target.is_named_runtime() {
-            // Named reuse does not replace runtime bytes. Its binding writer
-            // rechecks admission under the registry lock when publishing.
-            let _admission = try_lock_runtime_binding(&resolved.name, &self.env, &self.cwd)?;
+            // Resolution already owns shared custody for named reuse.
             None
         } else {
             Some(self.lock_isolated_runtime_mutation(env_name, &resolved.name)?)
@@ -5014,6 +5052,7 @@ impl Cli {
             runtime_backups,
             runtime_guard: None,
             _source_runtime_guard: None,
+            _target_runtime_guard: None,
             created_runtime_names,
             rollback_enabled,
             started_at,
@@ -5738,6 +5777,7 @@ struct PreparedUpgradeTarget {
     action: OfficialRuntimePrepareAction,
     staged: Option<StagedRuntimeInstall>,
     runtime_guard: Option<Arc<RuntimeMutationGuard>>,
+    named_runtime_guard: Option<Arc<RuntimeBindingGuard>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5979,6 +6019,7 @@ struct UpgradeTransaction {
     runtime_backups: Vec<RuntimeRollbackBackup>,
     runtime_guard: Option<Arc<RuntimeMutationGuard>>,
     _source_runtime_guard: Option<Arc<RuntimeBindingGuard>>,
+    _target_runtime_guard: Option<Arc<RuntimeBindingGuard>>,
     created_runtime_names: Vec<String>,
     rollback_enabled: bool,
     started_at: time::OffsetDateTime,

@@ -10021,3 +10021,303 @@ fn assert_upgrade_previous_runtime_custody(
         assert!(ocm::store::get_runtime(&mutation_owner, &env, &cwd).is_err());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn upgrade_named_target_custody_spans_admission_settlement_and_native_children() {
+    for (target_kind, launcher, phase, outcome) in [
+        ("registered", false, "finalize", "success"),
+        ("installed", true, "finalize", "success"),
+        ("installed", false, "version", "success"),
+        ("registered", true, "finalize", "failure"),
+        ("installed", false, "finalize", "interrupt"),
+        ("registered", true, "finalize", "kill"),
+        ("installed", false, "version", "kill"),
+        ("registered", false, "version", "dry-run"),
+        ("installed", true, "version", "downgrade"),
+    ] {
+        assert_upgrade_named_target_custody(target_kind, launcher, phase, outcome);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_named_alias_target_custody_survives_admission_finalizer_and_parent_exit() {
+    for (launcher, phase, outcome) in [
+        (false, "version", "dry-run"),
+        (false, "version", "kill"),
+        (true, "finalize", "kill"),
+        (false, "finalize", "failure"),
+        (true, "finalize", "interrupt"),
+    ] {
+        assert_upgrade_named_target_custody("backed", launcher, phase, outcome);
+    }
+}
+
+#[cfg(unix)]
+fn assert_upgrade_named_target_custody(
+    target_kind: &str,
+    launcher: bool,
+    phase: &str,
+    outcome: &str,
+) {
+    use std::os::unix::process::CommandExt;
+    struct ProcessGroup(u32);
+    impl Drop for ProcessGroup {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) };
+        }
+    }
+    fn finish(mut child: std::process::Child) -> std::process::Output {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let output = child.wait_with_output().unwrap();
+                panic!("named target custody did not settle: {}", stderr(&output));
+            }
+            sleep(Duration::from_millis(20));
+        }
+        child.wait_with_output().unwrap()
+    }
+    let root = TestDir::new("upgrade-named-target-custody");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let started = root.child("native.started");
+    let release = root.child("native.release");
+    let old = root.child("old-openclaw");
+    let selected = root.child("selected-openclaw");
+    let replacement = root.child("replacement-openclaw");
+    write_executable_script(&old, &recording_openclaw_script("2026.6.1"));
+    write_executable_script(&replacement, &recording_openclaw_script("2026.4.1"));
+    let target_version = if outcome == "downgrade" {
+        "2026.5.1"
+    } else {
+        "2026.7.1"
+    };
+    let script = recording_openclaw_script(target_version).replace(
+        "  --version)\n",
+        r#"  --version)
+    if [ "$OCM_TEST_TARGET_PHASE" = version ] && [ ! -e "$OCM_TEST_TARGET_RELEASE" ]; then
+      printf '%s' "$$" > "$OCM_TEST_TARGET_STARTED"
+      while [ ! -e "$OCM_TEST_TARGET_RELEASE" ]; do sleep 0.05; done
+    fi
+"#,
+    );
+    write_executable_script(&selected, &script);
+    env.insert("OCM_TEST_TARGET_PHASE".into(), phase.into());
+    env.insert("OCM_TEST_TARGET_STARTED".into(), path_string(&started));
+    env.insert("OCM_TEST_TARGET_RELEASE".into(), path_string(&release));
+    if phase == "finalize" {
+        env.insert(
+            "OCM_TEST_UPDATE_FINALIZE_STARTED".into(),
+            path_string(&started),
+        );
+        env.insert(
+            "OCM_TEST_UPDATE_FINALIZE_RELEASE".into(),
+            path_string(&release),
+        );
+    }
+    if outcome == "failure" {
+        env.insert("OCM_TEST_FAIL_UPDATE_FINALIZE".into(), "1".into());
+    }
+    let command = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ocm"));
+        command
+            .current_dir(&cwd)
+            .args(args)
+            .env_clear()
+            .envs(&env)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    };
+    let ok = |args: &[&str]| {
+        let output = finish(command(args).spawn().unwrap());
+        assert!(
+            output.status.success(),
+            "{phase}/{outcome} {args:?}: {} {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        output
+    };
+    ok(&["runtime", "add", "old", "--path", &path_string(&old)]);
+    let mutation_name = if target_kind == "backed" {
+        "backing"
+    } else {
+        "selected"
+    };
+    let selected_path = if target_kind == "backed" {
+        ok(&[
+            "runtime",
+            "install",
+            "backing",
+            "--path",
+            &path_string(&selected),
+        ]);
+        ocm::store::get_runtime("backing", &env, &cwd)
+            .unwrap()
+            .binary_path
+    } else {
+        path_string(&selected)
+    };
+    ok(&[
+        "runtime",
+        if target_kind == "installed" {
+            "install"
+        } else {
+            "add"
+        },
+        "selected",
+        "--path",
+        &selected_path,
+    ]);
+    if launcher {
+        ok(&[
+            "launcher",
+            "add",
+            "previous",
+            "--command",
+            &path_string(&old),
+        ]);
+        ok(&["env", "create", "demo", "--launcher", "previous"]);
+    } else {
+        ok(&["env", "create", "demo", "--runtime", "old"]);
+    }
+    let selected_meta = ocm::store::get_runtime("selected", &env, &cwd).unwrap();
+    let selected_bytes = fs::read(&selected_meta.binary_path).unwrap();
+    // Admission must accept existing shared readers. Release this reader once
+    // native work begins so it cannot mask a missing upgrade-owned lease.
+    let lock_path = ocm::store::runtime_install_root(mutation_name, &env, &cwd)
+        .unwrap()
+        .with_file_name(format!(".{mutation_name}.lock"));
+    let reader = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    fs2::FileExt::lock_shared(&reader).unwrap();
+    let mut args = vec!["upgrade", "demo", "--runtime", "selected", "--json"];
+    if outcome == "dry-run" {
+        args.push("--dry-run");
+    }
+    let mut upgrade_command = command(&args);
+    upgrade_command
+        .stdout(fs::File::create(root.child("upgrade.out")).unwrap())
+        .stderr(fs::File::create(root.child("upgrade.err")).unwrap());
+    let mut upgrade = upgrade_command.spawn().unwrap();
+    let _upgrade_group = ProcessGroup(upgrade.id());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !started.exists() {
+        assert!(
+            upgrade.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "{phase}/{outcome} did not reach native latch: {:?} {:?}",
+            fs::read_to_string(root.child("upgrade.out")),
+            fs::read_to_string(root.child("upgrade.err"))
+        );
+        sleep(Duration::from_millis(20));
+    }
+    fs2::FileExt::unlock(&reader).unwrap();
+    drop(reader);
+    let during = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    assert_eq!(
+        during.default_runtime.as_deref(),
+        if launcher { None } else { Some("old") }
+    );
+    if outcome == "kill" {
+        upgrade.kill().unwrap();
+        upgrade.wait().unwrap();
+    } else if outcome == "interrupt" {
+        unsafe { libc::kill(upgrade.id() as i32, libc::SIGTERM) };
+    }
+    let mutation_args = [
+        "runtime",
+        "install",
+        mutation_name,
+        "--path",
+        replacement.to_str().unwrap(),
+        "--force",
+    ];
+    let mut mutation = command(&mutation_args).spawn().unwrap();
+    let _mutation_group = ProcessGroup(mutation.id());
+    sleep(Duration::from_millis(200));
+    assert!(
+        mutation.try_wait().unwrap().is_none(),
+        "{phase}/{outcome}: replacement did not wait"
+    );
+    assert_eq!(
+        fs::read(&selected_meta.binary_path).unwrap(),
+        selected_bytes
+    );
+    // A queued replacement must not hold the environment registry or exclude
+    // compatible readers of this target or mutations of unrelated runtimes.
+    ok(&[
+        "runtime",
+        "install",
+        "unrelated",
+        "--path",
+        old.to_str().unwrap(),
+    ]);
+    ok(&["env", "create", "reader", "--runtime", "selected"]);
+    ok(&["env", "set-runtime", "reader", "none"]);
+    fs::write(&release, "").unwrap();
+    if outcome != "kill" {
+        let output = finish(upgrade);
+        assert_eq!(
+            output.status.success(),
+            matches!(outcome, "success" | "dry-run"),
+            "{phase}/{outcome}: {:?} {:?}",
+            fs::read_to_string(root.child("upgrade.out")),
+            fs::read_to_string(root.child("upgrade.err"))
+        );
+        if outcome == "downgrade" {
+            assert!(
+                fs::read_to_string(root.child("upgrade.err"))
+                    .unwrap()
+                    .contains("refusing to downgrade")
+            );
+        } else {
+            let summary: Value =
+                serde_json::from_slice(&fs::read(root.child("upgrade.out")).unwrap()).unwrap();
+            assert_eq!(summary["runtimeReleaseVersion"], target_version);
+            match outcome {
+                "success" => assert_eq!(summary["outcome"], "switched"),
+                "dry-run" => assert_eq!(summary["outcome"], "would-switch"),
+                _ => assert_eq!(summary["rollback"], "restored"),
+            }
+        }
+    }
+    let mutation = finish(mutation);
+    // Success publishes the target binding before the waiting writer resumes.
+    // Other outcomes leave it unbound, so the same writer can then replace it.
+    assert_eq!(
+        mutation.status.success(),
+        outcome != "success",
+        "{phase}/{outcome}: {} {}",
+        stdout(&mutation),
+        stderr(&mutation)
+    );
+    if outcome == "success" {
+        assert!(stderr(&mutation).contains("still used by environment"));
+        assert_eq!(
+            fs::read(&selected_meta.binary_path).unwrap(),
+            selected_bytes
+        );
+        let version = ok(&["@demo", "--", "--version"]);
+        assert_eq!(stdout(&version).trim(), target_version);
+        ok(&["env", "set-runtime", "demo", "none"]);
+        ok(&mutation_args);
+    } else if outcome != "kill" {
+        let version = ok(&["@demo", "--", "--version"]);
+        assert_eq!(stdout(&version).trim(), "2026.6.1");
+    }
+    let after = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    assert!(!after.service_enabled && !after.service_running);
+    if matches!(outcome, "dry-run" | "downgrade") {
+        assert!(!root.child("ocm-home/snapshots/demo").exists());
+    }
+}
