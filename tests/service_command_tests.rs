@@ -593,6 +593,7 @@ fn service_start_refuses_failed_or_unknown_manager_observations() {
                     "printf 'LoadState=not-found\\nActiveState=active\\nMainPID=999\\n'; exit 4",
                     "printf 'LoadState=loaded\\nActiveState=activating\\nMainPID=0\\n'; exit 0",
                     "printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nMainPID=invalid\\n'; exit 0",
+                    "printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nMainPID=\\n'; exit 0",
                 ]
             } else {
                 [
@@ -602,6 +603,7 @@ fn service_start_refuses_failed_or_unknown_manager_observations() {
                     "printf 'state = running\\npid = 999\\n'; exit 1",
                     "printf 'state = running\\n'; exit 0",
                     "printf 'state = not running\\npid = invalid\\n'; exit 0",
+                    "printf 'state = not running\\npid = \\n'; exit 0",
                 ]
             };
             for reply in replies {

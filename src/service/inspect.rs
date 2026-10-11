@@ -776,7 +776,7 @@ fn parse_launchctl_print(raw: &str, status: &mut LaunchdJobStatus) {
             status.state = Some(value);
             continue;
         }
-        if let Some(value) = trimmed.strip_prefix("pid = ") {
+        if let Some(value) = trimmed.strip_prefix("pid =") {
             let pid = value.trim().parse::<u32>();
             status.pid_parse_failed |= pid.is_err();
             status.pid = pid.ok();

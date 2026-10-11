@@ -1701,6 +1701,7 @@ fn service_start_observation_failure_preserves_live_sibling() {
         for reply in [
             "exit 1",
             "printf 'state = not running\\npid = invalid\\n'; exit 0",
+            "printf 'state = not running\\npid = \\n'; exit 0",
         ] {
             service_start_failure_preserves_live_sibling(ordinal, reply);
         }
