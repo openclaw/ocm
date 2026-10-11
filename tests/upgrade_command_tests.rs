@@ -4251,7 +4251,15 @@ fn upgrade_rolls_back_when_post_upgrade_version_verification_fails() {
 #[test]
 fn automatic_rollback_verifies_restored_binding_before_discarding_displaced_state() {
     for launcher in [false, true] {
-        for failure in ["missing", "unusable", "mismatch", "healthy"] {
+        for failure in [
+            "missing",
+            "unusable",
+            "mismatch",
+            "healthy",
+            "target-drift",
+            "target-drift-missing",
+        ] {
+            let target_drift = failure.starts_with("target-drift");
             let root = TestDir::new("automatic-rollback-verification");
             let cwd = root.child("workspace");
             fs::create_dir_all(&cwd).unwrap();
@@ -4273,15 +4281,28 @@ fn automatic_rollback_verifies_restored_binding_before_discarding_displaced_stat
                     finalized.display()
                 ),
             );
-            let remove_source = if failure == "missing" {
+            let remove_source = if matches!(failure, "missing" | "target-drift-missing") {
                 format!("rm '{}'", source.display())
             } else {
                 ":".to_string()
             };
+            let target_version = if target_drift {
+                format!(
+                    "if [ -e '{}' ]; then echo 2026.5.1; else echo 2026.7.1; fi",
+                    finalized.display()
+                )
+            } else {
+                "echo 2026.7.1".to_string()
+            };
+            let finalize_result = if target_drift {
+                "echo '{\"ok\":true}'"
+            } else {
+                "echo 'forced finalization failure' >&2; exit 41"
+            };
             write_executable_script(
                 &target,
                 &format!(
-                    "#!/bin/sh\ncase \"$1\" in\n  --version) echo 2026.7.1;;\n  update)\n    if [ \"$2\" = finalize ]; then\n      printf 'candidate state' > \"$OPENCLAW_HOME/recovery-marker\"\n      touch '{}'\n      {remove_source}\n      echo 'forced finalization failure' >&2\n      exit 41\n    fi;;\nesac\n",
+                    "#!/bin/sh\ncase \"$1\" in\n  --version) {target_version};;\n  update)\n    if [ \"$2\" = finalize ]; then\n      printf 'candidate state' > \"$OPENCLAW_HOME/recovery-marker\"\n      touch '{}'\n      {remove_source}\n      {finalize_result}\n    fi;;\nesac\n",
                     finalized.display()
                 ),
             );
@@ -4322,6 +4343,15 @@ fn automatic_rollback_verifies_restored_binding_before_discarding_displaced_stat
             let env_root = Path::new(created["root"].as_str().unwrap());
             write_text(&env_root.join("recovery-marker"), "original state");
 
+            let admitted_target = run_ocm(&cwd, &env, &["runtime", "show", "target", "--json"]);
+            assert!(
+                admitted_target.status.success(),
+                "{}",
+                stderr(&admitted_target)
+            );
+            let admitted_target: Value = serde_json::from_str(&stdout(&admitted_target)).unwrap();
+            assert!(admitted_target["releaseVersion"].is_null());
+
             let upgrade = run_ocm(
                 &cwd,
                 &env,
@@ -4330,7 +4360,24 @@ fn automatic_rollback_verifies_restored_binding_before_discarding_displaced_stat
             assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
             let result: Value = serde_json::from_str(&stdout(&upgrade)).unwrap();
             let note = result["note"].as_str().unwrap();
-            assert!(note.contains("forced finalization failure"), "{result}");
+            if target_drift {
+                assert!(
+                    note.contains(
+                        "post-upgrade version verification failed: expected 2026.7.1, got 2026.5.1"
+                    ),
+                    "{result}"
+                );
+                assert_eq!(result["runtimeReleaseVersion"], "2026.7.1");
+                let final_target = run_ocm(&cwd, &env, &["runtime", "show", "target", "--json"]);
+                assert!(final_target.status.success(), "{}", stderr(&final_target));
+                let final_target: Value = serde_json::from_str(&stdout(&final_target)).unwrap();
+                assert_eq!(
+                    final_target, admitted_target,
+                    "target registry identity changed"
+                );
+            } else {
+                assert!(note.contains("forced finalization failure"), "{result}");
+            }
             assert_eq!(
                 fs::read_to_string(env_root.join("recovery-marker")).unwrap(),
                 "original state"
@@ -4350,7 +4397,7 @@ fn automatic_rollback_verifies_restored_binding_before_discarding_displaced_stat
                 .unwrap()
                 .filter_map(Result::ok)
                 .find(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"));
-            if failure == "healthy" {
+            if matches!(failure, "healthy" | "target-drift") {
                 assert_eq!(result["outcome"], "rolled-back", "{result}");
                 assert_eq!(result["rollback"], "restored", "{result}");
                 assert!(retained.is_none());
@@ -4382,6 +4429,10 @@ fn automatic_rollback_verifies_restored_binding_before_discarding_displaced_stat
             let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
             assert_eq!(history[0]["outcome"], result["outcome"]);
             assert_eq!(history[0]["rollback"], result["rollback"]);
+            assert_eq!(
+                history[0]["target"]["openclawVersion"],
+                result["runtimeReleaseVersion"]
+            );
         }
     }
 }
@@ -7962,6 +8013,47 @@ fn upgrade_rejects_mixed_unsupported_candidate_failure_before_finalization() {
     let command_log = fs::read_to_string(command_log_path).unwrap();
     assert!(command_log.contains("doctor --lint --only codex/managed-app-server --json"));
     assert!(!command_log.contains("update finalize"), "{command_log}");
+}
+
+#[test]
+fn named_runtime_upgrade_accepts_unchanged_detected_version_from_both_bindings() {
+    for launcher in [false, true] {
+        let root = TestDir::new("upgrade-named-version-control");
+        let (cwd, env, _) = setup_named_runtime_candidate_fixture(&root);
+        write_executable_script(
+            &root.child("new-openclaw"),
+            &recording_openclaw_script("OpenClaw 2026.8.2 (test)"),
+        );
+        if launcher {
+            let add = run_ocm(
+                &cwd,
+                &env,
+                &[
+                    "launcher",
+                    "add",
+                    "source",
+                    "--command",
+                    &path_string(&root.child("old-openclaw")),
+                ],
+            );
+            assert!(add.status.success(), "{}", stderr(&add));
+            let bind = run_ocm(&cwd, &env, &["env", "set-launcher", "demo", "source"]);
+            assert!(bind.status.success(), "{}", stderr(&bind));
+        }
+        let upgrade = run_ocm(
+            &cwd,
+            &env,
+            &["upgrade", "demo", "--runtime", "new-local", "--json"],
+        );
+        assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+        let result: Value = serde_json::from_str(&stdout(&upgrade)).unwrap();
+        assert_eq!(result["outcome"], "switched", "{result}");
+        assert_eq!(result["runtimeReleaseVersion"], "2026.8.2");
+        assert!(result["rollback"].is_null());
+        let version = run_ocm(&cwd, &env, &["@demo", "--", "--version"]);
+        assert!(version.status.success(), "{}", stderr(&version));
+        assert_eq!(stdout(&version).trim(), "OpenClaw 2026.8.2 (test)");
+    }
 }
 
 #[test]

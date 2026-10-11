@@ -522,6 +522,9 @@ In `--json` output, `runtimeReleaseVersion` and `runtimeReleaseChannel` describe
 the resolved target even when preparation fails or the upgrade rolls back.
 The version includes a named runtime's detected version; the channel remains
 `null` when the selected runtime's channel is unknown.
+Final verification compares the running command with the named runtime version detected at admission, falling back to release metadata when no comparable version was detected.
+A mismatch fails the upgrade.
+When automatic rollback is enabled, recovery is reported as restored only after the previous binding passes verification.
 
 On Linux and macOS, a no-target upgrade can update a recognized `pnpm openclaw` or `node <checkout>/openclaw.mjs` checkout in place while keeping its launcher binding.
 On Unix, literal single- or double-quoted paths can contain spaces, including aliases to a source checkout.

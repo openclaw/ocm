@@ -2865,7 +2865,9 @@ impl Cli {
             let verification_started = transaction.timings.start();
             let verification_note = match self.verify_upgraded_openclaw(
                 env_name,
-                prepared.meta.release_version.as_deref(),
+                target_version
+                    .as_deref()
+                    .or(prepared.meta.release_version.as_deref()),
                 service_action.is_some(),
                 operation_lock,
             ) {
@@ -3849,7 +3851,9 @@ impl Cli {
         let verification_started = transaction.timings.start();
         let verification_note = match self.verify_upgraded_openclaw(
             env_name,
-            prepared.meta.release_version.as_deref(),
+            target_version
+                .as_deref()
+                .or(prepared.meta.release_version.as_deref()),
             service_action.is_some(),
             operation_lock,
         ) {
