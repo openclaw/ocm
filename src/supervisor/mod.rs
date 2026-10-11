@@ -22,7 +22,9 @@ use crate::infra::process_identity::{
     ProcessIdentity, current_process_identity, observe_process, process_scope_id,
 };
 use crate::infra::shell::apply_external_supervision_hint;
-use crate::service::inspect::{ManagedJobObservation, inspect_job, observe_job_for_source_watch};
+use crate::service::inspect::{
+    ManagedJobObservation, inspect_job, inspect_job_for_activation, observe_job_for_source_watch,
+};
 use crate::service::platform::{
     ManagedServiceDefinition, ManagedServiceEnablement, ServiceManagerKind,
     activate_managed_service, deactivate_managed_service, ensure_service_definition_dir,
@@ -652,7 +654,7 @@ impl<'a> SupervisorService<'a> {
     ) -> Result<SupervisorDaemonSummary, String> {
         let definition = self.supervisor_daemon_definition()?;
         validate_managed_service_owner(&definition, self.env)?;
-        let status = self.daemon_status()?;
+        let status = self.daemon_status_for_activation()?;
         if status.running {
             return Ok(status);
         }
@@ -703,7 +705,7 @@ impl<'a> SupervisorService<'a> {
         let definition = self.supervisor_daemon_definition()?;
         *daemon_mutation_attempted = true;
         deactivate_managed_service(&definition, self.env)?;
-        self.daemon_summary("uninstall")
+        self.daemon_summary("uninstall", false)
     }
 
     pub(crate) fn lock_daemon_lifecycle(&self) -> Result<crate::store::ExclusiveFileLock, String> {
@@ -796,8 +798,12 @@ impl<'a> SupervisorService<'a> {
     }
 
     pub fn daemon_status(&self) -> Result<SupervisorDaemonSummary, String> {
-        self.daemon_summary("status")
+        self.daemon_summary("status", false)
     }
+    pub(crate) fn daemon_status_for_activation(&self) -> Result<SupervisorDaemonSummary, String> {
+        self.daemon_summary("status", true)
+    }
+
     fn build_state(&self) -> Result<SupervisorState, String> {
         ensure_store(self.env, self.cwd)?;
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
@@ -955,7 +961,7 @@ impl<'a> SupervisorService<'a> {
         *daemon_mutation_attempted = true;
         write_managed_service_definition(&definition, self.env)?;
         activate_managed_service(&definition.label, &definition.definition_path, self.env)?;
-        self.daemon_summary(action)
+        self.daemon_summary(action, false)
     }
 
     fn preserve_operation_owner_before_daemon_refresh(&self) -> Result<(), String> {
@@ -970,7 +976,11 @@ impl<'a> SupervisorService<'a> {
         )
     }
 
-    fn daemon_summary(&self, action: &str) -> Result<SupervisorDaemonSummary, String> {
+    fn daemon_summary(
+        &self,
+        action: &str,
+        checked: bool,
+    ) -> Result<SupervisorDaemonSummary, String> {
         ensure_store(self.env, self.cwd)?;
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let state_path = supervisor_state_path(self.env, self.cwd)?;
@@ -978,7 +988,11 @@ impl<'a> SupervisorService<'a> {
         let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;
         let stdout_path = logs_dir.join("daemon.stdout.log");
         let stderr_path = logs_dir.join("daemon.stderr.log");
-        let status = inspect_job(&identity.label, &identity.definition_path, self.env);
+        let status = if checked {
+            inspect_job_for_activation(&identity.label, &identity.definition_path, self.env)?
+        } else {
+            inspect_job(&identity.label, &identity.definition_path, self.env)
+        };
         let enablement =
             if status.loaded && service_manager_kind(self.env) == ServiceManagerKind::Launchd {
                 managed_service_enablement(&identity.label, self.env)?

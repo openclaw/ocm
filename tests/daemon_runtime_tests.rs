@@ -1691,6 +1691,19 @@ fn failed_upgrade_rollback_preserves_running_sibling_despite_unrelated_drift() {
 #[cfg(unix)]
 #[test]
 fn service_start_preflight_failure_preserves_live_sibling() {
+    service_start_failure_preserves_live_sibling(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn service_start_observation_failure_preserves_live_sibling() {
+    for ordinal in [1, 2] {
+        service_start_failure_preserves_live_sibling(ordinal);
+    }
+}
+
+#[cfg(unix)]
+fn service_start_failure_preserves_live_sibling(ordinal: usize) {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("service-preflight-live-sibling");
     let cwd = root.child("workspace");
@@ -1744,18 +1757,30 @@ fn service_start_preflight_failure_preserves_live_sibling() {
         let manager_path = root.child("fake-bin/launchctl");
         let original = fs::read_to_string(&manager_path).unwrap();
         let marker = root.child("preflight-failed");
+        let injection = if ordinal == 0 {
+            format!(
+                "if [ \"$1\" = \"managername\" ] && [ ! -f '{marker}' ]; then : > '{marker}'; exit 1; fi",
+                marker = path_string(&marker)
+            )
+        } else {
+            format!(
+                "if [ \"$1\" = \"print\" ]; then\n n=0; [ ! -f '{marker}' ] || n=$(/bin/cat '{marker}')\n n=$((n + 1)); echo $n > '{marker}'\n [ $n -ne {ordinal} ] || exit 1\nfi",
+                marker = path_string(&marker)
+            )
+        };
         write_executable_script(
             &manager_path,
-            &format!(
-                "#!/bin/sh\nif [ \"$1\" = \"managername\" ] && [ ! -f '{marker}' ]; then\n  : > '{marker}'\n  exit 1\nfi\n{original}",
-                marker = path_string(&marker),
-            ),
+            &format!("#!/bin/sh\n{injection}\n{original}"),
         );
         fs::write(root.child("launchctl.log"), "").unwrap();
         let started = run_ocm(&cwd, &env, &["service", "start", "target"]);
         assert!(!started.status.success());
         assert!(
-            stderr(&started).contains("usable launchctl session"),
+            stderr(&started).contains(if ordinal == 0 {
+                "usable launchctl session"
+            } else {
+                "failed to inspect managed service"
+            }),
             "{}",
             stderr(&started)
         );

@@ -453,6 +453,10 @@ ocm service stop mira
 ocm service restart mira
 ```
 
+Starting a service requires a successful manager observation or confirmed absence of the OCM daemon.
+If the manager cannot be queried or reports an unknown process state, OCM refuses activation and preserves the existing daemon and other environment services.
+Retry after restoring manager access; `ocm service status` remains available for best-effort inspection.
+
 Saved dev service plans must still match the env's current binding and recorded
 worktree. If OCM refuses a stale plan, use `ocm service restart <env>` to refresh it.
 

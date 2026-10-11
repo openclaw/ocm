@@ -498,7 +498,11 @@ fn update_service_with_observation(
     // this lock prevents another store or command from racing ownership/teardown.
     let _lifecycle_lock = supervisor.lock_daemon_lifecycle()?;
     supervisor.validate_daemon_owner_locked()?;
-    let daemon_before = supervisor.daemon_status()?;
+    let daemon_before = if matches!(supervisor_policy, ServiceSupervisorPolicy::EnsureRunning) {
+        supervisor.daemon_status_for_activation()?
+    } else {
+        supervisor.daemon_status()?
+    };
     if matches!(supervisor_policy, ServiceSupervisorPolicy::EnsureRunning) && !daemon_before.running
     {
         supervisor.require_durable_daemon_executable()?;

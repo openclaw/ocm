@@ -581,6 +581,145 @@ fn service_start_preflight_failure_preserves_daemon_registration() {
     }
 }
 
+#[test]
+fn service_start_refuses_failed_or_unknown_manager_observations() {
+    for systemd in [false, true] {
+        for ordinal in [1, 2] {
+            for reply in [
+                "exit 1",
+                "exit 0",
+                "printf 'unexpected manager reply\\n'; exit 0",
+                "printf 'LoadState=not-found\\nActiveState=active\\nMainPID=999\\nstate = running\\n'; exit 4",
+                "printf 'LoadState=loaded\\nActiveState=activating\\nMainPID=0\\nstate = running\\n'; exit 0",
+            ] {
+                let root = TestDir::new("service-observation-failure");
+                let cwd = root.child("workspace");
+                fs::create_dir_all(&cwd).unwrap();
+                let env = if systemd {
+                    systemd_env(&root)
+                } else {
+                    launchd_env(&root)
+                };
+                setup_launcher_env(&cwd, &env);
+                let installed = run_ocm(&cwd, &env, &["service", "install", "demo"]);
+                assert!(installed.status.success(), "{}", stderr(&installed));
+                let definition = managed_service_definition_path(&env, &cwd, "ocm");
+                let definition_before = fs::read(&definition).unwrap();
+                let state = supervisor_state_path(&env, &cwd).unwrap();
+                let state_before: Value =
+                    serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+                let (binary, log, operation) = if systemd {
+                    ("systemctl", "systemctl.log", "\"$2\" = \"show\"")
+                } else {
+                    ("launchctl", "launchctl.log", "\"$1\" = \"print\"")
+                };
+                let manager = root.child(format!("fake-bin/{binary}"));
+                let original = fs::read_to_string(&manager).unwrap();
+                let count = root.child("observations");
+                write_executable_script(
+                    &manager,
+                    &format!(
+                        "#!/bin/sh\nif [ {operation} ]; then\n n=0; [ ! -f '{count}' ] || n=$(/bin/cat '{count}')\n n=$((n + 1)); echo $n > '{count}'\n if [ $n -eq {ordinal} ]; then {reply}; fi\nfi\n{original}",
+                        count = path_string(&count),
+                    ),
+                );
+                fs::write(root.child(log), "").unwrap();
+                let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+                assert!(
+                    !started.status.success(),
+                    "systemd={systemd}, ordinal={ordinal}, reply={reply}"
+                );
+                assert!(
+                    stderr(&started).contains("managed service"),
+                    "{}",
+                    stderr(&started)
+                );
+                assert_eq!(fs::read(&definition).unwrap(), definition_before);
+                let after: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+                assert_eq!(after["children"], state_before["children"]);
+                let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+                assert_eq!(json_output(&shown)["serviceEnabled"], true);
+                assert_eq!(json_output(&shown)["serviceRunning"], false);
+                let calls = fs::read_to_string(root.child(log)).unwrap();
+                assert!(
+                    !calls.contains("bootout")
+                        && !calls.contains("bootstrap")
+                        && !calls.contains("unload")
+                        && !calls.contains("daemon-reload")
+                        && !calls.contains("--user stop")
+                        && !calls.contains("--user restart"),
+                    "{calls}"
+                );
+                // The same unavailable/unknown manager remains displayable through status.
+                write_executable_script(
+                    &manager,
+                    &format!("#!/bin/sh\nif [ {operation} ]; then {reply}; fi\n{original}"),
+                );
+                let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+                assert!(status.status.success(), "{}", stderr(&status));
+            }
+        }
+    }
+}
+
+#[test]
+fn service_start_rechecks_running_daemon_before_activation() {
+    for systemd in [false, true] {
+        for stopped in [false, true] {
+            let root = TestDir::new("service-observation-freshness");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = if systemd {
+                systemd_env(&root)
+            } else {
+                launchd_env(&root)
+            };
+            setup_launcher_env(&cwd, &env);
+            let installed = run_ocm(&cwd, &env, &["service", "install", "demo"]);
+            assert!(installed.status.success(), "{}", stderr(&installed));
+            let (binary, log, operation) = if systemd {
+                ("systemctl", "systemctl.log", "\"$2\" = \"show\"")
+            } else {
+                ("launchctl", "launchctl.log", "\"$1\" = \"print\"")
+            };
+            let reply = match (systemd, stopped) {
+                (true, true) => {
+                    "printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\n'; exit 0"
+                }
+                (true, false) => {
+                    "printf 'LoadState=not-found\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\n'; exit 4"
+                }
+                (false, true) => "printf 'state = not running\\n'; exit 0",
+                (false, false) => {
+                    "printf 'Could not find service \"%s\" in domain for user gui\\n' \"${2##*/}\" >&2; exit 1"
+                }
+            };
+            let manager = root.child(format!("fake-bin/{binary}"));
+            let original = fs::read_to_string(&manager).unwrap();
+            let count = root.child("observations");
+            write_executable_script(
+                &manager,
+                &format!(
+                    "#!/bin/sh\nif [ {operation} ]; then\n n=0; [ ! -f '{count}' ] || n=$(/bin/cat '{count}')\n n=$((n + 1)); echo $n > '{count}'\n if [ $n -eq 2 ]; then {reply}; fi\nfi\n{original}",
+                    count = path_string(&count),
+                ),
+            );
+            fs::write(root.child(log), "").unwrap();
+            let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+            assert!(started.status.success(), "{}", stderr(&started));
+            let calls = fs::read_to_string(root.child(log)).unwrap();
+            assert!(
+                calls.contains(if systemd {
+                    "--user restart"
+                } else {
+                    "bootstrap"
+                }),
+                "{calls}"
+            );
+        }
+    }
+}
+
 fn fail_launchctl_enablement_read(root: &TestDir, nth: usize) {
     let manager_path = root.child("fake-bin/launchctl");
     let original = fs::read_to_string(&manager_path).unwrap();
