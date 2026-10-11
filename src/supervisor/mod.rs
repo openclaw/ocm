@@ -4144,15 +4144,23 @@ mod tests {
                 let retained: SupervisorState = read_json(&state_path).unwrap();
                 assert_eq!(retained.restart_requests, saved.restart_requests);
                 drop(preparation);
-                assert!(refresh_active_state(
+                // A concurrent fork can retain the lease descriptor until exec or exit.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !refresh_active_state(
                     &state_path,
                     &service,
                     &mut active,
                     &mut count,
                     &mut running.0,
                     &mut pending,
-                    &mut inactive
-                ));
+                    &mut inactive,
+                ) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "deferred restart did not reconcile after preparation ownership settled"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
                 assert!(running.0.is_empty());
                 assert_eq!(pending["demo"].restart_count, 1);
                 let saved: SupervisorState = read_json(&state_path).unwrap();
