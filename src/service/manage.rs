@@ -507,7 +507,24 @@ fn update_service(
             cwd,
         ));
     }
-    let (mut summary, warnings) = wait_for_action_summary(name, action, env, cwd)?;
+    let (mut summary, warnings) =
+        wait_for_action_summary(name, action, env, cwd).map_err(|error| {
+            if daemon_mutation_attempted {
+                // Activation completed; an observation-only failure must not
+                // undo its accepted effects or tear down the daemon.
+                error
+            } else {
+                rollback_service_update(
+                    error,
+                    &change,
+                    &supervisor,
+                    &daemon_before,
+                    daemon_mutation_attempted,
+                    env,
+                    cwd,
+                )
+            }
+        })?;
     let should_remove_daemon =
         if matches!(update, ServiceUpdate::Stop | ServiceUpdate::Uninstall) && !summary.running {
             match supervisor.has_desired_running_services() {
