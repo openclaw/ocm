@@ -24,7 +24,7 @@ fn install_fake_launchctl(root: &TestDir, env: &mut BTreeMap<String, String>) {
     fs::create_dir_all(&bin_dir).unwrap();
     let log_path = root.child("launchctl.log");
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$1\" in\n  print)\n    printf 'Could not find service\\n' >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$1\" in\n  print)\n    printf 'Could not find service \"%s\" in domain for user gui\\n' \"${{2##*/}}\" >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
         path_string(&log_path)
     );
     write_executable_script(&bin_dir.join("launchctl"), &script);

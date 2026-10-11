@@ -167,7 +167,7 @@ if (args[0] === 'print') {{
   if (/^(gui|user)\/[0-9]+$/.test(args[1])) process.exit(0);
   const pid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, 'utf8')) : 0;
   if (pid && alive(pid)) {{ console.log('state = running\npid = ' + pid); process.exit(0); }}
-  console.error('Could not find service'); process.exit(1);
+  console.error('Could not find service "' + args[1].split('/').pop() + '" in domain for user gui'); process.exit(1);
 }}
 if (args[0] === 'bootout' || args[0] === 'unload') {{
   if (fs.existsSync(pidFile)) {{
