@@ -193,9 +193,15 @@ fn reject_workspace_copy_destination_links(source: &Path, target: &Path) -> Resu
     {
         return Ok(());
     }
-    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        reject_workspace_copy_destination_links(&entry.path(), &target.join(entry.file_name()))?;
+    let entries = fs::read_dir(source)
+        .map_err(|error| error.to_string())?
+        .map(|entry| {
+            let entry = entry.map_err(|error| error.to_string())?;
+            Ok((entry.path(), target.join(entry.file_name())))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for (source_path, target_path) in entries {
+        reject_workspace_copy_destination_links(&source_path, &target_path)?;
     }
     Ok(())
 }

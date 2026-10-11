@@ -1001,6 +1001,60 @@ fn adopt_import_copies_an_external_workspace_into_the_disposable_environment() {
 
 #[cfg(unix)]
 #[test]
+fn migrate_copies_deep_external_workspaces_with_bounded_directory_handles() {
+    for overlay in [false, true] {
+        let root = TestDir::new("migrate-deep-workspace");
+        let source = root.child("plain-home");
+        let external = root.child("external");
+        let relative: std::path::PathBuf = std::iter::repeat_n("d", 96).collect();
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(external.join(&relative)).unwrap();
+        fs::write(external.join(&relative).join("notes.txt"), "deep payload\n").unwrap();
+        if overlay {
+            fs::create_dir_all(source.join("workspaces/default").join(&relative)).unwrap();
+        }
+        fs::write(
+            source.join("openclaw.json"),
+            serde_json::json!({
+                "agents": {"defaults": {"workspace": external}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let env = ocm_env(&root);
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "ulimit -n 64 && exec \"$@\"", "migration-limit"])
+            .arg(support::ocm_test_binary_path())
+            .args(["migrate", "mira"])
+            .arg(&source)
+            .current_dir(&source)
+            .env_clear()
+            .envs(&env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "overlay={overlay}: {}",
+            stderr(&output)
+        );
+        assert_eq!(
+            fs::read_to_string(
+                root.child("ocm-home/envs/mira/.openclaw/workspaces/default")
+                    .join(&relative)
+                    .join("notes.txt")
+            )
+            .unwrap(),
+            "deep payload\n"
+        );
+        assert_eq!(
+            fs::read_to_string(external.join(&relative).join("notes.txt")).unwrap(),
+            "deep payload\n"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn migrate_rejects_copied_workspace_destination_links_without_changing_originals() {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
