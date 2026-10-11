@@ -166,6 +166,15 @@ pub fn start_service(
     update_service(name, ServiceUpdate::Start, env, cwd)
 }
 
+pub(super) fn start_service_with_readiness(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    observe: impl FnOnce(&mut ServiceActionSummary) -> Result<(), String>,
+) -> Result<ServiceActionSummary, String> {
+    update_service_with_observation(name, ServiceUpdate::Start, env, cwd, observe)
+}
+
 pub fn stop_service(
     name: &str,
     env: &BTreeMap<String, String>,
@@ -466,6 +475,16 @@ fn update_service(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<ServiceActionSummary, String> {
+    update_service_with_observation(name, update, env, cwd, |_| Ok(()))
+}
+
+fn update_service_with_observation(
+    name: &str,
+    update: ServiceUpdate,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    observe: impl FnOnce(&mut ServiceActionSummary) -> Result<(), String>,
+) -> Result<ServiceActionSummary, String> {
     let (action, service_enabled, service_running, require_binding, supervisor_policy) =
         update.settings();
     if service_running == Some(true) || matches!(update, ServiceUpdate::Install) {
@@ -558,7 +577,30 @@ fn update_service(
         }
         summary = super::inspect::service_status_fast(name, env, cwd)?;
     }
-    Ok(service_action_summary(action, summary, warnings))
+    let mut summary = service_action_summary(action, summary, warnings);
+    // Readiness can wait for a Gateway; it must not block independent service
+    // operations on the shared daemon lifecycle lock.
+    drop(_lifecycle_lock);
+    if let Err(error) = observe(&mut summary) {
+        if daemon_mutation_attempted {
+            return Err(error);
+        }
+        let _lifecycle_lock = supervisor
+            .lock_daemon_lifecycle()
+            .map_err(|rollback_error| {
+                format!("{error}; failed to restore the previous service state: {rollback_error}")
+            })?;
+        return Err(rollback_service_update(
+            error,
+            &change,
+            &supervisor,
+            &daemon_before,
+            daemon_mutation_attempted,
+            env,
+            cwd,
+        ));
+    }
+    Ok(summary)
 }
 
 fn rollback_service_update(

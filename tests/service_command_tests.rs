@@ -608,12 +608,14 @@ fi
 #[test]
 fn service_start_read_failures_restore_policy_without_daemon_mutation() {
     // The first read captures the transaction snapshot, the second decides
-    // whether activation is needed, and the third constructs the action summary.
-    for failed_read in [2, 3] {
+    // whether activation is needed, the third builds the summary, and the fourth
+    // observes readiness with the ordinary readiness path enabled.
+    for failed_read in [2, 3, 4] {
         let root = TestDir::new("service-start-enablements-read-failure");
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
-        let env = launchd_env(&root);
+        let mut env = launchd_env(&root);
+        env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
         setup_launcher_env(&cwd, &env);
         let installed = run_ocm(&cwd, &env, &["service", "install", "demo"]);
         assert!(installed.status.success(), "{}", stderr(&installed));
@@ -652,13 +654,19 @@ fn service_start_read_failures_restore_policy_without_daemon_mutation() {
 
 #[test]
 fn service_start_distinguishes_activation_failure_from_summary_failure() {
-    for (installed_before, summary_failure) in
-        [(false, false), (true, false), (false, true), (true, true)]
-    {
+    for (installed_before, observation_read) in [
+        (false, None),
+        (true, None),
+        (false, Some(2)),
+        (true, Some(2)),
+        (false, Some(3)),
+        (true, Some(3)),
+    ] {
         let root = TestDir::new("service-start-partial-activation-failure");
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
-        let env = launchd_env(&root);
+        let mut env = launchd_env(&root);
+        env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
         setup_launcher_env(&cwd, &env);
         let definition_path = managed_service_definition_path(&env, &cwd, "ocm");
         let definition_before = if installed_before {
@@ -669,10 +677,9 @@ fn service_start_distinguishes_activation_failure_from_summary_failure() {
         } else {
             None
         };
-        let (marker, expected_error) = if summary_failure {
-            // Activation succeeds; the next status observation fails while
-            // constructing the action summary.
-            fail_launchctl_enablement_read(&root, 2);
+        let (marker, expected_error) = if let Some(failed_read) = observation_read {
+            // Activation succeeds; summary or readiness observation then fails.
+            fail_launchctl_enablement_read(&root, failed_read);
             (
                 root.child("enablement-reads"),
                 "injected enablement read failure",
@@ -708,7 +715,7 @@ fn service_start_distinguishes_activation_failure_from_summary_failure() {
         );
         assert!(marker.exists());
         let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
-        if summary_failure {
+        if observation_read.is_some() {
             // Only observation failed after a successful activation; the
             // accepted policy and daemon registration must remain applied.
             assert!(definition_path.exists());

@@ -4081,6 +4081,9 @@ fn service_start_reports_failed_backoff_with_the_child_error() {
     ));
     assert!(body["issue"].as_str().unwrap().contains("23"));
 
+    let meta = EnvironmentService::new(&env, &cwd).get("demo").unwrap();
+    assert!(meta.service_enabled && meta.service_running);
+
     stop_process(&mut daemon);
 }
 
@@ -4101,6 +4104,9 @@ fn service_start_reports_an_explicit_readiness_timeout() {
             .unwrap()
             .contains("did not become ready within")
     );
+
+    let meta = EnvironmentService::new(&env, &cwd).get("demo").unwrap();
+    assert!(meta.service_enabled && meta.service_running);
 
     stop_process(&mut daemon);
 }
