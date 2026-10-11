@@ -634,6 +634,19 @@ fn service_start_refuses_failed_or_unknown_manager_observations() {
                     "{}",
                     stderr(&started)
                 );
+                assert!(
+                    stderr(&started)
+                        .contains("activation was refused to preserve running services"),
+                    "{}",
+                    stderr(&started)
+                );
+                assert!(
+                    stderr(&started).contains(
+                        "Restore service-manager access or wait for its state to settle, then retry"
+                    ),
+                    "{}",
+                    stderr(&started)
+                );
                 assert_eq!(fs::read(&definition).unwrap(), definition_before);
                 let after: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
                 assert_eq!(after["children"], state_before["children"]);

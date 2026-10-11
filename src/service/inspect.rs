@@ -536,7 +536,9 @@ pub(crate) fn inspect_job_for_activation(
     service_path: &Path,
     env: &BTreeMap<String, String>,
 ) -> Result<LaunchdJobStatus, String> {
-    inspect_job_inner(label, service_path, env, true)
+    inspect_job_inner(label, service_path, env, true).map_err(|error| {
+        format!("{error}; activation was refused to preserve running services. Restore service-manager access or wait for its state to settle, then retry")
+    })
 }
 
 fn inspect_job_inner(
@@ -549,8 +551,7 @@ fn inspect_job_inner(
         installed: service_path.exists(),
         ..LaunchdJobStatus::default()
     };
-    let unknown =
-        || format!("managed service {label} has an unknown process state; refusing activation");
+    let unknown = || format!("managed service {label} has an unknown process state");
     match service_manager_kind(env) {
         ServiceManagerKind::Launchd => {
             let domain = if checked {
