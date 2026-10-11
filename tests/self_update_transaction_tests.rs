@@ -12,7 +12,10 @@ use flate2::{Compression, write::GzEncoder};
 use fs2::FileExt;
 use ocm::infra::download::file_sha256;
 use serde_json::{Value, json};
-use support::{TestDir, TestHttpServer, ocm_env, run_ocm_binary, stderr, write_executable_script};
+use support::{
+    TestDir, TestHttpServer, managed_service_definition_path, ocm_env, run_ocm_binary, stderr,
+    write_executable_script,
+};
 
 fn wait_for(mut predicate: impl FnMut() -> bool, detail: &str) {
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -93,6 +96,15 @@ impl Fixture {
     fn new(candidate: &Path, label: &str) -> Self {
         let root = TestDir::new(label);
         let mut env = ocm_env(&root);
+        // A subprocess cwd resolves macOS temporary-directory aliases.
+        // Match that spelling when comparing relative and absolute OCM_HOME.
+        env.insert(
+            "OCM_HOME".into(),
+            fs::canonicalize(root.child("ocm-home"))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
         env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
         env.insert("OCM_INTERNAL_SELF_UPDATE_TIMEOUT_MS".into(), "2000".into());
         env.insert(
@@ -302,6 +314,99 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
     let candidate_root = TestDir::new("self-update-build");
     let candidate = build_candidate(&candidate_root);
 
+    for relative in [true, false] {
+        let mut stopped = Fixture::new(&candidate, "transaction-store-context");
+        stopped.setup_gateway();
+        let result = stopped.run(&["service", "stop", "running"]);
+        assert!(result.status.success(), "{}", stderr(&result));
+        let result = stopped.run(&["service", "install", "stopped"]);
+        assert!(result.status.success(), "{}", stderr(&result));
+        let result = Command::new(stopped.env.get("OCM_INTERNAL_LAUNCHCTL_BIN").unwrap())
+            .arg("bootout")
+            .env_clear()
+            .envs(&stopped.env)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", stderr(&result));
+        let definition =
+            managed_service_definition_path(&stopped.env, stopped.root.path(), "stopped");
+        let original_definition = fs::read_to_string(&definition).unwrap();
+        let original_binary = file_sha256(&stopped.binary).unwrap();
+        let manager_before = fs::read(stopped.root.child("manager.log")).unwrap();
+        let store = stopped.env["OCM_HOME"].clone();
+
+        // The worker must still reject another store or executable before writing.
+        stopped.env.insert(
+            "OCM_HOME".into(),
+            stopped.root.child("foreign-store").to_string_lossy().into(),
+        );
+        let foreign_store = stopped.run(&["self", "update", "--version", "9.9.9"]);
+        assert!(!foreign_store.status.success());
+        assert!(
+            stderr(&foreign_store).contains("different OCM_HOME"),
+            "{}",
+            stderr(&foreign_store)
+        );
+        stopped.env.insert(
+            "OCM_HOME".into(),
+            if relative {
+                "ocm-home".into()
+            } else {
+                store.clone()
+            },
+        );
+        let foreign_definition = original_definition.replace(
+            stopped.binary.to_str().unwrap(),
+            stopped.root.child("other-ocm").to_str().unwrap(),
+        );
+        assert_ne!(foreign_definition, original_definition);
+        fs::write(&definition, &foreign_definition).unwrap();
+        let foreign_binary = stopped.run(&["self", "update", "--version", "9.9.9"]);
+        assert!(!foreign_binary.status.success());
+        assert!(
+            stderr(&foreign_binary).contains("different executable"),
+            "{}",
+            stderr(&foreign_binary)
+        );
+        assert_eq!(file_sha256(&stopped.binary).unwrap(), original_binary);
+        assert_eq!(fs::read_to_string(&definition).unwrap(), foreign_definition);
+        assert_eq!(
+            fs::read(stopped.root.child("manager.log")).unwrap(),
+            manager_before
+        );
+        fs::write(&definition, &original_definition).unwrap();
+
+        let updated = stopped.run(&["self", "update", "--version", "9.9.9", "--json"]);
+        assert!(
+            updated.status.success(),
+            "relative={relative}: {}",
+            stderr(&updated)
+        );
+        assert_eq!(stopped.receipt()["phase"], "updated");
+        assert_eq!(stopped.receipt()["ocmHome"], store);
+        assert_eq!(stopped.receipt()["daemonWasRunning"], false);
+        assert_eq!(
+            file_sha256(&stopped.binary).unwrap(),
+            file_sha256(&candidate).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(&definition).unwrap(),
+            original_definition
+        );
+        assert!(!stopped.root.child("daemon.pid").exists());
+        assert!(!stopped.root.child("ocm-home/ocm-home").exists());
+    }
+
+    let mut absent = Fixture::new(&candidate, "transaction-relative-no-daemon");
+    absent.env.insert("OCM_HOME".into(), "ocm-home".into());
+    let updated = absent.run(&["self", "update", "--version", "9.9.9", "--json"]);
+    assert!(updated.status.success(), "{}", stderr(&updated));
+    assert_eq!(absent.receipt()["phase"], "updated");
+    assert_eq!(absent.receipt()["daemonWasRunning"], false);
+    assert!(!managed_service_definition_path(&absent.env, absent.root.path(), "stopped").exists());
+    assert!(!absent.root.child("ocm-home/ocm-home").exists());
+    drop(absent);
+
     // The source gateway launches the update in its own group. Refresh kills
     // that group, including the CLI. Only the detached retained helper survives.
     let success = Fixture::new(&candidate, "transaction-success");
@@ -397,8 +502,9 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
     assert_eq!(status["running"], true);
     drop(rollback);
 
-    let crash = Fixture::new(&candidate, "transaction-crash");
+    let mut crash = Fixture::new(&candidate, "transaction-crash");
     crash.setup_gateway();
+    crash.env.insert("OCM_HOME".into(), "ocm-home".into());
     let original = file_sha256(&crash.binary).unwrap();
     fs::write(crash.root.child("pause"), "yes").unwrap();
     let mut caller = Command::new(&crash.binary)
@@ -450,6 +556,27 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
         String::from_utf8_lossy(&retry.stdout),
         stderr(&retry)
     );
+    let before_recovery = fs::read(crash.root.child("manager.log")).unwrap();
+    for key in ["HOME", "OCM_HOME"] {
+        let mut foreign = crash.env.clone();
+        foreign.insert(
+            key.into(),
+            crash.root.child("foreign").to_string_lossy().into(),
+        );
+        let rejected = run_ocm_binary(
+            &crash.binary,
+            crash.root.path(),
+            &foreign,
+            &["self", "update", "--recover"],
+        );
+        assert!(!rejected.status.success());
+        assert!(stderr(&rejected).contains("different HOME or OCM_HOME"));
+        assert_eq!(crash.receipt()["phase"], "applying");
+        assert_eq!(
+            fs::read(crash.root.child("manager.log")).unwrap(),
+            before_recovery
+        );
+    }
     let recovered = crash.run(&["self", "update", "--recover"]);
     assert_eq!(
         crash.receipt()["phase"],
@@ -458,7 +585,12 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
         stderr(&recovered)
     );
     assert_eq!(crash.receipt()["id"], id);
+    assert_eq!(
+        crash.receipt()["ocmHome"],
+        json!(fs::canonicalize(crash.root.child("ocm-home")).unwrap())
+    );
     assert_eq!(file_sha256(&crash.binary).unwrap(), original);
+    assert!(!crash.root.child("ocm-home/ocm-home").exists());
     let before_retry = fs::read(crash.root.child("manager.log")).unwrap();
     let _ = crash.run(&["self", "update", "--recover"]);
     assert_eq!(

@@ -355,6 +355,11 @@ impl Cli {
         env.remove("OCM_ACTIVE_ENV");
         env.remove("OPENCLAW_SERVICE_KIND");
         env.insert("OCM_SERVICE_EXECUTABLE".into(), binary.clone());
+        // Keep the validated store when the worker changes its working directory.
+        env.insert(
+            "OCM_HOME".into(),
+            receipt.ocm_home.to_string_lossy().into_owned(),
+        );
         let worker = Cli {
             env,
             cwd: receipt.ocm_home.clone(),
