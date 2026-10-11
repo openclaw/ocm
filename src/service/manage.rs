@@ -451,11 +451,12 @@ fn ensure_gateway_binding(
 fn ensure_supervisor_running_locked(
     supervisor: &SupervisorService<'_>,
     env: &BTreeMap<String, String>,
+    daemon_mutation_attempted: &mut bool,
 ) -> Result<(), String> {
     if let Some(error) = service_backend_support_error(env) {
         return Err(error);
     }
-    supervisor.ensure_daemon_running_locked()?;
+    supervisor.ensure_daemon_running_locked(daemon_mutation_attempted)?;
     Ok(())
 }
 
@@ -484,10 +485,13 @@ fn update_service(
         supervisor.require_durable_daemon_executable()?;
     }
     let change = set_environment_service_policy(name, service_enabled, service_running, env, cwd)?;
+    let mut daemon_mutation_attempted = false;
     let update_result = match supervisor_policy {
         ServiceSupervisorPolicy::EnsureRunning => sync_supervisor_env_if_present(env, cwd, name)
             .map(|_| ())
-            .and_then(|()| ensure_supervisor_running_locked(&supervisor, env)),
+            .and_then(|()| {
+                ensure_supervisor_running_locked(&supervisor, env, &mut daemon_mutation_attempted)
+            }),
         ServiceSupervisorPolicy::LeaveAsIs => {
             sync_supervisor_env_if_present(env, cwd, name).map(|_| ())
         }
@@ -498,6 +502,7 @@ fn update_service(
             &change,
             &supervisor,
             &daemon_before,
+            daemon_mutation_attempted,
             env,
             cwd,
         ));
@@ -513,6 +518,7 @@ fn update_service(
                         &change,
                         &supervisor,
                         &daemon_before,
+                        daemon_mutation_attempted,
                         env,
                         cwd,
                     ));
@@ -522,12 +528,13 @@ fn update_service(
             false
         };
     if should_remove_daemon {
-        if let Err(error) = supervisor.uninstall_daemon_locked() {
+        if let Err(error) = supervisor.uninstall_daemon_locked(&mut daemon_mutation_attempted) {
             return Err(rollback_service_update(
                 error,
                 &change,
                 &supervisor,
                 &daemon_before,
+                daemon_mutation_attempted,
                 env,
                 cwd,
             ));
@@ -542,6 +549,7 @@ fn rollback_service_update(
     change: &crate::store::EnvironmentServicePolicyChange,
     supervisor: &SupervisorService<'_>,
     daemon_before: &crate::supervisor::SupervisorDaemonSummary,
+    daemon_mutation_attempted: bool,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> String {
@@ -557,7 +565,9 @@ fn rollback_service_update(
         }
         Err(rollback_error) => rollback_errors.push(rollback_error),
     }
-    if let Err(rollback_error) = supervisor.restore_daemon_state_locked(daemon_before) {
+    if daemon_mutation_attempted
+        && let Err(rollback_error) = supervisor.restore_daemon_state_locked(daemon_before)
+    {
         rollback_errors.push(rollback_error);
     }
     if rollback_errors.is_empty() {

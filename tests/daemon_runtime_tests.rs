@@ -1688,6 +1688,110 @@ fn failed_upgrade_rollback_preserves_running_sibling_despite_unrelated_drift() {
     stop_process(&mut daemon);
 }
 
+#[cfg(unix)]
+#[test]
+fn service_start_preflight_failure_preserves_live_sibling() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-preflight-live-sibling");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let runtime = root.child("bin/gateway");
+    let started_path = root.child("sibling-started");
+    let stopped_path = root.child("sibling-stopped");
+    write_upgrade_aware_gateway_script(&runtime, "2026.8.1", &started_path, &stopped_path, false);
+    let added = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "add",
+            "gateway",
+            "--path",
+            &path_string(&runtime),
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    for name in ["sibling", "target"] {
+        let created = run_ocm(&cwd, &env, &["env", "create", name, "--runtime", "gateway"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+    }
+    set_service_enabled(&cwd, &env, "sibling", true);
+    let service = SupervisorService::new(&env, &cwd);
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+        let state_path = root.child("ocm-home/supervisor/state.json");
+        let initial =
+            wait_for_runtime_children(&runtime_path, 1, Some("sibling"), Duration::from_secs(5))
+                .unwrap();
+        let pid = runtime_child_pid(&initial, "sibling").unwrap();
+        wait_for_started_pid(&started_path, pid);
+        let before = persisted_child(&state_path, "sibling");
+        // Make the manager observation refer to the real fixture daemon.
+        fs::write(
+            root.child("launchctl-print.txt"),
+            format!("state = running\npid = {}\n", daemon.id()),
+        )
+        .unwrap();
+        let manager_path = root.child("fake-bin/launchctl");
+        let original = fs::read_to_string(&manager_path).unwrap();
+        let marker = root.child("preflight-failed");
+        write_executable_script(
+            &manager_path,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"managername\" ] && [ ! -f '{marker}' ]; then\n  : > '{marker}'\n  exit 1\nfi\n{original}",
+                marker = path_string(&marker),
+            ),
+        );
+        fs::write(root.child("launchctl.log"), "").unwrap();
+        let started = run_ocm(&cwd, &env, &["service", "start", "target"]);
+        assert!(!started.status.success());
+        assert!(
+            stderr(&started).contains("usable launchctl session"),
+            "{}",
+            stderr(&started)
+        );
+        assert!(marker.exists());
+        assert!(daemon.try_wait().unwrap().is_none());
+        assert!(process_exists(pid as u32));
+        assert_eq!(persisted_child(&state_path, "sibling"), before);
+        let status = run_ocm(&cwd, &env, &["service", "status", "sibling", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+        assert_eq!(status["running"], true);
+        let health = ureq::get(format!("http://127.0.0.1:{}/health", status["gatewayPort"]))
+            .call()
+            .unwrap();
+        assert_eq!(health.status(), 200);
+        assert_eq!(
+            runtime_child_pid(&read_persisted_service_state(&runtime_path), "sibling"),
+            Some(pid)
+        );
+        assert!(!stopped_path.exists());
+        let calls = fs::read_to_string(root.child("launchctl.log")).unwrap();
+        assert!(
+            !calls.contains("bootout") && !calls.contains("unload") && !calls.contains("bootstrap"),
+            "{calls}"
+        );
+        let target = run_ocm(&cwd, &env, &["env", "show", "target", "--json"]);
+        let target: Value = serde_json::from_str(&stdout(&target)).unwrap();
+        assert_eq!(target["serviceEnabled"], false);
+        assert_eq!(target["serviceRunning"], false);
+    }));
+    stop_process(&mut daemon);
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
 #[test]
 fn service_state_plans_runnable_children_and_skips_disabled_envs() {
     let _guard = daemon_runtime_test_lock();

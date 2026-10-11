@@ -643,10 +643,13 @@ impl<'a> SupervisorService<'a> {
 
     pub fn ensure_daemon_running(&self) -> Result<SupervisorDaemonSummary, String> {
         let _lifecycle_lock = self.lock_daemon_lifecycle()?;
-        self.ensure_daemon_running_locked()
+        self.ensure_daemon_running_locked(&mut false)
     }
 
-    pub(crate) fn ensure_daemon_running_locked(&self) -> Result<SupervisorDaemonSummary, String> {
+    pub(crate) fn ensure_daemon_running_locked(
+        &self,
+        daemon_mutation_attempted: &mut bool,
+    ) -> Result<SupervisorDaemonSummary, String> {
         let definition = self.supervisor_daemon_definition()?;
         validate_managed_service_owner(&definition, self.env)?;
         let status = self.daemon_status()?;
@@ -655,7 +658,7 @@ impl<'a> SupervisorService<'a> {
         }
         self.require_durable_daemon_executable()?;
         let _ = self.sync()?;
-        self.activate_daemon("install")
+        self.activate_daemon_tracking_mutation("install", daemon_mutation_attempted)
     }
 
     pub(crate) fn validate_daemon_owner_locked(&self) -> Result<(), String> {
@@ -693,8 +696,12 @@ impl<'a> SupervisorService<'a> {
         Ok(())
     }
 
-    pub(crate) fn uninstall_daemon_locked(&self) -> Result<SupervisorDaemonSummary, String> {
+    pub(crate) fn uninstall_daemon_locked(
+        &self,
+        daemon_mutation_attempted: &mut bool,
+    ) -> Result<SupervisorDaemonSummary, String> {
         let definition = self.supervisor_daemon_definition()?;
+        *daemon_mutation_attempted = true;
         deactivate_managed_service(&definition, self.env)?;
         self.daemon_summary("uninstall")
     }
@@ -934,8 +941,18 @@ impl<'a> SupervisorService<'a> {
     }
 
     pub(crate) fn activate_daemon(&self, action: &str) -> Result<SupervisorDaemonSummary, String> {
+        self.activate_daemon_tracking_mutation(action, &mut false)
+    }
+
+    fn activate_daemon_tracking_mutation(
+        &self,
+        action: &str,
+        daemon_mutation_attempted: &mut bool,
+    ) -> Result<SupervisorDaemonSummary, String> {
         self.require_durable_daemon_executable()?;
         let definition = self.supervisor_daemon_definition()?;
+        // An attempted write or activation can leave partial effects even on error.
+        *daemon_mutation_attempted = true;
         write_managed_service_definition(&definition, self.env)?;
         activate_managed_service(&definition.label, &definition.definition_path, self.env)?;
         self.daemon_summary(action)
