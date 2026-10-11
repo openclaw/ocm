@@ -1986,6 +1986,171 @@ fn contended_admission_preserves_sibling_supervision_and_desired_starts() {
     assert!(graceful, "admission contention blocked daemon shutdown");
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_applies_sibling_stop_after_inherited_handoff_output() {
+    let _guard = daemon_runtime_test_lock();
+    for (operation, stream, escaped) in [
+        ("capabilities", "stdout", false),
+        ("capabilities", "stderr", true),
+        ("consume", "stderr", false),
+        ("consume", "stdout", true),
+    ] {
+        let root = TestDir::new("daemon-handoff-output");
+        let (cwd, mut env, sibling_started, _) =
+            setup_daemon_run_fixture_with_child_sleep(&root, 120);
+        install_fake_service_manager(&root, &mut env);
+        // Start the sibling before introducing the target's slow helper.
+        EnvironmentService::new(&env, &cwd)
+            .set_service_running("prod", false)
+            .unwrap();
+        let service = SupervisorService::new(&env, &cwd);
+        service.sync().unwrap();
+        let mut daemon = spawn_daemon_process(&cwd, &env);
+        assert!(wait_for_file(&sibling_started, Duration::from_secs(5)));
+        let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+        let initial =
+            wait_for_runtime_children(&runtime_path, 1, Some("demo"), Duration::from_secs(5))
+                .unwrap();
+        let sibling_pid = runtime_child_pid(&initial, "demo").unwrap() as u32;
+        let helper_marker = root.child("helper.json");
+        let target_started = root.child("target-starts");
+        let target_script = root.child("target/openclaw.mjs");
+        write_executable_script(
+            &target_script,
+            &format!(
+                r#"#!/usr/bin/env node
+import fs from 'node:fs';
+import {{spawn}} from 'node:child_process';
+const args = process.argv.slice(2);
+const protocol = {{ok:true,protocol:'openclaw.gateway.restart-handoff',protocolVersion:1}};
+if (args[1] === 'restart-handoff') {{
+  if (args[2] === {operation:?}) {{
+    const holder = spawn('/bin/sleep', ['120'], {{detached:{escaped},stdio:['ignore',{out:?},{err:?}]}});
+    holder.unref();
+    fs.writeFileSync({marker:?}, JSON.stringify({{helper:process.pid,holder:holder.pid}}));
+  }}
+  const response = args[2] === 'capabilities' ? {{...protocol,operations:['consume']}} : {{...protocol,status:'accepted',handoff:{{pid:Number(args[4]),supervisorMode:'external'}}}};
+  process.stdout.write(JSON.stringify(response)+'\n', () => process.exit(0));
+}} else {{
+  fs.appendFileSync({started:?}, process.pid+'\n');
+  if ({operation:?} === 'consume') process.exit(0);
+  else setInterval(() => {{}}, 1000);
+}}
+"#,
+                operation = operation,
+                escaped = escaped,
+                out = if stream == "stdout" {
+                    "inherit"
+                } else {
+                    "ignore"
+                },
+                err = if stream == "stderr" {
+                    "inherit"
+                } else {
+                    "ignore"
+                },
+                marker = path_string(&helper_marker),
+                started = path_string(&target_started)
+            ),
+        );
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "launcher",
+                "add",
+                "target",
+                "--command",
+                &path_string(&target_script),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let env_service = EnvironmentService::new(&env, &cwd);
+        env_service.set_launcher("prod", "target").unwrap();
+        env_service.set_service_running("prod", true).unwrap();
+        service.sync().unwrap();
+        let observed_helper = wait_for_file(&helper_marker, Duration::from_secs(5));
+        let started = Instant::now();
+        // This is the same policy/sync boundary used by service stop; the daemon
+        // must consume it without this test releasing the holder first.
+        env_service.set_service_running("demo", false).unwrap();
+        service.sync().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while process_exists(sibling_pid) && Instant::now() < deadline {
+            sleep(Duration::from_millis(50));
+        }
+        let sibling_stopped = !process_exists(sibling_pid);
+        let elapsed = started.elapsed();
+        let target = if escaped || operation == "consume" {
+            wait_for_runtime_service_state(&runtime_path, "prod", "stopped", Duration::from_secs(3))
+        } else {
+            wait_for_runtime_service_state(&runtime_path, "prod", "running", Duration::from_secs(3))
+        };
+        let helper: Value = fs::read(&helper_marker)
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or(Value::Null);
+        let holder_pid = helper["holder"].as_u64().unwrap_or(0) as u32;
+        let holder_alive = holder_pid != 0 && process_exists(holder_pid);
+        // Sibling reconciliation must not trigger another unverified helper.
+        if escaped {
+            service.sync().unwrap();
+            sleep(Duration::from_millis(300));
+        }
+        let same_helper = fs::read(&helper_marker)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+            == Some(helper.clone());
+        let starts = fs::read_to_string(&target_started).unwrap_or_default();
+        stop_process(&mut daemon);
+        // Only test teardown may release an escaped holder, after observations.
+        if holder_pid != 0 && holder_alive {
+            let _ = Command::new("kill")
+                .args(["-KILL", &holder_pid.to_string()])
+                .status();
+        }
+        assert!(observed_helper, "helper did not run: {operation}/{stream}");
+        assert!(
+            sibling_stopped && elapsed < Duration::from_secs(20),
+            "helper blocked sibling Stop: {operation}/{stream}/{escaped}"
+        );
+        let target = target.expect("target result was not published");
+        if escaped {
+            assert!(holder_alive, "fixture did not retain escaped output");
+            assert!(
+                target["lastError"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cleanup is unverified"),
+                "{target}"
+            );
+            assert!(same_helper, "unverified helper was automatically retried");
+            if operation == "capabilities" {
+                assert!(starts.is_empty(), "unverified probe allowed legacy startup");
+            }
+        } else {
+            assert!(!holder_alive, "owned holder was not settled");
+        }
+        if operation == "consume" {
+            assert_eq!(
+                starts.lines().count(),
+                1,
+                "incomplete consume authorized a replacement"
+            );
+            assert!(
+                target["lastError"]
+                    .as_str()
+                    .unwrap()
+                    .contains("could not verify"),
+                "{target}"
+            );
+        } else if !escaped {
+            assert_eq!(target["restartHandoff"], "legacy");
+        }
+    }
+}
+
 #[test]
 fn daemon_publishes_a_started_child_before_a_sibling_probe_can_block() {
     let _guard = daemon_runtime_test_lock();

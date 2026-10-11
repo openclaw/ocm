@@ -2435,11 +2435,16 @@ fn start_due_children(
             eprintln!("{error}");
             continue;
         }
+        let mut cleanup_unverified = false;
         let start_result: Result<_, String> = (|| {
             // Do not probe a contended child. Probing itself stays outside
             // admission, so a slow OpenClaw command cannot block watch claims.
             drop(admit_supervisor_child_start(&next_child.spec, env, cwd)?);
             let restart_handoff_support = probe_restart_handoff_support(&next_child.spec);
+            if let RestartHandoffSupport::CleanupUnverified(error) = &restart_handoff_support {
+                cleanup_unverified = true;
+                return Err(error.clone());
+            }
             let admission = admit_supervisor_child_start(&next_child.spec, env, cwd)?;
             let child = spawn_running_child(
                 next_child.spec.clone(),
@@ -2474,6 +2479,18 @@ fn start_due_children(
             }
             Err(error) => {
                 eprintln!("{error}");
+                if cleanup_unverified {
+                    // Retrying this unchanged definition could accumulate helper
+                    // descendants. Keep a terminal target error, not legacy fallback.
+                    let mut stopped = inactive_from_pending(&next_child, "stopped");
+                    stopped.last_error = Some(error);
+                    stopped.last_event_at = Some(now_utc());
+                    stopped.next_retry_at = None;
+                    pending.remove(&env_name);
+                    inactive.insert(env_name, stopped);
+                    runtime_dirty = true;
+                    continue;
+                }
                 if let Some(entry) = pending.get_mut(&env_name) {
                     entry.restart_count += 1;
                     let delay_ms = restart_delay_ms(entry.restart_count);

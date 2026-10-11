@@ -488,6 +488,12 @@ a changed launch definition, or a new daemon run can start it again. Stopping th
 service removes its inactive runtime record so snapshot maintenance can verify
 that the environment is quiescent.
 
+Restart-handoff capability and consume helpers have a 15-second completion budget that includes stdout and stderr collection, followed by bounded cleanup.
+If a descendant keeps either output open, OCM stops the helper's owned process group on Unix and closes its readers before continuing sibling supervision.
+A capability timeout permits legacy startup only after cleanup is verified; otherwise the target stays stopped with a cleanup error and is not automatically retried for the unchanged launch definition.
+Resolve the reported helper or descendant problem before explicitly restarting that target.
+A failed or incomplete consume operation never authorizes a replacement Gateway.
+
 Recovery is limited to work OpenClaw knows how to persist and resume. It does
 not make arbitrary child processes or non-idempotent external side effects
 transactional.
