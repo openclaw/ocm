@@ -1753,6 +1753,28 @@ fn service_start_failure_preserves_live_sibling(ordinal: usize, reply: &str) {
                 .unwrap();
         let pid = runtime_child_pid(&initial, "sibling").unwrap();
         wait_for_started_pid(&started_path, pid);
+        // The PID marker precedes Node's listen call. Establish health before
+        // fault injection, keeping the post-action health assertion immediate.
+        let port = initial["children"][0]["childPort"].as_u64().unwrap();
+        let health_url = format!("http://127.0.0.1:{port}/health");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "sibling gateway did not become healthy within 5 seconds"
+            );
+            if ureq::get(&health_url)
+                .config()
+                .timeout_global(Some(remaining))
+                .build()
+                .call()
+                .is_ok_and(|response| response.status() == 200)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50).min(remaining));
+        }
         let before = persisted_child(&state_path, "sibling");
         // Make the manager observation refer to the real fixture daemon.
         fs::write(
