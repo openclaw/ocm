@@ -93,7 +93,8 @@ pub(crate) use runtimes::{
     install_runtime_with_context, lock_runtime_mutation,
     prepare_runtime_from_selected_official_openclaw_release, prepare_runtime_from_selected_release,
     remove_runtime_with_guard, runtime_binding_dependencies, runtime_operational_issue,
-    try_lock_runtime_binding, try_lock_runtime_binding_with_guard, try_lock_runtime_mutation,
+    runtime_owner_identity, try_lock_runtime_binding, try_lock_runtime_binding_with_guard,
+    try_lock_runtime_mutation,
 };
 pub use runtimes::{
     add_runtime, get_runtime, get_runtime_verified, install_runtime,

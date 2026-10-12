@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,7 +9,7 @@ use crate::env::EnvMeta;
 use crate::store::{
     InstallContext, RuntimeMutationGuard, add_runtime_with_context, get_runtime,
     get_runtime_verified, list_runtimes, remove_runtime_with_guard, runtime_binding_dependencies,
-    runtime_meta_path, validate_name, with_locked_environments,
+    runtime_meta_path, runtime_owner_identity, validate_name, with_locked_environments,
 };
 use crate::supervisor::sync_supervisor_binding_if_present;
 
@@ -155,6 +155,7 @@ impl<'a> RuntimeService<'a> {
     ) -> Result<Vec<String>, String> {
         let name = validate_name(name, "Runtime name")?;
         let mut dependencies = BTreeMap::new();
+        let mut mutation_identity = None;
         let mut users = Vec::new();
         for environment in environments {
             let Some(selected) = environment.default_runtime.as_deref() else {
@@ -167,19 +168,42 @@ impl<'a> RuntimeService<'a> {
                 *uses_runtime
             } else {
                 let registration = runtime_meta_path(&selected, self.env, self.cwd)?;
-                let uses_runtime = match std::fs::symlink_metadata(registration) {
+                let owners = match std::fs::symlink_metadata(registration) {
                     // Raw archive bindings may name an absent registration.
                     // There is no known indirect dependency to inspect yet.
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        BTreeSet::from([selected.clone()])
+                    }
                     Err(error) => return Err(error.to_string()),
-                    Ok(_) => runtime_binding_dependencies(
-                        &get_runtime(&selected, self.env, self.cwd)?,
-                        self.env,
-                        self.cwd,
-                    )?
-                    .owners
-                    .contains(&name),
+                    Ok(_) => {
+                        runtime_binding_dependencies(
+                            &get_runtime(&selected, self.env, self.cwd)?,
+                            self.env,
+                            self.cwd,
+                        )?
+                        .owners
+                    }
                 };
+                let mut uses_runtime = owners.contains(&name);
+                if !uses_runtime {
+                    let identity = match mutation_identity {
+                        Some(identity) => identity,
+                        None => {
+                            let identity = runtime_owner_identity(&name, self.env, self.cwd)?;
+                            mutation_identity = Some(identity);
+                            identity
+                        }
+                    };
+                    if let Some(identity) = identity {
+                        for owner in &owners {
+                            if runtime_owner_identity(owner, self.env, self.cwd)? == Some(identity)
+                            {
+                                uses_runtime = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 dependencies.insert(selected, uses_runtime);
                 uses_runtime
             };

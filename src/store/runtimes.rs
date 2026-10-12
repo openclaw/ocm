@@ -2179,6 +2179,21 @@ fn runtime_lock_path(
     Ok(parent.join(format!(".{name}.lock")))
 }
 
+pub(crate) fn runtime_owner_identity(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<Option<(u64, u64)>, String> {
+    // These files survive runtime removal and identify the existing mutation
+    // and binding namespace, including case aliases on insensitive filesystems.
+    let path = runtime_lock_path(name, env, cwd)?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+        Ok(_) => super::dev_sources::path_identity(&path).map(Some),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RuntimeMutationGuard {
     path: PathBuf,
