@@ -102,7 +102,8 @@ pub struct EnvArchiveOptions {
     pub sqlite_content_roots: BTreeSet<PathBuf>,
     pub required_sqlite_paths: BTreeSet<PathBuf>,
     pub file_contents: BTreeMap<PathBuf, Vec<u8>>,
-    pub prepare_sqlite_snapshot: Option<fn(&Path, &Path, &Path) -> Result<(), String>>,
+    pub prepare_sqlite_snapshot:
+        Option<fn(&Path, &Path, &Path, &EnvArchiveOptions) -> Result<(), String>>,
 }
 
 impl Default for EnvArchiveOptions {
@@ -122,7 +123,11 @@ impl Default for EnvArchiveOptions {
 }
 
 impl EnvArchiveOptions {
-    fn should_skip(&self, relative_path: &Path, kind: EnvArchiveEntryKind) -> Result<bool, String> {
+    pub(crate) fn should_skip(
+        &self,
+        relative_path: &Path,
+        kind: EnvArchiveEntryKind,
+    ) -> Result<bool, String> {
         if (self.should_exclude_path)(relative_path, kind)?
             || self
                 .excluded_path_roots
@@ -361,7 +366,7 @@ fn append_env_root(
             }
             let snapshot = create_sqlite_snapshot(&path).map_err(EnvArchiveWriteError::Fatal)?;
             if let Some(prepare) = options.prepare_sqlite_snapshot {
-                prepare(source_root, relative_path, snapshot.path())
+                prepare(source_root, relative_path, snapshot.path(), options)
                     .map_err(EnvArchiveWriteError::Fatal)?;
             }
             let snapshot_metadata = fs::metadata(snapshot.path()).map_err(|error| {

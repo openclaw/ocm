@@ -150,6 +150,9 @@ pub(crate) fn openclaw_env_state_archive_options(
     options.should_exclude_path = should_exclude_state_archive_path;
     options.prepare_sqlite_snapshot = Some(prepare_exported_state_snapshot);
     options.file_contents = super::openclaw_config::normalized_archive_config_contents(paths)?;
+    for path in super::openclaw_config::configured_archive_plugin_paths(paths, env, runtime)? {
+        validate_portable_plugin_path(&path, &paths.root, &options)?;
+    }
     Ok(options)
 }
 
@@ -157,6 +160,7 @@ fn prepare_exported_state_snapshot(
     source_root: &Path,
     relative_path: &Path,
     snapshot: &Path,
+    options: &EnvArchiveOptions,
 ) -> Result<(), String> {
     if relative_path != Path::new(".openclaw/state/openclaw.sqlite") {
         return Ok(());
@@ -168,7 +172,10 @@ fn prepare_exported_state_snapshot(
         snapshot,
         &source.state_dir,
         &source.state_dir,
-        PluginPathRelocation::Exported { source: &source },
+        PluginPathRelocation::Exported {
+            source: &source,
+            options,
+        },
     )?;
     Ok(())
 }
@@ -510,6 +517,7 @@ enum PluginPathRelocation<'a> {
     Imported,
     Exported {
         source: &'a EnvPaths,
+        options: &'a EnvArchiveOptions,
     },
     Archived {
         source: &'a EnvPaths,
@@ -596,7 +604,7 @@ fn relocate_installed_plugin_index_paths(
 ) -> Result<MigratedRuntimeStateResult, String> {
     let database_root = match relocation {
         PluginPathRelocation::Imported => target_state_root,
-        PluginPathRelocation::Exported { source } => &source.root,
+        PluginPathRelocation::Exported { source, .. } => &source.root,
         PluginPathRelocation::Cloned { target, .. }
         | PluginPathRelocation::Archived { target, .. } => &target.root,
     };
@@ -702,7 +710,7 @@ fn relocate_plugin_index_in_database(
         let copied = match relocation {
             PluginPathRelocation::Cloned { source, target }
             | PluginPathRelocation::Archived { source, target } => Some((source, target)),
-            PluginPathRelocation::Exported { source } => Some((source, source)),
+            PluginPathRelocation::Exported { source, .. } => Some((source, source)),
             PluginPathRelocation::Imported => None,
         };
         if let Some((source, target)) = copied {
@@ -714,7 +722,7 @@ fn relocate_plugin_index_in_database(
             ) {
                 Some(record_changed) => {
                     changed |= record_changed;
-                    if matches!(relocation, PluginPathRelocation::Exported { .. }) {
+                    if let PluginPathRelocation::Exported { options, .. } = relocation {
                         if let Some(path) = record
                             .get("installPath")
                             .and_then(Value::as_str)
@@ -726,7 +734,7 @@ fn relocate_plugin_index_in_database(
                                     .filter(|path| !path.trim().is_empty())
                             })
                         {
-                            validate_portable_plugin_path(Path::new(path), &source.root)?;
+                            validate_portable_plugin_path(Path::new(path), &source.root, options)?;
                         }
                     }
                 }
@@ -788,8 +796,17 @@ fn relocate_plugin_index_in_database(
     })
 }
 
-fn validate_portable_plugin_path(path: &Path, root: &Path) -> Result<(), String> {
-    let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+fn validate_portable_plugin_path(
+    path: &Path,
+    root: &Path,
+    options: &EnvArchiveOptions,
+) -> Result<(), String> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        format!(
+            "plugin path is outside the exported environment: {}",
+            path.display()
+        )
+    })?;
     let mut pending = relative
         .components()
         .map(|part| part.as_os_str().to_os_string())
@@ -797,17 +814,46 @@ fn validate_portable_plugin_path(path: &Path, root: &Path) -> Result<(), String>
     let mut current = root.to_path_buf();
     let mut followed = 0;
     while let Some(part) = pending.pop_front() {
+        if part == OsStr::new(".") {
+            continue;
+        }
+        if part == OsStr::new("..") {
+            if current == root {
+                return Err("plugin symlink leaves the environment root".to_string());
+            }
+            current.pop();
+            continue;
+        }
         current.push(part);
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
+        let relative = current
+            .strip_prefix(root)
+            .map_err(|error| error.to_string())?;
+        let kind = if metadata.is_symlink() {
+            EnvArchiveEntryKind::Symlink
+        } else if metadata.is_dir() {
+            EnvArchiveEntryKind::Directory
+        } else {
+            EnvArchiveEntryKind::File
+        };
+        if options.should_skip(relative, kind)? {
+            return Err(format!(
+                "plugin path is excluded from the environment archive: {}",
+                current.display()
+            ));
+        }
         if !metadata.is_symlink() {
+            if !metadata.is_dir() && !pending.is_empty() {
+                return Err("plugin path traverses a non-directory".to_string());
+            }
             continue;
         }
         let target = fs::read_link(&current).map_err(|error| error.to_string())?;
-        if target.is_absolute() {
+        if target.has_root() || matches!(target.components().next(), Some(Component::Prefix(_))) {
             return Err(format!(
                 "cannot export a plugin path through an absolute symlink: {}",
                 current.display()
@@ -817,19 +863,27 @@ fn validate_portable_plugin_path(path: &Path, root: &Path) -> Result<(), String>
         if followed > 40 {
             return Err("plugin symlink chain is too deep to export".to_string());
         }
-        let target = clean_path(
-            &current
-                .parent()
-                .ok_or("plugin link has no parent")?
-                .join(target),
-        );
-        let relative = target
-            .strip_prefix(root)
-            .map_err(|_| "plugin symlink leaves the environment root".to_string())?;
-        for part in relative.components().rev() {
+        current.pop();
+        // Resolve each link before processing a following .. component.
+        for part in target.components().rev() {
             pending.push_front(part.as_os_str().to_os_string());
         }
-        current = root.to_path_buf();
+    }
+    let relative = current
+        .strip_prefix(root)
+        .map_err(|error| error.to_string())?;
+    if fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.is_dir())
+        && ((options.should_skip_path)(relative, EnvArchiveEntryKind::Directory)
+            && !options
+                .included_path_roots
+                .iter()
+                .any(|included| relative.starts_with(included))
+            || relative == Path::new(".openclaw"))
+    {
+        return Err(format!(
+            "plugin payload is not fully selected by the environment archive: {}",
+            current.display()
+        ));
     }
     Ok(())
 }

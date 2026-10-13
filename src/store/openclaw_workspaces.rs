@@ -312,9 +312,8 @@ fn resolve_openclaw_workspaces(
         .as_ref()
         .map(|resolved| resolved.value.clone())
         .unwrap_or_else(|| Value::Object(Map::new()));
-    let mut config_env = openclaw_config_env(env, openclaw_home, state_dir, config_path, runtime);
-    apply_openclaw_config_env(&config, &mut config_env);
-    let config = resolve_config_env_vars(config, &config_env);
+    let config =
+        resolve_openclaw_config_value(config, openclaw_home, state_dir, config_path, env, runtime);
     let config_include_paths = resolved
         .map(|resolved| resolved.include_paths)
         .unwrap_or_default();
@@ -387,6 +386,38 @@ fn resolve_openclaw_workspaces(
         configured_agent_workspace_roots,
         default_agent_id,
     })
+}
+
+pub(super) fn resolved_env_openclaw_config(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+) -> Result<Option<Value>, String> {
+    Ok(
+        load_effective_openclaw_config(&paths.config_path)?.map(|resolved| {
+            resolve_openclaw_config_value(
+                resolved.value,
+                &paths.openclaw_home,
+                &paths.state_dir,
+                &paths.config_path,
+                env,
+                runtime,
+            )
+        }),
+    )
+}
+
+fn resolve_openclaw_config_value(
+    config: Value,
+    home: &Path,
+    state: &Path,
+    path: &Path,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+) -> Value {
+    let mut config_env = openclaw_config_env(env, home, state, path, runtime);
+    apply_openclaw_config_env(&config, &mut config_env);
+    resolve_config_env_vars(config, &config_env)
 }
 
 fn openclaw_config_env(

@@ -117,6 +117,53 @@ pub(crate) fn repair_openclaw_config(
     Ok(true)
 }
 
+pub(super) fn configured_archive_plugin_paths(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: super::openclaw_workspaces::OpenClawWorkspaceRuntime<'_>,
+) -> Result<Vec<PathBuf>, String> {
+    let Some(config) =
+        super::openclaw_workspaces::resolved_env_openclaw_config(paths, env, runtime)?
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = config
+        .pointer("/plugins/load/paths")
+        .and_then(Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut result = Vec::new();
+    for raw in values
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let mut value = Value::String(raw.to_string());
+        rewrite_env_root_paths(&mut value, &paths.root, &paths.root);
+        let raw = value.as_str().unwrap();
+        if raw.contains("${") {
+            return Err("cannot export an unresolved configured plugin path".to_string());
+        }
+        let expanded = if raw == "~" {
+            paths.openclaw_home.clone()
+        } else if raw.starts_with("~/") || raw.starts_with("~\\") {
+            let mut value = paths.openclaw_home.as_os_str().to_os_string();
+            value.push(&raw[1..]);
+            PathBuf::from(value)
+        } else {
+            PathBuf::from(raw)
+        };
+        result.push(clean_path(&if expanded.is_absolute() {
+            expanded
+        } else {
+            paths.root.join(expanded)
+        }));
+    }
+    Ok(result)
+}
+
 pub(super) fn normalized_archive_config_contents(
     paths: &EnvPaths,
 ) -> Result<BTreeMap<PathBuf, Vec<u8>>, String> {

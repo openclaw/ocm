@@ -723,70 +723,163 @@ fn env_export_include_state_rejects_damaged_canonical_databases() {
 fn env_export_include_state_rejects_absolute_plugin_links_and_keeps_relative_links() {
     use rusqlite::Connection;
     use serde_json::json;
-    for absolute in [true, false] {
-        let root = TestDir::new("export-plugin-link");
-        let env = ocm_env(&root);
-        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
-        assert!(create.status.success(), "{}", stderr(&create));
-        let source = root.child("ocm-home/envs/source/.openclaw");
-        write_text(
-            &source.join("extensions/actual/package.json"),
-            r#"{"name":"demo","version":"1.0.0"}"#,
-        );
-        let target = if absolute {
-            source.join("extensions/actual")
-        } else {
-            std::path::PathBuf::from("actual")
-        };
-        std::os::unix::fs::symlink(target, source.join("extensions/link")).unwrap();
-        fs::create_dir_all(source.join("state")).unwrap();
-        let db = Connection::open(source.join("state/openclaw.sqlite")).unwrap();
-        db.execute_batch("CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT);").unwrap();
-        let receipt = json!({"demo":{"source":"path","installPath":source.join("extensions/link"),"sourcePath":source.join("extensions/link")}});
-        db.execute(
-            "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1)",
-            [receipt.to_string()],
-        )
-        .unwrap();
-        drop(db);
-        let export = run_ocm(
-            root.path(),
-            &env,
-            &[
-                "env",
-                "export",
-                "source",
-                "--include-state",
-                "--output",
-                "state.tar",
-            ],
-        );
-        if absolute {
-            assert!(!export.status.success());
-            assert!(
-                stderr(&export).contains("absolute symlink"),
-                "{}",
-                stderr(&export)
+    for kind in [
+        "absolute",
+        "relative",
+        "chained-absolute",
+        "chained-relative",
+    ] {
+        for receipt in [false, true] {
+            let root = TestDir::new("export-plugin-link");
+            let env = ocm_env(&root);
+            let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source/.openclaw");
+            write_text(
+                &source.join("extensions/actual/package.json"),
+                r#"{"name":"demo","version":"1.0.0"}"#,
             );
-            assert!(!root.child("state.tar").exists());
-        } else {
-            assert!(export.status.success(), "{}", stderr(&export));
-            fs::rename(&source, root.child("source-offline")).unwrap();
-            let import = run_ocm(
+            let target = match kind {
+                "absolute" => source.join("extensions/actual"),
+                "relative" => std::path::PathBuf::from("actual"),
+                _ => {
+                    fs::create_dir_all(source.join("extensions/nested")).unwrap();
+                    let bridge = if kind == "chained-absolute" {
+                        source.join("extensions/nested")
+                    } else {
+                        std::path::PathBuf::from("nested")
+                    };
+                    std::os::unix::fs::symlink(bridge, source.join("extensions/bridge")).unwrap();
+                    std::path::PathBuf::from("bridge/../actual")
+                }
+            };
+            std::os::unix::fs::symlink(target, source.join("extensions/link")).unwrap();
+            if receipt {
+                fs::create_dir_all(source.join("state")).unwrap();
+                let db = Connection::open(source.join("state/openclaw.sqlite")).unwrap();
+                db.execute_batch("CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT);").unwrap();
+                let record = json!({"demo":{"source":"path","installPath":source.join("extensions/link"),"sourcePath":source.join("extensions/link")}});
+                db.execute(
+                    "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1)",
+                    [record.to_string()],
+                )
+                .unwrap();
+            } else {
+                write_text(
+                    &source.join("openclaw.json"),
+                    &json!({"plugins":{"load":{"paths":[source.join("extensions/link")]}}})
+                        .to_string(),
+                );
+            }
+            let export = run_ocm(
                 root.path(),
                 &env,
-                &["env", "import", "state.tar", "--name", "target"],
+                &[
+                    "env",
+                    "export",
+                    "source",
+                    "--include-state",
+                    "--output",
+                    "state.tar",
+                ],
             );
-            assert!(import.status.success(), "{}", stderr(&import));
-            let target = root.child("ocm-home/envs/target/.openclaw");
-            assert_eq!(
-                fs::read_link(target.join("extensions/link")).unwrap(),
-                std::path::Path::new("actual")
+            if kind.contains("absolute") {
+                assert!(!export.status.success(), "{kind}, receipt={receipt}");
+                assert!(
+                    stderr(&export).contains("absolute symlink"),
+                    "{}",
+                    stderr(&export)
+                );
+                assert!(!root.child("state.tar").exists());
+            } else {
+                assert!(export.status.success(), "{}", stderr(&export));
+                fs::rename(&source, root.child("source-offline")).unwrap();
+                let import = run_ocm(
+                    root.path(),
+                    &env,
+                    &["env", "import", "state.tar", "--name", "target"],
+                );
+                assert!(import.status.success(), "{}", stderr(&import));
+                let target = root.child("ocm-home/envs/target/.openclaw");
+                assert_eq!(
+                    fs::canonicalize(target.join("extensions/link")).unwrap(),
+                    fs::canonicalize(target.join("extensions/actual")).unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn env_export_include_state_requires_selected_plugin_payload_roots() {
+    use rusqlite::Connection;
+    use serde_json::json;
+    for (relative, workspace, selected) in [
+        ("extensions/demo", false, true),
+        ("custom/demo", false, false),
+        ("custom/demo", true, true),
+    ] {
+        for receipt in [false, true] {
+            let root = TestDir::new("export-plugin-selection");
+            let env = ocm_env(&root);
+            let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source/.openclaw");
+            write_text(
+                &source.join(relative).join("package.json"),
+                r#"{"name":"demo","version":"1.0.0"}"#,
             );
-            assert_eq!(
-                fs::canonicalize(target.join("extensions/link")).unwrap(),
-                fs::canonicalize(target.join("extensions/actual")).unwrap()
+            let mut config = json!({});
+            if workspace {
+                config["agents"] = json!({"defaults":{"workspace":source.join("custom")}});
+            }
+            if receipt {
+                fs::create_dir_all(source.join("state")).unwrap();
+                let db = Connection::open(source.join("state/openclaw.sqlite")).unwrap();
+                db.execute_batch("CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT);").unwrap();
+                db.execute(
+                    "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1)",
+                    [
+                        json!({"demo":{"source":"path","installPath":source.join(relative)}})
+                            .to_string(),
+                    ],
+                )
+                .unwrap();
+            } else {
+                config["plugins"] = json!({"load":{"paths":[source.join(relative)]}});
+            }
+            write_text(&source.join("openclaw.json"), &config.to_string());
+            let export = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "export",
+                    "source",
+                    "--include-state",
+                    "--output",
+                    "state.tar",
+                ],
             );
+            assert_eq!(export.status.success(), selected, "{}", stderr(&export));
+            if !selected {
+                assert!(stderr(&export).contains("excluded"), "{}", stderr(&export));
+                assert!(!root.child("state.tar").exists());
+            } else {
+                fs::rename(&source, root.child("source-offline")).unwrap();
+                let import = run_ocm(
+                    root.path(),
+                    &env,
+                    &["env", "import", "state.tar", "--name", "target"],
+                );
+                assert!(import.status.success(), "{}", stderr(&import));
+                assert!(
+                    root.child("ocm-home/envs/target/.openclaw")
+                        .join(relative)
+                        .join("package.json")
+                        .exists()
+                );
+            }
         }
     }
 }
