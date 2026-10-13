@@ -955,7 +955,7 @@ snapshot, including uncheckpointed WAL writes. Raw database sidecars, sockets,
 pids, locks, and temporary process files are omitted. Databases and other files
 are not captured in one atomic transaction. JSON reports `includeState`; the
 human summary reports whether state was included. State symlinks are rejected
-so an import cannot retain live database links into the source installation.
+so an import cannot retain live database links into the source installation. Damaged canonical state databases and absolute links that would remain in imported plugin paths are rejected; supported relative plugin links are preserved.
 
 Export normalizes owned config and plugin receipt aliases in copied content while the
 source filesystem is available, without changing the source. Import restores

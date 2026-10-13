@@ -1195,7 +1195,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
         let extracted_paths = derive_env_paths(&extracted.root_dir);
         validate_nonportable_runtime_state_paths(&extracted_paths)?;
         if extracted.metadata.include_state {
-            super::openclaw_state::validate_archived_state_links(&extracted_paths)?;
+            super::openclaw_state::validate_archived_openclaw_state(&extracted_paths)?;
         }
         reject_include_owned_sandbox_origin(&extracted_paths.config_path)?;
         reject_include_owned_agent_workspaces(&extracted_paths.config_path)?;

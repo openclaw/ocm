@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -10,6 +10,8 @@ use crate::env::EnvMeta;
 use crate::infra::archive::{EnvArchiveEntryKind, EnvArchiveOptions};
 
 use super::common::path_exists;
+
+const CORE_STATE_DATABASES: [&str; 2] = ["openclaw.sqlite", "openclaw-quarantine.sqlite"];
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_workspaces::{
     OpenClawWorkspaceInventory, OpenClawWorkspaceRuntime, resolve_env_openclaw_workspaces,
@@ -134,6 +136,7 @@ pub(crate) fn openclaw_env_state_archive_options(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<EnvArchiveOptions, String> {
+    validate_nonportable_runtime_state_paths(paths)?;
     let mut options = openclaw_env_archive_options(paths, env, runtime)?;
     options
         .included_path_roots
@@ -141,6 +144,9 @@ pub(crate) fn openclaw_env_state_archive_options(
     options
         .sqlite_content_roots
         .insert(PathBuf::from(".openclaw/state"));
+    options
+        .required_sqlite_paths
+        .extend(CORE_STATE_DATABASES.map(|name| Path::new(".openclaw/state").join(name)));
     options.should_exclude_path = should_exclude_state_archive_path;
     options.prepare_sqlite_snapshot = Some(prepare_exported_state_snapshot);
     options.file_contents = super::openclaw_config::normalized_archive_config_contents(paths)?;
@@ -162,10 +168,7 @@ fn prepare_exported_state_snapshot(
         snapshot,
         &source.state_dir,
         &source.state_dir,
-        PluginPathRelocation::Cloned {
-            source: &source,
-            target: &source,
-        },
+        PluginPathRelocation::Exported { source: &source },
     )?;
     Ok(())
 }
@@ -198,7 +201,7 @@ fn should_exclude_state_archive_path(
     Ok(false)
 }
 
-pub(super) fn validate_archived_state_links(paths: &EnvPaths) -> Result<(), String> {
+pub(super) fn validate_archived_openclaw_state(paths: &EnvPaths) -> Result<(), String> {
     let state = paths.state_dir.join("state");
     let mut pending = vec![state.clone()];
     while let Some(path) = pending.pop() {
@@ -215,6 +218,23 @@ pub(super) fn validate_archived_state_links(paths: &EnvPaths) -> Result<(), Stri
         }
         if path == state && !metadata.is_dir() {
             return Err("OpenClaw state must be a real directory".to_string());
+        }
+        if metadata.is_file()
+            && CORE_STATE_DATABASES
+                .iter()
+                .any(|name| path == state.join(name))
+        {
+            let database = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|error| format!("invalid archived SQLite state: {error}"))?;
+            let check: String = database
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .map_err(|error| format!("invalid archived SQLite state: {error}"))?;
+            if check != "ok" {
+                return Err(format!("invalid archived SQLite state: {check}"));
+            }
         }
         if metadata.is_dir() {
             for entry in fs::read_dir(&path).map_err(|error| error.to_string())? {
@@ -488,6 +508,9 @@ fn is_legacy_audit_generation(suffix: &str) -> bool {
 #[derive(Clone, Copy)]
 enum PluginPathRelocation<'a> {
     Imported,
+    Exported {
+        source: &'a EnvPaths,
+    },
     Archived {
         source: &'a EnvPaths,
         target: &'a EnvPaths,
@@ -573,6 +596,7 @@ fn relocate_installed_plugin_index_paths(
 ) -> Result<MigratedRuntimeStateResult, String> {
     let database_root = match relocation {
         PluginPathRelocation::Imported => target_state_root,
+        PluginPathRelocation::Exported { source } => &source.root,
         PluginPathRelocation::Cloned { target, .. }
         | PluginPathRelocation::Archived { target, .. } => &target.root,
     };
@@ -675,16 +699,37 @@ fn relocate_plugin_index_in_database(
         let Some(record) = record.as_object_mut() else {
             continue;
         };
-        if let PluginPathRelocation::Cloned { source, target }
-        | PluginPathRelocation::Archived { source, target } = relocation
-        {
+        let copied = match relocation {
+            PluginPathRelocation::Cloned { source, target }
+            | PluginPathRelocation::Archived { source, target } => Some((source, target)),
+            PluginPathRelocation::Exported { source } => Some((source, source)),
+            PluginPathRelocation::Imported => None,
+        };
+        if let Some((source, target)) = copied {
             match relocate_cloned_plugin_record(
                 record,
                 source,
                 target,
-                matches!(relocation, PluginPathRelocation::Cloned { .. }),
+                !matches!(relocation, PluginPathRelocation::Archived { .. }),
             ) {
-                Some(record_changed) => changed |= record_changed,
+                Some(record_changed) => {
+                    changed |= record_changed;
+                    if matches!(relocation, PluginPathRelocation::Exported { .. }) {
+                        if let Some(path) = record
+                            .get("installPath")
+                            .and_then(Value::as_str)
+                            .filter(|path| !path.trim().is_empty())
+                            .or_else(|| {
+                                record
+                                    .get("sourcePath")
+                                    .and_then(Value::as_str)
+                                    .filter(|path| !path.trim().is_empty())
+                            })
+                        {
+                            validate_portable_plugin_path(Path::new(path), &source.root)?;
+                        }
+                    }
+                }
                 None => {
                     external_plugin_ids.insert(plugin_id.clone());
                 }
@@ -741,6 +786,52 @@ fn relocate_plugin_index_in_database(
         changed: true,
         external_plugin_ids: external_plugin_ids.into_iter().collect(),
     })
+}
+
+fn validate_portable_plugin_path(path: &Path, root: &Path) -> Result<(), String> {
+    let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+    let mut pending = relative
+        .components()
+        .map(|part| part.as_os_str().to_os_string())
+        .collect::<VecDeque<_>>();
+    let mut current = root.to_path_buf();
+    let mut followed = 0;
+    while let Some(part) = pending.pop_front() {
+        current.push(part);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        if !metadata.is_symlink() {
+            continue;
+        }
+        let target = fs::read_link(&current).map_err(|error| error.to_string())?;
+        if target.is_absolute() {
+            return Err(format!(
+                "cannot export a plugin path through an absolute symlink: {}",
+                current.display()
+            ));
+        }
+        followed += 1;
+        if followed > 40 {
+            return Err("plugin symlink chain is too deep to export".to_string());
+        }
+        let target = clean_path(
+            &current
+                .parent()
+                .ok_or("plugin link has no parent")?
+                .join(target),
+        );
+        let relative = target
+            .strip_prefix(root)
+            .map_err(|_| "plugin symlink leaves the environment root".to_string())?;
+        for part in relative.components().rev() {
+            pending.push_front(part.as_os_str().to_os_string());
+        }
+        current = root.to_path_buf();
+    }
+    Ok(())
 }
 
 fn relocate_cloned_plugin_record(

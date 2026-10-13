@@ -654,3 +654,139 @@ fn env_import_rejects_state_archive_without_source_root() {
     );
     assert!(!root.child("ocm-home/envs/target").exists());
 }
+
+#[test]
+fn env_export_include_state_rejects_damaged_canonical_databases() {
+    for name in ["openclaw.sqlite", "openclaw-quarantine.sqlite"] {
+        let root = TestDir::new("export-damaged-state");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root
+            .child("ocm-home/envs/source/.openclaw/state")
+            .join(name);
+        write_text(&source, "damaged database header");
+        let default = run_ocm(
+            root.path(),
+            &env,
+            &["env", "export", "source", "--output", "default.tar"],
+        );
+        assert!(default.status.success(), "{}", stderr(&default));
+        let export = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--include-state",
+                "--output",
+                "state.tar",
+            ],
+        );
+        assert!(!export.status.success());
+        assert!(stderr(&export).contains("SQLite"), "{}", stderr(&export));
+        assert!(!root.child("state.tar").exists());
+        let mut extracted = extract_env_archive::<EnvArchiveMetadata>(
+            &root.child("default.tar"),
+            &root.child("extracted"),
+        )
+        .unwrap();
+        extracted.metadata.include_state = true;
+        write_text(
+            &extracted.root_dir.join(".openclaw/state").join(name),
+            "damaged database header",
+        );
+        ocm::infra::archive::write_env_archive(
+            &extracted.metadata,
+            &extracted.root_dir,
+            &root.child("damaged.tar"),
+        )
+        .unwrap();
+        let import = run_ocm(
+            root.path(),
+            &env,
+            &["env", "import", "damaged.tar", "--name", "target"],
+        );
+        assert!(!import.status.success());
+        assert!(stderr(&import).contains("SQLite"), "{}", stderr(&import));
+        assert!(!root.child("ocm-home/envs/target").exists());
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "damaged database header"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_export_include_state_rejects_absolute_plugin_links_and_keeps_relative_links() {
+    use rusqlite::Connection;
+    use serde_json::json;
+    for absolute in [true, false] {
+        let root = TestDir::new("export-plugin-link");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source/.openclaw");
+        write_text(
+            &source.join("extensions/actual/package.json"),
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        );
+        let target = if absolute {
+            source.join("extensions/actual")
+        } else {
+            std::path::PathBuf::from("actual")
+        };
+        std::os::unix::fs::symlink(target, source.join("extensions/link")).unwrap();
+        fs::create_dir_all(source.join("state")).unwrap();
+        let db = Connection::open(source.join("state/openclaw.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT);").unwrap();
+        let receipt = json!({"demo":{"source":"path","installPath":source.join("extensions/link"),"sourcePath":source.join("extensions/link")}});
+        db.execute(
+            "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1)",
+            [receipt.to_string()],
+        )
+        .unwrap();
+        drop(db);
+        let export = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--include-state",
+                "--output",
+                "state.tar",
+            ],
+        );
+        if absolute {
+            assert!(!export.status.success());
+            assert!(
+                stderr(&export).contains("absolute symlink"),
+                "{}",
+                stderr(&export)
+            );
+            assert!(!root.child("state.tar").exists());
+        } else {
+            assert!(export.status.success(), "{}", stderr(&export));
+            fs::rename(&source, root.child("source-offline")).unwrap();
+            let import = run_ocm(
+                root.path(),
+                &env,
+                &["env", "import", "state.tar", "--name", "target"],
+            );
+            assert!(import.status.success(), "{}", stderr(&import));
+            let target = root.child("ocm-home/envs/target/.openclaw");
+            assert_eq!(
+                fs::read_link(target.join("extensions/link")).unwrap(),
+                std::path::Path::new("actual")
+            );
+            assert_eq!(
+                fs::canonicalize(target.join("extensions/link")).unwrap(),
+                fs::canonicalize(target.join("extensions/actual")).unwrap()
+            );
+        }
+    }
+}

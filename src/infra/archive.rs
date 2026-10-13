@@ -19,14 +19,14 @@ const MAX_ENV_ARCHIVE_WRITE_ATTEMPTS: usize = 2;
 const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 enum EnvArchiveWriteError {
-    EntryChanged(String),
+    EntryDisappeared(String),
     Fatal(String),
 }
 
 impl EnvArchiveWriteError {
     fn from_entry_io(error: io::Error) -> Self {
         if error.kind() == io::ErrorKind::NotFound {
-            Self::EntryChanged(error.to_string())
+            Self::EntryDisappeared(error.to_string())
         } else {
             Self::Fatal(error.to_string())
         }
@@ -34,7 +34,7 @@ impl EnvArchiveWriteError {
 
     fn into_message(self) -> String {
         match self {
-            Self::EntryChanged(message) | Self::Fatal(message) => message,
+            Self::EntryDisappeared(message) | Self::Fatal(message) => message,
         }
     }
 }
@@ -100,6 +100,7 @@ pub struct EnvArchiveOptions {
     pub excluded_path_roots: BTreeSet<PathBuf>,
     pub snapshot_sqlite_files: bool,
     pub sqlite_content_roots: BTreeSet<PathBuf>,
+    pub required_sqlite_paths: BTreeSet<PathBuf>,
     pub file_contents: BTreeMap<PathBuf, Vec<u8>>,
     pub prepare_sqlite_snapshot: Option<fn(&Path, &Path, &Path) -> Result<(), String>>,
 }
@@ -113,6 +114,7 @@ impl Default for EnvArchiveOptions {
             excluded_path_roots: BTreeSet::new(),
             snapshot_sqlite_files: false,
             sqlite_content_roots: BTreeSet::new(),
+            required_sqlite_paths: BTreeSet::new(),
             prepare_sqlite_snapshot: None,
             file_contents: BTreeMap::new(),
         }
@@ -171,7 +173,7 @@ pub fn write_env_archive_with_options<T: Serialize>(
     for attempt in 0..MAX_ENV_ARCHIVE_WRITE_ATTEMPTS {
         match write_env_archive_attempt(metadata, source_root, output_path, options.clone()) {
             Ok(()) => return Ok(()),
-            Err(EnvArchiveWriteError::EntryChanged(_))
+            Err(EnvArchiveWriteError::EntryDisappeared(_))
                 if attempt + 1 < MAX_ENV_ARCHIVE_WRITE_ATTEMPTS => {}
             Err(error) => return Err(error.into_message()),
         }
@@ -233,7 +235,6 @@ fn append_env_root(
         .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
     let mut state_databases = BTreeSet::new();
     let mut state_sidecars = BTreeSet::new();
-    let mut written_sidecar_candidates = BTreeSet::new();
     while let Some(path) = stack.pop() {
         let relative_path = path.strip_prefix(source_root).map_err(|error| {
             EnvArchiveWriteError::Fatal(format!(
@@ -248,6 +249,12 @@ fn append_env_root(
             ))
         })?;
         let entry_kind = env_archive_entry_kind(&metadata);
+        if options.required_sqlite_paths.contains(relative_path) && !metadata.is_file() {
+            return Err(EnvArchiveWriteError::Fatal(format!(
+                "required SQLite archive source is not a regular file: {}",
+                path.display()
+            )));
+        }
         if options
             .should_skip(relative_path, entry_kind)
             .map_err(EnvArchiveWriteError::Fatal)?
@@ -260,20 +267,11 @@ fn append_env_root(
             .any(|root| relative_path.starts_with(root));
         let state_database = discover_sqlite
             && metadata.is_file()
-            && (state_databases.contains(&path)
+            && (options.required_sqlite_paths.contains(relative_path)
+                || state_databases.contains(&path)
                 || is_sqlite_database(&path).map_err(EnvArchiveWriteError::Fatal)?);
         if state_database {
-            let sidecars = sqlite_sidecar_paths(&path);
-            if sidecars
-                .iter()
-                .any(|path| written_sidecar_candidates.contains(path))
-            {
-                return Err(EnvArchiveWriteError::EntryChanged(
-                    "SQLite database appeared after its sidecars were classified; retrying archive"
-                        .to_string(),
-                ));
-            }
-            state_sidecars.extend(sidecars);
+            state_sidecars.extend(sqlite_sidecar_paths(&path));
         } else if discover_sqlite
             && metadata.is_file()
             && (state_sidecars.contains(&path)
@@ -305,9 +303,6 @@ fn append_env_root(
             builder
                 .append_data(&mut header, &archive_path, Cursor::new(contents))
                 .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
-            if discover_sqlite && sqlite_sidecar_suffix(&path).is_some() {
-                written_sidecar_candidates.insert(path.clone());
-            }
             continue;
         }
         if metadata.is_dir() {
@@ -335,7 +330,8 @@ fn append_env_root(
                         continue;
                     }
                     if child_meta.is_file()
-                        && is_sqlite_database(child).map_err(EnvArchiveWriteError::Fatal)?
+                        && (options.required_sqlite_paths.contains(child_relative)
+                            || is_sqlite_database(child).map_err(EnvArchiveWriteError::Fatal)?)
                     {
                         state_databases.insert(child.clone());
                         state_sidecars.extend(sqlite_sidecar_paths(child));
@@ -403,9 +399,6 @@ fn append_env_root(
                     format!("failed to archive {}", path.display()),
                 ))
             })?;
-        if discover_sqlite && sqlite_sidecar_suffix(&path).is_some() {
-            written_sidecar_candidates.insert(path);
-        }
     }
 
     Ok(())
@@ -702,58 +695,57 @@ mod tests {
         }
     }
 
-    static LATE_DATABASE: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
+    #[cfg(unix)]
+    static DISAPPEARING_PRIMARY: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
 
-    fn create_database_after_sidecar_copy(
+    #[cfg(unix)]
+    fn remove_primary_after_capture(
         relative: &Path,
         _kind: EnvArchiveEntryKind,
     ) -> Result<bool, String> {
-        if relative == Path::new("state/late") {
-            let mut configured = LATE_DATABASE.lock().unwrap();
+        if relative == Path::new("state/live.db-wal") {
+            let mut configured = DISAPPEARING_PRIMARY.lock().unwrap();
             let (path, visits) = configured.as_mut().unwrap();
             *visits += 1;
             if *visits == 2 {
-                fs::remove_file(&*path).unwrap();
-                let db = Connection::open(&*path).unwrap();
-                db.execute_batch(
-                    "CREATE TABLE records (value TEXT); INSERT INTO records VALUES ('committed');",
-                )
-                .unwrap();
+                fs::remove_file(path).unwrap();
             }
         }
         Ok(false)
     }
 
+    #[cfg(unix)]
     #[test]
-    fn env_archive_retries_when_a_database_appears_after_sidecar_classification() {
+    fn env_archive_omits_sidecars_after_the_captured_primary_disappears() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         fs::create_dir_all(source.join("state")).unwrap();
-        fs::write(source.join("state/late"), "not yet a database").unwrap();
-        fs::write(source.join("state/late-journal"), "earlier opaque data").unwrap();
-        *LATE_DATABASE.lock().unwrap() = Some((source.join("state/late"), 0));
+        let primary = source.join("state/live.db");
+        let writer = Connection::open(&primary).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records (value TEXT); INSERT INTO records VALUES ('committed');").unwrap();
+        *DISAPPEARING_PRIMARY.lock().unwrap() = Some((primary.clone(), 0));
         let output = root.path().join("archive.tar");
         write_env_archive_with_options(
             &serde_json::json!({}),
             &source,
             &output,
             EnvArchiveOptions {
-                should_exclude_path: create_database_after_sidecar_copy,
+                should_exclude_path: remove_primary_after_capture,
                 sqlite_content_roots: BTreeSet::from([PathBuf::from("state")]),
                 ..EnvArchiveOptions::default()
             },
         )
         .unwrap();
-        let visits = LATE_DATABASE.lock().unwrap().take().unwrap().1;
-        assert!(
-            visits >= 4,
-            "the changed database must trigger an archive retry"
-        );
+        let visits = DISAPPEARING_PRIMARY.lock().unwrap().take().unwrap().1;
+        assert_eq!(visits, 2);
+        assert!(!primary.exists());
+        assert!(source.join("state/live.db-wal").exists());
         let extracted =
             extract_env_archive::<serde_json::Value>(&output, &root.path().join("extracted"))
                 .unwrap();
-        assert!(!extracted.root_dir.join("state/late-journal").exists());
-        let db = Connection::open(extracted.root_dir.join("state/late")).unwrap();
+        assert!(!extracted.root_dir.join("state/live.db-wal").exists());
+        assert!(!extracted.root_dir.join("state/live.db-shm").exists());
+        let db = Connection::open(extracted.root_dir.join("state/live.db")).unwrap();
         let value: String = db
             .query_row("SELECT value FROM records", [], |row| row.get(0))
             .unwrap();
