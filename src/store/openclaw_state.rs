@@ -878,11 +878,9 @@ fn validate_exported_plugin_payload(
     options: &EnvArchiveOptions,
 ) -> Result<(), String> {
     let mut resolved = validate_portable_plugin_path(path, paths, options)?;
-    // A file entrypoint can share its directory with unrelated environment data.
-    // Inspect retained siblings for links without requiring all parent contents
-    // to be plugin payload. The selected entry itself was validated above.
-    let file_entrypoint = resolved.is_file();
-    if file_entrypoint {
+    // OpenClaw treats a file entrypoint's parent as its plugin root. Validate
+    // that whole payload without guessing which files its code may import.
+    if resolved.is_file() {
         resolved = resolved.parent().unwrap().to_path_buf();
     }
     let mut pending = vec![resolved];
@@ -919,16 +917,13 @@ fn validate_exported_plugin_payload(
             } else {
                 payload_survives_import(&path, paths, options)
             };
-            if file_entrypoint && !retained {
-                continue;
-            }
             if kind == EnvArchiveEntryKind::Other {
                 return Err(format!(
                     "unsupported plugin payload entry: {}",
                     path.display()
                 ));
             }
-            if metadata.is_symlink() {
+            if metadata.is_symlink() && !options.file_contents.contains_key(relative) {
                 pending.push(validate_portable_plugin_path(&path, paths, options)?);
             } else {
                 if !retained {
@@ -1014,6 +1009,12 @@ fn validate_portable_plugin_path(
                 "plugin path traverses an entry removed during import: {}",
                 current.display()
             ));
+        }
+        if options.file_contents.contains_key(relative) {
+            if !pending.is_empty() {
+                return Err("plugin path traverses a materialized config file".to_string());
+            }
+            continue;
         }
         if metadata.is_symlink()
             && current.parent() == Some(paths.state_dir.join("agents").as_path())

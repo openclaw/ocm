@@ -255,7 +255,12 @@ fn state_export_rejects_caller_relative_plugin_selection_without_changing_defaul
 #[cfg(unix)]
 #[test]
 fn state_export_keeps_root_file_entrypoints_and_checks_retained_sibling_links() {
-    for absolute in [false, true] {
+    for (absolute, removed_dependency, config_link) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
         let root = TestDir::new("export-root-file-plugin");
         let env = ocm_env(&root);
         let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
@@ -263,8 +268,16 @@ fn state_export_keeps_root_file_entrypoints_and_checks_retained_sibling_links() 
         let source = root.child("ocm-home/envs/source");
         write_text(&source.join("entry.mjs"), "import './impl.mjs';");
         write_text(&source.join("actual.mjs"), "export default {};");
-        fs::create_dir_all(source.join(".openclaw/memory")).unwrap();
-        write_text(&source.join(".openclaw/memory/unused"), "discarded");
+        if removed_dependency {
+            write_text(
+                &source.join("entry.mjs"),
+                "import './.openclaw/memory/impl.mjs';",
+            );
+            write_text(
+                &source.join(".openclaw/memory/impl.mjs"),
+                "export default {};",
+            );
+        }
         std::os::unix::fs::symlink(
             if absolute {
                 source.join("actual.mjs")
@@ -278,6 +291,13 @@ fn state_export_keeps_root_file_entrypoints_and_checks_retained_sibling_links() 
             &source.join(".openclaw/openclaw.json"),
             &json!({"plugins":{"load":{"paths":[source.join("entry.mjs")]}}}).to_string(),
         );
+        if config_link {
+            let target = source.join(".openclaw/plugins/settings.json");
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let config = source.join(".openclaw/openclaw.json");
+            fs::rename(&config, &target).unwrap();
+            std::os::unix::fs::symlink(target, config).unwrap();
+        }
         let export = run_ocm(
             root.path(),
             &env,
@@ -290,9 +310,17 @@ fn state_export_keeps_root_file_entrypoints_and_checks_retained_sibling_links() 
                 "state.tar",
             ],
         );
-        assert_eq!(export.status.success(), !absolute, "{}", stderr(&export));
+        assert_eq!(
+            export.status.success(),
+            !absolute && !removed_dependency,
+            "{}",
+            stderr(&export)
+        );
         if absolute {
             assert!(stderr(&export).contains("absolute symlink"));
+        } else if removed_dependency {
+            assert!(stderr(&export).contains("removed during import"));
+            assert!(!root.child("state.tar").exists());
         } else {
             fs::rename(&source, root.child("source-offline")).unwrap();
             let import = run_ocm(
