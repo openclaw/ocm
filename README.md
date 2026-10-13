@@ -536,21 +536,15 @@ durable rows, and source leases unchanged.
 Clone and import reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
 Individual agent directory links are removed from the copy without changing their linked source data.
 
-Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite
-snapshots for recognized operational databases: shared state and quarantine,
-canonical agent stores, legacy `memory/*.sqlite` stores, and the default Workboard,
-Team Reports, Logbook, and active Matrix account state stores. Agent database paths
-recorded in the source shared-state registry are also included when the existing
-copy traverses them. Each database is a coherent committed snapshot; databases
-and other files are not captured in one atomic transaction. The source stays
-running and its database contents are not rewritten.
+Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite snapshots for recognized operational databases: shared state and quarantine, canonical agent stores, legacy `memory/*.sqlite` stores, and the default Workboard, Team Reports, Logbook, and active Matrix account state stores.
+Agent database paths recorded in the source shared-state registry are also included when the existing copy traverses them.
+Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
+The source stays running and its database contents are not rewritten.
 
-OCM does not classify a package or project asset as operational merely because it
-has a SQLite header or filename. Unregistered custom database locations and
-opaque package, project, import, audit, and Workshop payloads retain their existing
-copy behavior. Symlinks keep their existing handling. A selected database that
-cannot be snapshotted makes the command fail and invokes its existing target
-cleanup; raw source WAL or journal files are never attached to its snapshot.
+OCM does not classify a package or project asset as operational merely because it has a SQLite header or filename.
+Unregistered custom database locations and opaque package, project, import, audit, and Workshop payloads retain their existing copy behavior.
+Symlinks keep their existing handling.
+A selected database that cannot be snapshotted makes the command fail and invokes its existing target cleanup; raw source WAL or journal files are never attached to its snapshot.
 
 Cloned plugin registrations use the clone's managed files. Copied local projects
 and archives retain their original source information, and missing managed
@@ -598,10 +592,9 @@ directly invoked OpenClaw runtime to gain recovery-aware restarts. Use
 `ocm service restart <env> --force` only to explicitly bypass a recovery
 handoff that is advertised but unhealthy.
 
-Delayed legacy or forced restart recovery activates the shared daemon only when
-the service manager confirms it is absent or stopped. A failed or unknown
-observation fails the command with retry guidance, preserving healthy sibling
-Gateways. The target restart request remains pending for the existing daemon.
+Delayed legacy or forced restart recovery activates the shared daemon only when the service manager confirms it is absent or stopped.
+A failed or unknown observation fails the command with retry guidance, preserving healthy sibling Gateways.
+The target restart request remains pending for the existing daemon.
 
 ## Why not just run OpenClaw directly?
 

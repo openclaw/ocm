@@ -491,11 +491,9 @@ Forced restart explicitly replaces the supervised child directly. It bypasses
 OpenClaw's restart-recovery handoff and can lose in-flight work, so it is
 intentionally an emergency override rather than a compatibility requirement.
 
-If a legacy or forced restart is not observed within 30 seconds, OCM reissues
-only that environment's restart request. Recovery activates the shared daemon
-only after confirming it is absent or stopped, retaining unrelated child
-definitions and restart requests. A failed or unknown service-manager observation
-returns an error without replacing the daemon or interrupting healthy siblings.
+If a legacy or forced restart is not observed within 30 seconds, OCM reissues only that environment's restart request.
+Recovery activates the shared daemon only after confirming it is absent or stopped, retaining unrelated child definitions and restart requests.
+A failed or unknown service-manager observation returns an error without replacing the daemon or interrupting healthy siblings.
 Restore service-manager access or wait for its state to settle, then retry.
 The target request remains pending, so the existing daemon can still process it.
 
@@ -697,21 +695,15 @@ Clone copies the workspace and env config into a new environment, gives the clon
 ocm start rowan
 ```
 
-Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite
-snapshots for recognized operational databases: shared state and quarantine,
-canonical agent stores, legacy `memory/*.sqlite` stores, and the default Workboard,
-Team Reports, Logbook, and active Matrix account state stores. Agent database paths
-recorded in the source shared-state registry are also included when the existing
-copy traverses them. Each database is a coherent committed snapshot; databases
-and other files are not captured in one atomic transaction. The source stays
-running and its database contents are not rewritten.
+Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite snapshots for recognized operational databases: shared state and quarantine, canonical agent stores, legacy `memory/*.sqlite` stores, and the default Workboard, Team Reports, Logbook, and active Matrix account state stores.
+Agent database paths recorded in the source shared-state registry are also included when the existing copy traverses them.
+Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
+The source stays running and its database contents are not rewritten.
 
-OCM does not classify a package or project asset as operational merely because it
-has a SQLite header or filename. Unregistered custom database locations and
-opaque package, project, import, audit, and Workshop payloads retain their existing
-copy behavior. Symlinks keep their existing handling. A selected database that
-cannot be snapshotted makes the command fail and invokes its existing target
-cleanup; raw source WAL or journal files are never attached to its snapshot.
+OCM does not classify a package or project asset as operational merely because it has a SQLite header or filename.
+Unregistered custom database locations and opaque package, project, import, audit, and Workshop payloads retain their existing copy behavior.
+Symlinks keep their existing handling.
+A selected database that cannot be snapshotted makes the command fail and invokes its existing target cleanup; raw source WAL or journal files are never attached to its snapshot.
 
 Registered managed plugins use the clone's installed files. Local project and
 archive paths can remain as source information once the installed payload's
