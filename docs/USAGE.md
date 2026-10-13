@@ -998,12 +998,18 @@ Remove only the environment:
 ocm env remove mira
 ```
 
-Destroy the environment, its OCM-managed service, and its snapshots:
+Destroy the environment, uninstall its environment service, and remove its snapshots:
 
 ```bash
 ocm env destroy mira
 ocm env destroy mira --yes
 ```
+
+`environment service uninstalled: <env>` confirms that the environment was
+removed from OCM service supervision. It does not report deletion of the shared
+daemon: a running sibling keeps that daemon, and it may already be absent after
+stopping the last running environment. JSON `serviceUninstalled` retains this
+environment-service meaning; `serviceLabel` remains `ocm`.
 
 Destroy first stops the recorded foreground dev session, including any required
 service restoration, and verifies that its owned processes exited. It then

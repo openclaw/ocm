@@ -850,7 +850,10 @@ pub fn env_help(cmd: &str) -> String {
                     ("clone", "Clone an environment"),
                     ("list", "List environments"),
                     ("show", "Show environment metadata"),
-                    ("destroy", "Preview or remove an env and its OCM service"),
+                    (
+                        "destroy",
+                        "Preview or remove an env and uninstall its environment service",
+                    ),
                     ("remove", "Remove an environment"),
                     ("prune", "Preview or remove old environments"),
                 ],
@@ -1625,7 +1628,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
         ),
         "destroy" => render_leaf(
             "Destroy an environment",
-            "Preview or remove an environment, its env snapshots, and its attached OCM-managed service.",
+            "Preview or remove an environment and its snapshots, and uninstall its environment service.",
             vec![format!(
                 "{cmd} env destroy <name> [--yes] [--force | --if-state-token <token>] [--raw] [--json]"
             )],
@@ -1649,7 +1652,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} env destroy mira --yes --force"),
             ],
             &[
-                "Destroy removes env snapshots for that env and uninstalls its OCM-managed service when present.",
+                "Destroy uninstalls the environment service; this does not mean the shared OCM daemon was removed.",
                 "An ordinary --yes apply first stops and verifies the recorded source-watch generation. Unverifiable ownership blocks removal.",
                 "Guarded --if-state-token apply requires a stopped watch: run dev stop, then request a fresh destroy preview.",
                 "Destroy does not remove shared runtimes or launchers.",

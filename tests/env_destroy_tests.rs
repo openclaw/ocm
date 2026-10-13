@@ -676,7 +676,7 @@ fn env_destroy_yes_uninstalls_service_removes_snapshots_and_deletes_env() {
     let output = stdout(&destroy);
     assert!(output.contains("Destroyed env demo"));
     assert!(output.contains("snapshots removed: 1"));
-    assert!(output.contains("service removed: ocm"));
+    assert!(output.contains("environment service uninstalled: demo"));
     assert!(
         output.contains("warning: snapshot")
             && output.contains("linked upgrade recovery cleanup failed"),

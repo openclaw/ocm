@@ -215,9 +215,9 @@ pub fn env_destroyed(
                 },
             ),
             KeyValueRow::new(
-                "OCM service",
+                "Environment service",
                 if summary.service_uninstalled {
-                    "removed"
+                    "uninstalled"
                 } else {
                     "none"
                 },
@@ -278,7 +278,10 @@ fn env_destroyed_raw(summary: &EnvDestroySummary, command_example: &str) -> Vec<
         lines.push("  worktree removed".to_string());
     }
     if summary.service_uninstalled {
-        lines.push(format!("  service removed: {}", summary.service_label));
+        lines.push(format!(
+            "  environment service uninstalled: {}",
+            summary.env_name
+        ));
     }
     lines.extend(
         summary
@@ -1733,6 +1736,12 @@ mod tests {
         let lines = env_destroyed(&summary, RenderProfile::pretty(false), "ocm");
         assert_eq!(lines[0], "Destroyed env demo");
         assert!(lines.iter().any(|line| line.contains("Removed")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Environment service") && line.contains("uninstalled"))
+        );
+        assert!(!lines.iter().any(|line| line.contains("OCM service")));
         assert!(lines.iter().any(|line| line.contains("Next")));
         assert!(lines.iter().any(|line| line.contains("ocm env list")));
         assert!(lines.iter().any(|line| line.contains("ocm start demo")));

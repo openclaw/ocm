@@ -1101,6 +1101,65 @@ fn service_stop_keeps_the_daemon_while_a_sibling_env_is_running() {
 }
 
 #[test]
+fn env_destroy_reports_environment_uninstall_for_each_daemon_outcome() {
+    for json in [false, true] {
+        for scenario in ["absent", "sibling", "final"] {
+            let root = TestDir::new("destroy-service-report");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = launchd_env(&root);
+            setup_launcher_env(&cwd, &env);
+            let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+            assert!(started.status.success(), "{}", stderr(&started));
+            let definition = managed_service_definition_path(&env, &cwd, "ocm");
+            assert!(definition.exists());
+            if scenario == "absent" {
+                let stopped = run_ocm(&cwd, &env, &["service", "stop", "demo"]);
+                assert!(stopped.status.success(), "{}", stderr(&stopped));
+                assert!(!definition.exists());
+            } else if scenario == "sibling" {
+                let created = run_ocm(
+                    &cwd,
+                    &env,
+                    &["env", "create", "prod", "--launcher", "stable"],
+                );
+                assert!(created.status.success(), "{}", stderr(&created));
+                let started = run_ocm(&cwd, &env, &["service", "start", "prod"]);
+                assert!(started.status.success(), "{}", stderr(&started));
+            }
+
+            let mut args = vec!["env", "destroy", "demo", "--yes"];
+            if json {
+                args.push("--json");
+            }
+            let destroyed = run_ocm(&cwd, &env, &args);
+            assert!(destroyed.status.success(), "{}", stderr(&destroyed));
+            if json {
+                let body = json_output(&destroyed);
+                assert_eq!(body["serviceUninstalled"], true);
+                assert_eq!(body["serviceLabel"], "ocm");
+                assert_eq!(body["removed"], true);
+            } else {
+                let output = String::from_utf8_lossy(&destroyed.stdout);
+                assert!(
+                    output.contains("environment service uninstalled: demo"),
+                    "{output}"
+                );
+                assert!(!output.contains("service removed: ocm"), "{output}");
+            }
+            assert_eq!(definition.exists(), scenario == "sibling");
+            if scenario == "sibling" {
+                let show = run_ocm(&cwd, &env, &["env", "show", "prod", "--json"]);
+                assert!(show.status.success(), "{}", stderr(&show));
+                let body = json_output(&show);
+                assert_eq!(body["serviceEnabled"], true);
+                assert_eq!(body["serviceRunning"], true);
+            }
+        }
+    }
+}
+
+#[test]
 fn service_start_accepts_reformatted_same_store_plist() {
     let root = TestDir::new("service-start-reformatted-owner");
     let cwd = root.child("workspace");
