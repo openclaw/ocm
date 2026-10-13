@@ -818,6 +818,8 @@ fn env_export_include_state_requires_selected_plugin_payload_roots() {
         ("extensions/demo", false, true),
         ("custom/demo", false, false),
         ("custom/demo", true, true),
+        ("memory/demo", false, false),
+        ("memory/demo", true, true),
     ] {
         for receipt in [false, true] {
             let root = TestDir::new("export-plugin-selection");
@@ -831,7 +833,7 @@ fn env_export_include_state_requires_selected_plugin_payload_roots() {
             );
             let mut config = json!({});
             if workspace {
-                config["agents"] = json!({"defaults":{"workspace":source.join("custom")}});
+                config["agents"] = json!({"defaults":{"workspace":source.join(std::path::Path::new(relative).parent().unwrap())}});
             }
             if receipt {
                 fs::create_dir_all(source.join("state")).unwrap();
@@ -863,7 +865,12 @@ fn env_export_include_state_requires_selected_plugin_payload_roots() {
             );
             assert_eq!(export.status.success(), selected, "{}", stderr(&export));
             if !selected {
-                assert!(stderr(&export).contains("excluded"), "{}", stderr(&export));
+                assert!(
+                    stderr(&export).contains("excluded")
+                        || stderr(&export).contains("removed during import"),
+                    "{}",
+                    stderr(&export)
+                );
                 assert!(!root.child("state.tar").exists());
             } else {
                 fs::rename(&source, root.child("source-offline")).unwrap();
@@ -882,4 +889,129 @@ fn env_export_include_state_requires_selected_plugin_payload_roots() {
             }
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_export_include_state_checks_discovered_and_nested_payload_links() {
+    use serde_json::json;
+    for (container, relative_link) in [(true, false), (false, false), (true, true), (false, true)] {
+        let root = TestDir::new("export-payload-tree");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source");
+        let plugin = source.join("payload/demo");
+        write_text(
+            &plugin.join("package.json"),
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        );
+        write_text(
+            &plugin.join("impl.js"),
+            "export default { register() {} };\n",
+        );
+        let configured = if container {
+            fs::create_dir_all(source.join("catalog")).unwrap();
+            let target = if relative_link {
+                std::path::PathBuf::from("../payload/demo")
+            } else {
+                plugin.clone()
+            };
+            std::os::unix::fs::symlink(target, source.join("catalog/demo")).unwrap();
+            source.join("catalog")
+        } else {
+            let target = if relative_link {
+                std::path::PathBuf::from("impl.js")
+            } else {
+                plugin.join("impl.js")
+            };
+            std::os::unix::fs::symlink(target, plugin.join("index.js")).unwrap();
+            plugin.clone()
+        };
+        write_text(
+            &source.join(".openclaw/openclaw.json"),
+            &json!({"plugins":{"load":{"paths":[configured]}}}).to_string(),
+        );
+        let export = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--include-state",
+                "--output",
+                "state.tar",
+            ],
+        );
+        assert_eq!(
+            export.status.success(),
+            relative_link,
+            "{}",
+            stderr(&export)
+        );
+        if !relative_link {
+            assert!(stderr(&export).contains("absolute symlink"));
+            assert!(!root.child("state.tar").exists());
+        } else {
+            fs::rename(&source, root.child("source-offline")).unwrap();
+            let import = run_ocm(
+                root.path(),
+                &env,
+                &["env", "import", "state.tar", "--name", "target"],
+            );
+            assert!(import.status.success(), "{}", stderr(&import));
+            let target = root.child("ocm-home/envs/target");
+            let path = if container {
+                target.join("catalog/demo/impl.js")
+            } else {
+                target.join("payload/demo/index.js")
+            };
+            assert!(fs::read_to_string(path).unwrap().contains("register"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_export_include_state_materializes_unchanged_linked_config() {
+    let root = TestDir::new("export-linked-config");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    let original = source.join("plugins/settings.json");
+    write_text(&original, "{}\n");
+    std::os::unix::fs::symlink(&original, source.join("openclaw.json")).unwrap();
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "state.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    assert!(
+        fs::symlink_metadata(source.join("openclaw.json"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_to_string(original).unwrap(), "{}\n");
+    fs::rename(&source, root.child("source-offline")).unwrap();
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "state.tar", "--name", "target"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    assert!(
+        fs::symlink_metadata(root.child("ocm-home/envs/target/.openclaw/openclaw.json"))
+            .unwrap()
+            .is_file()
+    );
 }

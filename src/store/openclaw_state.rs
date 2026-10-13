@@ -151,7 +151,7 @@ pub(crate) fn openclaw_env_state_archive_options(
     options.prepare_sqlite_snapshot = Some(prepare_exported_state_snapshot);
     options.file_contents = super::openclaw_config::normalized_archive_config_contents(paths)?;
     for path in super::openclaw_config::configured_archive_plugin_paths(paths, env, runtime)? {
-        validate_portable_plugin_path(&path, &paths.root, &options)?;
+        validate_exported_plugin_payload(&path, paths, &options)?;
     }
     Ok(options)
 }
@@ -346,11 +346,7 @@ pub(crate) fn clear_nonportable_runtime_state(
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
         let name = entry.file_name();
-        if name == OsStr::new("openclaw.json")
-            || is_durable_openclaw_state_root(&name)
-            || workspaces.contains(&path)
-            || is_integrity_protected_history_path(&paths.state_dir, &path)
-        {
+        if preserves_openclaw_root_entry(paths, &path) || workspaces.contains(&path) {
             continue;
         }
         if name == OsStr::new("agents") {
@@ -369,6 +365,39 @@ pub(crate) fn clear_nonportable_runtime_state(
     }
 
     Ok(changed)
+}
+
+fn preserves_openclaw_root_entry(paths: &EnvPaths, path: &Path) -> bool {
+    path == paths.config_path
+        || path.file_name().is_some_and(is_durable_openclaw_state_root)
+        || is_integrity_protected_history_path(&paths.state_dir, path)
+}
+
+fn payload_survives_import(path: &Path, paths: &EnvPaths, options: &EnvArchiveOptions) -> bool {
+    let Ok(relative) = path.strip_prefix(&paths.state_dir) else {
+        return true;
+    };
+    let root_relative = path.strip_prefix(&paths.root).unwrap();
+    // Explicit roots preserve workspaces, include files, and the opted-in state root.
+    if options
+        .included_path_roots
+        .iter()
+        .any(|root| root_relative.starts_with(root))
+    {
+        return true;
+    }
+    let mut parts = relative.components();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    if preserves_openclaw_root_entry(paths, &paths.state_dir.join(first.as_os_str())) {
+        return true;
+    }
+    first.as_os_str() == OsStr::new("agents")
+        && parts.next().is_some()
+        && parts
+            .next()
+            .is_some_and(|part| part.as_os_str() == OsStr::new("agent"))
 }
 
 fn is_durable_openclaw_state_root(name: &OsStr) -> bool {
@@ -734,7 +763,7 @@ fn relocate_plugin_index_in_database(
                                     .filter(|path| !path.trim().is_empty())
                             })
                         {
-                            validate_portable_plugin_path(Path::new(path), &source.root, options)?;
+                            validate_exported_plugin_payload(Path::new(path), source, options)?;
                         }
                     }
                 }
@@ -796,11 +825,77 @@ fn relocate_plugin_index_in_database(
     })
 }
 
-fn validate_portable_plugin_path(
+fn validate_exported_plugin_payload(
     path: &Path,
-    root: &Path,
+    paths: &EnvPaths,
     options: &EnvArchiveOptions,
 ) -> Result<(), String> {
+    let resolved = validate_portable_plugin_path(path, paths, options)?;
+    let mut pending = vec![resolved];
+    let mut visited = BTreeSet::new();
+    while let Some(path) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !metadata.is_dir() || !visited.insert(path.clone()) {
+            continue;
+        }
+        for entry in fs::read_dir(&path).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            let kind = if metadata.is_symlink() {
+                EnvArchiveEntryKind::Symlink
+            } else if metadata.is_dir() {
+                EnvArchiveEntryKind::Directory
+            } else if metadata.is_file() {
+                EnvArchiveEntryKind::File
+            } else {
+                EnvArchiveEntryKind::Other
+            };
+            let relative = path
+                .strip_prefix(&paths.root)
+                .map_err(|error| error.to_string())?;
+            if options.should_skip(relative, kind)? {
+                continue;
+            }
+            if kind == EnvArchiveEntryKind::Other {
+                return Err(format!(
+                    "unsupported plugin payload entry: {}",
+                    path.display()
+                ));
+            }
+            if metadata.is_symlink() {
+                pending.push(validate_portable_plugin_path(&path, paths, options)?);
+            } else {
+                if !payload_survives_import(&path, paths, options) {
+                    return Err(format!(
+                        "plugin payload would be removed during import: {}",
+                        path.display()
+                    ));
+                }
+                if metadata.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_portable_plugin_path(
+    path: &Path,
+    paths: &EnvPaths,
+    options: &EnvArchiveOptions,
+) -> Result<PathBuf, String> {
+    let root = paths.root.as_path();
+    if !payload_survives_import(path, paths, options) {
+        return Err(format!(
+            "plugin payload would be removed during import: {}",
+            path.display()
+        ));
+    }
     let relative = path.strip_prefix(root).map_err(|_| {
         format!(
             "plugin path is outside the exported environment: {}",
@@ -827,7 +922,9 @@ fn validate_portable_plugin_path(
         current.push(part);
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(path.to_path_buf());
+            }
             Err(error) => return Err(error.to_string()),
         };
         let relative = current
@@ -845,6 +942,15 @@ fn validate_portable_plugin_path(
                 "plugin path is excluded from the environment archive: {}",
                 current.display()
             ));
+        }
+        if metadata.is_symlink()
+            && current.parent() == Some(paths.state_dir.join("agents").as_path())
+            && !options
+                .included_path_roots
+                .iter()
+                .any(|included| relative.starts_with(included))
+        {
+            return Err("plugin path uses an agent link that import removes".to_string());
         }
         if !metadata.is_symlink() {
             if !metadata.is_dir() && !pending.is_empty() {
@@ -885,7 +991,13 @@ fn validate_portable_plugin_path(
             current.display()
         ));
     }
-    Ok(())
+    if !payload_survives_import(&current, paths, options) {
+        return Err(format!(
+            "plugin payload would be removed during import: {}",
+            current.display()
+        ));
+    }
+    Ok(current)
 }
 
 fn relocate_cloned_plugin_record(

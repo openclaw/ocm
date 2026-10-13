@@ -543,7 +543,7 @@ as one transaction across the environment. Export normalizes owned config and pl
 leaving the source untouched. Import relocates those paths, clears copied
 database process leases, and leaves the new environment stopped. Export JSON and human
 output both report whether state was included. State symlinks are rejected so an
-import cannot retain live database links into the source installation. Damaged canonical state databases and absolute links that would remain in imported plugin paths are rejected; supported relative plugin links are preserved. Configured and recorded plugin payloads must be within the selected archive roots.
+import cannot retain live database links into the source installation. Damaged canonical state databases and absolute links that would remain in imported plugin paths are rejected; supported relative plugin links are preserved. Configured and recorded plugin payloads must be within the selected archive roots and survive import cleanup. Included payload links are checked recursively, and linked configuration files are materialized.
 
 Clone and import reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
 Individual agent directory links are removed from the copy without changing their linked source data.

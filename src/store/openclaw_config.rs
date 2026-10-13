@@ -182,7 +182,11 @@ pub(super) fn normalized_archive_config_contents(
             &mut value,
             config_path.parent().ok_or("config path has no parent")?,
         )?;
-        if value == original {
+        if value == original
+            && !fs::symlink_metadata(&config_path)
+                .map_err(|error| error.to_string())?
+                .is_symlink()
+        {
             continue;
         }
         let relative = config_path
