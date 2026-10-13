@@ -996,7 +996,7 @@ fn should_discard_current_openclaw_restore_entry(name: &OsStr, is_dir: bool) -> 
         || matches!(name.to_str(), Some("sock") | Some("socket"))
 }
 
-fn is_snapshot_process_residue(name: &OsStr, is_dir: bool) -> bool {
+pub(super) fn is_snapshot_process_residue(name: &OsStr, is_dir: bool) -> bool {
     if is_dir
         && matches!(
             name.to_str(),

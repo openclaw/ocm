@@ -954,9 +954,10 @@ Each SQLite database in that directory is captured through a coherent committed
 snapshot, including uncheckpointed WAL writes. Raw database sidecars, sockets,
 pids, locks, and temporary process files are omitted. Databases and other files
 are not captured in one atomic transaction. JSON reports `includeState`; the
-human summary reports whether state was included.
+human summary reports whether state was included. State symlinks are rejected
+so an import cannot retain live database links into the source installation.
 
-Export normalizes owned plugin receipt aliases in the SQLite backup while the
+Export normalizes owned config and plugin receipt aliases in copied content while the
 source filesystem is available, without changing the source. Import restores
 the included state, relocates those paths to the new environment, and clears
 copied database process leases. Imported environments get a fresh identity and gateway

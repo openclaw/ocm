@@ -98,6 +98,7 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
          CREATE TABLE agent_database_leases (lease_id TEXT PRIMARY KEY, owner_pid INTEGER);
          INSERT INTO agent_database_leases VALUES ('source-owner', 123);"
     ).unwrap();
+    write_text(&source.join("openclaw.json"), "{}\n");
     let receipt = json!({"demo": {"source": "npm", "spec": "demo@1.0.0",
         "installPath": source.join("extensions/demo").to_str().unwrap()},
         "recovered": {"source": "npm", "installPath": root.child("former/.openclaw/extensions/recovered")}});
@@ -115,6 +116,11 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
         );
         std::os::unix::fs::symlink(source.join("extensions/alias"), &alias).unwrap();
         receipt["alias"] = json!({"source": "path", "installPath": alias, "sourcePath": alias});
+        let config_path = source.join("openclaw.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config["plugins"] = json!({"load": {"paths": [alias]}});
+        fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
         receipt
     };
     connection
@@ -136,7 +142,8 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
         r#"{"name":"demo","version":"1.0.0"}"#,
     );
 
-    let secondary_path = source.join("state/nested/history.db");
+    let source_config = fs::read(source.join("openclaw.json")).unwrap();
+    let secondary_path = source.join("state/history.socket/records.db");
     fs::create_dir_all(secondary_path.parent().unwrap()).unwrap();
     let secondary = Connection::open(&secondary_path).unwrap();
     secondary
@@ -146,12 +153,21 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
         BEGIN; INSERT INTO history VALUES ('uncommitted');",
         )
         .unwrap();
+    let journal_named = Connection::open(source.join("state/activity-journal")).unwrap();
+    journal_named.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records (value TEXT); INSERT INTO records VALUES ('durable database');").unwrap();
+    write_text(
+        &source.join("state/bundle-wal/notes.txt"),
+        "durable directory",
+    );
+    write_text(
+        &source.join("state/service.sock"),
+        "durable socket-named file",
+    );
     write_text(&source.join("state/note.txt"), "durable note");
     write_text(&source.join("state/opaque.sqlite"), "opaque payload");
     for residue in [
         "gateway.pid",
         "lock",
-        "service.sock",
         "locks/owner",
         "tmp/cache",
         "gateway-supervisor-restart-handoff.json",
@@ -170,7 +186,7 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
         (short_root, listener)
     };
 
-    let mut connections = Some((connection, secondary));
+    let mut connections = Some((connection, secondary, journal_named));
     let mut default_members = Vec::new();
     for (name, include_state) in [("default", false), ("with-state", true)] {
         let archive = format!("{name}.tar");
@@ -198,15 +214,14 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
             for residue in [
                 "gateway.pid",
                 "lock",
-                "service.sock",
                 "locks",
                 "tmp",
                 "native",
                 "gateway-supervisor-restart-handoff.json",
                 "openclaw.sqlite-wal",
                 "openclaw.sqlite-shm",
-                "nested/history.db-wal",
-                "nested/history.db-shm",
+                "history.socket/records.db-wal",
+                "history.socket/records.db-shm",
                 "orphan.db-wal",
                 "orphan.db-shm",
                 "orphan.db-journal",
@@ -248,6 +263,10 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
                 })
                 .unwrap();
             assert_eq!(owners, 1);
+            assert_eq!(
+                fs::read(source.join("openclaw.json")).unwrap(),
+                source_config
+            );
             // Import must not rely on the exporting machine still being available.
             drop(connections.take());
             fs::rename(&source, root.child("source-offline")).unwrap();
@@ -268,8 +287,25 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
             fs::read_to_string(target.join("state/opaque.sqlite")).unwrap(),
             "opaque payload"
         );
+        assert_eq!(
+            fs::read_to_string(target.join("state/service.sock")).unwrap(),
+            "durable socket-named file"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("state/bundle-wal/notes.txt")).unwrap(),
+            "durable directory"
+        );
+        let journal_named = Connection::open_with_flags(
+            target.join("state/activity-journal"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let value: String = journal_named
+            .query_row("SELECT value FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "durable database");
         let history = Connection::open_with_flags(
-            target.join("state/nested/history.db"),
+            target.join("state/history.socket/records.db"),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
@@ -315,6 +351,15 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
             target.join("extensions/recovered").to_str().unwrap()
         );
         #[cfg(unix)]
+        {
+            let config: Value =
+                serde_json::from_slice(&fs::read(target.join("openclaw.json")).unwrap()).unwrap();
+            assert_eq!(
+                config["plugins"]["load"]["paths"][0],
+                target.join("extensions/alias").to_str().unwrap()
+            );
+        }
+        #[cfg(unix)]
         for field in ["installPath", "sourcePath"] {
             assert_eq!(
                 imported_receipt["alias"][field],
@@ -337,4 +382,140 @@ fn env_export_help_describes_include_state() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("--include-state"));
     assert!(stdout(&output).contains("SQLite"));
+}
+
+#[cfg(unix)]
+#[test]
+fn env_export_include_state_rejects_links_without_copying_their_targets() {
+    for linked in ["state", "state/history.db"] {
+        let root = TestDir::new("export-state-link");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let outside = root.child("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let db = rusqlite::Connection::open(outside.join("history.db")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE records (value TEXT); INSERT INTO records VALUES ('unchanged');",
+        )
+        .unwrap();
+        let link = root.child("ocm-home/envs/source/.openclaw").join(linked);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let target = if linked == "state" {
+            outside.clone()
+        } else {
+            outside.join("history.db")
+        };
+        std::os::unix::fs::symlink(target, link).unwrap();
+        let export = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--include-state",
+                "--output",
+                "state.tar",
+            ],
+        );
+        assert!(!export.status.success(), "linked {linked} was accepted");
+        assert!(
+            stderr(&export).contains("state symlink"),
+            "{}",
+            stderr(&export)
+        );
+        assert!(!root.child("state.tar").exists());
+        let value: String = db
+            .query_row("SELECT value FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "unchanged");
+        let default = run_ocm(
+            root.path(),
+            &env,
+            &["env", "export", "source", "--output", "default.tar"],
+        );
+        assert!(default.status.success(), "{}", stderr(&default));
+        let mut extracted = extract_env_archive::<EnvArchiveMetadata>(
+            &root.child("default.tar"),
+            &root.child("extracted"),
+        )
+        .unwrap();
+        extracted.metadata.include_state = true;
+        let link = extracted.root_dir.join(".openclaw").join(linked);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let target = if linked == "state" {
+            outside.clone()
+        } else {
+            outside.join("history.db")
+        };
+        std::os::unix::fs::symlink(target, link).unwrap();
+        ocm::infra::archive::write_env_archive(
+            &extracted.metadata,
+            &extracted.root_dir,
+            &root.child("linked.tar"),
+        )
+        .unwrap();
+        let import = run_ocm(
+            root.path(),
+            &env,
+            &["env", "import", "linked.tar", "--name", "target"],
+        );
+        assert!(!import.status.success());
+        assert!(
+            stderr(&import).contains("state symlink"),
+            "{}",
+            stderr(&import)
+        );
+        assert!(!root.child("ocm-home/envs/target").exists());
+        let value: String = db
+            .query_row("SELECT value FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "unchanged");
+    }
+}
+
+#[test]
+fn env_import_rejects_state_archive_without_source_root() {
+    let root = TestDir::new("import-state-metadata");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "valid.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    let mut extracted = extract_env_archive::<EnvArchiveMetadata>(
+        &root.child("valid.tar"),
+        &root.child("extracted"),
+    )
+    .unwrap();
+    extracted.metadata.env.source_root = None;
+    ocm::infra::archive::write_env_archive(
+        &extracted.metadata,
+        &extracted.root_dir,
+        &root.child("invalid.tar"),
+    )
+    .unwrap();
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "invalid.tar", "--name", "target"],
+    );
+    assert!(!import.status.success());
+    assert!(
+        stderr(&import).contains("sourceRoot"),
+        "{}",
+        stderr(&import)
+    );
+    assert!(!root.child("ocm-home/envs/target").exists());
 }

@@ -117,6 +117,33 @@ pub(crate) fn repair_openclaw_config(
     Ok(true)
 }
 
+pub(super) fn normalized_archive_config_contents(
+    paths: &EnvPaths,
+) -> Result<BTreeMap<PathBuf, Vec<u8>>, String> {
+    let mut config_paths = openclaw_config_include_paths(&paths.config_path, &paths.state_dir)?;
+    config_paths.push(paths.config_path.clone());
+    let mut contents = BTreeMap::new();
+    for config_path in config_paths {
+        let Some(mut value) = read_config_value(&config_path)? else {
+            continue;
+        };
+        let original = value.clone();
+        // Keep the source spelling used by archive metadata, resolving owned
+        // aliases before the exporting filesystem becomes unavailable.
+        rewrite_env_root_paths(&mut value, &paths.root, &paths.root);
+        if value == original {
+            continue;
+        }
+        let relative = config_path
+            .strip_prefix(&paths.root)
+            .map_err(|error| error.to_string())?;
+        let mut bytes = serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?;
+        bytes.push(b'\n');
+        contents.insert(relative.to_path_buf(), bytes);
+    }
+    Ok(contents)
+}
+
 pub(crate) fn rewrite_openclaw_config_for_target(
     target_paths: &EnvPaths,
     source_root: Option<&Path>,

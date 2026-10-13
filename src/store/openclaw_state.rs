@@ -143,6 +143,7 @@ pub(crate) fn openclaw_env_state_archive_options(
         .insert(PathBuf::from(".openclaw/state"));
     options.should_exclude_path = should_exclude_state_archive_path;
     options.prepare_sqlite_snapshot = Some(prepare_exported_state_snapshot);
+    options.file_contents = super::openclaw_config::normalized_archive_config_contents(paths)?;
     Ok(options)
 }
 
@@ -169,15 +170,59 @@ fn prepare_exported_state_snapshot(
     Ok(())
 }
 
-fn should_exclude_state_archive_path(path: &Path, kind: EnvArchiveEntryKind) -> bool {
+fn should_exclude_state_archive_path(
+    path: &Path,
+    kind: EnvArchiveEntryKind,
+) -> Result<bool, String> {
     if !path.starts_with(".openclaw/state") {
-        return false;
+        return Ok(false);
     }
     let name = path.file_name().unwrap_or_default();
-    kind == EnvArchiveEntryKind::Other
-        || should_remove_volatile_runtime_path(name, kind == EnvArchiveEntryKind::Directory)
-        || should_remove_volatile_runtime_path(name, false)
-        || name == OsStr::new("gateway-supervisor-restart-handoff.json")
+    if kind == EnvArchiveEntryKind::Other
+        || super::snapshots::is_snapshot_process_residue(
+            name,
+            kind == EnvArchiveEntryKind::Directory,
+        )
+    {
+        return Ok(true);
+    }
+    if kind == EnvArchiveEntryKind::Symlink {
+        return Err(format!(
+            "OpenClaw state symlink is not portable: {}",
+            path.display()
+        ));
+    }
+    if path == Path::new(".openclaw/state") && kind != EnvArchiveEntryKind::Directory {
+        return Err("OpenClaw state must be a real directory".to_string());
+    }
+    Ok(false)
+}
+
+pub(super) fn validate_archived_state_links(paths: &EnvPaths) -> Result<(), String> {
+    let state = paths.state_dir.join("state");
+    let mut pending = vec![state.clone()];
+    while let Some(path) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && path == state => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.is_symlink() {
+            return Err(format!(
+                "OpenClaw state symlink is not portable: {}",
+                path.display()
+            ));
+        }
+        if path == state && !metadata.is_dir() {
+            return Err("OpenClaw state must be a real directory".to_string());
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path).map_err(|error| error.to_string())? {
+                pending.push(entry.map_err(|error| error.to_string())?.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn should_skip_openclaw_env_archive_path(

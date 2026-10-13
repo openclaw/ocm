@@ -1136,6 +1136,20 @@ pub(crate) fn import_environment_with_sandbox_origin(
             ));
         }
 
+        let state_source_root = if extracted.metadata.include_state {
+            Some(
+                extracted
+                    .metadata
+                    .env
+                    .source_root
+                    .as_deref()
+                    .filter(|root| !root.is_empty())
+                    .ok_or("state-inclusive archive is missing env.sourceRoot")?,
+            )
+        } else {
+            None
+        };
+
         let source_name = extracted.metadata.env.name.clone();
         let name = if let Some(name) = options.name.as_deref() {
             validate_name(name, "Environment name")?
@@ -1180,6 +1194,9 @@ pub(crate) fn import_environment_with_sandbox_origin(
         }
         let extracted_paths = derive_env_paths(&extracted.root_dir);
         validate_nonportable_runtime_state_paths(&extracted_paths)?;
+        if extracted.metadata.include_state {
+            super::openclaw_state::validate_archived_state_links(&extracted_paths)?;
+        }
         reject_include_owned_sandbox_origin(&extracted_paths.config_path)?;
         reject_include_owned_agent_workspaces(&extracted_paths.config_path)?;
         let extracted_workspaces = resolve_env_openclaw_workspaces(
@@ -1218,9 +1235,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 env,
                 target_runtime,
             )?;
-            if extracted.metadata.include_state
-                && let Some(source_root) = extracted.metadata.env.source_root.as_deref()
-            {
+            if let Some(source_root) = state_source_root {
                 relocate_archived_plugin_index_paths(
                     &derive_env_paths(Path::new(source_root)),
                     &target_paths,
