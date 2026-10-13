@@ -3,6 +3,7 @@ mod support;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -1835,5 +1836,200 @@ fn migrate_rejects_multiple_env_names() {
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("migrate accepts only one env name from <env> or --name <env>")
+    );
+}
+
+#[test]
+fn migration_snapshots_registered_databases_and_preserves_workspace_assets() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migration-live-sqlite");
+        let source = root.child("plain-home");
+        let external = root.child("external");
+        fs::create_dir_all(source.join("state")).unwrap();
+        fs::create_dir_all(source.join("workspaces/default")).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(
+            source.join("openclaw.json"),
+            serde_json::json!({
+                "agents": {"defaults": {"workspace": external}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let primary = source.join("state/openclaw.sqlite");
+        let overlay = external.join("notes.db");
+        let mut connections = Vec::new();
+        for path in [&primary, &overlay] {
+            let db = Connection::open(path).unwrap();
+            db.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                CREATE TABLE durable (value TEXT); INSERT INTO durable VALUES ('committed');",
+            )
+            .unwrap();
+            connections.push(db);
+        }
+        connections[0]
+            .execute_batch("CREATE TABLE agent_databases (path TEXT NOT NULL);")
+            .unwrap();
+        connections[0]
+            .execute(
+                "INSERT INTO agent_databases VALUES (?1)",
+                [overlay.to_str().unwrap()],
+            )
+            .unwrap();
+        let opaque = b"SQLite format 3\0opaque workspace fixture";
+        fs::write(external.join("fixture.sqlite"), opaque).unwrap();
+        fs::write(external.join("fixture.sqlite-wal"), b"opaque sidecar").unwrap();
+        // Stale logs from the home must not survive replacement by the overlay.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            fs::write(
+                source.join(format!("workspaces/default/notes.db{suffix}")),
+                b"stale log",
+            )
+            .unwrap();
+        }
+        let originals: Vec<_> = [&primary, &overlay]
+            .iter()
+            .map(|path| {
+                (
+                    fs::read(path).unwrap(),
+                    fs::read(format!("{}-wal", path.display())).unwrap(),
+                )
+            })
+            .collect();
+        let env = ocm_env(&root);
+        let args = if adopt {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "target",
+                source.to_str().unwrap(),
+            ]
+        } else {
+            vec!["migrate", "target", source.to_str().unwrap()]
+        };
+        let output = run_ocm(&source, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        for relative in ["state/openclaw.sqlite", "workspaces/default/notes.db"] {
+            let target = root.child(format!("ocm-home/envs/target/.openclaw/{relative}"));
+            for suffix in ["-wal", "-shm", "-journal"] {
+                assert!(!Path::new(&format!("{}{suffix}", target.display())).exists());
+            }
+            let db = Connection::open(target).unwrap();
+            assert_eq!(
+                db.query_row("SELECT value FROM durable", [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "committed"
+            );
+            assert_eq!(
+                db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+        }
+        assert_eq!(
+            fs::read(
+                root.child("ocm-home/envs/target/.openclaw/workspaces/default/fixture.sqlite")
+            )
+            .unwrap(),
+            opaque
+        );
+        assert_eq!(
+            fs::read(
+                root.child("ocm-home/envs/target/.openclaw/workspaces/default/fixture.sqlite-wal")
+            )
+            .unwrap(),
+            b"opaque sidecar"
+        );
+        for (path, (primary_before, wal_before)) in [&primary, &overlay].iter().zip(originals) {
+            assert_eq!(fs::read(path).unwrap(), primary_before);
+            assert_eq!(
+                fs::read(format!("{}-wal", path.display())).unwrap(),
+                wal_before
+            );
+        }
+        drop(connections);
+    }
+}
+
+#[test]
+fn migration_rolls_back_an_unreadable_sqlite_snapshot() {
+    let root = TestDir::new("migration-invalid-sqlite");
+    let source = root.child("plain-home");
+    fs::create_dir_all(source.join("state")).unwrap();
+    fs::write(source.join("openclaw.json"), "{}").unwrap();
+    let database = source.join("state/openclaw.sqlite");
+    let invalid = b"SQLite format 3\0invalid database fixture";
+    fs::write(&database, invalid).unwrap();
+    let env = ocm_env(&root);
+    let output = run_ocm(
+        &source,
+        &env,
+        &["migrate", "target", source.to_str().unwrap()],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("SQLite"), "{}", stderr(&output));
+    assert!(!root.child("ocm-home/envs/target").exists());
+    let listing = run_ocm(&source, &env, &["env", "list", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout(&listing)).unwrap(),
+        serde_json::json!([])
+    );
+    assert_eq!(fs::read(&database).unwrap(), invalid);
+}
+
+#[test]
+fn migration_rejects_an_orphan_overlay_log_for_a_copied_database() {
+    let root = TestDir::new("migration-orphan-sqlite-overlay");
+    let source = root.child("plain-home");
+    let external = root.child("external");
+    fs::create_dir_all(source.join("workspaces/default")).unwrap();
+    fs::create_dir_all(&external).unwrap();
+    let database = source.join("workspaces/default/notes.db");
+    let db = Connection::open(&database).unwrap();
+    db.execute_batch("CREATE TABLE durable(value); INSERT INTO durable VALUES(42);")
+        .unwrap();
+    drop(db);
+    let before = fs::read(&database).unwrap();
+    fs::create_dir_all(source.join("state")).unwrap();
+    let registry = Connection::open(source.join("state/openclaw.sqlite")).unwrap();
+    registry
+        .execute_batch("CREATE TABLE agent_databases (path TEXT NOT NULL);")
+        .unwrap();
+    registry
+        .execute(
+            "INSERT INTO agent_databases VALUES (?1)",
+            [external.join("notes.db").to_str().unwrap()],
+        )
+        .unwrap();
+    drop(registry);
+    fs::write(external.join("notes.db-wal"), b"unrelated overlay log").unwrap();
+    fs::write(
+        source.join("openclaw.json"),
+        serde_json::json!({
+            "agents": {"defaults": {"workspace": external}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let env = ocm_env(&root);
+    let output = run_ocm(
+        &source,
+        &env,
+        &["migrate", "target", source.to_str().unwrap()],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("cannot overlay SQLite sidecar"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!root.child("ocm-home/envs/target").exists());
+    assert_eq!(fs::read(database).unwrap(), before);
+    assert_eq!(
+        fs::read(external.join("notes.db-wal")).unwrap(),
+        b"unrelated overlay log"
     );
 }

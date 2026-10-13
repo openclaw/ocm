@@ -60,7 +60,9 @@ fn env_clone_drops_database_owners_without_changing_source_or_durable_state() {
     let connection = Connection::open(&source).unwrap();
     connection
         .execute_batch(
-            "CREATE TABLE agent_database_leases (
+            "PRAGMA journal_mode=WAL;
+        PRAGMA wal_autocheckpoint=0;
+        CREATE TABLE agent_database_leases (
             lease_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, path TEXT NOT NULL,
             owner_pid INTEGER NOT NULL, owner_start_time INTEGER, opened_at INTEGER NOT NULL
         ) STRICT;
@@ -75,11 +77,24 @@ fn env_clone_drops_database_owners_without_changing_source_or_durable_state() {
         "INSERT INTO agent_database_leases VALUES ('live', 'fixture', '/source/agent.sqlite', ?1, NULL, 1)",
         [std::process::id()],
     ).unwrap();
-    drop(connection);
     let before = fs::read(&source).unwrap();
+    let wal_before = fs::read(source.with_extension("sqlite-wal")).unwrap();
     let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
     assert!(clone.status.success(), "{}", stderr(&clone));
     assert_eq!(fs::read(&source).unwrap(), before);
+    assert_eq!(
+        fs::read(source.with_extension("sqlite-wal")).unwrap(),
+        wal_before
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM agent_database_leases", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        1
+    );
     let copied =
         Connection::open(root.child("ocm-home/envs/target/.openclaw/state/openclaw.sqlite"))
             .unwrap();
@@ -1383,4 +1398,30 @@ fn visit_files(root: &Path, on_file: &mut dyn FnMut(&Path)) {
             on_file(&path);
         }
     }
+}
+
+#[test]
+fn env_clone_rolls_back_an_unreadable_sqlite_snapshot() {
+    let root = TestDir::new("clone-invalid-sqlite");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    assert!(
+        run_ocm(&cwd, &env, &["env", "create", "source"])
+            .status
+            .success()
+    );
+    let database = root.child("ocm-home/envs/source/.openclaw/state/openclaw.sqlite");
+    let invalid = b"SQLite format 3\0invalid database fixture";
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    fs::write(&database, invalid).unwrap();
+    let output = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("SQLite"), "{}", stderr(&output));
+    assert!(!root.child("ocm-home/envs/target").exists());
+    let listing = run_ocm(&cwd, &env, &["env", "list", "--json"]);
+    let entries: Value = serde_json::from_str(&stdout(&listing)).unwrap();
+    assert_eq!(entries.as_array().unwrap().len(), 1);
+    assert_eq!(entries[0]["name"], "source");
+    assert_eq!(fs::read(&database).unwrap(), invalid);
 }

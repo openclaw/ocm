@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::DirBuilderExt;
 
 use super::common::{
-    copy_dir_recursive, copy_path, ensure_dir, path_exists, read_json, write_json,
+    copy_dir_recursive, copy_dir_with_sqlite_snapshots, copy_path, ensure_dir, path_exists,
+    read_json, write_json,
 };
 use super::dev_sources::ensure_root_outside_dev_sources;
 use super::gateway_ports::{
@@ -786,7 +787,11 @@ fn clone_environment_with_policy(
     )?;
     source_workspaces.archive_relative_roots(&source_paths.root)?;
     let result = (|| {
-        copy_dir_recursive(&source_paths.root, &target_paths.root)?;
+        copy_dir_with_sqlite_snapshots(
+            &source_paths.root,
+            &target_paths.root,
+            &source_paths.state_dir,
+        )?;
         validate_nonportable_runtime_state_paths(&target_paths)?;
         let created_at = now_utc();
         let gateway_port = choose_cloned_gateway_port(&source, &registry.envs, env);
@@ -1567,6 +1572,9 @@ mod tests {
         let database = source_paths.state_dir.join("state/openclaw.sqlite");
         fs::create_dir_all(database.parent().unwrap()).unwrap();
         let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
         connection.execute(
             "CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT NOT NULL)",
             [],
@@ -1584,8 +1592,9 @@ mod tests {
             "CREATE TABLE agent_database_leases (lease_id TEXT PRIMARY KEY, owner_pid INTEGER NOT NULL);
              INSERT INTO agent_database_leases VALUES ('copied-source-owner', 1);",
         ).unwrap();
-        drop(connection);
         let source_database_before = fs::read(&database).unwrap();
+        let source_wal_before = fs::read(database.with_extension("sqlite-wal")).unwrap();
+        let source_connection = connection;
 
         let registry = super::env_registry_path(&env, &cwd).unwrap();
         let registry_before = fs::read(&registry).unwrap();
@@ -1664,6 +1673,11 @@ mod tests {
             "export default {};\n"
         );
         assert_eq!(fs::read(&database).unwrap(), source_database_before);
+        assert_eq!(
+            fs::read(database.with_extension("sqlite-wal")).unwrap(),
+            source_wal_before
+        );
+        drop(source_connection);
         let config: Value =
             serde_json::from_str(&fs::read_to_string(&target_paths.config_path).unwrap()).unwrap();
         let gateway_port = simulation.gateway_port.unwrap();

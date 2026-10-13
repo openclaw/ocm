@@ -11,17 +11,17 @@ const SQLITE_BACKUP_PAGES_PER_STEP: i32 = 256;
 const SQLITE_BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
 const SQLITE_BACKUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(super) struct SqliteSnapshot {
+pub(crate) struct SqliteSnapshot {
     file: NamedTempFile,
 }
 
 impl SqliteSnapshot {
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         self.file.path()
     }
 }
 
-pub(super) fn create_sqlite_snapshot(source: &Path) -> Result<SqliteSnapshot, String> {
+pub(crate) fn create_sqlite_snapshot(source: &Path) -> Result<SqliteSnapshot, String> {
     let snapshot = SqliteSnapshot {
         file: NamedTempFile::new()
             .map_err(|error| format!("failed to create private SQLite snapshot: {error}"))?,

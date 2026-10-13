@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+use super::openclaw_state::{OpenClawSqliteCopy, is_sqlite_database};
+use crate::infra::sqlite_snapshot::create_sqlite_snapshot;
 
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -204,6 +208,25 @@ pub(crate) fn try_lock_file_shared(
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_dir_recursive_inner(source, destination, None)
+}
+
+// Clone and migration opt in; package, archive restore, and checkpoint callers
+// retain the raw copy contract. Protected historical payloads remain byte copies.
+pub(crate) fn copy_dir_with_sqlite_snapshots(
+    source: &Path,
+    destination: &Path,
+    state_root: &Path,
+) -> Result<(), String> {
+    let selection = OpenClawSqliteCopy::new(state_root)?;
+    copy_dir_recursive_inner(source, destination, Some(&selection))
+}
+
+fn copy_dir_recursive_inner(
+    source: &Path,
+    destination: &Path,
+    selection: Option<&OpenClawSqliteCopy<'_>>,
+) -> Result<(), String> {
     ensure_dir(destination)?;
 
     let entries = fs::read_dir(source)
@@ -214,11 +237,79 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
         })
         .collect::<Result<Vec<_>, String>>()?;
 
+    // Enumerate before copying: a sidecar may precede its primary, or disappear
+    // during a checkpoint. Never attach raw sidecars to a completed snapshot.
+    let mut databases = HashSet::new();
+    let mut sidecars = HashSet::new();
+    if let Some(selection) = selection {
+        for (path, _) in &entries {
+            if selection.contains(path)
+                && fs::symlink_metadata(path)
+                    .map_err(|error| error.to_string())?
+                    .is_file()
+                && is_sqlite_database(path)?
+            {
+                databases.insert(path.clone());
+                sidecars.extend(sqlite_sidecars(path));
+            }
+        }
+    }
+    let mut existing_sidecars = HashSet::new();
+    if let Some(selection) = selection {
+        for entry in fs::read_dir(destination).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if selection.contains(&source.join(entry.file_name()))
+                && entry
+                    .file_type()
+                    .map_err(|error| error.to_string())?
+                    .is_file()
+                && is_sqlite_database(&entry.path())?
+            {
+                existing_sidecars.extend(sqlite_sidecars(&entry.path()));
+            }
+        }
+    }
     for (source_path, destination_path) in entries {
-        copy_path(&source_path, &destination_path)?;
+        if sidecars.contains(&source_path) {
+            continue;
+        }
+        if databases.contains(&source_path) {
+            let permissions = fs::metadata(&source_path)
+                .map_err(|error| error.to_string())?
+                .permissions();
+            let snapshot = create_sqlite_snapshot(&source_path)?;
+            // An external-workspace overlay can replace an earlier home copy.
+            // Its old WAL/journal must not be replayed over the new snapshot.
+            for sidecar in sqlite_sidecars(&destination_path) {
+                match fs::remove_file(&sidecar) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            fs::copy(snapshot.path(), &destination_path).map_err(|error| error.to_string())?;
+            fs::set_permissions(&destination_path, permissions)
+                .map_err(|error| error.to_string())?;
+        } else {
+            if existing_sidecars.contains(&destination_path) {
+                return Err(format!(
+                    "cannot overlay SQLite sidecar without its source database: {}",
+                    source_path.display()
+                ));
+            }
+            copy_path_inner(&source_path, &destination_path, selection)?;
+        }
     }
 
     Ok(())
+}
+
+fn sqlite_sidecars(path: &Path) -> [PathBuf; 3] {
+    ["-wal", "-shm", "-journal"].map(|suffix| {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    })
 }
 
 pub(crate) fn copy_path_recursive(source: &Path, destination: &Path) -> Result<(), String> {
@@ -226,6 +317,14 @@ pub(crate) fn copy_path_recursive(source: &Path, destination: &Path) -> Result<(
 }
 
 pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_path_inner(source, destination, None)
+}
+
+fn copy_path_inner(
+    source: &Path,
+    destination: &Path,
+    selection: Option<&OpenClawSqliteCopy<'_>>,
+) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     let file_type = metadata.file_type();
 
@@ -233,7 +332,7 @@ pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String>
         return copy_symlink(source, destination);
     }
     if file_type.is_dir() {
-        return copy_dir_recursive(source, destination);
+        return copy_dir_recursive_inner(source, destination, selection);
     }
     #[cfg(unix)]
     if file_type.is_socket() {
@@ -366,7 +465,7 @@ pub(crate) fn load_json_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_dir_recursive, write_file_replacing_path};
+    use super::{copy_dir_recursive, copy_dir_with_sqlite_snapshots, write_file_replacing_path};
 
     use std::fs;
     use std::path::PathBuf;
@@ -543,5 +642,131 @@ mod tests {
         assert!(fs::symlink_metadata(&owned).unwrap().file_type().is_file());
 
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn sqlite_copy_preserves_opaque_history_and_raw_copy_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let raw = root.path().join("raw");
+        let target = root.path().join("target");
+        let invalid = b"SQLite format 3\0opaque historical payload";
+        for relative in [
+            "skill-workshop/proposals/example/support/data.sqlite",
+            "audit/system-agent.jsonl.migrated.2",
+        ] {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, invalid).unwrap();
+        }
+        fs::write(source.join("opaque.sqlite"), b"not a database").unwrap();
+        for relative in [
+            "extensions/example/fixture.sqlite",
+            "plugins/example/fixture.sqlite",
+            "workspace/fixture.sqlite",
+            "imports/archived.sqlite",
+        ] {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, invalid).unwrap();
+        }
+        let operational = [
+            "state/openclaw-quarantine.sqlite",
+            "agents/main/agent/openclaw-agent.sqlite",
+            "plugins/workboard/workboard.sqlite",
+            "plugins/team-reports/team-reports.sqlite",
+            "logbook/logbook.sqlite",
+            "matrix/accounts/default/server__user/0123456789abcdef/state/openclaw.sqlite",
+        ];
+        let mut writers = Vec::new();
+        for relative in operational {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE durable(value); INSERT INTO durable VALUES(42);").unwrap();
+            writers.push(db);
+        }
+
+        copy_dir_with_sqlite_snapshots(&source, &target, &source).unwrap();
+        for relative in [
+            "skill-workshop/proposals/example/support/data.sqlite",
+            "audit/system-agent.jsonl.migrated.2",
+        ] {
+            assert_eq!(fs::read(target.join(relative)).unwrap(), invalid);
+        }
+        assert_eq!(
+            fs::read(target.join("opaque.sqlite")).unwrap(),
+            b"not a database"
+        );
+        for relative in [
+            "extensions/example/fixture.sqlite",
+            "plugins/example/fixture.sqlite",
+            "workspace/fixture.sqlite",
+            "imports/archived.sqlite",
+        ] {
+            assert_eq!(fs::read(target.join(relative)).unwrap(), invalid);
+        }
+        for relative in operational {
+            let path = target.join(relative);
+            assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
+            let db = rusqlite::Connection::open(path).unwrap();
+            assert_eq!(
+                db.query_row("SELECT value FROM durable", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                42
+            );
+        }
+        fs::write(source.join("broken.sqlite"), invalid).unwrap();
+        fs::write(source.join("broken.sqlite-wal"), b"raw sidecar").unwrap();
+        copy_dir_recursive(&source, &raw).unwrap();
+        assert_eq!(fs::read(raw.join("broken.sqlite")).unwrap(), invalid);
+        assert_eq!(
+            fs::read(raw.join("broken.sqlite-wal")).unwrap(),
+            b"raw sidecar"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_copy_preserves_permissions_and_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(source.join("memory")).unwrap();
+        let path = source.join("memory/main.sqlite");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE durable(value); INSERT INTO durable VALUES(42);",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink("missing", source.join("broken.sqlite")).unwrap();
+        symlink("memory/main.sqlite", source.join("linked.sqlite")).unwrap();
+        copy_dir_with_sqlite_snapshots(&source, &target, &source).unwrap();
+        assert_eq!(
+            fs::metadata(target.join("memory/main.sqlite"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::read_link(target.join("broken.sqlite")).unwrap(),
+            PathBuf::from("missing")
+        );
+        assert_eq!(
+            fs::read_link(target.join("linked.sqlite")).unwrap(),
+            PathBuf::from("memory/main.sqlite")
+        );
+        assert!(!target.join("memory/main.sqlite-wal").exists());
+        let copied = rusqlite::Connection::open(target.join("memory/main.sqlite")).unwrap();
+        assert_eq!(
+            copied
+                .query_row("SELECT value FROM durable", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
     }
 }

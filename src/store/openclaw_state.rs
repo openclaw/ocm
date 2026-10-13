@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 
 use crate::env::EnvMeta;
@@ -785,7 +785,107 @@ fn relocatable_plugin_path(
         .then(|| relative.to_path_buf())
 }
 
-fn is_sqlite_database(path: &Path) -> Result<bool, String> {
+// Only runtime-owned locations participate in coherent copies. A SQLite header
+// in a package, Workshop bundle, archive, or project fixture is not ownership.
+pub(super) struct OpenClawSqliteCopy<'a> {
+    state_root: &'a Path,
+    registered_agents: BTreeSet<PathBuf>,
+}
+
+impl<'a> OpenClawSqliteCopy<'a> {
+    pub(super) fn new(state_root: &'a Path) -> Result<Self, String> {
+        let mut selection = Self {
+            state_root,
+            registered_agents: BTreeSet::new(),
+        };
+        let database = state_root.join("state/openclaw.sqlite");
+        // Preserve the existing handling of linked state; never discover owners
+        // by following a database or its parent outside the copied tree.
+        if !fs::symlink_metadata(state_root.join("state")).is_ok_and(|meta| meta.is_dir())
+            || !fs::symlink_metadata(&database).is_ok_and(|meta| meta.is_file())
+            || !is_sqlite_database(&database)?
+        {
+            return Ok(selection);
+        }
+        let db = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("failed to inspect OpenClaw SQLite owners: {error}"))?;
+        let has_registry: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_databases')",
+            [], |row| row.get(0),
+        ).map_err(|error| format!("failed to inspect OpenClaw SQLite owners: {error}"))?;
+        if has_registry {
+            let mut statement = db
+                .prepare("SELECT path FROM agent_databases")
+                .map_err(|error| format!("failed to inspect OpenClaw SQLite owners: {error}"))?;
+            let paths = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("failed to inspect OpenClaw SQLite owners: {error}"))?;
+            for path in paths {
+                let path = PathBuf::from(path.map_err(|error| error.to_string())?);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    state_root.join(path)
+                };
+                // Workspace admission can canonicalize an alias (for example
+                // /var on macOS). Match that spelling without expanding the
+                // copy footprint or following links during traversal.
+                let canonical = fs::canonicalize(&path).or_else(|error| {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(error);
+                    }
+                    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                        return Err(error);
+                    };
+                    fs::canonicalize(parent).map(|parent| parent.join(name))
+                });
+                if let Ok(canonical) = canonical {
+                    if let Ok(root) = fs::canonicalize(state_root)
+                        && let Ok(relative) = canonical.strip_prefix(root)
+                    {
+                        selection
+                            .registered_agents
+                            .insert(state_root.join(relative));
+                    }
+                    selection.registered_agents.insert(canonical);
+                }
+                selection.registered_agents.insert(path);
+            }
+        }
+        Ok(selection)
+    }
+
+    pub(super) fn contains(&self, path: &Path) -> bool {
+        if is_integrity_protected_history_path(self.state_root, path) {
+            return false;
+        }
+        let relative = path.strip_prefix(self.state_root).ok();
+        if relative.is_some_and(|path| path.starts_with("imports")) {
+            return false;
+        }
+        if self.registered_agents.contains(path) {
+            return true;
+        }
+        let Some(relative) = relative else {
+            return false;
+        };
+        let components = path_components(relative);
+        matches!(
+            components.as_slice(),
+            ["state", "openclaw.sqlite" | "openclaw-quarantine.sqlite"]
+                | ["agents", _, "agent", "openclaw-agent.sqlite"]
+                | ["plugins", "workboard", "workboard.sqlite"]
+                | ["plugins", "team-reports", "team-reports.sqlite"]
+                | ["logbook", "logbook.sqlite"]
+        ) || matches!(components.as_slice(), ["memory", name] if name.ends_with(".sqlite"))
+            || matches!(components.as_slice(),
+                ["matrix", "accounts", _, server_user, token, "state", "openclaw.sqlite" | "openclaw-quarantine.sqlite"]
+                if server_user.contains("__") && token.len() == 16 && token.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            )
+    }
+}
+
+pub(super) fn is_sqlite_database(path: &Path) -> Result<bool, String> {
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
