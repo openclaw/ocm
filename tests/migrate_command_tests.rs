@@ -1871,22 +1871,39 @@ fn migration_snapshots_registered_databases_and_preserves_workspace_assets() {
         connections[0]
             .execute_batch("CREATE TABLE agent_databases (path TEXT NOT NULL);")
             .unwrap();
+        let earlier = source.join("workspaces/default/notes.db");
+        if adopt {
+            let earlier_db = Connection::open(&earlier).unwrap();
+            earlier_db
+                .execute_batch(
+                    "CREATE TABLE durable(value); INSERT INTO durable VALUES ('earlier home');",
+                )
+                .unwrap();
+        }
         connections[0]
             .execute(
                 "INSERT INTO agent_databases VALUES (?1)",
-                [overlay.to_str().unwrap()],
+                [if adopt {
+                    earlier.as_path()
+                } else {
+                    overlay.as_path()
+                }
+                .to_str()
+                .unwrap()],
             )
             .unwrap();
         let opaque = b"SQLite format 3\0opaque workspace fixture";
         fs::write(external.join("fixture.sqlite"), opaque).unwrap();
         fs::write(external.join("fixture.sqlite-wal"), b"opaque sidecar").unwrap();
         // Stale logs from the home must not survive replacement by the overlay.
-        for suffix in ["-wal", "-shm", "-journal"] {
-            fs::write(
-                source.join(format!("workspaces/default/notes.db{suffix}")),
-                b"stale log",
-            )
-            .unwrap();
+        if !adopt {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                fs::write(
+                    source.join(format!("workspaces/default/notes.db{suffix}")),
+                    b"stale log",
+                )
+                .unwrap();
+            }
         }
         let originals: Vec<_> = [&primary, &overlay]
             .iter()
@@ -1982,54 +1999,62 @@ fn migration_rolls_back_an_unreadable_sqlite_snapshot() {
 
 #[test]
 fn migration_rejects_an_orphan_overlay_log_for_a_copied_database() {
-    let root = TestDir::new("migration-orphan-sqlite-overlay");
-    let source = root.child("plain-home");
-    let external = root.child("external");
-    fs::create_dir_all(source.join("workspaces/default")).unwrap();
-    fs::create_dir_all(&external).unwrap();
-    let database = source.join("workspaces/default/notes.db");
-    let db = Connection::open(&database).unwrap();
-    db.execute_batch("CREATE TABLE durable(value); INSERT INTO durable VALUES(42);")
-        .unwrap();
-    drop(db);
-    let before = fs::read(&database).unwrap();
-    fs::create_dir_all(source.join("state")).unwrap();
-    let registry = Connection::open(source.join("state/openclaw.sqlite")).unwrap();
-    registry
-        .execute_batch("CREATE TABLE agent_databases (path TEXT NOT NULL);")
-        .unwrap();
-    registry
-        .execute(
-            "INSERT INTO agent_databases VALUES (?1)",
-            [external.join("notes.db").to_str().unwrap()],
+    for registered_in_home in [false, true] {
+        let root = TestDir::new("migration-orphan-sqlite-overlay");
+        let source = root.child("plain-home");
+        let external = root.child("external");
+        fs::create_dir_all(source.join("workspaces/default")).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        let database = source.join("workspaces/default/notes.db");
+        let db = Connection::open(&database).unwrap();
+        db.execute_batch("CREATE TABLE durable(value); INSERT INTO durable VALUES(42);")
+            .unwrap();
+        drop(db);
+        let before = fs::read(&database).unwrap();
+        fs::create_dir_all(source.join("state")).unwrap();
+        let registry = Connection::open(source.join("state/openclaw.sqlite")).unwrap();
+        registry
+            .execute_batch("CREATE TABLE agent_databases (path TEXT NOT NULL);")
+            .unwrap();
+        registry
+            .execute(
+                "INSERT INTO agent_databases VALUES (?1)",
+                [if registered_in_home {
+                    database.clone()
+                } else {
+                    external.join("notes.db")
+                }
+                .to_str()
+                .unwrap()],
+            )
+            .unwrap();
+        drop(registry);
+        fs::write(external.join("notes.db-wal"), b"unrelated overlay log").unwrap();
+        fs::write(
+            source.join("openclaw.json"),
+            serde_json::json!({
+                "agents": {"defaults": {"workspace": external}}
+            })
+            .to_string(),
         )
         .unwrap();
-    drop(registry);
-    fs::write(external.join("notes.db-wal"), b"unrelated overlay log").unwrap();
-    fs::write(
-        source.join("openclaw.json"),
-        serde_json::json!({
-            "agents": {"defaults": {"workspace": external}}
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let env = ocm_env(&root);
-    let output = run_ocm(
-        &source,
-        &env,
-        &["migrate", "target", source.to_str().unwrap()],
-    );
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("cannot overlay SQLite sidecar"),
-        "{}",
-        stderr(&output)
-    );
-    assert!(!root.child("ocm-home/envs/target").exists());
-    assert_eq!(fs::read(database).unwrap(), before);
-    assert_eq!(
-        fs::read(external.join("notes.db-wal")).unwrap(),
-        b"unrelated overlay log"
-    );
+        let env = ocm_env(&root);
+        let output = run_ocm(
+            &source,
+            &env,
+            &["migrate", "target", source.to_str().unwrap()],
+        );
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("cannot overlay SQLite sidecar"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(!root.child("ocm-home/envs/target").exists());
+        assert_eq!(fs::read(database).unwrap(), before);
+        assert_eq!(
+            fs::read(external.join("notes.db-wal")).unwrap(),
+            b"unrelated overlay log"
+        );
+    }
 }

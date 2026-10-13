@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::env::{CreateEnvironmentOptions, EnvImportSummary, EnvironmentService};
 use crate::launcher::{AddLauncherOptions, LauncherService};
 use crate::store::{
-    OpenClawWorkspaceRuntime, copy_dir_with_sqlite_snapshots, default_env_root, derive_env_paths,
+    OpenClawDirectoryCopy, OpenClawWorkspaceRuntime, default_env_root, derive_env_paths,
     display_path, list_environments, normalize_new_environment_sandbox_origin,
     prepare_migrated_runtime_state, reject_include_owned_agent_workspaces,
     reject_include_owned_sandbox_origin, resolve_plain_openclaw_workspaces, resolve_user_home,
@@ -125,7 +125,7 @@ impl ExternalWorkspaceCopyPlan {
     fn copy_and_rewrite_config(
         &self,
         config_path: &Path,
-        source_state_root: &Path,
+        copying: &mut OpenClawDirectoryCopy<'_>,
     ) -> Result<(), String> {
         // The home copy preserves symlinks. Admit every overlay before any workspace
         // copy can follow a link copied into one of its destinations.
@@ -151,18 +151,10 @@ impl ExternalWorkspaceCopyPlan {
         }
         remove_copied_external_default_workspace_link(config_path)?;
         if let Some(workspace) = &self.default_workspace {
-            copy_dir_with_sqlite_snapshots(
-                &workspace.source,
-                &workspace.target,
-                source_state_root,
-            )?;
+            copying.copy(&workspace.source, &workspace.target)?;
         }
         for workspace in self.agent_workspaces.values() {
-            copy_dir_with_sqlite_snapshots(
-                &workspace.source,
-                &workspace.target,
-                source_state_root,
-            )?;
+            copying.copy(&workspace.source, &workspace.target)?;
         }
         let agent_workspaces = self
             .agent_workspaces
@@ -455,8 +447,9 @@ fn complete_migration_import(
         fs::remove_dir_all(&target_paths.state_dir).map_err(|error| error.to_string())?;
     }
 
-    copy_dir_with_sqlite_snapshots(source_home, &target_paths.state_dir, source_home)?;
-    external_workspace_plan.copy_and_rewrite_config(&target_paths.config_path, source_home)?;
+    let mut copying = OpenClawDirectoryCopy::new(source_home)?;
+    copying.copy(source_home, &target_paths.state_dir)?;
+    external_workspace_plan.copy_and_rewrite_config(&target_paths.config_path, &mut copying)?;
     reject_include_owned_sandbox_origin(&target_paths.config_path)?;
     let config_rewrite = rewrite_openclaw_config_for_migration(
         target_paths,

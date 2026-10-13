@@ -218,14 +218,33 @@ pub(crate) fn copy_dir_with_sqlite_snapshots(
     destination: &Path,
     state_root: &Path,
 ) -> Result<(), String> {
-    let selection = OpenClawSqliteCopy::new(state_root)?;
-    copy_dir_recursive_inner(source, destination, Some(&selection))
+    OpenClawDirectoryCopy::new(state_root)?.copy(source, destination)
+}
+
+// One operation retains destination ownership through every migration overlay.
+// Incoming workspace names cannot turn a completed snapshot back into a raw copy.
+pub(crate) struct OpenClawDirectoryCopy<'a> {
+    selection: OpenClawSqliteCopy<'a>,
+    databases: HashSet<PathBuf>,
+}
+
+impl<'a> OpenClawDirectoryCopy<'a> {
+    pub(crate) fn new(state_root: &'a Path) -> Result<Self, String> {
+        Ok(Self {
+            selection: OpenClawSqliteCopy::new(state_root)?,
+            databases: HashSet::new(),
+        })
+    }
+
+    pub(crate) fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), String> {
+        copy_dir_recursive_inner(source, destination, Some(self))
+    }
 }
 
 fn copy_dir_recursive_inner(
     source: &Path,
     destination: &Path,
-    selection: Option<&OpenClawSqliteCopy<'_>>,
+    mut copying: Option<&mut OpenClawDirectoryCopy<'_>>,
 ) -> Result<(), String> {
     ensure_dir(destination)?;
 
@@ -241,9 +260,9 @@ fn copy_dir_recursive_inner(
     // during a checkpoint. Never attach raw sidecars to a completed snapshot.
     let mut databases = HashSet::new();
     let mut sidecars = HashSet::new();
-    if let Some(selection) = selection {
-        for (path, _) in &entries {
-            if selection.contains(path)
+    if let Some(copying) = copying.as_ref() {
+        for (path, target) in &entries {
+            if (copying.selection.contains(path) || copying.databases.contains(target))
                 && fs::symlink_metadata(path)
                     .map_err(|error| error.to_string())?
                     .is_file()
@@ -255,10 +274,11 @@ fn copy_dir_recursive_inner(
         }
     }
     let mut existing_sidecars = HashSet::new();
-    if let Some(selection) = selection {
+    if let Some(copying) = copying.as_ref() {
         for entry in fs::read_dir(destination).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
-            if selection.contains(&source.join(entry.file_name()))
+            if (copying.selection.contains(&source.join(entry.file_name()))
+                || copying.databases.contains(&entry.path()))
                 && entry
                     .file_type()
                     .map_err(|error| error.to_string())?
@@ -290,6 +310,9 @@ fn copy_dir_recursive_inner(
             fs::copy(snapshot.path(), &destination_path).map_err(|error| error.to_string())?;
             fs::set_permissions(&destination_path, permissions)
                 .map_err(|error| error.to_string())?;
+            if let Some(copying) = copying.as_deref_mut() {
+                copying.databases.insert(destination_path);
+            }
         } else {
             if existing_sidecars.contains(&destination_path) {
                 return Err(format!(
@@ -297,7 +320,16 @@ fn copy_dir_recursive_inner(
                     source_path.display()
                 ));
             }
-            copy_path_inner(&source_path, &destination_path, selection)?;
+            if copying
+                .as_ref()
+                .is_some_and(|copying| copying.databases.contains(&destination_path))
+            {
+                return Err(format!(
+                    "cannot replace copied SQLite database with a non-database: {}",
+                    source_path.display()
+                ));
+            }
+            copy_path_inner(&source_path, &destination_path, copying.as_deref_mut())?;
         }
     }
 
@@ -323,7 +355,7 @@ pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String>
 fn copy_path_inner(
     source: &Path,
     destination: &Path,
-    selection: Option<&OpenClawSqliteCopy<'_>>,
+    copying: Option<&mut OpenClawDirectoryCopy<'_>>,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     let file_type = metadata.file_type();
@@ -332,7 +364,7 @@ fn copy_path_inner(
         return copy_symlink(source, destination);
     }
     if file_type.is_dir() {
-        return copy_dir_recursive_inner(source, destination, selection);
+        return copy_dir_recursive_inner(source, destination, copying);
     }
     #[cfg(unix)]
     if file_type.is_socket() {
