@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -126,11 +125,11 @@ pub(crate) fn openclaw_env_archive_options(
         included_path_roots,
         excluded_path_roots,
         snapshot_sqlite_files: true,
+        ..EnvArchiveOptions::default()
     })
 }
 
-#[cfg(test)]
-pub(crate) fn openclaw_env_snapshot_archive_options(
+pub(crate) fn openclaw_env_state_archive_options(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
@@ -139,7 +138,22 @@ pub(crate) fn openclaw_env_snapshot_archive_options(
     options
         .included_path_roots
         .insert(Path::new(".openclaw/state").to_path_buf());
+    options
+        .sqlite_content_roots
+        .insert(PathBuf::from(".openclaw/state"));
+    options.should_exclude_path = should_exclude_state_archive_path;
     Ok(options)
+}
+
+fn should_exclude_state_archive_path(path: &Path, kind: EnvArchiveEntryKind) -> bool {
+    if !path.starts_with(".openclaw/state") {
+        return false;
+    }
+    let name = path.file_name().unwrap_or_default();
+    kind == EnvArchiveEntryKind::Other
+        || should_remove_volatile_runtime_path(name, kind == EnvArchiveEntryKind::Directory)
+        || should_remove_volatile_runtime_path(name, false)
+        || name == OsStr::new("gateway-supervisor-restart-handoff.json")
 }
 
 pub(crate) fn should_skip_openclaw_env_archive_path(
@@ -405,6 +419,10 @@ fn is_legacy_audit_generation(suffix: &str) -> bool {
 #[derive(Clone, Copy)]
 enum PluginPathRelocation<'a> {
     Imported,
+    Archived {
+        source: &'a EnvPaths,
+        target: &'a EnvPaths,
+    },
     Cloned {
         source: &'a EnvPaths,
         target: &'a EnvPaths,
@@ -420,6 +438,18 @@ pub(super) fn relocate_cloned_plugin_index_paths(
         &source.state_dir,
         &target.state_dir,
         PluginPathRelocation::Cloned { source, target },
+    )
+}
+
+pub(super) fn relocate_archived_plugin_index_paths(
+    source: &EnvPaths,
+    target: &EnvPaths,
+) -> Result<MigratedRuntimeStateResult, String> {
+    relocate_installed_plugin_index_paths(
+        &target.state_dir.join("state/openclaw.sqlite"),
+        &source.state_dir,
+        &target.state_dir,
+        PluginPathRelocation::Archived { source, target },
     )
 }
 
@@ -458,7 +488,8 @@ fn relocate_installed_plugin_index_paths(
 ) -> Result<MigratedRuntimeStateResult, String> {
     let database_root = match relocation {
         PluginPathRelocation::Imported => target_state_root,
-        PluginPathRelocation::Cloned { target, .. } => &target.root,
+        PluginPathRelocation::Cloned { target, .. }
+        | PluginPathRelocation::Archived { target, .. } => &target.root,
     };
     let Some(database_path) = contained_imported_database(database_path, database_root)? else {
         return Ok(MigratedRuntimeStateResult::default());
@@ -545,8 +576,15 @@ fn relocate_installed_plugin_index_paths(
         let Some(record) = record.as_object_mut() else {
             continue;
         };
-        if let PluginPathRelocation::Cloned { source, target } = relocation {
-            match relocate_cloned_plugin_record(record, source, target) {
+        if let PluginPathRelocation::Cloned { source, target }
+        | PluginPathRelocation::Archived { source, target } = relocation
+        {
+            match relocate_cloned_plugin_record(
+                record,
+                source,
+                target,
+                matches!(relocation, PluginPathRelocation::Cloned { .. }),
+            ) {
                 Some(record_changed) => changed |= record_changed,
                 None => {
                     external_plugin_ids.insert(plugin_id.clone());
@@ -610,6 +648,7 @@ fn relocate_cloned_plugin_record(
     record: &mut serde_json::Map<String, Value>,
     source_paths: &EnvPaths,
     target_paths: &EnvPaths,
+    require_source: bool,
 ) -> Option<bool> {
     let path = |field| {
         record
@@ -628,6 +667,7 @@ fn relocate_cloned_plugin_record(
             source_paths,
             target_paths,
             !is_path_plugin,
+            require_source,
         )?),
         None => None,
     };
@@ -645,9 +685,13 @@ fn relocate_cloned_plugin_record(
             if same_payload {
                 // Preserve the equality used to admit linked source entrypoints.
                 installed_copy.clone()
-            } else if let Some(copied_source) =
-                cloned_plugin_path(source, source_paths, target_paths, !is_path_plugin)
-            {
+            } else if let Some(copied_source) = cloned_plugin_path(
+                source,
+                source_paths,
+                target_paths,
+                !is_path_plugin,
+                require_source,
+            ) {
                 copied_source
             } else {
                 // With an owned preferred installPath, sourcePath is provenance
@@ -656,7 +700,13 @@ fn relocate_cloned_plugin_record(
                 return Some(changed);
             }
         } else {
-            cloned_plugin_path(source, source_paths, target_paths, !is_path_plugin)?
+            cloned_plugin_path(
+                source,
+                source_paths,
+                target_paths,
+                !is_path_plugin,
+                require_source,
+            )?
         };
         let value = Value::String(display_path(&relocated_source));
         changed |= record.get("sourcePath") != Some(&value);
@@ -670,6 +720,7 @@ fn cloned_plugin_path(
     source: &EnvPaths,
     target: &EnvPaths,
     allow_copied_gateway_path: bool,
+    require_source: bool,
 ) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
@@ -698,7 +749,7 @@ fn cloned_plugin_path(
     {
         return None;
     }
-    if check_source && !contained_plugin_path(path, &source.root) {
+    if require_source && check_source && !contained_plugin_path(path, &source.root) {
         return None;
     }
     let copied = target_base.join(relative);
@@ -885,15 +936,7 @@ impl<'a> OpenClawSqliteCopy<'a> {
     }
 }
 
-pub(super) fn is_sqlite_database(path: &Path) -> Result<bool, String> {
-    let mut file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.to_string()),
-    };
-    let mut magic = [0_u8; 16];
-    Ok(file.read_exact(&mut magic).is_ok() && &magic == b"SQLite format 3\0")
-}
+pub(super) use crate::infra::sqlite_snapshot::is_sqlite_database;
 
 fn clear_volatile_runtime_state(
     state_root: &Path,
@@ -1647,7 +1690,7 @@ mod tests {
             fs::write(path, "fixture\n").unwrap();
         }
 
-        let options = openclaw_env_snapshot_archive_options(
+        let options = openclaw_env_state_archive_options(
             &paths,
             &BTreeMap::new(),
             OpenClawWorkspaceRuntime::default(),
@@ -1714,7 +1757,7 @@ mod tests {
             OpenClawWorkspaceRuntime::default(),
         )
         .unwrap();
-        let options = openclaw_env_snapshot_archive_options(
+        let options = openclaw_env_state_archive_options(
             &paths,
             &BTreeMap::new(),
             OpenClawWorkspaceRuntime::default(),

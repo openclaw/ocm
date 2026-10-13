@@ -249,11 +249,13 @@ pub(crate) struct CloneEnvironmentResult {
 pub struct ExportEnvironmentOptions {
     pub name: String,
     pub output: Option<String>,
+    pub include_state: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvExportSummary {
+    pub include_state: bool,
     pub name: String,
     pub root: String,
     pub archive_path: String,

@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use zip::ZipArchive;
 
 use crate::env::{default_service_enabled, default_service_running};
-use crate::infra::sqlite_snapshot::create_sqlite_snapshot;
+use crate::infra::sqlite_snapshot::{create_sqlite_snapshot, is_sqlite_database};
 
 pub const ENV_ARCHIVE_METADATA_PATH: &str = "meta/env.json";
 pub const ENV_ARCHIVE_ROOT_DIR: &str = "root";
@@ -66,11 +66,17 @@ pub struct ArchivedEnvMeta {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvArchiveMetadata {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_state: bool,
     pub kind: String,
     pub format_version: u32,
     #[serde(with = "time::serde::rfc3339")]
     pub exported_at: OffsetDateTime,
     pub env: ArchivedEnvMeta,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 pub struct ExtractedEnvArchive<T> {
@@ -89,28 +95,33 @@ pub enum EnvArchiveEntryKind {
 #[derive(Clone)]
 pub struct EnvArchiveOptions {
     pub should_skip_path: fn(&Path, EnvArchiveEntryKind) -> bool,
+    pub should_exclude_path: fn(&Path, EnvArchiveEntryKind) -> bool,
     pub included_path_roots: BTreeSet<PathBuf>,
     pub excluded_path_roots: BTreeSet<PathBuf>,
     pub snapshot_sqlite_files: bool,
+    pub sqlite_content_roots: BTreeSet<PathBuf>,
 }
 
 impl Default for EnvArchiveOptions {
     fn default() -> Self {
         Self {
             should_skip_path: include_env_archive_path,
+            should_exclude_path: include_env_archive_path,
             included_path_roots: BTreeSet::new(),
             excluded_path_roots: BTreeSet::new(),
             snapshot_sqlite_files: false,
+            sqlite_content_roots: BTreeSet::new(),
         }
     }
 }
 
 impl EnvArchiveOptions {
     fn should_skip(&self, relative_path: &Path, kind: EnvArchiveEntryKind) -> bool {
-        if self
-            .excluded_path_roots
-            .iter()
-            .any(|root| relative_path == root || relative_path.starts_with(root))
+        if (self.should_exclude_path)(relative_path, kind)
+            || self
+                .excluded_path_roots
+                .iter()
+                .any(|root| relative_path == root || relative_path.starts_with(root))
         {
             return true;
         }
@@ -226,8 +237,27 @@ fn append_env_root(
         if options.should_skip(relative_path, entry_kind) {
             continue;
         }
-        if options.snapshot_sqlite_files
-            && sqlite_database_path_for_sidecar(relative_path).is_some()
+        let discover_sqlite = options
+            .sqlite_content_roots
+            .iter()
+            .any(|root| relative_path.starts_with(root));
+        let state_database = discover_sqlite
+            && metadata.is_file()
+            && is_sqlite_database(&path).map_err(EnvArchiveWriteError::Fatal)?;
+        let state_sidecar = if discover_sqlite {
+            if let Some(primary) = sqlite_primary_for_any_sidecar(&path) {
+                fs::symlink_metadata(&primary).is_ok_and(|meta| meta.is_file())
+                    && is_sqlite_database(&primary).map_err(EnvArchiveWriteError::Fatal)?
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if state_sidecar
+            || (!discover_sqlite
+                && options.snapshot_sqlite_files
+                && sqlite_database_path_for_sidecar(relative_path).is_some())
         {
             continue;
         }
@@ -246,7 +276,11 @@ fn append_env_root(
             continue;
         }
 
-        if options.snapshot_sqlite_files && is_sqlite_database_path(relative_path) {
+        if state_database
+            || (!discover_sqlite
+                && options.snapshot_sqlite_files
+                && is_sqlite_database_path(relative_path))
+        {
             let source_metadata = fs::metadata(&path).map_err(|error| {
                 EnvArchiveWriteError::from_entry_io(io_error_with_context(
                     error,
@@ -298,6 +332,14 @@ fn append_env_root(
     }
 
     Ok(())
+}
+
+fn sqlite_primary_for_any_sidecar(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    SQLITE_SIDECAR_SUFFIXES.iter().find_map(|suffix| {
+        name.strip_suffix(suffix)
+            .map(|primary| path.with_file_name(primary))
+    })
 }
 
 fn is_sqlite_database_path(path: &Path) -> bool {
@@ -538,6 +580,7 @@ mod tests {
             included_path_roots: BTreeSet::from([PathBuf::from(".openclaw/team/ops")]),
             excluded_path_roots: BTreeSet::new(),
             snapshot_sqlite_files: false,
+            ..EnvArchiveOptions::default()
         };
 
         for path in [
@@ -566,6 +609,7 @@ mod tests {
                 ".openclaw/extensions/demo/node_modules",
             )]),
             snapshot_sqlite_files: false,
+            ..EnvArchiveOptions::default()
         };
 
         assert!(!options.should_skip(
@@ -774,6 +818,7 @@ mod tests {
 
         let exported_at = time::OffsetDateTime::from_unix_timestamp(1_774_497_600).unwrap();
         let metadata = EnvArchiveMetadata {
+            include_state: false,
             kind: "ocm-env-archive".to_string(),
             format_version: 1,
             exported_at,

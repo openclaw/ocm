@@ -1309,10 +1309,14 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             "Export an environment",
             "Write a portable environment archive that can be imported later.",
             vec![format!(
-                "{cmd} env export <name> [--output <path>] [--raw] [--json]"
+                "{cmd} env export <name> [--output <path>] [--include-state] [--raw] [--json]"
             )],
             &[
                 ("--output <path>", "Write the archive to a specific path"),
+                (
+                    "--include-state",
+                    "Include OpenClaw state with coherent SQLite snapshots",
+                ),
                 (
                     "--raw",
                     "Force plain line output instead of the TTY receipt view",

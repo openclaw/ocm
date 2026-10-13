@@ -1200,6 +1200,7 @@ fn legacy_snapshot_restore_preserves_linked_registered_source() {
     // workspace containment, so use the original archive shape directly.
     write_env_archive(
         &EnvArchiveMetadata {
+            include_state: false,
             kind: "ocm-env-archive".to_string(),
             format_version: 1,
             exported_at: meta.updated_at,

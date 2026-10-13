@@ -675,6 +675,7 @@ impl Cli {
 
     pub(super) fn handle_env_export(&self, args: Vec<String>) -> Result<i32, String> {
         let (args, json_flag, profile) = self.consume_human_output_flags(args, "env export")?;
+        let (args, include_state) = Self::consume_flag(args, "--include-state");
         let (args, output) = Self::consume_option(args, "--output")?;
         let output = Self::require_option_value(output, "--output")?;
         let Some(name) = args.first() else {
@@ -684,6 +685,7 @@ impl Cli {
 
         let summary = self.with_progress(format!("Exporting env {name}"), || {
             self.environment_service().export(ExportEnvironmentOptions {
+                include_state,
                 name: name.clone(),
                 output,
             })

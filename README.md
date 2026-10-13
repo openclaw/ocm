@@ -528,10 +528,20 @@ Keep the original home and linked external data intact; do not remove the link's
 
 Environment clone, export, and import flows preserve managed OpenClaw plugin
 payloads under the legacy, extension, npm, and Git install roots. Clone and
-import still clear live sessions, logs, backups, and process residue so the new
+import still clear legacy file-based sessions, logs, backups, and process residue so the new
 environment does not share active runtime state with its source. New clones also
 clear copied agent database process leases while keeping the state database,
 durable rows, and source leases unchanged.
+
+Use `ocm env export <env> --include-state --output <archive>` to carry
+`.openclaw/state`, including plugin install receipts and SQLite-backed sessions,
+into `ocm env import <archive> --name <new-env>`. The flag is opt-in: ordinary
+exports retain their existing contents. SQLite databases include committed WAL
+writes through coherent snapshots; sockets, pids, locks, temporary files, and
+raw database sidecars are omitted. Each database is captured independently, not
+as one transaction across the environment. Import relocates managed plugin
+receipt paths and leaves the new environment stopped. Export JSON and human
+output both report whether state was included.
 
 Clone and import reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
 Individual agent directory links are removed from the copy without changing their linked source data.

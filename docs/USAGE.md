@@ -939,15 +939,28 @@ Export:
 
 ```bash
 ocm env export mira
+ocm env export mira --include-state --output ./mira-with-state.ocm-env.tar
 ```
 
 Import:
 
 ```bash
-ocm env import ./mira.tar --name rowan
+ocm env import ./mira-with-state.ocm-env.tar --name rowan
 ```
 
-Imported environments get a fresh identity, have env-scoped OpenClaw config rewritten for the new root, and keep durable agent settings while clearing copied runtime residue like sessions, logs, and backup files.
+Export omits `.openclaw/state` by default. Use `--include-state` to carry its
+OpenClaw installation records, SQLite-backed sessions, and other durable state.
+Each SQLite database in that directory is captured through a coherent committed
+snapshot, including uncheckpointed WAL writes. Raw database sidecars, sockets,
+pids, locks, and temporary process files are omitted. Databases and other files
+are not captured in one atomic transaction. JSON reports `includeState`; the
+human summary reports whether state was included.
+
+Import restores the included state and relocates managed plugin receipt paths
+to the new environment. Imported environments get a fresh identity and gateway
+port, have env-scoped config rewritten, and remain stopped. Legacy file-based
+sessions, logs, and backups still follow the existing cleanup policy. Export
+without the flag and import of older archives retain their existing behavior.
 
 Environment archives must contain real `meta/` and `root/` directories and a
 regular `meta/env.json` file. Import and legacy snapshot restore reject symlinks

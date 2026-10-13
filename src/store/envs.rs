@@ -32,7 +32,10 @@ use super::layout::{
     resolve_absolute_path, resolve_store_paths, validate_name,
 };
 use super::now_utc;
-use super::openclaw_state::validate_nonportable_runtime_state_paths;
+use super::openclaw_state::{
+    openclaw_env_state_archive_options, relocate_archived_plugin_index_paths,
+    validate_nonportable_runtime_state_paths,
+};
 use super::{
     DevSourceRegistration, OpenClawWorkspaceRuntime, clear_nonportable_runtime_state,
     normalize_new_environment_sandbox_origin, openclaw_config_include_paths,
@@ -1046,6 +1049,7 @@ pub fn export_environment(
     }
 
     let metadata = EnvArchiveMetadata {
+        include_state: options.include_state,
         kind: "ocm-env-archive".to_string(),
         format_version: 1,
         exported_at: now_utc(),
@@ -1065,11 +1069,16 @@ pub fn export_environment(
         },
     };
 
+    let archive_options = if options.include_state {
+        openclaw_env_state_archive_options
+    } else {
+        openclaw_env_archive_options
+    };
     let result = write_env_archive_with_options(
         &metadata,
         &env_paths.root,
         &output_path,
-        openclaw_env_archive_options(
+        archive_options(
             &env_paths,
             env,
             OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port),
@@ -1081,6 +1090,7 @@ pub fn export_environment(
     result?;
 
     Ok(EnvExportSummary {
+        include_state: options.include_state,
         name: meta.name,
         root: meta.root,
         archive_path: display_path(&output_path),
@@ -1208,6 +1218,14 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 env,
                 target_runtime,
             )?;
+            if extracted.metadata.include_state
+                && let Some(source_root) = extracted.metadata.env.source_root.as_deref()
+            {
+                relocate_archived_plugin_index_paths(
+                    &derive_env_paths(Path::new(source_root)),
+                    &target_paths,
+                )?;
+            }
             clear_nonportable_runtime_state(&target_paths, env, target_runtime)?;
 
             let created_at = now_utc();

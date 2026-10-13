@@ -555,6 +555,10 @@ pub fn env_exported(summary: &EnvExportSummary, profile: RenderProfile) -> Vec<S
         KeyValueRow::accent("Name", summary.name.clone()),
         KeyValueRow::plain("Root", summary.root.clone()),
         KeyValueRow::plain("Archive", summary.archive_path.clone()),
+        KeyValueRow::plain(
+            "State included",
+            if summary.include_state { "yes" } else { "no" },
+        ),
         action_export_binding_row(
             summary.default_runtime.clone(),
             summary.default_launcher.clone(),
@@ -573,6 +577,7 @@ fn env_exported_raw(summary: &EnvExportSummary) -> Vec<String> {
         format!("Exported env {}", summary.name),
         format!("  root: {}", summary.root),
         format!("  archive: {}", summary.archive_path),
+        format!("  state included: {}", summary.include_state),
     ];
     if let Some(runtime) = summary.default_runtime.as_deref() {
         lines.push(format!("  runtime: {runtime}"));

@@ -752,6 +752,7 @@ fn environment_export_writes_a_portable_archive() {
 
     let summary = export_environment(
         ExportEnvironmentOptions {
+            include_state: false,
             name: "source".to_string(),
             output: Some("./archives/source-backup.tar".to_string()),
         },
@@ -822,6 +823,7 @@ fn environment_import_restores_a_portable_archive_with_a_new_identity() {
 
     let exported = export_environment(
         ExportEnvironmentOptions {
+            include_state: false,
             name: "source".to_string(),
             output: Some("./archives/source-backup.tar".to_string()),
         },
@@ -920,6 +922,7 @@ fn environment_import_materializes_an_archived_config_symlink() {
 
     let exported = export_environment(
         ExportEnvironmentOptions {
+            include_state: false,
             name: "source".to_string(),
             output: Some("./archives/source-symlink.tar".to_string()),
         },
@@ -1015,6 +1018,7 @@ fn environment_import_clears_copied_runtime_state_outside_workspace_and_config()
 
     let exported = export_environment(
         ExportEnvironmentOptions {
+            include_state: false,
             name: "source".to_string(),
             output: Some("./archives/source-runtime.tar".to_string()),
         },

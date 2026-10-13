@@ -1,4 +1,5 @@
-use std::fs::File;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -19,6 +20,16 @@ impl SqliteSnapshot {
     pub(crate) fn path(&self) -> &Path {
         self.file.path()
     }
+}
+
+pub(crate) fn is_sqlite_database(path: &Path) -> Result<bool, String> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut magic = [0_u8; 16];
+    Ok(file.read_exact(&mut magic).is_ok() && &magic == b"SQLite format 3\0")
 }
 
 pub(crate) fn create_sqlite_snapshot(source: &Path) -> Result<SqliteSnapshot, String> {

@@ -321,6 +321,7 @@ mod tests {
         );
         let archive = crate::store::export_environment(
             ExportEnvironmentOptions {
+                include_state: false,
                 name: original.name.clone(),
                 output: Some(root.path().join("original.tar").display().to_string()),
             },
