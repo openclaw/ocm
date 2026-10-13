@@ -59,6 +59,17 @@ fn setup_launcher_env(cwd: &Path, env: &BTreeMap<String, String>) {
     assert!(created.status.success(), "{}", stderr(&created));
 }
 
+fn setup_launcher_env_on_available_port(cwd: &Path, env: &BTreeMap<String, String>) {
+    setup_launcher_env(cwd, env);
+    // Healthy status must not depend on the shared default port staying unused.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut meta = EnvironmentService::new(env, cwd).get("demo").unwrap();
+    meta.gateway_port = Some(u32::from(listener.local_addr().unwrap().port()));
+    meta.gateway_port_auto_assigned = false;
+    ocm::store::save_environment(meta, env, cwd).unwrap();
+    drop(listener);
+}
+
 fn setup_gateway_aware_restart_fixture(
     root: &TestDir,
     restart_handoff: &str,
@@ -968,7 +979,7 @@ fn service_stop_keeps_the_env_installed_but_stopped() {
         } else {
             launchd_env(&root)
         };
-        setup_launcher_env(&cwd, &env);
+        setup_launcher_env_on_available_port(&cwd, &env);
 
         let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
         assert!(started.status.success(), "{}", stderr(&started));
@@ -1041,7 +1052,7 @@ fn stopped_service_guidance_does_not_assert_the_shared_daemon_is_idle() {
         } else {
             launchd_env(&root)
         };
-        setup_launcher_env(&cwd, &env);
+        setup_launcher_env_on_available_port(&cwd, &env);
         let env_service = EnvironmentService::new(&env, &cwd);
         env_service
             .set_service_policy("demo", Some(true), Some(false))
