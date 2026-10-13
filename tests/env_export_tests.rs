@@ -895,7 +895,10 @@ fn env_export_include_state_requires_selected_plugin_payload_roots() {
 #[test]
 fn env_export_include_state_checks_discovered_and_nested_payload_links() {
     use serde_json::json;
-    for (container, relative_link) in [(true, false), (false, false), (true, true), (false, true)] {
+    for (mode, relative_link) in ["container", "directory", "file", "global", "workspace"]
+        .into_iter()
+        .flat_map(|mode| [false, true].map(|relative| (mode, relative)))
+    {
         let root = TestDir::new("export-payload-tree");
         let env = ocm_env(&root);
         let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
@@ -910,15 +913,25 @@ fn env_export_include_state_checks_discovered_and_nested_payload_links() {
             &plugin.join("impl.js"),
             "export default { register() {} };\n",
         );
-        let configured = if container {
-            fs::create_dir_all(source.join("catalog")).unwrap();
+        let catalog = match mode {
+            "global" => source.join(".openclaw/extensions"),
+            "workspace" => source.join("workspace/.openclaw/extensions"),
+            _ => source.join("catalog"),
+        };
+        let directory_link = matches!(mode, "container" | "global" | "workspace");
+        let configured = if directory_link {
+            fs::create_dir_all(&catalog).unwrap();
             let target = if relative_link {
-                std::path::PathBuf::from("../payload/demo")
+                std::path::PathBuf::from(match mode {
+                    "global" => "../../payload/demo",
+                    "workspace" => "../../../payload/demo",
+                    _ => "../payload/demo",
+                })
             } else {
                 plugin.clone()
             };
-            std::os::unix::fs::symlink(target, source.join("catalog/demo")).unwrap();
-            source.join("catalog")
+            std::os::unix::fs::symlink(target, catalog.join("demo")).unwrap();
+            catalog.clone()
         } else {
             let target = if relative_link {
                 std::path::PathBuf::from("impl.js")
@@ -926,11 +939,23 @@ fn env_export_include_state_checks_discovered_and_nested_payload_links() {
                 plugin.join("impl.js")
             };
             std::os::unix::fs::symlink(target, plugin.join("index.js")).unwrap();
-            plugin.clone()
+            if mode == "file" {
+                write_text(&plugin.join("entry.mjs"), "import './index.js';\n");
+                plugin.join("entry.mjs")
+            } else {
+                plugin.clone()
+            }
         };
         write_text(
             &source.join(".openclaw/openclaw.json"),
-            &json!({"plugins":{"load":{"paths":[configured]}}}).to_string(),
+            &match mode {
+                "global" => json!({}),
+                "workspace" => {
+                    json!({"agents":{"defaults":{"workspace": source.join("workspace")}}})
+                }
+                _ => json!({"plugins":{"load":{"paths":[configured]}}}),
+            }
+            .to_string(),
         );
         let export = run_ocm(
             root.path(),
@@ -962,8 +987,10 @@ fn env_export_include_state_checks_discovered_and_nested_payload_links() {
             );
             assert!(import.status.success(), "{}", stderr(&import));
             let target = root.child("ocm-home/envs/target");
-            let path = if container {
-                target.join("catalog/demo/impl.js")
+            let path = if directory_link {
+                target
+                    .join(catalog.strip_prefix(&source).unwrap())
+                    .join("demo/impl.js")
             } else {
                 target.join("payload/demo/index.js")
             };
@@ -1014,4 +1041,62 @@ fn env_export_include_state_materializes_unchanged_linked_config() {
             .unwrap()
             .is_file()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn env_export_include_state_checks_relative_link_traversal_after_cleanup() {
+    use serde_json::json;
+    for retained in [false, true] {
+        let root = TestDir::new("export-link-traversal");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source");
+        let state = source.join(".openclaw");
+        write_text(&state.join("plugins/demo/index.js"), "export default {};\n");
+        fs::create_dir_all(state.join("memory/keep")).unwrap();
+        fs::create_dir_all(state.join("extensions")).unwrap();
+        std::os::unix::fs::symlink("../memory/../plugins/demo", state.join("extensions/demo"))
+            .unwrap();
+        let config = if retained {
+            json!({"agents":{"defaults":{"workspace":state.join("memory/keep")}}})
+        } else {
+            json!({})
+        };
+        write_text(&state.join("openclaw.json"), &config.to_string());
+        let export = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--include-state",
+                "--output",
+                "state.tar",
+            ],
+        );
+        assert_eq!(export.status.success(), retained, "{}", stderr(&export));
+        if retained {
+            fs::rename(&source, root.child("source-offline")).unwrap();
+            let import = run_ocm(
+                root.path(),
+                &env,
+                &["env", "import", "state.tar", "--name", "target"],
+            );
+            assert!(import.status.success(), "{}", stderr(&import));
+            assert!(
+                root.child("ocm-home/envs/target/.openclaw/extensions/demo/index.js")
+                    .is_file()
+            );
+        } else {
+            assert!(
+                stderr(&export).contains("entry removed during import"),
+                "{}",
+                stderr(&export)
+            );
+            assert!(!root.child("state.tar").exists());
+        }
+    }
 }

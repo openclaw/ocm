@@ -149,9 +149,20 @@ pub(crate) fn openclaw_env_state_archive_options(
         .extend(CORE_STATE_DATABASES.map(|name| Path::new(".openclaw/state").join(name)));
     options.should_exclude_path = should_exclude_state_archive_path;
     options.prepare_sqlite_snapshot = Some(prepare_exported_state_snapshot);
-    options.file_contents = super::openclaw_config::normalized_archive_config_contents(paths)?;
+    options.file_contents =
+        super::openclaw_config::normalized_archive_config_contents(paths, env, runtime)?;
     for path in super::openclaw_config::configured_archive_plugin_paths(paths, env, runtime)? {
         validate_exported_plugin_payload(&path, paths, &options)?;
+    }
+    let workspaces = resolve_env_openclaw_workspaces(paths, env, runtime)?;
+    for root in std::iter::once(paths.state_dir.join("extensions")).chain(
+        workspaces
+            .workspace_roots()
+            .map(|workspace| workspace.join(".openclaw/extensions")),
+    ) {
+        if path_exists(&root) {
+            validate_exported_plugin_payload(&root, paths, &options)?;
+        }
     }
     Ok(options)
 }
@@ -405,6 +416,35 @@ fn is_durable_openclaw_state_root(name: &OsStr) -> bool {
         name.to_str(),
         Some("state") | Some("plugins") | Some("extensions") | Some("npm") | Some("git")
     )
+}
+
+fn traversal_survives_import(path: &Path, paths: &EnvPaths, options: &EnvArchiveOptions) -> bool {
+    if payload_survives_import(path, paths, options) || path == paths.state_dir {
+        return true;
+    }
+    let Ok(relative) = path.strip_prefix(&paths.root) else {
+        return false;
+    };
+    if options
+        .included_path_roots
+        .iter()
+        .any(|included| included.starts_with(relative))
+    {
+        return true;
+    }
+    let agents = paths.state_dir.join("agents");
+    if path.parent() == Some(agents.as_path()) {
+        return path_exists(&path.join("agent"));
+    }
+    if path == agents {
+        return fs::read_dir(path).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && path_exists(&entry.path().join("agent"))
+            })
+        });
+    }
+    false
 }
 
 fn rewrite_runtime_state_root_refs(
@@ -830,7 +870,11 @@ fn validate_exported_plugin_payload(
     paths: &EnvPaths,
     options: &EnvArchiveOptions,
 ) -> Result<(), String> {
-    let resolved = validate_portable_plugin_path(path, paths, options)?;
+    let mut resolved = validate_portable_plugin_path(path, paths, options)?;
+    // OpenClaw uses a file entrypoint's containing directory as its plugin root.
+    if resolved.is_file() {
+        resolved = validate_portable_plugin_path(resolved.parent().unwrap(), paths, options)?;
+    }
     let mut pending = vec![resolved];
     let mut visited = BTreeSet::new();
     while let Some(path) = pending.pop() {
@@ -940,6 +984,16 @@ fn validate_portable_plugin_path(
         if options.should_skip(relative, kind)? {
             return Err(format!(
                 "plugin path is excluded from the environment archive: {}",
+                current.display()
+            ));
+        }
+        if !(if metadata.is_dir() {
+            traversal_survives_import(&current, paths, options)
+        } else {
+            payload_survives_import(&current, paths, options)
+        }) {
+            return Err(format!(
+                "plugin path traverses an entry removed during import: {}",
                 current.display()
             ));
         }

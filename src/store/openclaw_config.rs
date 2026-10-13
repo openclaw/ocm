@@ -134,47 +134,65 @@ pub(super) fn configured_archive_plugin_paths(
         return Ok(Vec::new());
     };
     let mut result = Vec::new();
-    for raw in values
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let mut value = Value::String(raw.to_string());
-        rewrite_env_root_paths(&mut value, &paths.root, &paths.root);
-        let raw = value.as_str().unwrap();
-        if raw.contains("${") {
-            return Err("cannot export an unresolved configured plugin path".to_string());
+    for raw in values.iter().filter_map(Value::as_str) {
+        if let Some(path) = archive_plugin_path(raw, paths)? {
+            result.push(path);
         }
-        let expanded = if raw == "~" {
-            paths.openclaw_home.clone()
-        } else if raw.starts_with("~/") || raw.starts_with("~\\") {
-            let mut value = paths.openclaw_home.as_os_str().to_os_string();
-            value.push(&raw[1..]);
-            PathBuf::from(value)
-        } else {
-            PathBuf::from(raw)
-        };
-        result.push(clean_path(&if expanded.is_absolute() {
-            expanded
-        } else {
-            paths.root.join(expanded)
-        }));
     }
     Ok(result)
 }
 
+fn archive_plugin_path(raw: &str, paths: &EnvPaths) -> Result<Option<PathBuf>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut value = Value::String(raw.to_string());
+    rewrite_env_root_paths(&mut value, &paths.root, &paths.root);
+    let raw = value.as_str().unwrap();
+    if raw.contains("${") {
+        return Err("cannot export an unresolved configured plugin path".to_string());
+    }
+    let expanded = if raw == "~" {
+        paths.openclaw_home.clone()
+    } else if raw.starts_with("~/") || raw.starts_with("~\\") {
+        let mut value = paths.openclaw_home.as_os_str().to_os_string();
+        value.push(&raw[1..]);
+        PathBuf::from(value)
+    } else {
+        PathBuf::from(raw)
+    };
+    Ok(Some(clean_path(&if expanded.is_absolute() {
+        expanded
+    } else {
+        paths.root.join(expanded)
+    })))
+}
+
 pub(super) fn normalized_archive_config_contents(
     paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: super::openclaw_workspaces::OpenClawWorkspaceRuntime<'_>,
 ) -> Result<BTreeMap<PathBuf, Vec<u8>>, String> {
     let mut config_paths = openclaw_config_include_paths(&paths.config_path, &paths.state_dir)?;
     config_paths.push(paths.config_path.clone());
-    let mut contents = BTreeMap::new();
+    let mut config_files = BTreeMap::new();
     for config_path in config_paths {
-        let Some(mut value) = read_config_value(&config_path)? else {
-            continue;
-        };
+        if let Some(value) = read_config_value(&config_path)? {
+            config_files.insert(config_path, value);
+        }
+    }
+    let plugin_fields = archive_plugin_path_fields(paths, env, runtime, &config_files)?;
+    let mut contents = BTreeMap::new();
+    for (config_path, mut value) in config_files {
         let original = value.clone();
+        if let Some(fields) = plugin_fields.get(&config_path) {
+            for (pointer, replacement) in fields {
+                *value
+                    .pointer_mut(pointer)
+                    .ok_or("plugin config field disappeared")? = Value::String(replacement.clone());
+            }
+        }
         // Keep the source spelling used by archive metadata, resolving owned
         // aliases before the exporting filesystem becomes unavailable.
         rewrite_env_root_paths(&mut value, &paths.root, &paths.root);
@@ -197,6 +215,162 @@ pub(super) fn normalized_archive_config_contents(
         contents.insert(relative.to_path_buf(), bytes);
     }
     Ok(contents)
+}
+
+fn archive_plugin_path_fields(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: super::openclaw_workspaces::OpenClawWorkspaceRuntime<'_>,
+    config_files: &BTreeMap<PathBuf, Value>,
+) -> Result<BTreeMap<PathBuf, BTreeMap<String, String>>, String> {
+    let Some(original) = load_effective_openclaw_config(&paths.config_path)? else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(resolved) =
+        super::openclaw_workspaces::resolved_env_openclaw_config(paths, env, runtime)?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let (Some(original), Some(resolved)) = (
+        original
+            .value
+            .pointer("/plugins/load/paths")
+            .and_then(Value::as_array),
+        resolved
+            .pointer("/plugins/load/paths")
+            .and_then(Value::as_array),
+    ) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut replacements = BTreeMap::new();
+    for (original, resolved) in original.iter().zip(resolved) {
+        if let (Some(original), Some(resolved)) = (original.as_str(), resolved.as_str()) {
+            if let Some(path) = archive_plugin_path(resolved, paths)? {
+                let replacement = display_path(&path);
+                if original != replacement {
+                    replacements.insert(original.to_string(), replacement);
+                }
+            }
+        }
+    }
+    if replacements.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut visitor = ArchivePluginPathFields {
+        config_files,
+        replacements: &replacements,
+        visited: BTreeSet::new(),
+        fields: BTreeMap::new(),
+        unrelated: BTreeSet::new(),
+    };
+    visitor.visit_file(
+        &paths.config_path,
+        ArchivePluginScope::Fields(&["plugins", "load", "paths"]),
+    )?;
+    for (file, pointer) in visitor.unrelated {
+        if visitor
+            .fields
+            .get(&file)
+            .is_some_and(|fields| fields.contains_key(&pointer))
+        {
+            return Err("cannot export a configured plugin path from an include shared with unrelated configuration".to_string());
+        }
+    }
+    Ok(visitor.fields)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ArchivePluginScope {
+    Fields(&'static [&'static str]),
+    PathEntry,
+    Other,
+}
+
+struct ArchivePluginPathFields<'a> {
+    config_files: &'a BTreeMap<PathBuf, Value>,
+    replacements: &'a BTreeMap<String, String>,
+    visited: BTreeSet<(PathBuf, ArchivePluginScope)>,
+    fields: BTreeMap<PathBuf, BTreeMap<String, String>>,
+    unrelated: BTreeSet<(PathBuf, String)>,
+}
+
+impl ArchivePluginPathFields<'_> {
+    fn visit_file(&mut self, file: &Path, scope: ArchivePluginScope) -> Result<(), String> {
+        let file = clean_path(file);
+        if !self.visited.insert((file.clone(), scope)) {
+            return Ok(());
+        }
+        let config_files = self.config_files;
+        let value = config_files
+            .get(&file)
+            .ok_or("included config file disappeared")?;
+        self.visit_value(value, &file, "", scope)
+    }
+
+    fn visit_value(
+        &mut self,
+        value: &Value,
+        file: &Path,
+        pointer: &str,
+        scope: ArchivePluginScope,
+    ) -> Result<(), String> {
+        match value {
+            Value::Object(fields) => {
+                if let Some(include) = fields.get("$include") {
+                    let includes = match include {
+                        Value::Array(includes) => includes.as_slice(),
+                        include => std::slice::from_ref(include),
+                    };
+                    for include in includes {
+                        let path = include.as_str().ok_or("invalid config include path")?;
+                        // The include parser already checked containment, type,
+                        // depth and cycles; use only its validated file set.
+                        let target = file.parent().ok_or("config path has no parent")?.join(path);
+                        self.visit_file(&target, scope)?;
+                    }
+                }
+                for (name, value) in fields {
+                    if name == "$include" {
+                        continue;
+                    }
+                    let nested_scope = match scope {
+                        ArchivePluginScope::Fields([next, remaining @ ..]) if name == *next => {
+                            ArchivePluginScope::Fields(remaining)
+                        }
+                        _ => ArchivePluginScope::Other,
+                    };
+                    let key = name.replace('~', "~0").replace('/', "~1");
+                    self.visit_value(value, file, &format!("{pointer}/{key}"), nested_scope)?;
+                }
+            }
+            Value::Array(values) => {
+                let nested_scope = if scope == ArchivePluginScope::Fields(&[]) {
+                    ArchivePluginScope::PathEntry
+                } else {
+                    ArchivePluginScope::Other
+                };
+                for (index, value) in values.iter().enumerate() {
+                    self.visit_value(value, file, &format!("{pointer}/{index}"), nested_scope)?;
+                }
+            }
+            Value::String(raw) => {
+                if let Some(replacement) = self.replacements.get(raw) {
+                    if scope == ArchivePluginScope::PathEntry {
+                        self.fields
+                            .entry(file.to_path_buf())
+                            .or_default()
+                            .insert(pointer.to_string(), replacement.clone());
+                    } else {
+                        self.unrelated
+                            .insert((file.to_path_buf(), pointer.to_string()));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 fn make_archive_includes_relative(value: &mut Value, parent: &Path) -> Result<(), String> {
