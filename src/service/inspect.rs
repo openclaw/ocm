@@ -452,7 +452,7 @@ fn service_issue(context: ServiceIssueContext<'_>) -> Option<String> {
     if !installed {
         return None;
     }
-    if !daemon.installed {
+    if desired_running && !daemon.installed {
         return Some("OCM background service is not installed".to_string());
     }
     if desired_running {

@@ -459,6 +459,12 @@ ocm service stop mira
 ocm service restart mira
 ```
 
+`service stop` keeps the env installed with `desiredRunning: false`. When no env
+is desired running, OCM removes the idle shared daemon. Status then reports the
+daemon as absent without treating that absence as a fault. Leave it absent while
+the envs should stay stopped; `ocm service start <env>` recreates it when needed.
+`refresh-daemon` requires an existing daemon and is not an installation command.
+
 Starting a service requires a successful manager observation or confirmed absence of the OCM daemon.
 If the manager cannot be queried or reports an unknown process state, OCM refuses activation and preserves the existing daemon and other environment services.
 Retry after restoring manager access; `ocm service status` remains available for best-effort inspection.

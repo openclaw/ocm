@@ -570,6 +570,10 @@ ocm logs mira --tail 50
 ocm logs mira -f
 ```
 
+Stopped envs remain installed even when the idle shared daemon is absent.
+Use `ocm service start <env>` when you want to run one again; see
+[service status and recovery](docs/USAGE.md#start-stop-restart).
+
 OCM negotiates fresh-process restart support only when it executes an
 `openclaw.mjs` entrypoint directly or through OCM's managed Node.js toolchain,
 so the gateway PID is the process OCM owns. `ocm service status <env>` reports

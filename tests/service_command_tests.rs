@@ -959,26 +959,124 @@ fn service_start_replaces_stale_launchd_job_with_same_label() {
 
 #[test]
 fn service_stop_keeps_the_env_installed_but_stopped() {
-    let root = TestDir::new("service-stop");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = launchd_env(&root);
-    setup_launcher_env(&cwd, &env);
+    for systemd in [false, true] {
+        let root = TestDir::new("service-stop");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = if systemd {
+            systemd_env(&root)
+        } else {
+            launchd_env(&root)
+        };
+        setup_launcher_env(&cwd, &env);
 
-    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
-    assert!(started.status.success(), "{}", stderr(&started));
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(started.status.success(), "{}", stderr(&started));
 
-    let output = run_ocm(&cwd, &env, &["service", "stop", "demo", "--json"]);
-    assert!(output.status.success(), "{}", stderr(&output));
-    let body = json_output(&output);
-    assert_eq!(body["installed"], true);
-    assert_eq!(body["desiredRunning"], false);
+        let output = run_ocm(&cwd, &env, &["service", "stop", "demo", "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let body = json_output(&output);
+        assert_eq!(body["installed"], true);
+        assert_eq!(body["desiredRunning"], false);
+        assert_eq!(body["issue"], Value::Null);
 
-    let env_show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
-    let env_body = json_output(&env_show);
-    assert_eq!(env_body["serviceEnabled"], true);
-    assert_eq!(env_body["serviceRunning"], false);
-    assert!(!managed_service_definition_path(&env, &cwd, "ocm").exists());
+        let env_show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+        let env_body = json_output(&env_show);
+        assert_eq!(env_body["serviceEnabled"], true);
+        assert_eq!(env_body["serviceRunning"], false);
+        let definition = managed_service_definition_path(&env, &cwd, "ocm");
+        assert!(!definition.exists());
+
+        for target in ["demo", "--all"] {
+            let status = run_ocm(&cwd, &env, &["service", "status", target, "--json"]);
+            assert!(status.status.success(), "{}", stderr(&status));
+            let body = json_output(&status);
+            let service = if target == "--all" {
+                &body["services"][0]
+            } else {
+                &body
+            };
+            assert_eq!(service["installed"], true);
+            assert_eq!(service["desiredRunning"], false);
+            assert_eq!(service["gatewayState"], "stopped");
+            assert_eq!(service["ocmServiceInstalled"], false);
+            assert_eq!(service["issue"], Value::Null);
+            for format in [vec!["--raw"], vec!["--color", "always"]] {
+                let mut args = vec!["service", "status", target];
+                args.extend(format);
+                let status = run_ocm(&cwd, &env, &args);
+                assert!(status.status.success(), "{}", stderr(&status));
+                let text = String::from_utf8_lossy(&status.stdout);
+                assert!(text.contains("idle daemon absence is expected"), "{text}");
+                assert!(text.contains("ocm service start <env>"), "{text}");
+                assert!(
+                    !text.contains("OCM background service is not installed"),
+                    "{text}"
+                );
+            }
+        }
+        // Inspection must leave stopped policy and absent registration alone.
+        assert!(!definition.exists());
+        let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+        assert_eq!(json_output(&shown), env_body);
+
+        let restarted = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+        assert!(restarted.status.success(), "{}", stderr(&restarted));
+        assert!(definition.exists());
+        assert_eq!(json_output(&restarted)["desiredRunning"], true);
+    }
+}
+
+#[test]
+fn stopped_service_status_preserves_listener_and_observation_failures() {
+    for systemd in [false, true] {
+        let root = TestDir::new("service-stopped-faults");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = if systemd {
+            systemd_env(&root)
+        } else {
+            launchd_env(&root)
+        };
+        setup_launcher_env(&cwd, &env);
+        let env_service = EnvironmentService::new(&env, &cwd);
+        env_service
+            .set_service_policy("demo", Some(true), Some(false))
+            .unwrap();
+        let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let port = json_output(&status)["gatewayPort"].as_u64().unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port as u16)).unwrap();
+        for target in ["demo", "--all"] {
+            let status = run_ocm(&cwd, &env, &["service", "status", target, "--json"]);
+            assert!(status.status.success(), "{}", stderr(&status));
+            let body = json_output(&status);
+            let service = if target == "--all" {
+                &body["services"][0]
+            } else {
+                &body
+            };
+            assert_eq!(
+                service["issue"],
+                format!("port {port} is occupied by a process outside the OCM background service")
+            );
+        }
+        drop(listener);
+
+        let installed = run_ocm(&cwd, &env, &["service", "install", "demo"]);
+        assert!(installed.status.success(), "{}", stderr(&installed));
+        let runtime = supervisor_runtime_path(&env, &cwd).unwrap();
+        fs::write(runtime, "invalid runtime observation").unwrap();
+        for target in ["demo", "--all"] {
+            let status = run_ocm(&cwd, &env, &["service", "status", target, "--json"]);
+            assert!(!status.status.success());
+            assert!(
+                stderr(&status).contains("expected value at line 1 column 1"),
+                "{}",
+                stderr(&status)
+            );
+        }
+    }
 }
 
 #[test]
@@ -1692,6 +1790,10 @@ fn service_status_reports_missing_binding_issue() {
 
     let install = run_ocm(&cwd, &env, &["service", "install", "demo"]);
     assert!(!install.status.success());
+
+    EnvironmentService::new(&env, &cwd)
+        .set_service_policy("demo", Some(true), Some(false))
+        .unwrap();
 
     let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
     assert!(status.status.success(), "{}", stderr(&status));

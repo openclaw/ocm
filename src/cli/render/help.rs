@@ -2344,6 +2344,7 @@ pub fn service_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "TTY output uses cards for one env and a table when no env is passed or `--all` is used.",
+                "Stopped envs remain installed even when the idle shared daemon is absent. `service start <env>` recreates it.",
             ],
         ),
         "start" => render_leaf(

@@ -65,8 +65,28 @@ fn ocm_background_service_state(summary: &ServiceSummary) -> &'static str {
     )
 }
 
+const IDLE_DAEMON_NOTE: &str = "Stopped envs remain installed; idle daemon absence is expected. `ocm service start <env>` recreates it.";
+
+fn idle_daemon_absent(summary: &ServiceSummary) -> bool {
+    summary.installed
+        && !summary.desired_running
+        && !summary.ocm_service_installed
+        && !summary.ocm_service_loaded
+        && !summary.ocm_service_running
+        && summary.issue.is_none()
+}
+
 pub fn service_overview(summary: &ServiceSummaryList, profile: RenderProfile) -> Vec<String> {
-    service_overview_with_width(summary, profile, terminal_width())
+    let mut lines = service_overview_with_width(summary, profile, terminal_width());
+    if summary
+        .services
+        .iter()
+        .all(|service| !service.desired_running)
+        && summary.services.iter().any(idle_daemon_absent)
+    {
+        lines.push(paint(IDLE_DAEMON_NOTE, Tone::Muted, profile.color));
+    }
+    lines
 }
 
 fn service_overview_with_width(
@@ -202,7 +222,11 @@ pub fn service_status(
     command_example: &str,
 ) -> Vec<String> {
     if !profile.pretty {
-        return service_status_raw(summary);
+        let mut lines = service_status_raw(summary);
+        if idle_daemon_absent(summary) {
+            lines.push(IDLE_DAEMON_NOTE.to_string());
+        }
+        return lines;
     }
 
     let daemon = ocm_background_service_state(summary);
@@ -249,6 +273,10 @@ pub fn service_status(
         &summary_rows,
         profile.color,
     ));
+
+    if idle_daemon_absent(summary) {
+        lines.push(paint(IDLE_DAEMON_NOTE, Tone::Muted, profile.color));
+    }
 
     if let Some(note) = summary.ocm_service_version_note.as_deref() {
         lines.extend(render_key_value_card(
