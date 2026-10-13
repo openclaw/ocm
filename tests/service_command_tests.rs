@@ -1119,10 +1119,12 @@ fn stopped_service_status_preserves_listener_and_observation_failures() {
         env_service
             .set_service_policy("demo", Some(true), Some(false))
             .unwrap();
-        let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
-        assert!(status.status.success(), "{}", stderr(&status));
-        let port = json_output(&status)["gatewayPort"].as_u64().unwrap();
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port as u16)).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = u32::from(listener.local_addr().unwrap().port());
+        let mut meta = env_service.get("demo").unwrap();
+        meta.gateway_port = Some(port);
+        meta.gateway_port_auto_assigned = false;
+        ocm::store::save_environment(meta, &env, &cwd).unwrap();
         for target in ["demo", "--all"] {
             let status = run_ocm(&cwd, &env, &["service", "status", target, "--json"]);
             assert!(status.status.success(), "{}", stderr(&status));
