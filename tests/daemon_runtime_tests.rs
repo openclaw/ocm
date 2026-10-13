@@ -2696,61 +2696,164 @@ fn child_restart_request_rebuilds_missing_or_stale_state() {
 }
 
 #[test]
-fn child_restart_recovery_preserves_unrelated_child_specs() {
+fn child_restart_recovery_requires_known_daemon_state_and_preserves_siblings() {
     let _guard = daemon_runtime_test_lock();
-    let root = TestDir::new("restart-recovery-preserves-siblings");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let mut env = ocm_env(&root);
-    install_fake_systemd_tools(&root, &mut env);
-    let state_path = root.child("ocm-home/supervisor/state.json");
+    for systemd in [false, true] {
+        for observation in ["failed", "unknown", "running", "absent", "stopped"] {
+            let root = TestDir::new("restart-recovery-preserves-siblings");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let mut env = ocm_env(&root);
+            if systemd {
+                install_fake_systemd_tools(&root, &mut env);
+            } else {
+                env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+                install_fake_launchctl(&root, &mut env);
+            }
+            let state_path = root.child("ocm-home/supervisor/state.json");
 
-    for name in ["rescue", "main"] {
-        let launcher = run_ocm(
-            &cwd,
-            &env,
-            &["launcher", "add", name, "--command", "openclaw"],
-        );
-        assert!(launcher.status.success(), "{}", stderr(&launcher));
-        let created = run_ocm(&cwd, &env, &["env", "create", name, "--launcher", name]);
-        assert!(created.status.success(), "{}", stderr(&created));
-        set_service_enabled(&cwd, &env, name, true);
+            for name in ["rescue", "main"] {
+                let launcher = run_ocm(
+                    &cwd,
+                    &env,
+                    &["launcher", "add", name, "--command", "openclaw"],
+                );
+                assert!(launcher.status.success(), "{}", stderr(&launcher));
+                let created = run_ocm(&cwd, &env, &["env", "create", name, "--launcher", name]);
+                assert!(created.status.success(), "{}", stderr(&created));
+                set_service_enabled(&cwd, &env, name, true);
+            }
+
+            let service = SupervisorService::new(&env, &cwd);
+            service.install_daemon().unwrap();
+            let sibling_request = service.request_child_restart("main").unwrap();
+            let before = read_persisted_service_state(&state_path);
+            let sibling_before = before["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|child| child["envName"] == "main")
+                .unwrap();
+            let target_request = service.request_child_restart("rescue").unwrap();
+            let (binary, log, operation) = if systemd {
+                ("systemctl", "systemctl.log", "\"$2\" = \"show\"")
+            } else {
+                ("launchctl", "launchctl.log", "\"$1\" = \"print\"")
+            };
+            let reply = match (systemd, observation) {
+                (_, "failed") => "echo 'Operation not permitted' >&2; exit 1",
+                (_, "unknown") => "printf 'unexpected manager reply\\n'; exit 0",
+                (true, "absent") => {
+                    "printf 'LoadState=not-found\\nActiveState=inactive\\nMainPID=0\\n'; exit 4"
+                }
+                (true, "stopped") => {
+                    "printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\n'; exit 0"
+                }
+                (false, "absent") => {
+                    "printf 'Could not find service \"%s\" in domain for user gui\\n' \"${2##*/}\" >&2; exit 1"
+                }
+                (false, "stopped") => "printf 'state = not running\\n'; exit 0",
+                (_, "running") => "", // Use the fixture's ordinary running observation.
+                _ => unreachable!(),
+            };
+            let manager_path = root.child(format!("fake-bin/{binary}"));
+            let original = fs::read_to_string(&manager_path).unwrap();
+            let marker = root.child("recovery-observed");
+            // Direct library calls inherit the test process environment. Keep
+            // the manager's HOME in the same isolated fixture as CLI calls.
+            // Override only the recovery decision read; activation stays real
+            // to the existing manager fixture.
+            write_executable_script(
+                &manager_path,
+                &format!(
+                    "#!/bin/sh\nexport HOME='{home}'\nif [ {operation} ] && [ ! -f '{marker}' ]; then\n : > '{marker}'\n {reply}\nfi\n{original}",
+                    home = env["HOME"],
+                    marker = path_string(&marker),
+                ),
+            );
+            fs::write(root.child(log), "").unwrap();
+
+            let mut restart_env = env.clone();
+            restart_env.insert(
+                "NODE_OPTIONS".to_string(),
+                "--max-old-space-size=2048".to_string(),
+            );
+            let result = SupervisorService::new(&restart_env, &cwd).recover_child_restart("rescue");
+            if matches!(observation, "failed" | "unknown") {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("activation was refused to preserve running services"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains(
+                        "Restore service-manager access or wait for its state to settle, then retry"
+                    ),
+                    "{error}"
+                );
+            } else {
+                let summary = result.unwrap();
+                assert!(
+                    summary.running,
+                    "systemd={systemd}, observation={observation}: {summary:?}"
+                );
+            }
+            let calls = fs::read_to_string(root.child(log)).unwrap();
+            let activated = calls.contains(if systemd {
+                "--user restart"
+            } else {
+                "bootstrap"
+            });
+            assert_eq!(
+                activated,
+                matches!(observation, "absent" | "stopped"),
+                "{observation}: {calls}"
+            );
+            if !activated {
+                assert!(
+                    !calls.contains("bootout")
+                        && !calls.contains("unload")
+                        && !calls.contains("daemon-reload")
+                        && !calls.contains("--user stop"),
+                    "{calls}"
+                );
+            }
+
+            let state = read_persisted_service_state(&state_path);
+            let children = state["children"].as_array().unwrap();
+            let rescue = children
+                .iter()
+                .find(|child| child["envName"] == "rescue")
+                .unwrap();
+            let main = children
+                .iter()
+                .find(|child| child["envName"] == "main")
+                .unwrap();
+
+            assert_eq!(
+                rescue["processEnv"]["NODE_OPTIONS"],
+                "--max-old-space-size=2048"
+            );
+            assert_eq!(main, sibling_before);
+            let requests = state["restartRequests"].as_array().unwrap();
+            assert!(
+                requests.iter().any(|request| request["envName"] == "main"
+                    && request["requestId"] == sibling_request)
+            );
+            assert!(
+                !requests
+                    .iter()
+                    .any(|request| request["requestId"] == target_request)
+            );
+            assert!(
+                state["restartRequests"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["envName"] == "rescue")
+            );
+        }
     }
-
-    SupervisorService::new(&env, &cwd).sync().unwrap();
-
-    let mut restart_env = env.clone();
-    restart_env.insert(
-        "NODE_OPTIONS".to_string(),
-        "--max-old-space-size=2048".to_string(),
-    );
-    SupervisorService::new(&restart_env, &cwd)
-        .recover_child_restart("rescue")
-        .unwrap();
-
-    let state = read_persisted_service_state(&state_path);
-    let children = state["children"].as_array().unwrap();
-    let rescue = children
-        .iter()
-        .find(|child| child["envName"] == "rescue")
-        .unwrap();
-    let main = children
-        .iter()
-        .find(|child| child["envName"] == "main")
-        .unwrap();
-
-    assert_eq!(
-        rescue["processEnv"]["NODE_OPTIONS"],
-        "--max-old-space-size=2048"
-    );
-    assert!(main["processEnv"]["NODE_OPTIONS"].is_null());
-    assert!(
-        state["restartRequests"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|request| request["envName"] == "rescue")
-    );
 }
 
 #[test]

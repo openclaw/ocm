@@ -491,6 +491,14 @@ Forced restart explicitly replaces the supervised child directly. It bypasses
 OpenClaw's restart-recovery handoff and can lose in-flight work, so it is
 intentionally an emergency override rather than a compatibility requirement.
 
+If a legacy or forced restart is not observed within 30 seconds, OCM reissues
+only that environment's restart request. Recovery activates the shared daemon
+only after confirming it is absent or stopped, retaining unrelated child
+definitions and restart requests. A failed or unknown service-manager observation
+returns an error without replacing the daemon or interrupting healthy siblings.
+Restore service-manager access or wait for its state to settle, then retry.
+The target request remains pending, so the existing daemon can still process it.
+
 A Gateway that exits cleanly without an accepted restart handoff stays stopped
 while its saved launch definition remains unchanged. Starting or restarting a
 sibling environment does not revive it. An explicit restart of that environment,

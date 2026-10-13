@@ -582,6 +582,11 @@ directly invoked OpenClaw runtime to gain recovery-aware restarts. Use
 `ocm service restart <env> --force` only to explicitly bypass a recovery
 handoff that is advertised but unhealthy.
 
+Delayed legacy or forced restart recovery activates the shared daemon only when
+the service manager confirms it is absent or stopped. A failed or unknown
+observation fails the command with retry guidance, preserving healthy sibling
+Gateways. The target restart request remains pending for the existing daemon.
+
 ## Why not just run OpenClaw directly?
 
 Running OpenClaw directly is fine for the simplest case.

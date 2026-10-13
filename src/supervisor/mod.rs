@@ -743,9 +743,13 @@ impl<'a> SupervisorService<'a> {
         &self,
         name: &str,
     ) -> Result<(SupervisorDaemonSummary, String), String> {
+        // Serialize ownership, request publication and activation with teardown
+        // and other stores. Acquire lifecycle before the request's state lock.
+        let _lifecycle_lock = self.lock_daemon_lifecycle()?;
+        self.validate_daemon_owner_locked()?;
         // Reissue only the target request; a full sync could reload unrelated children.
         let request_id = self.request_child_restart(name)?;
-        let status = self.daemon_status()?;
+        let status = self.daemon_status_for_activation()?;
         if status.running {
             return Ok((status, request_id));
         }
