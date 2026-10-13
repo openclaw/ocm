@@ -13,6 +13,14 @@ not need the caller to remain connected. On Linux, a helper inside the OCM
 systemd service first moves into a transient `systemd-run --user --scope` scope.
 If that handoff fails, OCM does not replace the installed executable.
 
+When a replacement daemon starts, an occupied Gateway port family can belong to an outgoing process that is still draining.
+The initial startup plan stays `pending` while it retries that port check, using the existing 90-second Gateway readiness budget.
+The deadline is fixed at daemon startup and is not renewed by retries.
+Only retryable port occupancy gets this initial wait; other startup errors and later starts keep their usual failure handling.
+If occupancy persists, the daemon returns to ordinary backoff and automatic recovery, with each failed attempt publishing its new retry count and timestamp.
+Older update helpers can then finish their failed readiness check and roll back instead of waiting indefinitely.
+OCM neither adopts nor signals an unknown listener, and a free Gateway port alone is insufficient when another port in its family is occupied.
+
 ## Result and recovery
 
 After reconnecting, use the same `HOME` and `OCM_HOME`:

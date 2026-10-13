@@ -1277,6 +1277,13 @@ impl<'a> SupervisorService<'a> {
             0,
             Instant::now(),
         );
+        // Only the initial daemon plan can overlap an outgoing Gateway. Later
+        // starts and crash retries keep their ordinary failure policy.
+        let startup_port_deadline =
+            Instant::now() + crate::service::gateway_readiness_timeout(self.env);
+        for child in pending.values_mut() {
+            child.startup_port_deadline = Some(startup_port_deadline);
+        }
         // Publish the process-bound capability before any probe or child start.
         // A stale record from an earlier daemon can never authorize this process.
         write_supervisor_runtime_state(
@@ -1405,6 +1412,7 @@ struct PendingSupervisorChild {
     restart_count: usize,
     quick_clean_restart_count: usize,
     retry_at: Instant,
+    startup_port_deadline: Option<Instant>,
     retry_at_utc: OffsetDateTime,
     last_exit_code: Option<i32>,
     last_error: Option<String>,
@@ -2017,6 +2025,7 @@ fn reconcile_restart_requests(
 
         if let Some(pending_child) = pending.get_mut(&request.env_name) {
             pending_child.spec = next_spec;
+            pending_child.startup_port_deadline = None;
             pending_child.retry_at = Instant::now();
             pending_child.retry_at_utc = now_utc();
             pending_child.last_error = None;
@@ -2400,6 +2409,7 @@ fn queue_missing_children(
                 restart_count,
                 quick_clean_restart_count: 0,
                 retry_at,
+                startup_port_deadline: None,
                 retry_at_utc: now_utc(),
                 last_exit_code: None,
                 last_error: None,
@@ -2430,14 +2440,36 @@ fn start_due_children(
         let Some(next_child) = pending.get(&env_name).cloned() else {
             continue;
         };
-        if let Err(error) = preflight_supervisor_child_start(&next_child, running).and_then(|()| {
-            EnvironmentService::new(env, cwd).ensure_source_watch_allows_service(&env_name)
-        }) {
+        let mut port_conflict = false;
+        if let Err(error) = preflight_supervisor_child_start(&next_child, running)
+            .and_then(|()| {
+                EnvironmentService::new(env, cwd).ensure_source_watch_allows_service(&env_name)
+            })
+            .and_then(|()| {
+                let result = preflight_supervisor_child_ports(&next_child);
+                port_conflict = result.is_err();
+                result
+            })
+        {
             if let Some(entry) = pending.get_mut(&env_name) {
+                let now = Instant::now();
+                if !port_conflict
+                    || entry
+                        .startup_port_deadline
+                        .is_some_and(|deadline| now >= deadline)
+                {
+                    entry.startup_port_deadline = None;
+                }
                 entry.restart_count += 1;
-                let delay_ms = restart_delay_ms(entry.restart_count);
-                entry.retry_at = Instant::now() + Duration::from_millis(delay_ms);
-                entry.retry_at_utc = now_utc() + time::Duration::milliseconds(delay_ms as i64);
+                let retry_at = now + Duration::from_millis(restart_delay_ms(entry.restart_count));
+                // The initial budget never slides. Wake at its expiration even
+                // when normal exponential backoff would schedule a later retry.
+                entry.retry_at = entry
+                    .startup_port_deadline
+                    .map_or(retry_at, |deadline| retry_at.min(deadline));
+                // The delay is bounded by SUPERVISOR_MAX_RESTART_DELAY_MS.
+                let delay_ms = entry.retry_at.saturating_duration_since(now).as_millis() as i64;
+                entry.retry_at_utc = now_utc() + time::Duration::milliseconds(delay_ms);
                 entry.last_error = Some(error.clone());
                 entry.last_event_at = Some(now_utc());
             }
@@ -2450,8 +2482,12 @@ fn start_due_children(
                     "backoff",
                 ),
             );
+            runtime_dirty = true;
             eprintln!("{error}");
             continue;
+        }
+        if let Some(entry) = pending.get_mut(&env_name) {
+            entry.startup_port_deadline = None;
         }
         let mut cleanup_unverified = false;
         let start_result: Result<_, String> = (|| {
@@ -2526,6 +2562,7 @@ fn start_due_children(
                         "backoff",
                     ),
                 );
+                runtime_dirty = true;
             }
         }
     }
@@ -2641,6 +2678,7 @@ fn pending_supervisor_child(
         restart_count,
         quick_clean_restart_count,
         retry_at: Instant::now() + Duration::from_millis(delay_ms),
+        startup_port_deadline: None,
         retry_at_utc: now_utc() + time::Duration::milliseconds(delay_ms as i64),
         last_exit_code,
         last_error,
@@ -2692,10 +2730,7 @@ fn restart_delay_ms(restart_count: usize) -> u64 {
         .min(SUPERVISOR_MAX_RESTART_DELAY_MS)
 }
 
-fn preflight_supervisor_child_start(
-    pending_child: &PendingSupervisorChild,
-    running: &BTreeMap<String, RunningSupervisorChild>,
-) -> Result<(), String> {
+fn preflight_supervisor_child_ports(pending_child: &PendingSupervisorChild) -> Result<(), String> {
     if !openclaw_port_family_available(pending_child.spec.child_port) {
         let (start_port, end_port) = openclaw_port_family_range(pending_child.spec.child_port);
         return Err(format!(
@@ -2704,6 +2739,13 @@ fn preflight_supervisor_child_start(
         ));
     }
 
+    Ok(())
+}
+
+fn preflight_supervisor_child_start(
+    pending_child: &PendingSupervisorChild,
+    running: &BTreeMap<String, RunningSupervisorChild>,
+) -> Result<(), String> {
     let has_run_dir_conflict = running.values().any(|running_child| {
         running_child.spec.run_dir == pending_child.spec.run_dir
             && running_child.spec.binding_kind != "runtime"
@@ -3118,10 +3160,10 @@ fn write_supervisor_runtime_state(
         .map(supervisor_runtime_service_running)
         .collect::<Vec<_>>();
     services.extend(pending.values().map(|child| {
-        // A per-child acknowledgement can expose siblings before their first
-        // attempt. Keep those pending; reporting backoff would fail readiness
-        // while a sibling's capability probe is still running.
-        let state = if child.last_event_at.is_none() {
+        // Initial port settlement and siblings awaiting their first probe are
+        // still pending. Old readiness consumers reject successive backoffs;
+        // pending keeps their ordinary readiness deadline in force instead.
+        let state = if child.startup_port_deadline.is_some() || child.last_event_at.is_none() {
             "pending"
         } else {
             "backoff"

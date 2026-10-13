@@ -23,12 +23,15 @@ pub(crate) fn wait_for_gateway_readiness(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<GatewayReadiness, String> {
-    let timeout = env
-        .get("OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS")
+    let timeout = gateway_readiness_timeout(env);
+    wait_for_gateway_readiness_with_timeout(name, timeout, env, cwd)
+}
+
+pub(crate) fn gateway_readiness_timeout(env: &BTreeMap<String, String>) -> Duration {
+    env.get("OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_GATEWAY_READINESS_TIMEOUT);
-    wait_for_gateway_readiness_with_timeout(name, timeout, env, cwd)
+        .unwrap_or(DEFAULT_GATEWAY_READINESS_TIMEOUT)
 }
 
 fn wait_for_gateway_readiness_with_timeout(

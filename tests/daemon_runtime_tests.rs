@@ -4386,6 +4386,112 @@ fn service_start_preserves_exec_and_plain_executable_launchers() {
 }
 
 #[test]
+fn initial_port_settlement_is_bounded_and_preserves_automatic_recovery() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-initial-port-settlement");
+    let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 1_800);
+    set_service_enabled(&cwd, &env, "demo", true);
+    let service = SupervisorService::new(&env, &cwd);
+    let state = service.sync().unwrap();
+    let port = state.children[0].child_port as u16;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port + 1)).unwrap();
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    struct Daemon(Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            stop_process(&mut self.0);
+        }
+    }
+    let daemon = Daemon(spawn_daemon_process(&cwd, &env));
+
+    // Observe actual failed attempts in the published runtime, not just the
+    // pre-attempt pending record. Repeated attempts must not renew the budget.
+    let started = Instant::now();
+    let mut previous_count = 0;
+    let mut previous_retry = String::new();
+    for (expected_state, minimum_count) in [
+        ("pending", 1),
+        ("pending", 2),
+        ("backoff", 3),
+        ("backoff", 4),
+    ] {
+        loop {
+            let service = wait_for_runtime_service_state(
+                &runtime_path,
+                "demo",
+                expected_state,
+                Duration::from_secs(8),
+            )
+            .expect("daemon did not publish the expected startup transition");
+            let count = service["restartCount"].as_u64().unwrap();
+            if count >= minimum_count {
+                assert!(count > previous_count);
+                assert!(service["pid"].is_null(), "foreign listener was adopted");
+                assert!(
+                    service["lastError"]
+                        .as_str()
+                        .unwrap()
+                        .contains("port family")
+                );
+                let retry = service["nextRetryAt"].as_str().unwrap();
+                assert_ne!(retry, previous_retry, "retry publication was stale");
+                previous_count = count;
+                previous_retry = retry.to_string();
+                if minimum_count == 2 {
+                    // A refreshed unchanged plan cannot renew the startup budget.
+                    SupervisorService::new(&env, &cwd).sync().unwrap();
+                }
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(12),
+                "retry generation did not advance"
+            );
+            sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "initial pending budget slid"
+    );
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port + 1)).is_ok());
+    let runtime = read_persisted_service_state(&runtime_path);
+    assert!(runtime["children"].as_array().unwrap().is_empty());
+
+    // Releasing the foreign listener is a fixture action. Normal daemon retry
+    // still starts the desired Gateway without changing or restarting OCM.
+    drop(listener);
+    wait_for_runtime_children(&runtime_path, 1, Some("demo"), Duration::from_secs(10))
+        .expect("automatic recovery stopped after initial settlement expired");
+    let running =
+        wait_for_runtime_service_state(&runtime_path, "demo", "running", Duration::from_secs(2))
+            .unwrap();
+    assert!(running["pid"].as_u64().is_some());
+    assert!(running["lastError"].is_null());
+    assert!(running["nextRetryAt"].is_null());
+
+    // A later desired start in the same daemon gets ordinary backoff, without
+    // a new startup grace period. The initial budget belongs to daemon startup.
+    set_service_enabled(&cwd, &env, "demo", false);
+    service.sync().unwrap();
+    wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5)).unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port + 1)).unwrap();
+    set_service_enabled(&cwd, &env, "demo", true);
+    service.sync().unwrap();
+    let failed =
+        wait_for_runtime_service_state(&runtime_path, "demo", "backoff", Duration::from_secs(2))
+            .expect("later start incorrectly received initial port settlement");
+    assert!(
+        failed["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("port family")
+    );
+    drop(daemon);
+    drop(listener);
+}
+
+#[test]
 fn service_start_reports_failed_backoff_with_the_child_error() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("service-readiness-backoff");
