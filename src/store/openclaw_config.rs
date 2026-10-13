@@ -162,11 +162,10 @@ fn archive_plugin_path(raw: &str, paths: &EnvPaths) -> Result<Option<PathBuf>, S
     } else {
         PathBuf::from(raw)
     };
-    Ok(Some(clean_path(&if expanded.is_absolute() {
-        expanded
-    } else {
-        paths.root.join(expanded)
-    })))
+    if !expanded.is_absolute() {
+        return Err("cannot export an ambiguous relative plugin path; use an absolute path or an environment-root variable".to_string());
+    }
+    Ok(Some(clean_path(&expanded)))
 }
 
 pub(super) fn normalized_archive_config_contents(

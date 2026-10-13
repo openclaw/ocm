@@ -1047,7 +1047,10 @@ fn env_export_include_state_materializes_unchanged_linked_config() {
 #[test]
 fn env_export_include_state_checks_relative_link_traversal_after_cleanup() {
     use serde_json::json;
-    for retained in [false, true] {
+    for (traversed, retained) in ["memory", "agents/demo"]
+        .into_iter()
+        .flat_map(|path| [false, true].map(|retained| (path, retained)))
+    {
         let root = TestDir::new("export-link-traversal");
         let env = ocm_env(&root);
         let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
@@ -1055,12 +1058,22 @@ fn env_export_include_state_checks_relative_link_traversal_after_cleanup() {
         let source = root.child("ocm-home/envs/source");
         let state = source.join(".openclaw");
         write_text(&state.join("plugins/demo/index.js"), "export default {};\n");
-        fs::create_dir_all(state.join("memory/keep")).unwrap();
+        fs::create_dir_all(state.join(traversed)).unwrap();
+        if retained {
+            fs::create_dir_all(state.join(traversed).join("keep")).unwrap();
+        }
         fs::create_dir_all(state.join("extensions")).unwrap();
-        std::os::unix::fs::symlink("../memory/../plugins/demo", state.join("extensions/demo"))
-            .unwrap();
-        let config = if retained {
-            json!({"agents":{"defaults":{"workspace":state.join("memory/keep")}}})
+        std::os::unix::fs::symlink(
+            if traversed == "memory" {
+                "../memory/../plugins/demo"
+            } else {
+                "../agents/demo/../../plugins/demo"
+            },
+            state.join("extensions/demo"),
+        )
+        .unwrap();
+        let config = if retained || traversed == "agents/demo" {
+            json!({"agents":{"defaults":{"workspace":state.join(traversed).join("keep")}}})
         } else {
             json!({})
         };

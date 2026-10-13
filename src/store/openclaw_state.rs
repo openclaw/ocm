@@ -422,29 +422,36 @@ fn traversal_survives_import(path: &Path, paths: &EnvPaths, options: &EnvArchive
     if payload_survives_import(path, paths, options) || path == paths.state_dir {
         return true;
     }
-    let Ok(relative) = path.strip_prefix(&paths.root) else {
-        return false;
+    let has_preserved_descendant = |path: &Path| {
+        path.strip_prefix(&paths.root).is_ok_and(|relative| {
+            options
+                .included_path_roots
+                .iter()
+                .any(|included| included.starts_with(relative))
+        })
     };
-    if options
-        .included_path_roots
-        .iter()
-        .any(|included| included.starts_with(relative))
-    {
-        return true;
-    }
     let agents = paths.state_dir.join("agents");
     if path.parent() == Some(agents.as_path()) {
-        return path_exists(&path.join("agent"));
+        // Agent directories are removed when pruning leaves no actual children.
+        // A configured workspace that does not exist cannot keep one alive.
+        return fs::read_dir(path).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_name() == OsStr::new("agent")
+                    || payload_survives_import(&entry.path(), paths, options)
+                    || has_preserved_descendant(&entry.path())
+            })
+        });
     }
     if path == agents {
         return fs::read_dir(path).is_ok_and(|entries| {
             entries.flatten().any(|entry| {
-                entry.file_type().is_ok_and(|kind| kind.is_dir())
-                    && path_exists(&entry.path().join("agent"))
+                payload_survives_import(&entry.path(), paths, options)
+                    || (entry.file_type().is_ok_and(|kind| kind.is_dir())
+                        && traversal_survives_import(&entry.path(), paths, options))
             })
         });
     }
-    false
+    has_preserved_descendant(path)
 }
 
 fn rewrite_runtime_state_root_refs(
@@ -871,9 +878,12 @@ fn validate_exported_plugin_payload(
     options: &EnvArchiveOptions,
 ) -> Result<(), String> {
     let mut resolved = validate_portable_plugin_path(path, paths, options)?;
-    // OpenClaw uses a file entrypoint's containing directory as its plugin root.
-    if resolved.is_file() {
-        resolved = validate_portable_plugin_path(resolved.parent().unwrap(), paths, options)?;
+    // A file entrypoint can share its directory with unrelated environment data.
+    // Inspect retained siblings for links without requiring all parent contents
+    // to be plugin payload. The selected entry itself was validated above.
+    let file_entrypoint = resolved.is_file();
+    if file_entrypoint {
+        resolved = resolved.parent().unwrap().to_path_buf();
     }
     let mut pending = vec![resolved];
     let mut visited = BTreeSet::new();
@@ -904,6 +914,14 @@ fn validate_exported_plugin_payload(
             if options.should_skip(relative, kind)? {
                 continue;
             }
+            let retained = if metadata.is_dir() {
+                traversal_survives_import(&path, paths, options)
+            } else {
+                payload_survives_import(&path, paths, options)
+            };
+            if file_entrypoint && !retained {
+                continue;
+            }
             if kind == EnvArchiveEntryKind::Other {
                 return Err(format!(
                     "unsupported plugin payload entry: {}",
@@ -913,7 +931,7 @@ fn validate_exported_plugin_payload(
             if metadata.is_symlink() {
                 pending.push(validate_portable_plugin_path(&path, paths, options)?);
             } else {
-                if !payload_survives_import(&path, paths, options) {
+                if !retained {
                     return Err(format!(
                         "plugin payload would be removed during import: {}",
                         path.display()
