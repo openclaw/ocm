@@ -1007,7 +1007,10 @@ fn service_stop_keeps_the_env_installed_but_stopped() {
                 let status = run_ocm(&cwd, &env, &args);
                 assert!(status.status.success(), "{}", stderr(&status));
                 let text = String::from_utf8_lossy(&status.stdout);
-                assert!(text.contains("idle daemon absence is expected"), "{text}");
+                assert!(
+                    text.contains("shared daemon can be absent while idle"),
+                    "{text}"
+                );
                 assert!(text.contains("ocm service start <env>"), "{text}");
                 assert!(
                     !text.contains("OCM background service is not installed"),
@@ -1024,6 +1027,79 @@ fn service_stop_keeps_the_env_installed_but_stopped() {
         assert!(restarted.status.success(), "{}", stderr(&restarted));
         assert!(definition.exists());
         assert_eq!(json_output(&restarted)["desiredRunning"], true);
+    }
+}
+
+#[test]
+fn stopped_service_guidance_does_not_assert_the_shared_daemon_is_idle() {
+    for systemd in [false, true] {
+        let root = TestDir::new("service-stopped-guidance");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = if systemd {
+            systemd_env(&root)
+        } else {
+            launchd_env(&root)
+        };
+        setup_launcher_env(&cwd, &env);
+        let env_service = EnvironmentService::new(&env, &cwd);
+        env_service
+            .set_service_policy("demo", Some(true), Some(false))
+            .unwrap();
+        let peer = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "peer", "--launcher", "stable"],
+        );
+        assert!(peer.status.success(), "{}", stderr(&peer));
+        env_service
+            .set_service_policy("peer", Some(true), Some(true))
+            .unwrap();
+        let status = run_ocm(&cwd, &env, &["service", "status", "peer", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        assert_eq!(
+            json_output(&status)["issue"],
+            "OCM background service is not installed"
+        );
+
+        for unavailable in [false, true] {
+            if unavailable {
+                env_service
+                    .set_service_policy("peer", Some(true), Some(false))
+                    .unwrap();
+                let manager = if systemd { "systemctl" } else { "launchctl" };
+                write_executable_script(
+                    &root.child(format!("fake-bin/{manager}")),
+                    "#!/bin/sh\nexit 1\n",
+                );
+            }
+            for format in [vec!["--raw"], vec!["--color", "always"]] {
+                let mut args = vec!["service", "status", "demo"];
+                args.extend(format);
+                let status = run_ocm(&cwd, &env, &args);
+                assert!(status.status.success(), "{}", stderr(&status));
+                let text = String::from_utf8_lossy(&status.stdout);
+                assert!(
+                    text.contains("shared daemon can be absent while idle"),
+                    "{text}"
+                );
+                assert!(!text.contains("idle daemon absence is expected"), "{text}");
+            }
+            let all = run_ocm(&cwd, &env, &["service", "status", "--all", "--raw"]);
+            assert!(all.status.success(), "{}", stderr(&all));
+            let text = String::from_utf8_lossy(&all.stdout);
+            assert!(!text.contains("idle daemon absence is expected"), "{text}");
+            if !unavailable {
+                assert!(
+                    text.contains("issue=OCM background service is not installed"),
+                    "{text}"
+                );
+                assert!(
+                    !text.contains("shared daemon can be absent while idle"),
+                    "{text}"
+                );
+            }
+        }
     }
 }
 

@@ -65,7 +65,7 @@ fn ocm_background_service_state(summary: &ServiceSummary) -> &'static str {
     )
 }
 
-const IDLE_DAEMON_NOTE: &str = "Stopped envs remain installed; idle daemon absence is expected. `ocm service start <env>` recreates it.";
+const IDLE_DAEMON_NOTE: &str = "Stopped envs remain installed. The shared daemon can be absent while idle; `ocm service start <env>` recreates it when needed.";
 
 fn idle_daemon_absent(summary: &ServiceSummary) -> bool {
     summary.installed
