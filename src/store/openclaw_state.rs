@@ -150,7 +150,7 @@ pub(crate) fn openclaw_env_state_archive_options(
     let mut not_included = BTreeSet::new();
     for path in super::openclaw_config::configured_archive_plugin_paths(paths, env, runtime)? {
         if contained_plugin_path(&path, &paths.root) {
-            validate_exported_plugin_payload(&path, paths, &options)?;
+            not_included.extend(validate_exported_plugin_payload(&path, paths, &options)?);
         } else {
             not_included.insert(display_path(&path));
         }
@@ -174,9 +174,12 @@ pub(crate) fn openclaw_env_state_archive_options(
                 if let Some(path) = path {
                     let allow_old_root =
                         record.get("source").and_then(Value::as_str) != Some("path");
-                    if cloned_plugin_path(Path::new(path), paths, paths, allow_old_root, true)
-                        .is_none()
+                    if let Some(owned) =
+                        cloned_plugin_path(Path::new(path), paths, paths, allow_old_root, true)
                     {
+                        not_included
+                            .extend(validate_exported_plugin_payload(&owned, paths, &options)?);
+                    } else {
                         not_included.insert(path.to_string());
                     }
                 }
@@ -190,7 +193,7 @@ pub(crate) fn openclaw_env_state_archive_options(
             .map(|workspace| workspace.join(".openclaw/extensions")),
     ) {
         if path_exists(&root) {
-            validate_exported_plugin_payload(&root, paths, &options)?;
+            not_included.extend(validate_exported_plugin_payload(&root, paths, &options)?);
         }
     }
     Ok((options, not_included.into_iter().collect()))
@@ -845,7 +848,14 @@ fn validate_exported_plugin_payload(
     path: &Path,
     paths: &EnvPaths,
     options: &EnvArchiveOptions,
-) -> Result<(), String> {
+) -> Result<BTreeSet<String>, String> {
+    let mut not_included = BTreeSet::new();
+    if !contained_plugin_path(path, &paths.root) {
+        not_included.insert(display_path(
+            &fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        ));
+        return Ok(not_included);
+    }
     let mut resolved = validate_portable_plugin_path(path, paths, options)?;
     // OpenClaw treats a file entrypoint's parent as its plugin root. Validate
     // that whole payload without guessing which files its code may import.
@@ -888,13 +898,23 @@ fn validate_exported_plugin_payload(
                 ));
             }
             if metadata.is_symlink() && !options.file_contents.contains_key(relative) {
+                if !contained_plugin_path(&path, &paths.root) {
+                    not_included.insert(display_path(&fs::canonicalize(&path).unwrap_or(path)));
+                    continue;
+                }
+                if fs::metadata(&path).is_ok_and(|metadata| metadata.is_file())
+                    && is_sqlite_database(&path)?
+                {
+                    // The archive materializes owned database links as snapshots.
+                    continue;
+                }
                 pending.push(validate_portable_plugin_path(&path, paths, options)?);
             } else if metadata.is_dir() {
                 pending.push(path);
             }
         }
     }
-    Ok(())
+    Ok(not_included)
 }
 
 fn validate_portable_plugin_path(

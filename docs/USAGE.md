@@ -970,7 +970,9 @@ included. File plugins whose payload lives outside the environment root are
 not included. Export succeeds and names those paths in `notIncludedPluginPaths`
 and the human summary; it does not copy their external contents.
 
-State symlinks and damaged canonical state databases are rejected. Plugin paths
+Owned database links outside `.openclaw/state` are materialized as coherent
+snapshots; database links to external files are rejected. State symlinks and
+damaged canonical state databases are rejected. Plugin paths
 inside the environment must be portable: relative links are preserved, while
 absolute links that would remain in the imported payload are rejected. Linked
 configuration files are materialized, and copied plugin path settings retain

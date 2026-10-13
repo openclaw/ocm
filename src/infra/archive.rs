@@ -279,11 +279,17 @@ fn append_env_root(
             .sqlite_content_roots
             .iter()
             .any(|root| relative_path.starts_with(root));
+        let linked_database = if discover_sqlite && metadata.is_symlink() {
+            linked_sqlite_source(&path, source_root)?
+        } else {
+            None
+        };
         let state_database = discover_sqlite
-            && metadata.is_file()
-            && (options.required_sqlite_paths.contains(relative_path)
-                || state_databases.contains(&path)
-                || is_sqlite_database(&path).map_err(EnvArchiveWriteError::Fatal)?);
+            && (linked_database.is_some()
+                || metadata.is_file()
+                    && (options.required_sqlite_paths.contains(relative_path)
+                        || state_databases.contains(&path)
+                        || is_sqlite_database(&path).map_err(EnvArchiveWriteError::Fatal)?));
         if state_database {
             state_sidecars.extend(sqlite_sidecar_paths(&path));
         } else if discover_sqlite
@@ -358,7 +364,8 @@ fn append_env_root(
                     path.display()
                 )));
             }
-            let snapshot = create_sqlite_snapshot(&path).map_err(EnvArchiveWriteError::Fatal)?;
+            let snapshot = create_sqlite_snapshot(linked_database.as_deref().unwrap_or(&path))
+                .map_err(EnvArchiveWriteError::Fatal)?;
             if let Some(prepare) = options.prepare_sqlite_snapshot {
                 prepare(source_root, relative_path, snapshot.path(), options)
                     .map_err(EnvArchiveWriteError::Fatal)?;
@@ -401,6 +408,30 @@ fn append_env_root(
     }
 
     Ok(())
+}
+
+fn linked_sqlite_source(
+    path: &Path,
+    source_root: &Path,
+) -> Result<Option<PathBuf>, EnvArchiveWriteError> {
+    let target = match fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(EnvArchiveWriteError::from_entry_io(error)),
+    };
+    if !target.is_file() || !is_sqlite_database(&target).map_err(EnvArchiveWriteError::Fatal)? {
+        return Ok(None);
+    }
+    let root = fs::canonicalize(source_root).map_err(EnvArchiveWriteError::from_entry_io)?;
+    if !target.starts_with(root) {
+        return Err(EnvArchiveWriteError::Fatal(format!(
+            "SQLite link points outside the environment: {}",
+            path.display()
+        )));
+    }
+    // Snapshot the owned target directly so an absolute alias cannot retain a
+    // connection to the source or miss the target's committed WAL writes.
+    Ok(Some(target))
 }
 
 fn classify_sqlite_children(

@@ -1299,3 +1299,157 @@ fn env_export_include_state_reports_external_plugins_without_refusing_them() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn env_export_include_state_snapshots_owned_database_links_outside_state() {
+    use rusqlite::{Connection, OpenFlags};
+    let root = TestDir::new("export-linked-database");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    write_text(&source.join("entry.mjs"), "export default {};");
+    write_text(
+        &source.join(".openclaw/openclaw.json"),
+        &serde_json::json!({"plugins":{"load":{"paths":[source.join("entry.mjs")]}}}).to_string(),
+    );
+    fs::create_dir_all(source.join("legacy")).unwrap();
+    let db = Connection::open(source.join("legacy/actual.sqlite")).unwrap();
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records(value TEXT); INSERT INTO records VALUES ('committed'); BEGIN; INSERT INTO records VALUES ('uncommitted');").unwrap();
+    for (name, target) in [
+        ("history.sqlite", source.join("legacy/actual.sqlite")),
+        ("alias", "actual.sqlite".into()),
+    ] {
+        std::os::unix::fs::symlink(target, source.join("legacy").join(name)).unwrap();
+    }
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "state.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    drop(db);
+    fs::rename(&source, root.child("source-offline")).unwrap();
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "state.tar", "--name", "target"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    for name in ["actual.sqlite", "history.sqlite", "alias"] {
+        let path = root.child("ocm-home/envs/target/legacy").join(name);
+        assert!(fs::symlink_metadata(&path).unwrap().is_file(), "{name}");
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let values: Vec<String> = db
+            .prepare("SELECT value FROM records")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(values, ["committed"]);
+    }
+    let external = root.child("outside.sqlite");
+    let db = Connection::open(&external).unwrap();
+    db.execute_batch("CREATE TABLE private(value TEXT)")
+        .unwrap();
+    std::os::unix::fs::symlink(
+        &external,
+        root.child("ocm-home/envs/target/external.sqlite"),
+    )
+    .unwrap();
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "target",
+            "--include-state",
+            "--output",
+            "external.tar",
+        ],
+    );
+    assert!(!export.status.success());
+    assert!(
+        stderr(&export).contains("SQLite link points outside"),
+        "{}",
+        stderr(&export)
+    );
+    assert!(!root.child("external.tar").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn env_export_include_state_reports_discovered_external_plugin_links() {
+    use serde_json::{Value, json};
+    for workspace in [false, true] {
+        let root = TestDir::new("export-discovered-external");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source");
+        let external = root.child("outside-plugin");
+        write_text(&external.join("index.js"), "export default {};");
+        let catalog = source.join(if workspace {
+            "workspace/.openclaw/extensions"
+        } else {
+            ".openclaw/extensions"
+        });
+        fs::create_dir_all(&catalog).unwrap();
+        std::os::unix::fs::symlink(&external, catalog.join("demo")).unwrap();
+        let mut config = json!({});
+        if workspace {
+            config["agents"] = json!({"defaults":{"workspace":source.join("workspace")}});
+        }
+        write_text(&source.join(".openclaw/openclaw.json"), &config.to_string());
+        let export = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--include-state",
+                "--output",
+                "state.tar",
+                "--json",
+            ],
+        );
+        assert!(export.status.success(), "{}", stderr(&export));
+        let summary: Value = serde_json::from_str(&stdout(&export)).unwrap();
+        assert_eq!(
+            summary["notIncludedPluginPaths"],
+            json!([fs::canonicalize(&external).unwrap()])
+        );
+        let extracted = extract_env_archive::<EnvArchiveMetadata>(
+            &root.child("state.tar"),
+            &root.child("extracted"),
+        )
+        .unwrap();
+        let link = extracted
+            .root_dir
+            .join(catalog.strip_prefix(&source).unwrap())
+            .join("demo");
+        assert!(fs::symlink_metadata(link).unwrap().is_symlink());
+        fs::rename(&source, root.child("source-offline")).unwrap();
+        let import = run_ocm(
+            root.path(),
+            &env,
+            &["env", "import", "state.tar", "--name", "target"],
+        );
+        assert!(import.status.success(), "{}", stderr(&import));
+        assert_eq!(
+            fs::read_to_string(external.join("index.js")).unwrap(),
+            "export default {};"
+        );
+    }
+}

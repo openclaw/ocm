@@ -550,7 +550,9 @@ unchanged. File plugins outside the environment root are not included; JSON
 export. Both outputs also report whether state was included. Export without the
 flag and import of older archives retain their existing behavior.
 
-State symlinks and damaged canonical state databases are rejected. Plugin paths
+Owned database links outside `.openclaw/state` are materialized as coherent
+snapshots; database links to external files are rejected. State symlinks and
+damaged canonical state databases are rejected. Plugin paths
 inside the environment must be portable: relative links are preserved, while
 absolute links that would remain in the imported payload are rejected. Linked
 configuration files are materialized, and copied plugin path settings retain
