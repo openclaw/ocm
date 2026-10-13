@@ -523,6 +523,14 @@ pub(super) fn relocate_archived_plugin_index_paths(
 }
 
 pub(super) fn clear_copied_agent_database_leases(target: &EnvPaths) -> Result<(), String> {
+    clear_copied_database_leases(target, false)
+}
+
+pub(super) fn clear_imported_database_leases(target: &EnvPaths) -> Result<(), String> {
+    clear_copied_database_leases(target, true)
+}
+
+fn clear_copied_database_leases(target: &EnvPaths, include_global: bool) -> Result<(), String> {
     let Some(database_path) = contained_imported_database(
         &target.state_dir.join("state/openclaw.sqlite"),
         &target.root,
@@ -534,17 +542,25 @@ pub(super) fn clear_copied_agent_database_leases(target: &EnvPaths) -> Result<()
         return Ok(());
     }
     let connection = Connection::open(&database_path).map_err(|error| error.to_string())?;
-    let has_leases = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_database_leases')",
-        [],
-        |row| row.get::<_, bool>(0),
-    ).map_err(|error| error.to_string())?;
-    if has_leases {
-        // A new independent clone or archive import loses source-process claims.
-        // Shared migration/repair/restore cleanup preserves its own live owners.
-        connection
-            .execute("DELETE FROM agent_database_leases", [])
-            .map_err(|error| format!("failed to clear cloned agent database leases: {error}"))?;
+    for (table, delete) in [
+        ("agent_database_leases", "DELETE FROM agent_database_leases"),
+        ("state_leases", "DELETE FROM state_leases"),
+    ] {
+        if table == "state_leases" && !include_global {
+            continue;
+        }
+        let exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if exists {
+            connection
+                .execute(delete, [])
+                .map_err(|error| format!("failed to clear copied database leases: {error}"))?;
+        }
     }
     Ok(())
 }

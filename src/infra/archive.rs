@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -19,14 +19,14 @@ const MAX_ENV_ARCHIVE_WRITE_ATTEMPTS: usize = 2;
 const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 enum EnvArchiveWriteError {
-    EntryDisappeared(String),
+    EntryChanged(String),
     Fatal(String),
 }
 
 impl EnvArchiveWriteError {
     fn from_entry_io(error: io::Error) -> Self {
         if error.kind() == io::ErrorKind::NotFound {
-            Self::EntryDisappeared(error.to_string())
+            Self::EntryChanged(error.to_string())
         } else {
             Self::Fatal(error.to_string())
         }
@@ -34,7 +34,7 @@ impl EnvArchiveWriteError {
 
     fn into_message(self) -> String {
         match self {
-            Self::EntryDisappeared(message) | Self::Fatal(message) => message,
+            Self::EntryChanged(message) | Self::Fatal(message) => message,
         }
     }
 }
@@ -171,7 +171,7 @@ pub fn write_env_archive_with_options<T: Serialize>(
     for attempt in 0..MAX_ENV_ARCHIVE_WRITE_ATTEMPTS {
         match write_env_archive_attempt(metadata, source_root, output_path, options.clone()) {
             Ok(()) => return Ok(()),
-            Err(EnvArchiveWriteError::EntryDisappeared(_))
+            Err(EnvArchiveWriteError::EntryChanged(_))
                 if attempt + 1 < MAX_ENV_ARCHIVE_WRITE_ATTEMPTS => {}
             Err(error) => return Err(error.into_message()),
         }
@@ -231,6 +231,9 @@ fn append_env_root(
 
     let mut stack = sorted_child_paths(source_root)
         .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
+    let mut state_databases = BTreeSet::new();
+    let mut state_sidecars = BTreeSet::new();
+    let mut written_sidecar_candidates = BTreeSet::new();
     while let Some(path) = stack.pop() {
         let relative_path = path.strip_prefix(source_root).map_err(|error| {
             EnvArchiveWriteError::Fatal(format!(
@@ -257,17 +260,30 @@ fn append_env_root(
             .any(|root| relative_path.starts_with(root));
         let state_database = discover_sqlite
             && metadata.is_file()
-            && is_sqlite_database(&path).map_err(EnvArchiveWriteError::Fatal)?;
-        // A primary can itself have a sidecar-like name. Preserve databases and
-        // directories, while omitting orphaned process files independently of
-        // whether their primary still exists during this archive attempt.
-        if (discover_sqlite
-            && !metadata.is_dir()
-            && !state_database
-            && sqlite_primary_for_any_sidecar(&path).is_some())
-            || (!discover_sqlite
-                && options.snapshot_sqlite_files
-                && sqlite_database_path_for_sidecar(relative_path).is_some())
+            && (state_databases.contains(&path)
+                || is_sqlite_database(&path).map_err(EnvArchiveWriteError::Fatal)?);
+        if state_database {
+            let sidecars = sqlite_sidecar_paths(&path);
+            if sidecars
+                .iter()
+                .any(|path| written_sidecar_candidates.contains(path))
+            {
+                return Err(EnvArchiveWriteError::EntryChanged(
+                    "SQLite database appeared after its sidecars were classified; retrying archive"
+                        .to_string(),
+                ));
+            }
+            state_sidecars.extend(sidecars);
+        } else if discover_sqlite
+            && metadata.is_file()
+            && (state_sidecars.contains(&path)
+                || is_orphan_sqlite_sidecar(&path).map_err(EnvArchiveWriteError::from_entry_io)?)
+        {
+            continue;
+        }
+        if !discover_sqlite
+            && options.snapshot_sqlite_files
+            && sqlite_database_path_for_sidecar(relative_path).is_some()
         {
             continue;
         }
@@ -289,6 +305,9 @@ fn append_env_root(
             builder
                 .append_data(&mut header, &archive_path, Cursor::new(contents))
                 .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
+            if discover_sqlite && sqlite_sidecar_suffix(&path).is_some() {
+                written_sidecar_candidates.insert(path.clone());
+            }
             continue;
         }
         if metadata.is_dir() {
@@ -300,6 +319,29 @@ fn append_env_root(
             })?;
             let mut children =
                 sorted_child_paths(&path).map_err(EnvArchiveWriteError::from_entry_io)?;
+            if discover_sqlite {
+                // Classify sibling primaries before writing any of their sidecars.
+                // Retain this identity even if a live primary later disappears.
+                for child in &children {
+                    let child_meta =
+                        fs::symlink_metadata(child).map_err(EnvArchiveWriteError::from_entry_io)?;
+                    let child_relative = child
+                        .strip_prefix(source_root)
+                        .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
+                    if options
+                        .should_skip(child_relative, env_archive_entry_kind(&child_meta))
+                        .map_err(EnvArchiveWriteError::Fatal)?
+                    {
+                        continue;
+                    }
+                    if child_meta.is_file()
+                        && is_sqlite_database(child).map_err(EnvArchiveWriteError::Fatal)?
+                    {
+                        state_databases.insert(child.clone());
+                        state_sidecars.extend(sqlite_sidecar_paths(child));
+                    }
+                }
+            }
             stack.append(&mut children);
             continue;
         }
@@ -361,16 +403,55 @@ fn append_env_root(
                     format!("failed to archive {}", path.display()),
                 ))
             })?;
+        if discover_sqlite && sqlite_sidecar_suffix(&path).is_some() {
+            written_sidecar_candidates.insert(path);
+        }
     }
 
     Ok(())
 }
 
-fn sqlite_primary_for_any_sidecar(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.to_str()?;
-    SQLITE_SIDECAR_SUFFIXES.iter().find_map(|suffix| {
-        name.strip_suffix(suffix)
-            .map(|primary| path.with_file_name(primary))
+fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 3] {
+    SQLITE_SIDECAR_SUFFIXES.map(|suffix| {
+        let mut path = path.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    })
+}
+
+fn sqlite_sidecar_suffix(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.as_encoded_bytes();
+    SQLITE_SIDECAR_SUFFIXES
+        .into_iter()
+        .find(|suffix| name.ends_with(suffix.as_bytes()))
+}
+
+fn is_orphan_sqlite_sidecar(path: &Path) -> io::Result<bool> {
+    let Some(suffix) = sqlite_sidecar_suffix(path) else {
+        return Ok(false);
+    };
+    let mut header = Vec::new();
+    File::open(path)?.take(96).read_to_end(&mut header)?;
+    // SQLite's WAL/journal magic and duplicated wal-index header distinguish
+    // orphaned process files from durable payloads with sidecar-like names.
+    Ok(match suffix {
+        "-wal" => {
+            header.len() >= 8
+                && matches!(
+                    u32::from_be_bytes(header[0..4].try_into().unwrap()),
+                    0x377f0682 | 0x377f0683
+                )
+                && u32::from_be_bytes(header[4..8].try_into().unwrap()) == 3_007_000
+        }
+        "-journal" => header.starts_with(&[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]),
+        "-shm" => {
+            header.len() == 96
+                && header[..48] == header[48..]
+                && header[12] == 1
+                && (u32::from_le_bytes(header[0..4].try_into().unwrap()) == 3_007_000
+                    || u32::from_be_bytes(header[0..4].try_into().unwrap()) == 3_007_000)
+        }
+        _ => false,
     })
 }
 
@@ -535,7 +616,9 @@ pub fn extract_zip(archive_path: &Path, destination_dir: &Path) -> Result<(), St
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    #[cfg(unix)]
+    use super::{SQLITE_SIDECAR_SUFFIXES, sqlite_sidecar_paths, sqlite_sidecar_suffix};
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::sync::{
         Mutex,
@@ -603,6 +686,78 @@ mod tests {
 
     fn skip_openclaw_paths(relative_path: &Path, _kind: EnvArchiveEntryKind) -> bool {
         relative_path.starts_with(".openclaw")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_sidecar_names_do_not_require_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let database = PathBuf::from(std::ffi::OsString::from_vec(b"history-\xff.db".to_vec()));
+        for (sidecar, suffix) in sqlite_sidecar_paths(&database)
+            .iter()
+            .zip(SQLITE_SIDECAR_SUFFIXES)
+        {
+            assert_eq!(sqlite_sidecar_suffix(sidecar), Some(suffix));
+            assert!(sidecar.file_name().unwrap().to_str().is_none());
+        }
+    }
+
+    static LATE_DATABASE: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
+
+    fn create_database_after_sidecar_copy(
+        relative: &Path,
+        _kind: EnvArchiveEntryKind,
+    ) -> Result<bool, String> {
+        if relative == Path::new("state/late") {
+            let mut configured = LATE_DATABASE.lock().unwrap();
+            let (path, visits) = configured.as_mut().unwrap();
+            *visits += 1;
+            if *visits == 2 {
+                fs::remove_file(&*path).unwrap();
+                let db = Connection::open(&*path).unwrap();
+                db.execute_batch(
+                    "CREATE TABLE records (value TEXT); INSERT INTO records VALUES ('committed');",
+                )
+                .unwrap();
+            }
+        }
+        Ok(false)
+    }
+
+    #[test]
+    fn env_archive_retries_when_a_database_appears_after_sidecar_classification() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("state")).unwrap();
+        fs::write(source.join("state/late"), "not yet a database").unwrap();
+        fs::write(source.join("state/late-journal"), "earlier opaque data").unwrap();
+        *LATE_DATABASE.lock().unwrap() = Some((source.join("state/late"), 0));
+        let output = root.path().join("archive.tar");
+        write_env_archive_with_options(
+            &serde_json::json!({}),
+            &source,
+            &output,
+            EnvArchiveOptions {
+                should_exclude_path: create_database_after_sidecar_copy,
+                sqlite_content_roots: BTreeSet::from([PathBuf::from("state")]),
+                ..EnvArchiveOptions::default()
+            },
+        )
+        .unwrap();
+        let visits = LATE_DATABASE.lock().unwrap().take().unwrap().1;
+        assert!(
+            visits >= 4,
+            "the changed database must trigger an archive retry"
+        );
+        let extracted =
+            extract_env_archive::<serde_json::Value>(&output, &root.path().join("extracted"))
+                .unwrap();
+        assert!(!extracted.root_dir.join("state/late-journal").exists());
+        let db = Connection::open(extracted.root_dir.join("state/late")).unwrap();
+        let value: String = db
+            .query_row("SELECT value FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "committed");
     }
 
     #[test]

@@ -76,6 +76,12 @@ fn env_export_json_reports_the_custom_archive_path() {
 
 #[test]
 fn env_export_include_state_round_trips_committed_sqlite_state() {
+    for (included_config, absolute_include) in [(false, false), (true, false), (true, true)] {
+        assert_state_round_trip(included_config, absolute_include);
+    }
+}
+
+fn assert_state_round_trip(included_config: bool, absolute_include: bool) {
     use rusqlite::{Connection, OpenFlags};
     use serde_json::{Value, json};
 
@@ -96,7 +102,9 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
          INSERT INTO sessions VALUES ('session-1', 'committed conversation');
          CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT);
          CREATE TABLE agent_database_leases (lease_id TEXT PRIMARY KEY, owner_pid INTEGER);
-         INSERT INTO agent_database_leases VALUES ('source-owner', 123);"
+         INSERT INTO agent_database_leases VALUES ('source-owner', 123);
+         CREATE TABLE state_leases (scope TEXT, lease_key TEXT, owner TEXT, expires_at INTEGER);
+         INSERT INTO state_leases VALUES ('core:plugin-lifecycle', 'global', 'source-owner', 9999999999999);"
     ).unwrap();
     write_text(&source.join("openclaw.json"), "{}\n");
     let receipt = json!({"demo": {"source": "npm", "spec": "demo@1.0.0",
@@ -119,7 +127,24 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
         let config_path = source.join("openclaw.json");
         let mut config: serde_json::Value =
             serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-        config["plugins"] = json!({"load": {"paths": [alias]}});
+        if included_config {
+            let include = if absolute_include {
+                source
+                    .join("plugins/settings.json")
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            } else {
+                "plugins/settings.json".to_string()
+            };
+            config["plugins"] = json!({"$include": include});
+            write_text(
+                &source.join("plugins/settings.json"),
+                &json!({"load": {"paths": [alias]}}).to_string(),
+            );
+        } else {
+            config["plugins"] = json!({"load": {"paths": [alias]}});
+        }
         fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
         receipt
     };
@@ -142,7 +167,28 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
         r#"{"name":"demo","version":"1.0.0"}"#,
     );
 
+    #[cfg(not(unix))]
+    if included_config {
+        let include = if absolute_include {
+            source
+                .join("plugins/settings.json")
+                .to_str()
+                .unwrap()
+                .to_string()
+        } else {
+            "plugins/settings.json".to_string()
+        };
+        write_text(
+            &source.join("openclaw.json"),
+            &json!({"plugins":{"$include":include}}).to_string(),
+        );
+        write_text(
+            &source.join("plugins/settings.json"),
+            &json!({"load":{"paths":[source.join("extensions/demo")]}}).to_string(),
+        );
+    }
     let source_config = fs::read(source.join("openclaw.json")).unwrap();
+    let source_include = fs::read(source.join("plugins/settings.json")).ok();
     let secondary_path = source.join("state/history.socket/records.db");
     fs::create_dir_all(secondary_path.parent().unwrap()).unwrap();
     let secondary = Connection::open(&secondary_path).unwrap();
@@ -165,15 +211,41 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
     );
     write_text(&source.join("state/note.txt"), "durable note");
     write_text(&source.join("state/opaque.sqlite"), "opaque payload");
+    write_text(&source.join("state/event-journal"), "{\"durable\":true}");
+    let orphan_path = root.child("orphan.db");
+    let orphan = Connection::open(&orphan_path).unwrap();
+    orphan.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE value (data TEXT); INSERT INTO value VALUES ('orphan');").unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = orphan_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        fs::copy(
+            std::path::PathBuf::from(sidecar),
+            source.join(format!("state/orphan.db{suffix}")),
+        )
+        .unwrap();
+    }
+    fs::write(
+        source.join("state/orphan.db-journal"),
+        [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7],
+    )
+    .unwrap();
+    #[cfg(target_os = "linux")]
+    let non_utf8 = {
+        use std::os::unix::ffi::OsStringExt;
+        let name = std::ffi::OsString::from_vec(b"history-\xff.db".to_vec());
+        let path = source.join("state").join(&name);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records (value TEXT); INSERT INTO records VALUES ('non-UTF-8');").unwrap();
+        (name, Some(db))
+    };
+    #[cfg(target_os = "linux")]
+    let (non_utf8_name, mut non_utf8_connection) = non_utf8;
     for residue in [
         "gateway.pid",
         "lock",
         "locks/owner",
         "tmp/cache",
         "gateway-supervisor-restart-handoff.json",
-        "orphan.db-wal",
-        "orphan.db-shm",
-        "orphan.db-journal",
     ] {
         write_text(&source.join("state").join(residue), "runtime residue");
     }
@@ -267,11 +339,45 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
                 fs::read(source.join("openclaw.json")).unwrap(),
                 source_config
             );
+            let global_owners: i64 = source_db
+                .query_row("SELECT COUNT(*) FROM state_leases", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(global_owners, 1);
+            assert_eq!(
+                fs::read(source.join("plugins/settings.json")).ok(),
+                source_include
+            );
+            #[cfg(target_os = "linux")]
+            {
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    let mut name = non_utf8_name.clone();
+                    name.push(suffix);
+                    assert!(
+                        !extracted
+                            .root_dir
+                            .join(".openclaw/state")
+                            .join(name)
+                            .exists()
+                    );
+                }
+                drop(non_utf8_connection.take());
+            }
             // Import must not rely on the exporting machine still being available.
             drop(connections.take());
             fs::rename(&source, root.child("source-offline")).unwrap();
         }
         let import = run_ocm(&cwd, &env, &["env", "import", &archive, "--name", name]);
+        if absolute_include && !include_state {
+            // Ordinary archives keep their existing absolute-include refusal.
+            assert!(!import.status.success());
+            assert!(
+                stderr(&import).contains("$include path escapes"),
+                "{}",
+                stderr(&import)
+            );
+            assert!(!root.child(format!("ocm-home/envs/{name}")).exists());
+            continue;
+        }
         assert!(import.status.success(), "{}", stderr(&import));
         let target = root.child(format!("ocm-home/envs/{name}/.openclaw"));
         let target_db = target.join("state/openclaw.sqlite");
@@ -304,6 +410,22 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
             .query_row("SELECT value FROM records", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "durable database");
+        assert_eq!(
+            fs::read_to_string(target.join("state/event-journal")).unwrap(),
+            "{\"durable\":true}"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let db = Connection::open_with_flags(
+                target.join("state").join(&non_utf8_name),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let value: String = db
+                .query_row("SELECT value FROM records", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, "non-UTF-8");
+        }
         let history = Connection::open_with_flags(
             target.join("state/history.socket/records.db"),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -354,8 +476,17 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
         {
             let config: Value =
                 serde_json::from_slice(&fs::read(target.join("openclaw.json")).unwrap()).unwrap();
+            let configured = if included_config {
+                let include: Value = serde_json::from_slice(
+                    &fs::read(target.join("plugins/settings.json")).unwrap(),
+                )
+                .unwrap();
+                include["load"]["paths"][0].clone()
+            } else {
+                config["plugins"]["load"]["paths"][0].clone()
+            };
             assert_eq!(
-                config["plugins"]["load"]["paths"][0],
+                configured,
                 target.join("extensions/alias").to_str().unwrap()
             );
         }
@@ -372,6 +503,10 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
             })
             .unwrap();
         assert_eq!(owners, 0);
+        let global_owners: i64 = restored
+            .query_row("SELECT COUNT(*) FROM state_leases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(global_owners, 0);
     }
 }
 

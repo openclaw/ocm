@@ -1236,11 +1236,17 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 target_runtime,
             )?;
             if let Some(source_root) = state_source_root {
+                rewrite_openclaw_config_includes_for_target(
+                    &target_paths.config_path,
+                    &target_paths.state_dir,
+                    Path::new(source_root),
+                    &target_paths.root,
+                )?;
                 relocate_archived_plugin_index_paths(
                     &derive_env_paths(Path::new(source_root)),
                     &target_paths,
                 )?;
-                super::openclaw_state::clear_copied_agent_database_leases(&target_paths)?;
+                super::openclaw_state::clear_imported_database_leases(&target_paths)?;
             }
             clear_nonportable_runtime_state(&target_paths, env, target_runtime)?;
 

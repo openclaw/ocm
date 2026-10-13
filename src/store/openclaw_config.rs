@@ -131,6 +131,10 @@ pub(super) fn normalized_archive_config_contents(
         // Keep the source spelling used by archive metadata, resolving owned
         // aliases before the exporting filesystem becomes unavailable.
         rewrite_env_root_paths(&mut value, &paths.root, &paths.root);
+        make_archive_includes_relative(
+            &mut value,
+            config_path.parent().ok_or("config path has no parent")?,
+        )?;
         if value == original {
             continue;
         }
@@ -142,6 +146,59 @@ pub(super) fn normalized_archive_config_contents(
         contents.insert(relative.to_path_buf(), bytes);
     }
     Ok(contents)
+}
+
+fn make_archive_includes_relative(value: &mut Value, parent: &Path) -> Result<(), String> {
+    fn rewrite(value: &mut Value, parent: &Path) -> Result<(), String> {
+        match value {
+            Value::String(raw) if Path::new(raw).is_absolute() => {
+                let target = clean_path(Path::new(raw));
+                let common = parent
+                    .ancestors()
+                    .find(|base| target.starts_with(base))
+                    .ok_or("included config has no shared path root")?;
+                let mut relative = PathBuf::new();
+                for _ in parent
+                    .strip_prefix(common)
+                    .map_err(|error| error.to_string())?
+                    .components()
+                {
+                    relative.push("..");
+                }
+                relative.push(
+                    target
+                        .strip_prefix(common)
+                        .map_err(|error| error.to_string())?,
+                );
+                *raw = display_path(&relative);
+            }
+            Value::Array(values) => {
+                for value in values {
+                    rewrite(value, parent)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    match value {
+        Value::Object(fields) => {
+            for (name, value) in fields {
+                if name == "$include" {
+                    rewrite(value, parent)?;
+                } else {
+                    make_archive_includes_relative(value, parent)?;
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                make_archive_includes_relative(value, parent)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn rewrite_openclaw_config_for_target(
