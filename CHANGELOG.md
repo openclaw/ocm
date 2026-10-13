@@ -18,7 +18,7 @@ All notable changes to OCM are documented here.
 
 ### Added
 
-- Add opt-in `env export --include-state` to carry OpenClaw state with coherent SQLite snapshots and restore managed plugin install receipts on import.
+- Add opt-in `env export --include-state` to retain the environment installation with coherent SQLite snapshots, restore plugin receipts and legacy data, and report external plugin paths not included.
 
 - Add Unix `env artifact export` for bounded, raw file reads beneath an environment
   home, rejecting unsafe paths and observed file changes without choosing the

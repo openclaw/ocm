@@ -567,6 +567,12 @@ pub fn env_exported(summary: &EnvExportSummary, profile: RenderProfile) -> Vec<S
     if summary.protected {
         export_rows.push(KeyValueRow::warning("Protected", "yes"));
     }
+    if !summary.not_included_plugin_paths.is_empty() {
+        export_rows.push(KeyValueRow::warning(
+            "Plugin paths not included",
+            summary.not_included_plugin_paths.join(", "),
+        ));
+    }
     push_card(&mut lines, "Export", export_rows, profile.color);
 
     lines
@@ -579,6 +585,11 @@ fn env_exported_raw(summary: &EnvExportSummary) -> Vec<String> {
         format!("  archive: {}", summary.archive_path),
         format!("  state included: {}", summary.include_state),
     ];
+    for path in &summary.not_included_plugin_paths {
+        lines.push(format!(
+            "  plugin path not included (outside environment): {path}"
+        ));
+    }
     if let Some(runtime) = summary.default_runtime.as_deref() {
         lines.push(format!("  runtime: {runtime}"));
     }

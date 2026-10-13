@@ -811,15 +811,15 @@ fn env_export_include_state_rejects_absolute_plugin_links_and_keeps_relative_lin
 }
 
 #[test]
-fn env_export_include_state_requires_selected_plugin_payload_roots() {
+fn env_export_include_state_preserves_plugin_payload_roots() {
     use rusqlite::Connection;
     use serde_json::json;
-    for (relative, workspace, selected) in [
-        ("extensions/demo", false, true),
-        ("custom/demo", false, false),
-        ("custom/demo", true, true),
-        ("memory/demo", false, false),
-        ("memory/demo", true, true),
+    for (relative, workspace) in [
+        ("extensions/demo", false),
+        ("custom/demo", false),
+        ("custom/demo", true),
+        ("memory/demo", false),
+        ("memory/demo", true),
     ] {
         for receipt in [false, true] {
             let root = TestDir::new("export-plugin-selection");
@@ -863,30 +863,20 @@ fn env_export_include_state_requires_selected_plugin_payload_roots() {
                     "state.tar",
                 ],
             );
-            assert_eq!(export.status.success(), selected, "{}", stderr(&export));
-            if !selected {
-                assert!(
-                    stderr(&export).contains("excluded")
-                        || stderr(&export).contains("removed during import"),
-                    "{}",
-                    stderr(&export)
-                );
-                assert!(!root.child("state.tar").exists());
-            } else {
-                fs::rename(&source, root.child("source-offline")).unwrap();
-                let import = run_ocm(
-                    root.path(),
-                    &env,
-                    &["env", "import", "state.tar", "--name", "target"],
-                );
-                assert!(import.status.success(), "{}", stderr(&import));
-                assert!(
-                    root.child("ocm-home/envs/target/.openclaw")
-                        .join(relative)
-                        .join("package.json")
-                        .exists()
-                );
-            }
+            assert!(export.status.success(), "{}", stderr(&export));
+            fs::rename(&source, root.child("source-offline")).unwrap();
+            let import = run_ocm(
+                root.path(),
+                &env,
+                &["env", "import", "state.tar", "--name", "target"],
+            );
+            assert!(import.status.success(), "{}", stderr(&import));
+            assert!(
+                root.child("ocm-home/envs/target/.openclaw")
+                    .join(relative)
+                    .join("package.json")
+                    .exists()
+            );
         }
     }
 }
@@ -1045,7 +1035,7 @@ fn env_export_include_state_materializes_unchanged_linked_config() {
 
 #[cfg(unix)]
 #[test]
-fn env_export_include_state_checks_relative_link_traversal_after_cleanup() {
+fn env_export_include_state_preserves_relative_link_traversal_directories() {
     use serde_json::json;
     for (traversed, retained) in ["memory", "agents/demo"]
         .into_iter()
@@ -1090,8 +1080,8 @@ fn env_export_include_state_checks_relative_link_traversal_after_cleanup() {
                 "state.tar",
             ],
         );
-        assert_eq!(export.status.success(), retained, "{}", stderr(&export));
-        if retained {
+        assert!(export.status.success(), "{}", stderr(&export));
+        {
             fs::rename(&source, root.child("source-offline")).unwrap();
             let import = run_ocm(
                 root.path(),
@@ -1103,13 +1093,209 @@ fn env_export_include_state_checks_relative_link_traversal_after_cleanup() {
                 root.child("ocm-home/envs/target/.openclaw/extensions/demo/index.js")
                     .is_file()
             );
-        } else {
-            assert!(
-                stderr(&export).contains("entry removed during import"),
-                "{}",
-                stderr(&export)
-            );
-            assert!(!root.child("state.tar").exists());
         }
+    }
+}
+
+#[test]
+fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhere() {
+    use rusqlite::{Connection, OpenFlags};
+    let root = TestDir::new("export-whole-installation");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    let files = [
+        ".openclaw/custom/impl.mjs",
+        ".openclaw/memory/unused",
+        ".openclaw/agents/main/sessions/history.jsonl",
+        ".openclaw/logs/saved.log",
+        ".openclaw/backups/settings.json",
+        "legacy/data.txt",
+    ];
+    for path in files {
+        write_text(&source.join(path), "retained data");
+    }
+    write_text(
+        &source.join(".openclaw/custom/impl.mjs"),
+        "export const value = 42;",
+    );
+    write_text(
+        &source.join("entry.mjs"),
+        "import { value } from './.openclaw/custom/impl.mjs'; if (value !== 42) throw Error('missing payload');",
+    );
+    write_text(
+        &source.join(".openclaw/openclaw.json"),
+        &serde_json::json!({"plugins":{"load":{"paths":[source.join("entry.mjs")]}}}).to_string(),
+    );
+    let databases = [
+        "records",
+        ".openclaw/custom/data.db",
+        ".openclaw/agents/main/sessions/history.sqlite",
+    ];
+    let connections: Vec<_> = databases.iter().map(|path| {
+        let db = Connection::open(source.join(path)).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE entries(value TEXT); INSERT INTO entries VALUES ('committed'); BEGIN; INSERT INTO entries VALUES ('uncommitted');").unwrap();
+        db
+    }).collect();
+    let debris = [
+        ".openclaw/gateway.pid",
+        ".openclaw/locks/owner",
+        ".openclaw/state/tmp/cache",
+        ".openclaw/run/process",
+        ".openclaw/extensions/demo/.openclaw-runtime-deps.json",
+        ".openclaw/extensions/demo/node_modules/rebuilt.js",
+    ];
+    for path in debris {
+        write_text(&source.join(path), "runtime debris");
+    }
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "state.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    drop(connections);
+    fs::rename(&source, root.child("source-offline")).unwrap();
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "state.tar", "--name", "target"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    let target = root.child("ocm-home/envs/target");
+    for path in files {
+        assert!(target.join(path).is_file(), "{path}");
+    }
+    for path in debris {
+        assert!(!target.join(path).exists(), "{path}");
+    }
+    for path in databases {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!target.join(format!("{path}{suffix}")).exists());
+        }
+        let db = Connection::open_with_flags(target.join(path), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+        let values: Vec<String> = db
+            .prepare("SELECT value FROM entries")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(values, ["committed"], "{path}");
+        assert_eq!(
+            db.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
+    let executed = std::process::Command::new("node")
+        .arg(target.join("entry.mjs"))
+        .output()
+        .unwrap();
+    assert!(
+        executed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
+}
+
+#[test]
+fn env_export_include_state_reports_external_plugins_without_refusing_them() {
+    use rusqlite::Connection;
+    use serde_json::{Value, json};
+    for legacy in [false, true] {
+        let root = TestDir::new("export-external-plugin");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source");
+        let configured = root.child("external-configured/entry.mjs");
+        let recorded = root.child("external-recorded/entry.mjs");
+        for path in [&configured, &recorded] {
+            write_text(path, "export default {};");
+        }
+        write_text(
+            &source.join(".openclaw/openclaw.json"),
+            &json!({"plugins":{"load":{"paths":[configured]}}}).to_string(),
+        );
+        fs::create_dir_all(source.join(".openclaw/state")).unwrap();
+        let db = Connection::open(source.join(".openclaw/state/openclaw.sqlite")).unwrap();
+        let records =
+            json!({"external":{"source":"path", "installPath":recorded, "sourcePath":recorded}});
+        if legacy {
+            db.execute_batch(
+                "CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT)",
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?1)",
+                [json!({"index":{"installRecords":records}}).to_string()],
+            )
+            .unwrap();
+        } else {
+            db.execute_batch("CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT)").unwrap();
+            db.execute(
+                "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1)",
+                [records.to_string()],
+            )
+            .unwrap();
+        }
+        drop(db);
+        for (archive, output) in [("state.tar", "--json"), ("human.tar", "--raw")] {
+            let export = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "export",
+                    "source",
+                    "--include-state",
+                    "--output",
+                    archive,
+                    output,
+                ],
+            );
+            assert!(export.status.success(), "{}", stderr(&export));
+            if output == "--json" {
+                let summary: Value = serde_json::from_str(&stdout(&export)).unwrap();
+                assert_eq!(
+                    summary["notIncludedPluginPaths"],
+                    json!([configured, recorded])
+                );
+            } else {
+                assert!(stdout(&export).contains("plugin path not included"));
+                for path in [&configured, &recorded] {
+                    assert!(stdout(&export).contains(path.to_str().unwrap()));
+                }
+            }
+            let extracted = extract_env_archive::<EnvArchiveMetadata>(
+                &root.child(archive),
+                &root.child(format!("extract-{archive}")),
+            )
+            .unwrap();
+            assert!(!extracted.root_dir.join("external-configured").exists());
+            assert!(!extracted.root_dir.join("external-recorded").exists());
+        }
+        fs::rename(&source, root.child("source-offline")).unwrap();
+        let import = run_ocm(
+            root.path(),
+            &env,
+            &["env", "import", "state.tar", "--name", "target"],
+        );
+        assert!(import.status.success(), "{}", stderr(&import));
+        assert_eq!(fs::read_to_string(&recorded).unwrap(), "export default {};");
+        assert_eq!(
+            fs::read_to_string(&configured).unwrap(),
+            "export default {};"
+        );
     }
 }

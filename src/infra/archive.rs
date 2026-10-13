@@ -240,6 +240,15 @@ fn append_env_root(
         .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
     let mut state_databases = BTreeSet::new();
     let mut state_sidecars = BTreeSet::new();
+    if options.sqlite_content_roots.contains(Path::new("")) {
+        classify_sqlite_children(
+            &stack,
+            source_root,
+            options,
+            &mut state_databases,
+            &mut state_sidecars,
+        )?;
+    }
     while let Some(path) = stack.pop() {
         let relative_path = path.strip_prefix(source_root).map_err(|error| {
             EnvArchiveWriteError::Fatal(format!(
@@ -320,28 +329,13 @@ fn append_env_root(
             let mut children =
                 sorted_child_paths(&path).map_err(EnvArchiveWriteError::from_entry_io)?;
             if discover_sqlite {
-                // Classify sibling primaries before writing any of their sidecars.
-                // Retain this identity even if a live primary later disappears.
-                for child in &children {
-                    let child_meta =
-                        fs::symlink_metadata(child).map_err(EnvArchiveWriteError::from_entry_io)?;
-                    let child_relative = child
-                        .strip_prefix(source_root)
-                        .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
-                    if options
-                        .should_skip(child_relative, env_archive_entry_kind(&child_meta))
-                        .map_err(EnvArchiveWriteError::Fatal)?
-                    {
-                        continue;
-                    }
-                    if child_meta.is_file()
-                        && (options.required_sqlite_paths.contains(child_relative)
-                            || is_sqlite_database(child).map_err(EnvArchiveWriteError::Fatal)?)
-                    {
-                        state_databases.insert(child.clone());
-                        state_sidecars.extend(sqlite_sidecar_paths(child));
-                    }
-                }
+                classify_sqlite_children(
+                    &children,
+                    source_root,
+                    options,
+                    &mut state_databases,
+                    &mut state_sidecars,
+                )?;
             }
             stack.append(&mut children);
             continue;
@@ -406,6 +400,38 @@ fn append_env_root(
             })?;
     }
 
+    Ok(())
+}
+
+fn classify_sqlite_children(
+    children: &[PathBuf],
+    source_root: &Path,
+    options: &EnvArchiveOptions,
+    state_databases: &mut BTreeSet<PathBuf>,
+    state_sidecars: &mut BTreeSet<PathBuf>,
+) -> Result<(), EnvArchiveWriteError> {
+    // Classify sibling primaries before writing any of their sidecars.
+    // Retain this identity even if a live primary later disappears.
+    for child in children {
+        let child_meta =
+            fs::symlink_metadata(child).map_err(EnvArchiveWriteError::from_entry_io)?;
+        let child_relative = child
+            .strip_prefix(source_root)
+            .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
+        if options
+            .should_skip(child_relative, env_archive_entry_kind(&child_meta))
+            .map_err(EnvArchiveWriteError::Fatal)?
+        {
+            continue;
+        }
+        if child_meta.is_file()
+            && (options.required_sqlite_paths.contains(child_relative)
+                || is_sqlite_database(child).map_err(EnvArchiveWriteError::Fatal)?)
+        {
+            state_databases.insert(child.clone());
+            state_sidecars.extend(sqlite_sidecar_paths(child));
+        }
+    }
     Ok(())
 }
 

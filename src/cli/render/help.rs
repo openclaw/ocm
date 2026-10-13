@@ -1315,7 +1315,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 ("--output <path>", "Write the archive to a specific path"),
                 (
                     "--include-state",
-                    "Include OpenClaw state with coherent SQLite snapshots",
+                    "Export this environment as the same installation, with SQLite snapshots",
                 ),
                 (
                     "--raw",

@@ -527,23 +527,37 @@ Keep the copy's configured external workspace paths pointed at the intended sour
 Keep the original home and linked external data intact; do not remove the link's target directory or its contents.
 
 Environment clone, export, and import flows preserve managed OpenClaw plugin
-payloads under the legacy, extension, npm, and Git install roots. Clone and
-import still clear legacy file-based sessions, logs, backups, and process residue so the new
+payloads under the legacy, extension, npm, and Git install roots. Clone and default archive
+import clear legacy file-based sessions, logs, backups, and process residue so the new
 environment does not share active runtime state with its source. New clones also
 clear copied agent database process leases while keeping the state database,
 durable rows, and source leases unchanged.
 
-Use `ocm env export <env> --include-state --output <archive>` to carry
-`.openclaw/state`, including plugin install receipts and SQLite-backed sessions,
-into `ocm env import <archive> --name <new-env>`. The flag is opt-in: ordinary
-exports retain their existing contents. SQLite databases include committed WAL
-writes through coherent snapshots; sockets, pids, locks, temporary files, and
-raw database sidecars are omitted. Each database is captured independently, not
-as one transaction across the environment. Export normalizes owned config and plugin receipt aliases in copied content while
-leaving the source untouched. Import relocates those paths, clears copied
-database process leases, and leaves the new environment stopped. Export JSON and human
-output both report whether state was included. State symlinks are rejected so an
-import cannot retain live database links into the source installation. Damaged canonical state databases and absolute links that would remain in imported plugin paths are rejected; supported relative plugin links are preserved. Configured, recorded, and automatically discovered plugin payloads must be within the selected archive roots and survive import cleanup. Payload links and the directories they traverse are checked recursively, including file entrypoints and workspace extensions. A file entrypoint’s parent is its plugin root; all of its archived payload must survive import cleanup. Linked configuration files are materialized, and copied plugin path settings retain their resolved selection when the imported environment gets a new name or port. Relative plugin path settings are rejected because their meaning depends on the caller’s working directory; use absolute paths or environment-root variables. A plugin path setting shared with unrelated configuration through the same include file is rejected if it needs rewriting.
+Use `ocm env export <env> --include-state --output <archive>` to export this
+environment as the same installation, then restore it with
+`ocm env import <archive> --name <new-env>`. The flag retains every file under
+the environment root, including OpenClaw state, plugin payloads and dependencies,
+sessions, and unrelated or legacy data. It excludes non-durable process files
+and rebuildable runtime debris using the snapshot rules. SQLite databases
+anywhere under the root are captured as coherent committed snapshots, including
+WAL writes; raw database sidecars are omitted. Each database is captured
+independently, not as one transaction across the environment.
+
+Import relocates owned config and plugin receipt paths, clears copied database
+process leases, and leaves the new environment stopped. Export leaves the source
+unchanged. File plugins outside the environment root are not included; JSON
+(`notIncludedPluginPaths`) and human output name their paths without refusing the
+export. Both outputs also report whether state was included. Export without the
+flag and import of older archives retain their existing behavior.
+
+State symlinks and damaged canonical state databases are rejected. Plugin paths
+inside the environment must be portable: relative links are preserved, while
+absolute links that would remain in the imported payload are rejected. Linked
+configuration files are materialized, and copied plugin path settings retain
+their resolved selection across name or port changes. Relative plugin path
+settings depend on the caller's working directory and are rejected; use absolute
+paths or environment-root variables. A plugin path setting shared with unrelated
+configuration through the same include is rejected if it needs rewriting.
 
 Clone and import reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
 Individual agent directory links are removed from the copy without changing their linked source data.

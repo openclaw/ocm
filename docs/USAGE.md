@@ -948,22 +948,36 @@ Import:
 ocm env import ./mira-with-state.ocm-env.tar --name rowan
 ```
 
-Export omits `.openclaw/state` by default. Use `--include-state` to carry its
-OpenClaw installation records, SQLite-backed sessions, and other durable state.
-Each SQLite database in that directory is captured through a coherent committed
-snapshot, including uncheckpointed WAL writes. Raw database sidecars, sockets,
-pids, locks, and temporary process files are omitted. Databases and other files
-are not captured in one atomic transaction. JSON reports `includeState`; the
-human summary reports whether state was included. State symlinks are rejected
-so an import cannot retain live database links into the source installation. Damaged canonical state databases and absolute links that would remain in imported plugin paths are rejected; supported relative plugin links are preserved. Configured, recorded, and automatically discovered plugin payloads must be within the selected archive roots and survive import cleanup. Payload links and the directories they traverse are checked recursively, including file entrypoints and workspace extensions. A file entrypoint’s parent is its plugin root; all of its archived payload must survive import cleanup. Linked configuration files are materialized, and copied plugin path settings retain their resolved selection when the imported environment gets a new name or port. Relative plugin path settings are rejected because their meaning depends on the caller’s working directory; use absolute paths or environment-root variables. A plugin path setting shared with unrelated configuration through the same include file is rejected if it needs rewriting.
+Export omits `.openclaw/state` by default. `--include-state` means "export this
+environment as the same installation": it includes every file under the
+environment root, including plugin payloads and dependencies, SQLite-backed and
+file-based sessions, and unrelated or legacy data. Only non-durable process
+files and rebuildable runtime debris are excluded, using the snapshot rules
+for sockets, pids, locks and temporary directories, plus extension dependency
+caches and workspace runtime debris. Each SQLite database anywhere under the
+root is captured as a coherent committed snapshot, including uncheckpointed WAL
+writes; raw database sidecars are omitted. Databases and other files are not
+captured in one atomic transaction.
 
-Export normalizes owned config and plugin receipt aliases in copied content while the
-source filesystem is available, without changing the source. Import restores
-the included state, relocates those paths to the new environment, and clears
-copied database process leases. Imported environments get a fresh identity and gateway
-port, have env-scoped config rewritten, and remain stopped. Legacy file-based
-sessions, logs, and backups still follow the existing cleanup policy. Export
-without the flag and import of older archives retain their existing behavior.
+Export normalizes owned config and plugin receipt aliases in copied content
+without changing the source. Import preserves the included files, relocates
+owned paths, clears copied database process leases, assigns a new gateway port,
+and leaves the environment stopped. Export without the flag and import of
+older archives retain their existing selection and cleanup behavior.
+
+JSON reports `includeState`; the human summary also reports whether state was
+included. File plugins whose payload lives outside the environment root are
+not included. Export succeeds and names those paths in `notIncludedPluginPaths`
+and the human summary; it does not copy their external contents.
+
+State symlinks and damaged canonical state databases are rejected. Plugin paths
+inside the environment must be portable: relative links are preserved, while
+absolute links that would remain in the imported payload are rejected. Linked
+configuration files are materialized, and copied plugin path settings retain
+their resolved selection across name or port changes. Relative plugin path
+settings depend on the caller's working directory and are rejected; use absolute
+paths or environment-root variables. A plugin path setting shared with unrelated
+configuration through the same include is rejected if it needs rewriting.
 
 Environment archives must contain real `meta/` and `root/` directories and a
 regular `meta/env.json` file. Import and legacy snapshot restore reject symlinks

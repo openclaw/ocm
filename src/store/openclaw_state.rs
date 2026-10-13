@@ -135,15 +135,11 @@ pub(crate) fn openclaw_env_state_archive_options(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
-) -> Result<EnvArchiveOptions, String> {
+) -> Result<(EnvArchiveOptions, Vec<String>), String> {
     validate_nonportable_runtime_state_paths(paths)?;
     let mut options = openclaw_env_archive_options(paths, env, runtime)?;
-    options
-        .included_path_roots
-        .insert(Path::new(".openclaw/state").to_path_buf());
-    options
-        .sqlite_content_roots
-        .insert(PathBuf::from(".openclaw/state"));
+    options.included_path_roots.insert(PathBuf::new());
+    options.sqlite_content_roots.insert(PathBuf::new());
     options
         .required_sqlite_paths
         .extend(CORE_STATE_DATABASES.map(|name| Path::new(".openclaw/state").join(name)));
@@ -151,8 +147,41 @@ pub(crate) fn openclaw_env_state_archive_options(
     options.prepare_sqlite_snapshot = Some(prepare_exported_state_snapshot);
     options.file_contents =
         super::openclaw_config::normalized_archive_config_contents(paths, env, runtime)?;
+    let mut not_included = BTreeSet::new();
     for path in super::openclaw_config::configured_archive_plugin_paths(paths, env, runtime)? {
-        validate_exported_plugin_payload(&path, paths, &options)?;
+        if contained_plugin_path(&path, &paths.root) {
+            validate_exported_plugin_payload(&path, paths, &options)?;
+        } else {
+            not_included.insert(display_path(&path));
+        }
+    }
+    let database = paths.state_dir.join("state/openclaw.sqlite");
+    if fs::symlink_metadata(paths.state_dir.join("state")).is_ok_and(|meta| meta.is_dir())
+        && fs::symlink_metadata(&database).is_ok_and(|meta| meta.is_file())
+    {
+        let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| error.to_string())?;
+        if let Some((mut document, table_exists, _)) = read_plugin_index(&connection)? {
+            for record in plugin_records_mut(&mut document, table_exists)?.values() {
+                let Some(record) = record.as_object() else {
+                    continue;
+                };
+                let path = record
+                    .get("installPath")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.trim().is_empty())
+                    .or_else(|| record.get("sourcePath").and_then(Value::as_str));
+                if let Some(path) = path {
+                    let allow_old_root =
+                        record.get("source").and_then(Value::as_str) != Some("path");
+                    if cloned_plugin_path(Path::new(path), paths, paths, allow_old_root, true)
+                        .is_none()
+                    {
+                        not_included.insert(path.to_string());
+                    }
+                }
+            }
+        }
     }
     let workspaces = resolve_env_openclaw_workspaces(paths, env, runtime)?;
     for root in std::iter::once(paths.state_dir.join("extensions")).chain(
@@ -164,7 +193,7 @@ pub(crate) fn openclaw_env_state_archive_options(
             validate_exported_plugin_payload(&root, paths, &options)?;
         }
     }
-    Ok(options)
+    Ok((options, not_included.into_iter().collect()))
 }
 
 fn prepare_exported_state_snapshot(
@@ -195,17 +224,18 @@ fn should_exclude_state_archive_path(
     path: &Path,
     kind: EnvArchiveEntryKind,
 ) -> Result<bool, String> {
-    if !path.starts_with(".openclaw/state") {
-        return Ok(false);
-    }
     let name = path.file_name().unwrap_or_default();
     if kind == EnvArchiveEntryKind::Other
-        || super::snapshots::is_snapshot_process_residue(
-            name,
-            kind == EnvArchiveEntryKind::Directory,
-        )
+        || ((path.parent() == Some(Path::new(".openclaw")) || path.starts_with(".openclaw/state"))
+            && super::snapshots::is_snapshot_process_residue(
+                name,
+                kind == EnvArchiveEntryKind::Directory,
+            ))
     {
         return Ok(true);
+    }
+    if !path.starts_with(".openclaw/state") {
+        return Ok(false);
     }
     if kind == EnvArchiveEntryKind::Symlink {
         return Err(format!(
@@ -384,74 +414,11 @@ fn preserves_openclaw_root_entry(paths: &EnvPaths, path: &Path) -> bool {
         || is_integrity_protected_history_path(&paths.state_dir, path)
 }
 
-fn payload_survives_import(path: &Path, paths: &EnvPaths, options: &EnvArchiveOptions) -> bool {
-    let Ok(relative) = path.strip_prefix(&paths.state_dir) else {
-        return true;
-    };
-    let root_relative = path.strip_prefix(&paths.root).unwrap();
-    // Explicit roots preserve workspaces, include files, and the opted-in state root.
-    if options
-        .included_path_roots
-        .iter()
-        .any(|root| root_relative.starts_with(root))
-    {
-        return true;
-    }
-    let mut parts = relative.components();
-    let Some(first) = parts.next() else {
-        return false;
-    };
-    if preserves_openclaw_root_entry(paths, &paths.state_dir.join(first.as_os_str())) {
-        return true;
-    }
-    first.as_os_str() == OsStr::new("agents")
-        && parts.next().is_some()
-        && parts
-            .next()
-            .is_some_and(|part| part.as_os_str() == OsStr::new("agent"))
-}
-
 fn is_durable_openclaw_state_root(name: &OsStr) -> bool {
     matches!(
         name.to_str(),
         Some("state") | Some("plugins") | Some("extensions") | Some("npm") | Some("git")
     )
-}
-
-fn traversal_survives_import(path: &Path, paths: &EnvPaths, options: &EnvArchiveOptions) -> bool {
-    if payload_survives_import(path, paths, options) || path == paths.state_dir {
-        return true;
-    }
-    let has_preserved_descendant = |path: &Path| {
-        path.strip_prefix(&paths.root).is_ok_and(|relative| {
-            options
-                .included_path_roots
-                .iter()
-                .any(|included| included.starts_with(relative))
-        })
-    };
-    let agents = paths.state_dir.join("agents");
-    if path.parent() == Some(agents.as_path()) {
-        // Agent directories are removed when pruning leaves no actual children.
-        // A configured workspace that does not exist cannot keep one alive.
-        return fs::read_dir(path).is_ok_and(|entries| {
-            entries.flatten().any(|entry| {
-                entry.file_name() == OsStr::new("agent")
-                    || payload_survives_import(&entry.path(), paths, options)
-                    || has_preserved_descendant(&entry.path())
-            })
-        });
-    }
-    if path == agents {
-        return fs::read_dir(path).is_ok_and(|entries| {
-            entries.flatten().any(|entry| {
-                payload_survives_import(&entry.path(), paths, options)
-                    || (entry.file_type().is_ok_and(|kind| kind.is_dir())
-                        && traversal_survives_import(&entry.path(), paths, options))
-            })
-        });
-    }
-    has_preserved_descendant(path)
 }
 
 fn rewrite_runtime_state_root_refs(
@@ -699,6 +666,64 @@ fn relocate_installed_plugin_index_paths(
     )
 }
 
+fn read_plugin_index(
+    connection: &Connection,
+) -> Result<Option<(Value, bool, &'static str)>, String> {
+    let table_exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'installed_plugin_index'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("failed to inspect OpenClaw SQLite plugin index: {error}"))?
+        .is_some();
+    let (select_sql, update_sql) = if table_exists {
+        (
+            "SELECT install_records_json FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'",
+            "UPDATE installed_plugin_index SET install_records_json = ?1 WHERE index_key = 'installed-plugin-index'",
+        )
+    } else {
+        let machine_state_exists = connection
+            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_machine_state'", [], |_| Ok(()))
+            .optional().map_err(|error| error.to_string())?.is_some();
+        if !machine_state_exists {
+            return Ok(None);
+        }
+        (
+            "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'",
+            "UPDATE config_machine_state SET value_json = ?1 WHERE state_key = 'plugins.installedIndex'",
+        )
+    };
+
+    let Some(raw_records) = connection
+        .query_row(select_sql, [], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(|error| format!("failed to read OpenClaw plugin install records: {error}"))?
+    else {
+        return Ok(None);
+    };
+
+    let document: Value = serde_json::from_str(&raw_records)
+        .map_err(|error| format!("failed to parse OpenClaw plugin install records: {error}"))?;
+    Ok(Some((document, table_exists, update_sql)))
+}
+
+fn plugin_records_mut(
+    document: &mut Value,
+    table_exists: bool,
+) -> Result<&mut serde_json::Map<String, Value>, String> {
+    if table_exists {
+        document.as_object_mut()
+    } else {
+        document
+            .get_mut("index")
+            .and_then(|index| index.get_mut("installRecords"))
+            .and_then(Value::as_object_mut)
+    }
+    .ok_or_else(|| "OpenClaw plugin install records are not an object".to_string())
+}
+
 fn relocate_plugin_index_in_database(
     database_path: &Path,
     source_state_root: &Path,
@@ -711,71 +736,10 @@ fn relocate_plugin_index_in_database(
             display_path(&database_path)
         )
     })?;
-    let table_exists = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'installed_plugin_index'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|error| {
-            format!(
-                "failed to inspect imported OpenClaw plugin index {}: {error}",
-                display_path(&database_path)
-            )
-        })?
-        .is_some();
-    let (select_sql, update_sql) = if table_exists {
-        (
-            "SELECT install_records_json FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'",
-            "UPDATE installed_plugin_index SET install_records_json = ?1 WHERE index_key = 'installed-plugin-index'",
-        )
-    } else {
-        let machine_state_exists = connection
-            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_machine_state'", [], |_| Ok(()))
-            .optional().map_err(|error| error.to_string())?.is_some();
-        if !machine_state_exists {
-            return Ok(MigratedRuntimeStateResult::default());
-        }
-        (
-            "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'",
-            "UPDATE config_machine_state SET value_json = ?1 WHERE state_key = 'plugins.installedIndex'",
-        )
-    };
-
-    let Some(raw_records) = connection
-        .query_row(select_sql, [], |row| row.get::<_, String>(0))
-        .optional()
-        .map_err(|error| {
-            format!(
-                "failed to read imported OpenClaw plugin install records {}: {error}",
-                display_path(&database_path)
-            )
-        })?
-    else {
+    let Some((mut document, table_exists, update_sql)) = read_plugin_index(&connection)? else {
         return Ok(MigratedRuntimeStateResult::default());
     };
-
-    let mut document: Value = serde_json::from_str(&raw_records).map_err(|error| {
-        format!(
-            "failed to parse imported OpenClaw plugin install records {}: {error}",
-            display_path(&database_path)
-        )
-    })?;
-    let records = if table_exists {
-        document.as_object_mut()
-    } else {
-        document
-            .get_mut("index")
-            .and_then(|index| index.get_mut("installRecords"))
-            .and_then(Value::as_object_mut)
-    };
-    let Some(records) = records else {
-        return Err(format!(
-            "imported OpenClaw plugin install records are not an object: {}",
-            display_path(&database_path)
-        ));
-    };
+    let records = plugin_records_mut(&mut document, table_exists)?;
 
     let mut changed = false;
     let mut external_plugin_ids = BTreeSet::new();
@@ -842,7 +806,12 @@ fn relocate_plugin_index_in_database(
             external_plugin_ids.insert(plugin_id.clone());
         }
     }
-    if !external_plugin_ids.is_empty() {
+    if !external_plugin_ids.is_empty()
+        && !matches!(
+            relocation,
+            PluginPathRelocation::Exported { .. } | PluginPathRelocation::Archived { .. }
+        )
+    {
         return Err(format!(
             "imported OpenClaw plugin path(s) could not be isolated inside the env state: {}",
             external_plugin_ids
@@ -912,11 +881,6 @@ fn validate_exported_plugin_payload(
             if options.should_skip(relative, kind)? {
                 continue;
             }
-            let retained = if metadata.is_dir() {
-                traversal_survives_import(&path, paths, options)
-            } else {
-                payload_survives_import(&path, paths, options)
-            };
             if kind == EnvArchiveEntryKind::Other {
                 return Err(format!(
                     "unsupported plugin payload entry: {}",
@@ -925,16 +889,8 @@ fn validate_exported_plugin_payload(
             }
             if metadata.is_symlink() && !options.file_contents.contains_key(relative) {
                 pending.push(validate_portable_plugin_path(&path, paths, options)?);
-            } else {
-                if !retained {
-                    return Err(format!(
-                        "plugin payload would be removed during import: {}",
-                        path.display()
-                    ));
-                }
-                if metadata.is_dir() {
-                    pending.push(path);
-                }
+            } else if metadata.is_dir() {
+                pending.push(path);
             }
         }
     }
@@ -947,12 +903,6 @@ fn validate_portable_plugin_path(
     options: &EnvArchiveOptions,
 ) -> Result<PathBuf, String> {
     let root = paths.root.as_path();
-    if !payload_survives_import(path, paths, options) {
-        return Err(format!(
-            "plugin payload would be removed during import: {}",
-            path.display()
-        ));
-    }
     let relative = path.strip_prefix(root).map_err(|_| {
         format!(
             "plugin path is outside the exported environment: {}",
@@ -1000,30 +950,11 @@ fn validate_portable_plugin_path(
                 current.display()
             ));
         }
-        if !(if metadata.is_dir() {
-            traversal_survives_import(&current, paths, options)
-        } else {
-            payload_survives_import(&current, paths, options)
-        }) {
-            return Err(format!(
-                "plugin path traverses an entry removed during import: {}",
-                current.display()
-            ));
-        }
         if options.file_contents.contains_key(relative) {
             if !pending.is_empty() {
                 return Err("plugin path traverses a materialized config file".to_string());
             }
             continue;
-        }
-        if metadata.is_symlink()
-            && current.parent() == Some(paths.state_dir.join("agents").as_path())
-            && !options
-                .included_path_roots
-                .iter()
-                .any(|included| relative.starts_with(included))
-        {
-            return Err("plugin path uses an agent link that import removes".to_string());
         }
         if !metadata.is_symlink() {
             if !metadata.is_dir() && !pending.is_empty() {
@@ -1047,28 +978,6 @@ fn validate_portable_plugin_path(
         for part in target.components().rev() {
             pending.push_front(part.as_os_str().to_os_string());
         }
-    }
-    let relative = current
-        .strip_prefix(root)
-        .map_err(|error| error.to_string())?;
-    if fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.is_dir())
-        && ((options.should_skip_path)(relative, EnvArchiveEntryKind::Directory)
-            && !options
-                .included_path_roots
-                .iter()
-                .any(|included| relative.starts_with(included))
-            || relative == Path::new(".openclaw"))
-    {
-        return Err(format!(
-            "plugin payload is not fully selected by the environment archive: {}",
-            current.display()
-        ));
-    }
-    if !payload_survives_import(&current, paths, options) {
-        return Err(format!(
-            "plugin payload would be removed during import: {}",
-            current.display()
-        ));
     }
     Ok(current)
 }
@@ -2123,7 +2032,7 @@ mod tests {
             fs::write(path, "fixture\n").unwrap();
         }
 
-        let options = openclaw_env_state_archive_options(
+        let (options, _) = openclaw_env_state_archive_options(
             &paths,
             &BTreeMap::new(),
             OpenClawWorkspaceRuntime::default(),
@@ -2190,7 +2099,7 @@ mod tests {
             OpenClawWorkspaceRuntime::default(),
         )
         .unwrap();
-        let options = openclaw_env_state_archive_options(
+        let (options, _) = openclaw_env_state_archive_options(
             &paths,
             &BTreeMap::new(),
             OpenClawWorkspaceRuntime::default(),
@@ -2206,11 +2115,7 @@ mod tests {
                 .included_path_roots
                 .contains(Path::new(".openclaw/workspace"))
         );
-        assert!(
-            options
-                .included_path_roots
-                .contains(Path::new(".openclaw/state"))
-        );
+        assert!(options.included_path_roots.contains(Path::new("")));
         for options in [&export_options, &options] {
             assert!(
                 options

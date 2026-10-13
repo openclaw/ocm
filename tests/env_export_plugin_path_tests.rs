@@ -255,7 +255,7 @@ fn state_export_rejects_caller_relative_plugin_selection_without_changing_defaul
 #[cfg(unix)]
 #[test]
 fn state_export_keeps_root_file_entrypoints_and_checks_retained_sibling_links() {
-    for (absolute, removed_dependency, config_link) in [
+    for (absolute, custom_dependency, config_link) in [
         (false, false, false),
         (true, false, false),
         (false, true, false),
@@ -268,13 +268,17 @@ fn state_export_keeps_root_file_entrypoints_and_checks_retained_sibling_links() 
         let source = root.child("ocm-home/envs/source");
         write_text(&source.join("entry.mjs"), "import './impl.mjs';");
         write_text(&source.join("actual.mjs"), "export default {};");
-        if removed_dependency {
+        write_text(
+            &source.join(".openclaw/memory/unused"),
+            "unrelated legacy data",
+        );
+        if custom_dependency {
             write_text(
                 &source.join("entry.mjs"),
-                "import './.openclaw/memory/impl.mjs';",
+                "import './.openclaw/custom/impl.mjs';",
             );
             write_text(
-                &source.join(".openclaw/memory/impl.mjs"),
+                &source.join(".openclaw/custom/impl.mjs"),
                 "export default {};",
             );
         }
@@ -310,17 +314,9 @@ fn state_export_keeps_root_file_entrypoints_and_checks_retained_sibling_links() 
                 "state.tar",
             ],
         );
-        assert_eq!(
-            export.status.success(),
-            !absolute && !removed_dependency,
-            "{}",
-            stderr(&export)
-        );
+        assert_eq!(export.status.success(), !absolute, "{}", stderr(&export));
         if absolute {
             assert!(stderr(&export).contains("absolute symlink"));
-        } else if removed_dependency {
-            assert!(stderr(&export).contains("removed during import"));
-            assert!(!root.child("state.tar").exists());
         } else {
             fs::rename(&source, root.child("source-offline")).unwrap();
             let import = run_ocm(
@@ -330,7 +326,17 @@ fn state_export_keeps_root_file_entrypoints_and_checks_retained_sibling_links() 
             );
             assert!(import.status.success(), "{}", stderr(&import));
             assert!(root.child("ocm-home/envs/target/impl.mjs").is_file());
-            assert!(!root.child("ocm-home/envs/target/.openclaw/memory").exists());
+            assert_eq!(
+                fs::read_to_string(root.child("ocm-home/envs/target/.openclaw/memory/unused"))
+                    .unwrap(),
+                "unrelated legacy data"
+            );
+            if custom_dependency {
+                assert!(
+                    root.child("ocm-home/envs/target/.openclaw/custom/impl.mjs")
+                        .is_file()
+                );
+            }
         }
     }
 }

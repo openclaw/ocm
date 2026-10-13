@@ -1069,21 +1069,17 @@ pub fn export_environment(
         },
     };
 
-    let archive_options = if options.include_state {
-        openclaw_env_state_archive_options
+    let runtime = OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port);
+    let (archive_options, not_included_plugin_paths) = if options.include_state {
+        openclaw_env_state_archive_options(&env_paths, env, runtime)?
     } else {
-        openclaw_env_archive_options
+        (
+            openclaw_env_archive_options(&env_paths, env, runtime)?,
+            Vec::new(),
+        )
     };
-    let result = write_env_archive_with_options(
-        &metadata,
-        &env_paths.root,
-        &output_path,
-        archive_options(
-            &env_paths,
-            env,
-            OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port),
-        )?,
-    );
+    let result =
+        write_env_archive_with_options(&metadata, &env_paths.root, &output_path, archive_options);
     if result.is_err() {
         let _ = fs::remove_file(&output_path);
     }
@@ -1091,6 +1087,7 @@ pub fn export_environment(
 
     Ok(EnvExportSummary {
         include_state: options.include_state,
+        not_included_plugin_paths,
         name: meta.name,
         root: meta.root,
         archive_path: display_path(&output_path),
@@ -1247,8 +1244,9 @@ pub(crate) fn import_environment_with_sandbox_origin(
                     &target_paths,
                 )?;
                 super::openclaw_state::clear_imported_database_leases(&target_paths)?;
+            } else {
+                clear_nonportable_runtime_state(&target_paths, env, target_runtime)?;
             }
-            clear_nonportable_runtime_state(&target_paths, env, target_runtime)?;
 
             let created_at = now_utc();
             let meta = EnvMeta {
