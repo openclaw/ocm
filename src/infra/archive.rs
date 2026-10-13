@@ -100,6 +100,7 @@ pub struct EnvArchiveOptions {
     pub excluded_path_roots: BTreeSet<PathBuf>,
     pub snapshot_sqlite_files: bool,
     pub sqlite_content_roots: BTreeSet<PathBuf>,
+    pub prepare_sqlite_snapshot: Option<fn(&Path, &Path, &Path) -> Result<(), String>>,
 }
 
 impl Default for EnvArchiveOptions {
@@ -111,6 +112,7 @@ impl Default for EnvArchiveOptions {
             excluded_path_roots: BTreeSet::new(),
             snapshot_sqlite_files: false,
             sqlite_content_roots: BTreeSet::new(),
+            prepare_sqlite_snapshot: None,
         }
     }
 }
@@ -241,26 +243,18 @@ fn append_env_root(
             .sqlite_content_roots
             .iter()
             .any(|root| relative_path.starts_with(root));
-        let state_database = discover_sqlite
-            && metadata.is_file()
-            && is_sqlite_database(&path).map_err(EnvArchiveWriteError::Fatal)?;
-        let state_sidecar = if discover_sqlite {
-            if let Some(primary) = sqlite_primary_for_any_sidecar(&path) {
-                fs::symlink_metadata(&primary).is_ok_and(|meta| meta.is_file())
-                    && is_sqlite_database(&primary).map_err(EnvArchiveWriteError::Fatal)?
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if state_sidecar
+        // State sidecars are process residue even if their primary was removed
+        // or replaced. Never pair a copied WAL with an independently captured DB.
+        if (discover_sqlite && sqlite_primary_for_any_sidecar(&path).is_some())
             || (!discover_sqlite
                 && options.snapshot_sqlite_files
                 && sqlite_database_path_for_sidecar(relative_path).is_some())
         {
             continue;
         }
+        let state_database = discover_sqlite
+            && metadata.is_file()
+            && is_sqlite_database(&path).map_err(EnvArchiveWriteError::Fatal)?;
 
         let archive_path = Path::new(ENV_ARCHIVE_ROOT_DIR).join(relative_path);
         if metadata.is_dir() {
@@ -294,6 +288,10 @@ fn append_env_root(
                 )));
             }
             let snapshot = create_sqlite_snapshot(&path).map_err(EnvArchiveWriteError::Fatal)?;
+            if let Some(prepare) = options.prepare_sqlite_snapshot {
+                prepare(source_root, relative_path, snapshot.path())
+                    .map_err(EnvArchiveWriteError::Fatal)?;
+            }
             let snapshot_metadata = fs::metadata(snapshot.path()).map_err(|error| {
                 EnvArchiveWriteError::Fatal(format!(
                     "failed to inspect SQLite snapshot for {}: {error}",

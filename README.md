@@ -539,8 +539,9 @@ into `ocm env import <archive> --name <new-env>`. The flag is opt-in: ordinary
 exports retain their existing contents. SQLite databases include committed WAL
 writes through coherent snapshots; sockets, pids, locks, temporary files, and
 raw database sidecars are omitted. Each database is captured independently, not
-as one transaction across the environment. Import relocates managed plugin
-receipt paths and leaves the new environment stopped. Export JSON and human
+as one transaction across the environment. Export normalizes owned plugin receipt aliases in the SQLite backup while
+leaving the source untouched. Import relocates those paths, clears copied
+database process leases, and leaves the new environment stopped. Export JSON and human
 output both report whether state was included.
 
 Clone and import reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.

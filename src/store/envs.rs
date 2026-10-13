@@ -878,7 +878,7 @@ fn clone_environment_with_policy(
         };
 
         super::openclaw_state::relocate_cloned_plugin_index_paths(&source_paths, &target_paths)?;
-        super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
+        super::openclaw_state::clear_copied_agent_database_leases(&target_paths)?;
 
         let meta = EnvMeta {
             upgrade_independent_paths: Vec::new(),
@@ -1225,6 +1225,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                     &derive_env_paths(Path::new(source_root)),
                     &target_paths,
                 )?;
+                super::openclaw_state::clear_copied_agent_database_leases(&target_paths)?;
             }
             clear_nonportable_runtime_state(&target_paths, env, target_runtime)?;
 

@@ -142,7 +142,31 @@ pub(crate) fn openclaw_env_state_archive_options(
         .sqlite_content_roots
         .insert(PathBuf::from(".openclaw/state"));
     options.should_exclude_path = should_exclude_state_archive_path;
+    options.prepare_sqlite_snapshot = Some(prepare_exported_state_snapshot);
     Ok(options)
+}
+
+fn prepare_exported_state_snapshot(
+    source_root: &Path,
+    relative_path: &Path,
+    snapshot: &Path,
+) -> Result<(), String> {
+    if relative_path != Path::new(".openclaw/state/openclaw.sqlite") {
+        return Ok(());
+    }
+    let source = derive_env_paths(source_root);
+    // Resolve aliases while their source filesystem is available. Only the
+    // private SQLite backup is rewritten; all receipt paths then use sourceRoot.
+    relocate_plugin_index_in_database(
+        snapshot,
+        &source.state_dir,
+        &source.state_dir,
+        PluginPathRelocation::Cloned {
+            source: &source,
+            target: &source,
+        },
+    )?;
+    Ok(())
 }
 
 fn should_exclude_state_archive_path(path: &Path, kind: EnvArchiveEntryKind) -> bool {
@@ -453,7 +477,7 @@ pub(super) fn relocate_archived_plugin_index_paths(
     )
 }
 
-pub(super) fn clear_cloned_agent_database_leases(target: &EnvPaths) -> Result<(), String> {
+pub(super) fn clear_copied_agent_database_leases(target: &EnvPaths) -> Result<(), String> {
     let Some(database_path) = contained_imported_database(
         &target.state_dir.join("state/openclaw.sqlite"),
         &target.root,
@@ -471,8 +495,8 @@ pub(super) fn clear_cloned_agent_database_leases(target: &EnvPaths) -> Result<()
         |row| row.get::<_, bool>(0),
     ).map_err(|error| error.to_string())?;
     if has_leases {
-        // Only a new independent clone loses these source-process claims.
-        // Shared repair/import/restore cleanup must preserve its own live owners.
+        // A new independent clone or archive import loses source-process claims.
+        // Shared migration/repair/restore cleanup preserves its own live owners.
         connection
             .execute("DELETE FROM agent_database_leases", [])
             .map_err(|error| format!("failed to clear cloned agent database leases: {error}"))?;
@@ -498,6 +522,20 @@ fn relocate_installed_plugin_index_paths(
         return Ok(MigratedRuntimeStateResult::default());
     }
 
+    relocate_plugin_index_in_database(
+        &database_path,
+        source_state_root,
+        target_state_root,
+        relocation,
+    )
+}
+
+fn relocate_plugin_index_in_database(
+    database_path: &Path,
+    source_state_root: &Path,
+    target_state_root: &Path,
+    relocation: PluginPathRelocation<'_>,
+) -> Result<MigratedRuntimeStateResult, String> {
     let connection = Connection::open(&database_path).map_err(|error| {
         format!(
             "failed to open imported OpenClaw state database {}: {error}",
@@ -680,7 +718,8 @@ fn relocate_cloned_plugin_record(
         let relocated_source = if let Some(installed_copy) = relocated_install.as_ref() {
             let install = install_path.as_deref()?;
             let same_payload = install == source
-                || matches!((fs::canonicalize(install), fs::canonicalize(source)),
+                || require_source
+                    && matches!((fs::canonicalize(install), fs::canonicalize(source)),
                 (Ok(install), Ok(source)) if install == source);
             if same_payload {
                 // Preserve the equality used to admit linked source entrypoints.
@@ -725,24 +764,27 @@ fn cloned_plugin_path(
     if !path.is_absolute() {
         return None;
     }
-    let (relative, target_base, check_source) =
-        if let Ok(relative) = path.strip_prefix(&source.root) {
-            (relative.to_path_buf(), &target.root, true)
-        } else if let Ok(relative) = path.strip_prefix(&target.root) {
-            (relative.to_path_buf(), &target.root, false)
-        } else if let Some(relative) = existing_plugin_relative(path, &source.root) {
-            // Config rewriting also accepts existing aliases of copied env-owned
-            // files. Canonicalization here deliberately requires the payload to exist.
-            (relative, &target.root, false)
-        } else {
-            // An old gateway prefix is evidence only when the corresponding copied
-            // payload really exists. Missing-path support must not widen this case.
-            (
-                relocatable_plugin_path(path, &source.state_dir, allow_copied_gateway_path)?,
-                &target.state_dir,
-                false,
-            )
-        };
+    let (relative, target_base, check_source) = if let Ok(relative) =
+        path.strip_prefix(&source.root)
+    {
+        (relative.to_path_buf(), &target.root, true)
+    } else if let Ok(relative) = path.strip_prefix(&target.root) {
+        (relative.to_path_buf(), &target.root, false)
+    } else if require_source && let Some(relative) = existing_plugin_relative(path, &source.root) {
+        // Config rewriting also accepts existing aliases of copied env-owned
+        // files. Canonicalization here deliberately requires the payload to exist.
+        (relative, &target.root, false)
+    } else if require_source {
+        // An old gateway prefix is evidence only when the corresponding copied
+        // payload really exists. Missing-path support must not widen this case.
+        (
+            relocatable_plugin_path(path, &source.state_dir, allow_copied_gateway_path)?,
+            &target.state_dir,
+            false,
+        )
+    } else {
+        return None;
+    };
     if relative
         .components()
         .any(|part| !matches!(part, Component::CurDir | Component::Normal(_)))

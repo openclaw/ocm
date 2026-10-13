@@ -94,10 +94,29 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
          PRAGMA wal_autocheckpoint=0;
          CREATE TABLE sessions (id TEXT PRIMARY KEY, content TEXT);
          INSERT INTO sessions VALUES ('session-1', 'committed conversation');
-         CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT);"
+         CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT);
+         CREATE TABLE agent_database_leases (lease_id TEXT PRIMARY KEY, owner_pid INTEGER);
+         INSERT INTO agent_database_leases VALUES ('source-owner', 123);"
     ).unwrap();
     let receipt = json!({"demo": {"source": "npm", "spec": "demo@1.0.0",
-        "installPath": source.join("extensions/demo").to_str().unwrap()}});
+        "installPath": source.join("extensions/demo").to_str().unwrap()},
+        "recovered": {"source": "npm", "installPath": root.child("former/.openclaw/extensions/recovered")}});
+    write_text(
+        &source.join("extensions/recovered/index.js"),
+        "export default {};",
+    );
+    #[cfg(unix)]
+    let receipt = {
+        let mut receipt = receipt;
+        let alias = root.child("plugin-alias");
+        write_text(
+            &source.join("extensions/alias/index.js"),
+            "export default {};",
+        );
+        std::os::unix::fs::symlink(source.join("extensions/alias"), &alias).unwrap();
+        receipt["alias"] = json!({"source": "path", "installPath": alias, "sourcePath": alias});
+        receipt
+    };
     connection
         .execute(
             "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1)",
@@ -136,6 +155,9 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
         "locks/owner",
         "tmp/cache",
         "gateway-supervisor-restart-handoff.json",
+        "orphan.db-wal",
+        "orphan.db-shm",
+        "orphan.db-journal",
     ] {
         write_text(&source.join("state").join(residue), "runtime residue");
     }
@@ -185,6 +207,9 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
                 "openclaw.sqlite-shm",
                 "nested/history.db-wal",
                 "nested/history.db-shm",
+                "orphan.db-wal",
+                "orphan.db-shm",
+                "orphan.db-journal",
             ] {
                 assert!(
                     !members.contains(&std::path::Path::new("root/.openclaw/state").join(residue)),
@@ -208,6 +233,21 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
             include_state
         );
         if include_state {
+            let source_db = &connections.as_ref().unwrap().0;
+            let unchanged: String = source_db
+                .query_row(
+                    "SELECT install_records_json FROM installed_plugin_index",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&unchanged).unwrap(), receipt);
+            let owners: i64 = source_db
+                .query_row("SELECT COUNT(*) FROM agent_database_leases", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(owners, 1);
             // Import must not rely on the exporting machine still being available.
             drop(connections.take());
             fs::rename(&source, root.child("source-offline")).unwrap();
@@ -270,6 +310,23 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
             target.join("extensions/demo").to_str().unwrap()
         );
         assert_eq!(imported_receipt["demo"]["spec"], "demo@1.0.0");
+        assert_eq!(
+            imported_receipt["recovered"]["installPath"],
+            target.join("extensions/recovered").to_str().unwrap()
+        );
+        #[cfg(unix)]
+        for field in ["installPath", "sourcePath"] {
+            assert_eq!(
+                imported_receipt["alias"][field],
+                target.join("extensions/alias").to_str().unwrap()
+            );
+        }
+        let owners: i64 = restored
+            .query_row("SELECT COUNT(*) FROM agent_database_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(owners, 0);
     }
 }
 

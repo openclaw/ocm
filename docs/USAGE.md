@@ -956,8 +956,10 @@ pids, locks, and temporary process files are omitted. Databases and other files
 are not captured in one atomic transaction. JSON reports `includeState`; the
 human summary reports whether state was included.
 
-Import restores the included state and relocates managed plugin receipt paths
-to the new environment. Imported environments get a fresh identity and gateway
+Export normalizes owned plugin receipt aliases in the SQLite backup while the
+source filesystem is available, without changing the source. Import restores
+the included state, relocates those paths to the new environment, and clears
+copied database process leases. Imported environments get a fresh identity and gateway
 port, have env-scoped config rewritten, and remain stopped. Legacy file-based
 sessions, logs, and backups still follow the existing cleanup policy. Export
 without the flag and import of older archives retain their existing behavior.
