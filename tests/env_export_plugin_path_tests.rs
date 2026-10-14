@@ -709,6 +709,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "bracketedLog":format!("[INFO] loaded from {}/plugin", source.display()),
             "quotedEscape":format!("cat '{}/a b/../../outside'", source.display()),
             "quotedReferences":format!("paths '{} and {}/plugin'", external.display(), source.display()),
+            "relativeArgument":format!("sh -c '{}/run ../../../input'", source.display()),
             "quotedScript":format!("sh -c '{}/run --input {}/input'", source.display(), source.display()),
             "multilineEscape":format!("cat '{}/a\nb/../../outside'", source.display()),
             "prefixedUrl":format!("echo \"url={}\"; pwd", url::Url::from_file_path(installed.join("index.js")).unwrap()),
@@ -717,6 +718,8 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "fileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string(),
             "apostropheFileUrl":format!("{}'other/plugin.js", url::Url::from_file_path(&source).unwrap()),
             "quotedFileUrl":format!("cat '{}'", url::Url::from_file_path(installed.join("index.js")).unwrap()),
+            "spacedFileUrl":format!("{} other/plugin.js", url::Url::from_file_path(&source).unwrap()),
+            "mixedUrlAndPath":format!("echo \"url={} {}/a b/../../outside\"", url::Url::from_file_path(installed.join("index.js")).unwrap(), source.display()),
             "externalFileUrl":format!("{};other/plugin.js", url::Url::from_file_path(&source).unwrap()),
             "upperFileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string().replacen("file:", "FILE:", 1),
             "shortFileUrl":format!("file:{}", url::Url::from_file_path(installed.join("index.js")).unwrap().path()),
@@ -823,6 +826,8 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             ],
         );
         assert!(import.status.success(), "{}", stderr(&import));
+        let summary: Value = serde_json::from_slice(&import.stdout).unwrap();
+        let target = std::path::PathBuf::from(summary["root"].as_str().unwrap());
         let db = Connection::open_with_flags(
             target.join(".openclaw/state/openclaw.sqlite"),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -850,13 +855,19 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             expected["index"]["plugins"][0]["rootDir"] =
                 json!(target.join(".openclaw/extensions/demo"));
             expected["index"]["plugins"][0]["source"] =
-                json!(target.join(".openclaw/extensions/demo/index.js"));
+                json!(target.join(".openclaw/extensions/demo").join("index.js"));
             expected["index"]["plugins"][0]["setupSource"] =
-                json!(target.join(".openclaw/extensions/demo/setup.js"));
-            expected["index"]["plugins"][0]["manifestPath"] =
-                json!(target.join(".openclaw/extensions/demo/openclaw.plugin.json"));
-            expected["index"]["plugins"][0]["packageJson"]["path"] =
-                json!(target.join(".openclaw/extensions/demo/package.json"));
+                json!(target.join(".openclaw/extensions/demo").join("setup.js"));
+            expected["index"]["plugins"][0]["manifestPath"] = json!(
+                target
+                    .join(".openclaw/extensions/demo")
+                    .join("openclaw.plugin.json")
+            );
+            expected["index"]["plugins"][0]["packageJson"]["path"] = json!(
+                target
+                    .join(".openclaw/extensions/demo")
+                    .join("package.json")
+            );
             expected["index"]["workspaceDir"] = json!(target);
         }
         let source_encoded = serde_json::to_string(source.to_str().unwrap()).unwrap();
@@ -881,15 +892,19 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             );
             assert_eq!(
                 parsed[0]["source"],
-                json!(target.join(".openclaw/extensions/demo/index.js"))
+                json!(target.join(".openclaw/extensions/demo").join("index.js"))
             );
             assert_eq!(
                 parsed[0]["setupSource"],
-                json!(target.join(".openclaw/extensions/demo/setup.js"))
+                json!(target.join(".openclaw/extensions/demo").join("setup.js"))
             );
             assert_eq!(
                 parsed[0]["manifestPath"],
-                json!(target.join(".openclaw/extensions/demo/openclaw.plugin.json"))
+                json!(
+                    target
+                        .join(".openclaw/extensions/demo")
+                        .join("openclaw.plugin.json")
+                )
             );
             assert_eq!(db.query_row("SELECT workspace_dir FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get::<_, String>(0)).unwrap(), target.to_str().unwrap());
             let diagnostics: String = db.query_row("SELECT diagnostics_json FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get(0)).unwrap();
@@ -960,6 +975,21 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             external.display(),
             target.display()
         ));
+        // Free-form values use literal root boundaries; their command syntax
+        // and filesystem resolution are outside this text relocation contract.
+        for field in [
+            "quotedEscape",
+            "multilineEscape",
+            "escapedRoot",
+            "relativeArgument",
+        ] {
+            expected_runtime[field] = json!(
+                expected_runtime[field]
+                    .as_str()
+                    .unwrap()
+                    .replace(source.to_str().unwrap(), target.to_str().unwrap())
+            );
+        }
         expected_runtime["quotedScript"] = json!(format!(
             "sh -c '{}/run --input {}/input'",
             target.display(),
@@ -974,11 +1004,17 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             json!(format!("[INFO] loaded from {}/plugin", target.display()));
         expected_runtime["quotedOwned"] = json!(format!("cat '{}/a b/file'", target.display()));
         let expected_url =
-            url::Url::from_file_path(target.join(".openclaw/extensions/demo/index.js")).unwrap();
+            url::Url::from_file_path(target.join(".openclaw/extensions/demo").join("index.js"))
+                .unwrap();
         expected_runtime["text"] = json!(format!(
             "{}/run --input {}/input\n{}/second",
             target.display(),
             target.display(),
+            target.display()
+        ));
+        expected_runtime["mixedUrlAndPath"] = json!(format!(
+            "echo \"url={} {}/a b/../../outside\"",
+            expected_url,
             target.display()
         ));
         expected_runtime["prefixedUrl"] = json!(format!("echo \"url={}\"; pwd", expected_url));

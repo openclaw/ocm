@@ -975,9 +975,11 @@ outside the config and state-reference rewrites stays byte-identical to the arch
 Migration and state-inclusive import share root-reference matching for plain
 paths, file URLs, and existing runtime text. A root must end at a path component
 boundary; sibling names that share its prefix remain unchanged. On POSIX,
-backslashes in filenames are not directory separators. References outside the
-source environment root are left unchanged; external contents are not exported
-and may need separate preparation after moving.
+backslashes in filenames are not directory separators. Free-form text uses literal
+root substitutions without interpreting command syntax or resolving `..` segments;
+structured path fields and file URLs are checked as complete paths. References
+without the source-root prefix are left unchanged. External contents are not
+exported and may need separate preparation after moving.
 Import refuses to update a database outside the copied root; internal database
 links are retained.
 Owned file and directory links use relative targets in the archive; external
