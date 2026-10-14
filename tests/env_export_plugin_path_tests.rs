@@ -776,6 +776,11 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             url::Url::from_file_path(&source).unwrap(),
             source.display()
         ));
+        runtime["adjacentMixedReferences"] = json!(format!(
+            "{}/one,{}/two",
+            url::Url::from_file_path(&source).unwrap(),
+            source.display()
+        ));
         runtime["separatedRootUrls"] = json!([" ", "\t", "\r", "\n"].map(|separator| {
             let uri = url::Url::from_file_path(&source).unwrap();
             format!("{uri}{separator}{uri}/plugin")
@@ -1115,6 +1120,11 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         expected_runtime["lineTerminalRoot"] = json!(format!(
             "{}/a b/../../outside {}\n",
             url::Url::from_file_path(&source).unwrap(),
+            target.display()
+        ));
+        expected_runtime["adjacentMixedReferences"] = json!(format!(
+            "{}/one,{}/two",
+            url::Url::from_file_path(&target).unwrap(),
             target.display()
         ));
         expected_runtime["separatedRootUrls"] = json!([" ", "\t", "\r", "\n"].map(|separator| {

@@ -737,6 +737,7 @@ fn plain_root_references(
     raw: &str,
     source_root: &str,
     quoted: &[std::ops::Range<usize>],
+    file_urls: &[usize],
 ) -> Vec<usize> {
     let comparison = root_comparison(raw);
     let source = root_comparison(source_root);
@@ -744,6 +745,14 @@ fn plain_root_references(
     comparison
         .match_indices(source.as_ref())
         .filter_map(|(start, _)| {
+            // In file:/absolute/path, the path belongs to its own URI scheme.
+            // It is not a second plain reference after a punctuation boundary.
+            if start
+                .checked_sub(5)
+                .is_some_and(|scheme| file_urls.binary_search(&scheme).is_ok())
+            {
+                return None;
+            }
             let end = start + source_root.len();
             while quoted
                 .get(quote_index)
@@ -777,7 +786,7 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     let mut urls = Vec::new();
     let mut edits = Vec::new();
     let starts: Vec<_> = file_url_starts(raw).collect();
-    let plain = plain_root_references(raw, source_root, &quoted);
+    let plain = plain_root_references(raw, source_root, &quoted, &starts);
     let mut boundaries = starts.clone();
     boundaries.extend(plain.iter().copied());
     boundaries.sort_unstable();
@@ -827,29 +836,20 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
             })
             .flatten()
             .filter(|offset| *offset < quote_end);
-        // A separately introduced file scheme starts another reference even
-        // without whitespace (for example a comma-separated list).
-        let next_url = starts
-            .get(starts.partition_point(|offset| *offset <= start))
+        let enclosing_end = angle_end.unwrap_or(quote_end);
+        // Every recognized reference starts a new span, irrespective of its
+        // representation or separating punctuation. The same plain-path list
+        // drives replacement below, so discovery and rewriting cannot disagree.
+        let next = boundaries
+            .get(boundaries.partition_point(|offset| *offset <= start))
             .copied()
-            .unwrap_or(raw.len());
-        let enclosing_end = angle_end.unwrap_or(quote_end).min(next_url);
-        // Bound each URI at the next reference after a text separator.
-        // This preserves spaced filenames without rescanning shared suffixes.
-        let mut value_end = enclosing_end;
-        if let Some(space) =
-            raw[start..enclosing_end].find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
-        {
-            let after_space = boundaries.partition_point(|offset| *offset <= start + space);
-            if let Some(&next) = boundaries
-                .get(after_space)
-                .filter(|offset| **offset <= enclosing_end)
-            {
-                value_end = if raw[..next].ends_with('<') {
-                    next - 1
-                } else {
-                    next
-                };
+            .filter(|offset| *offset <= enclosing_end);
+        let mut value_end = next.unwrap_or(enclosing_end);
+        if let Some(next) = next {
+            if raw[..next].ends_with('<') {
+                value_end -= 1;
+            }
+            if let Some(space) = raw[start..next].find(char::is_whitespace) {
                 if let Some((offset, ch)) = raw[start + space..next]
                     .char_indices()
                     .rev()
@@ -871,7 +871,6 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
                         value_end = word_start;
                     }
                 }
-                value_end = start + raw[start..value_end].trim_end().len();
             }
         }
         // This selected span is the complete URI candidate. Never fall back
