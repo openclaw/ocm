@@ -606,7 +606,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         write_text(&package.join("package.json"), "{\"name\":\"demo\"}\n");
         let records = json!({
             "demo": {"source":"path", "installPath":installed, "sourcePath":package,
-                "version":"1.0.0", "integrity":"unchanged", "unknown":{"enabled":true}},
+                "version":"1.0.0", "integrity":"unchanged", "unknown":{"enabled":true,"path":source.join("historical-reference")}},
             "external": {"source":"path", "installPath":external, "sourcePath":external},
             "lookalike": {"source":"npm", "installPath":lookalike},
             "punctuation-sibling": {"source":"path", "installPath":source.with_file_name("source=other").join("plugin")},
@@ -616,7 +616,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "missing": {"source":"npm", "installPath":source.join(".openclaw/extensions/missing")}
         });
         let plugins = json!([{
-            "id": "demo", "rootDir": installed, "source": installed.join("index.js"),
+            "id": "demo", "rootDir": installed, "source": installed.join("index.js"), "setupSource": installed.join("setup.js"),
             "manifestPath": installed.join("openclaw.plugin.json"),
             "packageJson": {"path": installed.join("package.json"),
                 "fileSignature": {"mtimeMs": "PRECISE_TIMESTAMP"}}
@@ -707,6 +707,8 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "quotedOwned":format!("cat '{}/a b/file'", source.display()),
             "encoded":json!({"rootDir":installed}).to_string(),
             "fileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string(),
+            "apostropheFileUrl":format!("{}'other/plugin.js", url::Url::from_file_path(&source).unwrap()),
+            "quotedFileUrl":format!("cat '{}'", url::Url::from_file_path(installed.join("index.js")).unwrap()),
             "externalFileUrl":format!("{};other/plugin.js", url::Url::from_file_path(&source).unwrap()),
             "upperFileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string().replacen("file:", "FILE:", 1),
             "shortFileUrl":format!("file:{}", url::Url::from_file_path(installed.join("index.js")).unwrap().path()),
@@ -723,6 +725,12 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             &source.join(".openclaw/logs/root.txt"),
             &format!("{}\n", source.display()),
         );
+        let surrogate_file = ".openclaw/agents/main/sessions/surrogate.jsonl";
+        let surrogate = format!(
+            "{{\"opaque\":\"\\ud800\",\"path\":{}}}\n",
+            serde_json::to_string(&installed).unwrap()
+        );
+        write_text(&source.join(surrogate_file), &surrogate);
         let jsonl_file = ".openclaw/agents/main/sessions/commands.jsonl";
         write_text(
             &source.join(jsonl_file),
@@ -821,15 +829,13 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
                 json!(target.join(".openclaw/extensions/demo"));
             expected["index"]["plugins"][0]["source"] =
                 json!(target.join(".openclaw/extensions/demo/index.js"));
+            expected["index"]["plugins"][0]["setupSource"] =
+                json!(target.join(".openclaw/extensions/demo/setup.js"));
             expected["index"]["plugins"][0]["manifestPath"] =
                 json!(target.join(".openclaw/extensions/demo/openclaw.plugin.json"));
             expected["index"]["plugins"][0]["packageJson"]["path"] =
                 json!(target.join(".openclaw/extensions/demo/package.json"));
             expected["index"]["workspaceDir"] = json!(target);
-            expected["index"]["diagnostics"][0]["message"] = json!(format!(
-                "loaded from {}",
-                target.join(".openclaw/extensions/demo").display()
-            ));
         }
         let source_encoded = serde_json::to_string(source.to_str().unwrap()).unwrap();
         let target_encoded = serde_json::to_string(target.to_str().unwrap()).unwrap();
@@ -856,15 +862,16 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
                 json!(target.join(".openclaw/extensions/demo/index.js"))
             );
             assert_eq!(
+                parsed[0]["setupSource"],
+                json!(target.join(".openclaw/extensions/demo/setup.js"))
+            );
+            assert_eq!(
                 parsed[0]["manifestPath"],
                 json!(target.join(".openclaw/extensions/demo/openclaw.plugin.json"))
             );
             assert_eq!(db.query_row("SELECT workspace_dir FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get::<_, String>(0)).unwrap(), target.to_str().unwrap());
             let diagnostics: String = db.query_row("SELECT diagnostics_json FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get(0)).unwrap();
-            assert_eq!(
-                diagnostics.replace(target_encoded, source_encoded),
-                diagnostics_raw
-            );
+            assert_eq!(diagnostics, diagnostics_raw);
         } else {
             assert!(raw.contains("1791960884534.1313"));
         }
@@ -935,6 +942,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             target.display(),
             target.display()
         ));
+        expected_runtime["quotedFileUrl"] = json!(format!("cat '{}'", expected_url));
         expected_runtime["fileUrl"] = json!(expected_url.as_str());
         expected_runtime["upperFileUrl"] = json!(expected_url.as_str());
         expected_runtime["shortFileUrl"] = json!(expected_url.as_str());
@@ -951,6 +959,12 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         let actual_runtime: Value =
             serde_json::from_slice(&fs::read(target.join(runtime_file)).unwrap()).unwrap();
         assert_eq!(actual_runtime, expected_runtime);
+        let surrogate_copy = fs::read_to_string(target.join(surrogate_file)).unwrap();
+        assert_eq!(
+            surrogate_copy.replace(target_encoded, source_encoded),
+            surrogate
+        );
+        assert!(surrogate_copy.contains(target_encoded));
         assert_eq!(
             fs::read_to_string(target.join(".openclaw/logs/root.txt")).unwrap(),
             format!("{}\n", target.display())

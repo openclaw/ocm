@@ -2076,6 +2076,7 @@ fn migrate_relocates_complete_root_references_and_preserves_siblings() {
         "text": format!("{}/first --input {}/second\n{}/third", source.display(), source.display(), source.display()),
         "url": file_url.as_str(),
         "externalUrl": format!("{};other/plugin.js", url::Url::from_file_path(&source).unwrap()),
+        "apostropheUrl": format!("{}'other/plugin.js", url::Url::from_file_path(&source).unwrap()),
         "metadata": 17
     });
     fs::create_dir_all(source.join(file).parent().unwrap()).unwrap();

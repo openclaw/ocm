@@ -453,13 +453,15 @@ fn rewrite_runtime_root_references(
         while let Some(offset) = raw[cursor..].find('"') {
             let start = cursor + offset;
             output.push_str(&raw[cursor..start]);
-            let mut strings =
-                serde_json::Deserializer::from_str(&raw[start..]).into_iter::<String>();
-            let value = strings
-                .next()
-                .expect("JSON string begins at quote")
-                .map_err(|error| error.to_string())?;
-            let end = start + strings.byte_offset();
+            let end = json_value_end(raw, start)?;
+            let Ok(value) = serde_json::from_str::<String>(&raw[start..end]) else {
+                // JavaScript can persist lone UTF-16 surrogates. Preserve that
+                // opaque string without blocking other valid references.
+                output.push_str(&raw[start..end]);
+                cursor = end;
+                previous_key = None;
+                continue;
+            };
             let is_key = raw[end..].trim_start().starts_with(':');
             let path_value = !is_key
                 && previous_key.take().is_some_and(|key: String| {
@@ -520,17 +522,13 @@ fn rewrite_runtime_root_references(
         .collect())
 }
 
-fn is_path_separator(ch: char) -> bool {
-    ch == '/' || (cfg!(windows) && ch == '\\')
-}
-
 fn relocate_rooted_path(path: &str, source_root: &str, target_root: &str) -> Option<String> {
     let suffix = path.strip_prefix(source_root)?;
-    if !suffix.is_empty() && !suffix.starts_with(is_path_separator) {
+    if !suffix.is_empty() && !suffix.starts_with(std::path::is_separator) {
         return None;
     }
     let mut depth = 0usize;
-    for component in suffix.split(is_path_separator) {
+    for component in suffix.split(std::path::is_separator) {
         match component {
             "" | "." => {}
             ".." => depth = depth.checked_sub(1)?,
@@ -545,6 +543,13 @@ fn reference_boundary(ch: char) -> bool {
 }
 
 fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> String {
+    if raw
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+        && !raw.chars().any(char::is_whitespace)
+    {
+        return rewrite_file_url(raw, source_root, target_root).unwrap_or_else(|| raw.to_string());
+    }
     // File URLs have their own escaping and authority rules. Preserve other URL
     // components and never interpret an external URL as a local command path.
     let mut output = String::with_capacity(raw.len());
@@ -567,22 +572,21 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
         {
             continue;
         }
-        let end = raw[start..]
-            .find(|ch: char| ch.is_whitespace() || "\"'`<>".contains(ch))
+        let mut end = raw[start..]
+            .find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
             .map_or(raw.len(), |offset| start + offset);
+        if let Some(quote @ ('"' | '\'' | '`')) = raw[..start].chars().next_back() {
+            if raw[start..end].ends_with(quote) {
+                end -= quote.len_utf8();
+            }
+        }
         output.push_str(&rewrite_path_tokens(
             &raw[cursor..start],
             source_root,
             target_root,
         ));
         let token = &raw[start..end];
-        let relocated = url::Url::parse(token).ok().and_then(|mut url| {
-            let path = url.to_file_path().ok()?;
-            let relocated = relocate_rooted_path(path.to_str()?, source_root, target_root)?;
-            let encoded = url::Url::from_file_path(&relocated).ok()?;
-            url.set_path(encoded.path());
-            Some(url.to_string())
-        });
+        let relocated = rewrite_file_url(token, source_root, target_root);
         output.push_str(relocated.as_deref().unwrap_or(token));
         cursor = end;
     }
@@ -592,6 +596,131 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
         target_root,
     ));
     output
+}
+
+fn rewrite_file_url(value: &str, source_root: &str, target_root: &str) -> Option<String> {
+    let mut url = url::Url::parse(value).ok()?;
+    let path = url.to_file_path().ok()?;
+    let relocated = relocate_rooted_path(path.to_str()?, source_root, target_root)?;
+    let encoded = url::Url::from_file_path(&relocated).ok()?;
+    url.set_path(encoded.path());
+    Some(url.to_string())
+}
+
+fn rewrite_path_value(value: &str, source_root: &str, target_root: &str) -> String {
+    relocate_rooted_path(value, source_root, target_root)
+        .or_else(|| rewrite_file_url(value, source_root, target_root))
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn json_value_end(raw: &str, start: usize) -> Result<usize, String> {
+    let mut values =
+        serde_json::Deserializer::from_str(&raw[start..]).into_iter::<serde::de::IgnoredAny>();
+    values
+        .next()
+        .ok_or("missing JSON value")?
+        .map_err(|error| error.to_string())?;
+    Ok(start + values.byte_offset())
+}
+
+#[derive(Clone, Copy)]
+enum PluginIndexJson {
+    Document,
+    Index,
+    Records,
+    Record,
+    Plugins,
+    Plugin,
+    Package,
+    Path,
+    Preserve,
+}
+
+impl PluginIndexJson {
+    fn field(self, key: Option<&str>) -> Self {
+        match (self, key) {
+            (Self::Document, Some("index")) => Self::Index,
+            (Self::Index, Some("installRecords")) => Self::Records,
+            (Self::Index, Some("plugins")) => Self::Plugins,
+            (Self::Index, Some("workspaceDir")) => Self::Path,
+            (Self::Records, _) => Self::Record,
+            (Self::Record, Some("installPath" | "sourcePath")) => Self::Path,
+            (Self::Plugin, Some("rootDir" | "source" | "setupSource" | "manifestPath")) => {
+                Self::Path
+            }
+            (Self::Plugin, Some("packageJson")) => Self::Package,
+            (Self::Package, Some("path")) => Self::Path,
+            _ => Self::Preserve,
+        }
+    }
+}
+
+fn rewrite_plugin_index_json(
+    raw: &str,
+    scope: PluginIndexJson,
+    source_root: &str,
+    target_root: &str,
+) -> Result<String, String> {
+    if matches!(scope, PluginIndexJson::Preserve) {
+        return Ok(raw.to_string());
+    }
+    if matches!(scope, PluginIndexJson::Path) {
+        let Ok(value) = serde_json::from_str::<String>(raw) else {
+            return Ok(raw.to_string());
+        };
+        let rewritten = rewrite_path_value(&value, source_root, target_root);
+        return if rewritten == value {
+            Ok(raw.to_string())
+        } else {
+            serde_json::to_string(&rewritten).map_err(|error| error.to_string())
+        };
+    }
+    // Walk known containers while retaining the original serialization of every
+    // other value. In particular, diagnostic prose is not a relocation surface.
+    let bytes = raw.as_bytes();
+    let skip_space = |mut offset: usize| {
+        while bytes.get(offset).is_some_and(u8::is_ascii_whitespace) {
+            offset += 1;
+        }
+        offset
+    };
+    let start = skip_space(0);
+    let object = bytes.get(start) == Some(&b'{');
+    if !object && !(matches!(scope, PluginIndexJson::Plugins) && bytes.get(start) == Some(&b'[')) {
+        return Ok(raw.to_string());
+    }
+    let mut scan = skip_space(start + 1);
+    let mut cursor = 0;
+    let mut output = String::with_capacity(raw.len());
+    while !matches!(bytes.get(scan), None | Some(b'}' | b']')) {
+        let child = if object {
+            let key_end = json_value_end(raw, scan)?;
+            let key = serde_json::from_str::<String>(&raw[scan..key_end]).ok();
+            let colon = skip_space(key_end);
+            if bytes.get(colon) != Some(&b':') {
+                return Err("missing JSON object separator".to_string());
+            }
+            scan = skip_space(colon + 1);
+            scope.field(key.as_deref())
+        } else {
+            PluginIndexJson::Plugin
+        };
+        let end = json_value_end(raw, scan)?;
+        output.push_str(&raw[cursor..scan]);
+        output.push_str(&rewrite_plugin_index_json(
+            &raw[scan..end],
+            child,
+            source_root,
+            target_root,
+        )?);
+        cursor = end;
+        scan = skip_space(end);
+        if bytes.get(scan) == Some(&b',') {
+            scan = skip_space(scan + 1);
+        }
+    }
+    output.push_str(&raw[cursor..]);
+    Ok(output)
 }
 
 fn rewrite_path_tokens(raw: &str, source_root: &str, target_root: &str) -> String {
@@ -606,7 +735,7 @@ fn rewrite_path_tokens(raw: &str, source_root: &str, target_root: &str) -> Strin
             || raw[end..]
                 .chars()
                 .next()
-                .is_some_and(|ch| !is_path_separator(ch))
+                .is_some_and(|ch| !std::path::is_separator(ch))
         {
             continue;
         }
@@ -873,16 +1002,18 @@ fn relocate_plugin_records_in_database(
         )
     };
 
-    let mut queries = vec![(select_sql.to_string(), update_sql.to_string(), true)];
+    let scope = if table_exists {
+        PluginIndexJson::Records
+    } else {
+        PluginIndexJson::Document
+    };
+    let mut queries = vec![(select_sql.to_string(), update_sql.to_string(), scope)];
     if table_exists && matches!(relocation, PluginPathRelocation::Archived) {
         // Older databases store the same index in separate columns. Some older
         // snapshots contain only install_records_json, so inspect optional fields.
-        for (column, json) in [
-            ("plugins_json", true),
-            ("diagnostics_json", true),
-            ("workspace_dir", false),
-            ("warning", false),
-            ("refresh_reason", false),
+        for (column, scope) in [
+            ("plugins_json", PluginIndexJson::Plugins),
+            ("workspace_dir", PluginIndexJson::Path),
         ] {
             let exists = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('installed_plugin_index') WHERE name = ?1)",
@@ -892,13 +1023,13 @@ fn relocate_plugin_records_in_database(
                 queries.push((
                     format!("SELECT {column} FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'"),
                     format!("UPDATE installed_plugin_index SET {column} = ?1 WHERE index_key = 'installed-plugin-index'"),
-                    json,
+                    scope,
                 ));
             }
         }
     }
     let mut changed = false;
-    for (select_sql, update_sql, json) in queries {
+    for (select_sql, update_sql, scope) in queries {
         let raw_records = if matches!(relocation, PluginPathRelocation::Archived) {
             connection
                 .query_row(&select_sql, [], |row| row.get::<_, Option<String>>(0))
@@ -919,7 +1050,7 @@ fn relocate_plugin_records_in_database(
             continue;
         };
         let rewritten = if matches!(relocation, PluginPathRelocation::Archived) {
-            if json {
+            if !matches!(scope, PluginIndexJson::Path) {
                 serde_json::from_str::<serde::de::IgnoredAny>(&raw_records).map_err(|error| {
                     format!(
                         "failed to parse imported OpenClaw plugin index {}: {error}",
@@ -927,12 +1058,13 @@ fn relocate_plugin_records_in_database(
                     )
                 })?;
             }
-            // Keep every non-relocated token verbatim, including numeric metadata.
-            let rewritten = rewrite_runtime_root_references(
-                &raw_records,
-                &display_path(source_state_root),
-                &display_path(target_state_root),
-            )?;
+            let source_root = display_path(source_state_root);
+            let target_root = display_path(target_state_root);
+            let rewritten = if matches!(scope, PluginIndexJson::Path) {
+                rewrite_path_value(&raw_records, &source_root, &target_root)
+            } else {
+                rewrite_plugin_index_json(&raw_records, scope, &source_root, &target_root)?
+            };
             (rewritten != raw_records).then_some(rewritten)
         } else {
             rewrite_plugin_install_records(
