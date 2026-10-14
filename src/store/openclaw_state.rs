@@ -580,7 +580,17 @@ fn rewrite_root_reference_value(
                     && serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok()
             })
     {
-        return rewrite_runtime_root_references(raw, source_root, target_root, true);
+        // Nested content consists entirely of complete serialized values.
+        // Decode those values directly; file-level recovery framing stays above.
+        let mut output = String::with_capacity(raw.len());
+        for line in raw.split_inclusive('\n') {
+            output.push_str(&rewrite_root_reference_value(
+                line,
+                source_root,
+                target_root,
+            )?);
+        }
+        return Ok(output);
     }
     Ok(rewrite_rooted_text(raw, source_root, target_root))
 }
@@ -723,38 +733,43 @@ fn file_url_starts(raw: &str) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
-fn is_complete_file_url_value(value: &str, source_root: &str) -> bool {
-    if !value
-        .get(..5)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
-        || value.chars().any(char::is_control)
-        || file_url_starts(value).nth(1).is_some()
-    {
-        return false;
-    }
-    let Some(space) = value.find(char::is_whitespace) else {
-        return true;
-    };
-    let comparison = root_comparison(value);
+fn plain_root_references(
+    raw: &str,
+    source_root: &str,
+    quoted: &[std::ops::Range<usize>],
+) -> Vec<usize> {
+    let comparison = root_comparison(raw);
     let source = root_comparison(source_root);
-    !comparison.match_indices(source.as_ref()).any(|(start, _)| {
-        start > space
-            && value[..start]
+    let mut quote_index = 0;
+    comparison
+        .match_indices(source.as_ref())
+        .filter_map(|(start, _)| {
+            let end = start + source_root.len();
+            while quoted
+                .get(quote_index)
+                .is_some_and(|range| range.end <= start)
+            {
+                quote_index += 1;
+            }
+            let enclosing = quoted
+                .get(quote_index)
+                .filter(|range| range.start <= start && range.end >= end);
+            let before = raw[..start]
                 .chars()
                 .next_back()
-                .is_some_and(reference_boundary)
-            && value[start + source_root.len()..]
+                .is_none_or(reference_boundary);
+            let after = raw[end..]
                 .chars()
                 .next()
                 .is_none_or(std::path::is_separator)
-    })
+                || enclosing.is_some_and(|range| range.end == end)
+                || (enclosing.is_none() && raw[end..].starts_with(['\r', '\n']));
+            (before && after).then_some(start)
+        })
+        .collect()
 }
 
 fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> String {
-    if is_complete_file_url_value(raw, source_root) {
-        return rewrite_file_url(raw, source_root, target_root, true)
-            .unwrap_or_else(|| raw.to_string());
-    }
     // File URLs have their own escaping and authority rules. Preserve other URL
     // components and never interpret an external URL as a local command path.
     let quoted = quoted_value_ranges(raw);
@@ -762,25 +777,9 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     let mut urls = Vec::new();
     let mut edits = Vec::new();
     let starts: Vec<_> = file_url_starts(raw).collect();
-    let comparison = root_comparison(raw);
-    let source_comparison = root_comparison(source_root);
+    let plain = plain_root_references(raw, source_root, &quoted);
     let mut boundaries = starts.clone();
-    boundaries.extend(
-        comparison
-            .match_indices(source_comparison.as_ref())
-            .filter_map(|(start, _)| {
-                let end = start + source_root.len();
-                (raw[..start]
-                    .chars()
-                    .next_back()
-                    .is_none_or(reference_boundary)
-                    && raw[end..]
-                        .chars()
-                        .next()
-                        .is_none_or(std::path::is_separator))
-                .then_some(start)
-            }),
-    );
+    boundaries.extend(plain.iter().copied());
     boundaries.sort_unstable();
     boundaries.dedup();
     let line_ends: Vec<_> = raw
@@ -860,24 +859,10 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
                 value_end = start + raw[start..value_end].trim_end().len();
             }
         }
-        let complete_value = is_complete_file_url_value(&raw[start..value_end], source_root);
-        let end = if complete_value {
-            value_end
-        } else {
-            raw[start..value_end]
-                .find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
-                .map_or(value_end, |offset| start + offset)
-        };
-        let range = start..end;
-        if let Some(relocated) = rewrite_file_url(
-            &raw[range.clone()],
-            source_root,
-            target_root,
-            (complete_value && end == value_end)
-                || end == enclosing_end
-                || raw[end..].starts_with(['\r', '\n'])
-                || (raw[..start].ends_with('<') && raw[end..].starts_with('>')),
-        ) {
+        // This selected span is the complete URI candidate. Never fall back
+        // to a whitespace-truncated prefix: ownership can change after spaces.
+        let range = start..value_end;
+        if let Some(relocated) = rewrite_file_url(&raw[range.clone()], source_root, target_root) {
             edits.push((range.clone(), relocated));
         }
         urls.push(range);
@@ -885,38 +870,13 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     // Free-form text has no filesystem or command-language schema. Apply the
     // root boundary rule literally, without interpreting arguments or '..'.
     // Keep the original value intact while locating both URLs and plain paths.
-    let comparison = root_comparison(raw);
-    let source_comparison = root_comparison(source_root);
     let mut url_index = 0;
-    let mut quote_index = 0;
-    for (start, _) in comparison.match_indices(source_comparison.as_ref()) {
+    for start in plain {
         let end = start + source_root.len();
         while urls.get(url_index).is_some_and(|range| range.end <= start) {
             url_index += 1;
         }
-        if urls.get(url_index).is_some_and(|range| range.start < end) {
-            continue;
-        }
-        while quoted
-            .get(quote_index)
-            .is_some_and(|range| range.end <= start)
-        {
-            quote_index += 1;
-        }
-        let enclosing = quoted
-            .get(quote_index)
-            .filter(|range| range.start <= start && range.end >= end);
-        let before = raw[..start]
-            .chars()
-            .next_back()
-            .is_none_or(reference_boundary);
-        let after = raw[end..]
-            .chars()
-            .next()
-            .is_none_or(std::path::is_separator)
-            || enclosing.is_some_and(|range| range.end == end)
-            || (enclosing.is_none() && raw[end..].starts_with(['\r', '\n']));
-        if before && after {
+        if !urls.get(url_index).is_some_and(|range| range.start < end) {
             edits.push((start..end, target_root.to_string()));
         }
     }
@@ -965,12 +925,7 @@ fn uri_path_prefix_length(raw: &str, prefix: &str) -> Option<usize> {
     raw.is_char_boundary(offset).then_some(offset)
 }
 
-fn rewrite_file_url(
-    value: &str,
-    source_root: &str,
-    target_root: &str,
-    complete_end: bool,
-) -> Option<String> {
+fn rewrite_file_url(value: &str, source_root: &str, target_root: &str) -> Option<String> {
     if value.chars().any(char::is_control) {
         return None;
     }
@@ -980,13 +935,6 @@ fn rewrite_file_url(
     let canonical_source = source_url.to_file_path().ok()?;
     let path = path.to_str()?;
     let canonical_source = canonical_source.to_str()?;
-    if !complete_end
-        && root_comparison(path) == root_comparison(canonical_source)
-        && url.query().is_none()
-        && url.fragment().is_none()
-    {
-        return None;
-    }
     let relocated = relocate_rooted_path(path, canonical_source, target_root)?;
     // URL parsing establishes ownership; splice only the encoded root in the
     // original representation so filenames, query data and surrounding text
@@ -1033,7 +981,7 @@ fn rewrite_file_url(
 
 fn rewrite_path_value(value: &str, source_root: &str, target_root: &str) -> String {
     relocate_rooted_path(value, source_root, target_root)
-        .or_else(|| rewrite_file_url(value, source_root, target_root, true))
+        .or_else(|| rewrite_file_url(value, source_root, target_root))
         .unwrap_or_else(|| value.to_string())
 }
 
@@ -2396,7 +2344,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                rewrite_file_url(original, source, target, true).as_deref(),
+                rewrite_file_url(original, source, target).as_deref(),
                 Some(expected)
             );
         }

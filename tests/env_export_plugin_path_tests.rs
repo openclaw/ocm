@@ -766,6 +766,16 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             .as_object_mut()
             .unwrap()
             .extend(url_cases.as_object().unwrap().clone());
+        runtime["quotedTerminalRoot"] = json!(format!(
+            "echo \"{}/a b/../../outside {}\"",
+            url::Url::from_file_path(&source).unwrap(),
+            source.display()
+        ));
+        runtime["lineTerminalRoot"] = json!(format!(
+            "{}/a b/../../outside {}\n",
+            url::Url::from_file_path(&source).unwrap(),
+            source.display()
+        ));
         write_text(&source.join(runtime_file), &runtime.to_string());
         write_text(
             &source.join(".openclaw/logs/root.txt"),
@@ -1085,6 +1095,16 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             json!(format!("{{}}\n\"node {}/plugin", target.display()));
         expected_runtime["mixedUrlAndPlainEscape"] = json!(format!(
             "{}/a b/../../outside {}/plugin",
+            url::Url::from_file_path(&source).unwrap(),
+            target.display()
+        ));
+        expected_runtime["quotedTerminalRoot"] = json!(format!(
+            "echo \"{}/a b/../../outside {}\"",
+            url::Url::from_file_path(&source).unwrap(),
+            target.display()
+        ));
+        expected_runtime["lineTerminalRoot"] = json!(format!(
+            "{}/a b/../../outside {}\n",
             url::Url::from_file_path(&source).unwrap(),
             target.display()
         ));
