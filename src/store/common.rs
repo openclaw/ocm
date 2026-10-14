@@ -455,7 +455,14 @@ fn copy_path_inner(
     let file_type = metadata.file_type();
 
     if file_type.is_symlink() {
-        return copy_symlink(source, destination);
+        #[cfg(windows)]
+        let directory_hint = private_root.map(|_| {
+            use std::os::windows::fs::FileTypeExt;
+            file_type.is_symlink_dir()
+        });
+        #[cfg(not(windows))]
+        let directory_hint = None;
+        return copy_symlink(source, destination, directory_hint);
     }
     if file_type.is_dir() {
         return copy_dir_recursive_inner(source, destination, copying, private_root);
@@ -472,7 +479,11 @@ fn copy_path_inner(
         .map_err(|error| error.to_string())
 }
 
-fn copy_symlink(source_path: &Path, destination_path: &Path) -> Result<(), String> {
+fn copy_symlink(
+    source_path: &Path,
+    destination_path: &Path,
+    _directory_hint: Option<bool>,
+) -> Result<(), String> {
     if let Some(parent) = destination_path.parent() {
         ensure_dir(parent)?;
     }
@@ -484,9 +495,13 @@ fn copy_symlink(source_path: &Path, destination_path: &Path) -> Result<(), Strin
     }
     #[cfg(windows)]
     {
-        std::os::windows::fs::symlink_file(&target, destination_path)
-            .or_else(|_| std::os::windows::fs::symlink_dir(&target, destination_path))
-            .map_err(|error| error.to_string())?;
+        match _directory_hint {
+            Some(true) => std::os::windows::fs::symlink_dir(&target, destination_path),
+            Some(false) => std::os::windows::fs::symlink_file(&target, destination_path),
+            None => std::os::windows::fs::symlink_file(&target, destination_path)
+                .or_else(|_| std::os::windows::fs::symlink_dir(&target, destination_path)),
+        }
+        .map_err(|error| error.to_string())?;
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -951,6 +966,76 @@ mod archive_privacy_windows_tests {
     use super::*;
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    #[test]
+    fn private_config_state_archive_directory_links_round_trip() {
+        use crate::infra::archive::{
+            EnvArchiveOptions, extract_env_archive, restore_env_archive_directory_permissions,
+            write_env_archive_with_options,
+        };
+        use std::collections::BTreeSet;
+        use std::os::windows::fs::FileTypeExt;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let data = home.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let database = rusqlite::Connection::open(data.join("records.db")).unwrap();
+        database.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE entries(value TEXT); INSERT INTO entries VALUES ('retained');").unwrap();
+        let link = home.join("history");
+        let created = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&data)
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let output = root.path().join("archive.tar");
+        write_env_archive_with_options(
+            &serde_json::json!({}),
+            &home,
+            &output,
+            EnvArchiveOptions {
+                sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
+                relocate_internal_symlinks: true,
+                private_output: true,
+                ..EnvArchiveOptions::default()
+            },
+        )
+        .unwrap();
+        drop(database);
+        fs::rename(&home, root.path().join("offline")).unwrap();
+        let staging = root.path().join("staging");
+        ensure_private_dir(&staging).unwrap();
+        let extracted = extract_env_archive::<serde_json::Value>(&output, &staging).unwrap();
+        restore_env_archive_directory_permissions(&output, &staging).unwrap();
+        assert!(
+            fs::symlink_metadata(extracted.root_dir.join("history"))
+                .unwrap()
+                .file_type()
+                .is_symlink_dir()
+        );
+        let target = root.path().join("target");
+        copy_dir_preserving_permissions(&extracted.root_dir, &target).unwrap();
+        assert!(
+            fs::symlink_metadata(target.join("history"))
+                .unwrap()
+                .file_type()
+                .is_symlink_dir()
+        );
+        let restored =
+            rusqlite::Connection::open(target.join("history").join("records.db")).unwrap();
+        assert_eq!(
+            restored
+                .query_row("SELECT value FROM entries", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "retained"
+        );
+    }
 
     #[test]
     fn private_config_archive_directory_has_user_only_access() {

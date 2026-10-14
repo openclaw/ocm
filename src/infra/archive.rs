@@ -276,6 +276,10 @@ fn append_env_root(
     } else {
         Some(ArchiveSource::open(source_root)?)
     };
+    let source_root = capture
+        .as_ref()
+        .map(|source| source.root.as_path())
+        .unwrap_or(source_root);
     if let Some(source) = &capture {
         append_directory_header(
             builder,
@@ -292,8 +296,17 @@ fn append_env_root(
                 ))
             })?;
     }
-    let mut stack = sorted_child_paths(source_root)
-        .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
+    let mut stack = if let Some(source) = &capture {
+        source
+            .children(Path::new(""), &source.metadata()?)?
+            .1
+            .into_iter()
+            .map(|name| source_root.join(name))
+            .collect()
+    } else {
+        sorted_child_paths(source_root)
+            .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?
+    };
     let mut state_databases = BTreeSet::new();
     let mut state_sidecars = BTreeSet::new();
     if options.sqlite_content_roots.contains(Path::new("")) {
@@ -358,8 +371,10 @@ fn append_env_root(
 
         let archive_path = Path::new(ENV_ARCHIVE_ROOT_DIR).join(relative_path);
         if metadata.is_dir() {
-            if capture.is_some() {
-                append_directory_header(builder, &archive_path, &metadata)?;
+            let mut children = if let Some(source) = &capture {
+                let (directory_metadata, names) = source.children(relative_path, &metadata)?;
+                append_directory_header(builder, &archive_path, &directory_metadata)?;
+                names.into_iter().map(|name| path.join(name)).collect()
             } else {
                 builder.append_dir(&archive_path, &path).map_err(|error| {
                     EnvArchiveWriteError::from_entry_io(io_error_with_context(
@@ -367,9 +382,8 @@ fn append_env_root(
                         format!("failed to archive {}", path.display()),
                     ))
                 })?;
-            }
-            let mut children =
-                sorted_child_paths(&path).map_err(EnvArchiveWriteError::from_entry_io)?;
+                sorted_child_paths(&path).map_err(EnvArchiveWriteError::from_entry_io)?
+            };
             if discover_sqlite {
                 classify_sqlite_children(
                     &children,
@@ -457,16 +471,31 @@ fn append_env_root(
         if metadata.is_symlink() && (discover_sqlite || options.relocate_internal_symlinks) {
             let source = capture.as_ref().unwrap();
             let captured_target = source.link(relative_path, &metadata)?;
-            let target = if options.relocate_internal_symlinks {
+            let owned = if options.relocate_internal_symlinks {
                 owned_archive_link_target(
                     &source.root.join(relative_path),
                     &source.root,
                     &captured_target,
                 )?
-                .unwrap_or(captured_target)
             } else {
-                captured_target
+                None
             };
+            #[cfg(windows)]
+            let directory_link = {
+                use std::os::windows::fs::FileTypeExt;
+                metadata.file_type().is_symlink_dir()
+            };
+            #[cfg(not(windows))]
+            let directory_link = owned
+                .as_ref()
+                .is_some_and(|(_, relative)| source.directory(relative, None).is_ok());
+            let target = owned.map(|(target, _)| target).unwrap_or(captured_target);
+            if directory_link {
+                // Established PAX metadata preserves directory links on Windows.
+                builder
+                    .append_pax_extensions([("LIBARCHIVE.symlinktype", &b"dir"[..])])
+                    .map_err(EnvArchiveWriteError::from_entry_io)?;
+            }
             let mut header = Header::new_gnu();
             header.set_metadata(&metadata);
             header.set_entry_type(tar::EntryType::Symlink);
@@ -559,6 +588,81 @@ impl ArchiveSource {
         }
         #[cfg(not(any(unix, windows)))]
         Ok(Self { root })
+    }
+
+    fn directory(
+        &self,
+        relative: &Path,
+        expected: Option<&fs::Metadata>,
+    ) -> Result<CapturedArchiveFile, EnvArchiveWriteError> {
+        let components = relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(name) => Ok(name),
+                _ => Err(EnvArchiveWriteError::Fatal(
+                    "invalid relative archive directory".to_string(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(unix)]
+        let file = self.open_unix(&components, true)?;
+        #[cfg(windows)]
+        let (file, directories) = {
+            let mut path = self.root.clone();
+            let mut directories = Vec::new();
+            for component in components {
+                path.push(component);
+                directories.push(open_archive_windows_entry(&path, true)?);
+            }
+            let file = directories
+                .last()
+                .unwrap_or_else(|| self._directories.last().unwrap())
+                .try_clone()
+                .map_err(EnvArchiveWriteError::from_entry_io)?;
+            (file, directories)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let file =
+            File::open(self.root.join(relative)).map_err(EnvArchiveWriteError::from_entry_io)?;
+        let actual = file
+            .metadata()
+            .map_err(EnvArchiveWriteError::from_entry_io)?;
+        if !actual.is_dir()
+            || expected.is_some_and(|expected| !archive_identity_matches(expected, &actual))
+        {
+            return Err(EnvArchiveWriteError::EntryDisappeared(
+                "archive directory was replaced".to_string(),
+            ));
+        }
+        Ok(CapturedArchiveFile {
+            file,
+            #[cfg(windows)]
+            _directories: directories,
+        })
+    }
+
+    fn children(
+        &self,
+        relative: &Path,
+        expected: &fs::Metadata,
+    ) -> Result<(fs::Metadata, Vec<std::ffi::OsString>), EnvArchiveWriteError> {
+        let directory = self.directory(relative, Some(expected))?;
+        let metadata = directory
+            .file
+            .metadata()
+            .map_err(EnvArchiveWriteError::from_entry_io)?;
+        #[cfg(unix)]
+        let mut names = archive_directory_names(&directory.file)
+            .map_err(EnvArchiveWriteError::from_entry_io)?;
+        #[cfg(not(unix))]
+        let mut names = fs::read_dir(self.root.join(relative))
+            .map_err(EnvArchiveWriteError::from_entry_io)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(EnvArchiveWriteError::from_entry_io)?;
+        names.sort();
+        names.reverse();
+        Ok((metadata, names))
     }
 
     fn metadata(&self) -> Result<fs::Metadata, EnvArchiveWriteError> {
@@ -773,18 +877,7 @@ impl ArchiveSource {
         let actual = file
             .metadata()
             .map_err(EnvArchiveWriteError::from_entry_io)?;
-        #[cfg(unix)]
-        let same = {
-            use std::os::unix::fs::MetadataExt;
-            actual.dev() == expected.dev() && actual.ino() == expected.ino()
-        };
-        #[cfg(windows)]
-        let same = {
-            use std::os::windows::fs::MetadataExt;
-            actual.creation_time() == expected.creation_time()
-        };
-        #[cfg(not(any(unix, windows)))]
-        let same = actual.created().ok() == expected.created().ok();
+        let same = archive_identity_matches(expected, &actual);
         if !actual.is_file() || !same {
             return Err(EnvArchiveWriteError::EntryDisappeared(
                 "archive source was replaced".to_string(),
@@ -795,6 +888,86 @@ impl ArchiveSource {
             #[cfg(windows)]
             _directories: directories,
         })
+    }
+}
+
+fn archive_identity_matches(expected: &fs::Metadata, actual: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        actual.dev() == expected.dev() && actual.ino() == expected.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        actual.creation_time() == expected.creation_time()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        actual.created().ok() == expected.created().ok()
+    }
+}
+
+#[cfg(unix)]
+fn archive_directory_names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
+    use std::ffi::{CStr, OsString};
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::unix::ffi::OsStringExt;
+    struct DirectoryStream(*mut libc::DIR);
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let fd = directory.try_clone()?.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        drop(unsafe { File::from_raw_fd(fd) });
+        return Err(error);
+    }
+    let stream = DirectoryStream(stream);
+    let mut names = Vec::new();
+    loop {
+        #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+        let errno = unsafe { libc::__error() };
+        #[cfg(any(target_os = "linux", target_os = "dragonfly"))]
+        let errno = unsafe { libc::__errno_location() };
+        #[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+        let errno = unsafe { libc::__errno() };
+        #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+        let errno = unsafe { libc::___errno() };
+        #[cfg(not(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "android",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "solaris",
+            target_os = "illumos"
+        )))]
+        let errno: *mut libc::c_int = std::ptr::null_mut();
+        if errno.is_null() {
+            return Err(io::Error::other(
+                "directory enumeration is unavailable on this platform",
+            ));
+        }
+        unsafe { *errno = 0 };
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = unsafe { *errno };
+            if error != 0 {
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            return Ok(names);
+        }
+        // readdir owns this NUL-terminated name until the next call.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsString::from_vec(name.to_vec()));
+        }
     }
 }
 
@@ -859,7 +1032,7 @@ fn owned_archive_link_target(
     path: &Path,
     source_root: &Path,
     captured_target: &Path,
-) -> Result<Option<PathBuf>, EnvArchiveWriteError> {
+) -> Result<Option<(PathBuf, PathBuf)>, EnvArchiveWriteError> {
     let target_path = if captured_target.is_absolute() {
         captured_target.to_path_buf()
     } else {
@@ -893,7 +1066,7 @@ fn owned_archive_link_target(
     if relative.as_os_str().is_empty() {
         relative.push(".");
     }
-    Ok(Some(relative))
+    Ok(Some((relative, target.to_path_buf())))
 }
 
 fn classify_sqlite_children(
@@ -1087,6 +1260,8 @@ pub(crate) fn restore_env_archive_directory_permissions(
 ) -> Result<(), String> {
     let file = File::open(archive_path).map_err(|error| error.to_string())?;
     let mut archive = Archive::new(file);
+    #[cfg(windows)]
+    let mut directory_links = BTreeSet::new();
     // Seek over payloads: only directory headers need a second pass. Use tar's
     // containment checks, and never enable special permission bits on files.
     for entry in archive
@@ -1094,6 +1269,29 @@ pub(crate) fn restore_env_archive_directory_permissions(
         .map_err(|error| error.to_string())?
     {
         let mut entry = entry.map_err(|error| error.to_string())?;
+        #[cfg(windows)]
+        {
+            let path = entry
+                .path()
+                .map_err(|error| error.to_string())?
+                .into_owned();
+            directory_links.remove(&path);
+            if path.starts_with(ENV_ARCHIVE_ROOT_DIR) && entry.header().entry_type().is_symlink() {
+                if let Some(attributes) =
+                    entry.pax_extensions().map_err(|error| error.to_string())?
+                {
+                    for attribute in attributes {
+                        let attribute = attribute.map_err(|error| error.to_string())?;
+                        if attribute.key_bytes() == b"LIBARCHIVE.symlinktype"
+                            && attribute.value_bytes() == b"dir"
+                        {
+                            directory_links.insert(path.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         if entry.header().entry_type().is_dir()
             && entry
                 .path()
@@ -1108,6 +1306,44 @@ pub(crate) fn restore_env_archive_directory_permissions(
                 return Err("archive directory escaped staging".to_string());
             }
         }
+    }
+    #[cfg(windows)]
+    for path in directory_links {
+        use std::os::windows::fs::FileTypeExt;
+        let relative = path
+            .strip_prefix(ENV_ARCHIVE_ROOT_DIR)
+            .map_err(|_| "archive link is outside root/")?;
+        let components = relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(name) => Ok(name),
+                _ => Err("invalid archived directory link path"),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some((leaf, parents)) = components.split_last() else {
+            return Err("empty archived directory link path".to_string());
+        };
+        let mut path = staging_dir.join(ENV_ARCHIVE_ROOT_DIR);
+        for parent in parents {
+            path.push(parent);
+            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if !metadata.is_dir() || metadata.is_symlink() {
+                return Err("archived directory link has a linked parent".to_string());
+            }
+        }
+        path.push(leaf);
+        let kind = fs::symlink_metadata(&path)
+            .map_err(|error| error.to_string())?
+            .file_type();
+        if kind.is_symlink_dir() {
+            continue;
+        }
+        if !kind.is_symlink() {
+            return Err("archived directory link changed type".to_string());
+        }
+        let target = fs::read_link(&path).map_err(|error| error.to_string())?;
+        fs::remove_file(&path).map_err(|error| error.to_string())?;
+        std::os::windows::fs::symlink_dir(target, &path).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -1301,6 +1537,96 @@ mod tests {
             .query_row("SELECT value FROM records", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "committed");
+    }
+
+    #[cfg(unix)]
+    static DIRECTORY_REPLACEMENT: Mutex<Option<(PathBuf, PathBuf, usize)>> = Mutex::new(None);
+
+    #[cfg(unix)]
+    fn replace_observed_directory(path: &Path, kind: EnvArchiveEntryKind) -> bool {
+        if path == Path::new("history") && kind == EnvArchiveEntryKind::Directory {
+            let mut fixture = DIRECTORY_REPLACEMENT.lock().unwrap();
+            let (source, outside, visits) = fixture.as_mut().unwrap();
+            *visits += 1;
+            if *visits == 2 {
+                fs::rename(source.join("history"), source.join("saved")).unwrap();
+                std::os::unix::fs::symlink(outside, source.join("history")).unwrap();
+            }
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_directory_enumeration_does_not_follow_a_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("home");
+        let outside = fixture.path().join("outside");
+        fs::create_dir_all(source.join("history/owned")).unwrap();
+        fs::create_dir_all(outside.join("external-directory/private-name")).unwrap();
+        *DIRECTORY_REPLACEMENT.lock().unwrap() = Some((source.clone(), outside, 0));
+        let output = fixture.path().join("archive.tar");
+        write_env_archive_with_options(
+            &serde_json::json!({}),
+            &source,
+            &output,
+            EnvArchiveOptions {
+                sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
+                should_exclude_path: replace_observed_directory,
+                relocate_internal_symlinks: true,
+                private_output: true,
+                ..EnvArchiveOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(DIRECTORY_REPLACEMENT.lock().unwrap().take().unwrap().2, 2);
+        let mut archive = tar::Archive::new(fs::File::open(output).unwrap());
+        for entry in archive.entries().unwrap() {
+            assert!(
+                !entry
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("external-directory")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_directory_links_include_portable_type_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("home");
+        fs::create_dir_all(source.join("data")).unwrap();
+        std::os::unix::fs::symlink("data", source.join("history")).unwrap();
+        let output = root.path().join("archive.tar");
+        write_env_archive_with_options(
+            &serde_json::json!({}),
+            &source,
+            &output,
+            EnvArchiveOptions {
+                sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
+                relocate_internal_symlinks: true,
+                private_output: true,
+                ..EnvArchiveOptions::default()
+            },
+        )
+        .unwrap();
+        let mut archive = tar::Archive::new(fs::File::open(output).unwrap());
+        let mut found = false;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap() == Path::new("root/history") {
+                assert!(entry.pax_extensions().unwrap().unwrap().any(|attribute| {
+                    let attribute = attribute.unwrap();
+                    attribute.key_bytes() == b"LIBARCHIVE.symlinktype"
+                        && attribute.value_bytes() == b"dir"
+                }));
+                found = true;
+            }
+        }
+        assert!(found);
     }
 
     #[cfg(unix)]

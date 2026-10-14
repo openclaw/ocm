@@ -1184,7 +1184,10 @@ fn openclaw_extension_runtime_debris_roots_with_types(
             .map_err(|error| error.to_string())?;
         let has_runtime_deps_marker = children.iter().any(|child| {
             is_openclaw_runtime_dependency_marker(&child.file_name())
-                && (!typed || child.file_type().is_ok_and(|kind| kind.is_file()))
+                && (!typed
+                    || child
+                        .file_type()
+                        .is_ok_and(|kind| runtime_dependency_entry_kind(&child.file_name(), &kind)))
         });
         let plugin_relative_root = Path::new("extensions").join(entry.file_name());
 
@@ -1196,7 +1199,7 @@ fn openclaw_extension_runtime_debris_roots_with_types(
                 if typed {
                     let kind = child.file_type().map_err(|error| error.to_string())?;
                     let expected_kind = if is_openclaw_runtime_dependency_marker(&name) {
-                        kind.is_file()
+                        runtime_dependency_entry_kind(&name, &kind)
                     } else {
                         kind.is_dir()
                     };
@@ -1210,6 +1213,17 @@ fn openclaw_extension_runtime_debris_roots_with_types(
     }
 
     Ok(excluded)
+}
+
+fn runtime_dependency_entry_kind(name: &OsStr, kind: &fs::FileType) -> bool {
+    if matches!(
+        name.to_str(),
+        Some(".openclaw-runtime-deps.json" | ".openclaw-runtime-deps-stamp.json")
+    ) {
+        kind.is_file()
+    } else {
+        kind.is_dir()
+    }
 }
 
 fn is_openclaw_runtime_dependency_marker(name: &OsStr) -> bool {
