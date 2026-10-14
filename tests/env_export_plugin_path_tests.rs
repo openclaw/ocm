@@ -653,7 +653,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             )
             .unwrap();
             db.execute("UPDATE installed_plugin_index SET plugins_json=?1, diagnostics_json=?2, workspace_dir=?3 WHERE index_key='installed-plugin-index'",
-                [&plugins_raw, &diagnostics_raw, source.to_str().unwrap()]).unwrap();
+                [&plugins_raw, &diagnostics_raw, source.join("../source/workspace").to_str().unwrap()]).unwrap();
             (
                 "SELECT install_records_json FROM installed_plugin_index WHERE index_key='installed-plugin-index'",
                 records.clone(),
@@ -1012,7 +1012,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
                         .join("openclaw.plugin.json")
                 )
             );
-            assert_eq!(db.query_row("SELECT workspace_dir FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get::<_, String>(0)).unwrap(), target.to_str().unwrap());
+            assert_eq!(db.query_row("SELECT workspace_dir FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get::<_, String>(0)).unwrap(), target.join("workspace").to_str().unwrap());
             let diagnostics: String = db.query_row("SELECT diagnostics_json FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get(0)).unwrap();
             assert_eq!(
                 diagnostics,

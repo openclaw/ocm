@@ -302,7 +302,7 @@ fn relocate_archived_databases(
             selection.read_agent_registry(&database, true)?;
         }
     }
-    let mut directories = vec![paths.state_dir.clone()];
+    let mut directories = vec![paths.root.clone()];
     while let Some(directory) = directories.pop() {
         for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
@@ -378,9 +378,9 @@ fn rewrite_database_root_references(
         let schema = tx.prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*' ORDER BY name")?
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
-        // FTS text belongs to the virtual table. Updating its backing tables
-        // directly would leave search indexes out of sync. External-content
-        // indexes also need a rebuild because stored triggers are disabled.
+        // Update logical FTS text before its external content tables, while old
+        // values are still available to remove their index entries. This avoids
+        // rewriting binary backing tables or rebuilding unchanged indexes.
         let full_text = schema
             .iter()
             .filter_map(|(name, sql)| {
@@ -400,16 +400,18 @@ fn rewrite_database_root_references(
                     .map(|suffix| format!("{name}_{suffix}"))
             })
             .collect::<BTreeSet<_>>();
-        let mut tables = schema
-            .into_iter()
-            .filter_map(|(name, sql)| {
-                (!sql.to_ascii_lowercase().starts_with("create virtual table")
-                    && !shadows.contains(&name))
-                .then_some(name)
-            })
-            .collect::<Vec<_>>();
-        tables.extend(full_text.iter().cloned());
-        tx.execute_batch("CREATE TEMP TABLE ocm_root_rewrites (column_id INTEGER, original BLOB, replacement TEXT NOT NULL, PRIMARY KEY(column_id, original)) WITHOUT ROWID")?;
+        let mut tables = full_text.iter().cloned().collect::<Vec<_>>();
+        tables.extend(
+            schema
+                .into_iter()
+                .filter_map(|(name, sql)| {
+                    (!sql.to_ascii_lowercase().starts_with("create virtual table")
+                        && !shadows.contains(&name))
+                    .then_some(name)
+                })
+                .collect::<Vec<_>>(),
+        );
+        tx.execute_batch("CREATE TEMP TABLE ocm_root_rewrites (column_id INTEGER, original TEXT COLLATE BINARY, replacement TEXT NOT NULL, PRIMARY KEY(column_id, original)) WITHOUT ROWID")?;
         let mut changed = 0;
         for table in tables {
             let columns = tx
@@ -428,28 +430,42 @@ fn rewrite_database_root_references(
             let mut changed_columns = BTreeSet::new();
             if !quoted.is_empty() {
                 // Scan each table once. TEMP storage retains only changed text,
-                // indexed by exact bytes rather than the column's collation.
+                // compared with BINARY collation across database text encodings.
                 let mut read =
                     tx.prepare(&format!("SELECT {} FROM main.{table}", quoted.join(", ")))?;
                 let mut rows = read.query([])?;
                 while let Some(row) = rows.next()? {
-                    for (index, (id, _)) in columns.iter().enumerate() {
+                    for (index, (id, name)) in columns.iter().enumerate() {
                         let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(index)? else {
                             continue;
                         };
                         let original = std::str::from_utf8(bytes)?;
-                        let replacement = rewrite_runtime_root_references(
-                            original,
-                            source_root,
-                            target_root,
-                            false,
-                        )?;
+                        let path_column =
+                            matches!(name.as_str(), "path" | "cwd" | "source" | "workspace")
+                                || ["Path", "Dir", "Root", "_path", "_dir", "_root"]
+                                    .iter()
+                                    .any(|suffix| name.ends_with(suffix));
+                        let replacement = if path_column
+                            && (Path::new(original).is_absolute()
+                                || original
+                                    .get(..5)
+                                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:")))
+                        {
+                            rewrite_path_value(original, source_root, target_root)
+                        } else {
+                            rewrite_runtime_root_references(
+                                original,
+                                source_root,
+                                target_root,
+                                false,
+                            )?
+                        };
                         if replacement == original {
                             continue;
                         }
                         tx.execute(
                             "INSERT OR IGNORE INTO temp.ocm_root_rewrites VALUES (?1, ?2, ?3)",
-                            rusqlite::params![id, bytes, replacement],
+                            rusqlite::params![id, original, replacement],
                         )?;
                         changed += 1;
                         changed_columns.insert(index);
@@ -462,7 +478,7 @@ fn rewrite_database_root_references(
                 let id = columns[index].0;
                 let column = &quoted[index];
                 let lookup = format!(
-                    "SELECT replacement FROM temp.ocm_root_rewrites WHERE column_id = {id} AND original = CAST(ocm_source.{column} AS BLOB) AND typeof(ocm_source.{column}) = 'text'"
+                    "SELECT replacement FROM temp.ocm_root_rewrites WHERE column_id = {id} AND original = ocm_source.{column} COLLATE BINARY AND typeof(ocm_source.{column}) = 'text'"
                 );
                 assignments.push(format!(
                     "{column} = COALESCE(({lookup}), ocm_source.{column})"
@@ -483,15 +499,6 @@ fn rewrite_database_root_references(
                 )?;
             }
             tx.execute("DELETE FROM temp.ocm_root_rewrites", [])?;
-        }
-        if changed != 0 {
-            for name in &full_text {
-                let table = quote_sql_identifier(name);
-                tx.execute(
-                    &format!("INSERT INTO main.{table} ({table}) VALUES ('rebuild')"),
-                    [],
-                )?;
-            }
         }
         tx.commit()?;
         Ok(changed)
