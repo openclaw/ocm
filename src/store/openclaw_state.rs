@@ -157,6 +157,7 @@ pub(crate) fn openclaw_env_state_archive_options(
 fn should_exclude_state_archive_path(path: &Path, kind: EnvArchiveEntryKind) -> bool {
     let name = path.file_name().unwrap_or_default();
     if path.parent() == Some(Path::new(".openclaw"))
+        && kind == EnvArchiveEntryKind::Directory
         && matches!(
             name.to_str(),
             Some(
