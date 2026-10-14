@@ -11,9 +11,9 @@ use time::OffsetDateTime;
 use zip::ZipArchive;
 
 use crate::env::{default_service_enabled, default_service_running};
-use crate::infra::sqlite_snapshot::{
-    create_sqlite_snapshot, create_sqlite_snapshot_no_follow, file_is_sqlite_database,
-};
+#[cfg(not(target_os = "linux"))]
+use crate::infra::sqlite_snapshot::create_sqlite_snapshot_no_follow;
+use crate::infra::sqlite_snapshot::{create_sqlite_snapshot, file_is_sqlite_database};
 
 pub const ENV_ARCHIVE_METADATA_PATH: &str = "meta/env.json";
 pub const ENV_ARCHIVE_ROOT_DIR: &str = "root";
@@ -182,6 +182,15 @@ pub fn write_env_archive_with_options<T: Serialize>(
         None
     };
     let source_root = resolved_root.as_deref().unwrap_or(source_root);
+    let capture = if options.sqlite_content_roots.is_empty() && !options.relocate_internal_symlinks
+    {
+        None
+    } else {
+        Some(
+            ArchiveSource::open_canonical(source_root)
+                .map_err(EnvArchiveWriteError::into_message)?,
+        )
+    };
     let parent = output_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -229,7 +238,13 @@ pub fn write_env_archive_with_options<T: Serialize>(
         } else {
             File::create(output_path).map_err(|error| error.to_string())?
         };
-        match write_env_archive_attempt(metadata, source_root, file, options.clone()) {
+        match write_env_archive_attempt(
+            metadata,
+            source_root,
+            file,
+            options.clone(),
+            capture.as_ref(),
+        ) {
             Ok(()) => {
                 if let Some(staged) = staged {
                     staged
@@ -251,6 +266,7 @@ fn write_env_archive_attempt<T: Serialize>(
     source_root: &Path,
     file: File,
     options: EnvArchiveOptions,
+    capture: Option<&ArchiveSource>,
 ) -> Result<(), EnvArchiveWriteError> {
     let mut builder = Builder::new(file);
     builder.follow_symlinks(false);
@@ -269,7 +285,7 @@ fn write_env_archive_attempt<T: Serialize>(
             Cursor::new(metadata_bytes),
         )
         .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
-    append_env_root(&mut builder, source_root, &options)?;
+    append_env_root(&mut builder, source_root, &options, capture)?;
     builder
         .finish()
         .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))
@@ -279,18 +295,12 @@ fn append_env_root(
     builder: &mut Builder<File>,
     source_root: &Path,
     options: &EnvArchiveOptions,
+    capture: Option<&ArchiveSource>,
 ) -> Result<(), EnvArchiveWriteError> {
-    let capture = if options.sqlite_content_roots.is_empty() && !options.relocate_internal_symlinks
-    {
-        None
-    } else {
-        Some(ArchiveSource::open_canonical(source_root)?)
-    };
     let source_root = capture
-        .as_ref()
         .map(|source| source.root.as_path())
         .unwrap_or(source_root);
-    if let Some(source) = &capture {
+    if let Some(source) = capture {
         append_directory_header(
             builder,
             Path::new(ENV_ARCHIVE_ROOT_DIR),
@@ -306,7 +316,7 @@ fn append_env_root(
                 ))
             })?;
     }
-    let mut stack = if let Some(source) = &capture {
+    let mut stack = if let Some(source) = capture {
         source
             .children(Path::new(""), &source.metadata()?)?
             .1
@@ -323,7 +333,7 @@ fn append_env_root(
         classify_sqlite_children(
             &stack,
             source_root,
-            capture.as_ref().unwrap(),
+            capture.unwrap(),
             options,
             &mut state_databases,
             &mut state_sidecars,
@@ -351,7 +361,7 @@ fn append_env_root(
             .iter()
             .any(|root| relative_path.starts_with(root));
         let mut captured = if discover_sqlite && metadata.is_file() {
-            Some(capture.as_ref().unwrap().file(relative_path, &metadata)?)
+            Some(capture.unwrap().file(relative_path, &metadata)?)
         } else {
             None
         };
@@ -381,7 +391,7 @@ fn append_env_root(
 
         let archive_path = Path::new(ENV_ARCHIVE_ROOT_DIR).join(relative_path);
         if metadata.is_dir() {
-            let mut children = if let Some(source) = &capture {
+            let mut children = if let Some(source) = capture {
                 let (directory_metadata, names) = source.children(relative_path, &metadata)?;
                 append_directory_header(builder, &archive_path, &directory_metadata)?;
                 names.into_iter().map(|name| path.join(name)).collect()
@@ -398,7 +408,7 @@ fn append_env_root(
                 classify_sqlite_children(
                     &children,
                     source_root,
-                    capture.as_ref().unwrap(),
+                    capture.unwrap(),
                     options,
                     &mut state_databases,
                     &mut state_sidecars,
@@ -429,8 +439,28 @@ fn append_env_root(
                     path.display()
                 )));
             }
-            let snapshot = if let Some(source) = capture.as_ref().filter(|_| discover_sqlite) {
+            let snapshot = if let Some(source) = capture.filter(|_| discover_sqlite) {
+                #[cfg(target_os = "macos")]
+                let guard = super::archive_path_guard::SqlitePathGuard::new(
+                    &source.root,
+                    &source.metadata()?,
+                    &source.root.join(relative_path),
+                    &source_metadata,
+                )
+                .map_err(EnvArchiveWriteError::from_entry_io)?;
+                #[cfg(target_os = "linux")]
+                let snapshot = {
+                    let parent =
+                        source.directory(relative_path.parent().unwrap_or(Path::new("")), None)?;
+                    super::sqlite_snapshot::create_sqlite_snapshot_in_directory(
+                        &parent.file,
+                        relative_path.file_name().unwrap(),
+                    )
+                };
+                #[cfg(not(target_os = "linux"))]
                 let snapshot = create_sqlite_snapshot_no_follow(&source.root.join(relative_path));
+                #[cfg(target_os = "macos")]
+                guard.check().map_err(EnvArchiveWriteError::from_entry_io)?;
                 // A replaced primary invalidates this attempt, including its sidecar decisions.
                 source.file(relative_path, &source_metadata)?;
                 snapshot.map_err(EnvArchiveWriteError::Fatal)?
@@ -479,7 +509,7 @@ fn append_env_root(
         }
 
         if metadata.is_symlink() && (discover_sqlite || options.relocate_internal_symlinks) {
-            let source = capture.as_ref().unwrap();
+            let source = capture.unwrap();
             let captured_target = source.link(relative_path, &metadata)?;
             let owned = if options.relocate_internal_symlinks {
                 owned_archive_link_target(
@@ -975,7 +1005,7 @@ fn archive_identity_matches(expected: &fs::Metadata, actual: &fs::Metadata) -> b
 #[cfg(unix)]
 fn archive_directory_names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
     use std::ffi::{CStr, OsString};
-    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStringExt;
     struct DirectoryStream(*mut libc::DIR);
     impl Drop for DirectoryStream {
@@ -983,7 +1013,17 @@ fn archive_directory_names(directory: &File) -> io::Result<Vec<std::ffi::OsStrin
             unsafe { libc::closedir(self.0) };
         }
     }
-    let fd = directory.try_clone()?.into_raw_fd();
+    // A fresh open description gives each traversal its own directory cursor.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
     let stream = unsafe { libc::fdopendir(fd) };
     if stream.is_null() {
         let error = io::Error::last_os_error();
@@ -1625,7 +1665,13 @@ mod tests {
         let parent = fixture.path().join("parent");
         let home = parent.join("home");
         fs::create_dir_all(&home).unwrap();
-        fs::write(home.join("data"), b"owned").unwrap();
+        let writer = Connection::open(home.join("data")).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE records(value TEXT); INSERT INTO records VALUES ('owned');",
+            )
+            .unwrap();
+        drop(writer);
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o111)).unwrap();
         let result = write_env_archive_with_options(
             &serde_json::json!({}),
@@ -1639,6 +1685,67 @@ mod tests {
         );
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    static SQLITE_ROOT_REPLACEMENT: Mutex<Option<(PathBuf, PathBuf, usize)>> = Mutex::new(None);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn replace_sqlite_root(relative: &Path, _kind: EnvArchiveEntryKind) -> bool {
+        if relative == Path::new("history.db") {
+            let mut fixture = SQLITE_ROOT_REPLACEMENT.lock().unwrap();
+            let (root, other, visits) = fixture.as_mut().unwrap();
+            *visits += 1;
+            if *visits == 2 {
+                fs::rename(&*root, root.with_file_name("saved")).unwrap();
+                fs::rename(other, root).unwrap();
+            }
+        }
+        false
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn archive_sqlite_does_not_capture_a_replacement_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("home");
+        let other = fixture.path().join("other");
+        for (path, value) in [(&root, "owned"), (&other, "outside")] {
+            fs::create_dir(path).unwrap();
+            let db = Connection::open(path.join("history.db")).unwrap();
+            db.execute_batch("CREATE TABLE records(value TEXT)")
+                .unwrap();
+            db.execute("INSERT INTO records VALUES (?1)", [value])
+                .unwrap();
+        }
+        *SQLITE_ROOT_REPLACEMENT.lock().unwrap() = Some((root.clone(), other, 0));
+        let archive = fixture.path().join("archive.tar");
+        let result = write_env_archive_with_options(
+            &serde_json::json!({}),
+            &root,
+            &archive,
+            EnvArchiveOptions {
+                sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
+                should_exclude_path: replace_sqlite_root,
+                private_output: true,
+                ..EnvArchiveOptions::default()
+            },
+        );
+        assert!(SQLITE_ROOT_REPLACEMENT.lock().unwrap().take().unwrap().2 >= 2);
+        if result.is_ok() {
+            let restored = extract_env_archive::<serde_json::Value>(
+                &archive,
+                &fixture.path().join("restored"),
+            )
+            .unwrap();
+            let db = Connection::open(restored.root_dir.join("history.db")).unwrap();
+            let value: String = db
+                .query_row("SELECT value FROM records", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, "owned");
+        } else {
+            assert!(!archive.exists());
+        }
     }
 
     #[cfg(unix)]

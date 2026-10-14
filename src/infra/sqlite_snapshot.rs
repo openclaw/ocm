@@ -33,16 +33,33 @@ pub(crate) fn file_is_sqlite_database(file: &mut File) -> Result<bool, String> {
 }
 
 pub(crate) fn create_sqlite_snapshot(source: &Path) -> Result<SqliteSnapshot, String> {
-    create_sqlite_snapshot_with_flags(source, OpenFlags::empty())
+    create_sqlite_snapshot_with_flags(source, OpenFlags::empty(), None)
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn create_sqlite_snapshot_no_follow(source: &Path) -> Result<SqliteSnapshot, String> {
-    create_sqlite_snapshot_with_flags(source, OpenFlags::SQLITE_OPEN_NOFOLLOW)
+    create_sqlite_snapshot_with_flags(source, OpenFlags::SQLITE_OPEN_NOFOLLOW, None)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn create_sqlite_snapshot_in_directory(
+    directory: &File,
+    leaf: &std::ffi::OsStr,
+) -> Result<SqliteSnapshot, String> {
+    use std::os::fd::AsRawFd;
+    let path =
+        std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(leaf);
+    create_sqlite_snapshot_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        Some(super::sqlite_directory_vfs::pinned_directory_vfs()?),
+    )
 }
 
 fn create_sqlite_snapshot_with_flags(
     source: &Path,
     flags: OpenFlags,
+    vfs: Option<&std::ffi::CStr>,
 ) -> Result<SqliteSnapshot, String> {
     #[cfg(target_os = "macos")]
     let file = tempfile::Builder::new().make(crate::infra::macos_security::create_private_file_new);
@@ -54,7 +71,7 @@ fn create_sqlite_snapshot_with_flags(
     let snapshot = SqliteSnapshot {
         file: file.map_err(|error| format!("failed to create private SQLite snapshot: {error}"))?,
     };
-    create_sqlite_snapshot_inner(source, snapshot.path(), flags)?;
+    create_sqlite_snapshot_inner(source, snapshot.path(), flags, vfs)?;
     // Flush through the owned writable handle; Windows rejects a read-only handle.
     snapshot.file.as_file().sync_all().map_err(|error| {
         format!(
@@ -69,11 +86,14 @@ fn create_sqlite_snapshot_inner(
     source: &Path,
     target: &Path,
     flags: OpenFlags,
+    vfs: Option<&std::ffi::CStr>,
 ) -> Result<(), String> {
-    let source_db = Connection::open_with_flags(
-        source,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | flags,
-    )
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | flags;
+    let source_db = if let Some(vfs) = vfs {
+        Connection::open_with_flags_and_vfs(source, flags, vfs)
+    } else {
+        Connection::open_with_flags(source, flags)
+    }
     .map_err(|error| {
         format!(
             "failed to open SQLite database {} for snapshot: {error}",
@@ -174,6 +194,47 @@ fn create_sqlite_snapshot_inner(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sqlite_directory_snapshot_retains_committed_wal_after_parent_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let mut writer = Connection::open(source.join("history.db")).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records(value TEXT); INSERT INTO records VALUES ('committed');").unwrap();
+        let transaction = writer.transaction().unwrap();
+        transaction
+            .execute("INSERT INTO records VALUES ('pending')", [])
+            .unwrap();
+        let directory = File::open(&source).unwrap();
+        let saved = fixture.path().join("saved");
+        fs::rename(&source, &saved).unwrap();
+        fs::create_dir(&source).unwrap();
+        let other = Connection::open(source.join("history.db")).unwrap();
+        other
+            .execute_batch(
+                "CREATE TABLE records(value TEXT); INSERT INTO records VALUES ('outside');",
+            )
+            .unwrap();
+        let snapshot =
+            create_sqlite_snapshot_in_directory(&directory, std::ffi::OsStr::new("history.db"))
+                .unwrap();
+        let db = Connection::open(snapshot.path()).unwrap();
+        let values: Vec<String> = db
+            .prepare("SELECT value FROM records")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(values, ["committed"]);
+        drop(other);
+        fs::remove_dir_all(&source).unwrap();
+        fs::rename(&saved, &source).unwrap();
+        drop(transaction);
+        drop(writer);
+    }
 
     #[cfg(unix)]
     #[test]

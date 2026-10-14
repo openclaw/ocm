@@ -1,4 +1,6 @@
 pub mod archive;
+#[cfg(target_os = "macos")]
+mod archive_path_guard;
 pub(crate) mod command_output;
 pub mod download;
 pub(crate) mod install_owner;
@@ -7,6 +9,8 @@ pub(crate) mod macos_security;
 pub mod process;
 pub(crate) mod process_identity;
 pub mod shell;
+#[cfg(target_os = "linux")]
+mod sqlite_directory_vfs;
 pub(crate) mod sqlite_snapshot;
 pub mod terminal;
 pub(crate) mod tree_digest;
