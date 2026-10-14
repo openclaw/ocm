@@ -776,6 +776,15 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             url::Url::from_file_path(&source).unwrap(),
             source.display()
         ));
+        runtime["separatedRootUrls"] = json!([" ", "\t", "\r", "\n"].map(|separator| {
+            let uri = url::Url::from_file_path(&source).unwrap();
+            format!("{uri}{separator}{uri}/plugin")
+        }));
+        runtime["labelledRootUrls"] = json!(format!(
+            "{} second:{}",
+            url::Url::from_file_path(&source).unwrap(),
+            url::Url::from_file_path(&source).unwrap()
+        ));
         write_text(&source.join(runtime_file), &runtime.to_string());
         write_text(
             &source.join(".openclaw/logs/root.txt"),
@@ -1107,6 +1116,15 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "{}/a b/../../outside {}\n",
             url::Url::from_file_path(&source).unwrap(),
             target.display()
+        ));
+        expected_runtime["separatedRootUrls"] = json!([" ", "\t", "\r", "\n"].map(|separator| {
+            let uri = url::Url::from_file_path(&target).unwrap();
+            format!("{uri}{separator}{uri}/plugin")
+        }));
+        expected_runtime["labelledRootUrls"] = json!(format!(
+            "{} second:{}",
+            url::Url::from_file_path(&target).unwrap(),
+            url::Url::from_file_path(&target).unwrap()
         ));
         expected_runtime["decodedProse"] = json!(format!("{{}}\n{}/plugin", target.display()));
         expected_runtime["multipleUrlEscape"] = json!(format!(

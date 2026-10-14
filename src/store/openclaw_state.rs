@@ -843,7 +843,7 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
             let after_space = boundaries.partition_point(|offset| *offset <= start + space);
             if let Some(&next) = boundaries
                 .get(after_space)
-                .filter(|offset| **offset < enclosing_end)
+                .filter(|offset| **offset <= enclosing_end)
             {
                 value_end = if raw[..next].ends_with('<') {
                     next - 1
@@ -876,6 +876,9 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
         }
         // This selected span is the complete URI candidate. Never fall back
         // to a whitespace-truncated prefix: ownership can change after spaces.
+        // URL syntax ignores trailing ASCII spacing. Preserve it outside the
+        // replacement so a bare-root URL gets the same boundary as a child URL.
+        value_end = start + raw[start..value_end].trim_end_matches([' ', '\t']).len();
         let range = start..value_end;
         if let Some(relocated) = rewrite_file_url(&raw[range.clone()], source_root, target_root) {
             edits.push((range.clone(), relocated));
