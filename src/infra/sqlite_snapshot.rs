@@ -55,6 +55,13 @@ fn create_sqlite_snapshot_with_flags(
         file: file.map_err(|error| format!("failed to create private SQLite snapshot: {error}"))?,
     };
     create_sqlite_snapshot_inner(source, snapshot.path(), flags)?;
+    // Flush through the owned writable handle; Windows rejects a read-only handle.
+    snapshot.file.as_file().sync_all().map_err(|error| {
+        format!(
+            "failed to sync SQLite snapshot {}: {error}",
+            snapshot.path().display()
+        )
+    })?;
     Ok(snapshot)
 }
 
@@ -160,14 +167,7 @@ fn create_sqlite_snapshot_inner(
         .close()
         .map_err(|(_, error)| format!("failed to close SQLite source: {error}"))?;
 
-    File::open(target)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| {
-            format!(
-                "failed to sync SQLite snapshot {}: {error}",
-                target.display()
-            )
-        })
+    Ok(())
 }
 
 #[cfg(test)]
