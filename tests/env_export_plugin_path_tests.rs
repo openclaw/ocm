@@ -721,6 +721,12 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "escapedRoot":format!("node {}/../outside/index.js", source.display()),
             "external":external, "lookalike":lookalike});
         let url_cases = json!({
+            "apostropheProseSibling":format!("Don't open {}'other/plugin", source.display()),
+            "apostropheProseUriSibling":format!("Don't open {}'other/plugin", url::Url::from_file_path(&source).unwrap()),
+            "decodedProse":format!("{{}}\n{}/plugin", source.display()),
+            "multipleUrlEscape":format!("{}/a b/../../outside\n{}/plugin", url::Url::from_file_path(&source).unwrap(), url::Url::from_file_path(&source).unwrap()),
+            "sameLineUrlEscape":format!("{}/a b/../../outside {}/plugin", url::Url::from_file_path(&source).unwrap(), url::Url::from_file_path(&source).unwrap()),
+            "quotedMultipleUrlEscape":format!("echo \"{}/a b/../../outside\n{}/plugin\"", url::Url::from_file_path(&source).unwrap(), url::Url::from_file_path(&source).unwrap()),
             "prefixedUrl":format!("echo \"url={}\"; pwd", url::Url::from_file_path(installed.join("index.js")).unwrap()),
             "urlCommand":format!("open \"{}\"; pwd", url::Url::from_file_path(installed.join("index.js")).unwrap()),
             "fileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string(),
@@ -779,7 +785,10 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         let recovered_record = |base: &std::path::Path| {
             serde_json::json!({"cwd":base.join(".openclaw/workspace")}).to_string()
         };
-        let broken_record = format!("not-json {}\n", source.display());
+        let broken_record = format!(
+            "{{\"incomplete\":{}\n",
+            serde_json::to_string(&source).unwrap()
+        );
         write_text(
             &source.join(recovered_file),
             &format!(
@@ -1059,6 +1068,22 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         expected_runtime["prefixedUrl"] = json!(format!("echo \"url={}\"; pwd", expected_url));
         expected_runtime["quotedFileUrl"] = json!(format!("cat '{}'", expected_url));
         expected_runtime["urlCommand"] = json!(format!("open \"{}\"; pwd", expected_url));
+        expected_runtime["decodedProse"] = json!(format!("{{}}\n{}/plugin", target.display()));
+        expected_runtime["multipleUrlEscape"] = json!(format!(
+            "{}/a b/../../outside\n{}/plugin",
+            url::Url::from_file_path(&source).unwrap(),
+            url::Url::from_file_path(&target).unwrap()
+        ));
+        expected_runtime["sameLineUrlEscape"] = json!(format!(
+            "{}/a b/../../outside {}/plugin",
+            url::Url::from_file_path(&source).unwrap(),
+            url::Url::from_file_path(&target).unwrap()
+        ));
+        expected_runtime["quotedMultipleUrlEscape"] = json!(format!(
+            "echo \"{}/a b/../../outside\n{}/plugin\"",
+            url::Url::from_file_path(&source).unwrap(),
+            url::Url::from_file_path(&target).unwrap()
+        ));
         expected_runtime["reenteredUrl"] = json!(format!(
             "{}/plugin?q=keep%20bytes#part",
             url::Url::from_file_path(&target).unwrap()

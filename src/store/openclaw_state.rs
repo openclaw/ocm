@@ -473,7 +473,7 @@ fn rewrite_runtime_root_references(
         let parsed = serde_json::from_str::<serde::de::IgnoredAny>(line);
         let complete = parsed.is_ok();
         let incomplete = !line.trim().is_empty() && parsed.is_err_and(|error| error.is_eof());
-        if complete || incomplete || json_lines {
+        if complete || incomplete {
             output.push_str(&rewrite_rooted_text(
                 &raw[text_start..offset],
                 source_root,
@@ -742,7 +742,15 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     let mut quote_index = 0;
     let mut urls = Vec::new();
     let mut edits = Vec::new();
-    for start in file_url_starts(raw) {
+    let starts: Vec<_> = file_url_starts(raw).collect();
+    let line_ends: Vec<_> = raw
+        .match_indices(['\r', '\n'])
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(raw.len()))
+        .collect();
+    let mut line_index = 0;
+    let angle_ends: Vec<_> = raw.match_indices('>').map(|(offset, _)| offset).collect();
+    for &start in &starts {
         if urls
             .last()
             .is_some_and(|range: &std::ops::Range<usize>| start < range.end)
@@ -756,29 +764,77 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
             quote_index += 1;
         }
         let enclosing = quoted.get(quote_index).filter(|range| range.start <= start);
-        let quote_end = enclosing.map_or(raw.len(), |range| range.end);
+        while line_ends[line_index] <= start {
+            line_index += 1;
+        }
+        let quote_end = enclosing
+            .map_or(raw.len(), |range| range.end)
+            .min(line_ends[line_index]);
         let angle_end = raw[..start]
             .ends_with('<')
-            .then(|| raw[start..quote_end].find('>').map(|offset| start + offset))
-            .flatten();
+            .then(|| {
+                angle_ends
+                    .get(angle_ends.partition_point(|offset| *offset < start))
+                    .copied()
+            })
+            .flatten()
+            .filter(|offset| *offset < quote_end);
         let enclosing_end = angle_end.unwrap_or(quote_end);
-        let complete_quoted_url = enclosing.is_some()
-            && is_complete_file_url_value(&raw[start..enclosing_end], source_root);
-        let complete_angle_url = angle_end.is_some()
-            && is_complete_file_url_value(&raw[start..enclosing_end], source_root);
-        let end = if complete_quoted_url || complete_angle_url {
-            enclosing_end
+        // Bound each URI at the next reference after a text separator.
+        // This preserves spaced filenames without rescanning shared suffixes.
+        let mut value_end = enclosing_end;
+        if let Some(space) =
+            raw[start..enclosing_end].find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
+        {
+            let after_space = starts.partition_point(|offset| *offset <= start + space);
+            if let Some(&next) = starts
+                .get(after_space)
+                .filter(|offset| **offset < enclosing_end)
+            {
+                value_end = if raw[..next].ends_with('<') {
+                    next - 1
+                } else {
+                    next
+                };
+                if let Some((offset, ch)) = raw[start + space..next]
+                    .char_indices()
+                    .rev()
+                    .find(|(_, ch)| ch.is_whitespace())
+                {
+                    let word_start = start + space + offset + ch.len_utf8();
+                    let prefix = &raw[word_start..next];
+                    let label = prefix
+                        .strip_suffix('=')
+                        .or_else(|| prefix.strip_suffix(':'));
+                    if prefix.is_empty()
+                        || label.is_some_and(|label| {
+                            !label.is_empty()
+                                && label
+                                    .chars()
+                                    .all(|ch| ch.is_alphanumeric() || "_.-".contains(ch))
+                        })
+                    {
+                        value_end = word_start;
+                    }
+                }
+                value_end = start + raw[start..value_end].trim_end().len();
+            }
+        }
+        let complete_value = is_complete_file_url_value(&raw[start..value_end], source_root);
+        let end = if complete_value {
+            value_end
         } else {
-            raw[start..enclosing_end]
+            raw[start..value_end]
                 .find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
-                .map_or(enclosing_end, |offset| start + offset)
+                .map_or(value_end, |offset| start + offset)
         };
         let range = start..end;
         if let Some(relocated) = rewrite_file_url(
             &raw[range.clone()],
             source_root,
             target_root,
-            end == enclosing_end
+            (complete_value && end == value_end)
+                || end == enclosing_end
                 || raw[end..].starts_with(['\r', '\n'])
                 || (raw[..start].ends_with('<') && raw[end..].starts_with('>')),
         ) {
@@ -1076,6 +1132,14 @@ fn quoted_value_ranges(raw: &str) -> Vec<std::ops::Range<usize>> {
         let quote_at = scan + offset;
         let quote = raw[quote_at..].chars().next().unwrap();
         let start = quote_at + quote.len_utf8();
+        if raw[..quote_at]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| !reference_boundary(ch))
+        {
+            scan = start;
+            continue;
+        }
         let end = closing_quote(raw, start, quote).unwrap_or(raw.len());
         ranges.push(start..end);
         scan = end + usize::from(end < raw.len());
