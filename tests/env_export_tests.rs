@@ -187,7 +187,7 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
         "tmp/cache",
         "gateway-supervisor-restart-handoff.json",
     ] {
-        write_text(&source.join("state").join(residue), "runtime residue");
+        write_text(&source.join(residue), "runtime residue");
     }
     #[cfg(unix)]
     let _socket = {
@@ -228,8 +228,12 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
                 "lock",
                 "locks",
                 "tmp",
-                "native",
                 "gateway-supervisor-restart-handoff.json",
+            ] {
+                assert!(!members.contains(&std::path::Path::new("root/.openclaw").join(residue)));
+            }
+            for residue in [
+                "native",
                 "openclaw.sqlite-wal",
                 "openclaw.sqlite-shm",
                 "history.socket/records.db-wal",
@@ -436,6 +440,8 @@ fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhe
         ".openclaw/backups/settings.json",
         "legacy/data.txt",
         ".openclaw/state/projects/demo/Cargo.lock",
+        ".openclaw/state/Cargo.lock",
+        ".openclaw/state/tmp/notes.txt",
         ".openclaw/workspace/tmp/notes.txt",
     ];
     for path in files {
@@ -469,7 +475,6 @@ fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhe
         ".openclaw/gateway.pid",
         ".openclaw/locks/owner",
         ".openclaw/team/.openclaw/tmp/cache.bin",
-        ".openclaw/state/tmp/cache",
         ".openclaw/run/process",
         ".openclaw/plugin-runtime-deps/cache",
         ".openclaw/bundled-plugin-runtime-deps/cache",
