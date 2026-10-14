@@ -705,6 +705,11 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "shell":format!("cd {}; pwd", source.display()),
             "quotedExternal":format!("cat '{} other/plugin'", source.display()),
             "quotedOwned":format!("cat '{}/a b/file'", source.display()),
+            "quotedBackslash":format!("cat '{}/a\\' {}/other", source.display(), source.display()),
+            "bracketedLog":format!("[INFO] loaded from {}/plugin", source.display()),
+            "quotedEscape":format!("cat '{}/a b/../../outside'", source.display()),
+            "quotedOther":format!("cat '{} a {}/plugin'", external.display(), source.display()),
+            "urlCommand":format!("open \"{}\"; pwd", url::Url::from_file_path(installed.join("index.js")).unwrap()),
             "encoded":json!({"rootDir":installed}).to_string(),
             "fileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string(),
             "apostropheFileUrl":format!("{}'other/plugin.js", url::Url::from_file_path(&source).unwrap()),
@@ -726,11 +731,19 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             &format!("{}\n", source.display()),
         );
         let surrogate_file = ".openclaw/agents/main/sessions/surrogate.jsonl";
-        let surrogate = format!(
-            "{{\"opaque\":\"\\ud800\",\"path\":{}}}\n",
-            serde_json::to_string(&installed).unwrap()
-        );
+        let opaque_document = |path: &std::path::Path| {
+            let encoded = serde_json::to_string(path).unwrap();
+            let uri = url::Url::from_file_path(path).unwrap();
+            format!(
+                "{{\"opaque\":\"\\ud800\",\"mixed\":\"\\ud800 {}\",\"url\":\"\\ud800 {uri}\",\"path\":{encoded}}}\n",
+                &encoded[1..encoded.len() - 1]
+            )
+        };
+        let surrogate = opaque_document(&installed);
         write_text(&source.join(surrogate_file), &surrogate);
+        let partial_file = ".openclaw/agents/main/sessions/partial.jsonl";
+        let partial = format!("{}\n{{\"unfinished\":", json!({"path": installed}));
+        write_text(&source.join(partial_file), &partial);
         let jsonl_file = ".openclaw/agents/main/sessions/commands.jsonl";
         write_text(
             &source.join(jsonl_file),
@@ -933,6 +946,13 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             expected_runtime["shell"],
             json!(format!("cd {}; pwd", source.display()))
         );
+        expected_runtime["quotedBackslash"] = json!(format!(
+            "cat '{}/a\\' {}/other",
+            target.display(),
+            target.display()
+        ));
+        expected_runtime["bracketedLog"] =
+            json!(format!("[INFO] loaded from {}/plugin", target.display()));
         expected_runtime["quotedOwned"] = json!(format!("cat '{}/a b/file'", target.display()));
         let expected_url =
             url::Url::from_file_path(target.join(".openclaw/extensions/demo/index.js")).unwrap();
@@ -943,6 +963,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             target.display()
         ));
         expected_runtime["quotedFileUrl"] = json!(format!("cat '{}'", expected_url));
+        expected_runtime["urlCommand"] = json!(format!("open \"{}\"; pwd", expected_url));
         expected_runtime["fileUrl"] = json!(expected_url.as_str());
         expected_runtime["upperFileUrl"] = json!(expected_url.as_str());
         expected_runtime["shortFileUrl"] = json!(expected_url.as_str());
@@ -961,10 +982,16 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         assert_eq!(actual_runtime, expected_runtime);
         let surrogate_copy = fs::read_to_string(target.join(surrogate_file)).unwrap();
         assert_eq!(
-            surrogate_copy.replace(target_encoded, source_encoded),
-            surrogate
+            surrogate_copy,
+            opaque_document(&target.join(".openclaw/extensions/demo"))
         );
-        assert!(surrogate_copy.contains(target_encoded));
+        assert_eq!(
+            fs::read_to_string(target.join(partial_file)).unwrap(),
+            format!(
+                "{}\n{{\"unfinished\":",
+                json!({"path": target.join(".openclaw/extensions/demo")})
+            )
+        );
         assert_eq!(
             fs::read_to_string(target.join(".openclaw/logs/root.txt")).unwrap(),
             format!("{}\n", target.display())

@@ -454,14 +454,6 @@ fn rewrite_runtime_root_references(
             let start = cursor + offset;
             output.push_str(&raw[cursor..start]);
             let end = json_value_end(raw, start)?;
-            let Ok(value) = serde_json::from_str::<String>(&raw[start..end]) else {
-                // JavaScript can persist lone UTF-16 surrogates. Preserve that
-                // opaque string without blocking other valid references.
-                output.push_str(&raw[start..end]);
-                cursor = end;
-                previous_key = None;
-                continue;
-            };
             let is_key = raw[end..].trim_start().starts_with(':');
             let path_value = !is_key
                 && previous_key.take().is_some_and(|key: String| {
@@ -473,6 +465,20 @@ fn rewrite_runtime_root_references(
                         || key.ends_with("_path")
                         || key.ends_with("_dir")
                 });
+            let Ok(value) = serde_json::from_str::<String>(&raw[start..end]) else {
+                if path_value || is_key {
+                    output.push_str(&raw[start..end]);
+                } else {
+                    output.push_str(&rewrite_opaque_json_string(
+                        &raw[start..end],
+                        source_root,
+                        target_root,
+                    )?);
+                }
+                cursor = end;
+                previous_key = None;
+                continue;
+            };
             if is_key {
                 previous_key = Some(value.clone());
             }
@@ -496,33 +502,105 @@ fn rewrite_runtime_root_references(
         output.push_str(&raw[cursor..]);
         return Ok(output);
     }
-    if raw
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .all(|line| serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok())
-    {
-        return raw
-            .split_inclusive('\n')
-            .map(|line| {
-                if line.trim().is_empty() {
-                    Ok(line.to_string())
-                } else {
-                    rewrite_runtime_root_references(line, source_root, target_root)
-                }
-            })
-            .collect();
-    }
-    // A physical text line is a value; its line ending remains byte-identical.
-    Ok(raw
-        .split_inclusive('\n')
+    // JSONL records stand independently; an interrupted trailing record must
+    // not turn earlier complete records into unescaped raw text.
+    raw.split_inclusive('\n')
         .map(|line| {
             let value = line.trim_end_matches(['\r', '\n']);
-            rewrite_rooted_text(value, source_root, target_root) + &line[value.len()..]
+            if value.trim().is_empty() {
+                Ok(line.to_string())
+            } else if serde_json::from_str::<serde::de::IgnoredAny>(value).is_ok() {
+                rewrite_runtime_root_references(line, source_root, target_root)
+            } else if serde_json::from_str::<serde::de::IgnoredAny>(value)
+                .is_err_and(|error| error.is_eof())
+            {
+                Ok(line.to_string())
+            } else {
+                Ok(rewrite_rooted_text(value, source_root, target_root) + &line[value.len()..])
+            }
         })
-        .collect())
+        .collect()
+}
+
+fn rewrite_opaque_json_string(
+    raw: &str,
+    source_root: &str,
+    target_root: &str,
+) -> Result<String, String> {
+    let bytes = raw.as_bytes();
+    let code_unit = |at: usize| -> Option<u16> {
+        if bytes.get(at..at + 2)? != b"\\u" {
+            return None;
+        }
+        u16::from_str_radix(raw.get(at + 2..at + 6)?, 16).ok()
+    };
+    let mut opaque = Vec::new();
+    let mut scan = 1;
+    while scan < raw.len() - 1 {
+        if bytes[scan] == b'\\' {
+            if let Some(unit) = code_unit(scan) {
+                if (0xd800..=0xdbff).contains(&unit)
+                    && code_unit(scan + 6).is_some_and(|low| (0xdc00..=0xdfff).contains(&low))
+                {
+                    scan += 12;
+                    continue;
+                }
+                if (0xd800..=0xdfff).contains(&unit) {
+                    opaque.push(scan..scan + 6);
+                }
+                scan += 6;
+            } else {
+                scan += 2;
+            }
+        } else {
+            scan += raw[scan..].chars().next().unwrap().len_utf8();
+        }
+    }
+    let mut output = String::from("\"");
+    let mut start = 1;
+    let count = opaque.len();
+    for (index, range) in opaque
+        .into_iter()
+        .chain([raw.len() - 1..raw.len() - 1])
+        .enumerate()
+    {
+        let encoded = &raw[start..range.start];
+        let decoded: String =
+            serde_json::from_str(&format!("\"{encoded}\"")).map_err(|error| error.to_string())?;
+        // Opaque code units are not separators or valid path characters. Guards
+        // keep a reference from acquiring a false boundary at a split.
+        let guarded = format!(
+            "{}{}{}",
+            if start > 1 { "\0" } else { "" },
+            decoded,
+            if index < count { "\0" } else { "" }
+        );
+        let rewritten: String = guarded
+            .split_inclusive('\n')
+            .map(|line| {
+                let value = line.trim_end_matches(['\r', '\n']);
+                rewrite_rooted_text(value, source_root, target_root) + &line[value.len()..]
+            })
+            .collect();
+        let rewritten =
+            &rewritten[usize::from(start > 1)..rewritten.len() - usize::from(index < count)];
+        if rewritten == decoded {
+            output.push_str(encoded);
+        } else {
+            let encoded = serde_json::to_string(rewritten).map_err(|error| error.to_string())?;
+            output.push_str(&encoded[1..encoded.len() - 1]);
+        }
+        output.push_str(&raw[range.clone()]);
+        start = range.end;
+    }
+    output.push('"');
+    Ok(output)
 }
 
 fn relocate_rooted_path(path: &str, source_root: &str, target_root: &str) -> Option<String> {
+    if path.contains('\0') {
+        return None;
+    }
     let suffix = path.strip_prefix(source_root)?;
     if !suffix.is_empty() && !suffix.starts_with(std::path::is_separator) {
         return None;
@@ -572,14 +650,13 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
         {
             continue;
         }
-        let mut end = raw[start..]
-            .find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
-            .map_or(raw.len(), |offset| start + offset);
-        if let Some(quote @ ('"' | '\'' | '`')) = raw[..start].chars().next_back() {
-            if raw[start..end].ends_with(quote) {
-                end -= quote.len_utf8();
-            }
-        }
+        let end = if let Some(quote @ ('"' | '\'' | '`')) = raw[..start].chars().next_back() {
+            closing_quote(raw, start, quote).unwrap_or(raw.len())
+        } else {
+            raw[start..]
+                .find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
+                .map_or(raw.len(), |offset| start + offset)
+        };
         output.push_str(&rewrite_path_tokens(
             &raw[cursor..start],
             source_root,
@@ -599,6 +676,9 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
 }
 
 fn rewrite_file_url(value: &str, source_root: &str, target_root: &str) -> Option<String> {
+    if value.contains('\0') {
+        return None;
+    }
     let mut url = url::Url::parse(value).ok()?;
     let path = url.to_file_path().ok()?;
     let relocated = relocate_rooted_path(path.to_str()?, source_root, target_root)?;
@@ -723,10 +803,70 @@ fn rewrite_plugin_index_json(
     Ok(output)
 }
 
+fn closing_quote(raw: &str, start: usize, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, ch) in raw[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != '\'' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return Some(start + offset);
+        }
+    }
+    None
+}
+
+fn quoted_path_ranges(raw: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut scan = 0;
+    while let Some(offset) = raw[scan..].find(['"', '\'', '`']) {
+        let quote_at = scan + offset;
+        let quote = raw[quote_at..].chars().next().unwrap();
+        let start = quote_at + quote.len_utf8();
+        let end = closing_quote(raw, start, quote).unwrap_or(raw.len());
+        if Path::new(&raw[start..end]).is_absolute() {
+            ranges.push(start..end);
+        }
+        scan = end + usize::from(end < raw.len());
+    }
+    ranges
+}
+
 fn rewrite_path_tokens(raw: &str, source_root: &str, target_root: &str) -> String {
+    let quoted = quoted_path_ranges(raw);
+    let mut quoted_index = 0;
     let mut output = String::with_capacity(raw.len());
     let mut cursor = 0;
+    let mut skip_until = 0;
     for (start, _) in raw.match_indices(source_root) {
+        if start < skip_until {
+            continue;
+        }
+        while quoted
+            .get(quoted_index)
+            .is_some_and(|range| range.end <= start)
+        {
+            quoted_index += 1;
+        }
+        if let Some(range) = quoted
+            .get(quoted_index)
+            .filter(|range| range.start <= start)
+        {
+            skip_until = range.end;
+            if let Some(rewritten) =
+                relocate_rooted_path(&raw[range.clone()], source_root, target_root)
+            {
+                output.push_str(&raw[cursor..range.start]);
+                output.push_str(&rewritten);
+                cursor = range.end;
+            }
+            continue;
+        }
         let end = start + source_root.len();
         if raw[..start]
             .chars()
