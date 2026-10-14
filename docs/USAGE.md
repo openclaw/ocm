@@ -966,11 +966,12 @@ assigns the new gateway port and resets the sandbox origin. Configuration must
 be valid; includes that own agent workspaces or the sandbox origin must be
 flattened first, as for ordinary imports. No OpenClaw runtime is required.
 State is preserved; references to the environment root are rewritten to the
-new root. Import relocates installed plugin receipt paths and the runtime text
-references handled by plain-home migration, without clearing sessions, logs,
-leases, or other durable state. It changes only relocated values in the known
-plugin-index database row; unrelated rows and metadata are preserved. Workspace
-content and integrity-protected history retain their bytes. Every other file
+new root. Import rewrites text values across registered OpenClaw SQLite databases,
+including session metadata, recorded file paths, worktree records, and plugin
+receipts, plus the runtime JSON/JSONL and text files handled by plain-home migration.
+It retains sessions, logs, leases, and other durable state. Unchanged values and
+binary payload columns (including compressed records) retain their bytes. Other
+workspace files and integrity-protected history also retain their bytes. Every other file
 outside the config and state-reference rewrites stays byte-identical to the archive.
 Migration and state-inclusive import share root-reference matching for plain
 paths, file URLs, and existing runtime text. A root must end at a path component
@@ -996,7 +997,9 @@ An explicit `env import --sandbox-origin` still replaces that setting.
 Export JSON reports `includeState`; its human summary also reports whether
 state was included. State-inclusive import reports `configPathsRewritten: true`
 and `statePathsRewritten` in JSON; the latter says whether any state references
-changed. Its human summary reports both rewrites. Export without the
+changed. `databasePathsRewritten` maps each processed database path relative to
+the imported root to its count of changed text values; zero means no values
+changed. The human summary includes these counts. Export without the
 flag and imports without included state retain their existing selection,
 configuration rewriting, and cleanup behavior.
 

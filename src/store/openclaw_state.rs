@@ -243,20 +243,26 @@ pub(crate) fn prepare_migrated_runtime_state(
     })
 }
 
+#[derive(Default)]
+pub(super) struct ArchivedRuntimeStateResult {
+    pub changed: bool,
+    pub databases: BTreeMap<String, u64>,
+}
+
 pub(super) fn relocate_archived_runtime_state(
     paths: &EnvPaths,
     source_root: &Path,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
-) -> Result<bool, String> {
+) -> Result<ArchivedRuntimeStateResult, String> {
     if source_root.as_os_str().is_empty() {
         return Err("archive source root is empty".to_string());
     }
     if source_root == paths.root {
-        return Ok(false);
+        return Ok(ArchivedRuntimeStateResult::default());
     }
     if !path_exists(&paths.state_dir) {
-        return Ok(false);
+        return Ok(ArchivedRuntimeStateResult::default());
     }
     let workspaces = resolve_env_openclaw_workspaces(paths, env, runtime)?;
     let changed = rewrite_runtime_state_root_refs(
@@ -267,13 +273,235 @@ pub(super) fn relocate_archived_runtime_state(
         &paths.root,
         true,
     )?;
-    let plugin_paths = relocate_installed_plugin_index_paths(
-        &paths.state_dir.join("state/openclaw.sqlite"),
-        source_root,
-        &paths.root,
-        PluginPathRelocation::Archived,
-    )?;
-    Ok(changed || plugin_paths.changed)
+    let databases = relocate_archived_databases(paths, source_root)?;
+    Ok(ArchivedRuntimeStateResult {
+        changed: changed || databases.values().any(|count| *count != 0),
+        databases,
+    })
+}
+
+fn relocate_archived_databases(
+    paths: &EnvPaths,
+    source_root: &Path,
+) -> Result<BTreeMap<String, u64>, String> {
+    let mut counts = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    let global = paths.state_dir.join("state/openclaw.sqlite");
+    // Relocate registry paths before selecting additional agent databases. The
+    // archive may be imported after the original environment has been removed.
+    let global = contained_imported_database(&global, &paths.root, true)?;
+    if let Some(database) = &global {
+        relocate_archived_database(paths, source_root, database, &mut visited, &mut counts)?;
+    }
+    let mut selection = OpenClawSqliteCopy {
+        state_root: &paths.state_dir,
+        registered_agents: BTreeSet::new(),
+    };
+    if let Some(database) = global {
+        if is_sqlite_database(&database)? {
+            selection.read_agent_registry(&database, true)?;
+        }
+    }
+    let mut directories = vec![paths.state_dir.clone()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            if kind.is_dir() {
+                directories.push(path);
+            } else if selection.contains(&path) {
+                if let Some(database) = contained_imported_database(&path, &paths.root, true)? {
+                    relocate_archived_database(
+                        paths,
+                        source_root,
+                        &database,
+                        &mut visited,
+                        &mut counts,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn relocate_archived_database(
+    paths: &EnvPaths,
+    source_root: &Path,
+    database: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    counts: &mut BTreeMap<String, u64>,
+) -> Result<(), String> {
+    if !visited.insert(database.to_path_buf()) || !is_sqlite_database(database)? {
+        return Ok(());
+    }
+    let parent = database.parent().ok_or("imported database has no parent")?;
+    let count = with_owner_write_permission(parent, || {
+        with_owner_write_permission(database, || {
+            rewrite_database_root_references(
+                database,
+                &display_path(source_root),
+                &display_path(&paths.root),
+            )
+        })
+    })?;
+    let root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
+    let relative = database
+        .strip_prefix(root)
+        .map_err(|error| error.to_string())?;
+    counts.insert(display_path(relative), count);
+    Ok(())
+}
+
+fn quote_sql_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn rewrite_database_root_references(
+    database: &Path,
+    source_root: &str,
+    target_root: &str,
+) -> Result<u64, String> {
+    let rewrite = || -> Result<u64, Box<dyn std::error::Error>> {
+        let mut db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        // Stored callbacks and cascades must not modify unrelated values.
+        db.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY,
+            false,
+        )?;
+        db.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+            false,
+        )?;
+        let tx = db.transaction()?;
+        let schema = tx.prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*' ORDER BY name")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        // FTS text belongs to the virtual table. Updating its backing tables
+        // directly would leave search indexes out of sync. External-content
+        // indexes also need a rebuild because stored triggers are disabled.
+        let full_text = schema
+            .iter()
+            .filter_map(|(name, sql)| {
+                let sql = sql
+                    .to_ascii_lowercase()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (sql.starts_with("create virtual table") && sql.contains("using fts5"))
+                    .then_some(name.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let shadows = full_text
+            .iter()
+            .flat_map(|name| {
+                ["data", "idx", "content", "docsize", "config"]
+                    .map(|suffix| format!("{name}_{suffix}"))
+            })
+            .collect::<BTreeSet<_>>();
+        let mut tables = schema
+            .into_iter()
+            .filter_map(|(name, sql)| {
+                (!sql.to_ascii_lowercase().starts_with("create virtual table")
+                    && !shadows.contains(&name))
+                .then_some(name)
+            })
+            .collect::<Vec<_>>();
+        tables.extend(full_text.iter().cloned());
+        tx.execute_batch("CREATE TEMP TABLE ocm_root_rewrites (column_id INTEGER, original BLOB, replacement TEXT NOT NULL, PRIMARY KEY(column_id, original)) WITHOUT ROWID")?;
+        let mut changed = 0;
+        for table in tables {
+            let columns = tx
+                .prepare(
+                    "SELECT cid, name FROM pragma_table_xinfo(?1) WHERE hidden = 0 ORDER BY cid",
+                )?
+                .query_map([&table], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let table = quote_sql_identifier(&table);
+            let quoted = columns
+                .iter()
+                .map(|(_, name)| quote_sql_identifier(name))
+                .collect::<Vec<_>>();
+            let mut changed_columns = BTreeSet::new();
+            if !quoted.is_empty() {
+                // Scan each table once. TEMP storage retains only changed text,
+                // indexed by exact bytes rather than the column's collation.
+                let mut read =
+                    tx.prepare(&format!("SELECT {} FROM main.{table}", quoted.join(", ")))?;
+                let mut rows = read.query([])?;
+                while let Some(row) = rows.next()? {
+                    for (index, (id, _)) in columns.iter().enumerate() {
+                        let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(index)? else {
+                            continue;
+                        };
+                        let original = std::str::from_utf8(bytes)?;
+                        let replacement = rewrite_runtime_root_references(
+                            original,
+                            source_root,
+                            target_root,
+                            false,
+                        )?;
+                        if replacement == original {
+                            continue;
+                        }
+                        tx.execute(
+                            "INSERT OR IGNORE INTO temp.ocm_root_rewrites VALUES (?1, ?2, ?3)",
+                            rusqlite::params![id, bytes, replacement],
+                        )?;
+                        changed += 1;
+                        changed_columns.insert(index);
+                    }
+                }
+            }
+            let mut assignments = Vec::new();
+            let mut predicates = Vec::new();
+            for index in changed_columns {
+                let id = columns[index].0;
+                let column = &quoted[index];
+                let lookup = format!(
+                    "SELECT replacement FROM temp.ocm_root_rewrites WHERE column_id = {id} AND original = CAST(ocm_source.{column} AS BLOB) AND typeof(ocm_source.{column}) = 'text'"
+                );
+                assignments.push(format!(
+                    "{column} = COALESCE(({lookup}), ocm_source.{column})"
+                ));
+                predicates.push(format!("EXISTS ({lookup})"));
+            }
+            if !assignments.is_empty() {
+                // One statement uses the original values for every column and
+                // supports composite keys and WITHOUT ROWID tables. Never honor
+                // a stored REPLACE policy by deleting a conflicting record.
+                tx.execute(
+                    &format!(
+                        "UPDATE OR ABORT main.{table} AS ocm_source SET {} WHERE {}",
+                        assignments.join(", "),
+                        predicates.join(" OR ")
+                    ),
+                    [],
+                )?;
+            }
+            tx.execute("DELETE FROM temp.ocm_root_rewrites", [])?;
+        }
+        if changed != 0 {
+            for name in &full_text {
+                let table = quote_sql_identifier(name);
+                tx.execute(
+                    &format!("INSERT INTO main.{table} ({table}) VALUES ('rebuild')"),
+                    [],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    };
+    rewrite().map_err(|error| {
+        format!(
+            "failed to relocate imported OpenClaw state database {}: {error}",
+            display_path(database)
+        )
+    })
 }
 
 pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Result<(), String> {
@@ -1018,106 +1246,6 @@ fn json_value_end(raw: &str, start: usize) -> Result<usize, String> {
     Ok(start + values.byte_offset())
 }
 
-#[derive(Clone, Copy)]
-enum PluginIndexJson {
-    Document,
-    Index,
-    Records,
-    Record,
-    Plugins,
-    Plugin,
-    Package,
-    Path,
-    Preserve,
-}
-
-impl PluginIndexJson {
-    fn field(self, key: Option<&str>) -> Self {
-        match (self, key) {
-            (Self::Document, Some("index")) => Self::Index,
-            (Self::Index, Some("installRecords")) => Self::Records,
-            (Self::Index, Some("plugins")) => Self::Plugins,
-            (Self::Index, Some("workspaceDir")) => Self::Path,
-            (Self::Records, _) => Self::Record,
-            (Self::Record, Some("installPath" | "sourcePath")) => Self::Path,
-            (Self::Plugin, Some("rootDir" | "source" | "setupSource" | "manifestPath")) => {
-                Self::Path
-            }
-            (Self::Plugin, Some("packageJson")) => Self::Package,
-            (Self::Package, Some("path")) => Self::Path,
-            _ => Self::Preserve,
-        }
-    }
-}
-
-fn rewrite_plugin_index_json(
-    raw: &str,
-    scope: PluginIndexJson,
-    source_root: &str,
-    target_root: &str,
-) -> Result<String, String> {
-    if matches!(scope, PluginIndexJson::Preserve) {
-        return Ok(raw.to_string());
-    }
-    if matches!(scope, PluginIndexJson::Path) {
-        let Ok(value) = serde_json::from_str::<String>(raw) else {
-            return Ok(raw.to_string());
-        };
-        let rewritten = rewrite_path_value(&value, source_root, target_root);
-        return if rewritten == value {
-            Ok(raw.to_string())
-        } else {
-            serde_json::to_string(&rewritten).map_err(|error| error.to_string())
-        };
-    }
-    // Walk known containers while retaining the original serialization of every
-    // other value. In particular, diagnostic prose is not a relocation surface.
-    let bytes = raw.as_bytes();
-    let skip_space = |mut offset: usize| {
-        while bytes.get(offset).is_some_and(u8::is_ascii_whitespace) {
-            offset += 1;
-        }
-        offset
-    };
-    let start = skip_space(0);
-    let object = bytes.get(start) == Some(&b'{');
-    if !object && !(matches!(scope, PluginIndexJson::Plugins) && bytes.get(start) == Some(&b'[')) {
-        return Ok(raw.to_string());
-    }
-    let mut scan = skip_space(start + 1);
-    let mut cursor = 0;
-    let mut output = String::with_capacity(raw.len());
-    while !matches!(bytes.get(scan), None | Some(b'}' | b']')) {
-        let child = if object {
-            let key_end = json_value_end(raw, scan)?;
-            let key = serde_json::from_str::<String>(&raw[scan..key_end]).ok();
-            let colon = skip_space(key_end);
-            if bytes.get(colon) != Some(&b':') {
-                return Err("missing JSON object separator".to_string());
-            }
-            scan = skip_space(colon + 1);
-            scope.field(key.as_deref())
-        } else {
-            PluginIndexJson::Plugin
-        };
-        let end = json_value_end(raw, scan)?;
-        output.push_str(&raw[cursor..scan]);
-        output.push_str(&rewrite_plugin_index_json(
-            &raw[scan..end],
-            child,
-            source_root,
-            target_root,
-        )?);
-        cursor = end;
-        scan = skip_space(end);
-        if bytes.get(scan) == Some(&b',') {
-            scan = skip_space(scan + 1);
-        }
-    }
-    output.push_str(&raw[cursor..]);
-    Ok(output)
-}
-
 fn closing_quote(raw: &str, start: usize, quote: char) -> Option<usize> {
     let mut escaped = false;
     for (offset, ch) in raw[start..].char_indices() {
@@ -1252,7 +1380,6 @@ fn is_legacy_audit_generation(suffix: &str) -> bool {
 #[derive(Clone, Copy)]
 enum PluginPathRelocation<'a> {
     Imported,
-    Archived,
     Cloned {
         source: &'a EnvPaths,
         target: &'a EnvPaths,
@@ -1306,73 +1433,17 @@ fn relocate_installed_plugin_index_paths(
     relocation: PluginPathRelocation<'_>,
 ) -> Result<MigratedRuntimeStateResult, String> {
     let database_root = match relocation {
-        PluginPathRelocation::Imported | PluginPathRelocation::Archived => target_state_root,
+        PluginPathRelocation::Imported => target_state_root,
         PluginPathRelocation::Cloned { target, .. } => &target.root,
     };
-    let Some(database_path) = contained_imported_database(
-        database_path,
-        database_root,
-        matches!(relocation, PluginPathRelocation::Archived),
-    )?
+    let Some(database_path) = contained_imported_database(database_path, database_root, false)?
     else {
         return Ok(MigratedRuntimeStateResult::default());
     };
     if !is_sqlite_database(&database_path)? {
         return Ok(MigratedRuntimeStateResult::default());
     }
-
-    let relocate = || {
-        relocate_plugin_records_in_database(
-            &database_path,
-            source_state_root,
-            target_state_root,
-            relocation,
-        )
-    };
-    if matches!(relocation, PluginPathRelocation::Archived) {
-        let parent = database_path
-            .parent()
-            .ok_or("imported database has no parent")?;
-        with_owner_write_permission(parent, || {
-            with_owner_write_permission(&database_path, relocate)
-        })
-    } else {
-        relocate()
-    }
-}
-
-fn relocate_plugin_records_in_database(
-    database_path: &Path,
-    source_state_root: &Path,
-    target_state_root: &Path,
-    relocation: PluginPathRelocation<'_>,
-) -> Result<MigratedRuntimeStateResult, String> {
-    let connection = Connection::open(&database_path).map_err(|error| {
-        format!(
-            "failed to open imported OpenClaw state database {}: {error}",
-            display_path(&database_path)
-        )
-    })?;
-    if matches!(relocation, PluginPathRelocation::Archived) {
-        // Updating the receipt must not run stored callbacks or cascades that
-        // change other rows. Both settings are local to this connection.
-        connection
-            .set_db_config(
-                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY,
-                false,
-            )
-            .map_err(|error| {
-                format!("failed to isolate imported plugin receipt update: {error}")
-            })?;
-        connection
-            .set_db_config(
-                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
-                false,
-            )
-            .map_err(|error| {
-                format!("failed to isolate imported plugin receipt update: {error}")
-            })?;
-    }
+    let connection = Connection::open(&database_path).map_err(|error| error.to_string())?;
     let table_exists = connection
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'installed_plugin_index'",
@@ -1380,12 +1451,7 @@ fn relocate_plugin_records_in_database(
             |_| Ok(()),
         )
         .optional()
-        .map_err(|error| {
-            format!(
-                "failed to inspect imported OpenClaw plugin index {}: {error}",
-                display_path(&database_path)
-            )
-        })?
+        .map_err(|error| error.to_string())?
         .is_some();
     let (select_sql, update_sql) = if table_exists {
         (
@@ -1393,10 +1459,11 @@ fn relocate_plugin_records_in_database(
             "UPDATE installed_plugin_index SET install_records_json = ?1 WHERE index_key = 'installed-plugin-index'",
         )
     } else {
-        let machine_state_exists = connection
-            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_machine_state'", [], |_| Ok(()))
-            .optional().map_err(|error| error.to_string())?.is_some();
-        if !machine_state_exists {
+        let exists = connection.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_machine_state'",
+            [], |_| Ok(()),
+        ).optional().map_err(|error| error.to_string())?.is_some();
+        if !exists {
             return Ok(MigratedRuntimeStateResult::default());
         }
         (
@@ -1404,98 +1471,28 @@ fn relocate_plugin_records_in_database(
             "UPDATE config_machine_state SET value_json = ?1 WHERE state_key = 'plugins.installedIndex'",
         )
     };
-
-    let scope = if table_exists {
-        PluginIndexJson::Records
-    } else {
-        PluginIndexJson::Document
-    };
-    let mut queries = vec![(select_sql.to_string(), update_sql.to_string(), scope)];
-    if table_exists && matches!(relocation, PluginPathRelocation::Archived) {
-        // Older databases store the same index in separate columns. Some older
-        // snapshots contain only install_records_json, so inspect optional fields.
-        for (column, scope) in [
-            ("plugins_json", PluginIndexJson::Plugins),
-            ("workspace_dir", PluginIndexJson::Path),
-        ] {
-            let exists = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('installed_plugin_index') WHERE name = ?1)",
-                [column], |row| row.get::<_, bool>(0),
-            ).map_err(|error| error.to_string())?;
-            if exists {
-                queries.push((
-                    format!("SELECT {column} FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'"),
-                    format!("UPDATE installed_plugin_index SET {column} = ?1 WHERE index_key = 'installed-plugin-index'"),
-                    scope,
-                ));
-            }
-        }
-    }
-    let mut changed = false;
-    for (select_sql, update_sql, scope) in queries {
-        let raw_records = if matches!(relocation, PluginPathRelocation::Archived) {
-            connection
-                .query_row(&select_sql, [], |row| row.get::<_, Option<String>>(0))
-                .optional()
-                .map(|value| value.flatten())
-        } else {
-            connection
-                .query_row(&select_sql, [], |row| row.get::<_, String>(0))
-                .optional()
-        }
-        .map_err(|error| {
-            format!(
-                "failed to read imported OpenClaw plugin install records {}: {error}",
-                display_path(database_path)
-            )
-        })?;
-        let Some(raw_records) = raw_records else {
-            continue;
-        };
-        let rewritten = if matches!(relocation, PluginPathRelocation::Archived) {
-            if !matches!(scope, PluginIndexJson::Path) {
-                serde_json::from_str::<serde::de::IgnoredAny>(&raw_records).map_err(|error| {
-                    format!(
-                        "failed to parse imported OpenClaw plugin index {}: {error}",
-                        display_path(database_path)
-                    )
-                })?;
-            }
-            let source_root = display_path(source_state_root);
-            let target_root = display_path(target_state_root);
-            let rewritten = if matches!(scope, PluginIndexJson::Path) {
-                rewrite_path_value(&raw_records, &source_root, &target_root)
-            } else {
-                rewrite_plugin_index_json(&raw_records, scope, &source_root, &target_root)?
-            };
-            (rewritten != raw_records).then_some(rewritten)
-        } else {
+    let raw = connection
+        .query_row(select_sql, [], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let rewritten = raw
+        .map(|raw| {
             rewrite_plugin_install_records(
-                &raw_records,
-                database_path,
+                &raw,
+                &database_path,
                 table_exists,
                 source_state_root,
                 target_state_root,
                 relocation,
-            )?
-        };
-        if let Some(rewritten) = rewritten {
-            // A stored REPLACE conflict policy must not delete another row.
-            let update_sql = if matches!(relocation, PluginPathRelocation::Archived) {
-                update_sql.replacen("UPDATE ", "UPDATE OR ABORT ", 1)
-            } else {
-                update_sql
-            };
-            connection
-                .execute(&update_sql, [rewritten])
-                .map_err(|error| {
-                    format!(
-                        "failed to relocate imported OpenClaw plugin install records {}: {error}",
-                        display_path(database_path)
-                    )
-                })?;
-            changed = true;
-        }
+            )
+        })
+        .transpose()?
+        .flatten();
+    let changed = rewritten.is_some();
+    if let Some(rewritten) = rewritten {
+        connection
+            .execute(update_sql, [rewritten])
+            .map_err(|error| error.to_string())?;
     }
     Ok(MigratedRuntimeStateResult {
         changed,
@@ -1792,8 +1789,25 @@ impl<'a> OpenClawSqliteCopy<'a> {
         {
             return Ok(selection);
         }
-        let db = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|error| format!("failed to inspect OpenClaw SQLite owners: {error}"))?;
+        selection.read_agent_registry(&database, false)?;
+        Ok(selection)
+    }
+
+    fn read_agent_registry(&mut self, database: &Path, archived: bool) -> Result<(), String> {
+        let db = if archived {
+            // This is a closed snapshot in the private import copy, with no WAL.
+            // Read-only WAL connections otherwise create sidecars on discovery.
+            let mut location =
+                url::Url::from_file_path(database).map_err(|_| "invalid imported database path")?;
+            location.set_query(Some("immutable=1"));
+            Connection::open_with_flags(
+                location.as_str(),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+        } else {
+            Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        }
+        .map_err(|error| format!("failed to inspect OpenClaw SQLite owners: {error}"))?;
         let has_registry: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_databases')",
             [], |row| row.get(0),
@@ -1810,7 +1824,7 @@ impl<'a> OpenClawSqliteCopy<'a> {
                 let path = if path.is_absolute() {
                     path
                 } else {
-                    state_root.join(path)
+                    self.state_root.join(path)
                 };
                 // Workspace admission can canonicalize an alias (for example
                 // /var on macOS). Match that spelling without expanding the
@@ -1825,19 +1839,18 @@ impl<'a> OpenClawSqliteCopy<'a> {
                     fs::canonicalize(parent).map(|parent| parent.join(name))
                 });
                 if let Ok(canonical) = canonical {
-                    if let Ok(root) = fs::canonicalize(state_root)
+                    if let Ok(root) = fs::canonicalize(self.state_root)
                         && let Ok(relative) = canonical.strip_prefix(root)
                     {
-                        selection
-                            .registered_agents
-                            .insert(state_root.join(relative));
+                        self.registered_agents
+                            .insert(self.state_root.join(relative));
                     }
-                    selection.registered_agents.insert(canonical);
+                    self.registered_agents.insert(canonical);
                 }
-                selection.registered_agents.insert(path);
+                self.registered_agents.insert(path);
             }
         }
-        Ok(selection)
+        Ok(())
     }
 
     pub(super) fn contains(&self, path: &Path) -> bool {

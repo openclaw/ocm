@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -278,6 +279,8 @@ pub struct EnvImportSummary {
     pub config_paths_rewritten: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_paths_rewritten: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_paths_rewritten: Option<BTreeMap<String, u64>>,
     pub name: String,
     pub source_name: String,
     pub root: String,

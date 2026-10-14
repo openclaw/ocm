@@ -625,6 +625,14 @@ pub fn env_imported(
             },
         ));
     }
+    if let Some(databases) = &summary.database_paths_rewritten {
+        for (database, count) in databases {
+            import_rows.push(KeyValueRow::plain(
+                database,
+                format!("{count} text value(s) rewritten"),
+            ));
+        }
+    }
     if summary.protected {
         import_rows.push(KeyValueRow::warning("Protected", "yes"));
     }
@@ -667,6 +675,11 @@ fn env_imported_raw(summary: &EnvImportSummary, command_example: &str) -> Vec<St
                 "unchanged"
             }
         ));
+    }
+    if let Some(databases) = &summary.database_paths_rewritten {
+        for (database, count) in databases {
+            lines.push(format!("  {database}: {count} text value(s) rewritten"));
+        }
     }
     if let Some(runtime) = summary.default_runtime.as_deref() {
         lines.push(format!("  runtime: {runtime}"));

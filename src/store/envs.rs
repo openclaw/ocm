@@ -1245,7 +1245,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 env,
                 target_runtime,
             )?;
-            let state_paths_rewritten = if extracted.metadata.include_state {
+            let state_rewrite = if extracted.metadata.include_state {
                 if let Some(source_root) = extracted.metadata.env.source_root.as_deref() {
                     super::openclaw_state::relocate_archived_runtime_state(
                         &target_paths,
@@ -1254,10 +1254,10 @@ pub(crate) fn import_environment_with_sandbox_origin(
                         target_runtime,
                     )?
                 } else {
-                    false
+                    Default::default()
                 }
             } else {
-                false
+                Default::default()
             };
             if let Some(permissions) = &config_directory_permissions {
                 fs::set_permissions(&target_paths.state_dir, permissions.clone())
@@ -1288,17 +1288,21 @@ pub(crate) fn import_environment_with_sandbox_origin(
             };
             let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
             write_env_registry(&mut registry, env, cwd)?;
-            Ok((meta, config_rewrite, state_paths_rewritten))
+            Ok((meta, config_rewrite, state_rewrite))
         })();
 
         match imported {
-            Ok((meta, config_rewrite, state_paths_rewritten)) => Ok(ImportEnvironmentResult {
+            Ok((meta, config_rewrite, state_rewrite)) => Ok(ImportEnvironmentResult {
                 summary: EnvImportSummary {
                     config_paths_rewritten: extracted.metadata.include_state.then_some(true),
                     state_paths_rewritten: extracted
                         .metadata
                         .include_state
-                        .then_some(state_paths_rewritten),
+                        .then_some(state_rewrite.changed),
+                    database_paths_rewritten: extracted
+                        .metadata
+                        .include_state
+                        .then_some(state_rewrite.databases),
                     name: meta.name.clone(),
                     source_name,
                     root: meta.root.clone(),

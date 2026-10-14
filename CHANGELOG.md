@@ -46,6 +46,8 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Relocate session, recorded file, worktree, and other text references across registered OpenClaw databases during state-inclusive import, with per-database counts and unchanged binary payloads.
+
 - Relocate installed plugin receipts and runtime state references when importing a state-inclusive archive, preserving other state and references outside the source environment. Share path-component and file-URL matching with plain-home migration so sibling path prefixes are preserved.
 
 - Rewrite env-scoped configuration paths when importing a state-inclusive archive so agent workspaces and directories point into the imported environment, while preserving state contents.
