@@ -959,11 +959,17 @@ root is captured as a coherent committed snapshot, including uncheckpointed WAL
 writes; raw database sidecars are omitted. Databases and other files are not
 captured in one atomic transaction.
 
-State-inclusive export and import copy configuration files and database contents
-without resolving or rewriting them. `.env`, `openclaw.json`, includes, and
-plugin load-path expressions travel verbatim. No OpenClaw runtime is required.
-Paths outside the environment root are not exported, detected, or reported;
-absolute paths in file contents may need updating after moving the environment.
+State-inclusive export copies configuration files verbatim. Import rewrites
+env-scoped OpenClaw config paths for the new root, including agent workspaces
+and agent directories, through the same rules as an ordinary import. It also
+assigns the new gateway port and resets the sandbox origin. Configuration must
+be valid; includes that own agent workspaces or the sandbox origin must be
+flattened first, as for ordinary imports. No OpenClaw runtime is required.
+State contents, including SQLite snapshots, sessions, plugin receipts, `.env`
+files, and other files outside the config rewrite, stay byte-identical to the
+archive. Paths inside those contents are not rewritten. Paths outside the
+environment root are not exported; those references may need updating after
+moving the environment.
 Owned file and directory links use relative targets in the archive; external
 and dangling links retain their targets without copying external contents.
 State-inclusive archives are created with private access. Import preserves
@@ -973,9 +979,11 @@ Archive ownership and extended ACLs are not transferred; the private root
 prevents broader access when those restrictions cannot be reproduced.
 An explicit `env import --sandbox-origin` still replaces that setting.
 
-JSON reports `includeState`; the human summary also reports whether state was
-included. Export without the flag and import of older archives retain their
-existing selection, configuration rewriting, and cleanup behavior.
+Export JSON reports `includeState`; its human summary also reports whether
+state was included. State-inclusive import reports `configPathsRewritten: true`
+in JSON and the config-path rewrite in its human summary. Export without the
+flag and imports without included state retain their existing selection,
+configuration rewriting, and cleanup behavior.
 
 Environment archives must contain real `meta/` and `root/` directories and a
 regular `meta/env.json` file. Import and legacy snapshot restore reject symlinks

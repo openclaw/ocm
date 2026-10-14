@@ -274,6 +274,8 @@ pub struct ImportEnvironmentOptions {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvImportSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_paths_rewritten: Option<bool>,
     pub name: String,
     pub source_name: String,
     pub root: String,

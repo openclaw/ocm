@@ -395,6 +395,7 @@ fn migrate_plain_openclaw_home_inner(
 
     Ok(MigrateHomeResult {
         summary: EnvImportSummary {
+            config_paths_rewritten: None,
             name: completed.meta.name,
             source_name: "plain-openclaw".to_string(),
             root: completed.meta.root,

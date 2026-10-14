@@ -145,20 +145,6 @@ pub(crate) fn rewrite_openclaw_config_for_new_environment(
     )
 }
 
-pub(crate) fn replace_imported_sandbox_origin(
-    paths: &EnvPaths,
-    origin: &str,
-) -> Result<(), String> {
-    // An explicit import override changes only this setting, not stored paths.
-    reject_include_owned_sandbox_origin(&paths.config_path)?;
-    let mut value = read_config_value(&paths.config_path)?.unwrap_or_else(|| json!({}));
-    let mut outcome = OpenClawConfigRewriteOutcome::default();
-    if rewrite_sandbox_origin_for_new_environment(&mut value, Some(origin), &mut outcome)? {
-        write_config_value(&paths.config_path, &value)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn rewrite_openclaw_config_for_migration(
     target_paths: &EnvPaths,
     source_state_root: &Path,

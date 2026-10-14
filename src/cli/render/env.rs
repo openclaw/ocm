@@ -612,6 +612,9 @@ pub fn env_imported(
             summary.default_launcher.clone(),
         ),
     ];
+    if summary.config_paths_rewritten == Some(true) {
+        import_rows.push(KeyValueRow::plain("Config paths", "rewritten for new root"));
+    }
     if summary.protected {
         import_rows.push(KeyValueRow::warning("Protected", "yes"));
     }
@@ -642,6 +645,9 @@ fn env_imported_raw(summary: &EnvImportSummary, command_example: &str) -> Vec<St
         format!("  root: {}", summary.root),
         format!("  archive: {}", summary.archive_path),
     ];
+    if summary.config_paths_rewritten == Some(true) {
+        lines.push("  config paths: rewritten for new root".to_string());
+    }
     if let Some(runtime) = summary.default_runtime.as_deref() {
         lines.push(format!("  runtime: {runtime}"));
     }

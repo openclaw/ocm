@@ -46,6 +46,8 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Rewrite env-scoped configuration paths when importing a state-inclusive archive so agent workspaces and directories point into the imported environment, while preserving state contents.
+
 - Disclose skipped candidate preparation and validation in upgrade dry-run text and JSON, including batch previews, and point operators to isolated simulation. Thanks @shakkernerd (#124).
 - Limit runtime metadata to 64 MiB of decoded JSON, including gzip expansion, and preserve installed runtime files and metadata when an oversized update source is rejected. Thanks @SebTardif (#117).
 - Preserve newer Stop and Uninstall requests after foreground development sessions, and refuse foreground startup while a superseding request leaves the background Gateway running or requested. Thanks @shakkernerd (#299, #310).
