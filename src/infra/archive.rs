@@ -168,6 +168,20 @@ pub fn write_env_archive_with_options<T: Serialize>(
     output_path: &Path,
     mut options: EnvArchiveOptions,
 ) -> Result<(), String> {
+    // Resolve aliases once. A retry must not retarget the selected environment.
+    let resolved_root = if options.private_output
+        || !options.sqlite_content_roots.is_empty()
+        || options.relocate_internal_symlinks
+    {
+        Some(
+            source_root
+                .canonicalize()
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let source_root = resolved_root.as_deref().unwrap_or(source_root);
     let parent = output_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -194,11 +208,7 @@ pub fn write_env_archive_with_options<T: Serialize>(
             .path()
             .canonicalize()
             .map_err(|error| error.to_string())?
-            .strip_prefix(
-                source_root
-                    .canonicalize()
-                    .map_err(|error| error.to_string())?,
-            )
+            .strip_prefix(source_root)
         {
             options.excluded_path_roots.insert(relative.to_path_buf());
         }
@@ -274,7 +284,7 @@ fn append_env_root(
     {
         None
     } else {
-        Some(ArchiveSource::open(source_root)?)
+        Some(ArchiveSource::open_canonical(source_root)?)
     };
     let source_root = capture
         .as_ref()
@@ -554,18 +564,72 @@ struct CapturedArchiveFile {
 }
 
 impl ArchiveSource {
-    fn open(root: &Path) -> Result<Self, EnvArchiveWriteError> {
-        let root = root
-            .canonicalize()
-            .map_err(EnvArchiveWriteError::from_entry_io)?;
+    fn open_canonical(root: &Path) -> Result<Self, EnvArchiveWriteError> {
+        if !root.is_absolute() {
+            return Err(EnvArchiveWriteError::Fatal(
+                "archive root must be absolute".to_string(),
+            ));
+        }
+        let root = root.to_path_buf();
         #[cfg(unix)]
         {
+            use std::ffi::CString;
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
             use std::os::unix::fs::OpenOptionsExt;
-            let directory = fs::OpenOptions::new()
+            let components: Vec<_> = root
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(name) => Some(name),
+                    _ => None,
+                })
+                .collect();
+            #[cfg(target_os = "linux")]
+            let search = libc::O_PATH;
+            #[cfg(target_vendor = "apple")]
+            let search = libc::O_SEARCH;
+            #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+            let search = libc::O_RDONLY;
+            let mut directory = fs::OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&root)
+                .custom_flags(
+                    libc::O_DIRECTORY
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | if components.is_empty() {
+                            libc::O_RDONLY
+                        } else {
+                            search
+                        },
+                )
+                .open("/")
                 .map_err(EnvArchiveWriteError::from_entry_io)?;
+            for (index, component) in components.iter().enumerate() {
+                let name = CString::new(component.as_bytes())
+                    .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
+                let flags = libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | if index + 1 == components.len() {
+                        libc::O_RDONLY
+                    } else {
+                        search
+                    };
+                let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+                if fd < 0 {
+                    let error = io::Error::last_os_error();
+                    return Err(
+                        if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+                            EnvArchiveWriteError::EntryDisappeared(
+                                "archive root changed during capture".to_string(),
+                            )
+                        } else {
+                            EnvArchiveWriteError::from_entry_io(error)
+                        },
+                    );
+                }
+                directory = unsafe { File::from_raw_fd(fd) };
+            }
             Ok(Self { root, directory })
         }
         #[cfg(windows)]
@@ -1540,6 +1604,44 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn root_acquisition_rejects_a_replaced_ancestor() {
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = fixture.path().join("parent");
+        let outside = fixture.path().join("outside");
+        fs::create_dir_all(parent.join("home")).unwrap();
+        fs::create_dir_all(outside.join("home")).unwrap();
+        let selected = parent.join("home").canonicalize().unwrap();
+        fs::rename(&parent, fixture.path().join("saved")).unwrap();
+        std::os::unix::fs::symlink(outside, &parent).unwrap();
+        assert!(super::ArchiveSource::open_canonical(&selected).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn root_acquisition_only_needs_search_access_to_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = fixture.path().join("parent");
+        let home = parent.join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("data"), b"owned").unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o111)).unwrap();
+        let result = write_env_archive_with_options(
+            &serde_json::json!({}),
+            &home,
+            &fixture.path().join("archive.tar"),
+            EnvArchiveOptions {
+                sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
+                private_output: true,
+                ..EnvArchiveOptions::default()
+            },
+        );
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[cfg(unix)]
     static DIRECTORY_REPLACEMENT: Mutex<Option<(PathBuf, PathBuf, usize)>> = Mutex::new(None);
 
     #[cfg(unix)]
@@ -1706,7 +1808,8 @@ mod tests {
             fs::create_dir(&outside).unwrap();
             fs::write(home.join("data/config"), b"owned").unwrap();
             fs::write(outside.join("config"), b"external").unwrap();
-            let source = super::ArchiveSource::open(&home).unwrap();
+            let source =
+                super::ArchiveSource::open_canonical(&home.canonicalize().unwrap()).unwrap();
             let observed = fs::symlink_metadata(home.join("data/config")).unwrap();
             let mut captured = source.file(Path::new("data/config"), &observed).unwrap();
             if parent {
@@ -1735,7 +1838,7 @@ mod tests {
         fs::create_dir_all(home.join("data")).unwrap();
         let path = home.join("data/config");
         fs::write(&path, b"owned").unwrap();
-        let source = super::ArchiveSource::open(&home).unwrap();
+        let source = super::ArchiveSource::open_canonical(&home.canonicalize().unwrap()).unwrap();
         let observed = fs::symlink_metadata(&path).unwrap();
         let captured = source.file(Path::new("data/config"), &observed).unwrap();
         assert!(fs::rename(&path, home.join("renamed")).is_err());
@@ -1770,7 +1873,7 @@ mod tests {
             super::env_archive_entry_kind(&expected),
             EnvArchiveEntryKind::Symlink
         );
-        let source = super::ArchiveSource::open(&home).unwrap();
+        let source = super::ArchiveSource::open_canonical(&home.canonicalize().unwrap()).unwrap();
         assert_eq!(
             source.link(Path::new("data/link"), &expected).unwrap(),
             fs::read_link(&link).unwrap()
