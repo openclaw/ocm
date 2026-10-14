@@ -978,7 +978,7 @@ boundary; sibling names that share its prefix remain unchanged. On POSIX,
 backslashes in filenames are not directory separators. Free-form text uses literal
 root substitutions without interpreting command syntax or resolving `..` segments;
 structured path fields and file URLs are checked as complete paths. Within text,
-file URLs end at a closing quote or angle bracket, a newline, or the next root
+file URLs end at a closing quote or angle bracket, a control character, or the next root
 reference; spaces alone stay within the URL. References
 without the source-root prefix are left unchanged. External contents are not
 exported and may need separate preparation after moving.

@@ -798,19 +798,20 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     boundaries.dedup();
     // A separated opaque escape ends the valid text span; an adjacent escape
     // remains guarded so it cannot create a false root boundary.
-    let line_ends: Vec<_> = raw
-        .match_indices(['\r', '\n', '\0'])
+    let text_ends: Vec<_> = raw
+        .char_indices()
         .filter(|(offset, delimiter)| {
-            *delimiter != "\0"
-                || raw[..*offset]
-                    .chars()
-                    .next_back()
-                    .is_some_and(char::is_whitespace)
+            delimiter.is_control()
+                && (*delimiter != '\0'
+                    || raw[..*offset]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace))
         })
         .map(|(offset, _)| offset)
         .chain(std::iter::once(raw.len()))
         .collect();
-    let mut line_index = 0;
+    let mut text_index = 0;
     let angle_ends: Vec<_> = raw.match_indices('>').map(|(offset, _)| offset).collect();
     for &start in &starts {
         if urls
@@ -826,12 +827,12 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
             quote_index += 1;
         }
         let enclosing = quoted.get(quote_index).filter(|range| range.start <= start);
-        while line_ends[line_index] <= start {
-            line_index += 1;
+        while text_ends[text_index] <= start {
+            text_index += 1;
         }
         let quote_end = enclosing
             .map_or(raw.len(), |range| range.end)
-            .min(line_ends[line_index]);
+            .min(text_ends[text_index]);
         let angle_end = raw[..start]
             .ends_with('<')
             .then(|| {

@@ -781,6 +781,10 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             url::Url::from_file_path(&source).unwrap(),
             source.display()
         ));
+        runtime["urlControlText"] = json!(["\t", "\u{b}", "\u{c}", "\u{85}"].map(|separator| {
+            let uri = url::Url::from_file_path(&source).unwrap();
+            format!("loaded {uri}/plugin{separator}ready")
+        }));
         runtime["separatedRootUrls"] = json!([" ", "\t", "\r", "\n"].map(|separator| {
             let uri = url::Url::from_file_path(&source).unwrap();
             format!("{uri}{separator}{uri}/plugin")
@@ -1136,6 +1140,11 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             url::Url::from_file_path(&target).unwrap(),
             target.display()
         ));
+        expected_runtime["urlControlText"] =
+            json!(["\t", "\u{b}", "\u{c}", "\u{85}"].map(|separator| {
+                let uri = url::Url::from_file_path(&target).unwrap();
+                format!("loaded {uri}/plugin{separator}ready")
+            }));
         expected_runtime["separatedRootUrls"] = json!([" ", "\t", "\r", "\n"].map(|separator| {
             let uri = url::Url::from_file_path(&target).unwrap();
             format!("{uri}{separator}{uri}/plugin")
