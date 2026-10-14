@@ -603,6 +603,8 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "external": {"source":"path", "installPath":external, "sourcePath":external},
             "lookalike": {"source":"npm", "installPath":lookalike},
             "punctuation-sibling": {"source":"path", "installPath":source.with_file_name("source=other").join("plugin")},
+            "spaced-sibling": {"source":"path", "installPath":source.with_file_name("source other").join("plugin"), "sourcePath":source.with_file_name("source other").join("plugin")},
+            "spaced-escape": {"source":"path", "installPath":source.join("a b/../../outside")},
             "missing": {"source":"npm", "installPath":source.join(".openclaw/extensions/missing")}
         });
         let plugins = json!([{
@@ -692,14 +694,23 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         let runtime_file = ".openclaw/agents/main/agent/paths.json";
         let runtime = json!({"rootDir":installed, "package":package,
             "command":format!("node {}/index.js", installed.display()),
+            "shell":format!("cd {}; pwd", source.display()),
+            "quotedExternal":format!("cat '{} other/plugin'", source.display()),
+            "quotedOwned":format!("cat '{}/a b/file'", source.display()),
             "encoded":json!({"rootDir":installed}).to_string(),
-            "fileUrl":format!("file://{}/index.js", installed.display()),
+            "fileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string(),
+            "localFileUrl":format!("file://localhost{}", url::Url::from_file_path(installed.join("index.js")).unwrap().path()),
             "normalized":format!("{}/sub/../index.js", installed.display()),
-            "bareRoot":format!("{}\n", source.display()),
+            "newlineSibling":format!("{}\nother/plugin", source.display()),
+            "absoluteCommand": {"command":format!("{}/run --input {}/input", source.display(), source.display())},
             "externalCommand":format!("node {}=other/plugin.js", source.display()),
             "escapedRoot":format!("node {}/../outside/index.js", source.display()),
             "external":external, "lookalike":lookalike});
         write_text(&source.join(runtime_file), &runtime.to_string());
+        write_text(
+            &source.join(".openclaw/logs/root.txt"),
+            &format!("{}\n", source.display()),
+        );
         let jsonl_file = ".openclaw/agents/main/sessions/commands.jsonl";
         write_text(
             &source.join(jsonl_file),
@@ -752,9 +763,9 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         .unwrap();
         fs::rename(&source, root.child("source-offline")).unwrap();
         #[cfg(unix)]
-        let target = root.child("imports/copy-\"quoted\"");
+        let target = root.child("imports/copy-\"quoted\"#mark%name");
         #[cfg(not(unix))]
-        let target = root.child("imports/copy");
+        let target = root.child("imports/copy#mark%name");
         let import = run_ocm(
             root.path(),
             &env,
@@ -898,18 +909,28 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         ));
         expected_runtime["encoded"] =
             json!(json!({"rootDir":target.join(".openclaw/extensions/demo")}).to_string());
-        expected_runtime["fileUrl"] = json!(format!(
-            "file://{}/index.js",
-            target.join(".openclaw/extensions/demo").display()
-        ));
+        expected_runtime["shell"] = json!(format!("cd {}; pwd", target.display()));
+        expected_runtime["quotedOwned"] = json!(format!("cat '{}/a b/file'", target.display()));
+        let expected_url =
+            url::Url::from_file_path(target.join(".openclaw/extensions/demo/index.js")).unwrap();
+        expected_runtime["fileUrl"] = json!(expected_url.as_str());
+        expected_runtime["localFileUrl"] = json!(expected_url.as_str());
         expected_runtime["normalized"] = json!(format!(
             "{}/sub/../index.js",
             target.join(".openclaw/extensions/demo").display()
         ));
-        expected_runtime["bareRoot"] = json!(format!("{}\n", target.display()));
+        expected_runtime["absoluteCommand"]["command"] = json!(format!(
+            "{}/run --input {}/input",
+            target.display(),
+            target.display()
+        ));
         let actual_runtime: Value =
             serde_json::from_slice(&fs::read(target.join(runtime_file)).unwrap()).unwrap();
         assert_eq!(actual_runtime, expected_runtime);
+        assert_eq!(
+            fs::read_to_string(target.join(".openclaw/logs/root.txt")).unwrap(),
+            format!("{}\n", target.display())
+        );
         for line in fs::read_to_string(target.join(jsonl_file)).unwrap().lines() {
             assert_eq!(
                 serde_json::from_str::<Value>(line).unwrap(),
@@ -1021,4 +1042,64 @@ fn state_import_refuses_to_rewrite_a_database_outside_the_copy() {
     assert!(!root.child("ocm-home/envs/copy").exists());
     let show = run_ocm(root.path(), &env, &["env", "show", "copy"]);
     assert!(!show.status.success());
+}
+
+#[test]
+fn state_import_refuses_a_receipt_conflict_without_replacing_other_rows() {
+    let root = TestDir::new("state-import-receipt-conflict");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    let target = root.child("ocm-home/envs/copy");
+    let database = source.join(".openclaw/state/openclaw.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.execute_batch("CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT UNIQUE ON CONFLICT REPLACE);").unwrap();
+    let receipt = |base: &std::path::Path| {
+        serde_json::json!({"index":{"installRecords":{"demo":{"installPath":base.join(".openclaw/extensions/demo")}}}}).to_string()
+    };
+    db.execute(
+        "INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?1)",
+        [receipt(&source)],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO config_machine_state VALUES ('unrelated', ?1)",
+        [receipt(&target)],
+    )
+    .unwrap();
+    drop(db);
+    let before = fs::read(&database).unwrap();
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "state.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "state.tar", "--name", "copy"],
+    );
+    assert!(!import.status.success());
+    assert!(
+        stderr(&import).contains("UNIQUE constraint failed"),
+        "{}",
+        stderr(&import)
+    );
+    assert_eq!(fs::read(&database).unwrap(), before);
+    assert!(!target.exists());
+    assert!(
+        !run_ocm(root.path(), &env, &["env", "show", "copy"])
+            .status
+            .success()
+    );
 }

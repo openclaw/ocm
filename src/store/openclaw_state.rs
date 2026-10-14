@@ -423,11 +423,7 @@ fn rewrite_runtime_state_root_refs_inner(
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let rewritten = if archived {
-            rewrite_archived_root_references(&raw, source_root, target_root)?
-        } else {
-            raw.replace(source_root, target_root)
-        };
+        let rewritten = rewrite_runtime_root_references(&raw, source_root, target_root, archived)?;
         if rewritten == raw {
             continue;
         }
@@ -443,16 +439,28 @@ fn rewrite_runtime_state_root_refs_inner(
     Ok(())
 }
 
-fn rewrite_archived_root_references(
+fn rewrite_runtime_root_references(
     raw: &str,
     source_root: &str,
     target_root: &str,
+    preserve_bytes: bool,
 ) -> Result<String, String> {
+    if !preserve_bytes {
+        // Keep the established migration policy. Archive copies additionally
+        // preserve external references and the representation of untouched data.
+        return Ok(raw.replace(source_root, target_root));
+    }
+    if is_absolute_reference(raw) && !raw.contains(['\n', '\r']) {
+        return Ok(
+            relocate_rooted_path(raw, source_root, target_root).unwrap_or_else(|| raw.to_string())
+        );
+    }
     if serde_json::from_str::<serde::de::IgnoredAny>(raw).is_ok() {
         // Preserve authored JSON bytes around the relocated strings, including
         // whitespace and escapes. Decoding also handles Windows path separators.
         let mut output = String::with_capacity(raw.len());
         let mut cursor = 0;
+        let mut previous_key = None;
         while let Some(offset) = raw[cursor..].find('"') {
             let start = cursor + offset;
             output.push_str(&raw[cursor..start]);
@@ -463,7 +471,21 @@ fn rewrite_archived_root_references(
                 .expect("JSON string begins at quote")
                 .map_err(|error| error.to_string())?;
             let end = start + strings.byte_offset();
-            let replacement = rewrite_archived_root_references(&value, source_root, target_root)?;
+            let is_key = raw[end..].trim_start().starts_with(':');
+            let is_command = !is_key && previous_key.take().as_deref() == Some("command");
+            if is_key {
+                previous_key = Some(value.clone());
+            }
+            let replacement = if is_command {
+                rewrite_rooted_text(&value, source_root, target_root)
+            } else if is_absolute_reference(&value) {
+                // A JSON path is one filename; whitespace is not an argument
+                // separator, including escaped newlines within that filename.
+                relocate_rooted_path(&value, source_root, target_root)
+                    .unwrap_or_else(|| value.clone())
+            } else {
+                rewrite_runtime_root_references(&value, source_root, target_root, true)?
+            };
             if replacement != value {
                 output.push_str(
                     &serde_json::to_string(&replacement).map_err(|error| error.to_string())?,
@@ -487,7 +509,7 @@ fn rewrite_archived_root_references(
                 if line.trim().is_empty() {
                     Ok(line.to_string())
                 } else {
-                    rewrite_archived_root_references(line, source_root, target_root)
+                    rewrite_runtime_root_references(line, source_root, target_root, true)
                 }
             })
             .collect();
@@ -495,50 +517,103 @@ fn rewrite_archived_root_references(
     Ok(rewrite_rooted_text(raw, source_root, target_root))
 }
 
+fn is_absolute_reference(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with('\\')
+        || (value.as_bytes().get(1) == Some(&b':')
+            && matches!(value.as_bytes().get(2), Some(b'/' | b'\\')))
+}
+
+fn relocate_rooted_path(path: &str, source_root: &str, target_root: &str) -> Option<String> {
+    let suffix = path.strip_prefix(source_root)?;
+    if !suffix.is_empty() && !suffix.starts_with(['/', '\\']) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for component in suffix.split(['/', '\\']) {
+        match component {
+            "" | "." => {}
+            ".." => depth = depth.checked_sub(1)?,
+            _ => depth += 1,
+        }
+    }
+    Some(format!("{target_root}{suffix}"))
+}
+
+fn reference_boundary(ch: char) -> bool {
+    ch.is_whitespace() || "\"'`=([{,:;<>)]}|&".contains(ch)
+}
+
 fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> String {
-    // A reference may be a plain path, a command argument, or a file URL.
-    // Require a complete root component even when the path is embedded in text.
-    let boundary = |ch: char| ch.is_whitespace() || "\"'`=([{,:;<>)]}".contains(ch);
-    let path_end = |ch: char| ch.is_whitespace() || "\"'`".contains(ch);
+    // File URLs have their own escaping and authority rules. Preserve other URL
+    // components and never interpret an external URL as a local command path.
     let mut output = String::with_capacity(raw.len());
     let mut cursor = 0;
-    for (start, _) in raw.match_indices(source_root) {
-        let end = start + source_root.len();
-        let prefix = &raw[..start];
-        let before = prefix.chars().next_back();
-        let file_url = prefix
-            .strip_suffix("file://")
-            .is_some_and(|before_url| before_url.chars().next_back().is_none_or(boundary));
-        let after = raw[end..].chars().next();
-        if (!file_url && before.is_some_and(|ch| !boundary(ch)))
-            || after.is_some_and(|ch| ch != '/' && ch != '\\' && !path_end(ch))
+    for (start, _) in raw.match_indices("file://") {
+        if start < cursor
+            || raw[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| !reference_boundary(ch))
         {
             continue;
         }
-        // Allow normalization within the copied root, but never rebase a path
-        // that escapes it. No source filesystem access is needed after export.
-        let suffix = raw[end..].split(path_end).next().unwrap_or_default();
-        let mut depth = 0usize;
-        let escapes_root = suffix.split(['/', '\\']).any(|component| match component {
-            "" | "." => false,
-            ".." => match depth.checked_sub(1) {
-                Some(parent) => {
-                    depth = parent;
-                    false
-                }
-                None => true,
-            },
-            _ => {
-                depth += 1;
-                false
-            }
+        let end = raw[start..]
+            .find(|ch: char| ch.is_whitespace() || "\"'`<>;|&".contains(ch))
+            .map_or(raw.len(), |offset| start + offset);
+        output.push_str(&rewrite_path_tokens(
+            &raw[cursor..start],
+            source_root,
+            target_root,
+        ));
+        let token = &raw[start..end];
+        let relocated = url::Url::parse(token).ok().and_then(|mut url| {
+            let path = url.to_file_path().ok()?;
+            let relocated = relocate_rooted_path(path.to_str()?, source_root, target_root)?;
+            let encoded = url::Url::from_file_path(&relocated).ok()?;
+            url.set_path(encoded.path());
+            Some(url.to_string())
         });
-        if escapes_root {
+        output.push_str(relocated.as_deref().unwrap_or(token));
+        cursor = end;
+    }
+    output.push_str(&rewrite_path_tokens(
+        &raw[cursor..],
+        source_root,
+        target_root,
+    ));
+    output
+}
+
+fn rewrite_path_tokens(raw: &str, source_root: &str, target_root: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    let mut skip_until = 0;
+    for (start, _) in raw.match_indices(source_root) {
+        if start < skip_until {
             continue;
         }
-        output.push_str(&raw[cursor..start]);
-        output.push_str(target_root);
-        cursor = end;
+        let before = raw[..start].chars().next_back();
+        if before.is_some_and(|ch| !reference_boundary(ch)) {
+            continue;
+        }
+        // Quotes delimit one complete filename, including its whitespace.
+        // Unquoted command arguments end at shell separators.
+        let end = if let Some(quote @ ('"' | '\'' | '`')) = before {
+            raw[start..]
+                .find(quote)
+                .map_or(raw.len(), |offset| start + offset)
+        } else {
+            raw[start + source_root.len()..]
+                .find(|ch: char| ch.is_whitespace() || "\"'`;|&()<>".contains(ch))
+                .map_or(raw.len(), |offset| start + source_root.len() + offset)
+        };
+        skip_until = end;
+        if let Some(rewritten) = relocate_rooted_path(&raw[start..end], source_root, target_root) {
+            output.push_str(&raw[cursor..start]);
+            output.push_str(&rewritten);
+            cursor = end;
+        }
     }
     output.push_str(&raw[cursor..]);
     output
@@ -846,10 +921,11 @@ fn relocate_plugin_records_in_database(
                 })?;
             }
             // Keep every non-relocated token verbatim, including numeric metadata.
-            let rewritten = rewrite_archived_root_references(
+            let rewritten = rewrite_runtime_root_references(
                 &raw_records,
                 &display_path(source_state_root),
                 &display_path(target_state_root),
+                true,
             )?;
             (rewritten != raw_records).then_some(rewritten)
         } else {
@@ -863,6 +939,12 @@ fn relocate_plugin_records_in_database(
             )?
         };
         if let Some(rewritten) = rewritten {
+            // A stored REPLACE conflict policy must not delete another row.
+            let update_sql = if matches!(relocation, PluginPathRelocation::Archived) {
+                update_sql.replacen("UPDATE ", "UPDATE OR ABORT ", 1)
+            } else {
+                update_sql
+            };
             connection
                 .execute(&update_sql, [rewritten])
                 .map_err(|error| {
