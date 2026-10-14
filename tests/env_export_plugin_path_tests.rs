@@ -726,6 +726,8 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "fileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string(),
             "apostropheFileUrl":format!("{}'other/plugin.js", url::Url::from_file_path(&source).unwrap()),
             "quotedFileUrl":format!("cat '{}'", url::Url::from_file_path(installed.join("index.js")).unwrap()),
+            "proseUrlEscape":format!("echo \"loaded from {}/a b/../../outside\"", url::Url::from_file_path(&source).unwrap()),
+            "reenteredUrl":format!("{}/../source/plugin?q=keep%20bytes#part", url::Url::from_file_path(&source).unwrap()),
             "backslashFileUrl":format!("{}\\other/plugin", url::Url::from_file_path(&source).unwrap()),
             "angleUrlEscape":format!("<{}/a b/../../outside>", url::Url::from_file_path(&source).unwrap()),
             "spacedLabelUrlEscape":format!("echo \"url = {}/a b/../../outside\"", url::Url::from_file_path(&source).unwrap()),
@@ -1057,6 +1059,10 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         expected_runtime["prefixedUrl"] = json!(format!("echo \"url={}\"; pwd", expected_url));
         expected_runtime["quotedFileUrl"] = json!(format!("cat '{}'", expected_url));
         expected_runtime["urlCommand"] = json!(format!("open \"{}\"; pwd", expected_url));
+        expected_runtime["reenteredUrl"] = json!(format!(
+            "{}/plugin?q=keep%20bytes#part",
+            url::Url::from_file_path(&target).unwrap()
+        ));
         if cfg!(windows) {
             expected_runtime["backslashFileUrl"] = json!(format!(
                 "{}\\other/plugin",

@@ -762,11 +762,8 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
             .then(|| raw[start..quote_end].find('>').map(|offset| start + offset))
             .flatten();
         let enclosing_end = angle_end.unwrap_or(quote_end);
-        let complete_quoted_url =
-            enclosing.is_some_and(|range| {
-                let prefix = raw[range.start..start].trim();
-                prefix.is_empty() || prefix.ends_with(['=', ':'])
-            }) && is_complete_file_url_value(&raw[start..enclosing_end], source_root);
+        let complete_quoted_url = enclosing.is_some()
+            && is_complete_file_url_value(&raw[start..enclosing_end], source_root);
         let complete_angle_url = angle_end.is_some()
             && is_complete_file_url_value(&raw[start..enclosing_end], source_root);
         let end = if complete_quoted_url || complete_angle_url {
@@ -894,7 +891,7 @@ fn rewrite_file_url(
     {
         return None;
     }
-    rooted_path_suffix(path, canonical_source)?;
+    let relocated = relocate_rooted_path(path, canonical_source, target_root)?;
     // URL parsing establishes ownership; splice only the encoded root in the
     // original representation so filenames, query data and surrounding text
     // retain their bytes instead of being serialized again.
@@ -927,7 +924,15 @@ fn rewrite_file_url(
         }
     }
     let destination = url::Url::from_file_path(target_root).ok()?;
-    Some(format!("{destination}{suffix}"))
+    let candidate = format!("{destination}{suffix}");
+    if url::Url::parse(&candidate).ok()?.to_file_path().ok()? == Path::new(&relocated) {
+        return Some(candidate);
+    }
+    // A source path can leave and re-enter its root through dot segments. Its
+    // original suffix need not have the same meaning below a different root.
+    let destination = url::Url::from_file_path(&relocated).ok()?;
+    let trailer = value.find(['?', '#']).map_or("", |offset| &value[offset..]);
+    Some(format!("{destination}{trailer}"))
 }
 
 fn rewrite_path_value(value: &str, source_root: &str, target_root: &str) -> String {
