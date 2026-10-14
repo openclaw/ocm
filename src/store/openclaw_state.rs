@@ -169,12 +169,13 @@ fn should_exclude_state_archive_path(path: &Path, kind: EnvArchiveEntryKind) -> 
         return true;
     }
     kind == EnvArchiveEntryKind::Other
-        || ((path.parent() == Some(Path::new(".openclaw")) || path.starts_with(".openclaw/state"))
+        || ((path.parent() == Some(Path::new(".openclaw"))
+            || path.parent() == Some(Path::new(".openclaw/state")))
             && super::snapshots::is_snapshot_process_residue(
                 name,
                 kind == EnvArchiveEntryKind::Directory,
             ))
-        || path == Path::new(".openclaw/workspace/.openclaw/tmp")
+        || path.ends_with(".openclaw/tmp")
 }
 
 #[cfg(test)]

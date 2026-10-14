@@ -550,7 +550,8 @@ Paths outside the environment root are not exported, detected, or reported;
 absolute paths in file contents may need updating after moving the environment.
 Owned file and directory links use relative targets in the archive; external
 and dangling links retain their targets without copying external contents.
-Import leaves the environment stopped, and export leaves the source unchanged.
+Import preserves directory permissions and leaves the environment stopped;
+export leaves the source unchanged.
 An explicit `env import --sandbox-origin` still replaces that setting.
 
 JSON reports `includeState`; the human summary also reports whether state was

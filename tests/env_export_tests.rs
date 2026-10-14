@@ -435,6 +435,8 @@ fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhe
         ".openclaw/logs/saved.log",
         ".openclaw/backups/settings.json",
         "legacy/data.txt",
+        ".openclaw/state/projects/demo/Cargo.lock",
+        ".openclaw/workspace/tmp/notes.txt",
     ];
     for path in files {
         write_text(&source.join(path), "retained data");
@@ -455,8 +457,10 @@ fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhe
         "records",
         ".openclaw/custom/data.db",
         ".openclaw/agents/main/sessions/history.sqlite",
+        ".openclaw/state/history/run/records.db",
     ];
     let connections: Vec<_> = databases.iter().map(|path| {
+        fs::create_dir_all(source.join(path).parent().unwrap()).unwrap();
         let db = Connection::open(source.join(path)).unwrap();
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE entries(value TEXT); INSERT INTO entries VALUES ('committed'); BEGIN; INSERT INTO entries VALUES ('uncommitted');").unwrap();
         db
@@ -464,6 +468,7 @@ fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhe
     let debris = [
         ".openclaw/gateway.pid",
         ".openclaw/locks/owner",
+        ".openclaw/team/.openclaw/tmp/cache.bin",
         ".openclaw/state/tmp/cache",
         ".openclaw/run/process",
         ".openclaw/plugin-runtime-deps/cache",

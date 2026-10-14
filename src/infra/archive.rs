@@ -346,6 +346,15 @@ fn append_env_root(
             continue;
         }
 
+        if discover_sqlite && metadata.is_file() {
+            let mut file = File::open(&path).map_err(EnvArchiveWriteError::from_entry_io)?;
+            let captured_metadata = file
+                .metadata()
+                .map_err(EnvArchiveWriteError::from_entry_io)?;
+            append_bounded_file(builder, &archive_path, &mut file, &captured_metadata)?;
+            continue;
+        }
+
         if metadata.is_symlink() && options.relocate_internal_symlinks {
             if let Some(target) = owned_archive_link_target(&path, source_root)? {
                 let mut header = Header::new_gnu();
@@ -369,6 +378,30 @@ fn append_env_root(
             })?;
     }
 
+    Ok(())
+}
+
+fn append_bounded_file(
+    builder: &mut Builder<File>,
+    archive_path: &Path,
+    file: &mut File,
+    metadata: &fs::Metadata,
+) -> Result<(), EnvArchiveWriteError> {
+    let mut header = Header::new_gnu();
+    header.set_metadata(metadata);
+    header.set_cksum();
+    // Appends after metadata capture belong to a later export. Reading to EOF
+    // could write beyond the tar header and misalign subsequent entries.
+    let mut contents = file.take(metadata.len());
+    builder
+        .append_data(&mut header, archive_path, &mut contents)
+        .map_err(EnvArchiveWriteError::from_entry_io)?;
+    if contents.limit() != 0 {
+        return Err(EnvArchiveWriteError::EntryDisappeared(format!(
+            "file shrank while archiving {}",
+            archive_path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -776,6 +809,60 @@ mod tests {
             .query_row("SELECT value FROM records", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "committed");
+    }
+
+    #[test]
+    fn bounded_archive_file_ignores_growth_and_detects_truncation() {
+        use std::fs::File;
+        use std::io::{Read, Write};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("log");
+        fs::write(&source, vec![b'a'; 513]).unwrap();
+        let mut file = File::open(&source).unwrap();
+        let metadata = file.metadata().unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(&vec![b'b'; 1024])
+            .unwrap();
+        let archive_path = root.path().join("archive.tar");
+        let mut builder = tar::Builder::new(File::create(&archive_path).unwrap());
+        assert!(
+            super::append_bounded_file(&mut builder, Path::new("log"), &mut file, &metadata)
+                .is_ok()
+        );
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "after", &b"next"[..])
+            .unwrap();
+        builder.finish().unwrap();
+        let mut archive = tar::Archive::new(File::open(archive_path).unwrap());
+        let mut entries = archive.entries().unwrap();
+        let mut captured = Vec::new();
+        entries
+            .next()
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut captured)
+            .unwrap();
+        assert_eq!(captured, vec![b'a'; 513]);
+        assert_eq!(
+            entries.next().unwrap().unwrap().path().unwrap(),
+            Path::new("after")
+        );
+        assert!(entries.next().is_none());
+
+        let mut file = File::open(&source).unwrap();
+        let metadata = file.metadata().unwrap();
+        fs::write(&source, b"short").unwrap();
+        let mut builder = tar::Builder::new(File::create(root.path().join("short.tar")).unwrap());
+        assert!(matches!(
+            super::append_bounded_file(&mut builder, Path::new("log"), &mut file, &metadata),
+            Err(super::EnvArchiveWriteError::EntryDisappeared(_))
+        ));
     }
 
     #[test]

@@ -174,3 +174,56 @@ fn state_import_honors_an_explicit_sandbox_origin_without_relocating_paths() {
     .unwrap();
     assert_eq!(actual, expected);
 }
+
+#[cfg(unix)]
+#[test]
+fn state_import_preserves_private_directory_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TestDir::new("export-directory-modes");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    write_text(
+        &source.join(".openclaw/state/private/data"),
+        "private state",
+    );
+    for path in ["", ".openclaw/state", ".openclaw/state/private"] {
+        fs::set_permissions(source.join(path), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "modes.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "modes.tar", "--name", "target"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    let target = root.child("ocm-home/envs/target");
+    for path in ["", ".openclaw/state", ".openclaw/state/private"] {
+        assert_eq!(
+            fs::metadata(target.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        fs::read(target.join(".openclaw/state/private/data")).unwrap(),
+        b"private state"
+    );
+}

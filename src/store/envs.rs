@@ -1114,6 +1114,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
     }
 
     let result = (|| {
+        super::common::ensure_private_dir(&staging_dir)?;
         let extracted = extract_env_archive::<EnvArchiveMetadata>(&archive_path, &staging_dir)?;
         if extracted.metadata.kind != "ocm-env-archive" {
             return Err(format!(
@@ -1195,7 +1196,14 @@ pub(crate) fn import_environment_with_sandbox_origin(
             let gateway_port =
                 choose_available_gateway_port(preferred_gateway_port, &registry.envs, env);
             let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
-            copy_dir_recursive(&extracted.root_dir, &target_paths.root)?;
+            if extracted.metadata.include_state {
+                super::common::copy_dir_preserving_permissions(
+                    &extracted.root_dir,
+                    &target_paths.root,
+                )?;
+            } else {
+                copy_dir_recursive(&extracted.root_dir, &target_paths.root)?;
+            }
             let config_rewrite = if let Some(extracted_workspaces) = &extracted_workspaces {
                 validate_nonportable_runtime_state_paths(&target_paths)?;
                 reject_include_owned_sandbox_origin(&target_paths.config_path)?;

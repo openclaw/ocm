@@ -208,7 +208,32 @@ pub(crate) fn try_lock_file_shared(
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None)
+    copy_dir_recursive_inner(source, destination, None, false)
+}
+
+pub(crate) fn copy_dir_preserving_permissions(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    copy_dir_recursive_inner(source, destination, None, true)
+}
+
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 // Clone and migration opt in; package, archive restore, and checkpoint callers
@@ -237,7 +262,7 @@ impl<'a> OpenClawDirectoryCopy<'a> {
     }
 
     pub(crate) fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), String> {
-        copy_dir_recursive_inner(source, destination, Some(self))
+        copy_dir_recursive_inner(source, destination, Some(self), false)
     }
 }
 
@@ -245,8 +270,13 @@ fn copy_dir_recursive_inner(
     source: &Path,
     destination: &Path,
     mut copying: Option<&mut OpenClawDirectoryCopy<'_>>,
+    preserve_permissions: bool,
 ) -> Result<(), String> {
-    ensure_dir(destination)?;
+    if preserve_permissions {
+        ensure_private_dir(destination)?;
+    } else {
+        ensure_dir(destination)?;
+    }
 
     let entries = fs::read_dir(source)
         .map_err(|error| error.to_string())?
@@ -329,10 +359,22 @@ fn copy_dir_recursive_inner(
                     source_path.display()
                 ));
             }
-            copy_path_inner(&source_path, &destination_path, copying.as_deref_mut())?;
+            copy_path_inner(
+                &source_path,
+                &destination_path,
+                copying.as_deref_mut(),
+                preserve_permissions,
+            )?;
         }
     }
 
+    if preserve_permissions {
+        // Restore nested modes before exposing the containing directory.
+        let permissions = fs::metadata(source)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        fs::set_permissions(destination, permissions).map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -349,13 +391,14 @@ pub(crate) fn copy_path_recursive(source: &Path, destination: &Path) -> Result<(
 }
 
 pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_path_inner(source, destination, None)
+    copy_path_inner(source, destination, None, false)
 }
 
 fn copy_path_inner(
     source: &Path,
     destination: &Path,
     copying: Option<&mut OpenClawDirectoryCopy<'_>>,
+    preserve_permissions: bool,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     let file_type = metadata.file_type();
@@ -364,7 +407,7 @@ fn copy_path_inner(
         return copy_symlink(source, destination);
     }
     if file_type.is_dir() {
-        return copy_dir_recursive_inner(source, destination, copying);
+        return copy_dir_recursive_inner(source, destination, copying, preserve_permissions);
     }
     #[cfg(unix)]
     if file_type.is_socket() {
