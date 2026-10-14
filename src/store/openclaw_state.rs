@@ -782,8 +782,17 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     boundaries.extend(plain.iter().copied());
     boundaries.sort_unstable();
     boundaries.dedup();
+    // A separated opaque escape ends the valid text span; an adjacent escape
+    // remains guarded so it cannot create a false root boundary.
     let line_ends: Vec<_> = raw
-        .match_indices(['\r', '\n'])
+        .match_indices(['\r', '\n', '\0'])
+        .filter(|(offset, delimiter)| {
+            *delimiter != "\0"
+                || raw[..*offset]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace)
+        })
         .map(|(offset, _)| offset)
         .chain(std::iter::once(raw.len()))
         .collect();
@@ -818,7 +827,13 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
             })
             .flatten()
             .filter(|offset| *offset < quote_end);
-        let enclosing_end = angle_end.unwrap_or(quote_end);
+        // A separately introduced file scheme starts another reference even
+        // without whitespace (for example a comma-separated list).
+        let next_url = starts
+            .get(starts.partition_point(|offset| *offset <= start))
+            .copied()
+            .unwrap_or(raw.len());
+        let enclosing_end = angle_end.unwrap_or(quote_end).min(next_url);
         // Bound each URI at the next reference after a text separator.
         // This preserves spaced filenames without rescanning shared suffixes.
         let mut value_end = enclosing_end;

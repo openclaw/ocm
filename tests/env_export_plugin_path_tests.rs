@@ -786,7 +786,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             let encoded = serde_json::to_string(path).unwrap();
             let uri = url::Url::from_file_path(path).unwrap();
             format!(
-                "{{\"opaque\":\"\\ud800\",\"mixed\":\"\\ud800 {}\",\"url\":\"\\ud800 {uri}\",\"path\":{encoded}}}\n",
+                "{{\"opaque\":\"\\ud800\",\"mixed\":\"\\ud800 {}\",\"url\":\"\\ud800 {uri}\",\"urlBefore\":\"{uri} \\ud800\",\"urls\":\"{uri},{uri}\",\"path\":{encoded}}}\n",
                 &encoded[1..encoded.len() - 1]
             )
         };
