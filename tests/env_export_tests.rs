@@ -439,6 +439,7 @@ fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhe
         ".openclaw/logs/saved.log",
         ".openclaw/backups/settings.json",
         "legacy/data.txt",
+        ".openclaw/extensions/demo/.openclaw-install-stage-old",
         ".openclaw/state/projects/demo/Cargo.lock",
         ".openclaw/state/Cargo.lock",
         ".openclaw/state/tmp/notes.txt",
@@ -466,6 +467,8 @@ fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhe
         ".openclaw/state/history/run/records.db",
         "legacy/.openclaw/tmp",
         ".openclaw/plugin-runtime-deps",
+        ".openclaw/extensions/demo/.openclaw-pnpm-store",
+        ".openclaw/extensions/filedeps/node_modules",
     ];
     let connections: Vec<_> = databases.iter().map(|path| {
         fs::create_dir_all(source.join(path).parent().unwrap()).unwrap();
@@ -482,6 +485,7 @@ fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhe
         ".openclaw/.openclaw-pnpm-store/cache",
         ".openclaw/.openclaw-npm-cache/cache",
         ".openclaw/extensions/demo/.openclaw-runtime-deps.json",
+        ".openclaw/extensions/filedeps/.openclaw-runtime-deps.json",
         ".openclaw/extensions/demo/node_modules/rebuilt.js",
     ];
     for path in debris {

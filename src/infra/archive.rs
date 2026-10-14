@@ -1427,7 +1427,7 @@ mod tests {
         let outside = root.path().join("outside");
         fs::create_dir_all(home.join("data")).unwrap();
         fs::create_dir(&outside).unwrap();
-        let link = home.join("data/link");
+        let link = home.join("data").join("link");
         let created = std::process::Command::new("cmd")
             .args(["/c", "mklink", "/J"])
             .arg(&link)
