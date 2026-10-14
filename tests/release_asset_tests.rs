@@ -8,7 +8,7 @@ use std::process::{Command, Output};
 use flate2::{Compression, write::GzEncoder};
 use tar::{Builder, EntryType, Header};
 
-use crate::support::{TestDir, path_string, write_executable_script};
+use crate::support::{TestDir, path_string, stdout, write_executable_script};
 
 const SUPPORTED_TARGETS: [&str; 3] = [
     "aarch64-apple-darwin",
@@ -267,13 +267,30 @@ elif [[ "$*" == *"--check-notarization"* ]]; then
   [[ "$#" == "7" && "$1" == "--verify" && "$2" == "--strict" &&
     "$3" == "--verbose=2" && "$4" == "--check-notarization" &&
     "$5" == "--test-requirement" && "$6" == "=notarized" ]] || exit 99
-  if [[ "${TEST_MACOS_NOTARIZATION:-accepted}" != "accepted" ]]; then
+  notarization="${TEST_MACOS_NOTARIZATION:-accepted}"
+  if [[ "$notarization" == "transient" ]]; then
+    if [[ -e "$TEST_MACOS_LOOKUP_COUNT" ]]; then
+      notarization=accepted
+    else
+      touch "$TEST_MACOS_LOOKUP_COUNT"
+    fi
+  fi
+  if [[ "$notarization" != "accepted" ]]; then
     printf '%s\n' 'ocm: code failed to satisfy specified code requirement(s)' >&2
     exit 3
   fi
 elif [[ "${TEST_MACOS_SIGNATURE:-valid}" == "unsigned" ]]; then
   printf '%s\n' 'ocm: code object is not signed at all' >&2
   exit 1
+fi
+"#,
+    );
+    write_executable_script(
+        &fake_bin.join("sleep"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${TEST_MACOS_SLEEP_LOG:-}" ]]; then
+  printf '%s\n' "$*" >>"$TEST_MACOS_SLEEP_LOG"
 fi
 "#,
     );
@@ -468,6 +485,124 @@ fn macos_release_verifier_rejects_unsigned_ad_hoc_and_unnotarized_code() {
     assert!(fs::read_to_string(&codesign_log).unwrap().contains(
         "--verify --strict --verbose=2 --check-notarization --test-requirement =notarized"
     ));
+}
+
+#[test]
+fn macos_release_verifier_rechecks_notarization_without_relaxing_acceptance() {
+    let root = TestDir::new("verify-macos-notarization-recovery");
+    let binary = root.child("ocm");
+    fs::write(&binary, "binary").unwrap();
+    let fake_bin = fake_macos_verification_tools(&root);
+    let path = format!(
+        "{}:{}",
+        path_string(&fake_bin),
+        std::env::var("PATH").unwrap()
+    );
+
+    for (name, signature, notarization, team, success, lookups, delays) in [
+        (
+            "accepted",
+            "valid",
+            "accepted",
+            TEST_MACOS_TEAM_ID,
+            true,
+            1,
+            "",
+        ),
+        (
+            "transient",
+            "valid",
+            "transient",
+            TEST_MACOS_TEAM_ID,
+            true,
+            2,
+            "10\n",
+        ),
+        (
+            "rejected",
+            "valid",
+            "rejected",
+            TEST_MACOS_TEAM_ID,
+            false,
+            3,
+            "10\n20\n",
+        ),
+        (
+            "unsigned",
+            "unsigned",
+            "transient",
+            TEST_MACOS_TEAM_ID,
+            false,
+            0,
+            "",
+        ),
+        (
+            "wrong-team",
+            "valid",
+            "transient",
+            "ZZZZZ99999",
+            false,
+            0,
+            "",
+        ),
+    ] {
+        let codesign_log = root.child(&format!("{name}-codesign.log"));
+        let sleep_log = root.child(&format!("{name}-sleep.log"));
+        let output = Command::new(script("verify-macos-release.sh"))
+            .arg("--binary")
+            .arg(&binary)
+            .args(["--team-id", team, "--require-notarization"])
+            .env("PATH", &path)
+            .env("TEST_MACOS_SIGNATURE", signature)
+            .env("TEST_MACOS_NOTARIZATION", notarization)
+            .env(
+                "TEST_MACOS_LOOKUP_COUNT",
+                root.child(&format!("{name}-lookup")),
+            )
+            .env("TEST_MACOS_CODESIGN_LOG", &codesign_log)
+            .env("TEST_MACOS_SLEEP_LOG", &sleep_log)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{name}: {}",
+            stderr(&output)
+        );
+        let calls = fs::read_to_string(&codesign_log).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.contains("--check-notarization"))
+                .count(),
+            lookups,
+            "{name}: {calls}"
+        );
+        assert_eq!(
+            fs::read_to_string(&sleep_log).unwrap_or_default(),
+            delays,
+            "{name}"
+        );
+        assert_eq!(
+            stderr(&output)
+                .matches("code failed to satisfy specified code requirement(s)")
+                .count(),
+            if notarization == "rejected" {
+                3
+            } else if name == "transient" {
+                1
+            } else {
+                0
+            },
+            "{name}: {}",
+            stderr(&output)
+        );
+        assert_eq!(
+            stdout(&output).contains("Verified macOS notarization with codesign"),
+            success,
+            "{name}"
+        );
+    }
 }
 
 #[test]

@@ -20,6 +20,14 @@ Use the same Apple Developer team and `com.openclaw.ocm` identifier for every re
 
 OCM keeps the existing `.tar.gz` install and self-update format. Apple cannot staple tickets to a standalone command-line executable or tar archive. The workflow therefore notarizes a ZIP containing the signed executable and verifies the ticket with `codesign --verify --strict --check-notarization --test-requirement '=notarized'` before packaging. `--check-notarization` forces an online ticket check, and the explicit `notarized` requirement makes a missing ticket fail validation. Unlike `spctl --assess --type execute`, this checks standalone command-line tools without requiring an app bundle. The Mach-O code signature is embedded in the executable, and `package-release.sh` verifies it after a tar create-and-extract round trip. `install.sh` and `ocm self update` continue to verify the published tarball against `SHA256SUMS` before installing it.
 
+After the local signature and identity checks pass, the shared verifier allows up
+to three strict notarization checks, waiting 10 and 20 seconds before rechecking.
+This lets release packaging and native npm verification recover from a temporary
+ticket lookup failure without rebuilding or signing again. Each failed attempt
+is printed, and an unsuccessful final check still fails validation. Invalid local
+signatures or signing metadata fail immediately; a retry never substitutes for a
+successful strict notarization check.
+
 References:
 
 - Apple's `man codesign`: `--check-notarization` and `--test-requirement`.

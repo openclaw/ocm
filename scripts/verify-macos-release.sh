@@ -93,9 +93,21 @@ grep -Eq '^Timestamp=' <<<"$metadata" || {
 }
 
 if [[ "$require_notarization" == "1" ]]; then
-  if ! assessment="$(codesign --verify --strict --verbose=2 \
-    --check-notarization --test-requirement '=notarized' "$binary" 2>&1)"; then
+  notarized=0
+  for attempt in 1 2 3; do
+    if assessment="$(codesign --verify --strict --verbose=2 \
+      --check-notarization --test-requirement '=notarized' "$binary" 2>&1)"; then
+      notarized=1
+      break
+    fi
     printf '%s\n' "$assessment" >&2
+    if [[ "$attempt" -lt 3 ]]; then
+      delay=$((attempt * 10))
+      echo "warning: macOS notarization check failed (attempt ${attempt}/3); retrying in ${delay}s" >&2
+      sleep "$delay"
+    fi
+  done
+  if [[ "$notarized" != "1" ]]; then
     echo "error: macOS release binary does not satisfy Apple's notarization requirement" >&2
     exit 1
   fi
