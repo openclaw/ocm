@@ -985,7 +985,7 @@ impl IncludeProcessor {
     }
 }
 
-fn read_regular_text_file(
+pub(super) fn read_regular_text_file(
     path: &Path,
     label: &str,
     max_bytes: Option<u64>,

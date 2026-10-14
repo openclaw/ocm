@@ -16,6 +16,7 @@ use super::gateway_ports::read_port_number;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_workspaces::{
     OpenClawWorkspaceInventory, load_effective_openclaw_config, normalize_agent_id,
+    read_regular_text_file,
 };
 
 #[cfg(all(test, target_os = "macos"))]
@@ -774,7 +775,7 @@ fn read_config_value(config_path: &Path) -> Result<Option<Value>, String> {
         Err(error) => return Err(error.to_string()),
     }
 
-    let raw = fs::read_to_string(config_path).map_err(|error| error.to_string())?;
+    let raw = read_regular_text_file(config_path, "OpenClaw config", None)?;
     let value = json5::from_str(&raw).map_err(|error| error.to_string())?;
     Ok(Some(value))
 }

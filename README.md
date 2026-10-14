@@ -569,7 +569,7 @@ in JSON and the config-path rewrite in its human summary. Export without the
 flag and imports without included state retain their existing selection,
 configuration rewriting, and cleanup behavior.
 
-Clone and import reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
+Clone and imports without state reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
 Clone and imports without state remove individual agent directory links from
 the copy without changing their linked source data.
 

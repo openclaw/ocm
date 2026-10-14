@@ -1179,7 +1179,19 @@ pub(crate) fn import_environment_with_sandbox_origin(
             return Err("archive is missing root/".to_string());
         }
         let extracted_paths = derive_env_paths(&extracted.root_dir);
-        validate_nonportable_runtime_state_paths(&extracted_paths)?;
+        let config_directory_permissions = if extracted.metadata.include_state {
+            match fs::symlink_metadata(&extracted_paths.state_dir) {
+                Ok(metadata) if metadata.is_dir() => Some(metadata.permissions()),
+                Ok(_) => {
+                    return Err("OpenClaw config directory must be a real directory".to_string());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.to_string()),
+            }
+        } else {
+            validate_nonportable_runtime_state_paths(&extracted_paths)?;
+            None
+        };
         reject_include_owned_sandbox_origin(&extracted_paths.config_path)?;
         reject_include_owned_agent_workspaces(&extracted_paths.config_path)?;
         let extracted_workspaces = resolve_env_openclaw_workspaces(
@@ -1204,7 +1216,15 @@ pub(crate) fn import_environment_with_sandbox_origin(
             } else {
                 copy_dir_recursive(&extracted.root_dir, &target_paths.root)?;
             }
-            validate_nonportable_runtime_state_paths(&target_paths)?;
+            if extracted.metadata.include_state {
+                if config_directory_permissions.is_some() {
+                    // The copied directory can be read-only. Rewrite inside a private,
+                    // writable directory, then restore its archived permissions.
+                    super::common::ensure_private_dir(&target_paths.state_dir)?;
+                }
+            } else {
+                validate_nonportable_runtime_state_paths(&target_paths)?;
+            }
             reject_include_owned_sandbox_origin(&target_paths.config_path)?;
             let config_rewrite = rewrite_openclaw_config_for_new_environment(
                 &target_paths,
@@ -1225,6 +1245,10 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 env,
                 target_runtime,
             )?;
+            if let Some(permissions) = &config_directory_permissions {
+                fs::set_permissions(&target_paths.state_dir, permissions.clone())
+                    .map_err(|error| error.to_string())?;
+            }
             if !extracted.metadata.include_state {
                 clear_nonportable_runtime_state(&target_paths, env, target_runtime)?;
             }
