@@ -56,6 +56,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check Windows targets
         run: cargo check --workspace --all-targets --locked
+      - name: Prove Windows managed Node ZIP install and offline reuse
+        timeout-minutes: 5
+        run: cargo test --locked --lib managed_node::tests::windows_managed_node_zip_installs_and_reuses_offline -- --ignored --exact --nocapture
       - name: Prove missing Unicode environment root isolation
         timeout-minutes: 5
         run: cargo test --locked --test env_root_isolation_tests missing_unicode_

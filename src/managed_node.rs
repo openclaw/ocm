@@ -479,6 +479,53 @@ mod tests {
         prepend_to_path,
     };
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "downloads the pinned Windows Node.js distribution"]
+    fn windows_managed_node_zip_installs_and_reuses_offline() {
+        use std::process::Command;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let mut env = BTreeMap::from([(
+            "OCM_HOME".to_string(),
+            fixture.path().join("ocm").to_str().unwrap().to_string(),
+        )]);
+        let installed = super::ensure_managed_node_toolchain(&env, fixture.path()).unwrap();
+        let node_version = Command::new(&installed.node_bin)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(node_version.status.success());
+        assert_eq!(
+            String::from_utf8(node_version.stdout).unwrap().trim(),
+            format!("v{}", super::MANAGED_NODE_VERSION)
+        );
+        let npm_version = Command::new(&installed.node_bin)
+            .arg(&installed.npm_cli)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(npm_version.status.success());
+        assert!(!npm_version.stdout.is_empty());
+
+        // A broken download source must not affect an already installed toolchain.
+        env.insert(
+            super::INTERNAL_MANAGED_NODE_ARCHIVE_URL_ENV.to_string(),
+            "http://127.0.0.1:1/unavailable.zip".to_string(),
+        );
+        let reused = super::ensure_managed_node_toolchain(&env, fixture.path()).unwrap();
+        assert_eq!(reused.node_bin, installed.node_bin);
+        assert_eq!(reused.npm_cli, installed.npm_cli);
+        assert!(
+            Command::new(&reused.node_bin)
+                .arg(&reused.npm_cli)
+                .arg("--version")
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
     #[test]
     fn managed_node_path_reads_windows_path_case_insensitively() {
         let mut env = BTreeMap::new();
