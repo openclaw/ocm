@@ -809,7 +809,14 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         let partial_file = ".openclaw/agents/main/sessions/partial.jsonl";
         let partial = format!("{}\n{{\"unfinished\":", json!({"path": installed}));
         write_text(&source.join(partial_file), &partial);
-        let recovered_file = ".openclaw/agents/main/sessions/recovered.jsonl";
+        let recovered_files = [
+            ".openclaw/agents/main/sessions/recovered.jsonl",
+            ".openclaw/agents/main/sessions/recovered.jsonl.deleted.2026-10-14T00-00-00.000Z",
+            ".openclaw/agents/main/sessions/recovered.jsonl.reset.2026-10-14T00-00-00.000Z",
+            ".openclaw/agents/main/sessions/recovered.jsonl.bak.2026-10-14T00-00-00.000Z",
+            ".openclaw/agents/main/sessions/recovered.jsonl.migrated.1",
+            ".openclaw/agents/main/sessions/recovered.jsonl.pre-doctor-branch-repair-2026-10-14T00-00-00-000Z.bak",
+        ];
         let recovered_record = |base: &std::path::Path| {
             serde_json::json!({"cwd":base.join(".openclaw/workspace")}).to_string()
         };
@@ -817,15 +824,17 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "{{\"incomplete\":{}\n",
             serde_json::to_string(&source).unwrap()
         );
-        write_text(
-            &source.join(recovered_file),
-            &format!(
-                "{{\"unfinished\":\n{}\n{}{}\n",
-                recovered_record(&source),
-                broken_record,
-                recovered_record(&source)
-            ),
-        );
+        for recovered_file in recovered_files {
+            write_text(
+                &source.join(recovered_file),
+                &format!(
+                    "{{\"unfinished\":\n{}\n{}{}\n",
+                    recovered_record(&source),
+                    broken_record,
+                    recovered_record(&source)
+                ),
+            );
+        }
         let jsonl_file = ".openclaw/agents/main/sessions/commands.jsonl";
         write_text(
             &source.join(jsonl_file),
@@ -1224,15 +1233,17 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             fs::read_to_string(target.join(".openclaw/logs/root.txt")).unwrap(),
             format!("{}\n", target.display())
         );
-        assert_eq!(
-            fs::read_to_string(target.join(recovered_file)).unwrap(),
-            format!(
-                "{{\"unfinished\":\n{}\n{}{}\n",
-                recovered_record(&target),
-                broken_record,
-                recovered_record(&target)
-            )
-        );
+        for recovered_file in recovered_files {
+            assert_eq!(
+                fs::read_to_string(target.join(recovered_file)).unwrap(),
+                format!(
+                    "{{\"unfinished\":\n{}\n{}{}\n",
+                    recovered_record(&target),
+                    broken_record,
+                    recovered_record(&target)
+                )
+            );
+        }
         for line in fs::read_to_string(target.join(jsonl_file)).unwrap().lines() {
             assert_eq!(
                 serde_json::from_str::<Value>(line).unwrap(),

@@ -426,10 +426,15 @@ fn rewrite_runtime_state_root_refs_inner(
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let json_lines = matches!(
-            path.extension().and_then(OsStr::to_str),
-            Some("jsonl" | "ndjson")
-        );
+        // Retained records keep their format when backup, reset, deletion or
+        // migration suffixes are appended to the original filename.
+        let json_lines = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| {
+                name.split('.')
+                    .any(|part| matches!(part, "jsonl" | "ndjson"))
+            });
         let rewritten =
             rewrite_runtime_root_references(&raw, source_root, target_root, json_lines)?;
         if rewritten == raw {
