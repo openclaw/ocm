@@ -528,7 +528,7 @@ fn rewrite_opaque_json_string(
     target_root: &str,
 ) -> Result<String, String> {
     let bytes = raw.as_bytes();
-    let code_unit = |at: usize| -> Option<u16> {
+    let utf16_escape = |at: usize| -> Option<u16> {
         if bytes.get(at..at + 2)? != b"\\u" {
             return None;
         }
@@ -538,14 +538,14 @@ fn rewrite_opaque_json_string(
     let mut scan = 1;
     while scan < raw.len() - 1 {
         if bytes[scan] == b'\\' {
-            if let Some(unit) = code_unit(scan) {
-                if (0xd800..=0xdbff).contains(&unit)
-                    && code_unit(scan + 6).is_some_and(|low| (0xdc00..=0xdfff).contains(&low))
+            if let Some(escaped) = utf16_escape(scan) {
+                if (0xd800..=0xdbff).contains(&escaped)
+                    && utf16_escape(scan + 6).is_some_and(|low| (0xdc00..=0xdfff).contains(&low))
                 {
                     scan += 12;
                     continue;
                 }
-                if (0xd800..=0xdfff).contains(&unit) {
+                if (0xd800..=0xdfff).contains(&escaped) {
                     opaque.push(scan..scan + 6);
                 }
                 scan += 6;
@@ -567,7 +567,7 @@ fn rewrite_opaque_json_string(
         let encoded = &raw[start..range.start];
         let decoded: String =
             serde_json::from_str(&format!("\"{encoded}\"")).map_err(|error| error.to_string())?;
-        // Opaque code units are not separators or valid path characters. Guards
+        // Opaque UTF-16 escapes are not separators or valid path characters. Guards
         // keep a reference from acquiring a false boundary at a split.
         let guarded = format!(
             "{}{}{}",
