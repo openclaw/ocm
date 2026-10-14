@@ -625,7 +625,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "manifestPath": installed.join("openclaw.plugin.json"),
             "packageJson": {"path": installed.join("package.json"),
                 "fileSignature": {"mtimeMs": "PRECISE_TIMESTAMP"}}
-        }, {"id":"reentered", "rootDir":reentered}]);
+        }, {"id":"reentered", "rootDir":reentered, "setupSource":reentered}, {"id":"external-setup", "setupSource":source.join("../outside/setup.js")}]);
         let plugins_raw = plugins
             .to_string()
             .replace("\"PRECISE_TIMESTAMP\"", "1791960884534.1313");
@@ -947,6 +947,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             json!(target.join(".openclaw/extensions/missing"));
         if !legacy {
             expected["index"]["plugins"][1]["rootDir"] = json!(target.join("plugin"));
+            expected["index"]["plugins"][1]["setupSource"] = json!(target.join("plugin"));
             expected["index"]["plugins"][0]["rootDir"] =
                 json!(target.join(".openclaw/extensions/demo"));
             expected["index"]["plugins"][0]["source"] =
@@ -992,6 +993,11 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             assert!(stored_plugins.contains("1791960884534.1313"));
             let parsed: Value = serde_json::from_str(&stored_plugins).unwrap();
             assert_eq!(parsed[1]["rootDir"], json!(target.join("plugin")));
+            assert_eq!(parsed[1]["setupSource"], json!(target.join("plugin")));
+            assert_eq!(
+                parsed[2]["setupSource"],
+                json!(source.join("../outside/setup.js"))
+            );
             assert_eq!(
                 parsed[0]["rootDir"],
                 json!(target.join(".openclaw/extensions/demo"))

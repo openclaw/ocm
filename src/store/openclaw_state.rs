@@ -760,7 +760,7 @@ fn rewrite_root_reference_value(
                 && previous_key.take().is_some_and(|key: String| {
                     matches!(
                         key.as_str(),
-                        "path" | "source" | "cwd" | "workspace" | "package"
+                        "path" | "source" | "setupSource" | "cwd" | "workspace" | "package"
                     ) || key.ends_with("Path")
                         || key.ends_with("Dir")
                         || key.ends_with("_path")
