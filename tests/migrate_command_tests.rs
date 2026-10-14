@@ -2058,3 +2058,61 @@ fn migration_rejects_an_orphan_overlay_log_for_a_copied_database() {
         );
     }
 }
+
+#[test]
+fn migrate_relocates_complete_root_references_and_preserves_siblings() {
+    let root = TestDir::new("migrate-root-boundaries");
+    let source = root.child("legacy/.openclaw");
+    seed_plain_openclaw_home(&source);
+    let mut env = ocm_env(&root);
+    install_fake_openclaw_on_path(&root, &mut env);
+    let file = "agents/main/agent/root-references.json";
+    let owned = source.join("extensions/demo/index.js");
+    let file_url = url::Url::from_file_path(&owned).unwrap();
+    let value = serde_json::json!({
+        "installPath": source.with_file_name(".openclaw-other").join("plugin"),
+        "sourcePath": source.with_file_name(".openclaw other").join("plugin"),
+        "rootDir": owned,
+        "text": format!("{}/first --input {}/second\n{}/third", source.display(), source.display(), source.display()),
+        "url": file_url.as_str(),
+        "externalUrl": format!("{};other/plugin.js", url::Url::from_file_path(&source).unwrap()),
+        "metadata": 17
+    });
+    fs::create_dir_all(source.join(file).parent().unwrap()).unwrap();
+    fs::write(source.join(file), value.to_string()).unwrap();
+    #[cfg(unix)]
+    fs::write(
+        source.join("agents/main/agent/posix.json"),
+        serde_json::json!({"installPath":format!("{}\\other/plugin", source.display())})
+            .to_string(),
+    )
+    .unwrap();
+    let output = run_ocm(
+        root.path(),
+        &env,
+        &["migrate", "copy", source.to_str().unwrap(), "--json"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let target = root.child("ocm-home/envs/copy/.openclaw");
+    let actual: serde_json::Value =
+        serde_json::from_slice(&fs::read(target.join(file)).unwrap()).unwrap();
+    let mut expected = value;
+    expected["rootDir"] = serde_json::json!(target.join("extensions/demo/index.js"));
+    expected["text"] = serde_json::json!(format!(
+        "{}/first --input {}/second\n{}/third",
+        target.display(),
+        target.display(),
+        target.display()
+    ));
+    expected["url"] = serde_json::json!(
+        url::Url::from_file_path(target.join("extensions/demo/index.js"))
+            .unwrap()
+            .as_str()
+    );
+    assert_eq!(actual, expected);
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read(target.join("agents/main/agent/posix.json")).unwrap(),
+        fs::read(source.join("agents/main/agent/posix.json")).unwrap()
+    );
+}

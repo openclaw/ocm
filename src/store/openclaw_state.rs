@@ -423,7 +423,7 @@ fn rewrite_runtime_state_root_refs_inner(
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let rewritten = rewrite_runtime_root_references(&raw, source_root, target_root, archived)?;
+        let rewritten = rewrite_runtime_root_references(&raw, source_root, target_root)?;
         if rewritten == raw {
             continue;
         }
@@ -443,18 +443,7 @@ fn rewrite_runtime_root_references(
     raw: &str,
     source_root: &str,
     target_root: &str,
-    preserve_bytes: bool,
 ) -> Result<String, String> {
-    if !preserve_bytes {
-        // Keep the established migration policy. Archive copies additionally
-        // preserve external references and the representation of untouched data.
-        return Ok(raw.replace(source_root, target_root));
-    }
-    if is_absolute_reference(raw) && !raw.contains(['\n', '\r']) {
-        return Ok(
-            relocate_rooted_path(raw, source_root, target_root).unwrap_or_else(|| raw.to_string())
-        );
-    }
     if serde_json::from_str::<serde::de::IgnoredAny>(raw).is_ok() {
         // Preserve authored JSON bytes around the relocated strings, including
         // whitespace and escapes. Decoding also handles Windows path separators.
@@ -472,19 +461,26 @@ fn rewrite_runtime_root_references(
                 .map_err(|error| error.to_string())?;
             let end = start + strings.byte_offset();
             let is_key = raw[end..].trim_start().starts_with(':');
-            let is_command = !is_key && previous_key.take().as_deref() == Some("command");
+            let path_value = !is_key
+                && previous_key.take().is_some_and(|key: String| {
+                    matches!(
+                        key.as_str(),
+                        "path" | "source" | "cwd" | "workspace" | "package"
+                    ) || key.ends_with("Path")
+                        || key.ends_with("Dir")
+                        || key.ends_with("_path")
+                        || key.ends_with("_dir")
+                });
             if is_key {
                 previous_key = Some(value.clone());
             }
-            let replacement = if is_command {
-                rewrite_rooted_text(&value, source_root, target_root)
-            } else if is_absolute_reference(&value) {
+            let replacement = if path_value && Path::new(&value).is_absolute() {
                 // A JSON path is one filename; whitespace is not an argument
                 // separator, including escaped newlines within that filename.
                 relocate_rooted_path(&value, source_root, target_root)
                     .unwrap_or_else(|| value.clone())
             } else {
-                rewrite_runtime_root_references(&value, source_root, target_root, true)?
+                rewrite_runtime_root_references(&value, source_root, target_root)?
             };
             if replacement != value {
                 output.push_str(
@@ -509,28 +505,32 @@ fn rewrite_runtime_root_references(
                 if line.trim().is_empty() {
                     Ok(line.to_string())
                 } else {
-                    rewrite_runtime_root_references(line, source_root, target_root, true)
+                    rewrite_runtime_root_references(line, source_root, target_root)
                 }
             })
             .collect();
     }
-    Ok(rewrite_rooted_text(raw, source_root, target_root))
+    // A physical text line is a value; its line ending remains byte-identical.
+    Ok(raw
+        .split_inclusive('\n')
+        .map(|line| {
+            let value = line.trim_end_matches(['\r', '\n']);
+            rewrite_rooted_text(value, source_root, target_root) + &line[value.len()..]
+        })
+        .collect())
 }
 
-fn is_absolute_reference(value: &str) -> bool {
-    value.starts_with('/')
-        || value.starts_with('\\')
-        || (value.as_bytes().get(1) == Some(&b':')
-            && matches!(value.as_bytes().get(2), Some(b'/' | b'\\')))
+fn is_path_separator(ch: char) -> bool {
+    ch == '/' || (cfg!(windows) && ch == '\\')
 }
 
 fn relocate_rooted_path(path: &str, source_root: &str, target_root: &str) -> Option<String> {
     let suffix = path.strip_prefix(source_root)?;
-    if !suffix.is_empty() && !suffix.starts_with(['/', '\\']) {
+    if !suffix.is_empty() && !suffix.starts_with(is_path_separator) {
         return None;
     }
     let mut depth = 0usize;
-    for component in suffix.split(['/', '\\']) {
+    for component in suffix.split(is_path_separator) {
         match component {
             "" | "." => {}
             ".." => depth = depth.checked_sub(1)?,
@@ -549,7 +549,16 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     // components and never interpret an external URL as a local command path.
     let mut output = String::with_capacity(raw.len());
     let mut cursor = 0;
-    for (start, _) in raw.match_indices("file://") {
+    for (colon, _) in raw.match_indices(':') {
+        let Some(start) = colon.checked_sub(4) else {
+            continue;
+        };
+        if !raw
+            .get(start..colon)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file"))
+        {
+            continue;
+        }
         if start < cursor
             || raw[..start]
                 .chars()
@@ -559,7 +568,7 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
             continue;
         }
         let end = raw[start..]
-            .find(|ch: char| ch.is_whitespace() || "\"'`<>;|&".contains(ch))
+            .find(|ch: char| ch.is_whitespace() || "\"'`<>".contains(ch))
             .map_or(raw.len(), |offset| start + offset);
         output.push_str(&rewrite_path_tokens(
             &raw[cursor..start],
@@ -588,32 +597,30 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
 fn rewrite_path_tokens(raw: &str, source_root: &str, target_root: &str) -> String {
     let mut output = String::with_capacity(raw.len());
     let mut cursor = 0;
-    let mut skip_until = 0;
     for (start, _) in raw.match_indices(source_root) {
-        if start < skip_until {
+        let end = start + source_root.len();
+        if raw[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| !reference_boundary(ch))
+            || raw[end..]
+                .chars()
+                .next()
+                .is_some_and(|ch| !is_path_separator(ch))
+        {
             continue;
         }
-        let before = raw[..start].chars().next_back();
-        if before.is_some_and(|ch| !reference_boundary(ch)) {
+        let suffix = raw[end..]
+            .split(|ch: char| ch.is_whitespace() || "\"'`".contains(ch))
+            .next()
+            .unwrap_or_default();
+        if relocate_rooted_path(&raw[start..end + suffix.len()], source_root, target_root).is_none()
+        {
             continue;
         }
-        // Quotes delimit one complete filename, including its whitespace.
-        // Unquoted command arguments end at shell separators.
-        let end = if let Some(quote @ ('"' | '\'' | '`')) = before {
-            raw[start..]
-                .find(quote)
-                .map_or(raw.len(), |offset| start + offset)
-        } else {
-            raw[start + source_root.len()..]
-                .find(|ch: char| ch.is_whitespace() || "\"'`;|&()<>".contains(ch))
-                .map_or(raw.len(), |offset| start + source_root.len() + offset)
-        };
-        skip_until = end;
-        if let Some(rewritten) = relocate_rooted_path(&raw[start..end], source_root, target_root) {
-            output.push_str(&raw[cursor..start]);
-            output.push_str(&rewritten);
-            cursor = end;
-        }
+        output.push_str(&raw[cursor..start]);
+        output.push_str(target_root);
+        cursor = end;
     }
     output.push_str(&raw[cursor..]);
     output
@@ -925,7 +932,6 @@ fn relocate_plugin_records_in_database(
                 &raw_records,
                 &display_path(source_state_root),
                 &display_path(target_state_root),
-                true,
             )?;
             (rewritten != raw_records).then_some(rewritten)
         } else {

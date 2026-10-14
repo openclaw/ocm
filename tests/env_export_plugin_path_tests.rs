@@ -595,6 +595,13 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         let package = source.join("packages/demo");
         let external = root.child("external-plugin");
         let lookalike = source.with_file_name("source-other").join("plugin");
+        let separator_sibling = source
+            .with_file_name(if cfg!(windows) {
+                "source-other"
+            } else {
+                "source\\other"
+            })
+            .join("plugin");
         write_text(&installed.join("index.js"), "export default {};\n");
         write_text(&package.join("package.json"), "{\"name\":\"demo\"}\n");
         let records = json!({
@@ -603,6 +610,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "external": {"source":"path", "installPath":external, "sourcePath":external},
             "lookalike": {"source":"npm", "installPath":lookalike},
             "punctuation-sibling": {"source":"path", "installPath":source.with_file_name("source=other").join("plugin")},
+            "backslash-sibling": {"source":"path", "installPath":separator_sibling},
             "spaced-sibling": {"source":"path", "installPath":source.with_file_name("source other").join("plugin"), "sourcePath":source.with_file_name("source other").join("plugin")},
             "spaced-escape": {"source":"path", "installPath":source.join("a b/../../outside")},
             "missing": {"source":"npm", "installPath":source.join(".openclaw/extensions/missing")}
@@ -699,10 +707,14 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "quotedOwned":format!("cat '{}/a b/file'", source.display()),
             "encoded":json!({"rootDir":installed}).to_string(),
             "fileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string(),
+            "externalFileUrl":format!("{};other/plugin.js", url::Url::from_file_path(&source).unwrap()),
+            "upperFileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string().replacen("file:", "FILE:", 1),
+            "shortFileUrl":format!("file:{}", url::Url::from_file_path(installed.join("index.js")).unwrap().path()),
             "localFileUrl":format!("file://localhost{}", url::Url::from_file_path(installed.join("index.js")).unwrap().path()),
             "normalized":format!("{}/sub/../index.js", installed.display()),
-            "newlineSibling":format!("{}\nother/plugin", source.display()),
+            "newlineSiblingPath":format!("{}\nother/plugin", source.display()),
             "absoluteCommand": {"command":format!("{}/run --input {}/input", source.display(), source.display())},
+            "text":format!("{}/run --input {}/input\n{}/second", source.display(), source.display(), source.display()),
             "externalCommand":format!("node {}=other/plugin.js", source.display()),
             "escapedRoot":format!("node {}/../outside/index.js", source.display()),
             "external":external, "lookalike":lookalike});
@@ -909,11 +921,23 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         ));
         expected_runtime["encoded"] =
             json!(json!({"rootDir":target.join(".openclaw/extensions/demo")}).to_string());
-        expected_runtime["shell"] = json!(format!("cd {}; pwd", target.display()));
+        // A bare root followed by punctuation is not a complete root component.
+        assert_eq!(
+            expected_runtime["shell"],
+            json!(format!("cd {}; pwd", source.display()))
+        );
         expected_runtime["quotedOwned"] = json!(format!("cat '{}/a b/file'", target.display()));
         let expected_url =
             url::Url::from_file_path(target.join(".openclaw/extensions/demo/index.js")).unwrap();
+        expected_runtime["text"] = json!(format!(
+            "{}/run --input {}/input\n{}/second",
+            target.display(),
+            target.display(),
+            target.display()
+        ));
         expected_runtime["fileUrl"] = json!(expected_url.as_str());
+        expected_runtime["upperFileUrl"] = json!(expected_url.as_str());
+        expected_runtime["shortFileUrl"] = json!(expected_url.as_str());
         expected_runtime["localFileUrl"] = json!(expected_url.as_str());
         expected_runtime["normalized"] = json!(format!(
             "{}/sub/../index.js",
