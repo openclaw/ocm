@@ -672,6 +672,17 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         db.execute_batch(&format!("CREATE TRIGGER unrelated_change AFTER UPDATE ON {receipt_table} BEGIN UPDATE durable SET value='changed by trigger'; END;")).unwrap();
         let original_document: String = db.query_row(select, [], |row| row.get(0)).unwrap();
         let expected_document: Value = serde_json::from_str(&original_document).unwrap();
+        let receipt_column = if legacy {
+            "install_records_json"
+        } else {
+            "value_json"
+        };
+        db.execute_batch(&format!("CREATE UNIQUE INDEX receipt_value ON {receipt_table}({receipt_column}); CREATE TABLE receipt_history (original TEXT REFERENCES {receipt_table}({receipt_column}) ON UPDATE CASCADE);")).unwrap();
+        db.execute(
+            "INSERT INTO receipt_history VALUES (?1)",
+            [&original_document],
+        )
+        .unwrap();
         drop(db);
         #[cfg(unix)]
         if legacy {
@@ -682,6 +693,11 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         let runtime = json!({"rootDir":installed, "package":package,
             "command":format!("node {}/index.js", installed.display()),
             "encoded":json!({"rootDir":installed}).to_string(),
+            "fileUrl":format!("file://{}/index.js", installed.display()),
+            "normalized":format!("{}/sub/../index.js", installed.display()),
+            "bareRoot":format!("{}\n", source.display()),
+            "externalCommand":format!("node {}=other/plugin.js", source.display()),
+            "escapedRoot":format!("node {}/../outside/index.js", source.display()),
             "external":external, "lookalike":lookalike});
         write_text(&source.join(runtime_file), &runtime.to_string());
         let jsonl_file = ".openclaw/agents/main/sessions/commands.jsonl";
@@ -761,6 +777,12 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         .unwrap();
         let raw: String = db.query_row(select, [], |row| row.get(0)).unwrap();
         let actual: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            db.query_row("SELECT original FROM receipt_history", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            original_document
+        );
         let mut expected = expected_document;
         let expected_records = if legacy {
             &mut expected
@@ -876,6 +898,15 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         ));
         expected_runtime["encoded"] =
             json!(json!({"rootDir":target.join(".openclaw/extensions/demo")}).to_string());
+        expected_runtime["fileUrl"] = json!(format!(
+            "file://{}/index.js",
+            target.join(".openclaw/extensions/demo").display()
+        ));
+        expected_runtime["normalized"] = json!(format!(
+            "{}/sub/../index.js",
+            target.join(".openclaw/extensions/demo").display()
+        ));
+        expected_runtime["bareRoot"] = json!(format!("{}\n", target.display()));
         let actual_runtime: Value =
             serde_json::from_slice(&fs::read(target.join(runtime_file)).unwrap()).unwrap();
         assert_eq!(actual_runtime, expected_runtime);

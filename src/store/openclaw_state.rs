@@ -496,23 +496,44 @@ fn rewrite_archived_root_references(
 }
 
 fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> String {
-    // Legacy runtime text contains paths in logs and key/value records. Match a
-    // complete root at a token boundary, not a sibling or embedded path prefix.
-    let delimiter = |ch: char| ch.is_whitespace() || "\"'`=([{,:;<>)]}".contains(ch);
+    // A reference may be a plain path, a command argument, or a file URL.
+    // Require a complete root component even when the path is embedded in text.
+    let boundary = |ch: char| ch.is_whitespace() || "\"'`=([{,:;<>)]}".contains(ch);
+    let path_end = |ch: char| ch.is_whitespace() || "\"'`".contains(ch);
     let mut output = String::with_capacity(raw.len());
     let mut cursor = 0;
     for (start, _) in raw.match_indices(source_root) {
         let end = start + source_root.len();
-        let before = raw[..start].chars().next_back();
+        let prefix = &raw[..start];
+        let before = prefix.chars().next_back();
+        let file_url = prefix
+            .strip_suffix("file://")
+            .is_some_and(|before_url| before_url.chars().next_back().is_none_or(boundary));
         let after = raw[end..].chars().next();
-        if (start == 0 && after.is_some_and(|ch| ch != '/' && ch != '\\'))
-            || before.is_some_and(|ch| !delimiter(ch))
-            || after.is_some_and(|ch| ch != '/' && ch != '\\' && !delimiter(ch))
+        if (!file_url && before.is_some_and(|ch| !boundary(ch)))
+            || after.is_some_and(|ch| ch != '/' && ch != '\\' && !path_end(ch))
         {
             continue;
         }
-        let suffix = raw[end..].split(delimiter).next().unwrap_or_default();
-        if suffix.split(['/', '\\']).any(|component| component == "..") {
+        // Allow normalization within the copied root, but never rebase a path
+        // that escapes it. No source filesystem access is needed after export.
+        let suffix = raw[end..].split(path_end).next().unwrap_or_default();
+        let mut depth = 0usize;
+        let escapes_root = suffix.split(['/', '\\']).any(|component| match component {
+            "" | "." => false,
+            ".." => match depth.checked_sub(1) {
+                Some(parent) => {
+                    depth = parent;
+                    false
+                }
+                None => true,
+            },
+            _ => {
+                depth += 1;
+                false
+            }
+        });
+        if escapes_root {
             continue;
         }
         output.push_str(&raw[cursor..start]);
@@ -719,7 +740,16 @@ fn relocate_plugin_records_in_database(
         )
     })?;
     if matches!(relocation, PluginPathRelocation::Archived) {
-        // Updating the receipt must not run stored callbacks that change other rows.
+        // Updating the receipt must not run stored callbacks or cascades that
+        // change other rows. Both settings are local to this connection.
+        connection
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY,
+                false,
+            )
+            .map_err(|error| {
+                format!("failed to isolate imported plugin receipt update: {error}")
+            })?;
         connection
             .set_db_config(
                 rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
