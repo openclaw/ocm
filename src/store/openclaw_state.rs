@@ -222,6 +222,7 @@ pub(crate) fn prepare_migrated_runtime_state(
         &workspaces,
         source_state_root,
         &paths.state_dir,
+        false,
     )?;
     let plugin_paths = relocate_installed_plugin_index_paths(
         &paths.state_dir.join("state/openclaw.sqlite"),
@@ -240,6 +241,39 @@ pub(crate) fn prepare_migrated_runtime_state(
         changed,
         external_plugin_ids: plugin_paths.external_plugin_ids,
     })
+}
+
+pub(super) fn relocate_archived_runtime_state(
+    paths: &EnvPaths,
+    source_root: &Path,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+) -> Result<bool, String> {
+    if source_root.as_os_str().is_empty() {
+        return Err("archive source root is empty".to_string());
+    }
+    if source_root == paths.root {
+        return Ok(false);
+    }
+    if !path_exists(&paths.state_dir) {
+        return Ok(false);
+    }
+    let workspaces = resolve_env_openclaw_workspaces(paths, env, runtime)?;
+    let changed = rewrite_runtime_state_root_refs(
+        &paths.state_dir,
+        &paths.config_path,
+        &workspaces,
+        source_root,
+        &paths.root,
+        true,
+    )?;
+    let plugin_paths = relocate_installed_plugin_index_paths(
+        &paths.state_dir.join("state/openclaw.sqlite"),
+        source_root,
+        &paths.root,
+        PluginPathRelocation::Archived,
+    )?;
+    Ok(changed || plugin_paths.changed)
 }
 
 pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Result<(), String> {
@@ -324,6 +358,7 @@ fn rewrite_runtime_state_root_refs(
     workspaces: &OpenClawWorkspaceInventory,
     source_state_root: &Path,
     target_state_root: &Path,
+    archived: bool,
 ) -> Result<bool, String> {
     let mut changed = false;
     let source_root = display_path(source_state_root);
@@ -335,6 +370,7 @@ fn rewrite_runtime_state_root_refs(
         workspaces,
         &source_root,
         &target_root,
+        archived,
         &mut changed,
     )?;
     Ok(changed)
@@ -347,6 +383,7 @@ fn rewrite_runtime_state_root_refs_inner(
     workspaces: &OpenClawWorkspaceInventory,
     source_root: &str,
     target_root: &str,
+    archived: bool,
     changed: &mut bool,
 ) -> Result<(), String> {
     if !path_exists(root) {
@@ -370,6 +407,7 @@ fn rewrite_runtime_state_root_refs_inner(
                 workspaces,
                 source_root,
                 target_root,
+                archived,
                 changed,
             )?;
             continue;
@@ -378,18 +416,146 @@ fn rewrite_runtime_state_root_refs_inner(
             continue;
         }
 
+        if archived && is_sqlite_database(&path)? {
+            // SQLite values are handled through their owning table, never as text.
+            continue;
+        }
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let rewritten = raw.replace(source_root, target_root);
+        let rewritten = if archived {
+            rewrite_archived_root_references(&raw, source_root, target_root)?
+        } else {
+            raw.replace(source_root, target_root)
+        };
         if rewritten == raw {
             continue;
         }
-        fs::write(&path, rewritten).map_err(|error| error.to_string())?;
+        let write = || fs::write(&path, rewritten).map_err(|error| error.to_string());
+        if archived {
+            with_owner_write_permission(&path, write)?;
+        } else {
+            write()?;
+        }
         *changed = true;
     }
 
     Ok(())
+}
+
+fn archive_relative_path<'a>(path: &'a Path, source_root: &Path) -> Option<&'a Path> {
+    let relative = path.strip_prefix(source_root).ok()?;
+    relative
+        .components()
+        .all(|part| matches!(part, Component::CurDir | Component::Normal(_)))
+        .then_some(relative)
+}
+
+fn rewrite_archived_root_references(
+    raw: &str,
+    source_root: &str,
+    target_root: &str,
+) -> Result<String, String> {
+    if serde_json::from_str::<Value>(raw).is_ok() {
+        // Preserve authored JSON bytes around the relocated strings, including
+        // whitespace and escapes. Decoding also handles Windows path separators.
+        let mut output = String::with_capacity(raw.len());
+        let mut cursor = 0;
+        while let Some(offset) = raw[cursor..].find('"') {
+            let start = cursor + offset;
+            output.push_str(&raw[cursor..start]);
+            let mut strings =
+                serde_json::Deserializer::from_str(&raw[start..]).into_iter::<String>();
+            let value = strings
+                .next()
+                .expect("JSON string begins at quote")
+                .map_err(|error| error.to_string())?;
+            let end = start + strings.byte_offset();
+            if let Some(relative) = archive_relative_path(Path::new(&value), Path::new(source_root))
+            {
+                let replacement = display_path(&Path::new(target_root).join(relative));
+                output.push_str(
+                    &serde_json::to_string(&replacement).map_err(|error| error.to_string())?,
+                );
+            } else {
+                output.push_str(&raw[start..end]);
+            }
+            cursor = end;
+        }
+        output.push_str(&raw[cursor..]);
+        return Ok(output);
+    }
+    if raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| serde_json::from_str::<Value>(line).is_ok())
+    {
+        return raw
+            .split_inclusive('\n')
+            .map(|line| {
+                if line.trim().is_empty() {
+                    Ok(line.to_string())
+                } else {
+                    rewrite_archived_root_references(line, source_root, target_root)
+                }
+            })
+            .collect();
+    }
+    // Legacy runtime text contains paths in logs and key/value records. Match a
+    // complete root at a token boundary, not a sibling or embedded path prefix.
+    let delimiter = |ch: char| ch.is_whitespace() || "\"'`=([{,:;<>)]}".contains(ch);
+    let mut output = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    for (start, _) in raw.match_indices(source_root) {
+        let end = start + source_root.len();
+        let before = raw[..start].chars().next_back();
+        let after = raw[end..].chars().next();
+        if before.is_some_and(|ch| !delimiter(ch))
+            || after.is_some_and(|ch| ch != '/' && ch != '\\' && !delimiter(ch))
+        {
+            continue;
+        }
+        let suffix = raw[end..].split(delimiter).next().unwrap_or_default();
+        if suffix.split(['/', '\\']).any(|component| component == "..") {
+            continue;
+        }
+        output.push_str(&raw[cursor..start]);
+        output.push_str(target_root);
+        cursor = end;
+    }
+    output.push_str(&raw[cursor..]);
+    Ok(output)
+}
+
+fn with_owner_write_permission<T>(
+    path: &Path,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let permissions = fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    let mut writable = permissions.clone();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        writable.set_mode(permissions.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    writable.set_readonly(false);
+    if writable == permissions {
+        return action();
+    }
+    fs::set_permissions(path, writable).map_err(|error| error.to_string())?;
+    let result = action();
+    let restored = fs::set_permissions(path, permissions).map_err(|error| error.to_string());
+    match (result, restored) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(format!("failed to restore imported permissions: {error}")),
+        (Err(error), Err(restore)) => Err(format!(
+            "{error}; failed to restore imported permissions: {restore}"
+        )),
+    }
 }
 
 // Workshop drafts, support files, and rollback receipts share stored hashes.
@@ -455,6 +621,7 @@ fn is_legacy_audit_generation(suffix: &str) -> bool {
 #[derive(Clone, Copy)]
 enum PluginPathRelocation<'a> {
     Imported,
+    Archived,
     Cloned {
         source: &'a EnvPaths,
         target: &'a EnvPaths,
@@ -477,6 +644,7 @@ pub(super) fn clear_cloned_agent_database_leases(target: &EnvPaths) -> Result<()
     let Some(database_path) = contained_imported_database(
         &target.state_dir.join("state/openclaw.sqlite"),
         &target.root,
+        false,
     )?
     else {
         return Ok(());
@@ -507,22 +675,64 @@ fn relocate_installed_plugin_index_paths(
     relocation: PluginPathRelocation<'_>,
 ) -> Result<MigratedRuntimeStateResult, String> {
     let database_root = match relocation {
-        PluginPathRelocation::Imported => target_state_root,
+        PluginPathRelocation::Imported | PluginPathRelocation::Archived => target_state_root,
         PluginPathRelocation::Cloned { target, .. } => &target.root,
     };
-    let Some(database_path) = contained_imported_database(database_path, database_root)? else {
+    let Some(database_path) = contained_imported_database(
+        database_path,
+        database_root,
+        matches!(relocation, PluginPathRelocation::Archived),
+    )?
+    else {
         return Ok(MigratedRuntimeStateResult::default());
     };
     if !is_sqlite_database(&database_path)? {
         return Ok(MigratedRuntimeStateResult::default());
     }
 
+    let relocate = || {
+        relocate_plugin_records_in_database(
+            &database_path,
+            source_state_root,
+            target_state_root,
+            relocation,
+        )
+    };
+    if matches!(relocation, PluginPathRelocation::Archived) {
+        let parent = database_path
+            .parent()
+            .ok_or("imported database has no parent")?;
+        with_owner_write_permission(parent, || {
+            with_owner_write_permission(&database_path, relocate)
+        })
+    } else {
+        relocate()
+    }
+}
+
+fn relocate_plugin_records_in_database(
+    database_path: &Path,
+    source_state_root: &Path,
+    target_state_root: &Path,
+    relocation: PluginPathRelocation<'_>,
+) -> Result<MigratedRuntimeStateResult, String> {
     let connection = Connection::open(&database_path).map_err(|error| {
         format!(
             "failed to open imported OpenClaw state database {}: {error}",
             display_path(&database_path)
         )
     })?;
+    if matches!(relocation, PluginPathRelocation::Archived) {
+        // Updating the receipt must not run stored callbacks that change other rows.
+        connection
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+                false,
+            )
+            .map_err(|error| {
+                format!("failed to isolate imported plugin receipt update: {error}")
+            })?;
+    }
     let table_exists = connection
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'installed_plugin_index'",
@@ -611,9 +821,15 @@ fn relocate_installed_plugin_index_paths(
                 continue;
             };
             let path = Path::new(path);
-            let Some(relative) = relocatable_plugin_path(path, source_state_root, !is_path_plugin)
-            else {
-                has_external_path |= path.is_absolute() && !path.starts_with(target_state_root);
+            let relative = if matches!(relocation, PluginPathRelocation::Archived) {
+                archive_relative_path(path, source_state_root).map(Path::to_path_buf)
+            } else {
+                relocatable_plugin_path(path, source_state_root, !is_path_plugin)
+            };
+            let Some(relative) = relative else {
+                if !matches!(relocation, PluginPathRelocation::Archived) {
+                    has_external_path |= path.is_absolute() && !path.starts_with(target_state_root);
+                }
                 continue;
             };
             record.insert(
@@ -774,14 +990,20 @@ fn contained_plugin_path(path: &Path, root: &Path) -> bool {
 fn contained_imported_database(
     database_path: &Path,
     target_state_root: &Path,
+    allow_contained_link: bool,
 ) -> Result<Option<PathBuf>, String> {
     let metadata = match fs::symlink_metadata(database_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
-    // Resolve only regular imported files so a preserved symlink cannot redirect a writable open.
-    if !metadata.is_file() {
+    // Archive copies may retain internal links. Always resolve and check their
+    // regular target inside the owned copy before opening SQLite for writing.
+    let regular = metadata.is_file()
+        || (allow_contained_link
+            && metadata.is_symlink()
+            && fs::metadata(database_path).is_ok_and(|target| target.is_file()));
+    if !regular {
         return Err(format!(
             "imported OpenClaw state database must be a regular file inside the imported state: {}",
             display_path(database_path)

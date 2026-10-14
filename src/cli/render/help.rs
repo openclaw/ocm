@@ -1356,7 +1356,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 "OCM checks root overlap before creating or copying environment state.",
                 "The destination root must not overlap registered dev sources, including aliases and missing borrowed paths.",
                 "Import rewrites env-scoped OpenClaw config paths for the new root.",
-                "State-inclusive imports preserve state contents while rewriting env-scoped config paths.",
+                "State-inclusive imports preserve state while rewriting references to the environment root, including installed plugin receipts and runtime state paths.",
                 "Import removes a copied public MCP app sandbox origin unless --sandbox-origin supplies a dedicated origin for the imported env.",
                 "Flatten any config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin section owned by $include before OCM rewrites the origin.",
                 "Without included state, import keeps durable agent auth/settings but clears copied runtime residue like sessions, logs, and backups.",

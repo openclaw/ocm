@@ -46,6 +46,8 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Relocate installed plugin receipts and runtime state references when importing a state-inclusive archive, preserving other state and references outside the source environment.
+
 - Rewrite env-scoped configuration paths when importing a state-inclusive archive so agent workspaces and directories point into the imported environment, while preserving state contents.
 
 - Disclose skipped candidate preparation and validation in upgrade dry-run text and JSON, including batch previews, and point operators to isolated simulation. Thanks @shakkernerd (#124).

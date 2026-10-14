@@ -615,6 +615,16 @@ pub fn env_imported(
     if summary.config_paths_rewritten == Some(true) {
         import_rows.push(KeyValueRow::plain("Config paths", "rewritten for new root"));
     }
+    if let Some(rewritten) = summary.state_paths_rewritten {
+        import_rows.push(KeyValueRow::plain(
+            "State paths",
+            if rewritten {
+                "rewritten for new root"
+            } else {
+                "unchanged"
+            },
+        ));
+    }
     if summary.protected {
         import_rows.push(KeyValueRow::warning("Protected", "yes"));
     }
@@ -647,6 +657,16 @@ fn env_imported_raw(summary: &EnvImportSummary, command_example: &str) -> Vec<St
     ];
     if summary.config_paths_rewritten == Some(true) {
         lines.push("  config paths: rewritten for new root".to_string());
+    }
+    if let Some(rewritten) = summary.state_paths_rewritten {
+        lines.push(format!(
+            "  state paths: {}",
+            if rewritten {
+                "rewritten for new root"
+            } else {
+                "unchanged"
+            }
+        ));
     }
     if let Some(runtime) = summary.default_runtime.as_deref() {
         lines.push(format!("  runtime: {runtime}"));

@@ -965,11 +965,17 @@ and agent directories, through the same rules as an ordinary import. It also
 assigns the new gateway port and resets the sandbox origin. Configuration must
 be valid; includes that own agent workspaces or the sandbox origin must be
 flattened first, as for ordinary imports. No OpenClaw runtime is required.
-State contents, including SQLite snapshots, sessions, plugin receipts, `.env`
-files, and other files outside the config rewrite, stay byte-identical to the
-archive. Paths inside those contents are not rewritten. Paths outside the
-environment root are not exported; those references may need updating after
-moving the environment.
+State is preserved; references to the environment root are rewritten to the
+new root. Import relocates installed plugin receipt paths and the runtime text
+references handled by plain-home migration, without clearing sessions, logs,
+leases, or other durable state. It changes only relocated values in the known
+plugin-index database row; unrelated rows and metadata are preserved. Workspace
+content and integrity-protected history retain their bytes. Every other file
+outside the config and state-reference rewrites stays byte-identical to the archive.
+References outside the source environment root are left unchanged; external
+contents are not exported and may need separate preparation after moving.
+Import refuses to update a database outside the copied root; internal database
+links are retained.
 Owned file and directory links use relative targets in the archive; external
 and dangling links retain their targets without copying external contents.
 State-inclusive archives are created with private access. Import preserves
@@ -981,7 +987,8 @@ An explicit `env import --sandbox-origin` still replaces that setting.
 
 Export JSON reports `includeState`; its human summary also reports whether
 state was included. State-inclusive import reports `configPathsRewritten: true`
-in JSON and the config-path rewrite in its human summary. Export without the
+and `statePathsRewritten` in JSON; the latter says whether any state references
+changed. Its human summary reports both rewrites. Export without the
 flag and imports without included state retain their existing selection,
 configuration rewriting, and cleanup behavior.
 

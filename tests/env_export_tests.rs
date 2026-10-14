@@ -396,7 +396,9 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
             )
             .unwrap();
         let imported_receipt: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(imported_receipt, receipt);
+        let mut expected_receipt = receipt.clone();
+        expected_receipt["demo"]["installPath"] = serde_json::json!(target.join("extensions/demo"));
+        assert_eq!(imported_receipt, expected_receipt);
         assert_eq!(
             fs::read(target.join("openclaw.json")).unwrap(),
             source_config

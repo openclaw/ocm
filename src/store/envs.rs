@@ -1245,6 +1245,20 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 env,
                 target_runtime,
             )?;
+            let state_paths_rewritten = if extracted.metadata.include_state {
+                if let Some(source_root) = extracted.metadata.env.source_root.as_deref() {
+                    super::openclaw_state::relocate_archived_runtime_state(
+                        &target_paths,
+                        Path::new(source_root),
+                        env,
+                        target_runtime,
+                    )?
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             if let Some(permissions) = &config_directory_permissions {
                 fs::set_permissions(&target_paths.state_dir, permissions.clone())
                     .map_err(|error| error.to_string())?;
@@ -1274,13 +1288,17 @@ pub(crate) fn import_environment_with_sandbox_origin(
             };
             let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
             write_env_registry(&mut registry, env, cwd)?;
-            Ok((meta, config_rewrite))
+            Ok((meta, config_rewrite, state_paths_rewritten))
         })();
 
         match imported {
-            Ok((meta, config_rewrite)) => Ok(ImportEnvironmentResult {
+            Ok((meta, config_rewrite, state_paths_rewritten)) => Ok(ImportEnvironmentResult {
                 summary: EnvImportSummary {
                     config_paths_rewritten: extracted.metadata.include_state.then_some(true),
+                    state_paths_rewritten: extracted
+                        .metadata
+                        .include_state
+                        .then_some(state_paths_rewritten),
                     name: meta.name.clone(),
                     source_name,
                     root: meta.root.clone(),

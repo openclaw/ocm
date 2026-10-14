@@ -489,11 +489,23 @@ fn state_import_relocates_config_and_preserves_archive_state_bytes() {
         .into_iter()
         .chain([".openclaw/state/openclaw.sqlite"])
     {
-        assert_eq!(
-            fs::read(target.join(path)).unwrap(),
-            fs::read(extracted.root_dir.join(path)).unwrap(),
-            "{path}"
-        );
+        let archived = fs::read(extracted.root_dir.join(path)).unwrap();
+        let expected = if matches!(
+            path,
+            ".openclaw/agents/research/agent/settings.json"
+                | ".openclaw/agents/research/sessions/history.jsonl"
+                | ".openclaw/logs/saved.log"
+                | ".openclaw/backups/settings.json"
+                | ".openclaw/state/opaque.bin"
+        ) {
+            String::from_utf8(archived)
+                .unwrap()
+                .replace(source.to_str().unwrap(), target.to_str().unwrap())
+                .into_bytes()
+        } else {
+            archived
+        };
+        assert_eq!(fs::read(target.join(path)).unwrap(), expected, "{path}");
     }
     let summary: Value = serde_json::from_str(&stdout(&import)).unwrap();
     assert_eq!(summary["configPathsRewritten"], true);
@@ -565,4 +577,328 @@ fn state_import_rejects_a_config_link_to_a_fifo_without_blocking() {
     fs::remove_file(root.child("ocm-home/envs/source/.openclaw/openclaw.json")).unwrap();
     let retry = run_ocm(root.path(), &env, &["env", "create", "target"]);
     assert!(retry.status.success(), "{}", stderr(&retry));
+}
+
+#[test]
+fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
+    use ocm::infra::archive::{EnvArchiveMetadata, extract_env_archive};
+    use rusqlite::{Connection, OpenFlags};
+    use serde_json::{Value, json};
+
+    for legacy in [false, true] {
+        let root = TestDir::new("state-import-plugin-paths");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source");
+        let installed = source.join(".openclaw/extensions/demo");
+        let package = source.join("packages/demo");
+        let external = root.child("external-plugin");
+        let lookalike = source.with_file_name("source-other").join("plugin");
+        write_text(&installed.join("index.js"), "export default {};\n");
+        write_text(&package.join("package.json"), "{\"name\":\"demo\"}\n");
+        let records = json!({
+            "demo": {"source":"path", "installPath":installed, "sourcePath":package,
+                "version":"1.0.0", "integrity":"unchanged", "unknown":{"enabled":true}},
+            "external": {"source":"path", "installPath":external, "sourcePath":external},
+            "lookalike": {"source":"npm", "installPath":lookalike},
+            "missing": {"source":"npm", "installPath":source.join(".openclaw/extensions/missing")}
+        });
+        let database = source.join(".openclaw/state/openclaw.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let db = Connection::open(&database).unwrap();
+        db.execute_batch(
+            "CREATE TABLE durable (value TEXT); INSERT INTO durable VALUES ('session bytes');
+            CREATE TABLE agent_database_leases (lease_id TEXT, owner_pid INTEGER);
+            INSERT INTO agent_database_leases VALUES ('retained-owner', 123);",
+        )
+        .unwrap();
+        let (select, expected_document) = if legacy {
+            db.execute_batch("CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT, updated_at INTEGER);").unwrap();
+            db.execute(
+                "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1, 42)",
+                [records.to_string()],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO installed_plugin_index VALUES ('unrelated', ?1, 43)",
+                [source.display().to_string()],
+            )
+            .unwrap();
+            (
+                "SELECT install_records_json FROM installed_plugin_index WHERE index_key='installed-plugin-index'",
+                records.clone(),
+            )
+        } else {
+            db.execute_batch("CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT, updated_at_ms INTEGER);").unwrap();
+            let document =
+                json!({"revision":17,"index":{"installRecords":records},"unknown":"retained"});
+            db.execute(
+                "INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?1, 42)",
+                [document.to_string()],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO config_machine_state VALUES ('unrelated', ?1, 43)",
+                [source.display().to_string()],
+            )
+            .unwrap();
+            (
+                "SELECT value_json FROM config_machine_state WHERE state_key='plugins.installedIndex'",
+                document,
+            )
+        };
+        let receipt_table = if legacy {
+            "installed_plugin_index"
+        } else {
+            "config_machine_state"
+        };
+        db.execute_batch(&format!("CREATE TRIGGER unrelated_change AFTER UPDATE ON {receipt_table} BEGIN UPDATE durable SET value='changed by trigger'; END;")).unwrap();
+        drop(db);
+        #[cfg(unix)]
+        if legacy {
+            fs::rename(&database, database.with_file_name("index.sqlite")).unwrap();
+            std::os::unix::fs::symlink("index.sqlite", &database).unwrap();
+        }
+        let runtime_file = ".openclaw/agents/main/agent/paths.json";
+        let runtime = json!({"rootDir":installed, "package":package,
+            "external":external, "lookalike":lookalike});
+        write_text(&source.join(runtime_file), &runtime.to_string());
+        let untouched = [
+            ".env",
+            ".openclaw/workspace/notes.txt",
+            ".openclaw/skill-workshop/draft.json",
+            ".openclaw/logs/config-audit.jsonl",
+            "legacy/data.txt",
+        ];
+        for file in untouched {
+            write_text(&source.join(file), &format!("keep {}\n", source.display()));
+        }
+        fs::write(
+            source.join(".openclaw/state/opaque.bin"),
+            [0xff, 0x00, 0xfe],
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&database, fs::Permissions::from_mode(0o400)).unwrap();
+            fs::set_permissions(
+                database.parent().unwrap(),
+                fs::Permissions::from_mode(0o500),
+            )
+            .unwrap();
+            fs::set_permissions(source.join(runtime_file), fs::Permissions::from_mode(0o400))
+                .unwrap();
+        }
+        let export = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--include-state",
+                "--output",
+                "state.tar",
+            ],
+        );
+        assert!(export.status.success(), "{}", stderr(&export));
+        let archive = extract_env_archive::<EnvArchiveMetadata>(
+            &root.child("state.tar"),
+            &root.child("archive"),
+        )
+        .unwrap();
+        fs::rename(&source, root.child("source-offline")).unwrap();
+        #[cfg(unix)]
+        let target = root.child("imports/copy-\"quoted\"");
+        #[cfg(not(unix))]
+        let target = root.child("imports/copy");
+        let import = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "import",
+                "state.tar",
+                "--name",
+                "copy",
+                "--root",
+                target.to_str().unwrap(),
+                "--json",
+            ],
+        );
+        assert!(import.status.success(), "{}", stderr(&import));
+        let db = Connection::open_with_flags(
+            target.join(".openclaw/state/openclaw.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let raw: String = db.query_row(select, [], |row| row.get(0)).unwrap();
+        let actual: Value = serde_json::from_str(&raw).unwrap();
+        let mut expected = expected_document;
+        let expected_records = if legacy {
+            &mut expected
+        } else {
+            &mut expected["index"]["installRecords"]
+        };
+        expected_records["demo"]["installPath"] = json!(target.join(".openclaw/extensions/demo"));
+        expected_records["demo"]["sourcePath"] = json!(target.join("packages/demo"));
+        expected_records["missing"]["installPath"] =
+            json!(target.join(".openclaw/extensions/missing"));
+        assert_eq!(actual, expected);
+        let unrelated_query = if legacy {
+            "SELECT install_records_json, updated_at FROM installed_plugin_index WHERE index_key='unrelated'"
+        } else {
+            "SELECT value_json, updated_at_ms FROM config_machine_state WHERE state_key='unrelated'"
+        };
+        assert_eq!(
+            db.query_row(unrelated_query, [], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?
+            )))
+            .unwrap(),
+            (source.display().to_string(), 43)
+        );
+        let timestamp_query = if legacy {
+            "SELECT updated_at FROM installed_plugin_index WHERE index_key='installed-plugin-index'"
+        } else {
+            "SELECT updated_at_ms FROM config_machine_state WHERE state_key='plugins.installedIndex'"
+        };
+        assert_eq!(
+            db.query_row(timestamp_query, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            db.query_row("SELECT value FROM durable", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "session bytes"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT lease_id, owner_pid FROM agent_database_leases",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+            ("retained-owner".to_string(), 123)
+        );
+        assert_eq!(
+            db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        let mut expected_runtime = runtime;
+        expected_runtime["rootDir"] = json!(target.join(".openclaw/extensions/demo"));
+        expected_runtime["package"] = json!(target.join("packages/demo"));
+        let actual_runtime: Value =
+            serde_json::from_slice(&fs::read(target.join(runtime_file)).unwrap()).unwrap();
+        assert_eq!(actual_runtime, expected_runtime);
+        for file in untouched.into_iter().chain([
+            ".openclaw/state/opaque.bin",
+            ".openclaw/extensions/demo/index.js",
+            "packages/demo/package.json",
+        ]) {
+            assert_eq!(
+                fs::read(target.join(file)).unwrap(),
+                fs::read(archive.root_dir.join(file)).unwrap(),
+                "{file}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(target.join(".openclaw/state/openclaw.sqlite"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o400
+            );
+            assert_eq!(
+                fs::metadata(target.join(".openclaw/state"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o500
+            );
+            assert_eq!(
+                fs::metadata(target.join(runtime_file))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o400
+            );
+            if legacy {
+                assert_eq!(
+                    fs::read_link(target.join(".openclaw/state/openclaw.sqlite")).unwrap(),
+                    std::path::Path::new("index.sqlite")
+                );
+            }
+            for base in [target.clone(), root.child("source-offline")] {
+                fs::set_permissions(
+                    base.join(".openclaw/state"),
+                    fs::Permissions::from_mode(0o700),
+                )
+                .unwrap();
+            }
+        }
+        let summary: Value = serde_json::from_str(&stdout(&import)).unwrap();
+        assert_eq!(summary["statePathsRewritten"], true);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn state_import_refuses_to_rewrite_a_database_outside_the_copy() {
+    let root = TestDir::new("state-import-external-database");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    let external = root.child("external.sqlite");
+    let db = rusqlite::Connection::open(&external).unwrap();
+    db.execute_batch(
+        "CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT);",
+    )
+    .unwrap();
+    db.execute("INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?1)",
+        [serde_json::json!({"index":{"installRecords":{"demo":{"source":"path","installPath":source.join(".openclaw/extensions/demo")}}}}).to_string()]).unwrap();
+    drop(db);
+    let before = fs::read(&external).unwrap();
+    fs::create_dir_all(source.join(".openclaw/state")).unwrap();
+    std::os::unix::fs::symlink(&external, source.join(".openclaw/state/openclaw.sqlite")).unwrap();
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "state.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "state.tar", "--name", "copy"],
+    );
+    assert!(!import.status.success());
+    assert!(
+        stderr(&import).contains("inside the imported state"),
+        "{}",
+        stderr(&import)
+    );
+    assert_eq!(fs::read(&external).unwrap(), before);
+    assert!(!root.child("ocm-home/envs/copy").exists());
+    let show = run_ocm(root.path(), &env, &["env", "show", "copy"]);
+    assert!(!show.status.success());
 }
