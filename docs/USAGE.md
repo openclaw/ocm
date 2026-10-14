@@ -959,27 +959,19 @@ root is captured as a coherent committed snapshot, including uncheckpointed WAL
 writes; raw database sidecars are omitted. Databases and other files are not
 captured in one atomic transaction.
 
-Export normalizes owned config and plugin receipt aliases in copied content
-without changing the source. Import preserves the included files, relocates
-owned paths, clears copied database process leases, assigns a new gateway port,
-and leaves the environment stopped. Export without the flag and import of
-older archives retain their existing selection and cleanup behavior.
+State-inclusive export and import copy configuration files and database contents
+without resolving or rewriting them. `.env`, `openclaw.json`, includes, and
+plugin load-path expressions travel verbatim. No OpenClaw runtime is required.
+Paths outside the environment root are not exported, detected, or reported;
+absolute paths in file contents may need updating after moving the environment.
+Owned file and directory links use relative targets in the archive; external
+and dangling links retain their targets without copying external contents.
+Import leaves the environment stopped, and export leaves the source unchanged.
+An explicit `env import --sandbox-origin` still replaces that setting.
 
 JSON reports `includeState`; the human summary also reports whether state was
-included. File plugins whose payload lives outside the environment root are
-not included. Export succeeds and names those paths in `notIncludedPluginPaths`
-and the human summary; it does not copy their external contents.
-
-Owned database links outside `.openclaw/state` are materialized as coherent
-snapshots; database links to external files are rejected. State symlinks and
-damaged canonical state databases are rejected. Plugin paths
-inside the environment must be portable: relative links are preserved, while
-absolute links that would remain in the imported payload are rejected. Linked
-configuration files are materialized, and copied plugin path settings retain
-their resolved selection across name or port changes. Relative plugin path
-settings depend on the caller's working directory and are rejected; use absolute
-paths or environment-root variables. A plugin path setting shared with unrelated
-configuration through the same include is rejected if it needs rewriting.
+included. Export without the flag and import of older archives retain their
+existing selection, configuration rewriting, and cleanup behavior.
 
 Environment archives must contain real `meta/` and `root/` directories and a
 regular `meta/env.json` file. Import and legacy snapshot restore reject symlinks

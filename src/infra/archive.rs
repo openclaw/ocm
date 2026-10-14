@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -95,15 +95,12 @@ pub enum EnvArchiveEntryKind {
 #[derive(Clone)]
 pub struct EnvArchiveOptions {
     pub should_skip_path: fn(&Path, EnvArchiveEntryKind) -> bool,
-    pub should_exclude_path: fn(&Path, EnvArchiveEntryKind) -> Result<bool, String>,
+    pub should_exclude_path: fn(&Path, EnvArchiveEntryKind) -> bool,
     pub included_path_roots: BTreeSet<PathBuf>,
     pub excluded_path_roots: BTreeSet<PathBuf>,
     pub snapshot_sqlite_files: bool,
+    pub relocate_internal_symlinks: bool,
     pub sqlite_content_roots: BTreeSet<PathBuf>,
-    pub required_sqlite_paths: BTreeSet<PathBuf>,
-    pub file_contents: BTreeMap<PathBuf, Vec<u8>>,
-    pub prepare_sqlite_snapshot:
-        Option<fn(&Path, &Path, &Path, &EnvArchiveOptions) -> Result<(), String>>,
 }
 
 impl Default for EnvArchiveOptions {
@@ -114,34 +111,28 @@ impl Default for EnvArchiveOptions {
             included_path_roots: BTreeSet::new(),
             excluded_path_roots: BTreeSet::new(),
             snapshot_sqlite_files: false,
+            relocate_internal_symlinks: false,
             sqlite_content_roots: BTreeSet::new(),
-            required_sqlite_paths: BTreeSet::new(),
-            prepare_sqlite_snapshot: None,
-            file_contents: BTreeMap::new(),
         }
     }
 }
 
 impl EnvArchiveOptions {
-    pub(crate) fn should_skip(
-        &self,
-        relative_path: &Path,
-        kind: EnvArchiveEntryKind,
-    ) -> Result<bool, String> {
-        if (self.should_exclude_path)(relative_path, kind)?
+    pub(crate) fn should_skip(&self, relative_path: &Path, kind: EnvArchiveEntryKind) -> bool {
+        if (self.should_exclude_path)(relative_path, kind)
             || self
                 .excluded_path_roots
                 .iter()
                 .any(|root| relative_path == root || relative_path.starts_with(root))
         {
-            return Ok(true);
+            return true;
         }
         let explicitly_included = self.included_path_roots.iter().any(|root| {
             relative_path == root
                 || relative_path.starts_with(root)
                 || root.starts_with(relative_path)
         });
-        Ok(!explicitly_included && (self.should_skip_path)(relative_path, kind))
+        !explicitly_included && (self.should_skip_path)(relative_path, kind)
     }
 }
 
@@ -149,11 +140,8 @@ fn include_env_archive_path(_relative_path: &Path, _kind: EnvArchiveEntryKind) -
     false
 }
 
-fn exclude_no_env_archive_path(
-    _relative_path: &Path,
-    _kind: EnvArchiveEntryKind,
-) -> Result<bool, String> {
-    Ok(false)
+fn exclude_no_env_archive_path(_relative_path: &Path, _kind: EnvArchiveEntryKind) -> bool {
+    false
 }
 
 pub fn write_env_archive<T: Serialize>(
@@ -263,33 +251,17 @@ fn append_env_root(
             ))
         })?;
         let entry_kind = env_archive_entry_kind(&metadata);
-        if options.required_sqlite_paths.contains(relative_path) && !metadata.is_file() {
-            return Err(EnvArchiveWriteError::Fatal(format!(
-                "required SQLite archive source is not a regular file: {}",
-                path.display()
-            )));
-        }
-        if options
-            .should_skip(relative_path, entry_kind)
-            .map_err(EnvArchiveWriteError::Fatal)?
-        {
+        if options.should_skip(relative_path, entry_kind) {
             continue;
         }
         let discover_sqlite = options
             .sqlite_content_roots
             .iter()
             .any(|root| relative_path.starts_with(root));
-        let linked_database = if discover_sqlite && metadata.is_symlink() {
-            linked_sqlite_source(&path, source_root)?
-        } else {
-            None
-        };
         let state_database = discover_sqlite
-            && (linked_database.is_some()
-                || metadata.is_file()
-                    && (options.required_sqlite_paths.contains(relative_path)
-                        || state_databases.contains(&path)
-                        || is_sqlite_database(&path).map_err(EnvArchiveWriteError::Fatal)?));
+            && metadata.is_file()
+            && (state_databases.contains(&path)
+                || is_sqlite_database(&path).map_err(EnvArchiveWriteError::Fatal)?);
         if state_database {
             state_sidecars.extend(sqlite_sidecar_paths(&path));
         } else if discover_sqlite
@@ -307,24 +279,6 @@ fn append_env_root(
         }
 
         let archive_path = Path::new(ENV_ARCHIVE_ROOT_DIR).join(relative_path);
-        if let Some(contents) = options.file_contents.get(relative_path) {
-            let source_metadata =
-                fs::metadata(&path).map_err(EnvArchiveWriteError::from_entry_io)?;
-            if !source_metadata.is_file() {
-                return Err(EnvArchiveWriteError::Fatal(format!(
-                    "archive content source is not a regular file: {}",
-                    path.display()
-                )));
-            }
-            let mut header = Header::new_gnu();
-            header.set_metadata(&source_metadata);
-            header.set_size(contents.len() as u64);
-            header.set_cksum();
-            builder
-                .append_data(&mut header, &archive_path, Cursor::new(contents))
-                .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
-            continue;
-        }
         if metadata.is_dir() {
             builder.append_dir(&archive_path, &path).map_err(|error| {
                 EnvArchiveWriteError::from_entry_io(io_error_with_context(
@@ -364,12 +318,7 @@ fn append_env_root(
                     path.display()
                 )));
             }
-            let snapshot = create_sqlite_snapshot(linked_database.as_deref().unwrap_or(&path))
-                .map_err(EnvArchiveWriteError::Fatal)?;
-            if let Some(prepare) = options.prepare_sqlite_snapshot {
-                prepare(source_root, relative_path, snapshot.path(), options)
-                    .map_err(EnvArchiveWriteError::Fatal)?;
-            }
+            let snapshot = create_sqlite_snapshot(&path).map_err(EnvArchiveWriteError::Fatal)?;
             let snapshot_metadata = fs::metadata(snapshot.path()).map_err(|error| {
                 EnvArchiveWriteError::Fatal(format!(
                     "failed to inspect SQLite snapshot for {}: {error}",
@@ -397,6 +346,19 @@ fn append_env_root(
             continue;
         }
 
+        if metadata.is_symlink() && options.relocate_internal_symlinks {
+            if let Some(target) = owned_archive_link_target(&path, source_root)? {
+                let mut header = Header::new_gnu();
+                header.set_metadata(&metadata);
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                builder
+                    .append_link(&mut header, &archive_path, &target)
+                    .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
+                continue;
+            }
+        }
+
         builder
             .append_path_with_name(&path, &archive_path)
             .map_err(|error| {
@@ -410,28 +372,39 @@ fn append_env_root(
     Ok(())
 }
 
-fn linked_sqlite_source(
+fn owned_archive_link_target(
     path: &Path,
     source_root: &Path,
 ) -> Result<Option<PathBuf>, EnvArchiveWriteError> {
     let target = match fs::canonicalize(path) {
         Ok(target) => target,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(EnvArchiveWriteError::from_entry_io(error)),
+        Err(_) => return Ok(None),
     };
-    if !target.is_file() || !is_sqlite_database(&target).map_err(EnvArchiveWriteError::Fatal)? {
-        return Ok(None);
-    }
     let root = fs::canonicalize(source_root).map_err(EnvArchiveWriteError::from_entry_io)?;
-    if !target.starts_with(root) {
-        return Err(EnvArchiveWriteError::Fatal(format!(
-            "SQLite link points outside the environment: {}",
-            path.display()
-        )));
+    let Ok(target) = target.strip_prefix(&root) else {
+        return Ok(None);
+    };
+    let parent = path
+        .parent()
+        .unwrap()
+        .strip_prefix(source_root)
+        .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
+    let common = parent
+        .components()
+        .zip(target.components())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in parent.components().skip(common) {
+        relative.push("..");
     }
-    // Snapshot the owned target directly so an absolute alias cannot retain a
-    // connection to the source or miss the target's committed WAL writes.
-    Ok(Some(target))
+    for part in target.components().skip(common) {
+        relative.push(part);
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    Ok(Some(relative))
 }
 
 fn classify_sqlite_children(
@@ -449,16 +422,10 @@ fn classify_sqlite_children(
         let child_relative = child
             .strip_prefix(source_root)
             .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
-        if options
-            .should_skip(child_relative, env_archive_entry_kind(&child_meta))
-            .map_err(EnvArchiveWriteError::Fatal)?
-        {
+        if options.should_skip(child_relative, env_archive_entry_kind(&child_meta)) {
             continue;
         }
-        if child_meta.is_file()
-            && (options.required_sqlite_paths.contains(child_relative)
-                || is_sqlite_database(child).map_err(EnvArchiveWriteError::Fatal)?)
-        {
+        if child_meta.is_file() && is_sqlite_database(child).map_err(EnvArchiveWriteError::Fatal)? {
             state_databases.insert(child.clone());
             state_sidecars.extend(sqlite_sidecar_paths(child));
         }
@@ -761,10 +728,7 @@ mod tests {
     static DISAPPEARING_PRIMARY: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
 
     #[cfg(unix)]
-    fn remove_primary_after_capture(
-        relative: &Path,
-        _kind: EnvArchiveEntryKind,
-    ) -> Result<bool, String> {
+    fn remove_primary_after_capture(relative: &Path, _kind: EnvArchiveEntryKind) -> bool {
         if relative == Path::new("state/live.db-wal") {
             let mut configured = DISAPPEARING_PRIMARY.lock().unwrap();
             let (path, visits) = configured.as_mut().unwrap();
@@ -773,7 +737,7 @@ mod tests {
                 fs::remove_file(path).unwrap();
             }
         }
-        Ok(false)
+        false
     }
 
     #[cfg(unix)]
@@ -831,20 +795,14 @@ mod tests {
             ".openclaw/team/ops/notes.md",
         ] {
             assert!(
-                !options
-                    .should_skip(Path::new(path), EnvArchiveEntryKind::File)
-                    .unwrap(),
+                !options.should_skip(Path::new(path), EnvArchiveEntryKind::File),
                 "{path} should be traversed"
             );
         }
-        assert!(
-            options
-                .should_skip(
-                    Path::new(".openclaw/team/cache"),
-                    EnvArchiveEntryKind::Directory
-                )
-                .unwrap()
-        );
+        assert!(options.should_skip(
+            Path::new(".openclaw/team/cache"),
+            EnvArchiveEntryKind::Directory
+        ));
     }
 
     #[test]
@@ -859,22 +817,14 @@ mod tests {
             ..EnvArchiveOptions::default()
         };
 
-        assert!(
-            !options
-                .should_skip(
-                    Path::new(".openclaw/extensions/demo/package.json"),
-                    EnvArchiveEntryKind::File
-                )
-                .unwrap()
-        );
-        assert!(
-            options
-                .should_skip(
-                    Path::new(".openclaw/extensions/demo/node_modules/package/index.js"),
-                    EnvArchiveEntryKind::File
-                )
-                .unwrap()
-        );
+        assert!(!options.should_skip(
+            Path::new(".openclaw/extensions/demo/package.json"),
+            EnvArchiveEntryKind::File
+        ));
+        assert!(options.should_skip(
+            Path::new(".openclaw/extensions/demo/node_modules/package/index.js"),
+            EnvArchiveEntryKind::File
+        ));
     }
 
     #[test]

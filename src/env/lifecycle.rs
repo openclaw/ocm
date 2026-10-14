@@ -256,8 +256,6 @@ pub struct ExportEnvironmentOptions {
 #[serde(rename_all = "camelCase")]
 pub struct EnvExportSummary {
     pub include_state: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub not_included_plugin_paths: Vec<String>,
     pub name: String,
     pub root: String,
     pub archive_path: String,

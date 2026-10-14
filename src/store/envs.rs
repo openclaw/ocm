@@ -33,8 +33,7 @@ use super::layout::{
 };
 use super::now_utc;
 use super::openclaw_state::{
-    openclaw_env_state_archive_options, relocate_archived_plugin_index_paths,
-    validate_nonportable_runtime_state_paths,
+    openclaw_env_state_archive_options, validate_nonportable_runtime_state_paths,
 };
 use super::{
     DevSourceRegistration, OpenClawWorkspaceRuntime, clear_nonportable_runtime_state,
@@ -878,7 +877,7 @@ fn clone_environment_with_policy(
         };
 
         super::openclaw_state::relocate_cloned_plugin_index_paths(&source_paths, &target_paths)?;
-        super::openclaw_state::clear_copied_agent_database_leases(&target_paths)?;
+        super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
 
         let meta = EnvMeta {
             upgrade_independent_paths: Vec::new(),
@@ -1070,13 +1069,10 @@ pub fn export_environment(
     };
 
     let runtime = OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port);
-    let (archive_options, not_included_plugin_paths) = if options.include_state {
-        openclaw_env_state_archive_options(&env_paths, env, runtime)?
+    let archive_options = if options.include_state {
+        openclaw_env_state_archive_options(&env_paths)?
     } else {
-        (
-            openclaw_env_archive_options(&env_paths, env, runtime)?,
-            Vec::new(),
-        )
+        openclaw_env_archive_options(&env_paths, env, runtime)?
     };
     let result =
         write_env_archive_with_options(&metadata, &env_paths.root, &output_path, archive_options);
@@ -1087,7 +1083,6 @@ pub fn export_environment(
 
     Ok(EnvExportSummary {
         include_state: options.include_state,
-        not_included_plugin_paths,
         name: meta.name,
         root: meta.root,
         archive_path: display_path(&output_path),
@@ -1133,20 +1128,6 @@ pub(crate) fn import_environment_with_sandbox_origin(
             ));
         }
 
-        let state_source_root = if extracted.metadata.include_state {
-            Some(
-                extracted
-                    .metadata
-                    .env
-                    .source_root
-                    .as_deref()
-                    .filter(|root| !root.is_empty())
-                    .ok_or("state-inclusive archive is missing env.sourceRoot")?,
-            )
-        } else {
-            None
-        };
-
         let source_name = extracted.metadata.env.name.clone();
         let name = if let Some(name) = options.name.as_deref() {
             validate_name(name, "Environment name")?
@@ -1190,17 +1171,21 @@ pub(crate) fn import_environment_with_sandbox_origin(
             return Err("archive is missing root/".to_string());
         }
         let extracted_paths = derive_env_paths(&extracted.root_dir);
-        validate_nonportable_runtime_state_paths(&extracted_paths)?;
-        if extracted.metadata.include_state {
-            super::openclaw_state::validate_archived_openclaw_state(&extracted_paths)?;
-        }
-        reject_include_owned_sandbox_origin(&extracted_paths.config_path)?;
-        reject_include_owned_agent_workspaces(&extracted_paths.config_path)?;
-        let extracted_workspaces = resolve_env_openclaw_workspaces(
-            &extracted_paths,
-            env,
-            OpenClawWorkspaceRuntime::for_env(&source_name, extracted.metadata.env.gateway_port),
-        )?;
+        let extracted_workspaces = if extracted.metadata.include_state {
+            None
+        } else {
+            validate_nonportable_runtime_state_paths(&extracted_paths)?;
+            reject_include_owned_sandbox_origin(&extracted_paths.config_path)?;
+            reject_include_owned_agent_workspaces(&extracted_paths.config_path)?;
+            Some(resolve_env_openclaw_workspaces(
+                &extracted_paths,
+                env,
+                OpenClawWorkspaceRuntime::for_env(
+                    &source_name,
+                    extracted.metadata.env.gateway_port,
+                ),
+            )?)
+        };
         let imported = (|| {
             let preferred_gateway_port = extracted
                 .metadata
@@ -1211,42 +1196,38 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 choose_available_gateway_port(preferred_gateway_port, &registry.envs, env);
             let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
             copy_dir_recursive(&extracted.root_dir, &target_paths.root)?;
-            validate_nonportable_runtime_state_paths(&target_paths)?;
-            reject_include_owned_sandbox_origin(&target_paths.config_path)?;
-            let config_rewrite = rewrite_openclaw_config_for_new_environment(
-                &target_paths,
-                extracted.metadata.env.source_root.as_deref().map(Path::new),
-                Some(gateway_port),
-                sandbox_origin.as_deref(),
-            )?;
-            rewrite_identity_bound_workspace_paths_for_target(
-                &target_paths.config_path,
-                &extracted_workspaces,
-                &extracted.root_dir,
-                &target_paths.root,
-            )?;
-            verify_copied_workspaces_remain_preserved(
-                &extracted_workspaces,
-                &extracted.root_dir,
-                &target_paths,
-                env,
-                target_runtime,
-            )?;
-            if let Some(source_root) = state_source_root {
-                rewrite_openclaw_config_includes_for_target(
+            let config_rewrite = if let Some(extracted_workspaces) = &extracted_workspaces {
+                validate_nonportable_runtime_state_paths(&target_paths)?;
+                reject_include_owned_sandbox_origin(&target_paths.config_path)?;
+                let outcome = rewrite_openclaw_config_for_new_environment(
+                    &target_paths,
+                    extracted.metadata.env.source_root.as_deref().map(Path::new),
+                    Some(gateway_port),
+                    sandbox_origin.as_deref(),
+                )?;
+                rewrite_identity_bound_workspace_paths_for_target(
                     &target_paths.config_path,
-                    &target_paths.state_dir,
-                    Path::new(source_root),
+                    extracted_workspaces,
+                    &extracted.root_dir,
                     &target_paths.root,
                 )?;
-                relocate_archived_plugin_index_paths(
-                    &derive_env_paths(Path::new(source_root)),
+                verify_copied_workspaces_remain_preserved(
+                    extracted_workspaces,
+                    &extracted.root_dir,
                     &target_paths,
+                    env,
+                    target_runtime,
                 )?;
-                super::openclaw_state::clear_imported_database_leases(&target_paths)?;
-            } else {
                 clear_nonportable_runtime_state(&target_paths, env, target_runtime)?;
-            }
+                outcome
+            } else {
+                // Preserve authored files unless the caller explicitly overrides the origin.
+                if let Some(origin) = sandbox_origin.as_deref() {
+                    validate_nonportable_runtime_state_paths(&target_paths)?;
+                    super::openclaw_config::replace_imported_sandbox_origin(&target_paths, origin)?;
+                }
+                super::openclaw_config::OpenClawConfigRewriteOutcome::default()
+            };
 
             let created_at = now_utc();
             let meta = EnvMeta {

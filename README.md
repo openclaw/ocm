@@ -543,33 +543,31 @@ anywhere under the root are captured as coherent committed snapshots, including
 WAL writes; raw database sidecars are omitted. Each database is captured
 independently, not as one transaction across the environment.
 
-Import relocates owned config and plugin receipt paths, clears copied database
-process leases, and leaves the new environment stopped. Export leaves the source
-unchanged. File plugins outside the environment root are not included; JSON
-(`notIncludedPluginPaths`) and human output name their paths without refusing the
-export. Both outputs also report whether state was included. Export without the
-flag and import of older archives retain their existing behavior.
+State-inclusive export and import copy configuration files and database contents
+without resolving or rewriting them. `.env`, `openclaw.json`, includes, and
+plugin load-path expressions travel verbatim. No OpenClaw runtime is required.
+Paths outside the environment root are not exported, detected, or reported;
+absolute paths in file contents may need updating after moving the environment.
+Owned file and directory links use relative targets in the archive; external
+and dangling links retain their targets without copying external contents.
+Import leaves the environment stopped, and export leaves the source unchanged.
+An explicit `env import --sandbox-origin` still replaces that setting.
 
-Owned database links outside `.openclaw/state` are materialized as coherent
-snapshots; database links to external files are rejected. State symlinks and
-damaged canonical state databases are rejected. Plugin paths
-inside the environment must be portable: relative links are preserved, while
-absolute links that would remain in the imported payload are rejected. Linked
-configuration files are materialized, and copied plugin path settings retain
-their resolved selection across name or port changes. Relative plugin path
-settings depend on the caller's working directory and are rejected; use absolute
-paths or environment-root variables. A plugin path setting shared with unrelated
-configuration through the same include is rejected if it needs rewriting.
+JSON reports `includeState`; the human summary also reports whether state was
+included. Export without the flag and import of older archives retain their
+existing selection, configuration rewriting, and cleanup behavior.
 
-Clone and import reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
-Individual agent directory links are removed from the copy without changing their linked source data.
+Clone and imports without state reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
+Clone and imports without state remove individual agent directory links from
+the copy without changing their linked source data.
 
 Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite snapshots for recognized operational databases: shared state and quarantine, canonical agent stores, legacy `memory/*.sqlite` stores, and the default Workboard, Team Reports, Logbook, and active Matrix account state stores.
 Agent database paths recorded in the source shared-state registry are also included when the existing copy traverses them.
 Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
 The source stays running and its database contents are not rewritten.
 
-OCM does not classify a package or project asset as operational merely because it has a SQLite header or filename.
+For clone, migration, and adoption, OCM does not classify a package or project
+asset as operational merely because it has a SQLite header or filename.
 Unregistered custom database locations and opaque package, project, import, audit, and Workshop payloads retain their existing copy behavior.
 Symlinks keep their existing handling.
 A selected database that cannot be snapshotted makes the command fail and invokes its existing target cleanup; raw source WAL or journal files are never attached to its snapshot.

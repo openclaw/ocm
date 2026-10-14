@@ -1,186 +1,144 @@
 mod support;
 
-use std::fs;
-use std::path::Path;
-
-use ocm::infra::archive::{EnvArchiveMetadata, extract_env_archive};
-use serde_json::{Value, json};
-
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout, write_text};
+use std::fs;
 
 #[test]
-fn state_export_preserves_plugin_selection_across_environment_identity_changes() {
-    for include_scope in [
-        None,
-        Some("/plugins"),
-        Some("/plugins/load"),
-        Some("/plugins/load/paths"),
-    ] {
-        let root = TestDir::new("env-export-plugin-identity");
-        let cwd = root.child("workspace");
-        fs::create_dir_all(&cwd).unwrap();
-        let mut env = ocm_env(&root);
-        env.insert("SYNTHETIC_SECRET".to_string(), "not-for-config".to_string());
-        env.insert("OCM_ACTIVE_ENV".to_string(), "stale-name".to_string());
-        env.insert("OPENCLAW_GATEWAY_PORT".to_string(), "9999".to_string());
-        let create = run_ocm(&cwd, &env, &["env", "create", "source", "--port", "19789"]);
-        assert!(create.status.success(), "{}", stderr(&create));
-
-        let source = root.child("ocm-home/envs/source");
-        let templates = json!([
-            "${OPENCLAW_STATE_DIR}/plugins/${OCM_ACTIVE_ENV}",
-            "${OCM_ACTIVE_ENV_ROOT}/.openclaw/plugins/port-${OPENCLAW_GATEWAY_PORT}",
-            "${OPENCLAW_STATE_DIR}/plugins/${PLUGIN_DIRECTORY}"
-        ]);
-        let selected = ["source", "port-19789", "configured"];
-        for directory in selected {
-            write_text(
-                &source.join(format!(".openclaw/plugins/{directory}/index.js")),
-                directory,
-            );
-        }
-        let unrelated = json!({
-            "path": templates[0],
-            "secret": "${SYNTHETIC_SECRET}"
-        });
-        let mut config = json!({
-            "env": {"PLUGIN_DIRECTORY": "configured", "UNRELATED": templates[0]},
-            "plugins": {"load": {"paths": templates}, "entries": {"example": {"config": unrelated}}}
-        });
-        let owner_relative = if let Some(scope) = include_scope {
-            let owned = config.pointer(scope).unwrap().clone();
-            *config.pointer_mut(scope).unwrap() = json!({"$include": "config/plugins.json5"});
-            write_text(
-                &source.join(".openclaw/config/plugins.json5"),
-                &owned.to_string(),
-            );
-            ".openclaw/config/plugins.json5"
-        } else {
-            ".openclaw/openclaw.json"
-        };
-        write_text(&source.join(".openclaw/openclaw.json"), &config.to_string());
-        let source_config = fs::read(source.join(".openclaw/openclaw.json")).unwrap();
-        let source_owner = fs::read(source.join(owner_relative)).unwrap();
-
-        for (archive, include_state) in [("default.tar", false), ("state.tar", true)] {
-            let mut args = vec!["env", "export", "source", "--output", archive];
-            if include_state {
-                args.push("--include-state");
-            }
-            let export = run_ocm(&cwd, &env, &args);
-            assert!(
-                export.status.success(),
-                "{include_scope:?}: {}",
-                stderr(&export)
-            );
-            let extracted = extract_env_archive::<EnvArchiveMetadata>(
-                &cwd.join(archive),
-                &root.child(format!("extract-{archive}")),
-            )
-            .unwrap();
-            let owner = read_json(&extracted.root_dir.join(owner_relative));
-            let pointer = match include_scope {
-                None => "/plugins/load/paths",
-                Some("/plugins") => "/load/paths",
-                Some("/plugins/load") => "/paths",
-                Some("/plugins/load/paths") => "",
-                _ => unreachable!(),
-            };
-            if include_state {
-                let expected: Vec<_> = selected
-                    .iter()
-                    .map(|directory| source.join(format!(".openclaw/plugins/{directory}")))
-                    .collect();
-                assert_eq!(owner.pointer(pointer).unwrap(), &json!(expected));
-            } else {
-                assert_eq!(owner.pointer(pointer).unwrap(), &templates);
-                assert_eq!(
-                    fs::read(extracted.root_dir.join(owner_relative)).unwrap(),
-                    source_owner
-                );
-            }
-        }
-        assert_eq!(
-            fs::read(source.join(".openclaw/openclaw.json")).unwrap(),
-            source_config
+fn state_export_copies_configuration_verbatim_without_resolving_it() {
+    let root = TestDir::new("export-config-files");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    let cases = [
+        // Runtime-only expressions, includes, and malformed config are opaque files.
+        r#"{"plugins":{"load":{"paths":["${PLUGIN_DIRECTORY}","./entry.mjs"]}},"$include":"missing.json"}"#,
+        "{ incomplete configuration",
+    ];
+    for (index, config) in cases.iter().enumerate() {
+        write_text(&source.join(".openclaw/openclaw.json"), config);
+        write_text(
+            &source.join(".env"),
+            "PLUGIN_DIRECTORY=./.openclaw/custom\n",
         );
-        assert_eq!(fs::read(source.join(owner_relative)).unwrap(), source_owner);
-
-        fs::rename(&source, root.child("source-offline")).unwrap();
-        let import = run_ocm(
-            &cwd,
-            &env,
-            &["env", "import", "state.tar", "--name", "restored"],
+        write_text(
+            &source.join(".openclaw/.env"),
+            "UNRESOLVED=${OTHER_VALUE}\n",
         );
-        assert!(
-            import.status.success(),
-            "{include_scope:?}: {}",
-            stderr(&import)
+        write_text(&source.join("entry.mjs"), "export default {};\n");
+        write_text(
+            &source.join(".openclaw/custom/dependency.mjs"),
+            "export const value = 42;\n",
         );
-        let show = run_ocm(&cwd, &env, &["env", "show", "restored", "--json"]);
-        assert!(show.status.success(), "{}", stderr(&show));
-        let summary: Value = serde_json::from_str(&stdout(&show)).unwrap();
-        assert_ne!(summary["gatewayPort"].as_u64(), Some(19789));
-
-        let target = root.child("ocm-home/envs/restored");
-        let mut config = read_json(&target.join(".openclaw/openclaw.json"));
-        if let Some(scope) = include_scope {
-            assert_eq!(
-                config.pointer(scope).unwrap()["$include"],
-                "config/plugins.json5"
-            );
-            *config.pointer_mut(scope).unwrap() = read_json(&target.join(owner_relative));
-        }
-        let expected: Vec<_> = selected
-            .iter()
-            .map(|directory| target.join(format!(".openclaw/plugins/{directory}")))
-            .collect();
-        assert_eq!(config["plugins"]["load"]["paths"], json!(expected));
-        assert_eq!(config["plugins"]["entries"]["example"]["config"], unrelated);
-        assert_eq!(config["env"]["UNRELATED"], templates[0]);
-        for (path, content) in expected.iter().zip(selected) {
-            assert_eq!(fs::read_to_string(path.join("index.js")).unwrap(), content);
-        }
+        let archive = format!("config-{index}.tar");
+        let name = format!("target-{index}");
         let export = run_ocm(
-            &cwd,
+            root.path(),
             &env,
             &[
                 "env",
                 "export",
-                "restored",
+                "source",
                 "--include-state",
                 "--output",
-                "restored.tar",
+                &archive,
+                "--json",
             ],
         );
-        assert!(
-            export.status.success(),
-            "{include_scope:?}: {}",
-            stderr(&export)
+        assert!(export.status.success(), "{}", stderr(&export));
+        let summary: serde_json::Value = serde_json::from_str(&stdout(&export)).unwrap();
+        assert_eq!(summary["includeState"], true);
+        assert!(summary.get("notIncludedPluginPaths").is_none());
+        let import = run_ocm(
+            root.path(),
+            &env,
+            &["env", "import", &archive, "--name", &name],
         );
+        assert!(import.status.success(), "{}", stderr(&import));
+        let target = root.child(format!("ocm-home/envs/{name}"));
+        for path in [
+            ".openclaw/openclaw.json",
+            ".env",
+            ".openclaw/.env",
+            "entry.mjs",
+            ".openclaw/custom/dependency.mjs",
+        ] {
+            assert_eq!(
+                fs::read(source.join(path)).unwrap(),
+                fs::read(target.join(path)).unwrap(),
+                "{path}"
+            );
+        }
     }
 }
 
+#[cfg(unix)]
 #[test]
-fn state_export_rejects_plugin_path_rewrites_shared_with_unrelated_config() {
-    let root = TestDir::new("env-export-shared-plugin-config");
+fn state_export_preserves_links_without_copying_external_targets() {
+    use std::os::unix::fs::symlink;
+    let root = TestDir::new("export-linked-files");
     let env = ocm_env(&root);
     let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
     assert!(create.status.success(), "{}", stderr(&create));
-    let source = root.child("ocm-home/envs/source/.openclaw");
-    write_text(
-        &source.join("plugins/source/index.js"),
-        "export default {};",
+    let source = root.child("ocm-home/envs/source");
+    write_text(&source.join(".openclaw/state/data/value"), "owned");
+    write_text(&root.child("outside/value"), "external");
+    symlink(source.join(".openclaw/state/data"), source.join("history")).unwrap();
+    symlink(root.child("outside"), source.join("external")).unwrap();
+    symlink("missing", source.join("dangling")).unwrap();
+    symlink("loop", source.join("loop")).unwrap();
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "links.tar",
+        ],
     );
-    let shared = r#"["${OPENCLAW_STATE_DIR}/plugins/${OCM_ACTIVE_ENV}"]"#;
-    write_text(&source.join("shared.json"), shared);
-    let config = json!({
-        "plugins": {
-            "load": {"paths": {"$include": "shared.json"}},
-            "entries": {"example": {"config": {"$include": "shared.json"}}}
-        }
-    });
-    write_text(&source.join("openclaw.json"), &config.to_string());
+    assert!(export.status.success(), "{}", stderr(&export));
+    fs::rename(&source, root.child("source-offline")).unwrap();
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "links.tar", "--name", "target"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    let target = root.child("ocm-home/envs/target");
+    assert_eq!(
+        fs::read_to_string(target.join("history/value")).unwrap(),
+        "owned"
+    );
+    assert_eq!(
+        fs::read_link(target.join("external")).unwrap(),
+        root.child("outside")
+    );
+    assert_eq!(
+        fs::read_link(target.join("dangling")).unwrap(),
+        std::path::Path::new("missing")
+    );
+    assert_eq!(
+        fs::read_link(target.join("loop")).unwrap(),
+        std::path::Path::new("loop")
+    );
+    fs::remove_dir_all(root.child("outside")).unwrap();
+    assert!(!target.join("external/value").exists());
+}
+
+#[test]
+fn state_import_honors_an_explicit_sandbox_origin_without_relocating_paths() {
+    let root = TestDir::new("state-import-origin");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let config = serde_json::json!({"plugins":{"load":{"paths":["${UNRESOLVED_PLUGIN}"]}}, "mcp":{"apps":{"sandboxOrigin":"https://old.example.test"}}});
+    write_text(
+        &root.child("ocm-home/envs/source/.openclaw/openclaw.json"),
+        &config.to_string(),
+    );
     let export = run_ocm(
         root.path(),
         &env,
@@ -193,150 +151,26 @@ fn state_export_rejects_plugin_path_rewrites_shared_with_unrelated_config() {
             "state.tar",
         ],
     );
-    assert!(!export.status.success());
-    assert!(stderr(&export).contains("shared with unrelated configuration"));
-    assert!(!root.child("state.tar").exists());
-    assert_eq!(
-        fs::read_to_string(source.join("shared.json")).unwrap(),
-        shared
-    );
-    assert_eq!(read_json(&source.join("openclaw.json")), config);
-}
-
-fn read_json(path: &Path) -> Value {
-    json5::from_str(&fs::read_to_string(path).unwrap()).unwrap()
-}
-
-#[test]
-fn state_export_rejects_caller_relative_plugin_selection_without_changing_default() {
-    let root = TestDir::new("export-relative-plugin-config");
-    let env = ocm_env(&root);
-    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
-    assert!(create.status.success(), "{}", stderr(&create));
-    let source = root.child("ocm-home/envs/source");
-    write_text(
-        &source.join("workspace/plugins/demo/index.js"),
-        "export default {};",
-    );
-    write_text(
-        &source.join(".openclaw/openclaw.json"),
-        r#"{"plugins":{"load":{"paths":["plugins/demo"]}}}"#,
-    );
-    for cwd in [source.clone(), source.join("workspace")] {
-        let output = cwd.join("state.tar");
-        let export = run_ocm(
-            &cwd,
-            &env,
-            &[
-                "env",
-                "export",
-                "source",
-                "--include-state",
-                "--output",
-                output.to_str().unwrap(),
-            ],
-        );
-        assert!(!export.status.success());
-        assert!(
-            stderr(&export).contains("ambiguous relative plugin path"),
-            "{}",
-            stderr(&export)
-        );
-        assert!(!output.exists());
-    }
-    let export = run_ocm(
+    assert!(export.status.success(), "{}", stderr(&export));
+    let import = run_ocm(
         root.path(),
         &env,
-        &["env", "export", "source", "--output", "default.tar"],
+        &[
+            "env",
+            "import",
+            "state.tar",
+            "--name",
+            "target",
+            "--sandbox-origin",
+            "https://new.example.test",
+        ],
     );
-    assert!(export.status.success(), "{}", stderr(&export));
-}
-
-#[cfg(unix)]
-#[test]
-fn state_export_keeps_root_file_entrypoints_and_checks_retained_sibling_links() {
-    for (absolute, custom_dependency, config_link) in [
-        (false, false, false),
-        (true, false, false),
-        (false, true, false),
-        (false, false, true),
-    ] {
-        let root = TestDir::new("export-root-file-plugin");
-        let env = ocm_env(&root);
-        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
-        assert!(create.status.success(), "{}", stderr(&create));
-        let source = root.child("ocm-home/envs/source");
-        write_text(&source.join("entry.mjs"), "import './impl.mjs';");
-        write_text(&source.join("actual.mjs"), "export default {};");
-        write_text(
-            &source.join(".openclaw/memory/unused"),
-            "unrelated legacy data",
-        );
-        if custom_dependency {
-            write_text(
-                &source.join("entry.mjs"),
-                "import './.openclaw/custom/impl.mjs';",
-            );
-            write_text(
-                &source.join(".openclaw/custom/impl.mjs"),
-                "export default {};",
-            );
-        }
-        std::os::unix::fs::symlink(
-            if absolute {
-                source.join("actual.mjs")
-            } else {
-                "actual.mjs".into()
-            },
-            source.join("impl.mjs"),
-        )
-        .unwrap();
-        write_text(
-            &source.join(".openclaw/openclaw.json"),
-            &json!({"plugins":{"load":{"paths":[source.join("entry.mjs")]}}}).to_string(),
-        );
-        if config_link {
-            let target = source.join(".openclaw/plugins/settings.json");
-            fs::create_dir_all(target.parent().unwrap()).unwrap();
-            let config = source.join(".openclaw/openclaw.json");
-            fs::rename(&config, &target).unwrap();
-            std::os::unix::fs::symlink(target, config).unwrap();
-        }
-        let export = run_ocm(
-            root.path(),
-            &env,
-            &[
-                "env",
-                "export",
-                "source",
-                "--include-state",
-                "--output",
-                "state.tar",
-            ],
-        );
-        assert_eq!(export.status.success(), !absolute, "{}", stderr(&export));
-        if absolute {
-            assert!(stderr(&export).contains("absolute symlink"));
-        } else {
-            fs::rename(&source, root.child("source-offline")).unwrap();
-            let import = run_ocm(
-                root.path(),
-                &env,
-                &["env", "import", "state.tar", "--name", "target"],
-            );
-            assert!(import.status.success(), "{}", stderr(&import));
-            assert!(root.child("ocm-home/envs/target/impl.mjs").is_file());
-            assert_eq!(
-                fs::read_to_string(root.child("ocm-home/envs/target/.openclaw/memory/unused"))
-                    .unwrap(),
-                "unrelated legacy data"
-            );
-            if custom_dependency {
-                assert!(
-                    root.child("ocm-home/envs/target/.openclaw/custom/impl.mjs")
-                        .is_file()
-                );
-            }
-        }
-    }
+    assert!(import.status.success(), "{}", stderr(&import));
+    let mut expected = config;
+    expected["mcp"]["apps"]["sandboxOrigin"] = "https://new.example.test".into();
+    let actual: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.child("ocm-home/envs/target/.openclaw/openclaw.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
 }
