@@ -700,7 +700,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             std::os::unix::fs::symlink("index.sqlite", &database).unwrap();
         }
         let runtime_file = ".openclaw/agents/main/agent/paths.json";
-        let runtime = json!({"rootDir":installed, "package":package,
+        let mut runtime = json!({"rootDir":installed, "package":package,
             "command":format!("node {}/index.js", installed.display()),
             "shell":format!("cd {}; pwd", source.display()),
             "quotedExternal":format!("cat '{} other/plugin'", source.display()),
@@ -712,12 +712,28 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "relativeArgument":format!("sh -c '{}/run ../../../input'", source.display()),
             "quotedScript":format!("sh -c '{}/run --input {}/input'", source.display(), source.display()),
             "multilineEscape":format!("cat '{}/a\nb/../../outside'", source.display()),
+            "encoded":json!({"rootDir":installed}).to_string(),
+            "normalized":format!("{}/sub/../index.js", installed.display()),
+            "newlineSiblingPath":format!("{}\nother/plugin", source.display()),
+            "absoluteCommand": {"command":format!("{}/run --input {}/input", source.display(), source.display())},
+            "text":format!("{}/run --input {}/input\n{}/second", source.display(), source.display(), source.display()),
+            "externalCommand":format!("node {}=other/plugin.js", source.display()),
+            "escapedRoot":format!("node {}/../outside/index.js", source.display()),
+            "external":external, "lookalike":lookalike});
+        let url_cases = json!({
             "prefixedUrl":format!("echo \"url={}\"; pwd", url::Url::from_file_path(installed.join("index.js")).unwrap()),
             "urlCommand":format!("open \"{}\"; pwd", url::Url::from_file_path(installed.join("index.js")).unwrap()),
-            "encoded":json!({"rootDir":installed}).to_string(),
             "fileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string(),
             "apostropheFileUrl":format!("{}'other/plugin.js", url::Url::from_file_path(&source).unwrap()),
             "quotedFileUrl":format!("cat '{}'", url::Url::from_file_path(installed.join("index.js")).unwrap()),
+            "url":format!("{}/a b/../../outside", url::Url::from_file_path(&source).unwrap()),
+            "prefixedUrlEscape":format!("echo \"url={}/a b/../../outside\"", url::Url::from_file_path(&source).unwrap()),
+            "quotedUrlEscape":format!("cat '{}/a b/../../outside'", url::Url::from_file_path(&source).unwrap()),
+            "angleSibling":format!("{}>other/plugin", url::Url::from_file_path(&source).unwrap()),
+            "quotedAngleSibling":format!("cat '{}>other/plugin'", url::Url::from_file_path(&source).unwrap()),
+            "wrappedRootUrl":format!("<{}>", url::Url::from_file_path(&source).unwrap()),
+            "sameLineUrls":format!("{}/first {}/second", url::Url::from_file_path(&source).unwrap(), url::Url::from_file_path(&source).unwrap()),
+            "uriTextWithPlainReference":format!("{}/first {}/second", url::Url::from_file_path(&source).unwrap(), source.display()),
             "quotedSpacedFileUrl":format!("cat '{} other/plugin.js'", url::Url::from_file_path(&source).unwrap()),
             "rootUrls":format!("{}\n{}", url::Url::from_file_path(&source).unwrap(), url::Url::from_file_path(&source).unwrap()),
             "multipleUrls":format!("{}/first\n{}/second", url::Url::from_file_path(&source).unwrap(), url::Url::from_file_path(&source).unwrap()),
@@ -727,13 +743,11 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "upperFileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string().replacen("file:", "FILE:", 1),
             "shortFileUrl":format!("file:{}", url::Url::from_file_path(installed.join("index.js")).unwrap().path()),
             "localFileUrl":format!("file://localhost{}", url::Url::from_file_path(installed.join("index.js")).unwrap().path()),
-            "normalized":format!("{}/sub/../index.js", installed.display()),
-            "newlineSiblingPath":format!("{}\nother/plugin", source.display()),
-            "absoluteCommand": {"command":format!("{}/run --input {}/input", source.display(), source.display())},
-            "text":format!("{}/run --input {}/input\n{}/second", source.display(), source.display(), source.display()),
-            "externalCommand":format!("node {}=other/plugin.js", source.display()),
-            "escapedRoot":format!("node {}/../outside/index.js", source.display()),
-            "external":external, "lookalike":lookalike});
+        });
+        runtime
+            .as_object_mut()
+            .unwrap()
+            .extend(url_cases.as_object().unwrap().clone());
         write_text(&source.join(runtime_file), &runtime.to_string());
         write_text(
             &source.join(".openclaw/logs/root.txt"),
@@ -1023,6 +1037,18 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         expected_runtime["prefixedUrl"] = json!(format!("echo \"url={}\"; pwd", expected_url));
         expected_runtime["quotedFileUrl"] = json!(format!("cat '{}'", expected_url));
         expected_runtime["urlCommand"] = json!(format!("open \"{}\"; pwd", expected_url));
+        expected_runtime["wrappedRootUrl"] =
+            json!(format!("<{}>", url::Url::from_file_path(&target).unwrap()));
+        expected_runtime["sameLineUrls"] = json!(format!(
+            "{}/first {}/second",
+            url::Url::from_file_path(&target).unwrap(),
+            url::Url::from_file_path(&target).unwrap()
+        ));
+        expected_runtime["uriTextWithPlainReference"] = json!(format!(
+            "{}/first {}/second",
+            url::Url::from_file_path(&target).unwrap(),
+            target.display()
+        ));
         expected_runtime["rootUrls"] = json!(format!(
             "{}\n{}",
             url::Url::from_file_path(&target).unwrap(),

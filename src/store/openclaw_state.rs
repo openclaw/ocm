@@ -677,27 +677,61 @@ fn reference_boundary(ch: char) -> bool {
     ch.is_whitespace() || "\"'`=([{,:;<>)]}|&".contains(ch)
 }
 
+fn file_url_starts(raw: &str) -> impl Iterator<Item = usize> + '_ {
+    raw.match_indices(':').filter_map(move |(colon, _)| {
+        let start = colon.checked_sub(4)?;
+        (raw.get(start..colon)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file"))
+            && raw[..start]
+                .chars()
+                .next_back()
+                .is_none_or(reference_boundary))
+        .then_some(start)
+    })
+}
+
+fn is_complete_file_url_value(value: &str, source_root: &str) -> bool {
+    if !value
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+        || value.chars().any(char::is_control)
+        || file_url_starts(value).nth(1).is_some()
+    {
+        return false;
+    }
+    let Some(space) = value.find(char::is_whitespace) else {
+        return true;
+    };
+    let comparison = root_comparison(value);
+    let source = root_comparison(source_root);
+    !comparison.match_indices(source.as_ref()).any(|(start, _)| {
+        start > space
+            && value[..start]
+                .chars()
+                .next_back()
+                .is_some_and(reference_boundary)
+            && value[start + source_root.len()..]
+                .chars()
+                .next()
+                .is_none_or(std::path::is_separator)
+    })
+}
+
 fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> String {
+    if is_complete_file_url_value(raw, source_root) {
+        return rewrite_file_url(raw, source_root, target_root, true)
+            .unwrap_or_else(|| raw.to_string());
+    }
     // File URLs have their own escaping and authority rules. Preserve other URL
     // components and never interpret an external URL as a local command path.
     let quoted = quoted_value_ranges(raw);
     let mut quote_index = 0;
     let mut urls = Vec::new();
     let mut edits = Vec::new();
-    for (colon, _) in raw.match_indices(':') {
-        let Some(start) = colon.checked_sub(4) else {
-            continue;
-        };
-        if !raw
-            .get(start..colon)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file"))
-            || urls
-                .last()
-                .is_some_and(|range: &std::ops::Range<usize>| start < range.end)
-            || raw[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|ch| !reference_boundary(ch))
+    for start in file_url_starts(raw) {
+        if urls
+            .last()
+            .is_some_and(|range: &std::ops::Range<usize>| start < range.end)
         {
             continue;
         }
@@ -707,19 +741,29 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
         {
             quote_index += 1;
         }
-        let enclosing_end = quoted
-            .get(quote_index)
-            .filter(|range| range.start <= start)
-            .map_or(raw.len(), |range| range.end);
-        let end = raw[start..enclosing_end]
-            .find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
-            .map_or(enclosing_end, |offset| start + offset);
+        let enclosing = quoted.get(quote_index).filter(|range| range.start <= start);
+        let enclosing_end = enclosing.map_or(raw.len(), |range| range.end);
+        let complete_quoted_url =
+            enclosing.is_some_and(|range| {
+                let prefix = &raw[range.start..start];
+                prefix.is_empty()
+                    || (prefix.ends_with('=') && !prefix.chars().any(char::is_whitespace))
+            }) && is_complete_file_url_value(&raw[start..enclosing_end], source_root);
+        let end = if complete_quoted_url {
+            enclosing_end
+        } else {
+            raw[start..enclosing_end]
+                .find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
+                .map_or(enclosing_end, |offset| start + offset)
+        };
         let range = start..end;
         if let Some(relocated) = rewrite_file_url(
             &raw[range.clone()],
             source_root,
             target_root,
-            end == enclosing_end || raw[end..].starts_with(['>', '\r', '\n']),
+            end == enclosing_end
+                || raw[end..].starts_with(['\r', '\n'])
+                || (raw[..start].ends_with('<') && raw[end..].starts_with('>')),
         ) {
             edits.push((range.clone(), relocated));
         }
