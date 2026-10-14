@@ -33,9 +33,15 @@ pub(crate) fn is_sqlite_database(path: &Path) -> Result<bool, String> {
 }
 
 pub(crate) fn create_sqlite_snapshot(source: &Path) -> Result<SqliteSnapshot, String> {
+    #[cfg(target_os = "macos")]
+    let file = tempfile::Builder::new().make(crate::infra::macos_security::create_private_file_new);
+    #[cfg(windows)]
+    let file =
+        tempfile::Builder::new().make(crate::infra::windows_security::create_private_file_new);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let file = NamedTempFile::new();
     let snapshot = SqliteSnapshot {
-        file: NamedTempFile::new()
-            .map_err(|error| format!("failed to create private SQLite snapshot: {error}"))?,
+        file: file.map_err(|error| format!("failed to create private SQLite snapshot: {error}"))?,
     };
     create_sqlite_snapshot_inner(source, snapshot.path())?;
     Ok(snapshot)

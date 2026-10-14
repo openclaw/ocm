@@ -89,6 +89,54 @@ pub(crate) fn create_private_file_new(path: &Path) -> io::Result<File> {
     })
 }
 
+pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Security::{
+        PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, WRITE_DAC};
+    let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if encoded.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid private directory path",
+        ));
+    }
+    encoded.push(0);
+    let user = UserSid::current()?;
+    with_user_only_security_attributes(&user, |attributes| {
+        if unsafe { CreateDirectoryW(encoded.as_ptr(), attributes) } != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+        let directory = OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a real directory",
+            ));
+        }
+        if unsafe {
+            SetKernelObjectSecurity(
+                directory.as_raw_handle(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                attributes.lpSecurityDescriptor,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
+}
+
 pub(crate) fn owned_handle(raw: HANDLE) -> io::Result<OwnedHandle> {
     if raw.is_null() || raw == INVALID_HANDLE_VALUE {
         Err(io::Error::last_os_error())

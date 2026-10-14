@@ -16,6 +16,8 @@ const FILESEC_MODE: libc::c_int = 4;
 const FILESEC_ACL: libc::c_int = 5;
 
 unsafe extern "C" {
+    fn mkdirx_np(path: *const libc::c_char, security: *mut libc::c_void) -> libc::c_int;
+    fn chmodx_np(path: *const libc::c_char, security: *mut libc::c_void) -> libc::c_int;
     fn acl_init(count: libc::c_int) -> *mut libc::c_void;
     fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
     fn acl_valid(acl: *mut libc::c_void) -> libc::c_int;
@@ -70,6 +72,24 @@ impl Drop for FileSecurity {
 pub(crate) fn create_private_file_new(path: &Path) -> io::Result<File> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file path contains a NUL"))?;
+    let (security, _acl) = private_security(0o600)?;
+    // Inheritance must be disabled at creation. Clearing an ACL afterward
+    // cannot revoke another user's descriptor opened while the file was empty.
+    let fd = unsafe {
+        openx_np(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            security.0,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn private_security(mode: libc::mode_t) -> io::Result<(FileSecurity, Acl)> {
     let empty = Acl::checked(unsafe { acl_init(0) })?;
     let mut flags = MaybeUninit::<*mut libc::c_void>::uninit();
     if unsafe { acl_get_flagset_np(empty.0, flags.as_mut_ptr()) } != 0 {
@@ -91,7 +111,6 @@ pub(crate) fn create_private_file_new(path: &Path) -> io::Result<File> {
         return Err(io::Error::last_os_error());
     }
     let security = FileSecurity(security);
-    let mode: libc::mode_t = 0o600;
     // FILESEC_ACL copies an acl_t supplied by address, not the ACL object itself.
     if unsafe { filesec_set_property(security.0, FILESEC_MODE, ptr::from_ref(&mode).cast()) } != 0
         || unsafe { filesec_set_property(security.0, FILESEC_ACL, ptr::from_ref(&empty.0).cast()) }
@@ -99,20 +118,32 @@ pub(crate) fn create_private_file_new(path: &Path) -> io::Result<File> {
     {
         return Err(io::Error::last_os_error());
     }
-    // Inheritance must be disabled at creation. Clearing an ACL afterward
-    // cannot revoke another user's descriptor opened while the file was empty.
-    let fd = unsafe {
-        openx_np(
-            path.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            security.0,
-        )
-    };
-    if fd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
+    Ok((security, empty))
+}
+
+pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    let encoded = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "directory path contains a NUL")
+    })?;
+    let (security, _acl) = private_security(0o700)?;
+    if unsafe { mkdirx_np(encoded.as_ptr(), security.0) } == 0 {
+        return Ok(());
     }
+    let error = io::Error::last_os_error();
+    if error.kind() != io::ErrorKind::AlreadyExists {
+        return Err(error);
+    }
+    if !std::fs::symlink_metadata(path)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a real directory",
+        ));
+    }
+    // Existing empty import destinations must lose inherited grants before copying.
+    if unsafe { chmodx_np(encoded.as_ptr(), security.0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub(crate) fn file_has_no_extended_acl(file: &File) -> io::Result<bool> {

@@ -219,21 +219,72 @@ pub(crate) fn copy_dir_preserving_permissions(
 }
 
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), String> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
     }
-    builder.create(path).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    return crate::infra::macos_security::ensure_private_directory(path)
+        .map_err(|error| error.to_string());
+    #[cfg(windows)]
+    return crate::infra::windows_security::ensure_private_directory(path)
+        .map_err(|error| error.to_string());
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?;
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(path) {
+            Ok(()) => (),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) =>
+            {
+                ()
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+pub(crate) fn remove_owned_tree(path: &Path) -> Result<(), String> {
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(entry) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&entry) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            ensure_private_dir(&entry)?;
+            for child in fs::read_dir(&entry).map_err(|error| error.to_string())? {
+                pending.push(child.map_err(|error| error.to_string())?.path());
+            }
+        }
+        #[cfg(windows)]
+        if metadata.permissions().readonly() {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&entry, permissions).map_err(|error| error.to_string())?;
+        }
+    }
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 // Clone and migration opt in; package, archive restore, and checkpoint callers
@@ -843,5 +894,79 @@ mod tests {
                 .unwrap(),
             42
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod archive_privacy_tests {
+    use super::*;
+    use crate::infra::archive::{EnvArchiveOptions, write_env_archive_with_options};
+    use crate::infra::macos_security::file_has_no_extended_acl;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_archive_directories_and_output_exclude_inherited_acl() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("shared-parent");
+        fs::create_dir(&parent).unwrap();
+        let granted = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow read,readattr,readextattr,readsecurity,file_inherit,directory_inherit"])
+            .arg(&parent).status().unwrap();
+        assert!(granted.success());
+        let existing = parent.join("existing");
+        fs::create_dir(&existing).unwrap();
+        assert!(!file_has_no_extended_acl(&File::open(&existing).unwrap()).unwrap());
+        for directory in [existing, parent.join("new")] {
+            ensure_private_dir(&directory).unwrap();
+            assert!(file_has_no_extended_acl(&File::open(&directory).unwrap()).unwrap());
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("data"), b"private fixture").unwrap();
+        let output = parent.join("archive.tar");
+        write_env_archive_with_options(
+            &serde_json::json!({}),
+            &source,
+            &output,
+            EnvArchiveOptions {
+                private_output: true,
+                ..EnvArchiveOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(file_has_no_extended_acl(&File::open(&output).unwrap()).unwrap());
+        assert_eq!(
+            fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod archive_privacy_windows_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    #[test]
+    fn private_config_archive_directory_has_user_only_access() {
+        let root = tempfile::tempdir().unwrap();
+        for existing in [false, true] {
+            let directory = root.path().join(if existing { "existing" } else { "new" });
+            if existing {
+                fs::create_dir(&directory).unwrap();
+            }
+            ensure_private_dir(&directory).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(directory)
+                .unwrap();
+            assert!(crate::infra::windows_security::has_user_only_access(&file).unwrap());
+        }
     }
 }

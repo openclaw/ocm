@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -99,6 +99,7 @@ pub struct EnvArchiveOptions {
     pub included_path_roots: BTreeSet<PathBuf>,
     pub excluded_path_roots: BTreeSet<PathBuf>,
     pub snapshot_sqlite_files: bool,
+    pub private_output: bool,
     pub relocate_internal_symlinks: bool,
     pub sqlite_content_roots: BTreeSet<PathBuf>,
 }
@@ -111,6 +112,7 @@ impl Default for EnvArchiveOptions {
             included_path_roots: BTreeSet::new(),
             excluded_path_roots: BTreeSet::new(),
             snapshot_sqlite_files: false,
+            private_output: false,
             relocate_internal_symlinks: false,
             sqlite_content_roots: BTreeSet::new(),
         }
@@ -161,11 +163,68 @@ pub fn write_env_archive_with_options<T: Serialize>(
     metadata: &T,
     source_root: &Path,
     output_path: &Path,
-    options: EnvArchiveOptions,
+    mut options: EnvArchiveOptions,
 ) -> Result<(), String> {
+    let parent = output_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let staged = if options.private_output {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".ocm-export-");
+        #[cfg(target_os = "macos")]
+        let file = builder.make_in(
+            parent,
+            crate::infra::macos_security::create_private_file_new,
+        );
+        #[cfg(windows)]
+        let file = builder.make_in(
+            parent,
+            crate::infra::windows_security::create_private_file_new,
+        );
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let file = builder.tempfile_in(parent);
+        let file = file.map_err(|error| error.to_string())?;
+        // An output requested inside the environment must not capture its own staging file.
+        if let Ok(relative) = file
+            .path()
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+            .strip_prefix(
+                source_root
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+            )
+        {
+            options.excluded_path_roots.insert(relative.to_path_buf());
+        }
+        Some(file)
+    } else {
+        None
+    };
     for attempt in 0..MAX_ENV_ARCHIVE_WRITE_ATTEMPTS {
-        match write_env_archive_attempt(metadata, source_root, output_path, options.clone()) {
-            Ok(()) => return Ok(()),
+        let file = if let Some(staged) = &staged {
+            let mut file = staged
+                .as_file()
+                .try_clone()
+                .map_err(|error| error.to_string())?;
+            file.set_len(0).map_err(|error| error.to_string())?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| error.to_string())?;
+            file
+        } else {
+            File::create(output_path).map_err(|error| error.to_string())?
+        };
+        match write_env_archive_attempt(metadata, source_root, file, options.clone()) {
+            Ok(()) => {
+                if let Some(staged) = staged {
+                    staged
+                        .persist_noclobber(output_path)
+                        .map_err(|error| error.to_string())?;
+                }
+                return Ok(());
+            }
             Err(EnvArchiveWriteError::EntryDisappeared(_))
                 if attempt + 1 < MAX_ENV_ARCHIVE_WRITE_ATTEMPTS => {}
             Err(error) => return Err(error.into_message()),
@@ -177,16 +236,9 @@ pub fn write_env_archive_with_options<T: Serialize>(
 fn write_env_archive_attempt<T: Serialize>(
     metadata: &T,
     source_root: &Path,
-    output_path: &Path,
+    file: File,
     options: EnvArchiveOptions,
 ) -> Result<(), EnvArchiveWriteError> {
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
-    }
-
-    let file = File::create(output_path)
-        .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
     let mut builder = Builder::new(file);
     builder.follow_symlinks(false);
     let mut metadata_raw = serde_json::to_string_pretty(metadata)
@@ -809,6 +861,45 @@ mod tests {
             .query_row("SELECT value FROM records", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "committed");
+    }
+
+    #[test]
+    fn private_archive_excludes_staging_and_preserves_existing_output() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("data"), b"fixture").unwrap();
+        let output = root.path().join("archive.tar");
+        let options = EnvArchiveOptions {
+            private_output: true,
+            ..EnvArchiveOptions::default()
+        };
+        write_env_archive_with_options(
+            &serde_json::json!({}),
+            root.path(),
+            &output,
+            options.clone(),
+        )
+        .unwrap();
+        let original = fs::read(&output).unwrap();
+        let mut archive = tar::Archive::new(fs::File::open(&output).unwrap());
+        let paths: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("meta/env.json"),
+                PathBuf::from("root"),
+                PathBuf::from("root/data")
+            ]
+        );
+        assert!(
+            write_env_archive_with_options(&serde_json::json!({}), root.path(), &output, options)
+                .is_err()
+        );
+        assert_eq!(fs::read(output).unwrap(), original);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
     }
 
     #[test]

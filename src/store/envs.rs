@@ -1076,7 +1076,7 @@ pub fn export_environment(
     };
     let result =
         write_env_archive_with_options(&metadata, &env_paths.root, &output_path, archive_options);
-    if result.is_err() {
+    if result.is_err() && !options.include_state {
         let _ = fs::remove_file(&output_path);
     }
     result?;
@@ -1110,7 +1110,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
     let archive_path = resolve_absolute_path(&options.archive, env, cwd)?;
     let staging_dir = import_staging_dir();
     if path_exists(&staging_dir) {
-        let _ = fs::remove_dir_all(&staging_dir);
+        let _ = super::common::remove_owned_tree(&staging_dir);
     }
 
     let result = (|| {
@@ -1276,13 +1276,21 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 sandbox_port: config_rewrite.sandbox_port,
             }),
             Err(error) => {
-                let _ = fs::remove_dir_all(&target_paths.root);
+                if extracted.metadata.include_state {
+                    if let Err(cleanup) = super::common::remove_owned_tree(&target_paths.root) {
+                        return Err(format!(
+                            "{error}; failed to remove incomplete imported environment: {cleanup}"
+                        ));
+                    }
+                } else {
+                    let _ = fs::remove_dir_all(&target_paths.root);
+                }
                 Err(error)
             }
         }
     })();
 
-    let _ = fs::remove_dir_all(&staging_dir);
+    let _ = super::common::remove_owned_tree(&staging_dir);
     result
 }
 

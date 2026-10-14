@@ -149,6 +149,7 @@ pub(crate) fn openclaw_env_state_archive_options(
         sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
         snapshot_sqlite_files: true,
         relocate_internal_symlinks: true,
+        private_output: true,
         ..EnvArchiveOptions::default()
     })
 }

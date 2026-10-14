@@ -966,7 +966,8 @@ Paths outside the environment root are not exported, detected, or reported;
 absolute paths in file contents may need updating after moving the environment.
 Owned file and directory links use relative targets in the archive; external
 and dangling links retain their targets without copying external contents.
-Import preserves directory permissions and leaves the environment stopped;
+State-inclusive archives are created with private access. Import preserves
+directory permissions and leaves the environment stopped;
 export leaves the source unchanged.
 An explicit `env import --sandbox-origin` still replaces that setting.
 

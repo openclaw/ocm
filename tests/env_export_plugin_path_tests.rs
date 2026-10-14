@@ -227,3 +227,74 @@ fn state_import_preserves_private_directory_modes() {
         b"private state"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn state_import_cleans_readonly_directories_when_an_explicit_override_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TestDir::new("state-import-rollback");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    write_text(
+        &source.join(".openclaw/state/readonly/data"),
+        "retained data",
+    );
+    write_text(&source.join(".openclaw/openclaw.json"), "{ invalid");
+    fs::set_permissions(
+        source.join(".openclaw/state/readonly"),
+        fs::Permissions::from_mode(0o500),
+    )
+    .unwrap();
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "readonly.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    assert_eq!(
+        fs::metadata(root.child("readonly.tar"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "import",
+            "readonly.tar",
+            "--name",
+            "target",
+            "--sandbox-origin",
+            "https://new.example.test",
+        ],
+    );
+    assert!(!import.status.success());
+    assert!(!root.child("ocm-home/envs/target").exists());
+    let retry = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "readonly.tar", "--name", "target"],
+    );
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    let restored = root.child("ocm-home/envs/target/.openclaw/state/readonly");
+    assert_eq!(
+        fs::metadata(&restored).unwrap().permissions().mode() & 0o777,
+        0o500
+    );
+    for directory in [restored, source.join(".openclaw/state/readonly")] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
