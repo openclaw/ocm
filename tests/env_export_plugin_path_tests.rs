@@ -726,6 +726,12 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "fileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string(),
             "apostropheFileUrl":format!("{}'other/plugin.js", url::Url::from_file_path(&source).unwrap()),
             "quotedFileUrl":format!("cat '{}'", url::Url::from_file_path(installed.join("index.js")).unwrap()),
+            "backslashFileUrl":format!("{}\\other/plugin", url::Url::from_file_path(&source).unwrap()),
+            "angleUrlEscape":format!("<{}/a b/../../outside>", url::Url::from_file_path(&source).unwrap()),
+            "spacedLabelUrlEscape":format!("echo \"url = {}/a b/../../outside\"", url::Url::from_file_path(&source).unwrap()),
+            "colonLabelUrlEscape":format!("echo \"url: {}/a b/../../outside\"", url::Url::from_file_path(&source).unwrap()),
+            "uriLeadingProse":format!("{}/plugin please keep these words", url::Url::from_file_path(&source).unwrap()),
+            "encodedRootUrl":format!("{}/plugin?q=alpha%20beta#keep", url::Url::from_file_path(&source).unwrap()).replacen("/source/", "/%73ource/", 1),
             "url":format!("{}/a b/../../outside", url::Url::from_file_path(&source).unwrap()),
             "prefixedUrlEscape":format!("echo \"url={}/a b/../../outside\"", url::Url::from_file_path(&source).unwrap()),
             "quotedUrlEscape":format!("cat '{}/a b/../../outside'", url::Url::from_file_path(&source).unwrap()),
@@ -767,6 +773,20 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         let partial_file = ".openclaw/agents/main/sessions/partial.jsonl";
         let partial = format!("{}\n{{\"unfinished\":", json!({"path": installed}));
         write_text(&source.join(partial_file), &partial);
+        let recovered_file = ".openclaw/agents/main/sessions/recovered.jsonl";
+        let recovered_record = |base: &std::path::Path| {
+            serde_json::json!({"cwd":base.join(".openclaw/workspace")}).to_string()
+        };
+        let broken_record = format!("not-json {}\n", source.display());
+        write_text(
+            &source.join(recovered_file),
+            &format!(
+                "{{\"unfinished\":\n{}\n{}{}\n",
+                recovered_record(&source),
+                broken_record,
+                recovered_record(&source)
+            ),
+        );
         let jsonl_file = ".openclaw/agents/main/sessions/commands.jsonl";
         write_text(
             &source.join(jsonl_file),
@@ -1037,6 +1057,20 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         expected_runtime["prefixedUrl"] = json!(format!("echo \"url={}\"; pwd", expected_url));
         expected_runtime["quotedFileUrl"] = json!(format!("cat '{}'", expected_url));
         expected_runtime["urlCommand"] = json!(format!("open \"{}\"; pwd", expected_url));
+        if cfg!(windows) {
+            expected_runtime["backslashFileUrl"] = json!(format!(
+                "{}\\other/plugin",
+                url::Url::from_file_path(&target).unwrap()
+            ));
+        }
+        expected_runtime["uriLeadingProse"] = json!(format!(
+            "{}/plugin please keep these words",
+            url::Url::from_file_path(&target).unwrap()
+        ));
+        expected_runtime["encodedRootUrl"] = json!(format!(
+            "{}/plugin?q=alpha%20beta#keep",
+            url::Url::from_file_path(&target).unwrap()
+        ));
         expected_runtime["wrappedRootUrl"] =
             json!(format!("<{}>", url::Url::from_file_path(&target).unwrap()));
         expected_runtime["sameLineUrls"] = json!(format!(
@@ -1090,6 +1124,15 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         assert_eq!(
             fs::read_to_string(target.join(".openclaw/logs/root.txt")).unwrap(),
             format!("{}\n", target.display())
+        );
+        assert_eq!(
+            fs::read_to_string(target.join(recovered_file)).unwrap(),
+            format!(
+                "{{\"unfinished\":\n{}\n{}{}\n",
+                recovered_record(&target),
+                broken_record,
+                recovered_record(&target)
+            )
         );
         for line in fs::read_to_string(target.join(jsonl_file)).unwrap().lines() {
             assert_eq!(

@@ -426,7 +426,12 @@ fn rewrite_runtime_state_root_refs_inner(
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let rewritten = rewrite_runtime_root_references(&raw, source_root, target_root)?;
+        let json_lines = matches!(
+            path.extension().and_then(OsStr::to_str),
+            Some("jsonl" | "ndjson")
+        );
+        let rewritten =
+            rewrite_runtime_root_references(&raw, source_root, target_root, json_lines)?;
         if rewritten == raw {
             continue;
         }
@@ -446,14 +451,18 @@ fn rewrite_runtime_root_references(
     raw: &str,
     source_root: &str,
     target_root: &str,
+    json_lines: bool,
 ) -> Result<String, String> {
-    let document = serde_json::from_str::<serde::de::IgnoredAny>(raw);
-    if document.is_ok() {
-        return rewrite_root_reference_value(raw, source_root, target_root);
-    }
-    if document.is_err_and(|error| error.is_eof()) && raw.trim_start().starts_with(['{', '[', '"'])
-    {
-        return Ok(raw.to_string());
+    if !json_lines {
+        let document = serde_json::from_str::<serde::de::IgnoredAny>(raw);
+        if document.is_ok() {
+            return rewrite_root_reference_value(raw, source_root, target_root);
+        }
+        if document.is_err_and(|error| error.is_eof())
+            && raw.trim_start().starts_with(['{', '[', '"'])
+        {
+            return Ok(raw.to_string());
+        }
     }
     // Frame serialized records here, never after decoding a JSON string.
     // Contiguous legacy text remains a whole value, including quoted newlines.
@@ -464,7 +473,7 @@ fn rewrite_runtime_root_references(
         let parsed = serde_json::from_str::<serde::de::IgnoredAny>(line);
         let complete = parsed.is_ok();
         let incomplete = !line.trim().is_empty() && parsed.is_err_and(|error| error.is_eof());
-        if complete || incomplete {
+        if complete || incomplete || json_lines {
             output.push_str(&rewrite_rooted_text(
                 &raw[text_start..offset],
                 source_root,
@@ -567,7 +576,7 @@ fn rewrite_root_reference_value(
                     && serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok()
             })
     {
-        return rewrite_runtime_root_references(raw, source_root, target_root);
+        return rewrite_runtime_root_references(raw, source_root, target_root, true);
     }
     Ok(rewrite_rooted_text(raw, source_root, target_root))
 }
@@ -651,7 +660,7 @@ fn root_comparison(value: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-fn relocate_rooted_path(path: &str, source_root: &str, target_root: &str) -> Option<String> {
+fn rooted_path_suffix<'a>(path: &'a str, source_root: &str) -> Option<&'a str> {
     if path.contains('\0') {
         return None;
     }
@@ -670,6 +679,11 @@ fn relocate_rooted_path(path: &str, source_root: &str, target_root: &str) -> Opt
             _ => depth += 1,
         }
     }
+    Some(suffix)
+}
+
+fn relocate_rooted_path(path: &str, source_root: &str, target_root: &str) -> Option<String> {
+    let suffix = rooted_path_suffix(path, source_root)?;
     Some(format!("{target_root}{suffix}"))
 }
 
@@ -742,14 +756,20 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
             quote_index += 1;
         }
         let enclosing = quoted.get(quote_index).filter(|range| range.start <= start);
-        let enclosing_end = enclosing.map_or(raw.len(), |range| range.end);
+        let quote_end = enclosing.map_or(raw.len(), |range| range.end);
+        let angle_end = raw[..start]
+            .ends_with('<')
+            .then(|| raw[start..quote_end].find('>').map(|offset| start + offset))
+            .flatten();
+        let enclosing_end = angle_end.unwrap_or(quote_end);
         let complete_quoted_url =
             enclosing.is_some_and(|range| {
-                let prefix = &raw[range.start..start];
-                prefix.is_empty()
-                    || (prefix.ends_with('=') && !prefix.chars().any(char::is_whitespace))
+                let prefix = raw[range.start..start].trim();
+                prefix.is_empty() || prefix.ends_with(['=', ':'])
             }) && is_complete_file_url_value(&raw[start..enclosing_end], source_root);
-        let end = if complete_quoted_url {
+        let complete_angle_url = angle_end.is_some()
+            && is_complete_file_url_value(&raw[start..enclosing_end], source_root);
+        let end = if complete_quoted_url || complete_angle_url {
             enclosing_end
         } else {
             raw[start..enclosing_end]
@@ -819,6 +839,39 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     output
 }
 
+fn decoded_uri_byte(bytes: &[u8], offset: &mut usize) -> Option<u8> {
+    let byte = *bytes.get(*offset)?;
+    *offset += 1;
+    if byte == b'%' {
+        if let (Some(high), Some(low)) = (bytes.get(*offset), bytes.get(*offset + 1)) {
+            if let (Some(high), Some(low)) = (
+                char::from(*high).to_digit(16),
+                char::from(*low).to_digit(16),
+            ) {
+                *offset += 2;
+                return Some((high * 16 + low) as u8);
+            }
+        }
+    }
+    Some(byte)
+}
+
+fn uri_path_prefix_length(raw: &str, prefix: &str) -> Option<usize> {
+    let mut offset = 0;
+    let mut expected_offset = 0;
+    while let Some(expected) = decoded_uri_byte(prefix.as_bytes(), &mut expected_offset) {
+        let actual = decoded_uri_byte(raw.as_bytes(), &mut offset)?;
+        if actual != expected
+            && !(cfg!(windows)
+                && std::path::is_separator(char::from(actual))
+                && std::path::is_separator(char::from(expected)))
+        {
+            return None;
+        }
+    }
+    raw.is_char_boundary(offset).then_some(offset)
+}
+
 fn rewrite_file_url(
     value: &str,
     source_root: &str,
@@ -830,21 +883,51 @@ fn rewrite_file_url(
     }
     let url = url::Url::parse(value).ok()?;
     let path = url.to_file_path().ok()?;
+    let source_url = url::Url::from_file_path(source_root).ok()?;
+    let canonical_source = source_url.to_file_path().ok()?;
     let path = path.to_str()?;
-    // Whitespace in free-form text is not evidence that a bare root URL ends
-    // there: it may be the prefix of a sibling containing a space.
+    let canonical_source = canonical_source.to_str()?;
     if !complete_end
-        && root_comparison(path) == root_comparison(source_root)
+        && root_comparison(path) == root_comparison(canonical_source)
         && url.query().is_none()
         && url.fragment().is_none()
     {
         return None;
     }
-    let relocated = relocate_rooted_path(path, source_root, target_root)?;
-    let mut encoded = url::Url::from_file_path(&relocated).ok()?;
-    encoded.set_query(url.query());
-    encoded.set_fragment(url.fragment());
-    Some(encoded.to_string())
+    rooted_path_suffix(path, canonical_source)?;
+    // URL parsing establishes ownership; splice only the encoded root in the
+    // original representation so filenames, query data and surrounding text
+    // retain their bytes instead of being serialized again.
+    let after_scheme = value.get(5..)?;
+    let raw_path = if after_scheme.as_bytes().get(..2).is_some_and(|prefix| {
+        prefix
+            .iter()
+            .all(|byte| std::path::is_separator(char::from(*byte)))
+    }) {
+        let authority = &after_scheme[2..];
+        &authority[authority.find(std::path::is_separator)?..]
+    } else {
+        after_scheme
+    };
+    let source_path =
+        if !raw_path.starts_with(std::path::is_separator) && source_url.host_str().is_none() {
+            source_url.path().strip_prefix('/')?
+        } else {
+            source_url.path()
+        };
+    let prefix_length = uri_path_prefix_length(raw_path, source_path)?;
+    let suffix = &raw_path[prefix_length..];
+    if !suffix.is_empty() && !suffix.starts_with(['?', '#']) {
+        let mut offset = 0;
+        if !std::path::is_separator(char::from(decoded_uri_byte(
+            suffix.as_bytes(),
+            &mut offset,
+        )?)) {
+            return None;
+        }
+    }
+    let destination = url::Url::from_file_path(target_root).ok()?;
+    Some(format!("{destination}{suffix}"))
 }
 
 fn rewrite_path_value(value: &str, source_root: &str, target_root: &str) -> String {
