@@ -62,6 +62,9 @@ jobs:
       - name: Prove missing Unicode environment root isolation
         timeout-minutes: 5
         run: cargo test --locked --test env_root_isolation_tests missing_unicode_
+      - name: Prove imported state path relocation
+        timeout-minutes: 5
+        run: cargo test --locked --test env_export_plugin_path_tests state_import_relocates_plugin_receipts_and_runtime_references_only -- --exact
       - name: Prove private config writes
         run: cargo test --locked --lib private_config_
       - name: Prove private Windows UI handoffs

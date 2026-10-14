@@ -444,6 +444,55 @@ fn rewrite_runtime_root_references(
     source_root: &str,
     target_root: &str,
 ) -> Result<String, String> {
+    let document = serde_json::from_str::<serde::de::IgnoredAny>(raw);
+    if document.is_ok() {
+        return rewrite_root_reference_value(raw, source_root, target_root);
+    }
+    if document.is_err_and(|error| error.is_eof()) && raw.trim_start().starts_with(['{', '[', '"'])
+    {
+        return Ok(raw.to_string());
+    }
+    // Frame serialized records here, never after decoding a JSON string.
+    // Contiguous legacy text remains a whole value, including quoted newlines.
+    let mut output = String::with_capacity(raw.len());
+    let mut text_start = 0;
+    let mut offset = 0;
+    for line in raw.split_inclusive('\n') {
+        let parsed = serde_json::from_str::<serde::de::IgnoredAny>(line);
+        let complete = parsed.is_ok();
+        let incomplete = !line.trim().is_empty() && parsed.is_err_and(|error| error.is_eof());
+        if complete || incomplete {
+            output.push_str(&rewrite_rooted_text(
+                &raw[text_start..offset],
+                source_root,
+                target_root,
+            ));
+            if complete {
+                output.push_str(&rewrite_root_reference_value(
+                    line,
+                    source_root,
+                    target_root,
+                )?);
+            } else {
+                output.push_str(line);
+            }
+            text_start = offset + line.len();
+        }
+        offset += line.len();
+    }
+    output.push_str(&rewrite_rooted_text(
+        &raw[text_start..],
+        source_root,
+        target_root,
+    ));
+    Ok(output)
+}
+
+fn rewrite_root_reference_value(
+    raw: &str,
+    source_root: &str,
+    target_root: &str,
+) -> Result<String, String> {
     if serde_json::from_str::<serde::de::IgnoredAny>(raw).is_ok() {
         // Preserve authored JSON bytes around the relocated strings, including
         // whitespace and escapes. Decoding also handles Windows path separators.
@@ -488,7 +537,7 @@ fn rewrite_runtime_root_references(
                 relocate_rooted_path(&value, source_root, target_root)
                     .unwrap_or_else(|| value.clone())
             } else {
-                rewrite_runtime_root_references(&value, source_root, target_root)?
+                rewrite_root_reference_value(&value, source_root, target_root)?
             };
             if replacement != value {
                 output.push_str(
@@ -502,24 +551,18 @@ fn rewrite_runtime_root_references(
         output.push_str(&raw[cursor..]);
         return Ok(output);
     }
-    // JSONL records stand independently; an interrupted trailing record must
-    // not turn earlier complete records into unescaped raw text.
-    raw.split_inclusive('\n')
-        .map(|line| {
-            let value = line.trim_end_matches(['\r', '\n']);
-            if value.trim().is_empty() {
-                Ok(line.to_string())
-            } else if serde_json::from_str::<serde::de::IgnoredAny>(value).is_ok() {
-                rewrite_runtime_root_references(line, source_root, target_root)
-            } else if serde_json::from_str::<serde::de::IgnoredAny>(value)
-                .is_err_and(|error| error.is_eof())
-            {
-                Ok(line.to_string())
-            } else {
-                Ok(rewrite_rooted_text(value, source_root, target_root) + &line[value.len()..])
-            }
-        })
-        .collect()
+    if raw.contains('\n')
+        && raw
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| {
+                line.trim_start().starts_with(['{', '[', '"'])
+                    && serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok()
+            })
+    {
+        return rewrite_runtime_root_references(raw, source_root, target_root);
+    }
+    Ok(rewrite_rooted_text(raw, source_root, target_root))
 }
 
 fn rewrite_opaque_json_string(
@@ -575,13 +618,7 @@ fn rewrite_opaque_json_string(
             decoded,
             if index < count { "\0" } else { "" }
         );
-        let rewritten: String = guarded
-            .split_inclusive('\n')
-            .map(|line| {
-                let value = line.trim_end_matches(['\r', '\n']);
-                rewrite_rooted_text(value, source_root, target_root) + &line[value.len()..]
-            })
-            .collect();
+        let rewritten = rewrite_rooted_text(&guarded, source_root, target_root);
         let rewritten =
             &rewritten[usize::from(start > 1)..rewritten.len() - usize::from(index < count)];
         if rewritten == decoded {
@@ -630,6 +667,8 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     }
     // File URLs have their own escaping and authority rules. Preserve other URL
     // components and never interpret an external URL as a local command path.
+    let quoted = quoted_value_ranges(raw);
+    let mut quote_index = 0;
     let mut output = String::with_capacity(raw.len());
     let mut cursor = 0;
     for (colon, _) in raw.match_indices(':') {
@@ -650,13 +689,19 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
         {
             continue;
         }
-        let end = if let Some(quote @ ('"' | '\'' | '`')) = raw[..start].chars().next_back() {
-            closing_quote(raw, start, quote).unwrap_or(raw.len())
-        } else {
-            raw[start..]
-                .find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
-                .map_or(raw.len(), |offset| start + offset)
-        };
+        while quoted
+            .get(quote_index)
+            .is_some_and(|range| range.end <= start)
+        {
+            quote_index += 1;
+        }
+        let enclosing_end = quoted
+            .get(quote_index)
+            .filter(|range| range.start <= start)
+            .map_or(raw.len(), |range| range.end);
+        let end = raw[start..enclosing_end]
+            .find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
+            .map_or(enclosing_end, |offset| start + offset);
         output.push_str(&rewrite_path_tokens(
             &raw[cursor..start],
             source_root,
@@ -821,7 +866,7 @@ fn closing_quote(raw: &str, start: usize, quote: char) -> Option<usize> {
     None
 }
 
-fn quoted_path_ranges(raw: &str) -> Vec<std::ops::Range<usize>> {
+fn quoted_value_ranges(raw: &str) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut scan = 0;
     while let Some(offset) = raw[scan..].find(['"', '\'', '`']) {
@@ -829,16 +874,14 @@ fn quoted_path_ranges(raw: &str) -> Vec<std::ops::Range<usize>> {
         let quote = raw[quote_at..].chars().next().unwrap();
         let start = quote_at + quote.len_utf8();
         let end = closing_quote(raw, start, quote).unwrap_or(raw.len());
-        if Path::new(&raw[start..end]).is_absolute() {
-            ranges.push(start..end);
-        }
+        ranges.push(start..end);
         scan = end + usize::from(end < raw.len());
     }
     ranges
 }
 
 fn rewrite_path_tokens(raw: &str, source_root: &str, target_root: &str) -> String {
-    let quoted = quoted_path_ranges(raw);
+    let quoted = quoted_value_ranges(raw);
     let mut candidate_quote = 0;
     let starts: Vec<usize> = raw
         .match_indices(source_root)
@@ -850,9 +893,11 @@ fn rewrite_path_tokens(raw: &str, source_root: &str, target_root: &str) -> Strin
             {
                 candidate_quote += 1;
             }
-            let complete_quoted_root = quoted
+            let enclosing = quoted
                 .get(candidate_quote)
-                .is_some_and(|range| range.start == start && range.end == end);
+                .filter(|range| range.start <= start && range.end >= start + source_root.len());
+            let complete_quoted_root = enclosing.is_some_and(|range| range.end == end);
+            let line_end = enclosing.is_none() && raw[end..].starts_with(['\r', '\n']);
             let before = raw[..start]
                 .chars()
                 .next_back()
@@ -861,45 +906,36 @@ fn rewrite_path_tokens(raw: &str, source_root: &str, target_root: &str) -> Strin
                 .chars()
                 .next()
                 .is_none_or(std::path::is_separator);
-            (before && (after || complete_quoted_root)).then_some(start)
+            (before && (after || complete_quoted_root || line_end)).then_some(start)
         })
         .collect();
     let mut quoted_index = 0;
     let mut output = String::with_capacity(raw.len());
     let mut cursor = 0;
-    let mut skip_until = 0;
     for (index, &start) in starts.iter().enumerate() {
-        if start < skip_until {
-            continue;
-        }
         while quoted
             .get(quoted_index)
             .is_some_and(|range| range.end <= start)
         {
             quoted_index += 1;
         }
-        if let Some(range) = quoted
+        let enclosing = quoted
             .get(quoted_index)
-            .filter(|range| range.start <= start)
-        {
-            skip_until = range.end;
-            if let Some(rewritten) =
-                relocate_rooted_path(&raw[range.clone()], source_root, target_root)
-            {
-                output.push_str(&raw[cursor..range.start]);
-                output.push_str(&rewritten);
-                cursor = range.end;
-            }
-            continue;
-        }
+            .filter(|range| range.start <= start && range.end >= start + source_root.len());
         let end = start + source_root.len();
-        // Each unquoted reference owns only the span before the next one.
-        // Otherwise a long path list repeatedly scans the same remaining text.
+        // Quotes delimit text, which may contain a filename or a command.
+        // Validate each reference through its full quoted suffix (including
+        // whitespace), bounded by the next independently rooted reference.
         let next = starts.get(index + 1).copied().unwrap_or(raw.len());
-        let suffix = raw[end..next]
-            .split(|ch: char| ch.is_whitespace() || "\"'`".contains(ch))
-            .next()
-            .unwrap_or_default();
+        let limit = enclosing.map_or(next, |range| next.min(range.end));
+        let suffix = if enclosing.is_some() {
+            &raw[end..limit]
+        } else {
+            raw[end..limit]
+                .split(|ch: char| ch.is_whitespace() || "\"'`".contains(ch))
+                .next()
+                .unwrap_or_default()
+        };
         if relocate_rooted_path(&raw[start..end + suffix.len()], source_root, target_root).is_none()
         {
             continue;

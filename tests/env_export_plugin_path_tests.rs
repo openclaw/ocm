@@ -708,7 +708,10 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "quotedBackslash":format!("cat '{}/a\\' {}/other", source.display(), source.display()),
             "bracketedLog":format!("[INFO] loaded from {}/plugin", source.display()),
             "quotedEscape":format!("cat '{}/a b/../../outside'", source.display()),
-            "quotedOther":format!("cat '{} a {}/plugin'", external.display(), source.display()),
+            "quotedReferences":format!("paths '{} and {}/plugin'", external.display(), source.display()),
+            "quotedScript":format!("sh -c '{}/run --input {}/input'", source.display(), source.display()),
+            "multilineEscape":format!("cat '{}/a\nb/../../outside'", source.display()),
+            "prefixedUrl":format!("echo \"url={}\"; pwd", url::Url::from_file_path(installed.join("index.js")).unwrap()),
             "urlCommand":format!("open \"{}\"; pwd", url::Url::from_file_path(installed.join("index.js")).unwrap()),
             "encoded":json!({"rootDir":installed}).to_string(),
             "fileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string(),
@@ -775,6 +778,12 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             .unwrap();
             fs::set_permissions(source.join(runtime_file), fs::Permissions::from_mode(0o400))
                 .unwrap();
+        }
+        #[cfg(not(unix))]
+        for file in [&database, &source.join(runtime_file)] {
+            let mut permissions = fs::metadata(file).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(file, permissions).unwrap();
         }
         let export = run_ocm(
             root.path(),
@@ -946,6 +955,16 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             expected_runtime["shell"],
             json!(format!("cd {}; pwd", source.display()))
         );
+        expected_runtime["quotedReferences"] = json!(format!(
+            "paths '{} and {}/plugin'",
+            external.display(),
+            target.display()
+        ));
+        expected_runtime["quotedScript"] = json!(format!(
+            "sh -c '{}/run --input {}/input'",
+            target.display(),
+            target.display()
+        ));
         expected_runtime["quotedBackslash"] = json!(format!(
             "cat '{}/a\\' {}/other",
             target.display(),
@@ -962,6 +981,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             target.display(),
             target.display()
         ));
+        expected_runtime["prefixedUrl"] = json!(format!("echo \"url={}\"; pwd", expected_url));
         expected_runtime["quotedFileUrl"] = json!(format!("cat '{}'", expected_url));
         expected_runtime["urlCommand"] = json!(format!("open \"{}\"; pwd", expected_url));
         expected_runtime["fileUrl"] = json!(expected_url.as_str());
@@ -1052,6 +1072,26 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
                     fs::Permissions::from_mode(0o700),
                 )
                 .unwrap();
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            for file in [
+                target.join(".openclaw/state/openclaw.sqlite"),
+                target.join(runtime_file),
+            ] {
+                assert!(fs::metadata(file).unwrap().permissions().readonly());
+            }
+            drop(db);
+            for base in [target.clone(), root.child("source-offline")] {
+                for file in [
+                    base.join(".openclaw/state/openclaw.sqlite"),
+                    base.join(runtime_file),
+                ] {
+                    let mut permissions = fs::metadata(&file).unwrap().permissions();
+                    permissions.set_readonly(false);
+                    fs::set_permissions(file, permissions).unwrap();
+                }
             }
         }
         let summary: Value = serde_json::from_str(&stdout(&import)).unwrap();
