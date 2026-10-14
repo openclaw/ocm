@@ -1,5 +1,5 @@
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -22,17 +22,28 @@ impl SqliteSnapshot {
     }
 }
 
-pub(crate) fn is_sqlite_database(path: &Path) -> Result<bool, String> {
-    let mut file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.to_string()),
-    };
+pub(crate) fn file_is_sqlite_database(file: &mut File) -> Result<bool, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
     let mut magic = [0_u8; 16];
-    Ok(file.read_exact(&mut magic).is_ok() && &magic == b"SQLite format 3\0")
+    let database = file.read_exact(&mut magic).is_ok() && &magic == b"SQLite format 3\0";
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    Ok(database)
 }
 
 pub(crate) fn create_sqlite_snapshot(source: &Path) -> Result<SqliteSnapshot, String> {
+    create_sqlite_snapshot_with_flags(source, OpenFlags::empty())
+}
+
+pub(crate) fn create_sqlite_snapshot_no_follow(source: &Path) -> Result<SqliteSnapshot, String> {
+    create_sqlite_snapshot_with_flags(source, OpenFlags::SQLITE_OPEN_NOFOLLOW)
+}
+
+fn create_sqlite_snapshot_with_flags(
+    source: &Path,
+    flags: OpenFlags,
+) -> Result<SqliteSnapshot, String> {
     #[cfg(target_os = "macos")]
     let file = tempfile::Builder::new().make(crate::infra::macos_security::create_private_file_new);
     #[cfg(windows)]
@@ -43,14 +54,18 @@ pub(crate) fn create_sqlite_snapshot(source: &Path) -> Result<SqliteSnapshot, St
     let snapshot = SqliteSnapshot {
         file: file.map_err(|error| format!("failed to create private SQLite snapshot: {error}"))?,
     };
-    create_sqlite_snapshot_inner(source, snapshot.path())?;
+    create_sqlite_snapshot_inner(source, snapshot.path(), flags)?;
     Ok(snapshot)
 }
 
-fn create_sqlite_snapshot_inner(source: &Path, target: &Path) -> Result<(), String> {
+fn create_sqlite_snapshot_inner(
+    source: &Path,
+    target: &Path,
+    flags: OpenFlags,
+) -> Result<(), String> {
     let source_db = Connection::open_with_flags(
         source,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | flags,
     )
     .map_err(|error| {
         format!(

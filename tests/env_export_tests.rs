@@ -464,6 +464,7 @@ fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhe
         ".openclaw/custom/data.db",
         ".openclaw/agents/main/sessions/history.sqlite",
         ".openclaw/state/history/run/records.db",
+        "legacy/.openclaw/tmp",
     ];
     let connections: Vec<_> = databases.iter().map(|path| {
         fs::create_dir_all(source.join(path).parent().unwrap()).unwrap();

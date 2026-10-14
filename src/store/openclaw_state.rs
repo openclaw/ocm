@@ -175,7 +175,7 @@ fn should_exclude_state_archive_path(path: &Path, kind: EnvArchiveEntryKind) -> 
                 name,
                 kind == EnvArchiveEntryKind::Directory,
             ))
-        || path.ends_with(".openclaw/tmp")
+        || (kind == EnvArchiveEntryKind::Directory && path.ends_with(".openclaw/tmp"))
 }
 
 #[cfg(test)]

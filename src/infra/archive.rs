@@ -11,13 +11,16 @@ use time::OffsetDateTime;
 use zip::ZipArchive;
 
 use crate::env::{default_service_enabled, default_service_running};
-use crate::infra::sqlite_snapshot::{create_sqlite_snapshot, is_sqlite_database};
+use crate::infra::sqlite_snapshot::{
+    create_sqlite_snapshot, create_sqlite_snapshot_no_follow, file_is_sqlite_database,
+};
 
 pub const ENV_ARCHIVE_METADATA_PATH: &str = "meta/env.json";
 pub const ENV_ARCHIVE_ROOT_DIR: &str = "root";
 const MAX_ENV_ARCHIVE_WRITE_ATTEMPTS: usize = 2;
 const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 
+#[derive(Debug)]
 enum EnvArchiveWriteError {
     EntryDisappeared(String),
     Fatal(String),
@@ -276,6 +279,11 @@ fn append_env_root(
             ))
         })?;
 
+    let capture = if options.sqlite_content_roots.is_empty() {
+        None
+    } else {
+        Some(ArchiveSource::open(source_root)?)
+    };
     let mut stack = sorted_child_paths(source_root)
         .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
     let mut state_databases = BTreeSet::new();
@@ -284,6 +292,7 @@ fn append_env_root(
         classify_sqlite_children(
             &stack,
             source_root,
+            capture.as_ref().unwrap(),
             options,
             &mut state_databases,
             &mut state_sidecars,
@@ -310,18 +319,27 @@ fn append_env_root(
             .sqlite_content_roots
             .iter()
             .any(|root| relative_path.starts_with(root));
-        let state_database = discover_sqlite
-            && metadata.is_file()
-            && (state_databases.contains(&path)
-                || is_sqlite_database(&path).map_err(EnvArchiveWriteError::Fatal)?);
+        let mut captured = if discover_sqlite && metadata.is_file() {
+            Some(capture.as_ref().unwrap().file(relative_path, &metadata)?)
+        } else {
+            None
+        };
+        let state_database = if let Some(captured) = &mut captured {
+            state_databases.contains(&path)
+                || file_is_sqlite_database(&mut captured.file)
+                    .map_err(EnvArchiveWriteError::Fatal)?
+        } else {
+            false
+        };
         if state_database {
             state_sidecars.extend(sqlite_sidecar_paths(&path));
-        } else if discover_sqlite
-            && metadata.is_file()
-            && (state_sidecars.contains(&path)
-                || is_orphan_sqlite_sidecar(&path).map_err(EnvArchiveWriteError::from_entry_io)?)
-        {
-            continue;
+        } else if let Some(captured) = &mut captured {
+            if state_sidecars.contains(&path)
+                || is_orphan_sqlite_sidecar(&path, &mut captured.file)
+                    .map_err(EnvArchiveWriteError::from_entry_io)?
+            {
+                continue;
+            }
         }
         if !discover_sqlite
             && options.snapshot_sqlite_files
@@ -344,6 +362,7 @@ fn append_env_root(
                 classify_sqlite_children(
                     &children,
                     source_root,
+                    capture.as_ref().unwrap(),
                     options,
                     &mut state_databases,
                     &mut state_sidecars,
@@ -358,19 +377,30 @@ fn append_env_root(
                 && options.snapshot_sqlite_files
                 && is_sqlite_database_path(relative_path))
         {
-            let source_metadata = fs::metadata(&path).map_err(|error| {
-                EnvArchiveWriteError::from_entry_io(io_error_with_context(
-                    error,
-                    format!("failed to inspect SQLite database {}", path.display()),
-                ))
-            })?;
+            let source_metadata = captured
+                .as_ref()
+                .map(|captured| captured.file.metadata())
+                .unwrap_or_else(|| fs::metadata(&path))
+                .map_err(|error| {
+                    EnvArchiveWriteError::from_entry_io(io_error_with_context(
+                        error,
+                        format!("failed to inspect SQLite database {}", path.display()),
+                    ))
+                })?;
             if !source_metadata.is_file() {
                 return Err(EnvArchiveWriteError::Fatal(format!(
                     "SQLite archive source is not a regular file: {}",
                     path.display()
                 )));
             }
-            let snapshot = create_sqlite_snapshot(&path).map_err(EnvArchiveWriteError::Fatal)?;
+            let snapshot = if let Some(source) = capture.as_ref().filter(|_| discover_sqlite) {
+                let snapshot = create_sqlite_snapshot_no_follow(&source.root.join(relative_path));
+                // A replaced primary invalidates this attempt, including its sidecar decisions.
+                source.file(relative_path, &source_metadata)?;
+                snapshot.map_err(EnvArchiveWriteError::Fatal)?
+            } else {
+                create_sqlite_snapshot(&path).map_err(EnvArchiveWriteError::Fatal)?
+            };
             let snapshot_metadata = fs::metadata(snapshot.path()).map_err(|error| {
                 EnvArchiveWriteError::Fatal(format!(
                     "failed to inspect SQLite snapshot for {}: {error}",
@@ -398,12 +428,17 @@ fn append_env_root(
             continue;
         }
 
-        if discover_sqlite && metadata.is_file() {
-            let mut file = File::open(&path).map_err(EnvArchiveWriteError::from_entry_io)?;
-            let captured_metadata = file
+        if let Some(mut captured) = captured {
+            let captured_metadata = captured
+                .file
                 .metadata()
                 .map_err(EnvArchiveWriteError::from_entry_io)?;
-            append_bounded_file(builder, &archive_path, &mut file, &captured_metadata)?;
+            append_bounded_file(
+                builder,
+                &archive_path,
+                &mut captured.file,
+                &captured_metadata,
+            )?;
             continue;
         }
 
@@ -431,6 +466,190 @@ fn append_env_root(
     }
 
     Ok(())
+}
+
+struct ArchiveSource {
+    root: PathBuf,
+    #[cfg(unix)]
+    directory: File,
+    #[cfg(windows)]
+    _directories: Vec<File>,
+}
+
+struct CapturedArchiveFile {
+    file: File,
+    #[cfg(windows)]
+    _directories: Vec<File>,
+}
+
+impl ArchiveSource {
+    fn open(root: &Path) -> Result<Self, EnvArchiveWriteError> {
+        let root = root
+            .canonicalize()
+            .map_err(EnvArchiveWriteError::from_entry_io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let directory = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&root)
+                .map_err(EnvArchiveWriteError::from_entry_io)?;
+            Ok(Self { root, directory })
+        }
+        #[cfg(windows)]
+        {
+            let mut directories = Vec::new();
+            let mut path = PathBuf::new();
+            for component in root.components() {
+                path.push(component.as_os_str());
+                if matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                ) {
+                    directories.push(open_archive_windows_entry(&path, true)?);
+                }
+            }
+            Ok(Self {
+                root,
+                _directories: directories,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        Ok(Self { root })
+    }
+
+    fn file(
+        &self,
+        relative: &Path,
+        expected: &fs::Metadata,
+    ) -> Result<CapturedArchiveFile, EnvArchiveWriteError> {
+        let components = relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(name) => Ok(name),
+                _ => Err(EnvArchiveWriteError::Fatal(
+                    "invalid relative archive path".to_string(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some((leaf, parents)) = components.split_last() else {
+            return Err(EnvArchiveWriteError::Fatal(
+                "empty archive file path".to_string(),
+            ));
+        };
+        #[cfg(unix)]
+        let file = {
+            use std::ffi::CString;
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+            let mut file = self
+                .directory
+                .try_clone()
+                .map_err(EnvArchiveWriteError::from_entry_io)?;
+            for (name, directory) in parents
+                .iter()
+                .map(|name| (*name, true))
+                .chain(std::iter::once((*leaf, false)))
+            {
+                let name = CString::new(name.as_bytes())
+                    .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
+                let flags = libc::O_RDONLY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK
+                    | if directory { libc::O_DIRECTORY } else { 0 };
+                let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+                if fd < 0 {
+                    let error = io::Error::last_os_error();
+                    return Err(
+                        if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+                            EnvArchiveWriteError::EntryDisappeared(
+                                "archive source was replaced".to_string(),
+                            )
+                        } else {
+                            EnvArchiveWriteError::from_entry_io(error)
+                        },
+                    );
+                }
+                // Transfer the newly opened descriptor; every component is non-following.
+                file = unsafe { File::from_raw_fd(fd) };
+            }
+            file
+        };
+        #[cfg(windows)]
+        let (file, directories) = {
+            let mut path = self.root.clone();
+            let mut directories = Vec::new();
+            for parent in parents {
+                path.push(parent);
+                directories.push(open_archive_windows_entry(&path, true)?);
+            }
+            path.push(leaf);
+            (open_archive_windows_entry(&path, false)?, directories)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let file =
+            File::open(self.root.join(relative)).map_err(EnvArchiveWriteError::from_entry_io)?;
+        let actual = file
+            .metadata()
+            .map_err(EnvArchiveWriteError::from_entry_io)?;
+        #[cfg(unix)]
+        let same = {
+            use std::os::unix::fs::MetadataExt;
+            actual.dev() == expected.dev() && actual.ino() == expected.ino()
+        };
+        #[cfg(windows)]
+        let same = {
+            use std::os::windows::fs::MetadataExt;
+            actual.creation_time() == expected.creation_time()
+        };
+        #[cfg(not(any(unix, windows)))]
+        let same = actual.created().ok() == expected.created().ok();
+        if !actual.is_file() || !same {
+            return Err(EnvArchiveWriteError::EntryDisappeared(
+                "archive source was replaced".to_string(),
+            ));
+        }
+        Ok(CapturedArchiveFile {
+            file,
+            #[cfg(windows)]
+            _directories: directories,
+        })
+    }
+}
+
+#[cfg(windows)]
+fn open_archive_windows_entry(path: &Path, directory: bool) -> Result<File, EnvArchiveWriteError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let mut options = fs::OpenOptions::new();
+    if directory {
+        options.access_mode(0);
+    } else {
+        options.read(true);
+    }
+    // Denying delete-sharing pins all ancestors and the selected file against replacement.
+    let file = options
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(EnvArchiveWriteError::from_entry_io)?;
+    let metadata = file
+        .metadata()
+        .map_err(EnvArchiveWriteError::from_entry_io)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || (directory && !metadata.is_dir())
+        || (!directory && !metadata.is_file())
+    {
+        return Err(EnvArchiveWriteError::EntryDisappeared(
+            "archive source was replaced".to_string(),
+        ));
+    }
+    Ok(file)
 }
 
 fn append_bounded_file(
@@ -495,6 +714,7 @@ fn owned_archive_link_target(
 fn classify_sqlite_children(
     children: &[PathBuf],
     source_root: &Path,
+    capture: &ArchiveSource,
     options: &EnvArchiveOptions,
     state_databases: &mut BTreeSet<PathBuf>,
     state_sidecars: &mut BTreeSet<PathBuf>,
@@ -510,9 +730,12 @@ fn classify_sqlite_children(
         if options.should_skip(child_relative, env_archive_entry_kind(&child_meta)) {
             continue;
         }
-        if child_meta.is_file() && is_sqlite_database(child).map_err(EnvArchiveWriteError::Fatal)? {
-            state_databases.insert(child.clone());
-            state_sidecars.extend(sqlite_sidecar_paths(child));
+        if child_meta.is_file() {
+            let mut captured = capture.file(child_relative, &child_meta)?;
+            if file_is_sqlite_database(&mut captured.file).map_err(EnvArchiveWriteError::Fatal)? {
+                state_databases.insert(child.clone());
+                state_sidecars.extend(sqlite_sidecar_paths(child));
+            }
         }
     }
     Ok(())
@@ -533,12 +756,13 @@ fn sqlite_sidecar_suffix(path: &Path) -> Option<&'static str> {
         .find(|suffix| name.ends_with(suffix.as_bytes()))
 }
 
-fn is_orphan_sqlite_sidecar(path: &Path) -> io::Result<bool> {
+fn is_orphan_sqlite_sidecar(path: &Path, file: &mut File) -> io::Result<bool> {
     let Some(suffix) = sqlite_sidecar_suffix(path) else {
         return Ok(false);
     };
     let mut header = Vec::new();
-    File::open(path)?.take(96).read_to_end(&mut header)?;
+    (&mut *file).take(96).read_to_end(&mut header)?;
+    file.seek(SeekFrom::Start(0))?;
     // SQLite's WAL/journal magic and duplicated wal-index header distinguish
     // orphaned process files from durable payloads with sidecar-like names.
     Ok(match suffix {
@@ -892,6 +1116,57 @@ mod tests {
             .query_row("SELECT value FROM records", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "committed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_file_rejects_leaf_and_parent_symlink_replacements() {
+        use std::io::Read;
+        for parent in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            let outside = root.path().join("outside");
+            fs::create_dir_all(home.join("data")).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(home.join("data/config"), b"owned").unwrap();
+            fs::write(outside.join("config"), b"external").unwrap();
+            let source = super::ArchiveSource::open(&home).unwrap();
+            let observed = fs::symlink_metadata(home.join("data/config")).unwrap();
+            let mut captured = source.file(Path::new("data/config"), &observed).unwrap();
+            if parent {
+                fs::rename(home.join("data"), home.join("saved")).unwrap();
+                std::os::unix::fs::symlink(&outside, home.join("data")).unwrap();
+            } else {
+                fs::rename(home.join("data/config"), home.join("data/saved")).unwrap();
+                std::os::unix::fs::symlink(outside.join("config"), home.join("data/config"))
+                    .unwrap();
+            }
+            let mut bytes = Vec::new();
+            captured.file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"owned");
+            assert!(matches!(
+                source.file(Path::new("data/config"), &observed),
+                Err(super::EnvArchiveWriteError::EntryDisappeared(_))
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_config_archive_capture_pins_its_file_and_parents() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join("data")).unwrap();
+        let path = home.join("data/config");
+        fs::write(&path, b"owned").unwrap();
+        let source = super::ArchiveSource::open(&home).unwrap();
+        let observed = fs::symlink_metadata(&path).unwrap();
+        let captured = source.file(Path::new("data/config"), &observed).unwrap();
+        assert!(fs::rename(&path, home.join("renamed")).is_err());
+        assert!(fs::rename(home.join("data"), home.join("renamed-dir")).is_err());
+        drop(captured);
+        drop(source);
+        fs::rename(&path, home.join("renamed")).unwrap();
     }
 
     #[test]
