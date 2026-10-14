@@ -1389,7 +1389,7 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
     assert!(release.contains("cargo build --locked --release"));
     assert!(
         release.contains(
-            "Apple-Actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466"
+            "Apple-Actions/import-codesign-certs@77ba2a2a8f5cfc8c405ebf3159f767c323e238f9"
         )
     );
     assert!(release.contains("secrets.APPSTORE_CERTIFICATES_FILE_BASE64"));
