@@ -390,10 +390,13 @@ fn rewrite_runtime_state_root_refs_inner(
         return Ok(());
     }
 
-    let entries = fs::read_dir(root).map_err(|error| error.to_string())?;
-    for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path();
+    // DirEntry can retain its ReadDir handle. Collect paths before recursing.
+    let paths = fs::read_dir(root)
+        .map_err(|error| error.to_string())?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for path in paths {
         if path == config_path || workspaces.contains(&path) {
             continue;
         }
@@ -531,11 +534,15 @@ fn rewrite_root_reference_value(
             if is_key {
                 previous_key = Some(value.clone());
             }
-            let replacement = if path_value && Path::new(&value).is_absolute() {
+            let replacement = if path_value
+                && (Path::new(&value).is_absolute()
+                    || value
+                        .get(..5)
+                        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:")))
+            {
                 // A JSON path is one filename; whitespace is not an argument
                 // separator, including escaped newlines within that filename.
-                relocate_rooted_path(&value, source_root, target_root)
-                    .unwrap_or_else(|| value.clone())
+                rewrite_path_value(&value, source_root, target_root)
             } else {
                 rewrite_root_reference_value(&value, source_root, target_root)?
             };
@@ -671,12 +678,6 @@ fn reference_boundary(ch: char) -> bool {
 }
 
 fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> String {
-    if raw
-        .get(..5)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
-    {
-        return rewrite_file_url(raw, source_root, target_root).unwrap_or_else(|| raw.to_string());
-    }
     // File URLs have their own escaping and authority rules. Preserve other URL
     // components and never interpret an external URL as a local command path.
     let quoted = quoted_value_ranges(raw);
@@ -714,7 +715,12 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
             .find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
             .map_or(enclosing_end, |offset| start + offset);
         let range = start..end;
-        if let Some(relocated) = rewrite_file_url(&raw[range.clone()], source_root, target_root) {
+        if let Some(relocated) = rewrite_file_url(
+            &raw[range.clone()],
+            source_root,
+            target_root,
+            end == enclosing_end || raw[end..].starts_with(['>', '\r', '\n']),
+        ) {
             edits.push((range.clone(), relocated));
         }
         urls.push(range);
@@ -769,13 +775,28 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     output
 }
 
-fn rewrite_file_url(value: &str, source_root: &str, target_root: &str) -> Option<String> {
-    if value.contains('\0') {
+fn rewrite_file_url(
+    value: &str,
+    source_root: &str,
+    target_root: &str,
+    complete_end: bool,
+) -> Option<String> {
+    if value.chars().any(char::is_control) {
         return None;
     }
     let url = url::Url::parse(value).ok()?;
     let path = url.to_file_path().ok()?;
-    let relocated = relocate_rooted_path(path.to_str()?, source_root, target_root)?;
+    let path = path.to_str()?;
+    // Whitespace in free-form text is not evidence that a bare root URL ends
+    // there: it may be the prefix of a sibling containing a space.
+    if !complete_end
+        && root_comparison(path) == root_comparison(source_root)
+        && url.query().is_none()
+        && url.fragment().is_none()
+    {
+        return None;
+    }
+    let relocated = relocate_rooted_path(path, source_root, target_root)?;
     let mut encoded = url::Url::from_file_path(&relocated).ok()?;
     encoded.set_query(url.query());
     encoded.set_fragment(url.fragment());
@@ -784,7 +805,7 @@ fn rewrite_file_url(value: &str, source_root: &str, target_root: &str) -> Option
 
 fn rewrite_path_value(value: &str, source_root: &str, target_root: &str) -> String {
     relocate_rooted_path(value, source_root, target_root)
-        .or_else(|| rewrite_file_url(value, source_root, target_root))
+        .or_else(|| rewrite_file_url(value, source_root, target_root, true))
         .unwrap_or_else(|| value.to_string())
 }
 
@@ -2139,7 +2160,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                rewrite_file_url(original, source, target).as_deref(),
+                rewrite_file_url(original, source, target, true).as_deref(),
                 Some(expected)
             );
         }

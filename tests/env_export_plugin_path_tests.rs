@@ -718,6 +718,9 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "fileUrl":url::Url::from_file_path(installed.join("index.js")).unwrap().to_string(),
             "apostropheFileUrl":format!("{}'other/plugin.js", url::Url::from_file_path(&source).unwrap()),
             "quotedFileUrl":format!("cat '{}'", url::Url::from_file_path(installed.join("index.js")).unwrap()),
+            "quotedSpacedFileUrl":format!("cat '{} other/plugin.js'", url::Url::from_file_path(&source).unwrap()),
+            "rootUrls":format!("{}\n{}", url::Url::from_file_path(&source).unwrap(), url::Url::from_file_path(&source).unwrap()),
+            "multipleUrls":format!("{}/first\n{}/second", url::Url::from_file_path(&source).unwrap(), url::Url::from_file_path(&source).unwrap()),
             "spacedFileUrl":format!("{} other/plugin.js", url::Url::from_file_path(&source).unwrap()),
             "mixedUrlAndPath":format!("echo \"url={} {}/a b/../../outside\"", url::Url::from_file_path(installed.join("index.js")).unwrap(), source.display()),
             "externalFileUrl":format!("{};other/plugin.js", url::Url::from_file_path(&source).unwrap()),
@@ -1020,6 +1023,16 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         expected_runtime["prefixedUrl"] = json!(format!("echo \"url={}\"; pwd", expected_url));
         expected_runtime["quotedFileUrl"] = json!(format!("cat '{}'", expected_url));
         expected_runtime["urlCommand"] = json!(format!("open \"{}\"; pwd", expected_url));
+        expected_runtime["rootUrls"] = json!(format!(
+            "{}\n{}",
+            url::Url::from_file_path(&target).unwrap(),
+            url::Url::from_file_path(&target).unwrap()
+        ));
+        expected_runtime["multipleUrls"] = json!(format!(
+            "{}/first\n{}/second",
+            url::Url::from_file_path(&target).unwrap(),
+            url::Url::from_file_path(&target).unwrap()
+        ));
         expected_runtime["fileUrl"] = json!(expected_url.as_str());
         expected_runtime["upperFileUrl"] = json!(expected_url.as_str());
         expected_runtime["shortFileUrl"] = json!(expected_url.as_str());
@@ -1242,5 +1255,61 @@ fn state_import_refuses_a_receipt_conflict_without_replacing_other_rows() {
         !run_ocm(root.path(), &env, &["env", "show", "copy"])
             .status
             .success()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn state_import_bounds_directory_handles_for_deep_runtime_state() {
+    let root = TestDir::new("state-import-deep-runtime");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    let target = root.child("ocm-home/envs/copy");
+    let relative: std::path::PathBuf = std::iter::once(".openclaw/agents/main/sessions")
+        .chain(std::iter::repeat_n("d", 96))
+        .collect();
+    write_text(
+        &source.join(&relative).join("path.json"),
+        &serde_json::json!({"cwd": source.join(".openclaw/workspace")}).to_string(),
+    );
+    write_text(
+        &source.join(&relative).join("notes.txt"),
+        "unchanged payload\n",
+    );
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "deep.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", "ulimit -n 64 && exec \"$@\"", "import-limit"])
+        .arg(support::ocm_test_binary_path())
+        .args(["env", "import", "deep.tar", "--name", "copy"])
+        .current_dir(root.path())
+        .env_clear()
+        .envs(&env)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let actual: serde_json::Value =
+        serde_json::from_slice(&fs::read(target.join(&relative).join("path.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        actual["cwd"],
+        serde_json::json!(target.join(".openclaw/workspace"))
+    );
+    assert_eq!(
+        fs::read_to_string(target.join(&relative).join("notes.txt")).unwrap(),
+        "unchanged payload\n"
     );
 }
