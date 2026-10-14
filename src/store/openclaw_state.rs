@@ -839,11 +839,36 @@ fn quoted_path_ranges(raw: &str) -> Vec<std::ops::Range<usize>> {
 
 fn rewrite_path_tokens(raw: &str, source_root: &str, target_root: &str) -> String {
     let quoted = quoted_path_ranges(raw);
+    let mut candidate_quote = 0;
+    let starts: Vec<usize> = raw
+        .match_indices(source_root)
+        .filter_map(|(start, _)| {
+            let end = start + source_root.len();
+            while quoted
+                .get(candidate_quote)
+                .is_some_and(|range| range.end <= start)
+            {
+                candidate_quote += 1;
+            }
+            let complete_quoted_root = quoted
+                .get(candidate_quote)
+                .is_some_and(|range| range.start == start && range.end == end);
+            let before = raw[..start]
+                .chars()
+                .next_back()
+                .is_none_or(reference_boundary);
+            let after = raw[end..]
+                .chars()
+                .next()
+                .is_none_or(std::path::is_separator);
+            (before && (after || complete_quoted_root)).then_some(start)
+        })
+        .collect();
     let mut quoted_index = 0;
     let mut output = String::with_capacity(raw.len());
     let mut cursor = 0;
     let mut skip_until = 0;
-    for (start, _) in raw.match_indices(source_root) {
+    for (index, &start) in starts.iter().enumerate() {
         if start < skip_until {
             continue;
         }
@@ -868,18 +893,10 @@ fn rewrite_path_tokens(raw: &str, source_root: &str, target_root: &str) -> Strin
             continue;
         }
         let end = start + source_root.len();
-        if raw[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|ch| !reference_boundary(ch))
-            || raw[end..]
-                .chars()
-                .next()
-                .is_some_and(|ch| !std::path::is_separator(ch))
-        {
-            continue;
-        }
-        let suffix = raw[end..]
+        // Each unquoted reference owns only the span before the next one.
+        // Otherwise a long path list repeatedly scans the same remaining text.
+        let next = starts.get(index + 1).copied().unwrap_or(raw.len());
+        let suffix = raw[end..next]
             .split(|ch: char| ch.is_whitespace() || "\"'`".contains(ch))
             .next()
             .unwrap_or_default();
