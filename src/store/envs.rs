@@ -1129,6 +1129,13 @@ pub(crate) fn import_environment_with_sandbox_origin(
             ));
         }
 
+        if extracted.metadata.include_state {
+            crate::infra::archive::restore_env_archive_directory_permissions(
+                &archive_path,
+                &staging_dir,
+            )?;
+        }
+
         let source_name = extracted.metadata.env.name.clone();
         let name = if let Some(name) = options.name.as_deref() {
             validate_name(name, "Environment name")?

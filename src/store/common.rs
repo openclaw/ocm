@@ -208,14 +208,14 @@ pub(crate) fn try_lock_file_shared(
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, false)
+    copy_dir_recursive_inner(source, destination, None, None)
 }
 
 pub(crate) fn copy_dir_preserving_permissions(
     source: &Path,
     destination: &Path,
 ) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, true)
+    copy_dir_recursive_inner(source, destination, None, Some(destination))
 }
 
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), String> {
@@ -313,7 +313,7 @@ impl<'a> OpenClawDirectoryCopy<'a> {
     }
 
     pub(crate) fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), String> {
-        copy_dir_recursive_inner(source, destination, Some(self), false)
+        copy_dir_recursive_inner(source, destination, Some(self), None)
     }
 }
 
@@ -321,9 +321,9 @@ fn copy_dir_recursive_inner(
     source: &Path,
     destination: &Path,
     mut copying: Option<&mut OpenClawDirectoryCopy<'_>>,
-    preserve_permissions: bool,
+    private_root: Option<&Path>,
 ) -> Result<(), String> {
-    if preserve_permissions {
+    if private_root.is_some() {
         ensure_private_dir(destination)?;
     } else {
         ensure_dir(destination)?;
@@ -414,12 +414,12 @@ fn copy_dir_recursive_inner(
                 &source_path,
                 &destination_path,
                 copying.as_deref_mut(),
-                preserve_permissions,
+                private_root,
             )?;
         }
     }
 
-    if preserve_permissions {
+    if private_root.is_some_and(|root| root != destination) {
         // Restore nested modes before exposing the containing directory.
         let permissions = fs::metadata(source)
             .map_err(|error| error.to_string())?
@@ -442,14 +442,14 @@ pub(crate) fn copy_path_recursive(source: &Path, destination: &Path) -> Result<(
 }
 
 pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_path_inner(source, destination, None, false)
+    copy_path_inner(source, destination, None, None)
 }
 
 fn copy_path_inner(
     source: &Path,
     destination: &Path,
     copying: Option<&mut OpenClawDirectoryCopy<'_>>,
-    preserve_permissions: bool,
+    private_root: Option<&Path>,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     let file_type = metadata.file_type();
@@ -458,7 +458,7 @@ fn copy_path_inner(
         return copy_symlink(source, destination);
     }
     if file_type.is_dir() {
-        return copy_dir_recursive_inner(source, destination, copying, preserve_permissions);
+        return copy_dir_recursive_inner(source, destination, copying, private_root);
     }
     #[cfg(unix)]
     if file_type.is_socket() {
@@ -966,7 +966,10 @@ mod archive_privacy_windows_tests {
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
                 .open(directory)
                 .unwrap();
-            assert!(crate::infra::windows_security::has_user_only_access(&file).unwrap());
+            assert!(
+                crate::infra::windows_security::has_user_only_access(&file).unwrap(),
+                "existing directory: {existing}"
+            );
         }
     }
 }

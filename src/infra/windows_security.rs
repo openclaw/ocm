@@ -93,7 +93,7 @@ pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
     use windows_sys::Win32::Security::{
         PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity,
     };
-    use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, WRITE_DAC};
+    use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, WRITE_DAC, WRITE_OWNER};
     let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
     if encoded.contains(&0) {
         return Err(io::Error::new(
@@ -112,7 +112,7 @@ pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
             return Err(error);
         }
         let directory = OpenOptions::new()
-            .access_mode(READ_CONTROL | WRITE_DAC)
+            .access_mode(READ_CONTROL | WRITE_DAC | WRITE_OWNER)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)?;
@@ -126,7 +126,9 @@ pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
         if unsafe {
             SetKernelObjectSecurity(
                 directory.as_raw_handle(),
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION
+                    | OWNER_SECURITY_INFORMATION,
                 attributes.lpSecurityDescriptor,
             )
         } == 0

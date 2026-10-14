@@ -188,7 +188,13 @@ fn state_import_preserves_private_directory_modes() {
         &source.join(".openclaw/state/private/data"),
         "private state",
     );
-    for path in ["", ".openclaw/state", ".openclaw/state/private"] {
+    write_text(&source.join(".openclaw/state/shared/data"), "shared data");
+    fs::set_permissions(
+        source.join(".openclaw/state/shared"),
+        fs::Permissions::from_mode(0o1777),
+    )
+    .unwrap();
+    for path in [".openclaw/state", ".openclaw/state/private"] {
         fs::set_permissions(source.join(path), fs::Permissions::from_mode(0o700)).unwrap();
     }
     let export = run_ocm(
@@ -225,6 +231,14 @@ fn state_import_preserves_private_directory_modes() {
     assert_eq!(
         fs::read(target.join(".openclaw/state/private/data")).unwrap(),
         b"private state"
+    );
+    assert_eq!(
+        fs::metadata(target.join(".openclaw/state/shared"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o1777
     );
 }
 

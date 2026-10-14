@@ -551,8 +551,10 @@ absolute paths in file contents may need updating after moving the environment.
 Owned file and directory links use relative targets in the archive; external
 and dangling links retain their targets without copying external contents.
 State-inclusive archives are created with private access. Import preserves
-directory permissions and leaves the environment stopped;
+directory modes under a private environment root and leaves it stopped;
 export leaves the source unchanged.
+Archive ownership and extended ACLs are not transferred; the private root
+prevents broader access when those restrictions cannot be reproduced.
 An explicit `env import --sandbox-origin` still replaces that setting.
 
 JSON reports `includeState`; the human summary also reports whether state was

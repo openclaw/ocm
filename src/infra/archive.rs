@@ -672,6 +672,37 @@ pub fn extract_env_archive<T: DeserializeOwned>(
     Ok(ExtractedEnvArchive { metadata, root_dir })
 }
 
+pub(crate) fn restore_env_archive_directory_permissions(
+    archive_path: &Path,
+    staging_dir: &Path,
+) -> Result<(), String> {
+    let file = File::open(archive_path).map_err(|error| error.to_string())?;
+    let mut archive = Archive::new(file);
+    // Seek over payloads: only directory headers need a second pass. Use tar's
+    // containment checks, and never enable special permission bits on files.
+    for entry in archive
+        .entries_with_seek()
+        .map_err(|error| error.to_string())?
+    {
+        let mut entry = entry.map_err(|error| error.to_string())?;
+        if entry.header().entry_type().is_dir()
+            && entry
+                .path()
+                .map_err(|error| error.to_string())?
+                .starts_with(ENV_ARCHIVE_ROOT_DIR)
+        {
+            entry.set_preserve_permissions(true);
+            if !entry
+                .unpack_in(staging_dir)
+                .map_err(|error| error.to_string())?
+            {
+                return Err("archive directory escaped staging".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn extract_tar_gz(archive_path: &Path, destination_dir: &Path) -> Result<(), String> {
     fs::create_dir_all(destination_dir).map_err(|error| error.to_string())?;
 
