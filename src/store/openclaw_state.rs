@@ -570,6 +570,10 @@ fn rewrite_root_reference_value(
     if raw.contains('\n')
         && raw
             .lines()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok())
+        && raw
+            .lines()
             .find(|line| !line.trim().is_empty())
             .is_some_and(|line| {
                 line.trim_start().starts_with(['{', '[', '"'])
@@ -660,7 +664,7 @@ fn root_comparison(value: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-fn rooted_path_suffix<'a>(path: &'a str, source_root: &str) -> Option<&'a str> {
+fn rooted_path_suffix<'a>(path: &'a str, source_root: &str) -> Option<std::borrow::Cow<'a, str>> {
     if path.contains('\0') {
         return None;
     }
@@ -675,11 +679,26 @@ fn rooted_path_suffix<'a>(path: &'a str, source_root: &str) -> Option<&'a str> {
     for component in suffix.split(std::path::is_separator) {
         match component {
             "" | "." => {}
-            ".." => depth = depth.checked_sub(1)?,
+            ".." => {
+                if let Some(parent) = depth.checked_sub(1) {
+                    depth = parent;
+                } else {
+                    let normalized = clean_path(Path::new(path));
+                    let root = clean_path(Path::new(source_root));
+                    let relative = normalized.strip_prefix(root).ok()?;
+                    return Some(std::borrow::Cow::Owned(
+                        if relative.as_os_str().is_empty() {
+                            String::new()
+                        } else {
+                            format!("{}{}", std::path::MAIN_SEPARATOR, display_path(relative))
+                        },
+                    ));
+                }
+            }
             _ => depth += 1,
         }
     }
-    Some(suffix)
+    Some(std::borrow::Cow::Borrowed(suffix))
 }
 
 fn relocate_rooted_path(path: &str, source_root: &str, target_root: &str) -> Option<String> {
@@ -743,6 +762,27 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     let mut urls = Vec::new();
     let mut edits = Vec::new();
     let starts: Vec<_> = file_url_starts(raw).collect();
+    let comparison = root_comparison(raw);
+    let source_comparison = root_comparison(source_root);
+    let mut boundaries = starts.clone();
+    boundaries.extend(
+        comparison
+            .match_indices(source_comparison.as_ref())
+            .filter_map(|(start, _)| {
+                let end = start + source_root.len();
+                (raw[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(reference_boundary)
+                    && raw[end..]
+                        .chars()
+                        .next()
+                        .is_none_or(std::path::is_separator))
+                .then_some(start)
+            }),
+    );
+    boundaries.sort_unstable();
+    boundaries.dedup();
     let line_ends: Vec<_> = raw
         .match_indices(['\r', '\n'])
         .map(|(offset, _)| offset)
@@ -786,8 +826,8 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
         if let Some(space) =
             raw[start..enclosing_end].find(|ch: char| ch.is_whitespace() || "<>".contains(ch))
         {
-            let after_space = starts.partition_point(|offset| *offset <= start + space);
-            if let Some(&next) = starts
+            let after_space = boundaries.partition_point(|offset| *offset <= start + space);
+            if let Some(&next) = boundaries
                 .get(after_space)
                 .filter(|offset| **offset < enclosing_end)
             {

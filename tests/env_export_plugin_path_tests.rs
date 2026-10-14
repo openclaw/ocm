@@ -604,7 +604,9 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             .join("plugin");
         write_text(&installed.join("index.js"), "export default {};\n");
         write_text(&package.join("package.json"), "{\"name\":\"demo\"}\n");
+        let reentered = source.join("../source/plugin");
         let records = json!({
+            "reentered": {"source":"npm", "installPath":reentered},
             "demo": {"source":"path", "installPath":installed, "sourcePath":package,
                 "version":"1.0.0", "integrity":"unchanged", "unknown":{"enabled":true,"path":source.join("historical-reference")}},
             "external": {"source":"path", "installPath":external, "sourcePath":external},
@@ -620,7 +622,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "manifestPath": installed.join("openclaw.plugin.json"),
             "packageJson": {"path": installed.join("package.json"),
                 "fileSignature": {"mtimeMs": "PRECISE_TIMESTAMP"}}
-        }]);
+        }, {"id":"reentered", "rootDir":reentered}]);
         let plugins_raw = plugins
             .to_string()
             .replace("\"PRECISE_TIMESTAMP\"", "1791960884534.1313");
@@ -723,6 +725,8 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         let url_cases = json!({
             "apostropheProseSibling":format!("Don't open {}'other/plugin", source.display()),
             "apostropheProseUriSibling":format!("Don't open {}'other/plugin", url::Url::from_file_path(&source).unwrap()),
+            "decodedIncompleteProse":format!("{{}}\n\"node {}/plugin", source.display()),
+            "mixedUrlAndPlainEscape":format!("{}/a b/../../outside {}/plugin", url::Url::from_file_path(&source).unwrap(), source.display()),
             "decodedProse":format!("{{}}\n{}/plugin", source.display()),
             "multipleUrlEscape":format!("{}/a b/../../outside\n{}/plugin", url::Url::from_file_path(&source).unwrap(), url::Url::from_file_path(&source).unwrap()),
             "sameLineUrlEscape":format!("{}/a b/../../outside {}/plugin", url::Url::from_file_path(&source).unwrap(), url::Url::from_file_path(&source).unwrap()),
@@ -895,11 +899,13 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         } else {
             &mut expected["index"]["installRecords"]
         };
+        expected_records["reentered"]["installPath"] = json!(target.join("plugin"));
         expected_records["demo"]["installPath"] = json!(target.join(".openclaw/extensions/demo"));
         expected_records["demo"]["sourcePath"] = json!(target.join("packages/demo"));
         expected_records["missing"]["installPath"] =
             json!(target.join(".openclaw/extensions/missing"));
         if !legacy {
+            expected["index"]["plugins"][1]["rootDir"] = json!(target.join("plugin"));
             expected["index"]["plugins"][0]["rootDir"] =
                 json!(target.join(".openclaw/extensions/demo"));
             expected["index"]["plugins"][0]["source"] =
@@ -924,16 +930,23 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         let target_encoded = &target_encoded[1..target_encoded.len() - 1];
         assert_eq!(
             raw.replace(target_encoded, source_encoded),
-            original_document
+            original_document.replace(
+                &serde_json::to_string(&reentered).unwrap(),
+                &serde_json::to_string(&source.join("plugin")).unwrap()
+            )
         );
         if legacy {
             let stored_plugins: String = db.query_row("SELECT plugins_json FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get(0)).unwrap();
             assert_eq!(
                 stored_plugins.replace(target_encoded, source_encoded),
-                plugins_raw
+                plugins_raw.replace(
+                    &serde_json::to_string(&reentered).unwrap(),
+                    &serde_json::to_string(&source.join("plugin")).unwrap()
+                )
             );
             assert!(stored_plugins.contains("1791960884534.1313"));
             let parsed: Value = serde_json::from_str(&stored_plugins).unwrap();
+            assert_eq!(parsed[1]["rootDir"], json!(target.join("plugin")));
             assert_eq!(
                 parsed[0]["rootDir"],
                 json!(target.join(".openclaw/extensions/demo"))
@@ -1068,6 +1081,13 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         expected_runtime["prefixedUrl"] = json!(format!("echo \"url={}\"; pwd", expected_url));
         expected_runtime["quotedFileUrl"] = json!(format!("cat '{}'", expected_url));
         expected_runtime["urlCommand"] = json!(format!("open \"{}\"; pwd", expected_url));
+        expected_runtime["decodedIncompleteProse"] =
+            json!(format!("{{}}\n\"node {}/plugin", target.display()));
+        expected_runtime["mixedUrlAndPlainEscape"] = json!(format!(
+            "{}/a b/../../outside {}/plugin",
+            url::Url::from_file_path(&source).unwrap(),
+            target.display()
+        ));
         expected_runtime["decodedProse"] = json!(format!("{{}}\n{}/plugin", target.display()));
         expected_runtime["multipleUrlEscape"] = json!(format!(
             "{}/a b/../../outside\n{}/plugin",
