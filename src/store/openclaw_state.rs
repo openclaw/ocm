@@ -443,20 +443,12 @@ fn rewrite_runtime_state_root_refs_inner(
     Ok(())
 }
 
-fn archive_relative_path<'a>(path: &'a Path, source_root: &Path) -> Option<&'a Path> {
-    let relative = path.strip_prefix(source_root).ok()?;
-    relative
-        .components()
-        .all(|part| matches!(part, Component::CurDir | Component::Normal(_)))
-        .then_some(relative)
-}
-
 fn rewrite_archived_root_references(
     raw: &str,
     source_root: &str,
     target_root: &str,
 ) -> Result<String, String> {
-    if serde_json::from_str::<Value>(raw).is_ok() {
+    if serde_json::from_str::<serde::de::IgnoredAny>(raw).is_ok() {
         // Preserve authored JSON bytes around the relocated strings, including
         // whitespace and escapes. Decoding also handles Windows path separators.
         let mut output = String::with_capacity(raw.len());
@@ -471,9 +463,8 @@ fn rewrite_archived_root_references(
                 .expect("JSON string begins at quote")
                 .map_err(|error| error.to_string())?;
             let end = start + strings.byte_offset();
-            if let Some(relative) = archive_relative_path(Path::new(&value), Path::new(source_root))
-            {
-                let replacement = display_path(&Path::new(target_root).join(relative));
+            let replacement = rewrite_archived_root_references(&value, source_root, target_root)?;
+            if replacement != value {
                 output.push_str(
                     &serde_json::to_string(&replacement).map_err(|error| error.to_string())?,
                 );
@@ -488,7 +479,7 @@ fn rewrite_archived_root_references(
     if raw
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .all(|line| serde_json::from_str::<Value>(line).is_ok())
+        .all(|line| serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok())
     {
         return raw
             .split_inclusive('\n')
@@ -501,6 +492,10 @@ fn rewrite_archived_root_references(
             })
             .collect();
     }
+    Ok(rewrite_rooted_text(raw, source_root, target_root))
+}
+
+fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> String {
     // Legacy runtime text contains paths in logs and key/value records. Match a
     // complete root at a token boundary, not a sibling or embedded path prefix.
     let delimiter = |ch: char| ch.is_whitespace() || "\"'`=([{,:;<>)]}".contains(ch);
@@ -510,7 +505,8 @@ fn rewrite_archived_root_references(
         let end = start + source_root.len();
         let before = raw[..start].chars().next_back();
         let after = raw[end..].chars().next();
-        if before.is_some_and(|ch| !delimiter(ch))
+        if (start == 0 && after.is_some_and(|ch| ch != '/' && ch != '\\'))
+            || before.is_some_and(|ch| !delimiter(ch))
             || after.is_some_and(|ch| ch != '/' && ch != '\\' && !delimiter(ch))
         {
             continue;
@@ -524,7 +520,7 @@ fn rewrite_archived_root_references(
         cursor = end;
     }
     output.push_str(&raw[cursor..]);
-    Ok(output)
+    output
 }
 
 fn with_owner_write_permission<T>(
@@ -765,19 +761,103 @@ fn relocate_plugin_records_in_database(
         )
     };
 
-    let Some(raw_records) = connection
-        .query_row(select_sql, [], |row| row.get::<_, String>(0))
-        .optional()
+    let mut queries = vec![(select_sql.to_string(), update_sql.to_string(), true)];
+    if table_exists && matches!(relocation, PluginPathRelocation::Archived) {
+        // Older databases store the same index in separate columns. Some older
+        // snapshots contain only install_records_json, so inspect optional fields.
+        for (column, json) in [
+            ("plugins_json", true),
+            ("diagnostics_json", true),
+            ("workspace_dir", false),
+            ("warning", false),
+            ("refresh_reason", false),
+        ] {
+            let exists = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('installed_plugin_index') WHERE name = ?1)",
+                [column], |row| row.get::<_, bool>(0),
+            ).map_err(|error| error.to_string())?;
+            if exists {
+                queries.push((
+                    format!("SELECT {column} FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'"),
+                    format!("UPDATE installed_plugin_index SET {column} = ?1 WHERE index_key = 'installed-plugin-index'"),
+                    json,
+                ));
+            }
+        }
+    }
+    let mut changed = false;
+    for (select_sql, update_sql, json) in queries {
+        let raw_records = if matches!(relocation, PluginPathRelocation::Archived) {
+            connection
+                .query_row(&select_sql, [], |row| row.get::<_, Option<String>>(0))
+                .optional()
+                .map(|value| value.flatten())
+        } else {
+            connection
+                .query_row(&select_sql, [], |row| row.get::<_, String>(0))
+                .optional()
+        }
         .map_err(|error| {
             format!(
                 "failed to read imported OpenClaw plugin install records {}: {error}",
-                display_path(&database_path)
+                display_path(database_path)
             )
-        })?
-    else {
-        return Ok(MigratedRuntimeStateResult::default());
-    };
+        })?;
+        let Some(raw_records) = raw_records else {
+            continue;
+        };
+        let rewritten = if matches!(relocation, PluginPathRelocation::Archived) {
+            if json {
+                serde_json::from_str::<serde::de::IgnoredAny>(&raw_records).map_err(|error| {
+                    format!(
+                        "failed to parse imported OpenClaw plugin index {}: {error}",
+                        display_path(database_path)
+                    )
+                })?;
+            }
+            // Keep every non-relocated token verbatim, including numeric metadata.
+            let rewritten = rewrite_archived_root_references(
+                &raw_records,
+                &display_path(source_state_root),
+                &display_path(target_state_root),
+            )?;
+            (rewritten != raw_records).then_some(rewritten)
+        } else {
+            rewrite_plugin_install_records(
+                &raw_records,
+                database_path,
+                table_exists,
+                source_state_root,
+                target_state_root,
+                relocation,
+            )?
+        };
+        if let Some(rewritten) = rewritten {
+            connection
+                .execute(&update_sql, [rewritten])
+                .map_err(|error| {
+                    format!(
+                        "failed to relocate imported OpenClaw plugin install records {}: {error}",
+                        display_path(database_path)
+                    )
+                })?;
+            changed = true;
+        }
+    }
+    Ok(MigratedRuntimeStateResult {
+        changed,
+        ..Default::default()
+    })
+}
 
+fn rewrite_plugin_install_records(
+    raw_records: &str,
+    database_path: &Path,
+    table_exists: bool,
+    source_state_root: &Path,
+    target_state_root: &Path,
+    relocation: PluginPathRelocation<'_>,
+) -> Result<Option<String>, String> {
     let mut document: Value = serde_json::from_str(&raw_records).map_err(|error| {
         format!(
             "failed to parse imported OpenClaw plugin install records {}: {error}",
@@ -821,15 +901,9 @@ fn relocate_plugin_records_in_database(
                 continue;
             };
             let path = Path::new(path);
-            let relative = if matches!(relocation, PluginPathRelocation::Archived) {
-                archive_relative_path(path, source_state_root).map(Path::to_path_buf)
-            } else {
-                relocatable_plugin_path(path, source_state_root, !is_path_plugin)
-            };
-            let Some(relative) = relative else {
-                if !matches!(relocation, PluginPathRelocation::Archived) {
-                    has_external_path |= path.is_absolute() && !path.starts_with(target_state_root);
-                }
+            let Some(relative) = relocatable_plugin_path(path, source_state_root, !is_path_plugin)
+            else {
+                has_external_path |= path.is_absolute() && !path.starts_with(target_state_root);
                 continue;
             };
             record.insert(
@@ -851,25 +925,11 @@ fn relocate_plugin_records_in_database(
                 .join(", ")
         ));
     }
-    if !changed {
-        return Ok(MigratedRuntimeStateResult {
-            changed: false,
-            external_plugin_ids: external_plugin_ids.into_iter().collect(),
-        });
+    if changed {
+        Ok(Some(document.to_string()))
+    } else {
+        Ok(None)
     }
-
-    connection
-        .execute(update_sql, [document.to_string()])
-        .map_err(|error| {
-            format!(
-                "failed to relocate imported OpenClaw plugin install records {}: {error}",
-                display_path(&database_path)
-            )
-        })?;
-    Ok(MigratedRuntimeStateResult {
-        changed: true,
-        external_plugin_ids: external_plugin_ids.into_iter().collect(),
-    })
 }
 
 fn relocate_cloned_plugin_record(

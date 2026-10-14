@@ -602,8 +602,20 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
                 "version":"1.0.0", "integrity":"unchanged", "unknown":{"enabled":true}},
             "external": {"source":"path", "installPath":external, "sourcePath":external},
             "lookalike": {"source":"npm", "installPath":lookalike},
+            "punctuation-sibling": {"source":"path", "installPath":source.with_file_name("source=other").join("plugin")},
             "missing": {"source":"npm", "installPath":source.join(".openclaw/extensions/missing")}
         });
+        let plugins = json!([{
+            "id": "demo", "rootDir": installed, "source": installed.join("index.js"),
+            "manifestPath": installed.join("openclaw.plugin.json"),
+            "packageJson": {"path": installed.join("package.json"),
+                "fileSignature": {"mtimeMs": "PRECISE_TIMESTAMP"}}
+        }]);
+        let plugins_raw = plugins
+            .to_string()
+            .replace("\"PRECISE_TIMESTAMP\"", "1791960884534.1313");
+        let diagnostics_raw =
+            json!([{"message": format!("loaded from {}", installed.display())}]).to_string();
         let database = source.join(".openclaw/state/openclaw.sqlite");
         fs::create_dir_all(database.parent().unwrap()).unwrap();
         let db = Connection::open(&database).unwrap();
@@ -613,29 +625,33 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             INSERT INTO agent_database_leases VALUES ('retained-owner', 123);",
         )
         .unwrap();
-        let (select, expected_document) = if legacy {
-            db.execute_batch("CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT, updated_at INTEGER);").unwrap();
+        let (select, _initial_document) = if legacy {
+            db.execute_batch("CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT, updated_at INTEGER, plugins_json TEXT, diagnostics_json TEXT, workspace_dir TEXT);").unwrap();
             db.execute(
-                "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1, 42)",
+                "INSERT INTO installed_plugin_index (index_key, install_records_json, updated_at) VALUES ('installed-plugin-index', ?1, 42)",
                 [records.to_string()],
             )
             .unwrap();
             db.execute(
-                "INSERT INTO installed_plugin_index VALUES ('unrelated', ?1, 43)",
+                "INSERT INTO installed_plugin_index (index_key, install_records_json, updated_at) VALUES ('unrelated', ?1, 43)",
                 [source.display().to_string()],
             )
             .unwrap();
+            db.execute("UPDATE installed_plugin_index SET plugins_json=?1, diagnostics_json=?2, workspace_dir=?3 WHERE index_key='installed-plugin-index'",
+                [&plugins_raw, &diagnostics_raw, source.to_str().unwrap()]).unwrap();
             (
                 "SELECT install_records_json FROM installed_plugin_index WHERE index_key='installed-plugin-index'",
                 records.clone(),
             )
         } else {
             db.execute_batch("CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT, updated_at_ms INTEGER);").unwrap();
-            let document =
-                json!({"revision":17,"index":{"installRecords":records},"unknown":"retained"});
+            let document = json!({"revision":17,"index":{"installRecords":records, "plugins":plugins,
+                    "workspaceDir":source, "diagnostics":[{"message":format!("loaded from {}", installed.display())}]},"unknown":"retained"});
             db.execute(
                 "INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?1, 42)",
-                [document.to_string()],
+                [document
+                    .to_string()
+                    .replace("\"PRECISE_TIMESTAMP\"", "1791960884534.1313")],
             )
             .unwrap();
             db.execute(
@@ -654,6 +670,8 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "config_machine_state"
         };
         db.execute_batch(&format!("CREATE TRIGGER unrelated_change AFTER UPDATE ON {receipt_table} BEGIN UPDATE durable SET value='changed by trigger'; END;")).unwrap();
+        let original_document: String = db.query_row(select, [], |row| row.get(0)).unwrap();
+        let expected_document: Value = serde_json::from_str(&original_document).unwrap();
         drop(db);
         #[cfg(unix)]
         if legacy {
@@ -662,8 +680,15 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         }
         let runtime_file = ".openclaw/agents/main/agent/paths.json";
         let runtime = json!({"rootDir":installed, "package":package,
+            "command":format!("node {}/index.js", installed.display()),
+            "encoded":json!({"rootDir":installed}).to_string(),
             "external":external, "lookalike":lookalike});
         write_text(&source.join(runtime_file), &runtime.to_string());
+        let jsonl_file = ".openclaw/agents/main/sessions/commands.jsonl";
+        write_text(
+            &source.join(jsonl_file),
+            &(runtime.to_string() + "\n" + &runtime.to_string() + "\n"),
+        );
         let untouched = [
             ".env",
             ".openclaw/workspace/notes.txt",
@@ -746,6 +771,58 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         expected_records["demo"]["sourcePath"] = json!(target.join("packages/demo"));
         expected_records["missing"]["installPath"] =
             json!(target.join(".openclaw/extensions/missing"));
+        if !legacy {
+            expected["index"]["plugins"][0]["rootDir"] =
+                json!(target.join(".openclaw/extensions/demo"));
+            expected["index"]["plugins"][0]["source"] =
+                json!(target.join(".openclaw/extensions/demo/index.js"));
+            expected["index"]["plugins"][0]["manifestPath"] =
+                json!(target.join(".openclaw/extensions/demo/openclaw.plugin.json"));
+            expected["index"]["plugins"][0]["packageJson"]["path"] =
+                json!(target.join(".openclaw/extensions/demo/package.json"));
+            expected["index"]["workspaceDir"] = json!(target);
+            expected["index"]["diagnostics"][0]["message"] = json!(format!(
+                "loaded from {}",
+                target.join(".openclaw/extensions/demo").display()
+            ));
+        }
+        let source_encoded = serde_json::to_string(source.to_str().unwrap()).unwrap();
+        let target_encoded = serde_json::to_string(target.to_str().unwrap()).unwrap();
+        let source_encoded = &source_encoded[1..source_encoded.len() - 1];
+        let target_encoded = &target_encoded[1..target_encoded.len() - 1];
+        assert_eq!(
+            raw.replace(target_encoded, source_encoded),
+            original_document
+        );
+        if legacy {
+            let stored_plugins: String = db.query_row("SELECT plugins_json FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get(0)).unwrap();
+            assert_eq!(
+                stored_plugins.replace(target_encoded, source_encoded),
+                plugins_raw
+            );
+            assert!(stored_plugins.contains("1791960884534.1313"));
+            let parsed: Value = serde_json::from_str(&stored_plugins).unwrap();
+            assert_eq!(
+                parsed[0]["rootDir"],
+                json!(target.join(".openclaw/extensions/demo"))
+            );
+            assert_eq!(
+                parsed[0]["source"],
+                json!(target.join(".openclaw/extensions/demo/index.js"))
+            );
+            assert_eq!(
+                parsed[0]["manifestPath"],
+                json!(target.join(".openclaw/extensions/demo/openclaw.plugin.json"))
+            );
+            assert_eq!(db.query_row("SELECT workspace_dir FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get::<_, String>(0)).unwrap(), target.to_str().unwrap());
+            let diagnostics: String = db.query_row("SELECT diagnostics_json FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get(0)).unwrap();
+            assert_eq!(
+                diagnostics.replace(target_encoded, source_encoded),
+                diagnostics_raw
+            );
+        } else {
+            assert!(raw.contains("1791960884534.1313"));
+        }
         assert_eq!(actual, expected);
         let unrelated_query = if legacy {
             "SELECT install_records_json, updated_at FROM installed_plugin_index WHERE index_key='unrelated'"
@@ -793,9 +870,21 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         let mut expected_runtime = runtime;
         expected_runtime["rootDir"] = json!(target.join(".openclaw/extensions/demo"));
         expected_runtime["package"] = json!(target.join("packages/demo"));
+        expected_runtime["command"] = json!(format!(
+            "node {}/index.js",
+            target.join(".openclaw/extensions/demo").display()
+        ));
+        expected_runtime["encoded"] =
+            json!(json!({"rootDir":target.join(".openclaw/extensions/demo")}).to_string());
         let actual_runtime: Value =
             serde_json::from_slice(&fs::read(target.join(runtime_file)).unwrap()).unwrap();
         assert_eq!(actual_runtime, expected_runtime);
+        for line in fs::read_to_string(target.join(jsonl_file)).unwrap().lines() {
+            assert_eq!(
+                serde_json::from_str::<Value>(line).unwrap(),
+                expected_runtime
+            );
+        }
         for file in untouched.into_iter().chain([
             ".openclaw/state/opaque.bin",
             ".openclaw/extensions/demo/index.js",
