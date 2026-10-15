@@ -28,6 +28,21 @@ is printed, and an unsuccessful final check still fails validation. Invalid loca
 signatures or signing metadata fail immediately; a retry never substitutes for a
 successful strict notarization check.
 
+If signing or notarization fails, the release job preserves that failure and
+prints only bounded diagnostic metadata: the executable's CDHash, architecture,
+team and identifier; recent numeric notarization-daemon errors; and, after an
+accepted submission, its notary status, issue count and matching ticket entries.
+Daemon errors cover the host's previous two minutes and are clues, not proof of
+the specific failed lookup. Missing diagnostic access never makes validation pass.
+
+The job retains only the failed executable for one day in a
+`notarization-diagnostic-<target>-<attempt>` Actions artifact. This allows a strict
+check of the same bytes without rebuilding. It is not a release archive and is
+excluded from publication's `release-*` inventory. Keys, submission archives and
+raw system/notary logs are not uploaded. The diagnostic wrapper comes from the
+trusted workflow definition; the executable and signer still come from the
+verified signed tag, including when diagnosing an older tag.
+
 References:
 
 - Apple's `man codesign`: `--check-notarization` and `--test-requirement`.
