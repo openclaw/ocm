@@ -13,7 +13,7 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/release.yml"
 TARGET = "x86_64-apple-darwin"
 SUBMISSION = "9306a788-96c3-4260-87f4-97863b0c5ffe"
 CDHASH = "a" * 40
-SECRET = "synthetic-private-value-do-not-print"
+REDACTION_MARKER = "synthetic-output-redaction-marker"
 
 
 def signing_code():
@@ -38,7 +38,7 @@ class SigningDiagnosticsTests(unittest.TestCase):
             if symlink:
                 binary.unlink()
                 binary.symlink_to(root / "private-file")
-                (root / "private-file").write_text(SECRET)
+                (root / "private-file").write_text(REDACTION_MARKER)
             signer = root / "scripts/sign-notarize-macos.sh"
             output = "existing signer output\n"
             if accepted:
@@ -46,13 +46,13 @@ class SigningDiagnosticsTests(unittest.TestCase):
             signer.write_text(f"#!/bin/sh\nprintf '%s' '{output}'\nexit {status}\n")
             signer.chmod(0o755)
             report = {
-                "status": "Accepted", "statusCode": 0, "issues": [{"message": SECRET}],
+                "status": "Accepted", "statusCode": 0, "issues": [{"message": REDACTION_MARKER}],
                 "ticketContents": [
-                    {"cdhash": CDHASH, "arch": "x86_64", "path": "ocm.zip/ocm", "secret": SECRET},
-                    {"cdhash": SECRET, "arch": "x86_64", "path": "ocm.zip/ocm"},
-                    {"cdhash": CDHASH, "arch": SECRET, "path": "ocm.zip/ocm"},
-                    {"cdhash": CDHASH, "arch": "x86_64", "path": SECRET},
-                ], "secret": SECRET,
+                    {"cdhash": CDHASH, "arch": "x86_64", "path": "ocm.zip/ocm", "arbitraryText": REDACTION_MARKER},
+                    {"cdhash": REDACTION_MARKER, "arch": "x86_64", "path": "ocm.zip/ocm"},
+                    {"cdhash": CDHASH, "arch": REDACTION_MARKER, "path": "ocm.zip/ocm"},
+                    {"cdhash": CDHASH, "arch": "x86_64", "path": REDACTION_MARKER},
+                ], "arbitraryText": REDACTION_MARKER,
             }
             (root / "report.json").write_text(json.dumps(report))
             (root / "workflow.py").write_text(signing_code())
@@ -63,20 +63,20 @@ name = pathlib.Path(sys.argv[0]).name
 with (root / "calls").open("a") as log:
     log.write(name + "\\n")
 if name == "codesign":
-    print("CDHash={CDHASH}\\nIdentifier=com.openclaw.ocm\\nTeamIdentifier=AB12CD34EF\\nFormat=Mach-O thin (x86_64)\\n{SECRET}", file=sys.stderr)
+    print("CDHash={CDHASH}\\nIdentifier=com.openclaw.ocm\\nTeamIdentifier=AB12CD34EF\\nFormat=Mach-O thin (x86_64)\\n{REDACTION_MARKER}", file=sys.stderr)
 elif name == "system-log":
-    print(json.dumps([{{"eventMessage": "Error checking with notarization daemon: 51"}}, {{"eventMessage": "Error checking with notarization daemon: 3"}}, {{"eventMessage": "Error checking with notarization daemon: {SECRET}"}}, {{"eventMessage": "{SECRET}"}}]))
+    print(json.dumps([{{"eventMessage": "Error checking with notarization daemon: 51"}}, {{"eventMessage": "Error checking with notarization daemon: 3"}}, {{"eventMessage": "Error checking with notarization daemon: {REDACTION_MARKER}"}}, {{"eventMessage": "{REDACTION_MARKER}"}}]))
 else:
     key = pathlib.Path(sys.argv[sys.argv.index("--key") + 1])
     assert stat.S_IMODE(key.stat().st_mode) == 0o600
-    assert key.read_text() == "{SECRET}"
+    assert key.read_text() == "{REDACTION_MARKER}"
     (root / "key-path").write_text(str(key))
-    print("{SECRET}", file=sys.stderr)
+    print("{REDACTION_MARKER}", file=sys.stderr)
     if os.environ.get("TOOL_FAILURE"):
-        print("{SECRET}")
+        print("{REDACTION_MARKER}")
         sys.exit(9)
     if os.environ.get("MALFORMED"):
-        print("{SECRET}")
+        print("{REDACTION_MARKER}")
     elif os.environ.get("OVERSIZED"):
         print("x" * 65537)
     else:
@@ -106,7 +106,7 @@ runpy.run_path("workflow.py", run_name="__main__")
 '''
             env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
                        FIXTURE_ROOT=str(root), RUNNER_TEMP=str(runner),
-                       GITHUB_OUTPUT=str(root / "outputs"), OCM_NOTARY_API_PRIVATE_KEY=SECRET,
+                       GITHUB_OUTPUT=str(root / "outputs"), OCM_NOTARY_API_PRIVATE_KEY=REDACTION_MARKER,
                        OCM_NOTARY_API_KEY_ID="SYNTHETIC", OCM_NOTARY_ISSUER_ID="synthetic-issuer")
             for key, value in {"MALFORMED": malformed, "TOOL_FAILURE": tool_failure,
                                "OVERSIZED": oversized, "TIMEOUT": timeout,
@@ -117,7 +117,7 @@ runpy.run_path("workflow.py", run_name="__main__")
             result = subprocess.run([sys.executable, "-c", bootstrap], cwd=root, env=env,
                                     text=True, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, status, result.stderr)
-            self.assertNotIn(SECRET, result.stdout + result.stderr)
+            self.assertNotIn(REDACTION_MARKER, result.stdout + result.stderr)
             self.assertEqual(list(runner.iterdir()), [])
             if (root / "key-path").exists():
                 self.assertFalse(Path((root / "key-path").read_text()).exists())
