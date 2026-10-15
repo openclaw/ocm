@@ -1906,6 +1906,54 @@ fn source_history_failure_does_not_bypass_interrupt_fence() {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+static HISTORY_GATEWAY_PORTS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct HistoryGatewayPort(u16);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl HistoryGatewayPort {
+    fn reserve() -> Self {
+        use std::net::TcpListener;
+
+        // Match the gateway's complete base..=base+110 port family. Keep its
+        // claim while this fixture stops and restarts its actual listener.
+        // Some kernels assign ephemeral ports sequentially, so a conflicting
+        // family can require more than 110 candidates before reaching its end.
+        for _ in 0..u16::MAX {
+            let base = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = base.local_addr().unwrap().port();
+            let Some(end) = port.checked_add(110) else {
+                continue;
+            };
+            let mut claimed = HISTORY_GATEWAY_PORTS.lock().unwrap();
+            if claimed.iter().any(|other| port.abs_diff(*other) <= 110) {
+                continue;
+            }
+            let family: Result<Vec<_>, _> = ((port + 1)..=end)
+                .map(|port| TcpListener::bind(("127.0.0.1", port)))
+                .collect();
+            if family.is_ok() {
+                claimed.push(port);
+                // All probe listeners close before the gateway binds.
+                return Self(port);
+            }
+        }
+        panic!("no available gateway port family for history fixture");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for HistoryGatewayPort {
+    fn drop(&mut self) {
+        HISTORY_GATEWAY_PORTS
+            .lock()
+            .unwrap()
+            .retain(|port| *port != self.0);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn assert_source_history_write_failure(running: bool, interrupt: bool) {
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Child, Stdio};
@@ -1915,6 +1963,7 @@ fn assert_source_history_write_failure(running: bool, interrupt: bool) {
     struct FixtureCleanup {
         daemon: Option<Child>,
         history_dir: std::path::PathBuf,
+        _gateway_port: Option<HistoryGatewayPort>,
     }
     impl Drop for FixtureCleanup {
         fn drop(&mut self) {
@@ -1941,7 +1990,18 @@ fn assert_source_history_write_failure(running: bool, interrupt: bool) {
     let mut cleanup = FixtureCleanup {
         daemon: None,
         history_dir: history_dir.clone(),
+        _gateway_port: None,
     };
+    if running {
+        let port = HistoryGatewayPort::reserve();
+        let mut meta = ocm::env::EnvironmentService::new(&env, root.path())
+            .get("demo")
+            .unwrap();
+        meta.gateway_port = Some(u32::from(port.0));
+        meta.gateway_port_auto_assigned = false;
+        ocm::store::save_environment(meta, &env, root.path()).unwrap();
+        cleanup._gateway_port = Some(port);
+    }
     let initial_pid = if running {
         support::install_fake_service_manager(&root, &mut env);
         env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
