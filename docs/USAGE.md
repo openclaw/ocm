@@ -725,6 +725,8 @@ before writing the destination. Check the recorded source with `ocm env show
 ocm env clone mira rowan
 ```
 
+Automatic Gateway port selection searches upward from the preferred port through 65535, preserving existing environment and dev UI reservations. If no candidate remains, creation, cloning, or archive import fails without registering an environment or creating its destination root; it does not wrap to a lower port.
+
 Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Configured agent directories inside the environment retain their payloads through clone and ordinary export/import, including custom and nested locations.
 Agent directories remain separate from workspaces; external locations and paths reached through symlinks are rejected by these copy operations.
 Upgrade simulation rejects an identity-dependent agent directory supplied by an include shared with unrelated configuration fields; give those consumers separate include files before retrying.

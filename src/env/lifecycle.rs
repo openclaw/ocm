@@ -359,7 +359,7 @@ impl<'a> EnvironmentService<'a> {
         &self,
         envs: Vec<EnvMeta>,
     ) -> Result<Vec<EnvMeta>, String> {
-        let effective_ports = resolve_effective_gateway_ports(&envs, self.env);
+        let effective_ports = resolve_effective_gateway_ports(&envs, self.env)?;
 
         envs.into_iter()
             .map(|mut meta| {
@@ -584,7 +584,7 @@ impl<'a> EnvironmentService<'a> {
         }
 
         let effective_ports =
-            resolve_effective_gateway_ports(&list_environments(self.env, self.cwd)?, self.env);
+            resolve_effective_gateway_ports(&list_environments(self.env, self.cwd)?, self.env)?;
 
         effective_ports
             .get(&target.name)

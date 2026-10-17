@@ -262,7 +262,7 @@ mod tests {
         );
         let metas = list_environments(&env, root.path()).unwrap();
         assert_ne!(
-            crate::store::gateway_ports::choose_available_gateway_port(port, &metas, &env),
+            crate::store::gateway_ports::choose_available_gateway_port(port, &metas, &env).unwrap(),
             port
         );
         let mut legacy = original.clone();
@@ -272,13 +272,13 @@ mod tests {
         // An older environment without a selected Gateway must also avoid
         // the retained UI address when its effective port is computed.
         let mut legacy_envs = [original.clone(), legacy];
-        let baseline = crate::store::gateway_ports::resolve_effective_gateway_ports(
-            &legacy_envs,
-            &env,
-        )["legacy"];
+        let baseline =
+            crate::store::gateway_ports::resolve_effective_gateway_ports(&legacy_envs, &env)
+                .unwrap()["legacy"];
         legacy_envs[0].dev_ui_port = Some(baseline);
         let effective =
-            crate::store::gateway_ports::resolve_effective_gateway_ports(&legacy_envs, &env);
+            crate::store::gateway_ports::resolve_effective_gateway_ports(&legacy_envs, &env)
+                .unwrap();
         let legacy_port = effective["legacy"];
         let (start, end) = crate::store::gateway_ports::openclaw_port_family_range(legacy_port);
         assert!(!(start..=end).contains(&baseline));
