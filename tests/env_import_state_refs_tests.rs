@@ -173,13 +173,20 @@ fn state_import_relocates_registered_database_text_and_preserves_other_values() 
         )
         .unwrap();
         fs::rename(source_root, root.child("source-offline")).unwrap();
+        // A fresh registry can import below an archive's former source root.
+        // Discovery must not project an already-rewritten registry path twice.
+        let mut import_env = env.clone();
+        import_env.insert(
+            "OCM_HOME".into(),
+            root.child("fresh-import").display().to_string(),
+        );
         let imported = import_environment(
             ImportEnvironmentOptions {
                 archive: export.archive_path,
                 name: Some("copy".into()),
-                root: None,
+                root: Some(source_root.join("copy").display().to_string()),
             },
-            &env,
+            &import_env,
             root.path(),
         )
         .unwrap();

@@ -298,10 +298,17 @@ pub(super) fn relocate_copied_databases(
     let mut counts = BTreeMap::new();
     let mut visited = BTreeSet::new();
     let global_path = paths.state_dir.join("state/openclaw.sqlite");
-    // Relocate registry paths before selecting additional agent databases. The
-    // archive may be imported after the original environment has been removed.
     let global = contained_imported_database(&global_path, &paths.root, true)?;
+    let mut selection = OpenClawSqliteCopy {
+        state_root: &paths.state_dir,
+        registered_agents: BTreeSet::new(),
+    };
     if let Some(database) = &global {
+        // Project the original registry paths exactly once, before any writes.
+        // This also works when the source is gone or its registry is protected.
+        if is_sqlite_database(database)? {
+            selection.read_agent_registry(database, Some((source_roots, &paths.root)))?;
+        }
         relocate_archived_database(
             paths,
             source_roots,
@@ -311,15 +318,6 @@ pub(super) fn relocate_copied_databases(
             &mut visited,
             &mut counts,
         )?;
-    }
-    let mut selection = OpenClawSqliteCopy {
-        state_root: &paths.state_dir,
-        registered_agents: BTreeSet::new(),
-    };
-    if let Some(database) = global {
-        if is_sqlite_database(&database)? {
-            selection.read_agent_registry(&database, Some((source_roots, &paths.root)))?;
-        }
     }
     let mut directories = vec![paths.root.clone()];
     while let Some(directory) = directories.pop() {
