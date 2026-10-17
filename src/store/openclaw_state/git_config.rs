@@ -523,7 +523,7 @@ fn project(path: &Path, mappings: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
         .map(|(_, path)| path)
 }
 
-fn git_path(path: &Path) -> PathBuf {
+pub(super) fn git_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let raw = path.as_os_str().to_string_lossy();
