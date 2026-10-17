@@ -1057,7 +1057,13 @@ fn migration_preserves_shared_workspace_locations() {
                     {"id": "separate", "workspace": unrelated}
                 ]})
             };
-            let source_config = serde_json::json!({"agents": agents}).to_string();
+            let mut source_value = serde_json::json!({"agents": agents});
+            if layout == "internal" {
+                source_value["env"] = serde_json::json!({"WORKSPACE_ROOT": outer});
+                source_value["agents"]["defaults"]["workspace"] =
+                    serde_json::json!("${WORKSPACE_ROOT}");
+            }
+            let source_config = source_value.to_string();
             fs::write(source.join("openclaw.json"), &source_config).unwrap();
             let env = ocm_env(&root);
             let args = if adopt {
@@ -1109,6 +1115,12 @@ fn migration_preserves_shared_workspace_locations() {
                     &agents["list"][0]["workspace"],
                     &agents["list"][1]["workspace"],
                 )
+            };
+            let a = if layout == "internal" {
+                assert_eq!(a, "${WORKSPACE_ROOT}");
+                &config["env"]["WORKSPACE_ROOT"]
+            } else {
+                a
             };
             let a = Path::new(a.as_str().unwrap());
             let b = Path::new(b.as_str().unwrap());
