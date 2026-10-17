@@ -661,25 +661,41 @@ fn env_import_keeps_agent_auth_but_drops_live_runtime_state() {
 #[test]
 fn env_import_owns_selected_git_graphs_and_rolls_back_incomplete_graphs() {
     assert_imported_git_graphs(&[
-        (false, false, false, false),
-        (false, true, false, false),
-        (true, false, false, false),
-        (true, true, false, false),
-        (true, false, true, false),
+        (false, false, false, ImportGitLayout::Selected),
+        (false, true, false, ImportGitLayout::Selected),
+        (true, false, false, ImportGitLayout::Selected),
+        (true, true, false, ImportGitLayout::Selected),
+        (true, false, true, ImportGitLayout::Selected),
     ]);
 }
 
 #[test]
 fn env_import_maps_original_git_pointers_when_target_overlaps_old_source() {
-    assert_imported_git_graphs(&[(false, false, false, true), (true, false, false, true)]);
+    assert_imported_git_graphs(&[
+        (false, false, false, ImportGitLayout::NestedTarget),
+        (true, false, false, ImportGitLayout::NestedTarget),
+    ]);
 }
 
-fn assert_imported_git_graphs(cases: &[(bool, bool, bool, bool)]) {
+#[test]
+fn env_import_preserves_an_ordinary_archive_root_checkout() {
+    assert_imported_git_graphs(&[(false, false, false, ImportGitLayout::EnvironmentRoot)]);
+}
+
+#[derive(Clone, Copy)]
+enum ImportGitLayout {
+    Selected,
+    NestedTarget,
+    EnvironmentRoot,
+}
+
+fn assert_imported_git_graphs(cases: &[(bool, bool, bool, ImportGitLayout)]) {
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
-    use std::process::Command;
 
-    for &(include_state, incomplete, protected_history, nested) in cases {
+    for &(include_state, incomplete, protected_history, layout) in cases {
+        let nested = matches!(layout, ImportGitLayout::NestedTarget);
+        let root_checkout = matches!(layout, ImportGitLayout::EnvironmentRoot);
         if protected_history && !cfg!(unix) {
             continue;
         }
@@ -705,26 +721,18 @@ fn assert_imported_git_graphs(cases: &[(bool, bool, bool, bool)]) {
         );
         assert!(created.status.success(), "{}", stderr(&created));
         // These repositories are selected outside configured workspaces.
-        let repository = source.join("projects/repository");
+        let repository = if root_checkout {
+            source.clone()
+        } else {
+            source.join("projects/repository")
+        };
         let checkout = source.join(if include_state {
             ".openclaw/worktrees/task"
         } else {
             "projects/task"
         });
         fs::create_dir_all(&repository).unwrap();
-        let git = |path: &Path, args: &[&str]| {
-            let result = Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(args)
-                .env_clear()
-                .envs(&env)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .output()
-                .unwrap();
-            assert!(result.status.success(), "{}", stderr(&result));
-            stdout(&result).trim().to_string()
-        };
+        let git = |path: &Path, args: &[&str]| import_git(path, &env, args);
         git(&repository, &["init", "-q"]);
         write_text(&repository.join("authored.txt"), "authored content\n");
         git(&repository, &["add", "authored.txt"]);
@@ -749,7 +757,7 @@ fn assert_imported_git_graphs(cases: &[(bool, bool, bool, bool)]) {
             &["update-ref", "refs/snapshots/archive", "HEAD"],
         );
         let retained_config = source.join(".openclaw/credentials/copied-git.conf");
-        if !include_state && !incomplete {
+        if !include_state && !incomplete && !root_checkout {
             fs::create_dir_all(retained_config.parent().unwrap()).unwrap();
             fs::write(&retained_config, "[fixture]\n\tretained = selected\n").unwrap();
             fs::write(
@@ -896,7 +904,7 @@ fn assert_imported_git_graphs(cases: &[(bool, bool, bool, bool)]) {
             fs::read_to_string(copied_checkout.join("authored.txt")).unwrap(),
             "authored content\n"
         );
-        if !include_state {
+        if !include_state && !root_checkout {
             let config = target.join(retained_config.strip_prefix(&source).unwrap());
             assert_eq!(
                 fs::read_to_string(&config).unwrap(),
@@ -957,4 +965,99 @@ fn assert_imported_git_graphs(cases: &[(bool, bool, bool, bool)]) {
             );
         }
     }
+}
+
+fn import_git(
+    path: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    args: &[&str],
+) -> String {
+    let result = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .env_clear()
+        .envs(env)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", stderr(&result));
+    stdout(&result).trim().to_string()
+}
+
+#[test]
+fn env_import_preserves_selected_bare_repository() {
+    let fixture = TestDir::new("import-selected-bare-git");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let target = root.join("target");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let repository = source.join("projects/bare");
+    fs::create_dir_all(&repository).unwrap();
+    import_git(&repository, &env, &["init", "-q"]);
+    import_git(&repository, &env, &["config", "core.bare", "true"]);
+    assert_eq!(
+        import_git(&repository, &env, &["rev-parse", "--is-bare-repository"]),
+        "true"
+    );
+    let before = fs::read(repository.join(".git/config")).unwrap();
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let archive_before = fs::read(&archive).unwrap();
+    let offline = root.join("offline");
+    fs::rename(&source, &offline).unwrap();
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert_eq!(fs::read(archive).unwrap(), archive_before);
+    assert_eq!(
+        fs::read(offline.join("projects/bare/.git/config")).unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read(target.join("projects/bare/.git/config")).unwrap(),
+        before
+    );
+    assert_eq!(
+        import_git(
+            &target.join("projects/bare"),
+            &env,
+            &["rev-parse", "--is-bare-repository"]
+        ),
+        "true"
+    );
 }

@@ -1,5 +1,5 @@
 use super::git_config::{
-    CopiedGitConfigContext, relocate_copied_git_config, validate_copied_git_config,
+    CopiedGitConfigContext, git_path, relocate_copied_git_config, validate_copied_git_config,
 };
 use super::*;
 use crate::openclaw_repo::{git_command, git_identity_paths, read_git_pointer};
@@ -131,10 +131,10 @@ pub(in crate::store) fn relocate_copied_worktrees(
             std::os::unix::fs::symlink(target, link).map_err(|error| error.to_string())?;
             #[cfg(windows)]
             if target.is_dir() {
-                std::os::windows::fs::symlink_dir(git_path(target).as_ref(), link)
+                std::os::windows::fs::symlink_dir(native_path(target).as_ref(), link)
                     .map_err(|error| error.to_string())?;
             } else {
-                std::os::windows::fs::symlink_file(git_path(target).as_ref(), link)
+                std::os::windows::fs::symlink_file(native_path(target).as_ref(), link)
                     .map_err(|error| error.to_string())?;
             }
             Ok(())
@@ -205,15 +205,35 @@ impl CopiedWorktrees {
             }
         }
         validate_copied_git_config(&paths.root, &self.contexts)?;
+        let managed_roots = self
+            .records
+            .iter()
+            .flat_map(|record| [&record.repo, &record.checkout])
+            .collect::<BTreeSet<_>>();
         for (path, expected) in &self.checkouts {
             let actual = git_identity_paths(path)?.ok_or("copied Git checkout disappeared")?;
+            let checkout_matches = match git_value(path, &["rev-parse", "--show-toplevel"]) {
+                Ok(top) => {
+                    fs::canonicalize(top).map_err(|error| error.to_string())?
+                        == fs::canonicalize(path).map_err(|error| error.to_string())?
+                }
+                Err(error) => {
+                    // A selected repository may be bare, but a managed binding
+                    // must still identify its expected working checkout.
+                    if !managed_roots.contains(path)
+                        && git_value(path, &["rev-parse", "--is-bare-repository"])? == "true"
+                    {
+                        true
+                    } else {
+                        return Err(error);
+                    }
+                }
+            };
             if fs::canonicalize(actual.private_dir).map_err(|e| e.to_string())?
                 != fs::canonicalize(&expected.private).map_err(|error| error.to_string())?
                 || fs::canonicalize(actual.common_dir).map_err(|e| e.to_string())?
                     != fs::canonicalize(&expected.common).map_err(|error| error.to_string())?
-                || fs::canonicalize(git_value(path, &["rev-parse", "--show-toplevel"])?)
-                    .map_err(|error| error.to_string())?
-                    != fs::canonicalize(path).map_err(|error| error.to_string())?
+                || !checkout_matches
             {
                 return Err(format!(
                     "copied Git checkout did not resolve to its destination: {}",
@@ -253,7 +273,11 @@ impl CopiedWorktrees {
                 let canonical_common =
                     fs::canonicalize(common).map_err(|error| error.to_string())?;
                 let digest = Sha256::digest(
-                    format!("{}\n{origin}", display_path(&git_path(&canonical_common))).as_bytes(),
+                    format!(
+                        "{}\n{origin}",
+                        display_path(&native_path(&canonical_common))
+                    )
+                    .as_bytes(),
                 );
                 fingerprints.insert(
                     common.clone(),
@@ -287,7 +311,7 @@ impl CopiedWorktrees {
                         let tx = db.transaction().map_err(|e| e.to_string())?;
                         for record in &self.records {
                             tx.execute("UPDATE worktrees SET repo_root = ?1, path = ?2, repo_fingerprint = ?3 WHERE id = ?4",
-                    rusqlite::params![display_path(&git_path(&record.repo)), display_path(&git_path(&record.checkout)), fingerprints[&self.checkouts[&record.repo].common], record.id])
+                    rusqlite::params![display_path(&native_path(&record.repo)), display_path(&native_path(&record.checkout)), fingerprints[&self.checkouts[&record.repo].common], record.id])
                     .map_err(|e| e.to_string())?;
                         }
                         tx.commit().map_err(|e| e.to_string())
@@ -386,7 +410,9 @@ fn read_managed_registry(
     Ok(records)
 }
 
-fn git_path(path: &Path) -> Cow<'_, Path> {
+// OpenClaw stores native path spelling and hashes it into repository identity.
+// Git's own text files use `git_path` instead, with slash separators on Windows.
+fn native_path(path: &Path) -> Cow<'_, Path> {
     #[cfg(windows)]
     {
         let text = path.to_string_lossy();
@@ -481,22 +507,22 @@ fn unquote_git_path(input: &[u8]) -> Option<(Vec<u8>, usize)> {
 
 impl CopyGraph<'_> {
     fn project(&self, path: &Path) -> Option<PathBuf> {
-        let path = git_path(path);
-        if let Ok(relative) = path.strip_prefix(git_path(&self.root).as_ref()) {
+        let path = native_path(path);
+        if let Ok(relative) = path.strip_prefix(native_path(&self.root).as_ref()) {
             return Some(self.root.join(relative));
         }
-        if let Ok(relative) = path.strip_prefix(git_path(self.target).as_ref()) {
+        if let Ok(relative) = path.strip_prefix(native_path(self.target).as_ref()) {
             return Some(self.root.join(relative));
         }
         self.project_source(&path)
     }
 
     fn project_source(&self, path: &Path) -> Option<PathBuf> {
-        let path = git_path(path);
+        let path = native_path(path);
         self.mappings
             .iter()
             .filter_map(|(source, target)| {
-                path.strip_prefix(git_path(source).as_ref())
+                path.strip_prefix(native_path(source).as_ref())
                     .ok()
                     .map(|relative| (source.components().count(), target.join(relative)))
             })
@@ -636,6 +662,7 @@ impl CopyGraph<'_> {
         };
         if clean_path(&value) != target {
             let mut bytes = prefix.to_vec();
+            // Git parses structural paths with slash separators, including on Windows.
             bytes.extend_from_slice(git_path(&target).as_os_str().as_encoded_bytes());
             bytes.push(b'\n');
             if let Some(previous) = self.writes.insert(file, bytes.clone())
