@@ -65,6 +65,29 @@ pub struct EnvSnapshotMeta {
     pub created_at: OffsetDateTime,
 }
 
+/// Recovery admission is independent of diagnostic cleanup/resync warnings.
+/// This is transient operation state, never a persisted service policy.
+#[derive(Debug)]
+pub(crate) struct SnapshotRestoreError {
+    pub(crate) message: String,
+    pub(crate) prior_state_restored: bool,
+}
+
+impl SnapshotRestoreError {
+    pub(super) fn unchanged(message: String) -> Self {
+        Self {
+            message,
+            prior_state_restored: true,
+        }
+    }
+}
+
+impl std::fmt::Display for SnapshotRestoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct EnvSnapshotRestoreTransaction {
     pub(crate) summary: EnvSnapshotRestoreSummary,
@@ -590,7 +613,8 @@ pub fn restore_env_snapshot(
     cwd: &Path,
 ) -> Result<EnvSnapshotRestoreSummary, String> {
     let _operation_lock = super::lock_environment_operation(&options.env_name, env, cwd)?;
-    let transaction = prepare_env_snapshot_restore(options, env, cwd)?;
+    let transaction =
+        prepare_env_snapshot_restore(options, env, cwd).map_err(|error| error.to_string())?;
     Ok(commit_env_snapshot_restore(transaction))
 }
 
@@ -598,7 +622,7 @@ pub(crate) fn prepare_env_snapshot_restore(
     options: RestoreEnvSnapshotOptions,
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> Result<EnvSnapshotRestoreTransaction, String> {
+) -> Result<EnvSnapshotRestoreTransaction, SnapshotRestoreError> {
     prepare_env_snapshot_restore_with_binding(options, true, None, env, cwd)
 }
 
@@ -607,7 +631,7 @@ pub(crate) fn prepare_upgrade_snapshot_restore(
     runtime_guard: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> Result<EnvSnapshotRestoreTransaction, String> {
+) -> Result<EnvSnapshotRestoreTransaction, SnapshotRestoreError> {
     prepare_env_snapshot_restore_with_binding(options, false, runtime_guard, env, cwd)
 }
 
@@ -617,12 +641,16 @@ fn prepare_env_snapshot_restore_with_binding(
     runtime_guard: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> Result<EnvSnapshotRestoreTransaction, String> {
-    let env_name = validate_name(&options.env_name, "Environment name")?;
-    let snapshot = get_env_snapshot(&env_name, &options.snapshot_id, env, cwd)?;
+) -> Result<EnvSnapshotRestoreTransaction, SnapshotRestoreError> {
+    let mut prior_state_restored = true;
+    let env_name = validate_name(&options.env_name, "Environment name")
+        .map_err(SnapshotRestoreError::unchanged)?;
+    let snapshot = get_env_snapshot(&env_name, &options.snapshot_id, env, cwd)
+        .map_err(SnapshotRestoreError::unchanged)?;
     crate::env::EnvironmentService::new(env, cwd)
-        .ensure_source_watch_allows_state_mutation_locked(&env_name)?;
-    let current = get_environment(&env_name, env, cwd)?;
+        .ensure_source_watch_allows_state_mutation_locked(&env_name)
+        .map_err(SnapshotRestoreError::unchanged)?;
+    let current = get_environment(&env_name, env, cwd).map_err(SnapshotRestoreError::unchanged)?;
     let current_paths = derive_env_paths(Path::new(&current.root));
     let root_exists = path_exists(&current_paths.root);
     let independent = snapshot
@@ -630,16 +658,20 @@ fn prepare_env_snapshot_restore_with_binding(
         .as_ref()
         .map(|scope| scope.independent_paths.clone())
         .unwrap_or_default();
-    ensure_restore_preserves_dev_sources(&current, &independent, env, cwd)?;
+    ensure_restore_preserves_dev_sources(&current, &independent, env, cwd)
+        .map_err(SnapshotRestoreError::unchanged)?;
     if !independent.is_empty() {
-        super::checkpoint_scope::validate_ancestors(&current_paths.root, &independent)?;
+        super::checkpoint_scope::validate_ancestors(&current_paths.root, &independent)
+            .map_err(SnapshotRestoreError::unchanged)?;
         super::checkpoint_scope::validate_scoped_artifact(
             Path::new(&snapshot.archive_path),
             &independent,
-        )?;
+        )
+        .map_err(SnapshotRestoreError::unchanged)?;
     }
 
-    let operation = create_restore_operation_namespace(&current_paths.root)?;
+    let operation = create_restore_operation_namespace(&current_paths.root)
+        .map_err(SnapshotRestoreError::unchanged)?;
     let staging_dir = operation.legacy_staging_root.clone();
     let candidate_root = operation.candidate_root.clone();
     let backup_root = operation.backup_root.clone();
@@ -730,10 +762,16 @@ fn prepare_env_snapshot_restore_with_binding(
                 &candidate_root,
                 &backup_root,
                 &independent,
-            )?;
+            )
+            .map_err(|error| {
+                prior_state_restored = error.prior_state_restored;
+                error.to_string()
+            })?;
+            prior_state_restored = false;
             renamed = true;
         } else if root_exists {
             fs::rename(&current_paths.root, &backup_root).map_err(|error| error.to_string())?;
+            prior_state_restored = false;
             renamed = true;
         }
 
@@ -741,6 +779,7 @@ fn prepare_env_snapshot_restore_with_binding(
             if independent.is_empty() {
                 fs::rename(&candidate_root, &current_paths.root)
                     .map_err(|error| error.to_string())?;
+                prior_state_restored = false;
             }
             if legacy_archive && !restore_uses_directory_link(&current_paths.root)? {
                 rewrite_openclaw_config_for_target(
@@ -799,13 +838,16 @@ fn prepare_env_snapshot_restore_with_binding(
                     env,
                     cwd,
                 ) {
-                    Ok(()) => match remove_tree_if_present(&operation.root) {
-                        Ok(()) => Err(error),
-                        Err(cleanup_error) => Err(format!(
-                            "{error}; the displaced environment root was restored, but rejected restore cleanup failed at {}: {cleanup_error}",
-                            display_path(&operation.root)
-                        )),
-                    },
+                    Ok(()) => {
+                        prior_state_restored = true;
+                        match remove_tree_if_present(&operation.root) {
+                            Ok(()) => Err(error),
+                            Err(cleanup_error) => Err(format!(
+                                "{error}; the displaced environment root was restored, but rejected restore cleanup failed at {}: {cleanup_error}",
+                                display_path(&operation.root)
+                            )),
+                        }
+                    }
                     Err(rollback_error) => Err(format!(
                         "{error}; restoring the displaced environment root also failed: {rollback_error}"
                     )),
@@ -817,16 +859,21 @@ fn prepare_env_snapshot_restore_with_binding(
     if result.is_err() && !rollback_attempted && !path_exists(&backup_root) {
         let _ = remove_tree_if_present(&operation.root);
     }
-    result.map_err(|error| {
-        if path_exists(&operation.root) {
-            format!(
-                "{error}; restore operation retained at {}",
-                display_path(&operation.root)
-            )
-        } else {
-            error
-        }
-    })
+    result
+        .map_err(|error| {
+            if path_exists(&operation.root) {
+                format!(
+                    "{error}; restore operation retained at {}",
+                    display_path(&operation.root)
+                )
+            } else {
+                error
+            }
+        })
+        .map_err(|message| SnapshotRestoreError {
+            message,
+            prior_state_restored,
+        })
 }
 
 pub(crate) fn commit_env_snapshot_restore(
@@ -893,7 +940,8 @@ fn reinstate_displaced_environment_root(
             displaced,
             rejected_root,
             independent,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         if let Err(error) =
             super::save_environment_with_runtime_guard(original, runtime_guard, env, cwd)
         {

@@ -1034,9 +1034,10 @@ impl Cli {
                                 let rollback_result = self
                                     .environment_service()
                                     .rollback_snapshot_restore_locked(transaction);
+                                let recovery_safe = rollback_result.as_ref()
+                                    .map_or_else(|error| error.prior_state_restored, |()| true);
                                 let service_restore_result = self
-                                    .service_service()
-                                    .restore_after_snapshot_locked(name, service_state);
+                                    .restore_service_after_snapshot_failure_locked(name, service_state, recovery_safe);
                                 let mut error = format!(
                                     "snapshot {} failed managed-service acceptance: {service_error}",
                                     restored.snapshot_id
@@ -1056,10 +1057,9 @@ impl Cli {
                         }
                     }
                     Err(restore_error) => match self
-                        .service_service()
-                        .restore_after_snapshot_locked(name, service_state)
+                        .restore_service_after_snapshot_failure_locked(name, service_state, restore_error.prior_state_restored)
                     {
-                        Ok(()) => Err(restore_error),
+                        Ok(()) => Err(restore_error.to_string()),
                         Err(service_error) => Err(format!(
                             "{restore_error}; also failed to restore the pre-restore managed service state: {service_error}"
                         )),
@@ -1075,6 +1075,33 @@ impl Cli {
 
         self.stdout_lines(render::env::env_snapshot_restored(&restored, profile));
         Ok(0)
+    }
+
+    fn restore_service_after_snapshot_failure_locked(
+        &self,
+        name: &str,
+        state: Option<crate::service::ServiceMaintenanceState>,
+        prior_state_restored: bool,
+    ) -> Result<(), String> {
+        if prior_state_restored {
+            return self
+                .service_service()
+                .restore_after_snapshot_locked(name, state);
+        }
+        // The rejected snapshot may have published running intent. Keep it
+        // paused as well as withholding an explicit recovery start.
+        let quiescence = (|| {
+            let service = self.service_service();
+            let status = service.status(name)?;
+            if status.desired_running || status.running {
+                service.stop_locked(name)?;
+            }
+            service.wait_for_runtime_mutation_quiescence_locked(name)
+        })();
+        match quiescence {
+            Ok(()) => Err("automatic service resumption withheld because environment recovery is incomplete; managed service stopped".to_string()),
+            Err(error) => Err(format!("automatic service resumption withheld because environment recovery is incomplete; quiescing the managed service also failed: {error}")),
+        }
     }
 
     fn handle_env_snapshot_remove(&self, args: Vec<String>) -> Result<i32, String> {

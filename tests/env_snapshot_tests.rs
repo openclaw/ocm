@@ -1190,6 +1190,134 @@ fn env_snapshot_restore_recovers_the_displaced_root_when_acceptance_fails() {
     assert_eq!(operation_namespaces, 0);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn snapshot_restore_service_resumption_requires_recovered_data() {
+    // Faults apply only to this TestDir; restore flags even after an assertion panic.
+    struct ResetFlags(PathBuf);
+    impl Drop for ResetFlags {
+        fn drop(&mut self) {
+            let _ = Command::new("/usr/bin/chflags")
+                .args(["-R", "nouchg"])
+                .arg(&self.0)
+                .status();
+        }
+    }
+
+    for mode in [
+        "rollback-control",
+        "full-incomplete",
+        "scoped-incomplete",
+        "cleanup-warning",
+    ] {
+        let root = TestDir::new("snapshot-service-recovery");
+        let _flags = ResetFlags(root.child("ocm-home/envs"));
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+        env.insert("OCM_TEST_VERSION".into(), env!("CARGO_PKG_VERSION").into());
+        install_fake_launchctl(&root, &mut env);
+        for args in [
+            vec!["launcher", "add", "stable", "--command", "openclaw"],
+            vec!["env", "create", "source", "--launcher", "stable"],
+        ] {
+            let result = run_ocm(&cwd, &env, &args);
+            assert!(result.status.success(), "{}", stderr(&result));
+        }
+        let marker = root.child("ocm-home/envs/source/.openclaw/workspace/restore-marker.txt");
+        write_text(&marker, "snapshot-state\n");
+        let snapshot = run_ocm(
+            &cwd,
+            &env,
+            &["env", "snapshot", "create", "source", "--json"],
+        );
+        assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+        let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+        let id = snapshot["id"].as_str().unwrap();
+        let metadata_path = Path::new(snapshot["archivePath"].as_str().unwrap())
+            .parent()
+            .unwrap()
+            .join(format!("{id}.json"));
+        let mut metadata: Value =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["serviceEnabled"] = true.into();
+        metadata["serviceRunning"] = true.into();
+        if mode == "scoped-incomplete" {
+            metadata["kind"] = "ocm-env-upgrade-checkpoint-v1".into();
+            metadata["upgradeScope"] = serde_json::json!({"independentPaths": ["project"]});
+            write_text(
+                &root.child("ocm-home/envs/source/project/independent.txt"),
+                "preserve project",
+            );
+        }
+        fs::write(metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        write_text(&marker, "pre-restore-current-state\n");
+        write_executable_script(
+            Path::new(env.get("OCM_INTERNAL_LAUNCHCTL_BIN").unwrap()),
+            include_str!("fixtures/snapshot_restore_service_manager.py"),
+        );
+        write_text(&root.child("mode"), mode);
+        let started = run_ocm(&cwd, &env, &["service", "start", "source"]);
+        assert!(started.status.success(), "{}", stderr(&started));
+        write_text(&root.child("armed"), "reject acceptance");
+        let restored = run_ocm(&cwd, &env, &["env", "snapshot", "restore", "source", id]);
+        assert!(!restored.status.success());
+        assert!(
+            stderr(&restored).contains("failed managed-service acceptance"),
+            "{}",
+            stderr(&restored)
+        );
+        let events: Vec<Value> = fs::read_to_string(root.child("admission-events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let current = get_environment("source", &env, &cwd).unwrap();
+        let operations: Vec<_> = fs::read_dir(root.child("ocm-home/envs"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
+            .collect();
+        if mode.ends_with("incomplete") {
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert!(!current.service_running);
+            assert!(stderr(&restored).contains("automatic service resumption withheld"));
+            assert_eq!(fs::read_to_string(&marker).unwrap(), "snapshot-state\n");
+            assert_eq!(operations.len(), 1);
+            assert_eq!(
+                fs::read_to_string(
+                    operations[0]
+                        .path()
+                        .join("displaced/.openclaw/workspace/restore-marker.txt")
+                )
+                .unwrap(),
+                "pre-restore-current-state\n"
+            );
+        } else {
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert_eq!(events[1]["marker"], "pre-restore-current-state");
+            assert!(current.service_running);
+            assert_eq!(
+                fs::read_to_string(&marker).unwrap(),
+                "pre-restore-current-state\n"
+            );
+            assert_eq!(operations.len(), usize::from(mode == "cleanup-warning"));
+        }
+        if mode == "scoped-incomplete" {
+            assert_eq!(
+                fs::read_to_string(root.child("ocm-home/envs/source/project/independent.txt"))
+                    .unwrap(),
+                "preserve project"
+            );
+        }
+        let status = run_ocm(&cwd, &env, &["service", "status", "source", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+        assert_eq!(status["running"], !mode.ends_with("incomplete"));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn snapshot_restore_sync_failure_restores_data_and_policy() {

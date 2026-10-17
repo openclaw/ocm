@@ -118,9 +118,10 @@ pub(crate) fn replace_owned_entries(
     candidate: &Path,
     displaced: &Path,
     independent: &[PathBuf],
-) -> Result<(), String> {
-    validate_ancestors(current, independent)?;
-    validate_ancestors(candidate, independent)?;
+) -> Result<(), super::snapshots::SnapshotRestoreError> {
+    use super::snapshots::SnapshotRestoreError;
+    validate_ancestors(current, independent).map_err(SnapshotRestoreError::unchanged)?;
+    validate_ancestors(candidate, independent).map_err(SnapshotRestoreError::unchanged)?;
     let mut entries = Vec::new();
     let mut ancestors = Vec::new();
     collect_owned_entries(
@@ -130,18 +131,21 @@ pub(crate) fn replace_owned_entries(
         independent,
         &mut entries,
         &mut ancestors,
-    )?;
+    )
+    .map_err(SnapshotRestoreError::unchanged)?;
     // The sparse backup needs the same directory skeleton for compensation and
     // later service-acceptance rollback, even when an ancestor has no owned child.
     for relative in ancestors {
-        fs::create_dir_all(displaced.join(relative)).map_err(|error| error.to_string())?;
+        fs::create_dir_all(displaced.join(relative))
+            .map_err(|error| error.to_string())
+            .map_err(SnapshotRestoreError::unchanged)?;
     }
     for relative in &entries {
         if path_exists(&displaced.join(relative)) {
-            return Err(format!(
+            return Err(SnapshotRestoreError::unchanged(format!(
                 "scoped restore destination already exists: {}",
                 display_path(&displaced.join(relative))
-            ));
+            )));
         }
     }
     let mut completed: Vec<Replacement> = Vec::new();
@@ -178,13 +182,16 @@ pub(crate) fn replace_owned_entries(
                 Ok::<_, std::io::Error>(())
             })();
             if let Err(revert_error) = revert {
-                return Err(format!(
-                    "scoped restore failed ({error}); compensation failed ({revert_error}); recovery entries retained at {}",
-                    display_path(displaced)
-                ));
+                return Err(SnapshotRestoreError {
+                    message: format!(
+                        "scoped restore failed ({error}); compensation failed ({revert_error}); recovery entries retained at {}",
+                        display_path(displaced)
+                    ),
+                    prior_state_restored: false,
+                });
             }
         }
-        return Err(error);
+        return Err(SnapshotRestoreError::unchanged(error));
     }
     Ok(())
 }

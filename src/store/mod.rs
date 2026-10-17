@@ -102,9 +102,10 @@ pub use runtimes::{
     install_runtime_from_url, list_runtimes, remove_runtime, runtime_integrity_issue,
 };
 pub(crate) use snapshots::{
-    EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
-    create_env_snapshot_from_preparation, ensure_restore_preserves_dev_sources,
-    prepare_env_snapshot_capture, prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
+    EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, SnapshotRestoreError,
+    commit_env_snapshot_restore, create_env_snapshot_from_preparation,
+    ensure_restore_preserves_dev_sources, prepare_env_snapshot_capture,
+    prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
     prepare_upgrade_snapshot_restore, rollback_env_snapshot_restore,
     validate_upgrade_independent_paths,
 };

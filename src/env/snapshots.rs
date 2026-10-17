@@ -5,8 +5,8 @@ use time::{Duration, OffsetDateTime};
 
 use super::{EnvMeta, EnvironmentService};
 use crate::store::{
-    EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
-    create_env_snapshot, create_env_snapshot_from_preparation,
+    EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, SnapshotRestoreError,
+    commit_env_snapshot_restore, create_env_snapshot, create_env_snapshot_from_preparation,
     ensure_restore_preserves_dev_sources, get_env_snapshot, list_all_env_snapshots,
     list_env_snapshots, now_utc, prepare_env_snapshot_capture, prepare_env_snapshot_restore,
     prepare_upgrade_checkpoint_capture, prepare_upgrade_snapshot_restore, remove_env_snapshot,
@@ -240,14 +240,16 @@ impl<'a> EnvironmentService<'a> {
         &self,
         options: RestoreEnvSnapshotOptions,
     ) -> Result<EnvSnapshotRestoreSummary, String> {
-        let transaction = self.prepare_snapshot_restore_locked(options)?;
+        let transaction = self
+            .prepare_snapshot_restore_locked(options)
+            .map_err(|error| error.to_string())?;
         Ok(self.commit_snapshot_restore_locked(transaction))
     }
 
     pub(crate) fn prepare_snapshot_restore_locked(
         &self,
         options: RestoreEnvSnapshotOptions,
-    ) -> Result<EnvSnapshotRestoreTransaction, String> {
+    ) -> Result<EnvSnapshotRestoreTransaction, SnapshotRestoreError> {
         let transaction = prepare_env_snapshot_restore(options, self.env, self.cwd)?;
         self.sync_snapshot_restore_locked(transaction, None)
     }
@@ -258,24 +260,32 @@ impl<'a> EnvironmentService<'a> {
         runtime_guard: Option<&crate::store::RuntimeMutationGuard>,
     ) -> Result<EnvSnapshotRestoreTransaction, String> {
         let transaction =
-            prepare_upgrade_snapshot_restore(options, runtime_guard, self.env, self.cwd)?;
+            prepare_upgrade_snapshot_restore(options, runtime_guard, self.env, self.cwd)
+                .map_err(|error| error.to_string())?;
         self.sync_snapshot_restore_locked(transaction, runtime_guard)
+            .map_err(|error| error.to_string())
     }
 
     fn sync_snapshot_restore_locked(
         &self,
         transaction: EnvSnapshotRestoreTransaction,
         runtime_guard: Option<&crate::store::RuntimeMutationGuard>,
-    ) -> Result<EnvSnapshotRestoreTransaction, String> {
+    ) -> Result<EnvSnapshotRestoreTransaction, SnapshotRestoreError> {
         let env_name = &transaction.summary.env_name;
         if let Err(sync_error) = sync_supervisor_env_if_present(self.env, self.cwd, env_name) {
             let error = format!("snapshot restore failed supervisor synchronization: {sync_error}");
             return Err(
                 match self.rollback_snapshot_restore_with_guard_locked(transaction, runtime_guard) {
-                    Ok(()) => {
-                        format!("{error}; pre-restore environment root and registry were restored")
-                    }
-                    Err(rollback_error) => format!("{error}; {rollback_error}"),
+                    Ok(()) => SnapshotRestoreError {
+                        message: format!(
+                            "{error}; pre-restore environment root and registry were restored"
+                        ),
+                        prior_state_restored: true,
+                    },
+                    Err(rollback_error) => SnapshotRestoreError {
+                        message: format!("{error}; {rollback_error}"),
+                        prior_state_restored: rollback_error.prior_state_restored,
+                    },
                 },
             );
         }
@@ -292,7 +302,7 @@ impl<'a> EnvironmentService<'a> {
     pub(crate) fn rollback_snapshot_restore_locked(
         &self,
         transaction: EnvSnapshotRestoreTransaction,
-    ) -> Result<(), String> {
+    ) -> Result<(), SnapshotRestoreError> {
         self.rollback_snapshot_restore_with_guard_locked(transaction, None)
     }
 
@@ -300,10 +310,15 @@ impl<'a> EnvironmentService<'a> {
         &self,
         transaction: EnvSnapshotRestoreTransaction,
         runtime_guard: Option<&crate::store::RuntimeMutationGuard>,
-    ) -> Result<(), String> {
+    ) -> Result<(), SnapshotRestoreError> {
         let env_name = transaction.summary.env_name.clone();
         let cleanup_warning =
-            rollback_env_snapshot_restore(transaction, runtime_guard, self.env, self.cwd)?;
+            rollback_env_snapshot_restore(transaction, runtime_guard, self.env, self.cwd).map_err(
+                |message| SnapshotRestoreError {
+                    message,
+                    prior_state_restored: false,
+                },
+            )?;
         let sync_result = sync_supervisor_env_if_present(self.env, self.cwd, &env_name).map(|_| ());
         let result = match (cleanup_warning, sync_result) {
             (None, Ok(())) => Ok(()),
@@ -313,7 +328,10 @@ impl<'a> EnvironmentService<'a> {
                 "{cleanup_warning}; supervisor resync also failed: {sync_error}"
             )),
         };
-        result.map_err(|error| format!("pre-restore environment root and registry were restored; recovery requires attention: {error}"))
+        result.map_err(|error| SnapshotRestoreError {
+            message: format!("pre-restore environment root and registry were restored; recovery requires attention: {error}"),
+            prior_state_restored: true,
+        })
     }
 
     pub fn remove_snapshot(
@@ -515,6 +533,8 @@ mod tests {
             let error = service
                 .rollback_snapshot_restore_locked(transaction)
                 .unwrap_err();
+            assert!(!error.prior_state_restored);
+            let error = error.message;
             assert!(
             error.contains(
                 if scoped { "failed to restore the environment registry entry; the restored owned entries were reinstated" } else { "failed to restore the environment registry entry; the restored root was reinstated" }
@@ -567,6 +587,8 @@ mod tests {
         let error = service
             .rollback_snapshot_restore_locked(transaction)
             .unwrap_err();
+        assert!(error.prior_state_restored);
+        let error = error.message;
         let operation = std::fs::read_dir(root.path().join("ocm-home/envs"))
             .unwrap()
             .filter_map(Result::ok)
