@@ -518,6 +518,7 @@ Skill Workshop bundles also retain their original bytes, including drafts, suppo
 files, proposal metadata, and rollback receipts. OpenClaw owns their stored hashes
 and target relocation; OCM preserves the historical paths and excludes them from
 copied-runtime-reference diagnostics.
+Migration refuses an active state database that resolves to protected history and rolls back the partial import; passive history and ordinary unprotected database aliases remain supported.
 
 When a configured agent workspace is a repository checkout outside the plain
 OpenClaw home, including through a symlink, migration copies that workspace into
@@ -563,6 +564,8 @@ receipts, plus the runtime JSON/JSONL and text files handled by plain-home migra
 It retains sessions, logs, leases, and other durable state. Unchanged values and
 binary payload columns (including compressed records) retain their bytes. Other
 workspace files and integrity-protected history also retain their bytes.
+Import refuses a selected active database that resolves to protected history and removes the partial target before registration, instead of preserving stale runtime state or changing historical bytes.
+Unselected history and ordinary unprotected database aliases remain supported.
 Authored Board tabs and widgets retain their content, checksums, and associated metadata unchanged, even when their text mentions the original environment root.
 Every other file outside the config and state-reference rewrites stays byte-identical to the archive.
 Migration and state-inclusive import share root-reference matching for plain
@@ -601,6 +604,7 @@ Each database is a coherent committed snapshot; databases and other files are no
 The source stays running and its database contents are not rewritten.
 Clone and upgrade simulation also rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
 External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.
+Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 
 For clone, migration, and adoption, OCM does not classify a package or project
 asset as operational merely because it has a SQLite header or filename.

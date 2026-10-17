@@ -297,27 +297,37 @@ pub(super) fn relocate_copied_databases(
 ) -> Result<BTreeMap<String, u64>, String> {
     let mut counts = BTreeMap::new();
     let mut visited = BTreeSet::new();
-    let global_path = paths.state_dir.join("state/openclaw.sqlite");
-    let global = contained_imported_database(&global_path, &paths.root, true)?;
-    let mut selection = OpenClawSqliteCopy {
-        state_root: &paths.state_dir,
-        registered_agents: BTreeSet::new(),
-    };
+    let global = paths.state_dir.join("state/openclaw.sqlite");
+    // Relocate registry paths before selecting additional agent databases. The
+    // archive may be imported after the original environment has been removed.
+    let global = contained_imported_database(&global, &paths.root, &paths.state_dir, true)?;
     if let Some(database) = &global {
-        // Project the original registry paths exactly once, before any writes.
-        // This also works when the source is gone or its registry is protected.
-        if is_sqlite_database(database)? {
-            selection.read_agent_registry(database, Some((source_roots, &paths.root)))?;
-        }
         relocate_archived_database(
             paths,
             source_roots,
             relocation,
-            &global_path,
             database,
             &mut visited,
             &mut counts,
         )?;
+    }
+    let mut selection = OpenClawSqliteCopy {
+        state_root: &paths.state_dir,
+        registered_agents: BTreeSet::new(),
+    };
+    if let Some(database) = global {
+        if is_sqlite_database(&database)? {
+            selection.read_agent_registry(&database, true)?;
+        }
+    }
+    // Admit explicit owners before traversal can reach another spelling of the
+    // same file. Passive history remains excluded, but a protected registration
+    // must not be silently skipped or first written through its canonical path.
+    let root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
+    for selected in &selection.registered_agents {
+        if fs::canonicalize(selected).is_ok_and(|path| path.starts_with(&root)) {
+            contained_imported_database(selected, &paths.root, &paths.state_dir, true)?;
+        }
     }
     let mut directories = vec![paths.root.clone()];
     while let Some(directory) = directories.pop() {
@@ -328,12 +338,13 @@ pub(super) fn relocate_copied_databases(
             if kind.is_dir() {
                 directories.push(path);
             } else if selection.contains(&path) {
-                if let Some(database) = contained_imported_database(&path, &paths.root, true)? {
+                if let Some(database) =
+                    contained_imported_database(&path, &paths.root, &paths.state_dir, true)?
+                {
                     relocate_archived_database(
                         paths,
                         source_roots,
                         relocation,
-                        &path,
                         &database,
                         &mut visited,
                         &mut counts,
@@ -349,19 +360,11 @@ fn relocate_archived_database(
     paths: &EnvPaths,
     source_roots: &[&Path],
     relocation: DatabasePathRelocation,
-    selected_path: &Path,
     database: &Path,
     visited: &mut BTreeSet<PathBuf>,
     counts: &mut BTreeMap<String, u64>,
 ) -> Result<(), String> {
-    if !visited.insert(database.to_path_buf()) {
-        return Ok(());
-    }
-    // Classify the selected path before changing permissions or opening SQLite
-    // for writing, retaining protected roles along contained aliases.
-    if is_integrity_protected_history_destination(&paths.state_dir, selected_path, database)?
-        || !is_sqlite_database(database)?
-    {
+    if !visited.insert(database.to_path_buf()) || !is_sqlite_database(database)? {
         return Ok(());
     }
     let parent = database.parent().ok_or("imported database has no parent")?;
@@ -1636,6 +1639,7 @@ pub(super) fn clear_cloned_agent_database_leases(target: &EnvPaths) -> Result<()
     let Some(database_path) = contained_imported_database(
         &target.state_dir.join("state/openclaw.sqlite"),
         &target.root,
+        &target.state_dir,
         false,
     )?
     else {
@@ -1670,7 +1674,8 @@ fn relocate_installed_plugin_index_paths(
         PluginPathRelocation::Imported => target_state_root,
         PluginPathRelocation::Cloned { target, .. } => &target.root,
     };
-    let Some(database_path) = contained_imported_database(database_path, database_root, false)?
+    let Some(database_path) =
+        contained_imported_database(database_path, database_root, target_state_root, false)?
     else {
         return Ok(MigratedRuntimeStateResult::default());
     };
@@ -1933,7 +1938,8 @@ fn contained_plugin_path(path: &Path, root: &Path) -> bool {
 
 fn contained_imported_database(
     database_path: &Path,
-    target_state_root: &Path,
+    owned_root: &Path,
+    state_root: &Path,
     allow_contained_link: bool,
 ) -> Result<Option<PathBuf>, String> {
     let metadata = match fs::symlink_metadata(database_path) {
@@ -1953,11 +1959,19 @@ fn contained_imported_database(
             display_path(database_path)
         ));
     }
-    let canonical_root = fs::canonicalize(target_state_root).map_err(|error| error.to_string())?;
+    let canonical_root = fs::canonicalize(owned_root).map_err(|error| error.to_string())?;
     let canonical_database = fs::canonicalize(database_path).map_err(|error| error.to_string())?;
     if !canonical_database.starts_with(&canonical_root) {
         return Err(format!(
             "imported OpenClaw state database must be a regular file inside the imported state: {}",
+            display_path(database_path)
+        ));
+    }
+    // These callers select active copied databases before opening them for
+    // writes. Historical bytes cannot also serve as mutable runtime state.
+    if is_integrity_protected_history_destination(state_root, database_path, &canonical_database)? {
+        return Err(format!(
+            "copied OpenClaw database selects integrity-protected history: {}",
             display_path(database_path)
         ));
     }
@@ -2023,16 +2037,12 @@ impl<'a> OpenClawSqliteCopy<'a> {
         {
             return Ok(selection);
         }
-        selection.read_agent_registry(&database, None)?;
+        selection.read_agent_registry(&database, false)?;
         Ok(selection)
     }
 
-    fn read_agent_registry(
-        &mut self,
-        database: &Path,
-        copied_roots: Option<(&[&Path], &Path)>,
-    ) -> Result<(), String> {
-        let db = if copied_roots.is_some() {
+    fn read_agent_registry(&mut self, database: &Path, archived: bool) -> Result<(), String> {
+        let db = if archived {
             // This is a closed snapshot in the private import copy, with no WAL.
             // Read-only WAL connections otherwise create sidecars on discovery.
             let mut location =
@@ -2058,24 +2068,7 @@ impl<'a> OpenClawSqliteCopy<'a> {
                 .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|error| format!("failed to inspect OpenClaw SQLite owners: {error}"))?;
             for path in paths {
-                let path = path.map_err(|error| error.to_string())?;
-                // Protected registries retain source paths on disk. Project
-                // their owners into the copy without rewriting that history.
-                let path = copied_roots
-                    .and_then(|(sources, target)| {
-                        let target = display_path(target);
-                        sources
-                            .iter()
-                            .filter_map(|source| {
-                                let source = display_path(source);
-                                relocate_rooted_path(&path, &source, &target)
-                                    .map(|path| (source.len(), path))
-                            })
-                            .max_by_key(|(length, _)| *length)
-                            .map(|(_, path)| path)
-                    })
-                    .unwrap_or(path);
-                let path = PathBuf::from(path);
+                let path = PathBuf::from(path.map_err(|error| error.to_string())?);
                 let path = if path.is_absolute() {
                     path
                 } else {
@@ -2712,31 +2705,25 @@ mod tests {
                 db.execute("INSERT INTO session_nodes VALUES (?1)", [&entry])
                     .unwrap();
             }
-            let registry = Connection::open(&history).unwrap();
-            registry
-                .execute_batch("CREATE TABLE agent_databases (path TEXT)")
-                .unwrap();
-            registry
-                .execute(
-                    "INSERT INTO agent_databases VALUES (?1)",
-                    [source
-                        .join(".openclaw/custom/agent.sqlite")
-                        .to_str()
-                        .unwrap()],
-                )
-                .unwrap();
-            drop(registry);
             let selected = paths.state_dir.join("state/openclaw.sqlite");
             fs::create_dir_all(selected.parent().unwrap()).unwrap();
-            std::os::unix::fs::symlink("../skill-workshop/support/history.sqlite", selected)
+            std::os::unix::fs::symlink("../skill-workshop/support/history.sqlite", &selected)
                 .unwrap();
             let before = fs::read(&history).unwrap();
-
-            let counts = relocate_copied_databases(&paths, &[&source], relocation).unwrap();
-
+            let ordinary_before = fs::read(&ordinary).unwrap();
+            let error = relocate_copied_databases(&paths, &[&source], relocation).unwrap_err();
+            assert!(
+                error.contains("selects integrity-protected history"),
+                "{error}"
+            );
             assert_eq!(fs::read(&history).unwrap(), before);
-            assert_eq!(counts.len(), 1);
+            assert_eq!(fs::read(&ordinary).unwrap(), ordinary_before);
+
+            fs::remove_file(&selected).unwrap();
+            std::os::unix::fs::symlink("../custom/agent.sqlite", &selected).unwrap();
+            let counts = relocate_copied_databases(&paths, &[&source], relocation).unwrap();
             assert_eq!(counts[".openclaw/custom/agent.sqlite"], 1);
+            assert_eq!(fs::read(&history).unwrap(), before);
             let db = Connection::open(ordinary).unwrap();
             let copied: String = db
                 .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))

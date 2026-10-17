@@ -741,6 +741,8 @@ The source stays running and its database contents are not rewritten.
 Clone and upgrade simulation also rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
 This includes legacy live session entries that OpenClaw migrates into its current session store.
 External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.
+Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
+The same active-state ownership check applies to migration and its existing import rollback.
 
 OCM does not classify a package or project asset as operational merely because it has a SQLite header or filename.
 Unregistered custom database locations and opaque package, project, import, audit, and Workshop payloads retain their existing copy behavior.
@@ -1018,6 +1020,8 @@ receipts, plus the runtime JSON/JSONL and text files handled by plain-home migra
 It retains sessions, logs, leases, and other durable state. Unchanged values and
 binary payload columns (including compressed records) retain their bytes. Other
 workspace files and integrity-protected history also retain their bytes.
+Import refuses a selected active database that resolves to protected history and removes the partial target before registration, instead of preserving stale runtime state or changing historical bytes.
+Unselected history and ordinary unprotected database aliases remain supported.
 Authored Board tabs and widgets retain their content, checksums, and associated metadata unchanged, even when their text mentions the original environment root.
 Every other file outside the config and state-reference rewrites stays byte-identical to the archive.
 Migration and state-inclusive import share root-reference matching for plain

@@ -344,16 +344,48 @@ fn state_import_preserves_history_reached_through_database_aliases() {
 
     use support::{run_ocm, stderr, stdout};
 
-    for (selection, relative, namespace_alias) in [
-        ("global", "skill-workshop/support/history.sqlite", false),
-        ("agent", "skill-workshop/support/history.sqlite", false),
-        ("registered", "skill-workshop/support/history.sqlite", false),
-        ("none", "skill-workshop/support/history.sqlite", false),
-        ("global", "logs/config-audit.jsonl", false),
-        ("global", "custom/history.sqlite", false),
-        ("global", "skill-workshop/support/history.sqlite", true),
-        ("global", "logs/config-audit.jsonl", true),
-        ("global", "audit/system-agent.jsonl", true),
+    for (selection, relative, namespace_alias, needs_change) in [
+        (
+            "global",
+            "skill-workshop/support/history.sqlite",
+            false,
+            true,
+        ),
+        (
+            "agent",
+            "skill-workshop/support/history.sqlite",
+            false,
+            true,
+        ),
+        (
+            "registered",
+            "skill-workshop/support/history.sqlite",
+            false,
+            true,
+        ),
+        ("none", "skill-workshop/support/history.sqlite", false, true),
+        ("global", "logs/config-audit.jsonl", false, true),
+        ("global", "custom/history.sqlite", false, true),
+        (
+            "global",
+            "skill-workshop/support/history.sqlite",
+            true,
+            true,
+        ),
+        ("global", "logs/config-audit.jsonl", true, true),
+        ("global", "audit/system-agent.jsonl", true, true),
+        (
+            "global",
+            "skill-workshop/support/history.sqlite",
+            false,
+            false,
+        ),
+        (
+            "registered-direct",
+            "skill-workshop/support/history.sqlite",
+            false,
+            false,
+        ),
     ] {
         let root = TestDir::new("import-protected-database-alias");
         let env = ocm_env(&root);
@@ -384,7 +416,11 @@ fn state_import_preserves_history_reached_through_database_aliases() {
             .unwrap();
         db.execute(
             "INSERT INTO paths VALUES (?1)",
-            [source.join("payload").to_str().unwrap()],
+            [if needs_change {
+                source.join("payload").display().to_string()
+            } else {
+                "preserved history".into()
+            }],
         )
         .unwrap();
         let registered_ordinary = selection == "global" && relative != "custom/history.sqlite";
@@ -405,7 +441,11 @@ fn state_import_preserves_history_reached_through_database_aliases() {
                 .unwrap();
             db.execute(
                 "INSERT INTO agent_databases VALUES (?1)",
-                [ordinary.to_str().unwrap()],
+                [if needs_change {
+                    ordinary.display().to_string()
+                } else {
+                    "custom/registered.sqlite".into()
+                }],
             )
             .unwrap();
         }
@@ -425,10 +465,20 @@ fn state_import_preserves_history_reached_through_database_aliases() {
             };
             symlink(format!("{prefix}/{relative}"), selected).unwrap();
         }
-        if selection == "registered" {
+        if selection.starts_with("registered") {
             fs::create_dir_all(state.join("state")).unwrap();
             let db = Connection::open(state.join("state/openclaw.sqlite")).unwrap();
-            db.execute_batch("CREATE TABLE agent_databases (path TEXT); INSERT INTO agent_databases VALUES ('selected/history.sqlite')").unwrap();
+            db.execute_batch("CREATE TABLE agent_databases (path TEXT)")
+                .unwrap();
+            db.execute(
+                "INSERT INTO agent_databases VALUES (?1)",
+                [if selection == "registered-direct" {
+                    relative
+                } else {
+                    "selected/history.sqlite"
+                }],
+            )
+            .unwrap();
         }
         fs::set_permissions(&history, fs::Permissions::from_mode(0o400)).unwrap();
         fs::set_permissions(history.parent().unwrap(), fs::Permissions::from_mode(0o500)).unwrap();
@@ -464,18 +514,56 @@ fn state_import_preserves_history_reached_through_database_aliases() {
         fs::create_dir(&physical).unwrap();
         symlink(&physical, root.child("alias")).unwrap();
         let target = root.child("alias/imported");
-        let imported = run(&[
-            "env",
-            "import",
-            archive.to_str().unwrap(),
-            "--name",
-            "imported",
-            "--root",
-            target.to_str().unwrap(),
-            "--json",
-        ]);
-        let copied = target.join(".openclaw").join(relative);
+        let output = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "import",
+                archive.to_str().unwrap(),
+                "--name",
+                "imported",
+                "--root",
+                target.to_str().unwrap(),
+                "--json",
+            ],
+        );
         let protected = relative != "custom/history.sqlite";
+        if protected && selection != "none" {
+            assert!(!output.status.success());
+            assert!(
+                stderr(&output).contains("selects integrity-protected history"),
+                "{}",
+                stderr(&output)
+            );
+            assert!(!target.exists());
+            let shown = run_ocm(root.path(), &env, &["env", "show", "imported", "--json"]);
+            assert!(!shown.status.success());
+            let original = root.child("offline/.openclaw").join(relative);
+            assert_eq!(fs::read(&original).unwrap(), before);
+            assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+            assert_eq!(
+                fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+            assert_eq!(
+                fs::metadata(original.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o500
+            );
+            fs::set_permissions(
+                original.parent().unwrap(),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            continue;
+        }
+        assert!(output.status.success(), "{}", stderr(&output));
+        let imported: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        let copied = target.join(".openclaw").join(relative);
         if registered_ordinary {
             let db = Connection::open(target.join(".openclaw/custom/registered.sqlite")).unwrap();
             let path: String = db
