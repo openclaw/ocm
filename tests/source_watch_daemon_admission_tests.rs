@@ -171,6 +171,11 @@ impl AdmissionFixture {
     }
 
     fn start_daemon(&mut self) -> Value {
+        self.spawn_daemon();
+        self.suspend_daemon(Duration::from_secs(5))
+    }
+
+    fn spawn_daemon(&mut self) {
         // No services are desired running, so the owned daemon has no child
         // processes. Its real native identity supplies the capability fixture.
         let daemon = Command::new(ocm_test_binary_path())
@@ -186,7 +191,20 @@ impl AdmissionFixture {
         let pid = daemon.id();
         self.daemon = Some(daemon);
         self.set_manager_state("running", pid);
-        let deadline = Instant::now() + Duration::from_secs(5);
+    }
+
+    fn suspend_daemon(&mut self, timeout: Duration) -> Value {
+        let pid = self.daemon.as_ref().unwrap().id();
+        let publication = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                supervisor_state_path(&self.env, &self.cwd)
+                    .unwrap()
+                    .with_extension("lock"),
+            )
+            .unwrap();
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if let Ok(raw) = fs::read(&self.runtime)
                 && let Ok(runtime) = serde_json::from_slice::<Value>(&raw)
@@ -199,23 +217,42 @@ impl AdmissionFixture {
                         .as_str()
                         .is_some_and(|value| !value.is_empty())
                 );
-                // Freeze this empty daemon while invalid metadata is supplied.
-                // Otherwise its last startup publication could race a fixture
-                // write. The direct Child remains unreaped and owns this PID.
-                assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
-                let mut status = 0;
-                let waited = unsafe { libc::waitpid(pid as i32, &mut status, libc::WUNTRACED) };
-                if waited == pid as i32 && !libc::WIFSTOPPED(status) {
-                    self.daemon.take();
-                    panic!("empty daemon exited before fixture suspension");
+                // The runtime rename precedes publication-lock release. Keep
+                // that lock until the empty daemon is confirmed stopped, so it
+                // cannot freeze a lock needed by the operations under test.
+                match publication.try_lock_exclusive() {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("cannot exclude daemon publication: {error}"),
                 }
-                assert_eq!(waited, pid as i32);
-                assert!(libc::WIFSTOPPED(status));
-                return runtime;
+                // The direct Child remains unreaped and owns this PID.
+                assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+                while Instant::now() < deadline {
+                    let mut status = 0;
+                    let waited = unsafe {
+                        libc::waitpid(pid as i32, &mut status, libc::WUNTRACED | libc::WNOHANG)
+                    };
+                    if waited == pid as i32 {
+                        if !libc::WIFSTOPPED(status) {
+                            self.daemon.take();
+                            panic!("empty daemon exited before fixture suspension");
+                        }
+                        return runtime;
+                    }
+                    if waited < 0 {
+                        let error = std::io::Error::last_os_error();
+                        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                panic!("daemon did not stop before the suspension deadline");
             }
             thread::sleep(Duration::from_millis(20));
         }
-        panic!("daemon did not publish its process-bound admission capability");
+        panic!("daemon did not reach a safe publication boundary before the suspension deadline");
     }
 
     fn stop_daemon(&mut self) {
@@ -287,6 +324,97 @@ impl AdmissionFixture {
 impl Drop for AdmissionFixture {
     fn drop(&mut self) {
         self.stop_daemon();
+    }
+}
+
+#[test]
+fn daemon_suspension_excludes_publication_and_cleans_up_on_timeout() {
+    for release_publication in [true, false] {
+        let mut fixture = AdmissionFixture::new("daemon-suspension-publication");
+        fixture.spawn_daemon();
+        let pid = fixture.daemon.as_ref().unwrap().id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if fs::read(&fixture.runtime)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+                .is_some_and(|runtime| runtime["gatewayAdmission"]["process"]["pid"] == pid)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "daemon did not publish");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let publication = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                supervisor_state_path(&fixture.env, &fixture.cwd)
+                    .unwrap()
+                    .with_extension("lock"),
+            )
+            .unwrap();
+        loop {
+            match publication.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("cannot hold publication: {error}"),
+            }
+            assert!(Instant::now() < deadline, "publication remained busy");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = std::panic::catch_unwind(move || {
+                fixture.suspend_daemon(Duration::from_secs(1));
+                fixture
+            });
+            let _ = tx.send(result);
+        });
+        let premature = rx.recv_timeout(Duration::from_millis(100));
+        assert!(matches!(
+            premature,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        if release_publication {
+            FileExt::unlock(&publication).unwrap();
+        }
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        if release_publication {
+            let fixture = result.unwrap();
+            // Both the publication lock and the other locks needed by borrowed
+            // registration must be available while this real daemon is stopped.
+            publication.try_lock_exclusive().unwrap();
+            FileExt::unlock(&publication).unwrap();
+            for path in [
+                env_registry_path(&fixture.env, &fixture.cwd)
+                    .unwrap()
+                    .with_extension("lock"),
+                fixture.definition.with_extension("lifecycle.lock"),
+            ] {
+                let lock = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap();
+                lock.try_lock_exclusive().unwrap();
+            }
+            drop(fixture);
+        } else {
+            let panic = result.err().expect("busy publication did not time out");
+            let message = panic.downcast_ref::<&str>().copied().unwrap_or_default();
+            assert!(message.contains("safe publication boundary"), "{message}");
+        }
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 }
 
