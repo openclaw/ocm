@@ -5,7 +5,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -18,6 +18,8 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
+#[cfg(unix)]
+use crate::infra::process_identity::process_group_members;
 use crate::infra::process_identity::{
     ProcessIdentity, current_process_identity, observe_process, process_scope_id,
 };
@@ -1423,17 +1425,26 @@ impl<'a> SupervisorService<'a> {
             }
         }
 
-        for (_, mut running_child) in running {
-            stop_supervisor_child(&mut running_child);
-        }
+        let mut cleanup_errors = Vec::new();
+        running.retain(|_, child| match stop_supervisor_child(child) {
+            Ok(_) => false,
+            Err(error) => {
+                cleanup_errors.push(error);
+                true
+            }
+        });
         write_supervisor_runtime_state(
             &runtime_path,
             &active_state.ocm_home,
-            &BTreeMap::new(),
+            &running,
             &BTreeMap::new(),
             &BTreeMap::new(),
             &gateway_admission,
         )?;
+
+        if !cleanup_errors.is_empty() {
+            return Err(cleanup_errors.join("; "));
+        }
 
         Ok(SupervisorRunSummary {
             state_path: display_path(state_path),
@@ -1464,6 +1475,7 @@ struct RunningSupervisorChild {
     quick_clean_restart_count: usize,
     restart_handoff_support: RestartHandoffSupport,
     started_at: Instant,
+    cleanup_error: Option<(String, OffsetDateTime)>,
 }
 
 #[derive(Clone)]
@@ -1535,6 +1547,7 @@ fn spawn_running_child(
         quick_clean_restart_count,
         restart_handoff_support,
         started_at: Instant::now(),
+        cleanup_error: None,
     })
 }
 
@@ -1883,10 +1896,21 @@ fn refresh_active_state(
     let mut runtime_dirty = reconcile_running_children(running, pending, inactive, &next_state);
     runtime_dirty |=
         reconcile_restart_requests(&restart_requests, running, pending, inactive, &next_state);
+    // A failed stop is observed, but not acknowledged as a completed restart.
+    // Keep it in active_state too, so an unchanged request does not retry every
+    // poll and delay siblings. A fresh explicit request can retry cleanup.
+    let processed_requests = restart_requests
+        .into_iter()
+        .filter(|request| {
+            running
+                .get(&request.env_name)
+                .is_none_or(|child| child.cleanup_error.is_none())
+        })
+        .collect::<Vec<_>>();
     drop(state_lock);
     *managed_child_count = next_state.children.len();
     *active_state = next_state;
-    clear_processed_restart_requests(state_path, &restart_requests);
+    clear_processed_restart_requests(state_path, &processed_requests);
     runtime_dirty
 }
 
@@ -2005,13 +2029,15 @@ fn reconcile_running_children(
     let active_names = running.keys().cloned().collect::<Vec<_>>();
     for env_name in active_names {
         let Some(next_spec) = desired.get(&env_name) else {
-            if let Some(mut existing) = running.remove(&env_name) {
+            if let Some(existing) = running.get_mut(&env_name) {
                 eprintln!(
                     "ocm service: stopping removed env {}",
                     existing.spec.env_name
                 );
-                stop_supervisor_child(&mut existing);
-                inactive.remove(&env_name);
+                if stop_supervisor_child(existing).is_ok() {
+                    running.remove(&env_name);
+                    inactive.remove(&env_name);
+                }
                 runtime_dirty = true;
             }
             continue;
@@ -2021,21 +2047,24 @@ fn reconcile_running_children(
             .map(|existing| existing.spec != *next_spec)
             .unwrap_or(false);
         if needs_restart {
-            let mut existing = running
-                .remove(&env_name)
+            let existing = running
+                .get_mut(&env_name)
                 .expect("running child should exist when needs_restart is true");
             eprintln!(
                 "ocm service: reloading {} ({})",
                 existing.spec.env_name,
                 child_binding_label(next_spec)
             );
-            stop_supervisor_child(&mut existing);
+            runtime_dirty = true;
+            if stop_supervisor_child(existing).is_err() {
+                continue;
+            }
+            running.remove(&env_name);
+            inactive.remove(&env_name);
             pending.insert(
                 env_name,
                 pending_supervisor_child(next_spec.clone(), None, 0, 0, 0, None, None),
             );
-            inactive.remove(&existing.spec.env_name);
-            runtime_dirty = true;
         }
     }
     queue_missing_children(
@@ -2067,14 +2096,18 @@ fn reconcile_restart_requests(
             continue;
         };
 
-        if let Some(mut existing) = running.remove(&request.env_name) {
+        if let Some(existing) = running.get_mut(&request.env_name) {
             eprintln!(
                 "ocm service: restarting {} ({})",
                 existing.spec.env_name,
                 child_binding_label(&next_spec)
             );
             let restart_count = existing.restart_count + 1;
-            stop_supervisor_child(&mut existing);
+            runtime_dirty = true;
+            if stop_supervisor_child(existing).is_err() {
+                continue;
+            }
+            running.remove(&request.env_name);
             pending.insert(
                 request.env_name.clone(),
                 pending_supervisor_child(next_spec, None, restart_count, 0, 0, None, None),
@@ -2172,36 +2205,25 @@ fn clear_processed_restart_requests(
 
 fn collect_exited_children(
     running: &mut BTreeMap<String, RunningSupervisorChild>,
-) -> Result<Vec<ExitedSupervisorChild>, String> {
+) -> (Vec<String>, bool) {
     let mut exited = Vec::new();
+    let mut runtime_dirty = false;
     for (env_name, running_child) in running {
-        if let Some(status) = running_child.child.try_wait().map_err(|error| {
-            format!(
-                "failed to poll env \"{}\": {error}",
-                running_child.spec.env_name
-            )
-        })? {
-            let ran_for = running_child.started_at.elapsed();
-            let restart_handoff = if status.code() == Some(0) {
-                consume_restart_handoff(
-                    &running_child.spec,
-                    &running_child.restart_handoff_support,
-                    running_child.child.id(),
-                )
-            } else {
-                RestartHandoffConsumeResult::NotChecked
-            };
-            exited.push(ExitedSupervisorChild {
-                env_name: env_name.clone(),
-                exit_code: status.code(),
-                restart_count: running_child.restart_count,
-                quick_clean_restart_count: running_child.quick_clean_restart_count,
-                restart_handoff,
-                ran_for,
-            });
+        // An uncertain stop retains custody until a new request or shutdown.
+        // Retrying on every poll would stall unrelated services repeatedly.
+        if running_child.cleanup_error.is_some() {
+            continue;
+        }
+        match supervisor_child_exited(&mut running_child.child) {
+            Ok(false) => {}
+            Ok(true) => exited.push(env_name.clone()),
+            Err(error) => {
+                retain_supervisor_cleanup_error(running_child, error);
+                runtime_dirty = true;
+            }
         }
     }
-    Ok(exited)
+    (exited, runtime_dirty)
 }
 
 fn process_exited_children(
@@ -2218,14 +2240,40 @@ fn process_exited_children(
         inactive,
         results,
     } = children;
-    let exited = collect_exited_children(running)?;
-    let mut runtime_dirty = false;
+    let (exited, mut runtime_dirty) = collect_exited_children(running);
 
-    for exited_child in exited {
-        let Some(mut previous_child) = running.remove(&exited_child.env_name) else {
+    for env_name in exited {
+        let Some(running_child) = running.get_mut(&env_name) else {
             continue;
         };
-        stop_supervisor_child(&mut previous_child);
+        let ran_for = running_child.started_at.elapsed();
+        let status = match stop_supervisor_child(running_child) {
+            Ok(status) => status,
+            Err(_) => {
+                runtime_dirty = true;
+                continue;
+            }
+        };
+        let restart_handoff = if status.code() == Some(0) {
+            consume_restart_handoff(
+                &running_child.spec,
+                &running_child.restart_handoff_support,
+                running_child.child.id(),
+            )
+        } else {
+            RestartHandoffConsumeResult::NotChecked
+        };
+        let exited_child = ExitedSupervisorChild {
+            env_name: env_name.clone(),
+            exit_code: status.code(),
+            restart_count: running_child.restart_count,
+            quick_clean_restart_count: running_child.quick_clean_restart_count,
+            restart_handoff,
+            ran_for,
+        };
+        // Remove each settled child immediately. Later plan reconciliation or
+        // shutdown must never encounter a reaped handle still marked as owned.
+        let previous_child = running.remove(&env_name).expect("settled child exists");
         runtime_dirty = true;
         results.push(child_run_result(
             &previous_child.spec,
@@ -2590,8 +2638,11 @@ fn start_due_children(
                     inactive,
                     gateway_admission,
                 ) {
-                    if let Some(mut child) = running.remove(&env_name) {
-                        stop_supervisor_child(&mut child);
+                    if let Some(child) = running.get_mut(&env_name) {
+                        if let Err(cleanup_error) = stop_supervisor_child(child) {
+                            return Err(format!("{error}; {cleanup_error}"));
+                        }
+                        running.remove(&env_name);
                     }
                     return Err(error);
                 }
@@ -2636,52 +2687,131 @@ fn start_due_children(
     Ok(runtime_dirty)
 }
 
-fn stop_supervisor_child(running_child: &mut RunningSupervisorChild) {
+fn retain_supervisor_cleanup_error(
+    running_child: &mut RunningSupervisorChild,
+    error: String,
+) -> String {
+    let error = format!(
+        "cleanup is unverified for env \"{}\": {error}; retaining child ownership",
+        running_child.spec.env_name
+    );
+    eprintln!("ocm service: {error}");
+    running_child.cleanup_error = Some((error.clone(), now_utc()));
+    error
+}
+
+fn stop_supervisor_child(running_child: &mut RunningSupervisorChild) -> Result<ExitStatus, String> {
+    match stop_owned_supervisor_child(&mut running_child.child) {
+        Ok(status) => {
+            running_child.cleanup_error = None;
+            Ok(status)
+        }
+        Err(error) => Err(retain_supervisor_cleanup_error(running_child, error)),
+    }
+}
+
+fn stop_owned_supervisor_child(child: &mut Child) -> Result<ExitStatus, String> {
     #[cfg(unix)]
     {
-        let process_group = format!("-{}", running_child.child.id());
-        let _ = Command::new("kill")
-            .args(["-TERM", "--", &process_group])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        for _ in 0..20 {
-            let _ = running_child.child.try_wait();
-            if !supervisor_process_group_exists(&process_group) {
-                break;
-            }
-            sleep(Duration::from_millis(50));
-        }
-        if supervisor_process_group_exists(&process_group) {
-            let _ = Command::new("kill")
-                .args(["-KILL", "--", &process_group])
+        // WNOWAIT keeps even an exited leader's PID reserved through the last
+        // group signal. ECHILD is uncertainty, never permission to signal a PID
+        // whose identity may already have been reused.
+        supervisor_child_exited(child)?;
+        for signal in ["-TERM", "-KILL"] {
+            let process_group = format!("-{}", child.id());
+            let signaled = Command::new("kill")
+                .args([signal, "--", &process_group])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
-            for _ in 0..20 {
-                let _ = running_child.child.try_wait();
-                if !supervisor_process_group_exists(&process_group) {
-                    break;
+            // Some systems reject signals to zombie-only groups. Independent
+            // live-member observation can establish their settlement, but a
+            // failed command or probe must never establish absence by itself.
+            if !matches!(&signaled, Ok(status) if status.success())
+                && supervisor_process_group_exists(child.id())?
+            {
+                return Err(format!(
+                    "failed signaling process group {} with {signal}: {}",
+                    child.id(),
+                    match signaled {
+                        Ok(status) => status.to_string(),
+                        Err(error) => error.to_string(),
+                    }
+                ));
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let settled = loop {
+                if !supervisor_process_group_exists(child.id())? {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    if signal == "-KILL" {
+                        return Err(format!("process group {} did not stop", child.id()));
+                    }
+                    break false;
                 }
                 sleep(Duration::from_millis(50));
+            };
+            if settled {
+                break;
             }
         }
     }
-    // Always wait on the process-group leader. It can exit after try_wait()
-    // reports None but before the group-existence probe; returning in that
-    // window leaves a zombie that can block OpenClaw's single-instance lock.
-    let _ = running_child.child.kill();
-    let _ = running_child.child.wait();
+    // A direct child may have left its original group. Keep that cleanup and
+    // its wait bounded too, and do not discard a failed kill or reap.
+    if !supervisor_child_exited(child)? {
+        child
+            .kill()
+            .map_err(|error| format!("failed stopping child {}: {error}", child.id()))?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !supervisor_child_exited(child)? {
+        if Instant::now() >= deadline {
+            return Err(format!("child {} did not exit", child.id()));
+        }
+        sleep(Duration::from_millis(50));
+    }
+    child
+        .wait()
+        .map_err(|error| format!("failed reaping child {}: {error}", child.id()))
+}
+
+fn supervisor_child_exited(child: &mut Child) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if waited == -1 {
+            return Err(format!(
+                "failed observing child {}: {}",
+                child.id(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        // Darwin can report stopped children despite WEXITED.
+        Ok(unsafe { info.si_pid() } == child.id() as libc::pid_t
+            && matches!(
+                info.si_code,
+                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+            ))
+    }
+    #[cfg(not(unix))]
+    child
+        .try_wait()
+        .map(|status| status.is_some())
+        .map_err(|error| format!("failed observing child {}: {error}", child.id()))
 }
 
 #[cfg(unix)]
-fn supervisor_process_group_exists(process_group: &str) -> bool {
-    Command::new("kill")
-        .args(["-0", "--", process_group])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+fn supervisor_process_group_exists(process_group: u32) -> Result<bool, String> {
+    Ok(!process_group_members(process_group)?.is_empty())
 }
 
 fn supervisor_state_equivalent(left: &SupervisorState, right: &SupervisorState) -> bool {
@@ -3292,8 +3422,11 @@ fn supervisor_runtime_service_running(
         stdout_path: running_child.spec.stdout_path.clone(),
         stderr_path: running_child.spec.stderr_path.clone(),
         last_exit_code: None,
-        last_error: None,
-        last_event_at: None,
+        last_error: running_child
+            .cleanup_error
+            .as_ref()
+            .map(|(error, _)| error.clone()),
+        last_event_at: running_child.cleanup_error.as_ref().map(|(_, at)| *at),
         next_retry_at: None,
     }
 }
@@ -3881,62 +4014,86 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exited_supervisor_child_cleans_remaining_process_group() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "ocm-supervisor-process-group-{}-{}",
-            std::process::id(),
-            now_millis()
-        ));
-        fs::create_dir_all(&test_dir).unwrap();
-        let state_dir = test_dir.join(".openclaw");
-        fs::create_dir(&state_dir).unwrap();
-        let descendant_pid_path = test_dir.join("descendant.pid");
-        let mut spec = child_spec("process-group-cleanup", 19_999);
-        spec.command = Some(
+        for reap_first in [false, true] {
+            let test_dir = std::env::temp_dir().join(format!(
+                "ocm-supervisor-process-group-{}-{}",
+                std::process::id(),
+                now_millis()
+            ));
+            fs::create_dir_all(&test_dir).unwrap();
+            let state_dir = test_dir.join(".openclaw");
+            fs::create_dir(&state_dir).unwrap();
+            let descendant_pid_path = test_dir.join("descendant.pid");
+            let mut spec = child_spec("process-group-cleanup", 19_999);
+            spec.command = Some(
             "trap '' HUP; sleep 60 & descendant=$!; printf '%s' \"$descendant\" > \"$OCM_TEST_DESCENDANT_PID_FILE\"; exit 1"
                 .to_string(),
         );
-        spec.binary_path = None;
-        spec.run_dir = test_dir.to_string_lossy().into_owned();
-        spec.stdout_path = test_dir.join("stdout.log").to_string_lossy().into_owned();
-        spec.stderr_path = test_dir.join("stderr.log").to_string_lossy().into_owned();
-        spec.process_env.insert(
-            "OCM_TEST_DESCENDANT_PID_FILE".to_string(),
-            descendant_pid_path.to_string_lossy().into_owned(),
-        );
-        spec.process_env
-            .insert("OPENCLAW_STATE_DIR".to_string(), display_path(&state_dir));
+            spec.binary_path = None;
+            spec.run_dir = test_dir.to_string_lossy().into_owned();
+            spec.stdout_path = test_dir.join("stdout.log").to_string_lossy().into_owned();
+            spec.stderr_path = test_dir.join("stderr.log").to_string_lossy().into_owned();
+            spec.process_env.insert(
+                "OCM_TEST_DESCENDANT_PID_FILE".to_string(),
+                descendant_pid_path.to_string_lossy().into_owned(),
+            );
+            spec.process_env
+                .insert("OPENCLAW_STATE_DIR".to_string(), display_path(&state_dir));
 
-        let support = probe_restart_handoff_support(&spec);
-        let mut running_child = spawn_running_child(spec, 0, 0, support).unwrap();
-        let process_group = format!("-{}", running_child.child.id());
-        let status = running_child.child.wait().unwrap();
-        assert_eq!(status.code(), Some(1));
-
-        for _ in 0..100 {
-            if descendant_pid_path.exists() {
-                break;
+            let support = probe_restart_handoff_support(&spec);
+            let mut running_child = spawn_running_child(spec, 0, 0, support).unwrap();
+            let process_group = running_child.child.id();
+            for _ in 0..100 {
+                if supervisor_child_exited(&mut running_child.child).unwrap() {
+                    break;
+                }
+                sleep(Duration::from_millis(10));
             }
-            sleep(Duration::from_millis(10));
-        }
-        let descendant_pid = fs::read_to_string(&descendant_pid_path).unwrap();
-        assert!(supervisor_process_group_exists(&process_group));
+            assert!(supervisor_child_exited(&mut running_child.child).unwrap());
 
-        stop_supervisor_child(&mut running_child);
-
-        for _ in 0..100 {
-            let descendant_alive = Command::new("kill")
-                .args(["-0", "--", descendant_pid.trim()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-            if !descendant_alive {
-                break;
+            for _ in 0..100 {
+                if descendant_pid_path.exists() {
+                    break;
+                }
+                sleep(Duration::from_millis(10));
             }
-            sleep(Duration::from_millis(10));
+            let descendant_pid = fs::read_to_string(&descendant_pid_path).unwrap();
+            assert!(supervisor_process_group_exists(process_group).unwrap());
+
+            if reap_first {
+                assert_eq!(running_child.child.wait().unwrap().code(), Some(1));
+                assert!(stop_supervisor_child(&mut running_child).is_err());
+                assert!(
+                    supervisor_process_group_exists(process_group).unwrap(),
+                    "a group was signaled without its leader's custody"
+                );
+                // The fixture still owns this independently observed live descendant.
+                assert_eq!(
+                    unsafe { libc::kill(-(process_group as i32), libc::SIGKILL) },
+                    0
+                );
+            } else {
+                assert_eq!(
+                    stop_supervisor_child(&mut running_child).unwrap().code(),
+                    Some(1)
+                );
+            }
+
+            for _ in 0..100 {
+                let descendant_alive = Command::new("kill")
+                    .args(["-0", "--", descendant_pid.trim()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if !descendant_alive {
+                    break;
+                }
+                sleep(Duration::from_millis(10));
+            }
+            assert!(!supervisor_process_group_exists(process_group).unwrap());
+            let _ = fs::remove_dir_all(test_dir);
         }
-        assert!(!supervisor_process_group_exists(&process_group));
-        let _ = fs::remove_dir_all(test_dir);
     }
 
     #[cfg(unix)]
@@ -3964,7 +4121,7 @@ mod tests {
         let child_pid = running_child.child.id().to_string();
         sleep(Duration::from_millis(50));
 
-        stop_supervisor_child(&mut running_child);
+        stop_supervisor_child(&mut running_child).unwrap();
 
         let child_still_exists = Command::new("kill")
             .args(["-0", "--", &child_pid])
@@ -4140,7 +4297,7 @@ mod tests {
         impl Drop for RunningFixture {
             fn drop(&mut self) {
                 for child in self.0.values_mut() {
-                    stop_supervisor_child(child);
+                    let _ = stop_supervisor_child(child);
                 }
             }
         }
@@ -4210,6 +4367,7 @@ mod tests {
                         "fixture".to_string(),
                     ),
                     started_at: Instant::now(),
+                    cleanup_error: None,
                 },
             )]));
             let mut active = SupervisorState {
