@@ -65,6 +65,41 @@ fn corrupt_environment_bindings(
 }
 
 #[test]
+fn create_environment_rejects_invalid_gateway_ports_before_mutation() {
+    let root = TestDir::new("store-invalid-gateway-port");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let target = root.child("new-env");
+
+    for port in [0, 65536, u32::MAX] {
+        let error = create_environment(
+            CreateEnvironmentOptions {
+                name: "invalid".to_string(),
+                root: Some(path_string(&target)),
+                gateway_port: Some(port),
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: None,
+                dev: None,
+                protected: false,
+            },
+            &env,
+            &cwd,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("gateway port must be between 1 and 65535"),
+            "{error}"
+        );
+        assert!(!target.exists());
+        assert!(!env_registry_path(&env, &cwd).unwrap().exists());
+        assert_eq!(fs::read_dir(&env["OCM_HOME"]).unwrap().count(), 0);
+    }
+}
+
+#[test]
 fn environment_store_round_trip_covers_create_read_list_and_remove() {
     let root = TestDir::new("store-env-flow");
     let cwd = root.child("workspace");

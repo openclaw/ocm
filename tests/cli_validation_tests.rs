@@ -69,19 +69,68 @@ fn runtime_install_rejects_invalid_names() {
 }
 
 #[test]
-fn env_create_rejects_invalid_and_empty_port_values() {
+fn explicit_gateway_ports_reject_invalid_values_without_environment_changes() {
     let root = TestDir::new("cli-invalid-port");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let env = ocm_env(&root);
+    let stores = ensure_store(&env, &cwd).unwrap();
+    let registry = ocm::store::env_registry_path(&env, &cwd).unwrap();
 
-    let zero = run_ocm(&cwd, &env, &["env", "create", "demo", "--port", "0"]);
-    assert_eq!(zero.status.code(), Some(1));
-    assert!(stderr(&zero).contains("--port must be a positive integer"));
+    for prefix in [vec!["env", "create"], vec!["start"], vec!["dev"]] {
+        for (port, error) in [
+            ("0", "--port must be a positive integer"),
+            ("", "--port requires a value"),
+            ("65536", "gateway port must be between 1 and 65535"),
+            ("4294967295", "gateway port must be between 1 and 65535"),
+        ] {
+            let option = format!("--port={port}");
+            let mut args = prefix.clone();
+            args.extend(["demo", option.as_str()]);
+            let output = run_ocm(&cwd, &env, &args);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{args:?}: {}",
+                stderr(&output)
+            );
+            assert!(
+                stderr(&output).contains(error),
+                "{args:?}: {}",
+                stderr(&output)
+            );
+            assert!(!registry.exists(), "{args:?}");
+            assert_eq!(
+                fs::read_dir(&stores.envs_dir).unwrap().count(),
+                0,
+                "{args:?}"
+            );
+        }
+    }
+}
 
-    let empty = run_ocm(&cwd, &env, &["env", "create", "demo", "--port="]);
-    assert_eq!(empty.status.code(), Some(1));
-    assert!(stderr(&empty).contains("--port requires a value"));
+#[test]
+fn env_create_preserves_valid_explicit_gateway_ports() {
+    let root = TestDir::new("cli-valid-port");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    for port in [1, 20000, 65535] {
+        let name = format!("port-{port}");
+        let value = port.to_string();
+        let output = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", &name, "--port", &value, "--json"],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+        let summary: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(summary["gatewayPort"], port);
+        let meta = ocm::store::get_environment(&name, &env, &cwd).unwrap();
+        assert_eq!(meta.gateway_port, Some(port as u32));
+        assert!(!meta.gateway_port_auto_assigned);
+    }
 }
 
 #[test]

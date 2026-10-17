@@ -669,6 +669,9 @@ ocm self update --check
 
 ## Environment lifecycle
 
+`env create`, `start`, and `dev` accept explicit Gateway ports from 1 through 65535 with `--port`.
+An empty, zero, or out-of-range value is rejected before creating an environment or changing its configuration.
+
 New environment roots must be separate. A root cannot equal, contain, or sit
 inside another registered environment root, including through path aliases.
 OCM rejects overlap before creating or copying environment state or registering

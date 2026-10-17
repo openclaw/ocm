@@ -461,6 +461,12 @@ impl Cli {
         Ok(value)
     }
 
+    fn parse_gateway_port(raw: &str) -> Result<u32, String> {
+        let port = Self::parse_positive_u32(raw, "--port")?;
+        crate::store::validate_gateway_port(port).map_err(|error| format!("--port: {error}"))?;
+        Ok(port)
+    }
+
     fn require_option_value(value: Option<String>, name: &str) -> Result<Option<String>, String> {
         match value {
             Some(value) if value.trim().is_empty() => Err(format!("{name} requires a value")),

@@ -502,6 +502,13 @@ pub(crate) fn restore_environment_service_policy(
     Ok(true)
 }
 
+pub(crate) fn validate_gateway_port(port: u32) -> Result<(), String> {
+    if !(1..=u16::MAX as u32).contains(&port) {
+        return Err("gateway port must be between 1 and 65535".to_string());
+    }
+    Ok(())
+}
+
 pub fn create_environment(
     options: CreateEnvironmentOptions,
     env: &BTreeMap<String, String>,
@@ -566,6 +573,9 @@ fn create_environment_with_runtime_validation(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
+    if let Some(port) = options.gateway_port {
+        validate_gateway_port(port)?;
+    }
     let name = validate_name(&options.name, "Environment name")?;
     let registration = DevSourceRegistration::acquire(&name, options.dev.as_ref(), env, cwd)?;
     let service = crate::env::EnvironmentService::new(env, cwd);

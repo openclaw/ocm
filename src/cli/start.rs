@@ -71,7 +71,7 @@ impl Cli {
         let root = Self::require_option_value(root, "--root")?;
         let (args, port_raw) = Self::consume_option(args, "--port")?;
         let gateway_port = match port_raw.as_deref() {
-            Some(raw) => Some(Self::parse_positive_u32(raw, "--port")?),
+            Some(raw) => Some(Self::parse_gateway_port(raw)?),
             None => None,
         };
         let (args, runtime_name) = Self::consume_option(args, "--runtime")?;
