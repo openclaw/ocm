@@ -1000,6 +1000,239 @@ fn adopt_import_copies_an_external_workspace_into_the_disposable_environment() {
     );
 }
 
+#[test]
+fn migration_preserves_shared_workspace_locations() {
+    for adopt in [false, true] {
+        for layout in [
+            "identical",
+            "nested",
+            "outer-agent",
+            "agents-only",
+            "internal",
+            "home-parent",
+        ] {
+            let root = TestDir::new("migrate-shared-workspaces");
+            let source = root.child("input/plain");
+            let outer = match layout {
+                "internal" => source.join("workspace"),
+                "home-parent" => root.child("input"),
+                _ => root.child("input/outer"),
+            };
+            let relative = if layout == "home-parent" {
+                "plain/workspace"
+            } else {
+                "sub"
+            };
+            let inner = outer.join(relative);
+            let unrelated = root.child("input/unrelated");
+            for path in [&source, &inner, &unrelated] {
+                fs::create_dir_all(path).unwrap();
+            }
+            fs::write(inner.join("note.txt"), "shared source").unwrap();
+            fs::write(unrelated.join("note.txt"), "separate source").unwrap();
+            // This sibling is never admitted by the external-workspace plan.
+            fs::write(root.child("input/outside.txt"), "not a workspace").unwrap();
+            let (default, twin) = match layout {
+                "identical" => (outer.clone(), outer.clone()),
+                "outer-agent" => (inner.clone(), outer.clone()),
+                _ => (outer.clone(), inner.clone()),
+            };
+            let agents = if layout == "agents-only" {
+                serde_json::json!({"entries": {
+                    "zulu": {"workspace": outer},
+                    "alpha": {"workspace": outer},
+                    "child": {"workspace": inner},
+                    "separate": {"workspace": unrelated}
+                }})
+            } else if layout == "home-parent" {
+                // No defaults: main's implicit workspace is inside the plain home.
+                serde_json::json!({"list": [
+                    {"id": "main", "default": true},
+                    {"id": "outer", "workspace": outer},
+                    {"id": "separate", "workspace": unrelated}
+                ]})
+            } else {
+                serde_json::json!({"defaults": {"workspace": default}, "list": [
+                    {"id": "twin", "workspace": twin},
+                    {"id": "separate", "workspace": unrelated}
+                ]})
+            };
+            let mut source_value = serde_json::json!({"agents": agents});
+            if layout == "internal" {
+                source_value["env"] = serde_json::json!({"WORKSPACE_ROOT": outer});
+                source_value["agents"]["defaults"]["workspace"] =
+                    serde_json::json!("${WORKSPACE_ROOT}");
+            }
+            let source_config = source_value.to_string();
+            fs::write(source.join("openclaw.json"), &source_config).unwrap();
+            let env = ocm_env(&root);
+            let args = if adopt {
+                vec![
+                    "adopt",
+                    "import",
+                    "--name",
+                    "mira",
+                    source.to_str().unwrap(),
+                ]
+            } else {
+                vec!["migrate", "mira", source.to_str().unwrap()]
+            };
+            let output = run_ocm(root.path(), &env, &args);
+            assert!(output.status.success(), "{layout}: {}", stderr(&output));
+            let state = root.child("ocm-home/envs/mira/.openclaw");
+            let config: serde_json::Value =
+                serde_json::from_slice(&fs::read(state.join("openclaw.json")).unwrap()).unwrap();
+            let agents = &config["agents"];
+            let (a, b, separate) = if layout == "agents-only" {
+                assert_eq!(
+                    agents["entries"]["zulu"]["workspace"],
+                    agents["entries"]["alpha"]["workspace"]
+                );
+                assert_eq!(
+                    agents["entries"]["alpha"]["workspace"],
+                    state.join("workspaces/agents/alpha").to_str().unwrap()
+                );
+                (
+                    &agents["entries"]["alpha"]["workspace"],
+                    &agents["entries"]["child"]["workspace"],
+                    &agents["entries"]["separate"]["workspace"],
+                )
+            } else if layout == "home-parent" {
+                (
+                    &agents["list"][1]["workspace"],
+                    &agents["list"][0]["workspace"],
+                    &agents["list"][2]["workspace"],
+                )
+            } else if layout == "outer-agent" {
+                (
+                    &agents["list"][0]["workspace"],
+                    &agents["defaults"]["workspace"],
+                    &agents["list"][1]["workspace"],
+                )
+            } else {
+                (
+                    &agents["defaults"]["workspace"],
+                    &agents["list"][0]["workspace"],
+                    &agents["list"][1]["workspace"],
+                )
+            };
+            let a = if layout == "internal" {
+                assert_eq!(a, "${WORKSPACE_ROOT}");
+                &config["env"]["WORKSPACE_ROOT"]
+            } else {
+                a
+            };
+            let a = Path::new(a.as_str().unwrap());
+            let b = Path::new(b.as_str().unwrap());
+            let separate = Path::new(separate.as_str().unwrap());
+            let expected = if layout == "identical" {
+                a.to_path_buf()
+            } else {
+                a.join(relative)
+            };
+            assert_eq!(b, expected, "{layout}");
+            fs::write(b.join("shared-write.txt"), "visible through both").unwrap();
+            assert_eq!(
+                fs::read_to_string(expected.join("shared-write.txt")).unwrap(),
+                "visible through both"
+            );
+            assert!(!separate.join("shared-write.txt").exists());
+            assert_eq!(
+                fs::read_to_string(separate.join("note.txt")).unwrap(),
+                "separate source"
+            );
+            assert!(!inner.join("shared-write.txt").exists());
+            assert!(!outer.join("shared-write.txt").exists());
+            assert_eq!(
+                fs::read_to_string(inner.join("note.txt")).unwrap(),
+                "shared source"
+            );
+            assert_eq!(
+                fs::read_to_string(unrelated.join("note.txt")).unwrap(),
+                "separate source"
+            );
+            assert_eq!(
+                fs::read_to_string(source.join("openclaw.json")).unwrap(),
+                source_config
+            );
+            if !matches!(layout, "home-parent" | "internal") {
+                assert!(!a.join("outside.txt").exists());
+                assert!(!state.join("workspaces/default/outside.txt").exists());
+            }
+            if matches!(layout, "identical" | "nested") {
+                assert!(!state.join("workspaces/agents/twin").exists());
+                assert_eq!(a, state.join("workspaces/default"));
+            }
+            if layout == "outer-agent" {
+                assert!(!state.join("workspaces/default").exists());
+            }
+            // Runtime state remains at the existing location even for an outer workspace.
+            assert!(state.join("openclaw.json").is_file());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn migration_preserves_sharing_through_configured_workspace_aliases() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-shared-alias");
+        let source = root.child("plain");
+        let outer = root.child("outer");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(outer.join("child")).unwrap();
+        fs::write(outer.join("child/note.txt"), "source bytes").unwrap();
+        let alias = source.join("workspace");
+        std::os::unix::fs::symlink(&outer, &alias).unwrap();
+        let config = serde_json::json!({"agents": {
+            "defaults": {"workspace": alias},
+            "list": [{"id": "twin", "workspace": outer}, {"id": "child", "workspace": alias.join("child")}]
+        }}).to_string();
+        fs::write(source.join("openclaw.json"), &config).unwrap();
+        let env = ocm_env(&root);
+        let args = if adopt {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "mira",
+                source.to_str().unwrap(),
+            ]
+        } else {
+            vec!["migrate", "mira", source.to_str().unwrap()]
+        };
+        let output = run_ocm(root.path(), &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let state = root.child("ocm-home/envs/mira/.openclaw");
+        let imported: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.join("openclaw.json")).unwrap()).unwrap();
+        let workspace = Path::new(
+            imported["agents"]["defaults"]["workspace"]
+                .as_str()
+                .unwrap(),
+        );
+        assert_eq!(
+            imported["agents"]["list"][0]["workspace"],
+            workspace.to_str().unwrap()
+        );
+        assert_eq!(
+            imported["agents"]["list"][1]["workspace"],
+            workspace.join("child").to_str().unwrap()
+        );
+        fs::write(workspace.join("child/note.txt"), "target write").unwrap();
+        assert_eq!(
+            fs::read_to_string(outer.join("child/note.txt")).unwrap(),
+            "source bytes"
+        );
+        assert_eq!(fs::read_link(&alias).unwrap(), outer);
+        assert_eq!(
+            fs::read_to_string(source.join("openclaw.json")).unwrap(),
+            config
+        );
+        assert!(!state.join("workspaces/agents").exists());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn migrate_copies_deep_external_workspaces_with_bounded_directory_handles() {

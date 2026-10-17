@@ -68,6 +68,7 @@ struct ExternalWorkspaceCopy {
 struct ExternalWorkspaceCopyPlan {
     default_workspace: Option<ExternalWorkspaceCopy>,
     agent_workspaces: BTreeMap<String, ExternalWorkspaceCopy>,
+    copies: Vec<ExternalWorkspaceCopy>,
 }
 
 impl ExternalWorkspaceCopyPlan {
@@ -82,8 +83,8 @@ impl ExternalWorkspaceCopyPlan {
                 display_path(source_home)
             )
         })?;
-        let sources = resolve_plain_openclaw_workspaces(&source_home, env)?
-            .external_workspace_sources_for_migration(&source_home)?;
+        let inventory = resolve_plain_openclaw_workspaces(&source_home, env)?;
+        let sources = inventory.workspace_sources_for_migration(&source_home)?;
         let canonical_target_root = canonicalize_path_allow_missing(&target_paths.root)?;
         let mut plan = Self::default();
         if let Some(source) = sources.default_workspace {
@@ -119,7 +120,59 @@ impl ExternalWorkspaceCopyPlan {
                 ));
             }
         }
+        // Choose only maximal admitted external trees. Iteration order gives an
+        // identical root its default destination first, then the first agent ID.
+        let workspaces = plan
+            .default_workspace
+            .iter()
+            .chain(plan.agent_workspaces.values())
+            .collect::<Vec<_>>();
+        for workspace in &workspaces {
+            if workspace.source.starts_with(&source_home)
+                || workspaces.iter().any(|other| {
+                    workspace.source != other.source && workspace.source.starts_with(&other.source)
+                })
+                || plan
+                    .copies
+                    .iter()
+                    .any(|copy| copy.source == workspace.source)
+            {
+                continue;
+            }
+            plan.copies.push((*workspace).clone());
+        }
+        // Leave ordinary internal references to the existing config relocation,
+        // which preserves authored environment-variable templates.
+        plan.default_workspace = plan.default_workspace.and_then(|mut workspace| {
+            workspace.target = project_workspace(&plan.copies, &workspace.source)?;
+            Some(workspace)
+        });
+        plan.agent_workspaces.retain(|_, workspace| {
+            let Some(target) = project_workspace(&plan.copies, &workspace.source) else {
+                return false;
+            };
+            workspace.target = target;
+            true
+        });
+        // Implicit agent workspaces normally follow the rewritten default.
+        // An outer copy can also contain an implicit workspace in the plain home;
+        // retain that relationship without admitting another source tree.
+        for (agent_id, source) in inventory.agent_workspaces() {
+            let source = canonicalize_path_allow_missing(source)?;
+            if let Some(target) = project_workspace(&plan.copies, &source) {
+                plan.agent_workspaces.insert(
+                    agent_id.to_string(),
+                    ExternalWorkspaceCopy { source, target },
+                );
+            }
+        }
         Ok(plan)
+    }
+
+    fn workspace_copies(&self) -> impl Iterator<Item = (&Path, &Path)> {
+        self.copies
+            .iter()
+            .map(|copy| (copy.source.as_path(), copy.target.as_path()))
     }
 
     fn copy_and_rewrite_config(
@@ -132,13 +185,8 @@ impl ExternalWorkspaceCopyPlan {
         let state_dir = config_path
             .parent()
             .ok_or("missing imported state directory")?;
-        for workspace in self
-            .default_workspace
-            .iter()
-            .chain(self.agent_workspaces.values())
-        {
-            let relative = workspace
-                .target
+        for (source, target) in self.workspace_copies() {
+            let relative = target
                 .strip_prefix(state_dir)
                 .map_err(|error| error.to_string())?;
             let mut parent = state_dir.to_path_buf();
@@ -147,14 +195,11 @@ impl ExternalWorkspaceCopyPlan {
                 parent.push(component);
                 reject_workspace_destination_link(&parent)?;
             }
-            reject_workspace_copy_destination_links(&workspace.source, &workspace.target)?;
+            reject_workspace_copy_destination_links(source, target)?;
         }
         remove_copied_external_default_workspace_link(config_path)?;
-        if let Some(workspace) = &self.default_workspace {
-            copying.copy(&workspace.source, &workspace.target)?;
-        }
-        for workspace in self.agent_workspaces.values() {
-            copying.copy(&workspace.source, &workspace.target)?;
+        for (source, target) in self.workspace_copies() {
+            copying.copy(source, target)?;
         }
         let agent_workspaces = self
             .agent_workspaces
@@ -170,6 +215,18 @@ impl ExternalWorkspaceCopyPlan {
         )?;
         Ok(())
     }
+}
+
+fn project_workspace(copies: &[ExternalWorkspaceCopy], source: &Path) -> Option<PathBuf> {
+    copies.iter().find_map(|copy| {
+        source.strip_prefix(&copy.source).ok().map(|relative| {
+            if relative.as_os_str().is_empty() {
+                copy.target.clone()
+            } else {
+                copy.target.join(relative)
+            }
+        })
+    })
 }
 
 fn reject_workspace_destination_link(path: &Path) -> Result<(), String> {
