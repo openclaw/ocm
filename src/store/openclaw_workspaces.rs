@@ -129,8 +129,10 @@ impl OpenClawWorkspaceInventory {
                 .or_else(|_| preserved_path.strip_prefix(&canonical_archive_root));
             if require_root_spelling && relative.is_err() {
                 return Err(format!(
-                    "configured OpenClaw workspace uses an unsupported environment root spelling: {}",
-                    display_path(preserved_path)
+                    "configured OpenClaw workspace uses an unsupported environment root spelling: {}; use the accepted root {} or canonical root {} in the workspace configuration, then retry export",
+                    display_path(preserved_path),
+                    display_path(&archive_root),
+                    display_path(&canonical_archive_root)
                 ));
             }
             if let Ok(relative) = relative {

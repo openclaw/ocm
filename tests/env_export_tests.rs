@@ -196,7 +196,17 @@ fn default_export_selects_equivalent_workspace_root_spellings() {
             ],
         );
         assert!(!export.status.success());
-        assert!(stderr(&export).contains(error), "{}", stderr(&export));
+        let message = stderr(&export);
+        assert!(message.contains(error), "{message}");
+        if error == "unsupported environment root spelling" {
+            for accepted_root in [&source, &canonical] {
+                assert!(
+                    message.contains(&format!("root {}", accepted_root.display())),
+                    "{message}"
+                );
+            }
+            assert!(message.contains("retry export"), "{message}");
+        }
         assert!(!output.exists());
         assert_eq!(
             fs::read(source.join(".openclaw/openclaw.json")).unwrap(),
