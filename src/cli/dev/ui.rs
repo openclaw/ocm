@@ -853,6 +853,7 @@ for (const name of ['vite', 'dompurify']) {
                 .env_clear()
                 .envs(build_openclaw_dev_source_env(meta, &self.env, source))
                 .current_dir(source);
+            let spawn_admission = self.lock_source_watch_gateway_spawn(&meta.name)?;
             children.push(spawn_ui_child(
                 gateway,
                 DevUiChildRole::Gateway,
@@ -882,6 +883,7 @@ for (const name of ['vite', 'dompurify']) {
                     lease,
                 )?;
             override_token = Some(active.token.clone());
+            drop(spawn_admission);
             for child in &mut children {
                 if source_watch_cancelled(lease, stop)? {
                     return Ok(130);

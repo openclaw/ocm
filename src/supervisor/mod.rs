@@ -548,6 +548,15 @@ impl<'a> SupervisorService<'a> {
     /// Admission excludes new children; retain uncertain or unacknowledged ownership,
     /// including records left behind by an exited daemon.
     pub(crate) fn ensure_dev_rebind_quiescent(&self, env_name: &str) -> Result<(), String> {
+        self.ensure_background_gateway_quiescent(env_name, "rebinding")
+    }
+
+    pub(crate) fn ensure_background_gateway_quiescent(
+        &self,
+        env_name: &str,
+        action: &str,
+    ) -> Result<(), String> {
+        self.ensure_retained_ownership_recovered(env_name)?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let Some(runtime) = self.read_runtime_state()? else {
@@ -556,9 +565,9 @@ impl<'a> SupervisorService<'a> {
             if runtime.kind != SUPERVISOR_RUNTIME_KIND
                 || runtime.ocm_home != display_path(&resolve_ocm_home(self.env, self.cwd)?)
             {
-                return Err(
-                    "cannot verify background service ownership before dev rebind".to_string(),
-                );
+                return Err(format!(
+                    "cannot verify background service ownership before {action}"
+                ));
             }
             let has_child = runtime
                 .children
@@ -580,16 +589,16 @@ impl<'a> SupervisorService<'a> {
                 })
             {
                 return Err(format!(
-                    "background ownership for env {env_name} has not stopped; stop its service and verify shutdown before rebinding"
+                    "background ownership for env {env_name} has not stopped; stop its service and verify shutdown before {action}"
                 ));
             }
             // Service stop may return before the next daemon reconciliation.
             // Wait only for a current daemon's terminal record to be retired;
             // stale records and unknown processes never establish quiescence.
-            self.ensure_gateway_admission_compatible("rebind dev source")?;
+            self.ensure_gateway_admission_compatible(action)?;
             if self.live_runtime_state()?.is_none() || Instant::now() >= deadline {
                 return Err(format!(
-                    "background ownership for env {env_name} has not been retired; verify service shutdown before rebinding"
+                    "background ownership for env {env_name} has not been retired; verify service shutdown before {action}"
                 ));
             }
             sleep(Duration::from_millis(25));
@@ -3564,6 +3573,76 @@ mod tests {
             skipped_envs: Vec::new(),
             restart_requests,
         }
+    }
+
+    #[test]
+    fn unplanned_pending_publication_requires_positive_stopped_policy_to_drop_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([("OCM_HOME".into(), display_path(&root.path().join("store")))]);
+        let service = EnvironmentService::new(&env, root.path());
+        service
+            .create(crate::env::CreateEnvironmentOptions {
+                name: "demo".into(),
+                root: None,
+                gateway_port: Some(19999),
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: None,
+                dev: None,
+                protected: false,
+            })
+            .unwrap();
+        crate::store::set_environment_service_policy(
+            "demo",
+            Some(true),
+            Some(true),
+            &env,
+            root.path(),
+        )
+        .unwrap();
+        let supervisor = SupervisorService::new(&env, root.path());
+        let state = supervisor.build_state().unwrap();
+        assert!(state.children.is_empty());
+        assert_eq!(state.skipped_envs[0].env_name, "demo");
+        write_json(&supervisor_state_path(&env, root.path()).unwrap(), &state).unwrap();
+        let runtime_path = supervisor_runtime_path(&env, root.path()).unwrap();
+        let mut next: SupervisorRuntimeState = serde_json::from_value(serde_json::json!({
+            "kind":SUPERVISOR_RUNTIME_KIND, "ocmHome":env["OCM_HOME"],
+            "updatedAt":"2026-01-01T00:00:00Z", "children":[], "retainedOwnership":[],
+            "services":[{"envName":"demo", "bindingKind":"launcher", "bindingName":"old",
+                "gatewayState":"pending", "restartCount":0, "childPort":19999,
+                "pid":null, "stdoutPath":"out", "stderrPath":"err"}]
+        }))
+        .unwrap();
+        ownership::write_runtime(&runtime_path, next.clone()).unwrap();
+        assert_eq!(
+            supervisor
+                .read_runtime_state()
+                .unwrap()
+                .unwrap()
+                .services
+                .len(),
+            1
+        );
+        crate::store::set_environment_service_policy("demo", None, Some(false), &env, root.path())
+            .unwrap();
+        ownership::write_runtime(&runtime_path, next.clone()).unwrap();
+        assert!(
+            supervisor
+                .read_runtime_state()
+                .unwrap()
+                .unwrap()
+                .services
+                .is_empty()
+        );
+        // A missing registry entry cannot establish stopped policy.
+        next.services[0].env_name = "unknown".into();
+        ownership::write_runtime(&runtime_path, next).unwrap();
+        assert_eq!(
+            supervisor.read_runtime_state().unwrap().unwrap().services[0].env_name,
+            "unknown"
+        );
     }
 
     #[test]

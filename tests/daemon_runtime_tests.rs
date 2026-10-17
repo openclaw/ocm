@@ -1814,7 +1814,14 @@ fn service_start_failure_preserves_live_sibling(ordinal: usize, reply: &str) {
         );
         assert!(marker.exists());
         assert!(daemon.try_wait().unwrap().is_none());
-        assert!(process_exists(pid as u32));
+        assert!(
+            process_exists(pid as u32),
+            "sibling exited after observation fault ordinal={ordinal}, reply={reply:?}; initial={initial}; current={}; stderr={}; stops={}",
+            fs::read_to_string(&runtime_path).unwrap_or_default(),
+            fs::read_to_string(initial["children"][0]["stderrPath"].as_str().unwrap())
+                .unwrap_or_default(),
+            fs::read_to_string(&stopped_path).unwrap_or_default(),
+        );
         assert_eq!(persisted_child(&state_path, "sibling"), before);
         let status = run_ocm(&cwd, &env, &["service", "status", "sibling", "--json"]);
         assert!(status.status.success(), "{}", stderr(&status));
@@ -2447,6 +2454,7 @@ fn replacement_retains_claims_until_exact_operator_recovery() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(root);
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
     install_fake_launchctl(root, &mut env);
     let gateway = root.child("bin/ownership-gateway");
     write_executable_script(
@@ -2506,8 +2514,14 @@ while not (root / ('exit-' + name)).exists():
                 &root.child(format!("beats-{name}")),
                 Duration::from_secs(10)
             ),
-            "child did not execute: {}",
-            fs::read_to_string(root.child(format!("ocm-home/supervisor/logs/{name}.stderr.log")))
+            "child {name} did not execute; runtime={initial}; stderr={}",
+            initial["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["envName"] == name)
+                .and_then(|row| row["stderrPath"].as_str())
+                .map(|path| fs::read_to_string(path).unwrap_or_default())
                 .unwrap_or_default()
         );
     }
@@ -2655,6 +2669,20 @@ while not (root / ('exit-' + name)).exists():
     loop {
         let runtime: Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
         assert!(runtime_child_pid(&runtime, "source").is_none());
+        assert!(
+            !runtime["services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["envName"] == "source")
+        );
+        assert!(
+            !runtime["retainedOwnership"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["envName"] == "source")
+        );
         if runtime_child_pid(&runtime, "extra").is_some_and(|pid| pid != extra_pid) {
             break;
         }
@@ -2680,6 +2708,13 @@ while not (root / ('exit-' + name)).exists():
         final_state["retainedOwnership"]
     );
     assert!(runtime_child_pid(&second, "source").is_none());
+    assert!(
+        !second["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["envName"] == "source")
+    );
 }
 
 #[test]

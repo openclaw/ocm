@@ -179,11 +179,25 @@ pub(super) fn write_runtime(path: &Path, mut next: SupervisorRuntimeState) -> Re
             .map(|spec| spec.env_name.as_str())
             .collect();
         let retained = next.retained_envs();
-        next.services.retain(|row| {
-            row.pid.is_some()
-                || retained.contains(&row.env_name)
-                || desired_names.contains(row.env_name.as_str())
-        });
+        let unplanned = |row: &SupervisorRuntimeService| {
+            row.pid.is_none()
+                && !retained.contains(&row.env_name)
+                && !desired_names.contains(row.env_name.as_str())
+        };
+        if next.services.iter().any(unplanned) {
+            // A missing binding can remove a plan without changing running
+            // intent. Only positive stopped policy permits dropping its row.
+            // Admission excludes a policy change across an admitted spawn.
+            let store_env = BTreeMap::from([("OCM_HOME".to_string(), next.ocm_home.clone())]);
+            let stopped: BTreeSet<_> =
+                crate::store::list_environments(&store_env, Path::new(&next.ocm_home))?
+                    .into_iter()
+                    .filter(|meta| !meta.service_running)
+                    .map(|meta| meta.name)
+                    .collect();
+            next.services
+                .retain(|row| !unplanned(row) || !stopped.contains(&row.env_name));
+        }
         next.children.sort_by(|a, b| a.env_name.cmp(&b.env_name));
         next.services.sort_by(|a, b| a.env_name.cmp(&b.env_name));
         return write_json(path, &next);
@@ -288,6 +302,34 @@ impl SupervisorService<'_> {
                     "env {name} has unresolved retained service ownership; inspect it with `ocm service recover {name}`"
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Retained claims remain authoritative even when the native daemon is absent.
+    pub(crate) fn ensure_retained_ownership_recovered(&self, name: &str) -> Result<(), String> {
+        if self
+            .read_runtime_state()?
+            .is_some_and(|runtime| runtime.retained_envs().contains(name))
+        {
+            return Err(format!(
+                "env {name} has unresolved retained service ownership; inspect it with `ocm service recover {name}`"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Caller holds state publication and target admission through foreground
+    /// child ownership publication. Never wait for a writer under these locks.
+    pub(crate) fn ensure_foreground_gateway_unowned(&self, name: &str) -> Result<(), String> {
+        self.ensure_retained_ownership_recovered(name)?;
+        let home = display_path(&resolve_ocm_home(self.env, self.cwd)?);
+        if read_runtime(&supervisor_runtime_path(self.env, self.cwd)?, &home)?
+            .is_some_and(|runtime| runtime.row_envs().contains(name))
+        {
+            return Err(format!(
+                "background ownership for env {name} has not been retired; foreground Gateway was not started"
+            ));
         }
         Ok(())
     }

@@ -208,6 +208,8 @@ impl<'a> ServiceService<'a> {
         &self,
         name: &str,
     ) -> Result<Option<ServiceMaintenanceState>, String> {
+        crate::supervisor::SupervisorService::new(self.env, self.cwd)
+            .ensure_retained_ownership_recovered(name)?;
         let status = self.status(name)?;
         let meta = crate::env::EnvironmentService::new(self.env, self.cwd).get(name)?;
         let state = ServiceMaintenanceState {

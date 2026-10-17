@@ -206,6 +206,7 @@ pub fn restart_service(
     cwd: &Path,
 ) -> Result<ServiceActionSummary, String> {
     EnvironmentService::new(env, cwd).ensure_source_watch_allows_service(name)?;
+    SupervisorService::new(env, cwd).ensure_retained_ownership_recovered(name)?;
     ensure_gateway_binding(name, env, cwd)?;
     let env_service = EnvironmentService::new(env, cwd);
     let meta = env_service.get(name)?;
