@@ -21,11 +21,27 @@ def runtime():
     port=meta.get('gatewayPort') or 18789
     shared={'envName':'source','bindingKind':'launcher','bindingName':'stable','pid':4242,'restartCount':0,'childPort':port,'stdoutPath':str(case/'stdout.log'),'stderrPath':str(case/'stderr.log')}
     data={'kind':'ocm-supervisor-runtime','ocmHome':str(home),'daemonVersion':os.environ['OCM_TEST_VERSION'],'gatewayAdmission':json.loads(os.environ['OCM_TEST_GATEWAY_ADMISSION']),'updatedAt':datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),'children':[shared] if active else [],'services':[dict(shared,gatewayState='running',restartHandoff='none')] if active else []}
+    mode = (case/'mode').read_text()
+    if (case/'fault-path').exists() and 'retained-' in mode:
+        p=home/'supervisor/runtime.json'
+        if (case/'retained-runtime').exists(): return
+        if 'retained-sibling' in mode: shared['envName']='sibling'
+        data['children']=[shared]
+        data['services']=[dict(shared,gatewayState='running',restartHandoff='none')]
+        if 'retained-terminal' in mode:
+            data['children']=[]
+            data['services'][0].update(pid=None,gatewayState='stopped')
+        if 'retained-foreign' in mode:
+            data.update(ocmHome=str(case/'foreign-store'),children=[],services=[])
+        # Retained legacy records do not establish current process identity.
+        data.pop('gatewayAdmission')
+        (case/'retained-runtime').write_text('preserve until owner retires')
     p=home/'supervisor/runtime.json'
     p.parent.mkdir(parents=True,exist_ok=True)
     tmp=p.with_suffix('.fixture-tmp')
     tmp.write_text(json.dumps(data));tmp.replace(p)
 if args[0]=='bootstrap':
+    (case/'daemon-definition').write_text('path = '+args[-1])
     if (case/'armed').exists():
         counter=case/'bootstrap-count'
         count=int(counter.read_text())+1 if counter.exists() else 1
@@ -53,6 +69,12 @@ if args[0] in ('bootout','unload'):
         sys.exit(1)
     printed.unlink(missing_ok=True);runtime();sys.exit(0)
 if args[0]=='print':
+    if (case/'fault-path').exists() and 'retained-' in (case/'mode').read_text():
+        runtime()
+        if (case/'mode').read_text().endswith('stopped'):
+            print('state = stopped\n'+next(line for line in (case/'daemon-definition').read_text().splitlines() if line.startswith('path = ')))
+            sys.exit(0)
+        print('Could not find service "'+args[-1].rsplit('/',1)[-1]+'" in domain for user gui',file=sys.stderr);sys.exit(1)
     if (case/'fault-path').exists() and not metadata()['serviceRunning']:
         mode = (case/'mode').read_text()
         if mode.endswith('foreign-path') or mode.endswith('missing-path'):

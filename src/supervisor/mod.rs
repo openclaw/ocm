@@ -594,22 +594,27 @@ impl<'a> SupervisorService<'a> {
         } else {
             self.daemon_status()?
         };
-        let runtime = if daemon.running {
+        // Daemon exit does not acknowledge shutdown of its separately grouped
+        // children. Recovery must retain those records until the owner retires
+        // them; ordinary informational inspection keeps its existing semantics.
+        let runtime = if checked || daemon.running {
             self.read_runtime_state()?
         } else {
             None
         };
 
-        if checked && daemon.running {
-            let runtime = runtime
-                .as_ref()
-                .ok_or("running supervisor has no runtime observation")?;
+        if checked && let Some(runtime) = &runtime {
             if runtime.kind != SUPERVISOR_RUNTIME_KIND || runtime.ocm_home != daemon.ocm_home {
                 return Err(
                     "supervisor runtime observation does not belong to this store".to_string(),
                 );
             }
+        }
+
+        if checked && daemon.running {
             runtime
+                .as_ref()
+                .ok_or("running supervisor has no runtime observation")?
                 .gateway_admission
                 .as_ref()
                 .ok_or("running supervisor has no process identity in its runtime observation")?

@@ -1213,6 +1213,11 @@ fn snapshot_restore_service_resumption_requires_recovered_data() {
         "full-incomplete-observation-fails",
         "full-incomplete-foreign-path",
         "full-incomplete-missing-path",
+        "full-incomplete-retained-child-stopped",
+        "full-incomplete-retained-child-absent",
+        "full-incomplete-retained-terminal-absent",
+        "full-incomplete-retained-sibling-absent",
+        "full-incomplete-retained-foreign-absent",
         "cleanup-warning",
     ] {
         let root = TestDir::new("snapshot-service-recovery");
@@ -1296,8 +1301,32 @@ fn snapshot_restore_service_resumption_requires_recovered_data() {
             if mode.ends_with("sync-fails")
                 || mode.ends_with("observation-fails")
                 || mode.ends_with("-path")
+                || (mode.contains("retained-") && !mode.contains("retained-sibling"))
             {
                 assert!(stderr(&restored).contains("quiescing the managed service also failed"));
+                assert!(!stderr(&restored).contains("managed service stopped"));
+            } else {
+                assert!(stderr(&restored).contains("managed service stopped"));
+            }
+            if mode.contains("retained-") {
+                let runtime: Value = serde_json::from_slice(
+                    &fs::read(root.child("ocm-home/supervisor/runtime.json")).unwrap(),
+                )
+                .unwrap();
+                if mode.contains("retained-foreign") {
+                    assert!(runtime["services"].as_array().unwrap().is_empty());
+                    assert!(stderr(&restored).contains("does not belong to this store"));
+                } else {
+                    assert_eq!(runtime["services"].as_array().unwrap().len(), 1);
+                    assert_eq!(
+                        runtime["services"][0]["envName"],
+                        if mode.contains("retained-sibling") {
+                            "sibling"
+                        } else {
+                            "source"
+                        }
+                    );
+                }
             }
             assert_eq!(fs::read_to_string(&marker).unwrap(), "snapshot-state\n");
             assert_eq!(operations.len(), 1);
