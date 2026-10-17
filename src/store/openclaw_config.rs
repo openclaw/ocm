@@ -1337,7 +1337,7 @@ fn rewrite_env_root_string(raw: &mut String, source_root: &Path, target_root: &P
     true
 }
 
-fn normalize_path_allow_missing(path: &Path) -> Option<PathBuf> {
+pub(super) fn normalize_path_allow_missing(path: &Path) -> Option<PathBuf> {
     let mut existing = path;
     let mut missing = Vec::<OsString>::new();
     loop {

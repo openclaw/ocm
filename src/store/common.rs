@@ -319,6 +319,10 @@ impl<'a> OpenClawDirectoryCopy<'a> {
     pub(crate) fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), String> {
         copy_dir_recursive_inner(source, destination, Some(self), None)
     }
+
+    pub(crate) fn databases(&self) -> &HashSet<PathBuf> {
+        &self.databases
+    }
 }
 
 fn copy_dir_recursive_inner(
