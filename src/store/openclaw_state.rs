@@ -317,7 +317,7 @@ pub(super) fn relocate_copied_databases(
     };
     if let Some(database) = global {
         if is_sqlite_database(&database)? {
-            selection.read_agent_registry(&database, true)?;
+            selection.read_agent_registry(&database, Some((source_roots, &paths.root)))?;
         }
     }
     let mut directories = vec![paths.root.clone()];
@@ -1967,12 +1967,16 @@ impl<'a> OpenClawSqliteCopy<'a> {
         {
             return Ok(selection);
         }
-        selection.read_agent_registry(&database, false)?;
+        selection.read_agent_registry(&database, None)?;
         Ok(selection)
     }
 
-    fn read_agent_registry(&mut self, database: &Path, archived: bool) -> Result<(), String> {
-        let db = if archived {
+    fn read_agent_registry(
+        &mut self,
+        database: &Path,
+        copied_roots: Option<(&[&Path], &Path)>,
+    ) -> Result<(), String> {
+        let db = if copied_roots.is_some() {
             // This is a closed snapshot in the private import copy, with no WAL.
             // Read-only WAL connections otherwise create sidecars on discovery.
             let mut location =
@@ -1998,7 +2002,24 @@ impl<'a> OpenClawSqliteCopy<'a> {
                 .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|error| format!("failed to inspect OpenClaw SQLite owners: {error}"))?;
             for path in paths {
-                let path = PathBuf::from(path.map_err(|error| error.to_string())?);
+                let path = path.map_err(|error| error.to_string())?;
+                // Protected registries retain source paths on disk. Project
+                // their owners into the copy without rewriting that history.
+                let path = copied_roots
+                    .and_then(|(sources, target)| {
+                        let target = display_path(target);
+                        sources
+                            .iter()
+                            .filter_map(|source| {
+                                let source = display_path(source);
+                                relocate_rooted_path(&path, &source, &target)
+                                    .map(|path| (source.len(), path))
+                            })
+                            .max_by_key(|(length, _)| *length)
+                            .map(|(_, path)| path)
+                    })
+                    .unwrap_or(path);
+                let path = PathBuf::from(path);
                 let path = if path.is_absolute() {
                     path
                 } else {
@@ -2565,7 +2586,7 @@ mod tests {
             let history = paths
                 .state_dir
                 .join("skill-workshop/support/history.sqlite");
-            let ordinary = paths.state_dir.join("memory/main.sqlite");
+            let ordinary = paths.state_dir.join("custom/agent.sqlite");
             let entry = serde_json::json!({"spawnedCwd": source.join("workspace")}).to_string();
             for database in [&history, &ordinary] {
                 fs::create_dir_all(database.parent().unwrap()).unwrap();
@@ -2575,11 +2596,23 @@ mod tests {
                 db.execute("INSERT INTO session_nodes VALUES (?1)", [&entry])
                     .unwrap();
             }
-            let selected = paths
-                .state_dir
-                .join("agents/main/agent/openclaw-agent.sqlite");
+            let registry = Connection::open(&history).unwrap();
+            registry
+                .execute_batch("CREATE TABLE agent_databases (path TEXT)")
+                .unwrap();
+            registry
+                .execute(
+                    "INSERT INTO agent_databases VALUES (?1)",
+                    [source
+                        .join(".openclaw/custom/agent.sqlite")
+                        .to_str()
+                        .unwrap()],
+                )
+                .unwrap();
+            drop(registry);
+            let selected = paths.state_dir.join("state/openclaw.sqlite");
             fs::create_dir_all(selected.parent().unwrap()).unwrap();
-            std::os::unix::fs::symlink("../../../skill-workshop/support/history.sqlite", selected)
+            std::os::unix::fs::symlink("../skill-workshop/support/history.sqlite", selected)
                 .unwrap();
             let before = fs::read(&history).unwrap();
 
@@ -2587,7 +2620,7 @@ mod tests {
 
             assert_eq!(fs::read(&history).unwrap(), before);
             assert_eq!(counts.len(), 1);
-            assert_eq!(counts[".openclaw/memory/main.sqlite"], 1);
+            assert_eq!(counts[".openclaw/custom/agent.sqlite"], 1);
             let db = Connection::open(ordinary).unwrap();
             let copied: String = db
                 .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
