@@ -1224,26 +1224,29 @@ impl<'a> SupervisorService<'a> {
         Ok(Some(lock))
     }
 
+    /// No daemon definition or published plan/runtime means this store has
+    /// never admitted a managed child, even without a usable user manager.
+    pub(crate) fn has_daemon_state(&self) -> Result<bool, String> {
+        let identity = managed_service_identity(self.env, self.cwd)?;
+        let state_path = supervisor_state_path(self.env, self.cwd)?;
+        let runtime_path = supervisor_runtime_path(self.env, self.cwd)?;
+        Ok(identity.definition_path.try_exists().map_err(|error| {
+            format!("failed to inspect the managed service definition: {error}")
+        })? || state_path
+            .try_exists()
+            .map_err(|error| format!("failed to inspect daemon desired state: {error}"))?
+            || runtime_path
+                .try_exists()
+                .map_err(|error| format!("failed to inspect daemon runtime state: {error}"))?)
+    }
+
     fn ensure_gateway_admission_compatible(&self, action: &str) -> Result<(), String> {
         if service_manager_kind(self.env) == ServiceManagerKind::Unsupported {
             return Ok(());
         }
         let result = (|| {
             let identity = managed_service_identity(self.env, self.cwd)?;
-            // A store that has never published desired or runtime daemon state
-            // cannot have an admitted managed child, including on hosts without
-            // a user service manager. A deleted definition alone proves nothing.
-            let state_path = supervisor_state_path(self.env, self.cwd)?;
-            let runtime_path = supervisor_runtime_path(self.env, self.cwd)?;
-            if !identity.definition_path.try_exists().map_err(|error| {
-                format!("failed to inspect the managed service definition: {error}")
-            })? && !state_path
-                .try_exists()
-                .map_err(|error| format!("failed to inspect daemon desired state: {error}"))?
-                && !runtime_path
-                    .try_exists()
-                    .map_err(|error| format!("failed to inspect daemon runtime state: {error}"))?
-            {
+            if !self.has_daemon_state()? {
                 return Ok(());
             }
             let ocm_home = display_path(&resolve_ocm_home(self.env, self.cwd)?);

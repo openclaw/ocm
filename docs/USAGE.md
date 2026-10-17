@@ -530,6 +530,13 @@ a changed launch definition, or a new daemon run can start it again. Stopping th
 service removes its inactive runtime record so snapshot maintenance can verify
 that the environment is quiescent.
 
+Snapshot and upgrade maintenance check the target's supervisor ownership before capturing or replacing its state.
+A failed service-manager read, a running daemon without a current runtime observation, or a runtime identity mismatch fails maintenance before mutation; stored stopped intent alone is insufficient.
+If this check fails while pausing a running target, OCM restores its prior service intent without restarting the shared daemon.
+Resolve the reported observation problem and retry; for a daemon without process identity, refresh it from the current installation during an authorized maintenance window.
+These checks cover the native service observation and the supervisor's planned and recorded target ownership.
+They cannot discover older workloads that were never recorded or processes outside the supervisor's owned cleanup scope; refreshing the daemon does not prove those processes stopped.
+
 Restart-handoff capability and consume helpers have a 15-second completion budget that includes stdout and stderr collection, followed by bounded cleanup.
 If a descendant keeps either output open, OCM stops the helper's owned process group on Unix and closes its readers before continuing sibling supervision.
 A capability timeout permits legacy startup only after cleanup is verified; otherwise the target stays stopped with a cleanup error and is not automatically retried for the unchanged launch definition.

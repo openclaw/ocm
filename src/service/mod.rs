@@ -90,23 +90,16 @@ impl<'a> ServiceService<'a> {
 
     pub(crate) fn quiesce_after_failed_restore_locked(&self, name: &str) -> Result<(), String> {
         manage::pause_service_for_recovery(name, self.env, self.cwd)?;
-        self.wait_for_runtime_mutation_quiescence(name, true)
+        self.wait_for_runtime_mutation_quiescence_locked(name)
     }
 
     pub(crate) fn quiesce_for_runtime_mutation_locked(&self, name: &str) -> Result<bool, String> {
         let meta = crate::env::EnvironmentService::new(self.env, self.cwd).get(name)?;
         if !meta.service_enabled || !meta.service_running {
+            self.wait_for_runtime_mutation_quiescence_locked(name)?;
             return Ok(false);
         }
-        self.stop_locked(name)?;
-        if let Err(error) = self.wait_for_runtime_mutation_quiescence_locked(name) {
-            return match self.start_locked(name) {
-                Ok(_) => Err(error),
-                Err(restore_error) => Err(format!(
-                    "{error}; also failed to restore the pre-maintenance service state: {restore_error}"
-                )),
-            };
-        }
+        self.stop_for_maintenance_locked(name)?;
         Ok(true)
     }
 
@@ -164,22 +157,22 @@ impl<'a> ServiceService<'a> {
         &self,
         name: &str,
     ) -> Result<(), String> {
-        self.wait_for_runtime_mutation_quiescence(name, false)
-    }
-
-    fn wait_for_runtime_mutation_quiescence(
-        &self,
-        name: &str,
-        checked_observation: bool,
-    ) -> Result<(), String> {
+        let supervisor = crate::supervisor::SupervisorService::new(self.env, self.cwd);
+        if !supervisor.has_daemon_state()? {
+            return Ok(());
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let supervisor = crate::supervisor::SupervisorService::new(self.env, self.cwd);
-            let inspection = if checked_observation {
-                supervisor.inspect_for_recovery()?
-            } else {
-                supervisor.inspect()?
-            };
+            let inspection = supervisor.inspect_for_recovery().map_err(|error| {
+                format!("cannot confirm quiescence for env \"{name}\" before maintenance: {error}")
+            })?;
+            if inspection.retained_envs.contains(name) {
+                supervisor
+                    .ensure_retained_ownership_recovered(name)
+                    .map_err(|error| {
+                        format!("cannot confirm quiescence for env \"{name}\" before maintenance: {error}")
+                    })?;
+            }
             let acknowledged = !inspection
                 .planned_children
                 .iter()
@@ -209,45 +202,34 @@ impl<'a> ServiceService<'a> {
         name: &str,
     ) -> Result<Option<ServiceMaintenanceState>, String> {
         crate::supervisor::SupervisorService::new(self.env, self.cwd)
-            .ensure_retained_ownership_recovered(name)?;
-        let status = self.status(name)?;
+            .ensure_retained_ownership_recovered(name)
+            .map_err(|error| {
+                format!("cannot confirm quiescence for env \"{name}\" before maintenance: {error}")
+            })?;
         let meta = crate::env::EnvironmentService::new(self.env, self.cwd).get(name)?;
         let state = ServiceMaintenanceState {
             enabled: meta.service_enabled,
             running: meta.service_running,
         };
-        if !state.running && !status.running {
-            // A replacement may publish retained metadata during status().
-            // Require the canonical target rows to be retired, including a
-            // predecessor row that has not been marked retained yet.
-            crate::supervisor::SupervisorService::new(self.env, self.cwd)
-                .ensure_background_gateway_quiescent(name, "snapshot access")?;
-            return Ok(None);
-        }
         preserve_operation_owner_before_managed_gateway_stop(
             name,
             self.env,
             self.cwd,
             &format!("quiescing env \"{name}\""),
         )?;
-        if state.running {
-            self.stop_locked(name)?;
+        if !state.running {
+            self.wait_for_runtime_mutation_quiescence_locked(name)?;
+            return Ok(None);
         }
-        let quiescence = self
-            .wait_for_runtime_mutation_quiescence_locked(name)
-            .and_then(|()| {
-                crate::supervisor::SupervisorService::new(self.env, self.cwd)
-                    .ensure_background_gateway_quiescent(name, "snapshot access")
-            });
-        if let Err(error) = quiescence {
-            return match self.restore_after_snapshot_locked(name, Some(state)) {
-                Ok(()) => Err(error),
-                Err(restore_error) => Err(format!(
-                    "{error}; also failed to restore its pre-snapshot service policy: {restore_error}"
-                )),
-            };
-        }
+        self.stop_for_maintenance_locked(name)?;
         Ok(Some(state))
+    }
+
+    fn stop_for_maintenance_locked(&self, name: &str) -> Result<(), String> {
+        manage::stop_service_with_observation(name, self.env, self.cwd, |_| {
+            self.wait_for_runtime_mutation_quiescence_locked(name)
+        })?;
+        Ok(())
     }
 
     pub(crate) fn restore_after_snapshot_locked(

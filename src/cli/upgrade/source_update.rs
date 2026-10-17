@@ -807,9 +807,8 @@ impl Cli {
             let service = self.service_service();
             if meta.service_running || service.status(name)?.running {
                 service.stop_locked(name)?;
-                service.wait_for_runtime_mutation_quiescence_locked(name)?;
             }
-            Ok::<(), String>(())
+            service.wait_for_runtime_mutation_quiescence_locked(name)
         };
         let recovery: Result<String, String> = (|| {
             stop()?;

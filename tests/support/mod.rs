@@ -422,14 +422,21 @@ pub fn install_fake_launchctl(root: &TestDir, env: &mut BTreeMap<String, String>
     fs::create_dir_all(&bin_dir).unwrap();
     let log_path = root.child("launchctl.log");
     let print_path = root.child("launchctl-print.txt");
+    let pid_path = root.child("native-daemon.pid");
+    env.insert(
+        "OCM_TEST_NATIVE_DAEMON_PID_FILE".into(),
+        path_string(&pid_path),
+    );
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$1\" in\n  bootstrap)\n    if [ -n \"$OCM_TEST_NATIVE_DAEMON_PID\" ]; then\n      printf 'state = running\\npid = %s\\npath = %s\\n' \"$OCM_TEST_NATIVE_DAEMON_PID\" \"$3\" > \"{}\"\n    else\n      printf 'state = running\\npid = 23613\\n' > \"{}\"\n    fi\n    exit 0\n    ;;\n  bootout|unload)\n    /bin/rm -f \"{}\"\n    exit 0\n    ;;\n  print)\n    if [ -f \"{}\" ]; then\n      /bin/cat \"{}\"\n      exit 0\n    fi\n    printf 'Could not find service \"%s\" in domain for user gui\\n' \"${{2##*/}}\" >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$1\" in\n  bootstrap)\n    if [ -n \"$OCM_TEST_NATIVE_DAEMON_PID\" ]; then\n      printf 'state = running\\npid = %s\\npath = %s\\n' \"$OCM_TEST_NATIVE_DAEMON_PID\" \"$3\" > \"{}\"\n    else\n      printf 'state = running\\npid = 23613\\npath = %s\\n' \"$3\" > \"{}\"\n    fi\n    exit 0\n    ;;\n  bootout|unload)\n    /bin/rm -f \"{}\"\n    exit 0\n    ;;\n  print)\n    if [ -f \"{}\" ]; then\n      /bin/cat \"{}\"\n      if [ -f \"{}\" ]; then\n        read -r observed_pid < \"{}\"\n        printf 'pid = %s\\n' \"$observed_pid\"\n      fi\n      exit 0\n    fi\n    printf 'Could not find service \"%s\" in domain for user gui\\n' \"${{2##*/}}\" >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
         path_string(&log_path),
         path_string(&print_path),
         path_string(&print_path),
         path_string(&print_path),
         path_string(&print_path),
         path_string(&print_path),
+        path_string(&pid_path),
+        path_string(&pid_path),
     );
     write_executable_script(&bin_dir.join("launchctl"), &script);
 
@@ -451,9 +458,16 @@ pub fn install_fake_systemd_tools(root: &TestDir, env: &mut BTreeMap<String, Str
     fs::create_dir_all(&bin_dir).unwrap();
     let log_path = root.child("systemctl.log");
     let journal_log_path = root.child("journalctl.log");
+    let pid_path = root.child("native-daemon.pid");
+    env.insert(
+        "OCM_TEST_NATIVE_DAEMON_PID_FILE".into(),
+        path_string(&pid_path),
+    );
     let systemctl_script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--user\" ] && [ \"$2\" = \"show\" ]; then\n  unit=\"$3\"\n  fixture_home=\"${{HOME:-$PWD}}\"\n  unit_path=\"$fixture_home/.config/systemd/user/$unit.service\"\n  if [ -f \"$unit_path\" ]; then\n    printf 'LoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\nSubState=running\\nMainPID=%s\\nFragmentPath=%s\\n' \"${{OCM_TEST_NATIVE_DAEMON_PID:-4242}}\" \"$unit_path\"\n    exit 0\n  fi\n  printf 'LoadState=not-found\\nUnitFileState=not-found\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\nFragmentPath=\\n'\n  exit 4\nfi\nexit 0\n",
-        path_string(&log_path)
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--user\" ] && [ \"$2\" = \"show\" ]; then\n  unit=\"$3\"\n  fixture_home=\"${{HOME:-$PWD}}\"\n  unit_path=\"$fixture_home/.config/systemd/user/$unit.service\"\n  if [ -f \"$unit_path\" ]; then\n    observed_pid=\"${{OCM_TEST_NATIVE_DAEMON_PID:-4242}}\"\n    if [ -f \"{}\" ]; then read -r observed_pid < \"{}\"; fi\n    printf 'LoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\nSubState=running\\nMainPID=%s\\nFragmentPath=%s\\n' \"$observed_pid\" \"$unit_path\"\n    exit 0\n  fi\n  printf 'LoadState=not-found\\nUnitFileState=not-found\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\nFragmentPath=\\n'\n  exit 4\nfi\nexit 0\n",
+        path_string(&log_path),
+        path_string(&pid_path),
+        path_string(&pid_path),
     );
     let journalctl_script = format!(
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nprintf 'gateway ok\\n'\n",
@@ -502,14 +516,7 @@ pub fn enable_fake_daemon_gateway_admission(
     root: &TestDir,
     env: &mut BTreeMap<String, String>,
 ) -> ocm::supervisor::SupervisorGatewayAdmission {
-    let (started_at, process_scope) = fixture_process_ownership();
-    let capability =
-        serde_json::from_value::<ocm::supervisor::SupervisorGatewayAdmission>(serde_json::json!({
-            "version": 11,
-            "process": { "pid": std::process::id(), "startedAt": started_at },
-            "processScope": process_scope,
-        }))
-        .unwrap();
+    let capability = fake_daemon_gateway_admission();
     env.insert(
         "OCM_TEST_NATIVE_DAEMON_PID".to_string(),
         std::process::id().to_string(),
@@ -528,6 +535,19 @@ pub fn enable_fake_daemon_gateway_admission(
         &ocm::store::supervisor_runtime_path(env, root.path()).unwrap(),
         &runtime,
     );
+    capability
+}
+
+/// Current process identity for a synthetic daemon owned by this test process.
+pub fn fake_daemon_gateway_admission() -> ocm::supervisor::SupervisorGatewayAdmission {
+    let (started_at, process_scope) = fixture_process_ownership();
+    let capability =
+        serde_json::from_value::<ocm::supervisor::SupervisorGatewayAdmission>(serde_json::json!({
+            "version": 11,
+            "process": { "pid": std::process::id(), "startedAt": started_at },
+            "processScope": process_scope,
+        }))
+        .unwrap();
     capability
 }
 

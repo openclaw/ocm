@@ -27,10 +27,19 @@ use sha2::{Digest, Sha256, Sha512};
 use tar::{Builder, Header};
 
 use crate::support::{
-    TestDir, TestHttpServer, hold_environment_operation, install_fake_launchctl,
-    install_fake_node_and_npm, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script, write_json_replacing_path, write_text,
+    TestDir, TestHttpServer, hold_environment_operation,
+    install_fake_launchctl as install_base_fake_launchctl, install_fake_node_and_npm, ocm_env,
+    path_string, run_ocm, stderr, stdout, write_executable_script, write_json_replacing_path,
+    write_text,
 };
+
+fn install_fake_launchctl(root: &TestDir, env: &mut std::collections::BTreeMap<String, String>) {
+    install_base_fake_launchctl(root, env);
+    env.insert(
+        "OCM_TEST_NATIVE_DAEMON_PID".into(),
+        std::process::id().to_string(),
+    );
+}
 
 fn append_tar_file(
     builder: &mut Builder<&mut GzEncoder<Vec<u8>>>,
@@ -139,7 +148,7 @@ fn write_running_supervisor_binding(
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: None,
+        gateway_admission: Some(support::fake_daemon_gateway_admission()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -178,7 +187,7 @@ fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: None,
+        gateway_admission: Some(support::fake_daemon_gateway_admission()),
         updated_at: now_utc(),
         services: Vec::new(),
         children: Vec::new(),
@@ -198,7 +207,7 @@ fn write_backoff_supervisor_runtime(
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: None,
+        gateway_admission: Some(support::fake_daemon_gateway_admission()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -3848,8 +3857,9 @@ fn assert_upgrade_rollback_restart_failure(
     write_executable_script(
         std::path::Path::new(launchctl_bin),
         &format!(
-            "#!/bin/sh\nmarker='{}'\ncase \"$1\" in\n  managername)\n    exit 0\n    ;;\n  print)\n    if [ -e \"$marker\" ]; then\n      printf 'Could not find service \\\"%s\\\" in domain for user gui\\n' \"$2\" >&2\n      exit 1\n    fi\n    printf 'state = waiting\\n'\n    exit 0\n    ;;\n  bootout|unload)\n    : > \"$marker\"\n    exit 0\n    ;;\n  bootstrap)\n    echo 'forced bootstrap failure' >&2\n    if [ \"${{OCM_TEST_CODEX_PREFLIGHT:-}}\" = fail ]; then\n      echo 'Authorization: Bearer service-private-token' >&2\n    fi\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
-            stopped_marker.display()
+            "#!/bin/sh\nmarker='{}'\ncase \"$1\" in\n  managername)\n    exit 0\n    ;;\n  print)\n    if [ -e \"$marker\" ]; then\n      printf 'Could not find service \"%s\" in domain for user gui\\n' \"${{2##*/}}\" >&2\n      exit 1\n    fi\n    printf 'path = %s\\nstate = waiting\\n' '{}'\n    exit 0\n    ;;\n  bootout|unload)\n    : > \"$marker\"\n    exit 0\n    ;;\n  bootstrap)\n    echo 'forced bootstrap failure' >&2\n    if [ \"${{OCM_TEST_CODEX_PREFLIGHT:-}}\" = fail ]; then\n      echo 'Authorization: Bearer service-private-token' >&2\n    fi\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
+            stopped_marker.display(),
+            support::managed_service_definition_path(&env, &cwd, "demo").display(),
         ),
     );
 
@@ -6077,6 +6087,98 @@ fn upgrade_rollback_restores_retained_in_place_runtime_bytes() {
     let version = run_ocm(&fixture.cwd, &fixture.env, &["@demo", "--", "--version"]);
     assert!(version.status.success(), "{}", stderr(&version));
     assert_eq!(stdout(&version).trim(), "2026.6.33");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rollback_refuses_runtime_mutation_when_quiescence_observation_is_lost() {
+    let root = TestDir::new("rollback-quiescence-observation");
+    let mut fixture = seed_in_place_rollback(&root, "2026.6.11");
+    fixture
+        .env
+        .insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+    fixture
+        .env
+        .insert("OCM_TEST_MAINTENANCE_TARGET".into(), "demo".into());
+    install_fake_launchctl(&root, &mut fixture.env);
+    let identity = support::enable_fake_daemon_gateway_admission(&root, &mut fixture.env);
+    write_text(
+        &root.child("identity.json"),
+        &serde_json::to_string(&identity).unwrap(),
+    );
+    write_text(&root.child("mode"), "after-checkpoint-error");
+    write_executable_script(
+        &root.child("fake-bin/launchctl"),
+        include_str!("fixtures/maintenance_service_manager.py"),
+    );
+    let installed = run_ocm(&fixture.cwd, &fixture.env, &["service", "start", "demo"]);
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    for args in [
+        vec!["launcher", "add", "independent", "--command", "/bin/false"],
+        vec!["env", "create", "sibling", "--launcher", "independent"],
+        vec!["service", "start", "sibling"],
+    ] {
+        let result = run_ocm(&fixture.cwd, &fixture.env, &args);
+        assert!(result.status.success(), "{}", stderr(&result));
+    }
+    let history_path = root.child(format!(
+        "ocm-home/upgrade-history/demo/{}.json",
+        fixture.transaction_id
+    ));
+    let mut history: Value = serde_json::from_slice(&fs::read(&history_path).unwrap()).unwrap();
+    history["serviceAfter"] = serde_json::json!({"enabled":true,"running":true});
+    write_json_replacing_path(&history_path, &history);
+    let protected = [
+        fixture.marker.clone(),
+        root.child("ocm-home/runtimes/stable.json"),
+        root.child("ocm-home/runtimes/stable/files/bin/openclaw"),
+        fixture.original_recovery_root.join("stable/runtime.json"),
+        fixture
+            .original_recovery_root
+            .join("stable/install-root/files/bin/openclaw"),
+    ];
+    let before = protected.each_ref().map(|path| fs::read(path).unwrap());
+    write_text(&root.child("launchctl.log"), "");
+    use std::os::unix::fs::MetadataExt;
+    let env_root = root.child("ocm-home/envs/demo");
+    let root_inode = fs::metadata(&env_root).unwrap().ino();
+    let output = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["upgrade", "rollback", "demo", "--json"],
+    );
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let result: Value = serde_json::from_str(&stdout(&output))
+        .unwrap_or_else(|error| panic!("{error}: {}", stderr(&output)));
+    assert!(
+        result["note"]
+            .as_str()
+            .unwrap()
+            .contains("failed to quiesce the managed service before rollback"),
+        "{result}"
+    );
+    assert!(
+        result["note"]
+            .as_str()
+            .unwrap()
+            .contains("cannot confirm quiescence"),
+        "{result}"
+    );
+    assert_eq!(
+        fs::metadata(&env_root).unwrap().ino(),
+        root_inode,
+        "failed quiescence still replaced the root: {result}"
+    );
+    assert_eq!(
+        protected.each_ref().map(|path| fs::read(path).unwrap()),
+        before
+    );
+    assert!(root.child("observed-fault").exists());
+    let log = fs::read_to_string(root.child("launchctl.log")).unwrap();
+    assert!(
+        !log.contains("bootstrap") && !log.contains("bootout") && !log.contains("unload"),
+        "{log}"
+    );
 }
 
 #[test]
@@ -9164,13 +9266,17 @@ fn assert_current_package_job(case: &str) {
         vec![]
     };
     let job = finish_runtime_job(root.path(), &env, &target);
-    if case == "stopping" {
+    if matches!(case, "stopping" | "unknown-service") {
         assert_eq!(job["state"], "failed", "{job}");
         assert!(
             job["error"]
                 .as_str()
                 .unwrap()
-                .contains("did not acknowledge quiescence"),
+                .contains(if case == "stopping" {
+                    "did not acknowledge quiescence"
+                } else {
+                    "running supervisor has no runtime observation"
+                }),
             "{job}"
         );
         assert!(job["result"].is_null(), "{job}");
