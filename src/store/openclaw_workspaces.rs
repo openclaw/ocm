@@ -86,6 +86,10 @@ enum OpenClawPathSelection {
 }
 
 impl OpenClawWorkspaceInventory {
+    pub(super) fn preserve_copied_config_paths(&mut self, paths: &BTreeSet<PathBuf>) {
+        self.config_include_paths.extend(paths.iter().cloned());
+    }
+
     pub(crate) fn contains(&self, path: &Path) -> bool {
         let path = clean_path(path);
         self.workspace_roots
