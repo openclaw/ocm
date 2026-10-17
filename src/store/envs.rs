@@ -1211,14 +1211,14 @@ pub(crate) fn import_environment_with_sandbox_origin(
             .collect();
         if let Some(canonical) = extracted.metadata.env.canonical_source_root.as_deref() {
             let canonical = Path::new(canonical);
-            if source_roots.is_empty()
+            if source_roots.first().is_none_or(|root| !root.is_absolute())
                 || !canonical.is_absolute()
                 || canonical
                     .components()
                     .any(|part| matches!(part, std::path::Component::ParentDir))
             {
                 return Err(
-                    "archive canonical source root must be absolute and accompany sourceRoot"
+                    "archive canonical source root must be absolute and accompany an absolute sourceRoot"
                         .to_string(),
                 );
             }

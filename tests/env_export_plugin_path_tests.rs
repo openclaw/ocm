@@ -1690,6 +1690,43 @@ fn state_archive_relocates_both_root_identities_after_the_source_disappears() {
                 "archive {path}"
             );
         }
+        if !nested_alias {
+            // An optional alias identity cannot turn an absent or relative
+            // original root into ownership of arbitrary configuration strings.
+            for (index, invalid_root) in [None, Some(""), Some("relative")].into_iter().enumerate()
+            {
+                let mut metadata = extracted.metadata.clone();
+                metadata.env.source_root = invalid_root.map(str::to_string);
+                let invalid_archive = fixture.join(format!("invalid-{index}.tar"));
+                ocm::infra::archive::write_env_archive(
+                    &metadata,
+                    &extracted.root_dir,
+                    &invalid_archive,
+                )
+                .unwrap();
+                let invalid_target = fixture.join("invalid-import");
+                let rejected = run_ocm(
+                    root.path(),
+                    &env,
+                    &[
+                        "env",
+                        "import",
+                        invalid_archive.to_str().unwrap(),
+                        "--name",
+                        "invalid",
+                        "--root",
+                        invalid_target.to_str().unwrap(),
+                    ],
+                );
+                assert!(!rejected.status.success());
+                assert!(
+                    stderr(&rejected).contains("absolute sourceRoot"),
+                    "{}",
+                    stderr(&rejected)
+                );
+                assert!(!invalid_target.exists());
+            }
+        }
         fs::remove_dir_all(&canonical).unwrap();
         if !nested_alias {
             fs::remove_file(&alias).unwrap();
