@@ -1892,6 +1892,37 @@ fn assert_portable_archive_source_identities() {
     assert!(export.status.success(), "{}", stderr(&export));
     let extracted =
         extract_env_archive::<EnvArchiveMetadata>(&archive, &root.child("extracted")).unwrap();
+    let default_archive = root.child("default.tar");
+    let default_export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            default_archive.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        default_export.status.success(),
+        "{}",
+        stderr(&default_export)
+    );
+    let default_extracted = extract_env_archive::<EnvArchiveMetadata>(
+        &default_archive,
+        &root.child("default-extracted"),
+    )
+    .unwrap();
+    assert!(!default_extracted.metadata.include_state);
+    assert_eq!(
+        default_extracted.metadata.env.canonical_source_root,
+        Some(fs::canonicalize(&source).unwrap().display().to_string())
+    );
+    assert_eq!(
+        fs::read(default_extracted.root_dir.join(".openclaw/openclaw.json")).unwrap(),
+        fs::read(source.join(".openclaw/openclaw.json")).unwrap()
+    );
     for (label, source_root, canonical) in [
         ("posix", "/portable/source", "/portable/physical"),
         ("drive", r"C:\portable\source", r"\\?\C:\portable\physical"),

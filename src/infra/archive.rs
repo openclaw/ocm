@@ -184,17 +184,6 @@ pub fn write_env_archive_with_options<T: Serialize>(
         None
     };
     let source_root = resolved_root.as_deref().unwrap_or(source_root);
-    write_env_archive_from_resolved_root(metadata, source_root, output_path, options)
-}
-
-// The caller can bind metadata to this exact resolved root. Do not resolve it
-// again: opening the capture rejects a path replaced by a symlink.
-pub(crate) fn write_env_archive_from_resolved_root<T: Serialize>(
-    metadata: &T,
-    source_root: &Path,
-    output_path: &Path,
-    mut options: EnvArchiveOptions,
-) -> Result<(), String> {
     let capture = if options.sqlite_content_roots.is_empty() && !options.relocate_internal_symlinks
     {
         None
@@ -204,6 +193,35 @@ pub(crate) fn write_env_archive_from_resolved_root<T: Serialize>(
                 .map_err(EnvArchiveWriteError::into_message)?,
         )
     };
+    write_env_archive_with_capture(
+        metadata,
+        source_root,
+        output_path,
+        options,
+        capture.as_ref(),
+    )
+}
+
+// The caller can bind metadata to this exact resolved root. Do not resolve it
+// again: opening the capture rejects a path replaced by a symlink.
+pub(crate) fn write_env_archive_from_resolved_root<T: Serialize>(
+    metadata: &T,
+    source_root: &Path,
+    output_path: &Path,
+    options: EnvArchiveOptions,
+) -> Result<(), String> {
+    let capture =
+        ArchiveSource::open_canonical(source_root).map_err(EnvArchiveWriteError::into_message)?;
+    write_env_archive_with_capture(metadata, source_root, output_path, options, Some(&capture))
+}
+
+fn write_env_archive_with_capture<T: Serialize>(
+    metadata: &T,
+    source_root: &Path,
+    output_path: &Path,
+    mut options: EnvArchiveOptions,
+    capture: Option<&ArchiveSource>,
+) -> Result<(), String> {
     let parent = output_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -251,13 +269,7 @@ pub(crate) fn write_env_archive_from_resolved_root<T: Serialize>(
         } else {
             File::create(output_path).map_err(|error| error.to_string())?
         };
-        match write_env_archive_attempt(
-            metadata,
-            source_root,
-            file,
-            options.clone(),
-            capture.as_ref(),
-        ) {
+        match write_env_archive_attempt(metadata, source_root, file, options.clone(), capture) {
             Ok(()) => {
                 if let Some(staged) = staged {
                     staged
@@ -1668,6 +1680,17 @@ mod tests {
         fs::rename(&parent, fixture.path().join("saved")).unwrap();
         std::os::unix::fs::symlink(outside, &parent).unwrap();
         assert!(super::ArchiveSource::open_canonical(&selected).is_err());
+        let output = fixture.path().join("default.tar");
+        assert!(
+            super::write_env_archive_from_resolved_root(
+                &serde_json::json!({"env": {"canonicalSourceRoot": selected}}),
+                &selected,
+                &output,
+                EnvArchiveOptions::default(),
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

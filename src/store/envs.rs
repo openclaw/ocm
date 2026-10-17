@@ -11,7 +11,6 @@ use crate::env::{
 };
 use crate::infra::archive::{
     ArchivedEnvMeta, EnvArchiveMetadata, extract_env_archive, write_env_archive_from_resolved_root,
-    write_env_archive_with_options,
 };
 use crate::openclaw_repo::remove_openclaw_worktree;
 use serde::{Deserialize, Serialize};
@@ -1101,10 +1100,13 @@ pub fn export_environment(
         ));
     }
 
-    let canonical_root = options
-        .include_state
-        .then(|| fs::canonicalize(&env_paths.root).map_err(|error| error.to_string()))
-        .transpose()?;
+    let runtime = OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port);
+    let archive_options = if options.include_state {
+        openclaw_env_state_archive_options(&env_paths)?
+    } else {
+        openclaw_env_archive_options(&env_paths, env, runtime)?
+    };
+    let canonical_root = fs::canonicalize(&env_paths.root).map_err(|error| error.to_string())?;
     let metadata = EnvArchiveMetadata {
         include_state: options.include_state,
         kind: "ocm-env-archive".to_string(),
@@ -1113,7 +1115,7 @@ pub fn export_environment(
         env: ArchivedEnvMeta {
             name: meta.name.clone(),
             source_root: Some(meta.root.clone()),
-            canonical_source_root: canonical_root.as_ref().map(|root| display_path(root)),
+            canonical_source_root: Some(display_path(&canonical_root)),
             gateway_port: meta.gateway_port,
             gateway_port_auto_assigned: meta.gateway_port_auto_assigned,
             service_enabled: meta.service_enabled,
@@ -1127,17 +1129,12 @@ pub fn export_environment(
         },
     };
 
-    let runtime = OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port);
-    let archive_options = if options.include_state {
-        openclaw_env_state_archive_options(&env_paths)?
-    } else {
-        openclaw_env_archive_options(&env_paths, env, runtime)?
-    };
-    let result = if let Some(root) = canonical_root.as_deref() {
-        write_env_archive_from_resolved_root(&metadata, root, &output_path, archive_options)
-    } else {
-        write_env_archive_with_options(&metadata, &env_paths.root, &output_path, archive_options)
-    };
+    let result = write_env_archive_from_resolved_root(
+        &metadata,
+        &canonical_root,
+        &output_path,
+        archive_options,
+    );
     if result.is_err() && !options.include_state {
         let _ = fs::remove_file(&output_path);
     }
