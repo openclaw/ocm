@@ -906,6 +906,7 @@ fn clone_environment_with_policy(
             &target_paths,
             &[&source_paths.root, &canonical_source_root],
             super::openclaw_state::DatabasePathRelocation::ClonedSessions,
+            None,
         )?;
         super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
 
@@ -1422,6 +1423,17 @@ pub(crate) fn import_environment_with_sandbox_origin(
             }
             if !extracted.metadata.include_state {
                 clear_copied_runtime_state(&target_paths, env, target_runtime)?;
+                let copied_paths = super::openclaw_workspaces::resolve_env_openclaw_copy_paths(
+                    &target_paths,
+                    env,
+                    target_runtime,
+                )?;
+                super::openclaw_state::relocate_copied_databases(
+                    &target_paths,
+                    &source_roots,
+                    super::openclaw_state::DatabasePathRelocation::ClonedSessions,
+                    Some(&copied_paths),
+                )?;
             }
 
             let created_at = now_utc();

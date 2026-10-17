@@ -538,6 +538,7 @@ import clear legacy file-based sessions, logs, backups, and process residue so t
 environment does not share active runtime state with its source. New clones also
 clear copied agent database process leases while keeping the state database,
 durable rows, and source leases unchanged.
+Default import refuses configured active databases inside protected history and removes the partial target before registration, including for archives without source-root metadata.
 
 Use `ocm env export <env> --include-state --output <archive>` to export this
 environment as the same installation, then restore it with
@@ -549,7 +550,12 @@ anywhere under the root are captured as coherent committed snapshots, including
 WAL writes; raw database sidecars are omitted. Each database is captured
 independently, not as one transaction across the environment.
 
-New archives, with or without `--include-state`, retain the accepted source root and its captured canonical path in optional `env.canonicalSourceRoot` metadata. Configuration relocation uses both recorded roots without requiring the original source or alias to exist; state-inclusive runtime-reference relocation uses the same identities. Older archives keep their existing import behavior. The archive format remains version 1, and older readers ignore the optional field. Source identities may use POSIX, Windows drive, or UNC syntax; the extension preserves acceptance of portable foreign-platform contents without adding translation of platform-specific payload paths. On Windows, ordinary drive/UNC and extended-length spellings of a recorded root relocate together.
+New archives, with or without `--include-state`, retain the accepted source root and its captured canonical path in optional `env.canonicalSourceRoot` metadata.
+Configuration relocation uses both recorded roots without requiring the original source or alias to exist; state-inclusive runtime-reference relocation uses the same identities.
+Older archives retain their existing source-root matching rules.
+The archive format remains version 1, and older readers ignore the optional field.
+Source identities may use POSIX, Windows drive, or UNC syntax; the extension preserves acceptance of portable foreign-platform contents without adding translation of platform-specific payload paths.
+On Windows, ordinary drive/UNC and extended-length spellings of a recorded root relocate together.
 
 State-inclusive export copies configuration files verbatim. Import rewrites
 env-scoped OpenClaw config paths for the new root, including agent workspaces
@@ -604,7 +610,7 @@ Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite s
 Agent database paths recorded in the source shared-state registry are also included when the existing copy traverses them.
 Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
 The source stays running and its database contents are not rewritten.
-Clone and upgrade simulation also rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
+Clone, default archive import, and upgrade simulation rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
 External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.
 Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 

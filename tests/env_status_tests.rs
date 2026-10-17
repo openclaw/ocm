@@ -68,6 +68,111 @@ fn env_status_reports_the_resolved_launcher() {
     assert!(output.contains("openclawState: stopped"));
 }
 
+#[cfg(unix)]
+#[test]
+fn env_status_preserves_retained_ownership_and_prioritizes_inspection() {
+    use ocm::store::{get_environment, save_environment, supervisor_runtime_path};
+    use serde_json::json;
+
+    let root = TestDir::new("env-status-retained-ownership");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
+    let port = allocate_free_port().to_string();
+    for args in [
+        vec!["launcher", "add", "stable", "--command", "printf launcher"],
+        vec![
+            "env",
+            "create",
+            "demo",
+            "--launcher",
+            "stable",
+            "--port",
+            &port,
+        ],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let path = supervisor_runtime_path(&env, &cwd).unwrap();
+    let mut publisher = serde_json::to_value(support::enable_fake_daemon_gateway_admission(
+        &root, &mut env,
+    ))
+    .unwrap();
+    publisher["process"]["startedAt"] = json!("older-publisher-generation");
+    env.remove("OCM_TEST_NATIVE_DAEMON_PID");
+    let row = json!({
+        "envName": "demo", "bindingKind": "launcher", "bindingName": "stable",
+        "gatewayState": "pending", "restartCount": 0, "childPort": port.parse::<u32>().unwrap(),
+        "pid": null, "stdoutPath": "fixture.stdout", "stderrPath": "fixture.stderr",
+        "lastExitCode": null, "lastError": null, "lastEventAt": null, "nextRetryAt": null
+    });
+    let mut runtime = json!({
+        "kind": "ocm-supervisor-runtime", "ocmHome": env["OCM_HOME"],
+        "daemonVersion": env!("CARGO_PKG_VERSION"), "gatewayAdmission": publisher,
+        "updatedAt": "2026-01-01T00:00:00Z", "services": [row], "children": [],
+        "retainedOwnership": [{"envName": "demo", "claimId": "retained-status-fixture", "publisher": publisher}]
+    });
+    let mut meta = get_environment("demo", &env, &cwd).unwrap();
+    for bound in [true, false] {
+        for desired in [false, true] {
+            meta.default_launcher = bound.then(|| "stable".to_string());
+            meta.service_enabled = desired;
+            meta.service_running = desired;
+            save_environment(meta.clone(), &env, &cwd).unwrap();
+            support::write_json_replacing_path(&path, &runtime);
+            let before = fs::read(&path).unwrap();
+            let service = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+            assert!(service.status.success(), "{}", stderr(&service));
+            let service: Value = serde_json::from_slice(&service.stdout).unwrap();
+            assert_eq!(service["gatewayState"], "unknown");
+            let status = run_ocm(&cwd, &env, &["env", "status", "demo", "--json"]);
+            assert!(status.status.success(), "{}", stderr(&status));
+            let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+            assert_eq!(status["openclawState"], service["gatewayState"]);
+            assert_eq!(status["serviceIssue"], service["issue"]);
+            for flag in ["--raw", "--color=always"] {
+                let output = run_ocm(&cwd, &env, &["env", "status", "demo", flag]);
+                assert!(output.status.success(), "{}", stderr(&output));
+                let text = stdout(&output);
+                assert!(text.contains("unknown"), "{text}");
+                assert!(text.contains("ocm service recover demo"), "{text}");
+                for conflicting in [
+                    "ocm start demo",
+                    "ocm service start demo",
+                    "ocm service install demo",
+                    "ocm service restart demo",
+                    "ocm @demo",
+                ] {
+                    assert!(!text.contains(conflicting), "{text}");
+                }
+                if flag == "--color=always" {
+                    assert!(text.contains("Inspect ownership"), "{text}");
+                }
+            }
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let after = get_environment("demo", &env, &cwd).unwrap();
+            assert_eq!(after.service_running, desired);
+            assert_eq!(after.service_enabled, desired);
+        }
+    }
+    // A sibling claim must not make this target unknown; ordinary intent still projects as before.
+    runtime["services"][0]["envName"] = json!("sibling");
+    runtime["retainedOwnership"][0]["envName"] = json!("sibling");
+    support::write_json_replacing_path(&path, &runtime);
+    for (desired, expected) in [(false, "stopped"), (true, "pending")] {
+        meta.default_launcher = Some("stable".to_string());
+        meta.service_enabled = desired;
+        meta.service_running = desired;
+        save_environment(meta.clone(), &env, &cwd).unwrap();
+        let status = run_ocm(&cwd, &env, &["env", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["openclawState"], expected);
+    }
+}
+
 #[test]
 fn env_status_reports_a_broken_runtime_without_failing() {
     let root = TestDir::new("env-status-broken-runtime");
