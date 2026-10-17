@@ -597,6 +597,10 @@ Each database is a coherent committed snapshot; databases and other files are no
 The source stays running and its database contents are not rewritten.
 Clone and upgrade simulation also rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
 External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.
+Retained managed Git worktrees whose repository and required Git data are inside the copied environment keep their checkout content, including the default `.openclaw/worktrees` layout.
+Clone relocates their registry identity and structural Git links together, preserving session/worktree IDs, branch and snapshot refs, indexes, and authored content.
+It fails and removes the incomplete target when required Git data is missing or external, or copied locks/run ownership remain unresolved; resolve that condition in the source before retrying.
+Clone does not copy external repositories, clear Git locks, or change source registrations.
 
 For clone, migration, and adoption, OCM does not classify a package or project
 asset as operational merely because it has a SQLite header or filename.

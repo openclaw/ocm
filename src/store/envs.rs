@@ -805,6 +805,15 @@ fn clone_environment_with_policy(
             &source_paths.state_dir,
         )?;
         validate_nonportable_runtime_state_paths(&target_paths)?;
+        let canonical_source_root =
+            fs::canonicalize(&source_paths.root).map_err(|error| error.to_string())?;
+        let managed_worktrees = super::openclaw_state::relocate_copied_managed_worktrees(
+            &target_paths,
+            &[
+                (&source_paths.root, &target_paths.root),
+                (&canonical_source_root, &target_paths.root),
+            ],
+        )?;
         let created_at = now_utc();
         let gateway_port = choose_cloned_gateway_port(&source, &registry.envs, env);
         let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
@@ -832,7 +841,12 @@ fn clone_environment_with_policy(
                     target_runtime,
                     &source_paths.root,
                 )?;
-                clear_copied_runtime_state(&target_paths, env, target_runtime)?;
+                super::openclaw_state::clear_copied_runtime_state_preserving_worktrees(
+                    &target_paths,
+                    env,
+                    target_runtime,
+                    &managed_worktrees,
+                )?;
                 outcome
             }
             CloneEnvironmentPolicy::Simulation
@@ -867,6 +881,7 @@ fn clone_environment_with_policy(
                     &target_paths,
                     env,
                     target_runtime,
+                    &managed_worktrees,
                 )?;
                 Default::default()
             }
@@ -892,7 +907,12 @@ fn clone_environment_with_policy(
                     target_runtime,
                     &source_paths.root,
                 )?;
-                clear_copied_runtime_state(&target_paths, env, target_runtime)?;
+                super::openclaw_state::clear_copied_runtime_state_preserving_worktrees(
+                    &target_paths,
+                    env,
+                    target_runtime,
+                    &managed_worktrees,
+                )?;
                 outcome
             }
         };
@@ -900,8 +920,6 @@ fn clone_environment_with_policy(
         super::openclaw_state::relocate_cloned_plugin_index_paths(&source_paths, &target_paths)?;
         // Sessions may store canonical paths even when the environment root
         // was registered through an alias (for example /var on macOS).
-        let canonical_source_root =
-            fs::canonicalize(&source_paths.root).map_err(|error| error.to_string())?;
         super::openclaw_state::relocate_copied_databases(
             &target_paths,
             &[&source_paths.root, &canonical_source_root],
@@ -947,11 +965,17 @@ fn clear_simulation_runtime_state_preserving_includes(
     target_paths: &super::layout::EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
+    managed_worktrees: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<(), String> {
     let include_paths =
         openclaw_config_include_paths(&target_paths.config_path, &target_paths.state_dir)?;
     if include_paths.is_empty() {
-        clear_copied_runtime_state(target_paths, env, runtime)?;
+        super::openclaw_state::clear_copied_runtime_state_preserving_worktrees(
+            target_paths,
+            env,
+            runtime,
+            managed_worktrees,
+        )?;
         return Ok(());
     }
 
@@ -963,7 +987,12 @@ fn clear_simulation_runtime_state_preserving_includes(
                 .map_err(|error| error.to_string())?;
             copy_path(include_path, &staging_root.join(relative))?;
         }
-        clear_copied_runtime_state(target_paths, env, runtime)?;
+        super::openclaw_state::clear_copied_runtime_state_preserving_worktrees(
+            target_paths,
+            env,
+            runtime,
+            managed_worktrees,
+        )?;
         for include_path in &include_paths {
             let relative = include_path
                 .strip_prefix(&target_paths.state_dir)
@@ -1984,6 +2013,7 @@ mod tests {
             &paths,
             &BTreeMap::new(),
             OpenClawWorkspaceRuntime::default(),
+            &std::collections::BTreeSet::new(),
         )
         .unwrap_err();
         assert!(

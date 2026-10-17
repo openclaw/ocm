@@ -1,3 +1,7 @@
+mod worktrees;
+
+pub(super) use worktrees::relocate_copied_managed_worktrees;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -122,8 +126,12 @@ pub(crate) fn openclaw_env_archive_options(
         paths,
         &workspaces,
     )?);
-    let excluded_path_roots =
-        runtime_debris_outside_agent_directories(&paths.root, &workspaces, excluded_path_roots)?;
+    let excluded_path_roots = runtime_debris_outside_preserved_paths(
+        &paths.root,
+        &workspaces,
+        &BTreeSet::new(),
+        excluded_path_roots,
+    )?;
     Ok(EnvArchiveOptions {
         should_skip_path: should_skip_openclaw_env_archive_path,
         included_path_roots,
@@ -667,7 +675,16 @@ pub(crate) fn clear_copied_runtime_state(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<bool, String> {
-    clear_runtime_state_with_policy(paths, env, runtime, true)
+    clear_copied_runtime_state_preserving_worktrees(paths, env, runtime, &BTreeSet::new())
+}
+
+pub(super) fn clear_copied_runtime_state_preserving_worktrees(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    preserved: &BTreeSet<PathBuf>,
+) -> Result<bool, String> {
+    clear_runtime_state_with_policy(paths, env, runtime, true, preserved)
 }
 
 pub(crate) fn clear_nonportable_runtime_state(
@@ -675,7 +692,7 @@ pub(crate) fn clear_nonportable_runtime_state(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<bool, String> {
-    clear_runtime_state_with_policy(paths, env, runtime, false)
+    clear_runtime_state_with_policy(paths, env, runtime, false, &BTreeSet::new())
 }
 
 fn clear_runtime_state_with_policy(
@@ -683,6 +700,7 @@ fn clear_runtime_state_with_policy(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
     copying: bool,
+    preserved: &BTreeSet<PathBuf>,
 ) -> Result<bool, String> {
     validate_nonportable_runtime_state_paths(paths)?;
     if !path_exists(&paths.state_dir) {
@@ -693,13 +711,15 @@ fn clear_runtime_state_with_policy(
     } else {
         resolve_env_openclaw_workspaces
     };
-    let workspaces = resolve_paths(paths, env, runtime)?;
+    let mut workspaces = resolve_paths(paths, env, runtime)?;
+    workspaces.preserve_copied_roots(preserved);
     workspaces.archive_relative_roots(&paths.root)?;
 
     let mut changed = false;
-    for relative_path in runtime_debris_outside_agent_directories(
+    for relative_path in runtime_debris_outside_preserved_paths(
         &paths.state_dir,
         &workspaces,
+        preserved,
         openclaw_extension_runtime_debris_roots(&paths.state_dir)?,
     )? {
         remove_path(&paths.state_dir.join(relative_path))?;
@@ -2265,25 +2285,24 @@ fn openclaw_workspace_archive_excluded_path_roots(
         .collect()
 }
 
-fn runtime_debris_outside_agent_directories(
+fn runtime_debris_outside_preserved_paths(
     root: &Path,
     paths: &OpenClawWorkspaceInventory,
+    copied_roots: &BTreeSet<PathBuf>,
     candidates: BTreeSet<PathBuf>,
 ) -> Result<BTreeSet<PathBuf>, String> {
+    let preserved = paths
+        .agent_directory_roots()
+        .chain(copied_roots.iter().map(PathBuf::as_path))
+        .collect::<Vec<_>>();
     let mut pending = candidates.into_iter().collect::<Vec<_>>();
     let mut debris = BTreeSet::new();
     while let Some(relative) = pending.pop() {
         let path = root.join(&relative);
-        if paths
-            .agent_directory_roots()
-            .any(|root| path.starts_with(root))
-        {
+        if preserved.iter().any(|root| path.starts_with(root)) {
             continue;
         }
-        if paths
-            .agent_directory_roots()
-            .any(|root| root.starts_with(&path))
-        {
+        if preserved.iter().any(|root| root.starts_with(&path)) {
             let entries = match fs::read_dir(&path) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,

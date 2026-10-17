@@ -58,6 +58,10 @@ pub(crate) struct ExternalOpenClawWorkspaceSources {
 }
 
 impl OpenClawWorkspaceInventory {
+    pub(super) fn preserve_copied_roots(&mut self, roots: &BTreeSet<PathBuf>) {
+        self.workspace_roots.extend(roots.iter().cloned());
+    }
+
     pub(crate) fn contains(&self, path: &Path) -> bool {
         let path = clean_path(path);
         self.workspace_roots

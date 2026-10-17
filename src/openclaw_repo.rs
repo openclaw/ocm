@@ -962,7 +962,11 @@ pub(crate) fn git_registration_entries(common: &Path, root: &Path) -> Result<Vec
     Ok(entries)
 }
 
-fn read_git_pointer(path: &Path, base: &Path, prefix: &[u8]) -> Result<Option<PathBuf>, String> {
+pub(crate) fn read_git_pointer(
+    path: &Path,
+    base: &Path,
+    prefix: &[u8],
+) -> Result<Option<PathBuf>, String> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
