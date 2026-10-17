@@ -1017,7 +1017,18 @@ root is captured as a coherent committed snapshot, including uncheckpointed WAL
 writes; raw database sidecars are omitted. Databases and other files are not
 captured in one atomic transaction.
 
-New archives, with or without `--include-state`, retain the accepted source root and its captured canonical path in optional `env.canonicalSourceRoot` metadata. Configuration relocation uses both recorded roots without requiring the original source or alias to exist; state-inclusive runtime-reference relocation uses the same identities. Older archives keep their existing import behavior. The archive format remains version 1, and older readers ignore the optional field. Source identities may use POSIX, Windows drive, or UNC syntax; the extension preserves acceptance of portable foreign-platform contents without adding translation of platform-specific payload paths. On Windows, ordinary drive/UNC and extended-length spellings of a recorded root relocate together.
+New archives, with or without `--include-state`, retain the accepted source root and its captured canonical path in optional `env.canonicalSourceRoot` metadata.
+Configuration relocation uses both recorded roots without requiring the original source or alias to exist; state-inclusive runtime-reference relocation uses the same identities.
+Older archives retain their existing source-root matching rules.
+The archive format remains version 1, and older readers ignore the optional field.
+Source identities may use POSIX, Windows drive, or UNC syntax; the extension preserves acceptance of portable foreign-platform contents without adding translation of platform-specific payload paths.
+On Windows, ordinary drive/UNC and extended-length spellings of a recorded root relocate together.
+
+Default archives can still retain SQLite sessions in selected agent directories, using current `session_nodes` or legacy `session_entries` storage.
+Import uses the available recorded source identities to relocate their authoritative workspace fields, including databases in configured agent directories, without adding the global state database to the archive.
+Other session JSON, authored content, Board checksums and grants, and integrity-protected history remain unchanged.
+A configured active database inside protected history causes import to fail and removes the partial target before registration.
+This ownership check also applies to older archives without source-root metadata; unrelated history remains unchanged.
 
 State-inclusive export copies configuration files verbatim. Import rewrites
 env-scoped OpenClaw config paths for the new root, including agent workspaces
@@ -1375,6 +1386,10 @@ Examples:
 - `ocm help service`
 
 ## Retained service ownership recovery
+
+`ocm env status <env>` also reports `openclawState: "unknown"` while recorded service ownership remains unresolved, even when service intent is stopped or its binding is missing.
+Its terminal guidance points to `ocm service recover <env>` to inspect the claim before starting or repairing the environment.
+This status does not acknowledge recovery or change service intent.
 
 A replacement background daemon preserves unresolved runtime children and service rows from its predecessor, including pending rows whose child PID was never published. It refuses to start another child for those targets while allowing unrelated environments to progress. Service status reports retained ownership as `gatewayState: "unknown"`, not a verified running or stopped process. An old listener answering a health check does not make a replacement Start succeed. Snapshot capture and restore, service restart, and foreground dev startup also refuse an unresolved target claim, including after Stop or native daemon exit. Exact recovery releases that restriction for the target without blocking unrelated environments.
 
