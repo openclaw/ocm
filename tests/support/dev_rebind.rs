@@ -413,7 +413,16 @@ fn dev_rebind_retains_ui_port_and_serves_new_code_with_saved_conversation() {
         &root,
         root.path(),
         &env,
-        &["dev", "demo", "--repo", &path_string(&repo)],
+        // Other fixture stores probe from 18789 upward even while this
+        // environment is stopped. Keep its retained family below that range.
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--port",
+            "16789",
+        ],
     );
     let gateway = initial_ui_process(&root, "gateway", &mut controller);
     let ui = initial_ui_process(&root, "ui", &mut controller);
@@ -439,6 +448,20 @@ fn dev_rebind_retains_ui_port_and_serves_new_code_with_saved_conversation() {
     fs::write(&entry, &code).unwrap();
     fs::remove_dir_all(&repo).unwrap();
     let target = fs::canonicalize(target).unwrap();
+    let registry = ocm::store::env_registry_path(&env, root.path()).unwrap();
+    let previous_binding = fs::read(&registry).unwrap();
+    let occupied =
+        std::net::TcpListener::bind(("127.0.0.1", saved.gateway_port.unwrap() as u16 + 1)).unwrap();
+    let refused = rebind(root.path(), &env, &target);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("Gateway port family is in use"));
+    assert_eq!(fs::read(&registry).unwrap(), previous_binding);
+    assert_eq!(fs::read(&paths.config_path).unwrap(), config);
+    assert_eq!(
+        fs::read_to_string(&conversation).unwrap(),
+        "saved synthetic conversation"
+    );
+    drop(occupied);
     let rebound = rebind(root.path(), &env, &target);
     assert!(rebound.status.success(), "{}", stderr(&rebound));
     assert_eq!(
