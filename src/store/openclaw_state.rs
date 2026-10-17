@@ -13,8 +13,8 @@ use crate::infra::archive::{EnvArchiveEntryKind, EnvArchiveOptions};
 use super::common::path_exists;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_workspaces::{
-    OpenClawWorkspaceInventory, OpenClawWorkspaceRuntime, resolve_env_openclaw_copy_paths,
-    resolve_env_openclaw_workspaces,
+    OpenClawWorkspaceInventory, OpenClawWorkspaceRuntime, canonicalize_path_allow_missing,
+    resolve_env_openclaw_copy_paths, resolve_env_openclaw_workspaces,
 };
 
 #[derive(Clone, Debug)]
@@ -2376,20 +2376,24 @@ fn runtime_debris_outside_agent_directories(
     paths: &OpenClawWorkspaceInventory,
     candidates: BTreeSet<PathBuf>,
 ) -> Result<BTreeSet<PathBuf>, String> {
+    // Inventory admission already rejected internal redirects. Compare owned
+    // agent roots and debris candidates using the same root spelling.
+    let agent_roots = paths
+        .agent_directory_roots()
+        .map(canonicalize_path_allow_missing)
+        .collect::<Result<Vec<_>, _>>()?;
+    if agent_roots.is_empty() {
+        return Ok(candidates);
+    }
+    let canonical_root = canonicalize_path_allow_missing(root)?;
     let mut pending = candidates.into_iter().collect::<Vec<_>>();
     let mut debris = BTreeSet::new();
     while let Some(relative) = pending.pop() {
-        let path = root.join(&relative);
-        if paths
-            .agent_directory_roots()
-            .any(|root| path.starts_with(root))
-        {
+        let path = canonical_root.join(&relative);
+        if agent_roots.iter().any(|root| path.starts_with(root)) {
             continue;
         }
-        if paths
-            .agent_directory_roots()
-            .any(|root| root.starts_with(&path))
-        {
+        if agent_roots.iter().any(|root| root.starts_with(&path)) {
             let entries = match fs::read_dir(&path) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -2962,6 +2966,76 @@ mod tests {
                 fs::read_to_string(paths.state_dir.join("gateway.pid")).unwrap(),
                 "123"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_cleanup_preserves_agent_retention_policy_under_root_aliases() {
+        for copying in [false, true] {
+            for canonical in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let physical = temp.path().join("physical");
+                let alias = temp.path().join("alias");
+                fs::create_dir_all(&physical).unwrap();
+                std::os::unix::fs::symlink(&physical, &alias).unwrap();
+                let paths = derive_env_paths(alias.join("source"));
+                let relative = "extensions/demo/node_modules/private-agent";
+                let agent = paths.state_dir.join(relative);
+                fs::create_dir_all(&agent).unwrap();
+                fs::write(agent.join("auth-profiles.json"), "auth fixture").unwrap();
+                fs::write(
+                    paths
+                        .state_dir
+                        .join("extensions/demo/node_modules/stale.txt"),
+                    "debris",
+                )
+                .unwrap();
+                fs::write(
+                    paths
+                        .state_dir
+                        .join("extensions/demo/.openclaw-runtime-deps.json"),
+                    "{}",
+                )
+                .unwrap();
+                let configured = if canonical {
+                    fs::canonicalize(&agent).unwrap()
+                } else {
+                    agent.clone()
+                };
+                let config = serde_json::json!({"agents": {"list": [{"id": "main", "agentDir": configured}]}}).to_string();
+                fs::write(&paths.config_path, &config).unwrap();
+                assert!(
+                    clear_runtime_state_with_policy(
+                        &paths,
+                        &BTreeMap::new(),
+                        OpenClawWorkspaceRuntime::default(),
+                        copying,
+                    )
+                    .unwrap()
+                );
+                if copying {
+                    assert_eq!(
+                        fs::read(agent.join("auth-profiles.json")).unwrap(),
+                        b"auth fixture"
+                    );
+                } else {
+                    assert!(!agent.exists());
+                }
+                assert_eq!(fs::read(&paths.config_path).unwrap(), config.as_bytes());
+                assert!(
+                    !paths
+                        .state_dir
+                        .join("extensions/demo/node_modules/stale.txt")
+                        .exists()
+                );
+                assert!(
+                    !paths
+                        .state_dir
+                        .join("extensions/demo/.openclaw-runtime-deps.json")
+                        .exists()
+                );
+            }
         }
     }
 

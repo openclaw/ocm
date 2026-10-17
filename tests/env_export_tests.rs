@@ -929,3 +929,94 @@ fn env_export_import_retains_configured_agent_directories() {
         assert!(state.join("agents/main/sessions/stale.jsonl").exists());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn env_export_retains_agent_payload_under_equivalent_root_spellings() {
+    let root = TestDir::new("export-agent-root-alias");
+    let env = ocm_env(&root);
+    let physical = root.child("physical");
+    let alias = root.child("alias");
+    fs::create_dir_all(&physical).unwrap();
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    let source = alias.join("source");
+    let created = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let canonical = fs::canonicalize(&source).unwrap();
+    let state = source.join(".openclaw");
+    let payload = b"{\"fixture\":true}\n";
+    for relative in [
+        "workspace/.openclaw/tmp/private-agent",
+        "extensions/demo/node_modules/private-agent",
+    ] {
+        write_text(
+            &state.join(relative).join("auth-profiles.json"),
+            std::str::from_utf8(payload).unwrap(),
+        );
+    }
+    for relative in [
+        "workspace/.openclaw/tmp/stale.txt",
+        "extensions/demo/node_modules/stale.txt",
+        "extensions/demo/.openclaw-runtime-deps.json",
+    ] {
+        write_text(&state.join(relative), "{}");
+    }
+    for (index, spelling) in [&source, &canonical].into_iter().enumerate() {
+        let config = serde_json::json!({"agents": {
+            "defaults": {"workspace": state.join("workspace")},
+            "entries": {
+                "main": {"agentDir": spelling.join(".openclaw/workspace/.openclaw/tmp/private-agent")},
+                "plugin": {"agentDir": spelling.join(".openclaw/extensions/demo/node_modules/private-agent")}
+            }
+        }}).to_string();
+        write_text(&state.join("openclaw.json"), &config);
+        let archive = root.child(&format!("export-{index}.tar"));
+        let exported = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--output",
+                archive.to_str().unwrap(),
+            ],
+        );
+        assert!(exported.status.success(), "{}", stderr(&exported));
+        let extracted = extract_env_archive::<EnvArchiveMetadata>(
+            &archive,
+            &root.child(&format!("extract-{index}")),
+        )
+        .unwrap();
+        let copied_state = extracted.root_dir.join(".openclaw");
+        for relative in [
+            "workspace/.openclaw/tmp/private-agent/auth-profiles.json",
+            "extensions/demo/node_modules/private-agent/auth-profiles.json",
+        ] {
+            assert_eq!(fs::read(copied_state.join(relative)).unwrap(), payload);
+            assert_eq!(fs::read(state.join(relative)).unwrap(), payload);
+        }
+        for relative in [
+            "workspace/.openclaw/tmp/stale.txt",
+            "extensions/demo/node_modules/stale.txt",
+            "extensions/demo/.openclaw-runtime-deps.json",
+        ] {
+            assert!(!copied_state.join(relative).exists(), "{relative}");
+            assert_eq!(fs::read(state.join(relative)).unwrap(), b"{}");
+        }
+        assert_eq!(
+            fs::read(state.join("openclaw.json")).unwrap(),
+            config.as_bytes()
+        );
+    }
+}
