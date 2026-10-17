@@ -1022,6 +1022,7 @@ binary payload columns (including compressed records) retain their bytes. Other
 workspace files and integrity-protected history also retain their bytes.
 Import refuses a selected active database that resolves to protected history and removes the partial target before registration, instead of preserving stale runtime state or changing historical bytes.
 Unselected history and ordinary unprotected database aliases remain supported.
+The ownership check also applies when restoring to the original root or importing an archive without source-root metadata.
 Authored Board tabs and widgets retain their content, checksums, and associated metadata unchanged, even when their text mentions the original environment root.
 Every other file outside the config and state-reference rewrites stays byte-identical to the archive.
 Migration and state-inclusive import share root-reference matching for plain

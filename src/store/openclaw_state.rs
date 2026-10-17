@@ -261,21 +261,31 @@ pub(super) fn relocate_archived_runtime_state(
     if source_roots.iter().any(|root| root.as_os_str().is_empty()) {
         return Err("archive source root is empty".to_string());
     }
-    if source_roots.iter().all(|root| *root == paths.root) {
-        return Ok(ArchivedRuntimeStateResult::default());
-    }
     if !path_exists(&paths.state_dir) {
         return Ok(ArchivedRuntimeStateResult::default());
     }
-    let workspaces = resolve_env_openclaw_workspaces(paths, env, runtime)?;
-    let changed = rewrite_runtime_state_root_refs(
-        &paths.state_dir,
-        &paths.config_path,
-        &workspaces,
-        source_roots,
-        &paths.root,
-        true,
-    )?;
+    // Keep matching identities together: an unchanged longer root can prevent
+    // a shorter canonical prefix from relocating the same reference again.
+    let source_roots: &[&Path] = if source_roots.iter().all(|root| *root == paths.root) {
+        &[]
+    } else {
+        source_roots
+    };
+    let changed = if source_roots.is_empty() {
+        false
+    } else {
+        let workspaces = resolve_env_openclaw_workspaces(paths, env, runtime)?;
+        rewrite_runtime_state_root_refs(
+            &paths.state_dir,
+            &paths.config_path,
+            &workspaces,
+            source_roots,
+            &paths.root,
+            true,
+        )?
+    };
+    // Ownership admission still applies when no root relocation is needed or
+    // the archive predates source-root metadata.
     let databases =
         relocate_copied_databases(paths, source_roots, DatabasePathRelocation::ArchivedState)?;
     Ok(ArchivedRuntimeStateResult {
@@ -359,6 +369,9 @@ fn relocate_archived_database(
     visited: &mut BTreeSet<PathBuf>,
     counts: &mut BTreeMap<String, u64>,
 ) -> Result<(), String> {
+    if source_roots.is_empty() {
+        return Ok(());
+    }
     if !visited.insert(database.to_path_buf()) || !is_sqlite_database(database)? {
         return Ok(());
     }

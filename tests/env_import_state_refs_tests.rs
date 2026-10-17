@@ -9,6 +9,152 @@ use rusqlite::{Connection, params};
 
 use support::{TestDir, ocm_env};
 
+#[cfg(unix)]
+#[test]
+fn state_import_admits_databases_when_no_root_relocation_is_needed() {
+    use std::io::Read;
+    use std::os::unix::fs::symlink;
+    use support::{run_ocm, stderr, stdout};
+
+    for source_metadata in [true, false] {
+        for protected in [true, false] {
+            let root = TestDir::new("import-without-root-relocation");
+            let mut env = ocm_env(&root);
+            let source = root.child("source");
+            let created = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "create",
+                    "source",
+                    "--root",
+                    source.to_str().unwrap(),
+                ],
+            );
+            assert!(created.status.success(), "{}", stderr(&created));
+            let relative = if protected {
+                "skill-workshop/support/history.sqlite"
+            } else {
+                "state/openclaw.sqlite"
+            };
+            let state = source.join(".openclaw");
+            let database = state.join(relative);
+            fs::create_dir_all(database.parent().unwrap()).unwrap();
+            let db = Connection::open(&database).unwrap();
+            db.execute_batch("CREATE TABLE paths(path TEXT)").unwrap();
+            db.execute(
+                "INSERT INTO paths VALUES (?1)",
+                [source.join("payload").display().to_string()],
+            )
+            .unwrap();
+            drop(db);
+            if protected {
+                fs::create_dir(state.join("state")).unwrap();
+                symlink(
+                    "../skill-workshop/support/history.sqlite",
+                    state.join("state/openclaw.sqlite"),
+                )
+                .unwrap();
+            }
+            let before = fs::read(&database).unwrap();
+            let archive = root.child("state.tar");
+            let exported = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "export",
+                    "source",
+                    "--include-state",
+                    "--output",
+                    archive.to_str().unwrap(),
+                ],
+            );
+            assert!(exported.status.success(), "{}", stderr(&exported));
+            let original_archive = fs::read(&archive).unwrap();
+            let mut input = tar::Archive::new(original_archive.as_slice());
+            let mut output = tar::Builder::new(Vec::new());
+            let mut archived_database = Vec::new();
+            for entry in input.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().into_owned();
+                let mut header = entry.header().clone();
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                if path == Path::new("meta/env.json") && !source_metadata {
+                    let mut metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    metadata["env"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("sourceRoot");
+                    metadata["env"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("canonicalSourceRoot");
+                    bytes = serde_json::to_vec(&metadata).unwrap();
+                    header.set_size(bytes.len() as u64);
+                    header.set_cksum();
+                }
+                if path == Path::new("root/.openclaw").join(relative) {
+                    archived_database = bytes.clone();
+                }
+                output.append(&header, bytes.as_slice()).unwrap();
+            }
+            assert!(!archived_database.is_empty());
+            let archive_bytes = output.into_inner().unwrap();
+            fs::write(&archive, &archive_bytes).unwrap();
+            fs::rename(&source, root.child("offline")).unwrap();
+            env.insert(
+                "OCM_HOME".into(),
+                root.child("fresh-registry").display().to_string(),
+            );
+            let imported = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "import",
+                    archive.to_str().unwrap(),
+                    "--name",
+                    "restored",
+                    "--root",
+                    source.to_str().unwrap(),
+                    "--json",
+                ],
+            );
+            assert_eq!(
+                imported.status.success(),
+                !protected,
+                "{}",
+                stderr(&imported)
+            );
+            let shown = run_ocm(root.path(), &env, &["env", "show", "restored", "--json"]);
+            assert_eq!(shown.status.success(), !protected);
+            if protected {
+                assert!(stderr(&imported).contains("selects integrity-protected history"));
+                assert!(!source.exists());
+            } else {
+                assert_eq!(
+                    fs::read(source.join(".openclaw").join(relative)).unwrap(),
+                    archived_database
+                );
+                let summary: serde_json::Value = serde_json::from_str(&stdout(&imported)).unwrap();
+                let rewritten = summary["databasePathsRewritten"].as_object().unwrap();
+                assert!(rewritten.values().all(|count| count.as_u64() == Some(0)));
+                if !source_metadata {
+                    assert!(rewritten.is_empty());
+                }
+            }
+            assert_eq!(
+                fs::read(root.child("offline/.openclaw").join(relative)).unwrap(),
+                before
+            );
+            assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+        }
+    }
+}
+
 #[test]
 fn state_import_relocates_registered_database_text_and_preserves_other_values() {
     for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
