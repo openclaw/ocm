@@ -1364,6 +1364,10 @@ Examples:
 
 ## Retained service ownership recovery
 
+`ocm env status <env>` also reports `openclawState: "unknown"` while recorded service ownership remains unresolved, even when service intent is stopped or its binding is missing.
+Its terminal guidance points to `ocm service recover <env>` to inspect the claim before starting or repairing the environment.
+This status does not acknowledge recovery or change service intent.
+
 A replacement background daemon preserves unresolved runtime children and service rows from its predecessor, including pending rows whose child PID was never published. It refuses to start another child for those targets while allowing unrelated environments to progress. Service status reports retained ownership as `gatewayState: "unknown"`, not a verified running or stopped process. An old listener answering a health check does not make a replacement Start succeed. Snapshot capture and restore, service restart, and foreground dev startup also refuse an unresolved target claim, including after Stop or native daemon exit. Exact recovery releases that restriction for the target without blocking unrelated environments.
 
 First stop the target's running intent and inspect the claim:

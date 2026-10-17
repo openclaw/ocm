@@ -2074,6 +2074,13 @@ pub fn env_status(
 }
 
 fn env_status_next_steps(status: &EnvStatusSummary, command_example: &str) -> Vec<KeyValueRow> {
+    if status.openclaw_state.as_deref() == Some("unknown") {
+        return vec![KeyValueRow::warning(
+            "Inspect ownership",
+            format!("{command_example} service recover {}", status.env_name),
+        )];
+    }
+
     if status.resolved_kind.is_none() {
         return vec![KeyValueRow::accent(
             "Start",
