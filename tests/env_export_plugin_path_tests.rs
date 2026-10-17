@@ -1518,3 +1518,294 @@ fn state_import_bounds_directory_handles_for_deep_runtime_state() {
         "unchanged payload\n"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn state_archive_relocates_both_root_identities_after_the_source_disappears() {
+    use ocm::infra::archive::{EnvArchiveMetadata, extract_env_archive};
+    use rusqlite::Connection;
+    use serde_json::{Value, json};
+    use std::os::unix::{fs::PermissionsExt, fs::symlink};
+
+    for nested_alias in [false, true] {
+        let root = TestDir::new("state-archive-root-identities");
+        let env = ocm_env(&root);
+        let fixture = fs::canonicalize(root.path()).unwrap();
+        let physical_parent = fixture.join("physical");
+        let canonical = physical_parent.join("source");
+        fs::create_dir_all(&canonical).unwrap();
+        let alias = if nested_alias {
+            canonical.join("alias")
+        } else {
+            fixture.join("alias")
+        };
+        if !nested_alias {
+            symlink(&physical_parent, &alias).unwrap();
+        }
+        let lexical = alias.join("source");
+        let create = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "create",
+                "source",
+                "--root",
+                lexical.to_str().unwrap(),
+            ],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        if nested_alias {
+            // Register the initially empty root, then retain its files behind
+            // an alias whose spelling is below its canonical source root.
+            for entry in fs::read_dir(&lexical).unwrap() {
+                let entry = entry.unwrap();
+                fs::rename(entry.path(), canonical.join(entry.file_name())).unwrap();
+            }
+            fs::remove_dir_all(&alias).unwrap();
+            symlink(&physical_parent, &alias).unwrap();
+        }
+        let state = canonical.join(".openclaw");
+        fs::create_dir_all(state.join("custom-workspace")).unwrap();
+        let config = json!({
+            "plugin": {"$include": "extra.json"},
+            "agents": {"defaults": {"workspace": canonical.join(".openclaw/custom-workspace")},
+                "entries": {"main": {"agentDir": lexical.join(".openclaw/private-agent")}}}
+        })
+        .to_string();
+        write_text(&state.join("openclaw.json"), &config);
+        let include =
+            json!({"plugin": {"note": canonical.join("included-provenance")}}).to_string();
+        write_text(&state.join("extra.json"), &include);
+        let custom = state.join("private-agent/custom.sqlite");
+        fs::create_dir_all(custom.parent().unwrap()).unwrap();
+        let global = state.join("state/openclaw.sqlite");
+        fs::create_dir_all(global.parent().unwrap()).unwrap();
+        let registry = Connection::open(&global).unwrap();
+        registry
+            .execute_batch("CREATE TABLE agent_databases (path TEXT);")
+            .unwrap();
+        registry
+            .execute(
+                "INSERT INTO agent_databases VALUES (?1)",
+                [canonical
+                    .join(".openclaw/private-agent/custom.sqlite")
+                    .to_str()
+                    .unwrap()],
+            )
+            .unwrap();
+        drop(registry);
+        let db = Connection::open(&custom).unwrap();
+        db.execute_batch("CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, entry_json TEXT, payload BLOB);
+            CREATE TABLE board_widgets (name TEXT PRIMARY KEY, descriptor_json TEXT);
+            CREATE TABLE board_tabs (title TEXT);").unwrap();
+        let external = fixture.join("external");
+        let sibling = fixture.join("physical/source-sibling");
+        for (name, path) in [
+            ("lexical", &lexical),
+            ("canonical", &canonical),
+            ("external", &external),
+            ("sibling", &sibling),
+        ] {
+            let row = json!({"sessionRoot": path.join(".openclaw/custom-workspace"), "spawnedCwd": path.join(".openclaw/custom-workspace")}).to_string();
+            db.execute(
+                "INSERT INTO session_nodes VALUES (?1, ?2, ?3)",
+                rusqlite::params![name, row, row.as_bytes()],
+            )
+            .unwrap();
+        }
+        let authored = json!({"path": canonical.join("board-authored"), "command": format!("cat {}/fixture", lexical.display())}).to_string();
+        db.execute("INSERT INTO board_widgets VALUES ('main', ?1)", [&authored])
+            .unwrap();
+        db.execute("INSERT INTO board_tabs VALUES (?1)", [&authored])
+            .unwrap();
+        drop(db);
+        let runtime = json!({"paths": [lexical.join("active"), canonical.join("active")],
+            "command": format!("cat {}/first {}/second", lexical.display(), canonical.display()),
+            "urls": format!("{} {}", url::Url::from_file_path(lexical.join("active")).unwrap(), url::Url::from_file_path(canonical.join("active")).unwrap())}).to_string();
+        write_text(
+            &state.join("agents/main/sessions/legacy.jsonl"),
+            &(runtime + "\n"),
+        );
+        for file in [
+            "custom-workspace/notes.json",
+            "skill-workshop/receipt.json",
+            "logs/config-audit.jsonl",
+        ] {
+            write_text(&state.join(file), &authored);
+        }
+        fs::write(state.join("opaque.bin"), [0xff, 0, 0x81]).unwrap();
+        let protected = [
+            "openclaw.json",
+            "extra.json",
+            "custom-workspace/notes.json",
+            "skill-workshop/receipt.json",
+            "logs/config-audit.jsonl",
+            "opaque.bin",
+            "state/openclaw.sqlite",
+            "private-agent/custom.sqlite",
+        ];
+        let before: Vec<_> = protected
+            .iter()
+            .map(|path| fs::read(state.join(path)).unwrap())
+            .collect();
+        let archive = fixture.join("state.tar");
+        let export = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--include-state",
+                "--output",
+                archive.to_str().unwrap(),
+                "--json",
+            ],
+        );
+        assert!(export.status.success(), "{}", stderr(&export));
+        assert_eq!(
+            fs::metadata(&archive).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        for (path, bytes) in protected.iter().zip(&before) {
+            assert_eq!(fs::read(state.join(path)).unwrap(), *bytes, "source {path}");
+        }
+        let extracted =
+            extract_env_archive::<EnvArchiveMetadata>(&archive, &fixture.join("extracted"))
+                .unwrap();
+        assert_eq!(extracted.metadata.format_version, 1);
+        assert_eq!(
+            extracted.metadata.env.source_root.as_deref(),
+            lexical.to_str()
+        );
+        assert_eq!(
+            extracted.metadata.env.canonical_source_root.as_deref(),
+            canonical.to_str()
+        );
+        for (path, bytes) in protected[..6].iter().zip(&before) {
+            assert_eq!(
+                fs::read(extracted.root_dir.join(".openclaw").join(path)).unwrap(),
+                *bytes,
+                "archive {path}"
+            );
+        }
+        fs::remove_dir_all(&canonical).unwrap();
+        if !nested_alias {
+            fs::remove_file(&alias).unwrap();
+        }
+        assert!(!lexical.exists() && !canonical.exists());
+        // The nested destination also catches cascading replacement of an
+        // already relocated value by the shorter canonical source prefix.
+        let target = if nested_alias {
+            canonical.join("restored")
+        } else {
+            fixture.join("restored")
+        };
+        let import = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "import",
+                archive.to_str().unwrap(),
+                "--name",
+                "restored",
+                "--root",
+                target.to_str().unwrap(),
+                "--json",
+            ],
+        );
+        assert!(import.status.success(), "{}", stderr(&import));
+        let imported_state = target.join(".openclaw");
+        let config: Value =
+            serde_json::from_slice(&fs::read(imported_state.join("openclaw.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config["agents"]["defaults"]["workspace"],
+            target.join(".openclaw/custom-workspace").to_str().unwrap()
+        );
+        assert_eq!(
+            config["agents"]["entries"]["main"]["agentDir"],
+            target.join(".openclaw/private-agent").to_str().unwrap()
+        );
+        for (path, bytes) in protected[1..6].iter().zip(&before[1..6]) {
+            assert_eq!(
+                fs::read(imported_state.join(path)).unwrap(),
+                *bytes,
+                "import {path}"
+            );
+        }
+        let db = Connection::open(imported_state.join("private-agent/custom.sqlite")).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        for (name, original, expected) in [
+            ("lexical", &lexical, &target),
+            ("canonical", &canonical, &target),
+            ("external", &external, &external),
+            ("sibling", &sibling, &sibling),
+        ] {
+            let (raw, blob): (String, Vec<u8>) = db
+                .query_row(
+                    "SELECT entry_json, payload FROM session_nodes WHERE session_key = ?1",
+                    [name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let value: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                value["spawnedCwd"],
+                expected
+                    .join(".openclaw/custom-workspace")
+                    .to_str()
+                    .unwrap(),
+                "{name}"
+            );
+            let original = json!({"sessionRoot": original.join(".openclaw/custom-workspace"), "spawnedCwd": original.join(".openclaw/custom-workspace")}).to_string();
+            assert_eq!(blob, original.as_bytes());
+        }
+        for (table, column) in [
+            ("board_widgets", "descriptor_json"),
+            ("board_tabs", "title"),
+        ] {
+            assert_eq!(
+                db.query_row(&format!("SELECT {column} FROM {table}"), [], |row| row
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+                authored
+            );
+        }
+        let registry = Connection::open(imported_state.join("state/openclaw.sqlite")).unwrap();
+        assert_eq!(
+            registry
+                .query_row("SELECT path FROM agent_databases", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            target
+                .join(".openclaw/private-agent/custom.sqlite")
+                .to_str()
+                .unwrap()
+        );
+        let legacy: Value = serde_json::from_str(
+            &fs::read_to_string(imported_state.join("agents/main/sessions/legacy.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy["paths"],
+            json!([target.join("active"), target.join("active")])
+        );
+        assert_eq!(
+            legacy["command"],
+            format!("cat {}/first {}/second", target.display(), target.display())
+        );
+        let url = url::Url::from_file_path(target.join("active"))
+            .unwrap()
+            .to_string();
+        assert_eq!(legacy["urls"], format!("{url} {url}"));
+    }
+}

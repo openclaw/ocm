@@ -10,7 +10,8 @@ use crate::env::{
     ImportEnvironmentResult,
 };
 use crate::infra::archive::{
-    ArchivedEnvMeta, EnvArchiveMetadata, extract_env_archive, write_env_archive_with_options,
+    ArchivedEnvMeta, EnvArchiveMetadata, extract_env_archive, write_env_archive_from_resolved_root,
+    write_env_archive_with_options,
 };
 use crate::openclaw_repo::remove_openclaw_worktree;
 use serde::{Deserialize, Serialize};
@@ -1100,6 +1101,10 @@ pub fn export_environment(
         ));
     }
 
+    let canonical_root = options
+        .include_state
+        .then(|| fs::canonicalize(&env_paths.root).map_err(|error| error.to_string()))
+        .transpose()?;
     let metadata = EnvArchiveMetadata {
         include_state: options.include_state,
         kind: "ocm-env-archive".to_string(),
@@ -1108,6 +1113,10 @@ pub fn export_environment(
         env: ArchivedEnvMeta {
             name: meta.name.clone(),
             source_root: Some(meta.root.clone()),
+            canonical_source_root: canonical_root
+                .as_ref()
+                .filter(|root| *root != &env_paths.root)
+                .map(|root| display_path(root)),
             gateway_port: meta.gateway_port,
             gateway_port_auto_assigned: meta.gateway_port_auto_assigned,
             service_enabled: meta.service_enabled,
@@ -1127,8 +1136,11 @@ pub fn export_environment(
     } else {
         openclaw_env_archive_options(&env_paths, env, runtime)?
     };
-    let result =
-        write_env_archive_with_options(&metadata, &env_paths.root, &output_path, archive_options);
+    let result = if let Some(root) = canonical_root.as_deref() {
+        write_env_archive_from_resolved_root(&metadata, root, &output_path, archive_options)
+    } else {
+        write_env_archive_with_options(&metadata, &env_paths.root, &output_path, archive_options)
+    };
     if result.is_err() && !options.include_state {
         let _ = fs::remove_file(&output_path);
     }
@@ -1189,6 +1201,32 @@ pub(crate) fn import_environment_with_sandbox_origin(
             )?;
         }
 
+        let mut source_roots: Vec<&Path> = extracted
+            .metadata
+            .env
+            .source_root
+            .as_deref()
+            .map(Path::new)
+            .into_iter()
+            .collect();
+        if let Some(canonical) = extracted.metadata.env.canonical_source_root.as_deref() {
+            let canonical = Path::new(canonical);
+            if source_roots.is_empty()
+                || !canonical.is_absolute()
+                || canonical
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return Err(
+                    "archive canonical source root must be absolute and accompany sourceRoot"
+                        .to_string(),
+                );
+            }
+            source_roots.push(canonical);
+        }
+        // Match each original reference once, preferring its most specific root.
+        source_roots.sort_by_key(|root| std::cmp::Reverse(root.as_os_str().len()));
+        source_roots.dedup();
         let source_name = extracted.metadata.env.name.clone();
         let name = if let Some(name) = options.name.as_deref() {
             validate_name(name, "Environment name")?
@@ -1284,9 +1322,9 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 validate_nonportable_runtime_state_paths(&target_paths)?;
             }
             reject_include_owned_sandbox_origin(&target_paths.config_path)?;
-            let config_rewrite = rewrite_openclaw_config_for_new_environment(
+            let config_rewrite = super::openclaw_config::rewrite_archived_openclaw_config(
                 &target_paths,
-                extracted.metadata.env.source_root.as_deref().map(Path::new),
+                &source_roots,
                 Some(gateway_port),
                 sandbox_origin.as_deref(),
             )?;
@@ -1317,17 +1355,13 @@ pub(crate) fn import_environment_with_sandbox_origin(
                     .map(Path::new)
                     .unwrap_or(&extracted.root_dir),
             )?;
-            let state_rewrite = if extracted.metadata.include_state {
-                if let Some(source_root) = extracted.metadata.env.source_root.as_deref() {
-                    super::openclaw_state::relocate_archived_runtime_state(
-                        &target_paths,
-                        Path::new(source_root),
-                        env,
-                        target_runtime,
-                    )?
-                } else {
-                    Default::default()
-                }
+            let state_rewrite = if extracted.metadata.include_state && !source_roots.is_empty() {
+                super::openclaw_state::relocate_archived_runtime_state(
+                    &target_paths,
+                    &source_roots,
+                    env,
+                    target_runtime,
+                )?
             } else {
                 Default::default()
             };

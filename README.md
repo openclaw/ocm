@@ -548,6 +548,8 @@ anywhere under the root are captured as coherent committed snapshots, including
 WAL writes; raw database sidecars are omitted. Each database is captured
 independently, not as one transaction across the environment.
 
+State-inclusive archives retain the accepted source root and, when different, its canonical path in optional `env.canonicalSourceRoot` metadata. Import matches both recorded roots without requiring the original source or alias to exist; older archives keep their existing import behavior. The archive format remains version 1, and older readers ignore the optional field.
+
 State-inclusive export copies configuration files verbatim. Import rewrites
 env-scoped OpenClaw config paths for the new root, including agent workspaces
 and agent directories, through the same rules as an ordinary import. It also

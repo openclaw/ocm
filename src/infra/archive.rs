@@ -48,6 +48,8 @@ pub struct ArchivedEnvMeta {
     pub name: String,
     #[serde(default)]
     pub source_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_source_root: Option<String>,
     pub gateway_port: Option<u32>,
     #[serde(default)]
     pub gateway_port_auto_assigned: bool,
@@ -166,7 +168,7 @@ pub fn write_env_archive_with_options<T: Serialize>(
     metadata: &T,
     source_root: &Path,
     output_path: &Path,
-    mut options: EnvArchiveOptions,
+    options: EnvArchiveOptions,
 ) -> Result<(), String> {
     // Resolve aliases once. A retry must not retarget the selected environment.
     let resolved_root = if options.private_output
@@ -182,6 +184,17 @@ pub fn write_env_archive_with_options<T: Serialize>(
         None
     };
     let source_root = resolved_root.as_deref().unwrap_or(source_root);
+    write_env_archive_from_resolved_root(metadata, source_root, output_path, options)
+}
+
+// The caller can bind metadata to this exact resolved root. Do not resolve it
+// again: opening the capture rejects a path replaced by a symlink.
+pub(crate) fn write_env_archive_from_resolved_root<T: Serialize>(
+    metadata: &T,
+    source_root: &Path,
+    output_path: &Path,
+    mut options: EnvArchiveOptions,
+) -> Result<(), String> {
     let capture = if options.sqlite_content_roots.is_empty() && !options.relocate_internal_symlinks
     {
         None
@@ -2332,6 +2345,7 @@ mod tests {
             env: ArchivedEnvMeta {
                 name: "demo".to_string(),
                 source_root: Some(source_root.display().to_string()),
+                canonical_source_root: None,
                 gateway_port: Some(19789),
                 gateway_port_auto_assigned: false,
                 service_enabled: true,

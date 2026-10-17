@@ -223,7 +223,7 @@ pub(crate) fn prepare_migrated_runtime_state(
         &paths.state_dir,
         &paths.config_path,
         &workspaces,
-        source_state_root,
+        &[source_state_root],
         &paths.state_dir,
         false,
     )?;
@@ -254,14 +254,14 @@ pub(super) struct ArchivedRuntimeStateResult {
 
 pub(super) fn relocate_archived_runtime_state(
     paths: &EnvPaths,
-    source_root: &Path,
+    source_roots: &[&Path],
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<ArchivedRuntimeStateResult, String> {
-    if source_root.as_os_str().is_empty() {
+    if source_roots.iter().any(|root| root.as_os_str().is_empty()) {
         return Err("archive source root is empty".to_string());
     }
-    if source_root == paths.root {
+    if source_roots.iter().all(|root| *root == paths.root) {
         return Ok(ArchivedRuntimeStateResult::default());
     }
     if !path_exists(&paths.state_dir) {
@@ -272,12 +272,12 @@ pub(super) fn relocate_archived_runtime_state(
         &paths.state_dir,
         &paths.config_path,
         &workspaces,
-        source_root,
+        source_roots,
         &paths.root,
         true,
     )?;
     let databases =
-        relocate_copied_databases(paths, &[source_root], DatabasePathRelocation::ArchivedState)?;
+        relocate_copied_databases(paths, source_roots, DatabasePathRelocation::ArchivedState)?;
     Ok(ArchivedRuntimeStateResult {
         changed: changed || databases.values().any(|count| *count != 0),
         databases,
@@ -500,32 +500,28 @@ fn rewrite_database_root_references(
                                 || ["Path", "Dir", "Root", "_path", "_dir", "_root"]
                                     .iter()
                                     .any(|suffix| name.ends_with(suffix));
-                        let mut replacement = original.to_string();
-                        if session_entry {
-                            replacement = rewrite_cloned_session_entry(
+                        let replacement = if session_entry {
+                            rewrite_cloned_session_entry(
                                 original,
                                 &source_roots,
                                 target_root,
                                 false,
-                            )?;
+                            )?
+                        } else if path_column
+                            && (Path::new(original).is_absolute()
+                                || original
+                                    .get(..5)
+                                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:")))
+                        {
+                            rewrite_path_value(original, &source_roots, target_root)
                         } else {
-                            for source_root in &source_roots {
-                                replacement = if path_column
-                                    && (Path::new(&replacement).is_absolute()
-                                        || replacement.get(..5).is_some_and(|scheme| {
-                                            scheme.eq_ignore_ascii_case("file:")
-                                        })) {
-                                    rewrite_path_value(&replacement, source_root, target_root)
-                                } else {
-                                    rewrite_runtime_root_references(
-                                        &replacement,
-                                        source_root,
-                                        target_root,
-                                        false,
-                                    )?
-                                };
-                            }
-                        }
+                            rewrite_runtime_root_references(
+                                original,
+                                &source_roots,
+                                target_root,
+                                false,
+                            )?
+                        };
                         if replacement == original {
                             continue;
                         }
@@ -628,11 +624,8 @@ fn rewrite_cloned_session_entry(
                 true,
             )?);
         } else if path_field && let Ok(path) = serde_json::from_str::<String>(value) {
-            let replacement = source_roots.iter().find_map(|source_root| {
-                let replacement = rewrite_path_value(&path, source_root, target_root);
-                (replacement != path).then_some(replacement)
-            });
-            if let Some(replacement) = replacement {
+            let replacement = rewrite_path_value(&path, source_roots, target_root);
+            if replacement != path {
                 output.push_str(
                     &serde_json::to_string(&replacement).map_err(|error| error.to_string())?,
                 );
@@ -754,19 +747,22 @@ fn rewrite_runtime_state_root_refs(
     root: &Path,
     config_path: &Path,
     workspaces: &OpenClawWorkspaceInventory,
-    source_state_root: &Path,
+    source_state_roots: &[&Path],
     target_state_root: &Path,
     archived: bool,
 ) -> Result<bool, String> {
     let mut changed = false;
-    let source_root = display_path(source_state_root);
+    let source_roots = source_state_roots
+        .iter()
+        .map(|root| display_path(root))
+        .collect::<Vec<_>>();
     let target_root = display_path(target_state_root);
     rewrite_runtime_state_root_refs_inner(
         root,
         root,
         config_path,
         workspaces,
-        &source_root,
+        &source_roots,
         &target_root,
         archived,
         &mut changed,
@@ -779,7 +775,7 @@ fn rewrite_runtime_state_root_refs_inner(
     root: &Path,
     config_path: &Path,
     workspaces: &OpenClawWorkspaceInventory,
-    source_root: &str,
+    source_roots: &[String],
     target_root: &str,
     archived: bool,
     changed: &mut bool,
@@ -806,7 +802,7 @@ fn rewrite_runtime_state_root_refs_inner(
                 &path,
                 config_path,
                 workspaces,
-                source_root,
+                source_roots,
                 target_root,
                 archived,
                 changed,
@@ -834,7 +830,7 @@ fn rewrite_runtime_state_root_refs_inner(
                     .any(|part| matches!(part, "jsonl" | "ndjson"))
             });
         let rewritten =
-            rewrite_runtime_root_references(&raw, source_root, target_root, json_lines)?;
+            rewrite_runtime_root_references(&raw, source_roots, target_root, json_lines)?;
         if rewritten == raw {
             continue;
         }
@@ -852,14 +848,14 @@ fn rewrite_runtime_state_root_refs_inner(
 
 fn rewrite_runtime_root_references(
     raw: &str,
-    source_root: &str,
+    source_roots: &[String],
     target_root: &str,
     json_lines: bool,
 ) -> Result<String, String> {
     if !json_lines {
         let document = serde_json::from_str::<serde::de::IgnoredAny>(raw);
         if document.is_ok() {
-            return rewrite_root_reference_value(raw, source_root, target_root);
+            return rewrite_root_reference_value(raw, source_roots, target_root);
         }
         if document.is_err_and(|error| error.is_eof())
             && raw.trim_start().starts_with(['{', '[', '"'])
@@ -879,13 +875,13 @@ fn rewrite_runtime_root_references(
         if complete || incomplete {
             output.push_str(&rewrite_rooted_text(
                 &raw[text_start..offset],
-                source_root,
+                source_roots,
                 target_root,
             ));
             if complete {
                 output.push_str(&rewrite_root_reference_value(
                     line,
-                    source_root,
+                    source_roots,
                     target_root,
                 )?);
             } else {
@@ -897,7 +893,7 @@ fn rewrite_runtime_root_references(
     }
     output.push_str(&rewrite_rooted_text(
         &raw[text_start..],
-        source_root,
+        source_roots,
         target_root,
     ));
     Ok(output)
@@ -905,7 +901,7 @@ fn rewrite_runtime_root_references(
 
 fn rewrite_root_reference_value(
     raw: &str,
-    source_root: &str,
+    source_roots: &[String],
     target_root: &str,
 ) -> Result<String, String> {
     if serde_json::from_str::<serde::de::IgnoredAny>(raw).is_ok() {
@@ -935,7 +931,7 @@ fn rewrite_root_reference_value(
                 } else {
                     output.push_str(&rewrite_opaque_json_string(
                         &raw[start..end],
-                        source_root,
+                        source_roots,
                         target_root,
                     )?);
                 }
@@ -954,9 +950,9 @@ fn rewrite_root_reference_value(
             {
                 // A JSON path is one filename; whitespace is not an argument
                 // separator, including escaped newlines within that filename.
-                rewrite_path_value(&value, source_root, target_root)
+                rewrite_path_value(&value, source_roots, target_root)
             } else {
-                rewrite_root_reference_value(&value, source_root, target_root)?
+                rewrite_root_reference_value(&value, source_roots, target_root)?
             };
             if replacement != value {
                 output.push_str(
@@ -989,18 +985,18 @@ fn rewrite_root_reference_value(
         for line in raw.split_inclusive('\n') {
             output.push_str(&rewrite_root_reference_value(
                 line,
-                source_root,
+                source_roots,
                 target_root,
             )?);
         }
         return Ok(output);
     }
-    Ok(rewrite_rooted_text(raw, source_root, target_root))
+    Ok(rewrite_rooted_text(raw, source_roots, target_root))
 }
 
 fn rewrite_opaque_json_string(
     raw: &str,
-    source_root: &str,
+    source_roots: &[String],
     target_root: &str,
 ) -> Result<String, String> {
     let bytes = raw.as_bytes();
@@ -1051,7 +1047,7 @@ fn rewrite_opaque_json_string(
             decoded,
             if index < count { "\0" } else { "" }
         );
-        let rewritten = rewrite_rooted_text(&guarded, source_root, target_root);
+        let rewritten = rewrite_rooted_text(&guarded, source_roots, target_root);
         let rewritten =
             &rewritten[usize::from(start > 1)..rewritten.len() - usize::from(index < count)];
         if rewritten == decoded {
@@ -1181,7 +1177,7 @@ fn plain_root_references(
         .collect()
 }
 
-fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> String {
+fn rewrite_rooted_text(raw: &str, source_roots: &[String], target_root: &str) -> String {
     // File URLs have their own escaping and authority rules. Preserve other URL
     // components and never interpret an external URL as a local command path.
     let quoted = quoted_value_ranges(raw);
@@ -1189,9 +1185,18 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     let mut urls = Vec::new();
     let mut edits = Vec::new();
     let starts: Vec<_> = file_url_starts(raw).collect();
-    let plain = plain_root_references(raw, source_root, &quoted, &starts);
+    let mut plain: Vec<_> = source_roots
+        .iter()
+        .flat_map(|root| {
+            plain_root_references(raw, root, &quoted, &starts)
+                .into_iter()
+                .map(|start| (start, root.len()))
+        })
+        .collect();
+    plain.sort_unstable_by_key(|(start, len)| (*start, std::cmp::Reverse(*len)));
+    plain.dedup_by_key(|(start, _)| *start);
     let mut boundaries = starts.clone();
-    boundaries.extend(plain.iter().copied());
+    boundaries.extend(plain.iter().map(|(start, _)| *start));
     boundaries.sort_unstable();
     boundaries.dedup();
     // A separated opaque escape ends the valid text span; an adjacent escape
@@ -1283,7 +1288,10 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
         // replacement so a bare-root URL gets the same boundary as a child URL.
         value_end = start + raw[start..value_end].trim_end_matches([' ', '\t']).len();
         let range = start..value_end;
-        if let Some(relocated) = rewrite_file_url(&raw[range.clone()], source_root, target_root) {
+        if let Some(relocated) = source_roots
+            .iter()
+            .find_map(|root| rewrite_file_url(&raw[range.clone()], root, target_root))
+        {
             edits.push((range.clone(), relocated));
         }
         urls.push(range);
@@ -1292,8 +1300,8 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     // root boundary rule literally, without interpreting arguments or '..'.
     // Keep the original value intact while locating both URLs and plain paths.
     let mut url_index = 0;
-    for start in plain {
-        let end = start + source_root.len();
+    for (start, len) in plain {
+        let end = start + len;
         while urls.get(url_index).is_some_and(|range| range.end <= start) {
             url_index += 1;
         }
@@ -1305,6 +1313,9 @@ fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> Strin
     let mut output = String::with_capacity(raw.len());
     let mut cursor = 0;
     for (range, replacement) in edits {
+        if range.start < cursor {
+            continue;
+        }
         output.push_str(&raw[cursor..range.start]);
         output.push_str(&replacement);
         cursor = range.end;
@@ -1400,9 +1411,13 @@ fn rewrite_file_url(value: &str, source_root: &str, target_root: &str) -> Option
     Some(format!("{destination}{trailer}"))
 }
 
-fn rewrite_path_value(value: &str, source_root: &str, target_root: &str) -> String {
-    relocate_rooted_path(value, source_root, target_root)
-        .or_else(|| rewrite_file_url(value, source_root, target_root))
+fn rewrite_path_value(value: &str, source_roots: &[String], target_root: &str) -> String {
+    source_roots
+        .iter()
+        .find_map(|root| {
+            relocate_rooted_path(value, root, target_root)
+                .or_else(|| rewrite_file_url(value, root, target_root))
+        })
         .unwrap_or_else(|| value.to_string())
 }
 
