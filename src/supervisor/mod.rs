@@ -562,13 +562,32 @@ impl<'a> SupervisorService<'a> {
     }
 
     pub fn inspect(&self) -> Result<SupervisorInspection, String> {
+        self.inspect_with_checked_daemon(false)
+    }
+
+    pub(crate) fn inspect_for_recovery(&self) -> Result<SupervisorInspection, String> {
+        self.inspect_with_checked_daemon(true)
+    }
+
+    fn inspect_with_checked_daemon(&self, checked: bool) -> Result<SupervisorInspection, String> {
         let state = self.build_state()?;
-        let daemon = self.daemon_status()?;
+        let daemon = self.daemon_summary("status", checked)?;
         let runtime = if daemon.running {
             self.read_runtime_state()?
         } else {
             None
         };
+
+        if checked && daemon.running {
+            let runtime = runtime
+                .as_ref()
+                .ok_or("running supervisor has no runtime observation")?;
+            if runtime.kind != SUPERVISOR_RUNTIME_KIND || runtime.ocm_home != daemon.ocm_home {
+                return Err(
+                    "supervisor runtime observation does not belong to this store".to_string(),
+                );
+            }
+        }
 
         Ok(SupervisorInspection {
             daemon,

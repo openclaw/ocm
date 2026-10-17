@@ -74,6 +74,11 @@ impl<'a> ServiceService<'a> {
         manage::stop_service(name, self.env, self.cwd)
     }
 
+    pub(crate) fn quiesce_after_failed_restore_locked(&self, name: &str) -> Result<(), String> {
+        manage::pause_service_for_recovery(name, self.env, self.cwd)?;
+        self.wait_for_runtime_mutation_quiescence(name, true)
+    }
+
     pub(crate) fn quiesce_for_runtime_mutation_locked(&self, name: &str) -> Result<bool, String> {
         let meta = crate::env::EnvironmentService::new(self.env, self.cwd).get(name)?;
         if !meta.service_enabled || !meta.service_running {
@@ -145,10 +150,22 @@ impl<'a> ServiceService<'a> {
         &self,
         name: &str,
     ) -> Result<(), String> {
+        self.wait_for_runtime_mutation_quiescence(name, false)
+    }
+
+    fn wait_for_runtime_mutation_quiescence(
+        &self,
+        name: &str,
+        checked_observation: bool,
+    ) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let inspection =
-                crate::supervisor::SupervisorService::new(self.env, self.cwd).inspect()?;
+            let supervisor = crate::supervisor::SupervisorService::new(self.env, self.cwd);
+            let inspection = if checked_observation {
+                supervisor.inspect_for_recovery()?
+            } else {
+                supervisor.inspect()?
+            };
             let acknowledged = !inspection
                 .planned_children
                 .iter()

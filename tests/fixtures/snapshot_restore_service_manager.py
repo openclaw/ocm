@@ -33,11 +33,13 @@ if args[0]=='bootstrap':
         if count==1:
             event('acceptance-start-rejected')
             mode=(case/'mode').read_text()
-            target=root if mode=='full-incomplete' else root/'.openclaw' if mode=='scoped-incomplete' else marker if mode=='cleanup-warning' else None
+            target=root if mode.startswith('full-incomplete') else root/'.openclaw' if mode=='scoped-incomplete' else marker if mode=='cleanup-warning' else None
             if target is not None:
                 assert target.resolve().is_relative_to(case.resolve())
                 subprocess.run(['/usr/bin/chflags','uchg',str(target)],check=True)
                 (case/'fault-path').write_text(str(target))
+                if mode.endswith('sync-fails'):
+                    subprocess.run(['/usr/bin/chflags', 'uchg', str(home/'supervisor/state.json')], check=True)
             printed.unlink(missing_ok=True)
             runtime()
             print('forced snapshot acceptance failure',file=sys.stderr)
@@ -46,8 +48,15 @@ if args[0]=='bootstrap':
     printed.write_text('state = running\npid = 23613\n')
     runtime();sys.exit(0)
 if args[0] in ('bootout','unload'):
+    if (case/'fault-path').exists() and (case/'mode').read_text().endswith('unload-fails'):
+        print('forced unload failure', file=sys.stderr)
+        sys.exit(1)
     printed.unlink(missing_ok=True);runtime();sys.exit(0)
 if args[0]=='print':
+    if ((case/'fault-path').exists() and (case/'mode').read_text().endswith('observation-fails')
+            and not metadata()['serviceRunning']):
+        print('forced manager observation failure', file=sys.stderr)
+        sys.exit(1)
     runtime()
     if printed.exists():
         print(printed.read_text(),end='');sys.exit(0)

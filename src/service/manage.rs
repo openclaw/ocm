@@ -175,6 +175,22 @@ pub(super) fn start_service_with_readiness(
     update_service_with_observation(name, ServiceUpdate::Start, env, cwd, observe)
 }
 
+/// Suppress a rejected environment without compensating back to running intent.
+/// The caller retains environment-operation ownership and verifies quiescence.
+/// Daemon teardown is deferred: a cleanup failure must not reactivate this data.
+pub(crate) fn pause_service_for_recovery(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(), String> {
+    let supervisor = SupervisorService::new(env, cwd);
+    let _lifecycle_lock = supervisor.lock_daemon_lifecycle()?;
+    supervisor.validate_daemon_owner_locked()?;
+    set_environment_service_policy(name, None, Some(false), env, cwd)?;
+    sync_supervisor_env_if_present(env, cwd, name)?;
+    Ok(())
+}
+
 pub fn stop_service(
     name: &str,
     env: &BTreeMap<String, String>,

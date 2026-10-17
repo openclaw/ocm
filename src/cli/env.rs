@@ -1088,16 +1088,11 @@ impl Cli {
                 .service_service()
                 .restore_after_snapshot_locked(name, state);
         }
-        // The rejected snapshot may have published running intent. Keep it
-        // paused as well as withholding an explicit recovery start.
-        let quiescence = (|| {
-            let service = self.service_service();
-            let status = service.status(name)?;
-            if status.desired_running || status.running {
-                service.stop_locked(name)?;
-            }
-            service.wait_for_runtime_mutation_quiescence_locked(name)
-        })();
+        // A rejected snapshot may have published running intent. Recovery must
+        // never compensate a pause failure by reactivating that rejected data.
+        let quiescence = self
+            .service_service()
+            .quiesce_after_failed_restore_locked(name);
         match quiescence {
             Ok(()) => Err("automatic service resumption withheld because environment recovery is incomplete; managed service stopped".to_string()),
             Err(error) => Err(format!("automatic service resumption withheld because environment recovery is incomplete; quiescing the managed service also failed: {error}")),

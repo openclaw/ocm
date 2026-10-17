@@ -1208,10 +1208,13 @@ fn snapshot_restore_service_resumption_requires_recovered_data() {
         "rollback-control",
         "full-incomplete",
         "scoped-incomplete",
+        "full-incomplete-sync-fails",
+        "full-incomplete-unload-fails",
+        "full-incomplete-observation-fails",
         "cleanup-warning",
     ] {
         let root = TestDir::new("snapshot-service-recovery");
-        let _flags = ResetFlags(root.child("ocm-home/envs"));
+        let _flags = ResetFlags(root.child("ocm-home"));
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
         let mut env = ocm_env(&root);
@@ -1279,10 +1282,13 @@ fn snapshot_restore_service_resumption_requires_recovered_data() {
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
             .collect();
-        if mode.ends_with("incomplete") {
+        if mode.contains("incomplete") {
             assert_eq!(events.len(), 1, "{events:?}");
             assert!(!current.service_running);
             assert!(stderr(&restored).contains("automatic service resumption withheld"));
+            if mode.ends_with("sync-fails") || mode.ends_with("observation-fails") {
+                assert!(stderr(&restored).contains("quiescing the managed service also failed"));
+            }
             assert_eq!(fs::read_to_string(&marker).unwrap(), "snapshot-state\n");
             assert_eq!(operations.len(), 1);
             assert_eq!(
@@ -1314,7 +1320,7 @@ fn snapshot_restore_service_resumption_requires_recovered_data() {
         let status = run_ocm(&cwd, &env, &["service", "status", "source", "--json"]);
         assert!(status.status.success(), "{}", stderr(&status));
         let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
-        assert_eq!(status["running"], !mode.ends_with("incomplete"));
+        assert_eq!(status["running"], !mode.contains("incomplete"));
     }
 }
 
