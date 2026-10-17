@@ -45,6 +45,178 @@ fn env_export_writes_the_default_archive_path() {
 
 #[cfg(unix)]
 #[test]
+fn default_export_selects_equivalent_workspace_root_spellings() {
+    use std::collections::BTreeMap;
+    use std::io::Read;
+
+    let root = TestDir::new("default-export-workspace-alias");
+    let env = ocm_env(&root);
+    let physical = root.child("physical");
+    let alias = root.child("alias");
+    fs::create_dir_all(&physical).unwrap();
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    let source = alias.join("source");
+    let create = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let canonical = fs::canonicalize(&source).unwrap();
+    let workspace_paths = [".openclaw/workspace", ".openclaw/team/ops"];
+    let agent = ".openclaw/team/ops/.openclaw/tmp/agent";
+    for relative in workspace_paths {
+        write_text(
+            &source.join(relative).join("notes.txt"),
+            "workspace content",
+        );
+        write_text(
+            &source.join(relative).join(".openclaw/tmp/runtime.txt"),
+            "temporary workspace state",
+        );
+    }
+    write_text(&source.join(agent).join("auth-profiles.json"), "{}");
+    write_text(
+        &source.join(".openclaw/state/omitted.txt"),
+        "runtime registry",
+    );
+    let mut archives = Vec::new();
+    for (index, configured_root) in [&source, &canonical].into_iter().enumerate() {
+        let config = serde_json::json!({"agents": {
+            "defaults": {"workspace": configured_root.join(workspace_paths[0])},
+            "entries": {"ops": {
+                "workspace": configured_root.join(workspace_paths[1]),
+                "agentDir": configured_root.join(agent)
+            }}
+        }})
+        .to_string();
+        let config_path = source.join(".openclaw/openclaw.json");
+        write_text(&config_path, &config);
+        let output = root.child(&format!("export-{index}.tar"));
+        let export = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--output",
+                output.to_str().unwrap(),
+            ],
+        );
+        assert!(export.status.success(), "{}", stderr(&export));
+        assert_eq!(fs::read(&config_path).unwrap(), config.as_bytes());
+        let mut archive = tar::Archive::new(fs::File::open(output).unwrap());
+        let mut entries = BTreeMap::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            if !path.starts_with("root") {
+                continue;
+            }
+            let mut content = Vec::new();
+            entry.read_to_end(&mut content).unwrap();
+            entries.insert(path, content);
+        }
+        assert_eq!(
+            entries
+                .remove(std::path::Path::new("root/.openclaw/openclaw.json"))
+                .unwrap(),
+            config.as_bytes()
+        );
+        for relative in workspace_paths {
+            let relative = std::path::Path::new("root").join(relative);
+            assert_eq!(entries[&relative.join("notes.txt")], b"workspace content");
+            assert!(!entries.contains_key(&relative.join(".openclaw/tmp/runtime.txt")));
+            assert_eq!(
+                fs::read(
+                    source
+                        .join(relative.strip_prefix("root").unwrap())
+                        .join(".openclaw/tmp/runtime.txt")
+                )
+                .unwrap(),
+                b"temporary workspace state"
+            );
+        }
+        assert_eq!(
+            entries[&std::path::Path::new("root")
+                .join(agent)
+                .join("auth-profiles.json")],
+            b"{}"
+        );
+        assert_eq!(
+            fs::read(source.join(agent).join("auth-profiles.json")).unwrap(),
+            b"{}"
+        );
+        assert!(!entries.contains_key(std::path::Path::new("root/.openclaw/state/omitted.txt")));
+        archives.push(entries);
+    }
+    assert_eq!(archives[0], archives[1]);
+
+    let linked = ".openclaw/linked-workspace";
+    std::os::unix::fs::symlink(source.join(workspace_paths[0]), source.join(linked)).unwrap();
+    let other_alias = root.child("other-alias");
+    std::os::unix::fs::symlink(&physical, &other_alias).unwrap();
+    for (index, (workspace, error)) in [
+        (source.join(linked), "through a symlink"),
+        (canonical.join(linked), "through a symlink"),
+        (
+            other_alias.join("source").join(workspace_paths[0]),
+            "unsupported environment root spelling",
+        ),
+        (
+            other_alias.join("source").join(linked),
+            "unsupported environment root spelling",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let config = serde_json::json!({"agents": {
+            "defaults": {"workspace": workspace}
+        }})
+        .to_string();
+        write_text(&source.join(".openclaw/openclaw.json"), &config);
+        let output = root.child(&format!("refused-{index}.tar"));
+        let export = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--output",
+                output.to_str().unwrap(),
+            ],
+        );
+        assert!(!export.status.success());
+        let message = stderr(&export);
+        assert!(message.contains(error), "{message}");
+        if error == "unsupported environment root spelling" {
+            for accepted_root in [&source, &canonical] {
+                assert!(
+                    message.contains(&format!("root {}", accepted_root.display())),
+                    "{message}"
+                );
+            }
+            assert!(message.contains("retry export"), "{message}");
+        }
+        assert!(!output.exists());
+        assert_eq!(
+            fs::read(source.join(".openclaw/openclaw.json")).unwrap(),
+            config.as_bytes()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn default_export_retains_alias_identity_for_offline_configuration() {
     use serde_json::{Value, json};
 
