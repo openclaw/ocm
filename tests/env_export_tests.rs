@@ -845,6 +845,7 @@ fn env_export_import_retains_configured_agent_directories() {
         "identity/source-5",
         "extensions/demo/node_modules/private-agent",
         "workspace/.openclaw/tmp/private-agent",
+        "imports/active-agent",
     ]
     .iter()
     .enumerate()

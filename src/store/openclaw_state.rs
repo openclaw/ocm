@@ -359,19 +359,17 @@ pub(super) fn relocate_copied_databases(
     // Conflicts use the caller's existing copied-target rollback.
     selection.admit_registered_databases(&paths.root)?;
     for path in configured_databases {
-        if selection.contains(&path) {
-            if let Some(database) =
-                contained_imported_database(&path, &paths.root, &paths.state_dir, true)?
-            {
-                relocate_archived_database(
-                    paths,
-                    source_roots,
-                    relocation,
-                    &database,
-                    &mut visited,
-                    &mut counts,
-                )?;
-            }
+        if let Some(database) =
+            contained_imported_database(&path, &paths.root, &paths.state_dir, true)?
+        {
+            relocate_archived_database(
+                paths,
+                source_roots,
+                relocation,
+                &database,
+                &mut visited,
+                &mut counts,
+            )?;
         }
     }
     let mut directories = vec![paths.root.clone()];
