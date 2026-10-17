@@ -217,6 +217,11 @@ impl<'a> ServiceService<'a> {
             running: meta.service_running,
         };
         if !state.running && !status.running {
+            // A replacement may publish retained metadata during status().
+            // Require the canonical target rows to be retired, including a
+            // predecessor row that has not been marked retained yet.
+            crate::supervisor::SupervisorService::new(self.env, self.cwd)
+                .ensure_background_gateway_quiescent(name, "snapshot access")?;
             return Ok(None);
         }
         preserve_operation_owner_before_managed_gateway_stop(
@@ -228,7 +233,13 @@ impl<'a> ServiceService<'a> {
         if state.running {
             self.stop_locked(name)?;
         }
-        if let Err(error) = self.wait_for_runtime_mutation_quiescence_locked(name) {
+        let quiescence = self
+            .wait_for_runtime_mutation_quiescence_locked(name)
+            .and_then(|()| {
+                crate::supervisor::SupervisorService::new(self.env, self.cwd)
+                    .ensure_background_gateway_quiescent(name, "snapshot access")
+            });
+        if let Err(error) = quiescence {
             return match self.restore_after_snapshot_locked(name, Some(state)) {
                 Ok(()) => Err(error),
                 Err(restore_error) => Err(format!(

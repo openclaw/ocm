@@ -3314,6 +3314,50 @@ fn snapshots_refuse_retained_target_ownership_until_exact_recovery() {
             fs::remove_file(print).unwrap();
         }
     }
+    // Replacement publication can occur after entry validation, inside the
+    // native observation made by status(). It must not reopen the stopped path.
+    let manager = root.child("fake-bin/launchctl");
+    let manager_before = fs::read_to_string(&manager).unwrap();
+    let next_path = root.child("retained.next");
+    let observed = root.child("replacement-observed");
+    write_executable_script(
+        &manager,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = print ] && [ -f '{}' ]; then /bin/mv '{}' '{}'; printf observed > '{}'; fi\n{}",
+            path_string(&next_path),
+            path_string(&next_path),
+            path_string(&path),
+            path_string(&observed),
+            manager_before,
+        ),
+    );
+    for args in [
+        vec!["env", "snapshot", "create", "source"],
+        vec!["env", "snapshot", "restore", "source", id],
+    ] {
+        let mut predecessor = runtime.clone();
+        predecessor["retainedOwnership"] = serde_json::json!([]);
+        write_json_replacing_path(&path, &predecessor);
+        write_json_replacing_path(&next_path, &runtime);
+        let output = run_ocm(cwd, &env, &args);
+        assert!(
+            observed.exists(),
+            "native observation did not publish the replacement claim"
+        );
+        assert!(
+            !output.status.success(),
+            "snapshot used an observation from before retained publication"
+        );
+        assert!(
+            stderr(&output).contains("retained service ownership"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"current");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_file(&observed).unwrap();
+    }
+    write_executable_script(&manager, &manager_before);
     // Offline publication identity must itself be demonstrably no longer live.
     runtime["gatewayAdmission"] = original;
     write_json_replacing_path(&path, &runtime);
