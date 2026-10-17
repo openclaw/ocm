@@ -758,6 +758,16 @@ impl<'a> SupervisorService<'a> {
     }
 
     pub fn request_child_restart(&self, name: &str) -> Result<String, String> {
+        self.request_child_restart_with_id_generator(name, supervisor_restart_request_id)
+    }
+
+    fn request_child_restart_with_id_generator(
+        &self,
+        name: &str,
+        generate_id: impl FnOnce() -> Result<String, String>,
+    ) -> Result<String, String> {
+        // Fail before state preparation, which can persist effective Gateway ports.
+        let request_id = generate_id()?;
         let state_path = supervisor_state_path(self.env, self.cwd)?;
         let _lock = lock_supervisor_state(&state_path)?;
         let mut state = self.build_state()?;
@@ -771,7 +781,6 @@ impl<'a> SupervisorService<'a> {
             ));
         }
 
-        let request_id = supervisor_restart_request_id(name);
         state
             .restart_requests
             .retain(|request| request.env_name != name);
@@ -2375,6 +2384,7 @@ fn exited_child_restart_decision(
     }
 }
 
+#[cfg(test)]
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2382,8 +2392,12 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn supervisor_restart_request_id(name: &str) -> String {
-    format!("{}-{}-{}", name, std::process::id(), now_millis())
+fn supervisor_restart_request_id() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        format!("failed to generate supervisor restart request identity: {error}")
+    })?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn queue_missing_children(
@@ -3920,6 +3934,102 @@ mod tests {
 
         assert!(!supervisor_state_equivalent(&active, &requested));
         assert!(supervisor_state_equivalent(&requested, &requested));
+    }
+
+    #[test]
+    fn generated_restart_requests_remain_distinct_through_recognition_and_cleanup() {
+        let mut ids = BTreeSet::new();
+        // Exercise the producer in a burst without waiting for clock advancement.
+        for _ in 0..4096 {
+            let id = supervisor_restart_request_id().unwrap();
+            assert!(ids.insert(id), "restart request identity was reused");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([("OCM_HOME".to_string(), display_path(root.path()))]);
+        let state_path = supervisor_state_path(&env, root.path()).unwrap();
+        let service = SupervisorService::new(&env, root.path());
+        let newer = SupervisorRestartRequest {
+            env_name: "demo".to_string(),
+            request_id: supervisor_restart_request_id().unwrap(),
+        };
+        let sibling = SupervisorRestartRequest {
+            env_name: "sibling".to_string(),
+            request_id: supervisor_restart_request_id().unwrap(),
+        };
+        // Persisted IDs are opaque, including values from older OCM versions.
+        for previous_id in [
+            supervisor_restart_request_id().unwrap(),
+            "demo-123-1792224180822".to_string(),
+            "opaque pending request".to_string(),
+        ] {
+            let previous = SupervisorRestartRequest {
+                env_name: "demo".to_string(),
+                request_id: previous_id,
+            };
+            let active = supervisor_state(vec![previous.clone(), sibling.clone()]);
+            assert!(new_supervisor_restart_requests(&active, &active).is_empty());
+            let next = supervisor_state(vec![newer.clone(), sibling.clone()]);
+            assert_eq!(
+                new_supervisor_restart_requests(&active, &next),
+                vec![newer.clone()]
+            );
+            write_json(&state_path, &next).unwrap();
+            let before = fs::read(&state_path).unwrap();
+
+            service
+                .clear_child_restart_request("demo", &previous.request_id)
+                .unwrap();
+            clear_processed_restart_requests(&state_path, &[previous.clone()]);
+            assert_eq!(fs::read(&state_path).unwrap(), before);
+
+            clear_processed_restart_requests(&state_path, &[newer.clone()]);
+            let saved: SupervisorState = read_json(&state_path).unwrap();
+            assert_eq!(saved.restart_requests, vec![sibling.clone()]);
+
+            write_json(&state_path, &active).unwrap();
+            service
+                .clear_child_restart_request("demo", &previous.request_id)
+                .unwrap();
+            let saved: SupervisorState = read_json(&state_path).unwrap();
+            assert_eq!(saved.restart_requests, vec![sibling.clone()]);
+        }
+    }
+
+    #[test]
+    fn restart_identity_failure_leaves_existing_and_unprepared_state_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("ocm-home");
+        let env = BTreeMap::from([("OCM_HOME".to_string(), display_path(&home))]);
+        let service = SupervisorService::new(&env, root.path());
+        let fail = || Err("entropy unavailable".to_string());
+
+        assert_eq!(
+            service.request_child_restart_with_id_generator("demo", fail),
+            Err("entropy unavailable".to_string())
+        );
+        assert!(
+            !home.exists(),
+            "failure must precede store and lock creation"
+        );
+
+        let state_path = supervisor_state_path(&env, root.path()).unwrap();
+        let state = supervisor_state(vec![SupervisorRestartRequest {
+            env_name: "demo".to_string(),
+            request_id: "legacy-pending-request".to_string(),
+        }]);
+        write_json(&state_path, &state).unwrap();
+        let before = fs::read(&state_path).unwrap();
+        assert_eq!(
+            service.request_child_restart_with_id_generator("demo", fail),
+            Err("entropy unavailable".to_string())
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_dir(state_path.parent().unwrap()).unwrap().count(),
+            1
+        );
     }
 
     #[test]
