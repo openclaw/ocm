@@ -730,6 +730,13 @@ Automatic Gateway port selection searches upward from the preferred port through
 Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Configured agent directories inside the environment retain their payloads through clone and ordinary export/import, including custom and nested locations.
 Agent directories remain separate from workspaces; external locations and paths reached through symlinks are rejected by these copy operations.
 Upgrade simulation rejects an identity-dependent agent directory supplied by an include shared with unrelated configuration fields; give those consumers separate include files before retrying.
+Git repositories whose administrative directories are already contained in retained workspaces rebase owned core.worktree and include paths to the destination.
+Copied configuration referenced by these repositories survives cleanup without retaining unrelated siblings or acquiring external files.
+Git continues to select conditional includes, and authored predicates, repeated-entry order, comments and unrelated signing/remote settings remain intact.
+Relative values keep Git's containing-file or Git-directory context; external references and inactive missing or invalid includes remain unchanged unless their path maps to copied content.
+Config files retain their copied permissions; unsafe ownership, active invalid configuration, required writes into protected history, or configuration locks fail the clone before registration and roll back its target.
+Linked-worktree registrations and other Git storage pointers retain their separate copy handling.
+
 Clone does not copy dev source bindings. The usual next step is:
 
 ```bash
