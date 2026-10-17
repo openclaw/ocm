@@ -353,7 +353,15 @@ fn relocate_archived_database(
     visited: &mut BTreeSet<PathBuf>,
     counts: &mut BTreeMap<String, u64>,
 ) -> Result<(), String> {
-    if !visited.insert(database.to_path_buf()) || !is_sqlite_database(database)? {
+    if !visited.insert(database.to_path_buf()) {
+        return Ok(());
+    }
+    // Selection uses lexical paths, but a contained alias can resolve into
+    // immutable history. Classify the resolved destination before any writes,
+    // using the same root spelling returned by the containment check.
+    let state_root = fs::canonicalize(&paths.state_dir).map_err(|error| error.to_string())?;
+    if is_integrity_protected_history_path(&state_root, database) || !is_sqlite_database(database)?
+    {
         return Ok(());
     }
     let parent = database.parent().ok_or("imported database has no parent")?;
@@ -2539,6 +2547,57 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_database_relocation_preserves_protected_aliases_in_both_policies() {
+        for relocation in [
+            DatabasePathRelocation::ArchivedState,
+            DatabasePathRelocation::ClonedSessions,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let physical = temp.path().join("physical");
+            fs::create_dir(&physical).unwrap();
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(&physical, &alias).unwrap();
+            let paths = derive_env_paths(alias.join("copy"));
+            let source = temp.path().join("source");
+            let history = paths
+                .state_dir
+                .join("skill-workshop/support/history.sqlite");
+            let ordinary = paths.state_dir.join("memory/main.sqlite");
+            let entry = serde_json::json!({"spawnedCwd": source.join("workspace")}).to_string();
+            for database in [&history, &ordinary] {
+                fs::create_dir_all(database.parent().unwrap()).unwrap();
+                let db = Connection::open(database).unwrap();
+                db.execute_batch("CREATE TABLE session_nodes (entry_json TEXT)")
+                    .unwrap();
+                db.execute("INSERT INTO session_nodes VALUES (?1)", [&entry])
+                    .unwrap();
+            }
+            let selected = paths
+                .state_dir
+                .join("agents/main/agent/openclaw-agent.sqlite");
+            fs::create_dir_all(selected.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("../../../skill-workshop/support/history.sqlite", selected)
+                .unwrap();
+            let before = fs::read(&history).unwrap();
+
+            let counts = relocate_copied_databases(&paths, &[&source], relocation).unwrap();
+
+            assert_eq!(fs::read(&history).unwrap(), before);
+            assert_eq!(counts.len(), 1);
+            assert_eq!(counts[".openclaw/memory/main.sqlite"], 1);
+            let db = Connection::open(ordinary).unwrap();
+            let copied: String = db
+                .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                copied,
+                serde_json::json!({"spawnedCwd": paths.root.join("workspace")}).to_string()
+            );
+        }
+    }
 
     fn meta(name: &str, root: &str) -> EnvMeta {
         EnvMeta {
