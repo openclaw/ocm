@@ -71,6 +71,11 @@ fn gateway_owned_operation_waits_for_pid_publication(snapshot: bool) {
     let mut env = ocm_env(&root);
     env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
     install_fake_launchctl(&root, &mut env);
+    let daemon_identity = support::fake_daemon_gateway_admission();
+    env.insert(
+        "OCM_TEST_NATIVE_DAEMON_PID".into(),
+        std::process::id().to_string(),
+    );
     for args in [
         vec!["launcher", "add", "stable", "--command", "openclaw"],
         vec!["env", "create", "demo", "--launcher", "stable"],
@@ -91,7 +96,7 @@ fn gateway_owned_operation_waits_for_pid_publication(snapshot: bool) {
             kind: "ocm-supervisor-runtime".into(),
             ocm_home: env["OCM_HOME"].clone(),
             daemon_version: Some(env!("CARGO_PKG_VERSION").into()),
-            gateway_admission: None,
+            gateway_admission: Some(daemon_identity.clone()),
             updated_at: now_utc(),
             services: Vec::new(),
             children: pid
