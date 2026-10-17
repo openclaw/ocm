@@ -26,7 +26,7 @@ pub(crate) fn resolve_config_gateway_port(meta: &EnvMeta) -> Option<u32> {
 pub(crate) fn resolve_effective_gateway_ports(
     envs: &[EnvMeta],
     env: &BTreeMap<String, String>,
-) -> BTreeMap<String, u32> {
+) -> BTreeMap<String, Result<u32, String>> {
     let mut sorted = envs.to_vec();
     sorted.sort_by(|left, right| {
         left.created_at
@@ -42,17 +42,26 @@ pub(crate) fn resolve_effective_gateway_ports(
     for meta in &sorted {
         if let Some(port) = resolve_env_gateway_port(meta) {
             reserve_openclaw_port_family(port, &mut claimed);
-            effective.insert(meta.name.clone(), port);
+            effective.insert(meta.name.clone(), Ok(port));
         }
     }
 
+    let mut allocation_error: Option<String> = None;
     for meta in &sorted {
         if effective.contains_key(&meta.name) {
             continue;
         }
 
-        let port = next_available_gateway_port(DEFAULT_GATEWAY_PORT, &claimed);
-        reserve_openclaw_port_family(port, &mut claimed);
+        let port = match &allocation_error {
+            Some(error) => Err(error.clone()),
+            None => next_available_gateway_port(DEFAULT_GATEWAY_PORT, &claimed),
+        };
+        match &port {
+            Ok(port) => reserve_openclaw_port_family(*port, &mut claimed),
+            // Reservations only grow during this pass; do not repeat an
+            // exhausted search for every remaining legacy environment.
+            Err(error) => allocation_error = Some(error.clone()),
+        }
         effective.insert(meta.name.clone(), port);
     }
 
@@ -63,13 +72,13 @@ pub(crate) fn choose_available_gateway_port(
     preferred_port: u32,
     envs: &[EnvMeta],
     env: &BTreeMap<String, String>,
-) -> u32 {
+) -> Result<u32, String> {
     let effective = resolve_effective_gateway_ports(envs, env);
     let mut claimed = BTreeSet::new();
     reserve_foreign_openclaw_port_family(env, &mut claimed);
     reserve_dev_ui_ports(envs, &mut claimed);
-    for port in effective.values().copied() {
-        reserve_openclaw_port_family(port, &mut claimed);
+    for port in effective.into_values() {
+        reserve_openclaw_port_family(port?, &mut claimed);
     }
 
     next_available_gateway_port(preferred_port.max(DEFAULT_GATEWAY_PORT), &claimed)
@@ -99,7 +108,10 @@ pub(super) fn choose_source_ui_port(
 ) -> Result<u32, String> {
     let mut claimed = BTreeSet::new();
     reserve_foreign_openclaw_port_family(env, &mut claimed);
-    for port in resolve_effective_gateway_ports(envs, env).values().copied() {
+    for port in resolve_effective_gateway_ports(envs, env)
+        .into_values()
+        .filter_map(Result::ok)
+    {
         reserve_openclaw_port_family(port, &mut claimed);
     }
     claimed.extend(active_ui_ports);
@@ -128,12 +140,15 @@ pub(super) fn choose_source_ui_port(
         .ok_or_else(|| "no unreserved loopback port is available for the dev UI".to_string())
 }
 
-fn next_available_gateway_port(start: u32, claimed: &BTreeSet<u32>) -> u32 {
-    let mut port = start.max(DEFAULT_GATEWAY_PORT);
-    while openclaw_port_family_conflicts(port, claimed) || !openclaw_port_family_available(port) {
-        port = port.saturating_add(1);
-    }
-    port
+fn next_available_gateway_port(start: u32, claimed: &BTreeSet<u32>) -> Result<u32, String> {
+    let start = start.max(DEFAULT_GATEWAY_PORT);
+    (start..=u16::MAX as u32)
+        .find(|port| {
+            !openclaw_port_family_conflicts(*port, claimed) && openclaw_port_family_available(*port)
+        })
+        .ok_or_else(|| {
+            format!("no available Gateway port in automatic allocation range {start}..=65535")
+        })
 }
 
 fn openclaw_port_family_conflicts(base_port: u32, claimed: &BTreeSet<u32>) -> bool {
@@ -143,6 +158,9 @@ fn openclaw_port_family_conflicts(base_port: u32, claimed: &BTreeSet<u32>) -> bo
 }
 
 pub(crate) fn openclaw_port_family_available(base_port: u32) -> bool {
+    if !(1..=u16::MAX as u32).contains(&base_port) {
+        return false;
+    }
     let mut listeners = Vec::new();
     for port in openclaw_port_family(base_port) {
         match TcpListener::bind(("127.0.0.1", port as u16)) {
@@ -185,4 +203,26 @@ pub(super) fn read_port_number(value: &Value) -> Option<u32> {
 
     let port = number.as_f64()?;
     (port.fract() == 0.0 && (1.0..=u16::MAX as f64).contains(&port)).then_some(port as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_gateway_port_search_stops_at_domain_boundary() {
+        let claimed = (DEFAULT_GATEWAY_PORT..=u16::MAX as u32).collect();
+        for start in [DEFAULT_GATEWAY_PORT, 65_425, 65_535, 65_536, u32::MAX] {
+            assert!(next_available_gateway_port(start, &claimed).is_err());
+        }
+        assert!(next_available_gateway_port(65_536, &BTreeSet::new()).is_err());
+        assert!(next_available_gateway_port(u32::MAX, &BTreeSet::new()).is_err());
+    }
+
+    #[test]
+    fn invalid_gateway_port_families_are_never_available() {
+        for port in [0, 65_536, u32::MAX] {
+            assert!(!openclaw_port_family_available(port));
+        }
+    }
 }

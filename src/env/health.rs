@@ -72,6 +72,9 @@ impl<'a> EnvironmentService<'a> {
         let env = self.get(name)?;
         let config_audit = audit_openclaw_config(&env, &self.list()?);
         let state_audit = audit_openclaw_state(&env, &self.list()?, self.env);
+        if let Some(error) = &state_audit.cleanup_error {
+            return Err(error.clone());
+        }
         let doctor = self.doctor(name)?;
         let actions = cleanup_actions(&env, &doctor, &config_audit, &state_audit);
         Ok(build_cleanup_summary(&env, doctor, false, actions, None))
@@ -82,6 +85,9 @@ impl<'a> EnvironmentService<'a> {
         let mut env = self.get(name)?;
         let config_audit = audit_openclaw_config(&env, &self.list()?);
         let state_audit = audit_openclaw_state(&env, &self.list()?, self.env);
+        if let Some(error) = &state_audit.cleanup_error {
+            return Err(error.clone());
+        }
         let doctor_before = self.doctor(name)?;
         let actions = cleanup_actions(&env, &doctor_before, &config_audit, &state_audit);
 

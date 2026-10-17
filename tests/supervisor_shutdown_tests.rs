@@ -246,14 +246,16 @@ impl Drop for ShutdownFixture {
 }
 
 fn child_pid(runtime: &Value, name: &str) -> u64 {
+    find_child_pid(runtime, name).unwrap_or_else(|| panic!("missing {name} child: {runtime}"))
+}
+
+fn find_child_pid(runtime: &Value, name: &str) -> Option<u64> {
     runtime["children"]
         .as_array()
         .unwrap()
         .iter()
         .find(|child| child["envName"] == name)
-        .unwrap()["pid"]
-        .as_u64()
-        .unwrap()
+        .map(|child| child["pid"].as_u64().unwrap())
 }
 
 #[test]
@@ -436,7 +438,10 @@ fn post_reap_uncertainty_can_recover_after_group_disappears() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut after = fixture.runtime();
-    while child_pid(&after, "target") == target && Instant::now() < deadline {
+    // Pending ownership is published before the replacement PID.
+    while find_child_pid(&after, "target").is_none_or(|pid| pid == target)
+        && Instant::now() < deadline
+    {
         sleep(Duration::from_millis(20));
         after = fixture.runtime();
     }
@@ -446,14 +451,13 @@ fn post_reap_uncertainty_can_recover_after_group_disappears() {
         signals_before_retry,
         "a post-reap retry must not signal the released group identity"
     );
+    let replacement = find_child_pid(&after, "target");
     eprintln!(
-        "original_group_absent=true; old_target={target}; observed_target={}; services={}",
-        child_pid(&after, "target"),
+        "original_group_absent=true; old_target={target}; observed_target={replacement:?}; services={}",
         after["services"]
     );
-    assert_ne!(
-        child_pid(&after, "target"),
-        target,
-        "fresh restart cannot retire an already-reaped child after cleanup uncertainty resolves"
+    assert!(
+        replacement.is_some_and(|pid| pid != target),
+        "fresh restart cannot retire an already-reaped child after cleanup uncertainty resolves: {after}"
     );
 }

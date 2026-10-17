@@ -53,7 +53,7 @@ pub(crate) use envs::{
 };
 pub(crate) use gateway_ports::{
     openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,
-    resolve_effective_gateway_ports, resolve_env_gateway_port,
+    resolve_effective_gateway_ports,
 };
 pub use launchers::{add_launcher, get_launcher, list_launchers, remove_launcher};
 pub use layout::{

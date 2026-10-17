@@ -1716,15 +1716,19 @@ fn env_clone_retains_configured_agent_directories() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
-fn env_clone_rejects_internal_workspace_links_under_both_root_spellings() {
+fn env_clone_rejects_internal_workspace_links_under_root_spellings() {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as symlink_dir;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_dir;
     let root = TestDir::new("clone-internal-workspace-link");
     let env = ocm_env(&root);
     let physical = root.child("physical");
     let alias = root.child("alias");
     fs::create_dir_all(&physical).unwrap();
-    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    symlink_dir(&physical, &alias).unwrap();
     let source = alias.join("source");
     let created = run_ocm(
         root.path(),
@@ -1744,9 +1748,24 @@ fn env_clone_rejects_internal_workspace_links_under_both_root_spellings() {
         &state.join("agents/main/sessions/old.jsonl"),
         "source session",
     );
-    std::os::unix::fs::symlink("owned", state.join("redirect")).unwrap();
+    symlink_dir("owned", state.join("redirect")).unwrap();
     let canonical = fs::canonicalize(&source).unwrap();
-    for (spelling, configured_root) in [("accepted", &source), ("canonical", &canonical)] {
+    let mut roots = vec![
+        ("accepted", source.clone()),
+        ("canonical", canonical.clone()),
+    ];
+    #[cfg(windows)]
+    {
+        roots.push((
+            "ordinary-physical",
+            std::path::PathBuf::from(canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap()),
+        ));
+        roots.push((
+            "verbatim-accepted",
+            std::path::PathBuf::from(format!(r"\\?\{}", source.display())),
+        ));
+    }
+    for (spelling, configured_root) in roots.drain(..) {
         for (relative, allowed) in [("owned", true), ("redirect", false)] {
             let config = serde_json::json!({"agents": {"defaults": {"workspace": configured_root.join(".openclaw").join(relative)}}}).to_string();
             write_text(&state.join("openclaw.json"), &config);

@@ -1004,10 +1004,12 @@ fn adopt_import_copies_an_external_workspace_into_the_disposable_environment() {
 #[test]
 fn migrate_copies_deep_external_workspaces_with_bounded_directory_handles() {
     for overlay in [false, true] {
+        // Allow the 111-listener Gateway probe plus fixed overhead, while the
+        // directory depth still exceeds the descriptor limit to catch retained handles.
         let root = TestDir::new("migrate-deep-workspace");
         let source = root.child("plain-home");
         let external = root.child("external");
-        let relative: std::path::PathBuf = std::iter::repeat_n("d", 96).collect();
+        let relative: std::path::PathBuf = std::iter::repeat_n("d", 320).collect();
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(external.join(&relative)).unwrap();
         fs::write(external.join(&relative).join("notes.txt"), "deep payload\n").unwrap();
@@ -1024,7 +1026,7 @@ fn migrate_copies_deep_external_workspaces_with_bounded_directory_handles() {
         .unwrap();
         let env = ocm_env(&root);
         let output = std::process::Command::new("/bin/sh")
-            .args(["-c", "ulimit -n 64 && exec \"$@\"", "migration-limit"])
+            .args(["-c", "ulimit -n 256 && exec \"$@\"", "migration-limit"])
             .arg(support::ocm_test_binary_path())
             .args(["migrate", "mira"])
             .arg(&source)
