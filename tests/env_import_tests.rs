@@ -977,9 +977,11 @@ fn assert_imported_git_graphs(cases: &[(bool, bool, bool, ImportGitLayout)]) {
                 b"gitdir: /historical/uncopied/storage\n"
             );
             let summary: Value = serde_json::from_str(&stdout(&imported)).unwrap();
+            let database_key = Path::new(".openclaw").join("state").join("openclaw.sqlite");
             assert_eq!(
-                summary["databasePathsRewritten"][".openclaw/state/openclaw.sqlite"],
-                2
+                summary["databasePathsRewritten"][database_key.to_str().unwrap()],
+                2,
+                "{summary}"
             );
         }
     }
