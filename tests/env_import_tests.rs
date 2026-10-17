@@ -103,10 +103,11 @@ fn env_import_restores_an_archive_with_a_new_name_and_root() {
     let source_state = root.child("ocm-home/envs/source/.openclaw");
     write_text(
         &source_state.join("openclaw.json"),
-        &format!(
-            r#"{{"agents":{{"list":[{{"id":"main","default":true}},{{"id":"ops","workspace":"{}"}}]}}}}"#,
-            source_state.join("team/ops").display()
-        ),
+        &serde_json::json!({"agents":{"list":[
+            {"id":"main","default":true},
+            {"id":"ops","workspace":source_state.join("team/ops")}
+        ]}})
+        .to_string(),
     );
     write_text(
         &source_state.join("team/ops/custom.txt"),
@@ -373,10 +374,11 @@ fn env_import_rewrites_openclaw_config_for_the_new_root() {
     let source_root = root.child("ocm-home/envs/source");
     fs::write(
         source_root.join(".openclaw/openclaw.json"),
-        format!(
-            "{{\n  \"agents\": {{\n    \"defaults\": {{\n      \"workspace\": \"{}\"\n    }}\n  }},\n  \"gateway\": {{\n    \"port\": 19789\n  }}\n}}\n",
-            source_root.join(".openclaw/workspace").display()
-        ),
+        serde_json::json!({
+            "agents":{"defaults":{"workspace":source_root.join(".openclaw/workspace")}},
+            "gateway":{"port":19789}
+        })
+        .to_string(),
     )
     .unwrap();
 
@@ -983,6 +985,19 @@ fn assert_imported_git_graphs(cases: &[(bool, bool, bool, ImportGitLayout)]) {
     }
 }
 
+fn import_git_argument(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(path) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{path}");
+        }
+        if let Some(path) = value.strip_prefix(r"\\?\") {
+            return path.to_string();
+        }
+    }
+    value.to_string()
+}
+
 fn import_git(
     path: &Path,
     env: &std::collections::BTreeMap<String, String>,
@@ -990,8 +1005,8 @@ fn import_git(
 ) -> String {
     let result = std::process::Command::new("git")
         .arg("-C")
-        .arg(path)
-        .args(args)
+        .arg(import_git_argument(&path.to_string_lossy()))
+        .args(args.iter().map(|value| import_git_argument(value)))
         .env_clear()
         .envs(env)
         .env("GIT_CONFIG_NOSYSTEM", "1")
