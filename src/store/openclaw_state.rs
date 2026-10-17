@@ -1657,10 +1657,18 @@ fn relocate_installed_plugin_index_paths(
         PluginPathRelocation::Imported => target_state_root,
         PluginPathRelocation::Cloned { target, .. } => &target.root,
     };
-    let Some(database_path) = contained_imported_database(database_path, database_root, false)?
+    let Some(resolved_database) = contained_imported_database(database_path, database_root, false)?
     else {
         return Ok(MigratedRuntimeStateResult::default());
     };
+    if is_integrity_protected_history_destination(
+        target_state_root,
+        database_path,
+        &resolved_database,
+    )? {
+        return Ok(MigratedRuntimeStateResult::default());
+    }
+    let database_path = resolved_database;
     if !is_sqlite_database(&database_path)? {
         return Ok(MigratedRuntimeStateResult::default());
     }

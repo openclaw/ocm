@@ -433,6 +433,89 @@ fn check_clone_plugin_registry(folded: bool) {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn env_clone_preserves_plugin_history_behind_parent_aliases() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for folded in [false, true] {
+        for placement in [
+            "protected-alias",
+            "protected-unaliased",
+            "protected-namespace-alias",
+            "ordinary-alias",
+        ] {
+            let root = TestDir::new("clone-plugin-history");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = ocm_env(&root);
+            let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source/.openclaw");
+            let target = root.child("ocm-home/envs/target/.openclaw");
+            let protected = placement != "ordinary-alias";
+            let parent = if placement == "protected-namespace-alias" {
+                "workspace/history-store/support"
+            } else if protected {
+                "skill-workshop/support"
+            } else {
+                "workspace/ordinary"
+            };
+            let relative = Path::new(parent).join("openclaw.sqlite");
+            let database = source.join(&relative);
+            let records = serde_json::json!({"demo": {
+                "source": "npm", "installPath": source.join("extensions/demo")
+            }});
+            write_text(&source.join("extensions/demo/index.js"), "plugin payload");
+            // No lease or session tables: only plugin relocation can change this database.
+            seed_plugin_registry(&database, folded, records.clone());
+            let alias = if placement == "protected-namespace-alias" {
+                symlink("workspace/history-store", source.join("skill-workshop")).unwrap();
+                "skill-workshop/support"
+            } else {
+                parent
+            };
+            if placement != "protected-unaliased" {
+                symlink(alias, source.join("state")).unwrap();
+            }
+            let mode = if protected { 0o440 } else { 0o640 };
+            fs::set_permissions(&database, fs::Permissions::from_mode(mode)).unwrap();
+            let before = fs::read(&database).unwrap();
+            let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+            assert!(
+                clone.status.success(),
+                "placement={placement} folded={folded}: {}",
+                stderr(&clone)
+            );
+            let copied = target.join(&relative);
+            let actual = read_plugin_registry(&copied, folded);
+            if protected {
+                assert_eq!(actual, records);
+                assert_eq!(fs::read(&copied).unwrap(), before);
+            } else {
+                assert_eq!(
+                    actual["demo"]["installPath"],
+                    target.join("extensions/demo").to_str().unwrap()
+                );
+                assert_ne!(fs::read(&copied).unwrap(), before);
+            }
+            assert_eq!(fs::read(&database).unwrap(), before);
+            for path in [&database, &copied] {
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+            }
+            if placement != "protected-unaliased" {
+                assert_eq!(
+                    fs::read_link(target.join("state")).unwrap(),
+                    Path::new(alias)
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn env_clone_rejects_unowned_plugin_paths_without_changing_source() {
     for folded in [false, true] {
