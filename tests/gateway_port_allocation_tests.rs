@@ -132,24 +132,33 @@ fn exhausted_create_and_legacy_resolution_return_errors_without_writes() {
     assert!(status.status.success(), "{}", stderr(&status));
     assert_eq!(fs::read(&registry_path).unwrap(), before);
 
-    // Leave only the last TCP port available. The first legacy environment
+    // Leave one discovered free family available. The first legacy environment
     // keeps that valid assignment even when a later legacy environment fails.
     let entries = registry["envs"].as_array_mut().unwrap();
-    let last_reservation = entries
-        .iter_mut()
-        .find(|meta| meta["gatewayPort"] == 65_520)
-        .unwrap();
-    last_reservation["gatewayPort"] = json!(65_424);
+    let (available_port, listeners) = entries
+        .iter()
+        .filter_map(|meta| meta["gatewayPort"].as_u64())
+        .filter(|port| *port < 40_000)
+        .find_map(|port| {
+            let listeners = (port..=port + 110)
+                .map(|port| std::net::TcpListener::bind(("127.0.0.1", port as u16)))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            Some((port, listeners))
+        })
+        .expect("a free test port family");
+    entries.retain(|meta| meta["gatewayPort"] != available_port);
     let mut later = entries.last().unwrap().clone();
     later["name"] = json!("z-legacy");
     later["root"] = json!(root.child("z-legacy").to_str().unwrap());
     entries.push(later);
     fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
     let before = fs::read(&registry_path).unwrap();
+    drop(listeners);
     let earlier = run_ocm(root.path(), &env, &["env", "show", "legacy", "--json"]);
     assert!(earlier.status.success(), "{}", stderr(&earlier));
     let shown: Value = serde_json::from_slice(&earlier.stdout).unwrap();
-    assert_eq!(shown["gatewayPort"], 65_535);
+    assert_eq!(shown["gatewayPort"], available_port);
     let later = run_ocm(root.path(), &env, &["env", "show", "z-legacy", "--json"]);
     assert!(!later.status.success());
     assert!(
