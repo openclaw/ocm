@@ -523,8 +523,13 @@ Migration refuses an active state database that resolves to protected history an
 When a configured agent workspace is a repository checkout outside the plain
 OpenClaw home, including through a symlink, migration copies that workspace into
 the new environment and rewrites the imported config to use the copy. The source
-home and repository remain unchanged. Config `$include` files still must remain
-inside the plain home because OCM does not take ownership of external config.
+home and repository remain unchanged.
+Agents using identical or nested workspace folders retain that sharing in the copy, including configured aliases of the same folder.
+Each maximal configured external folder is copied once; nested workspaces use the corresponding subfolder, while unrelated folders remain separate.
+For identical roots, the default workspace destination takes precedence, followed by agent ID order.
+An outer workspace that contains the plain home also supplies the copied agent workspace locations inside that home; runtime state still lives in the managed environment's `.openclaw` directory.
+The copy of the home inside that outer workspace is ordinary workspace content, not a second active runtime home.
+Config `$include` files still must remain inside the plain home because OCM does not take ownership of external config.
 
 If migration reports a `copied destination symlink`, it refuses the workspace copy and removes the partial import.
 The diagnostic names a destination inside that removed import; inspect the matching `workspaces/...` path in the original plain home to locate the conflicting link.

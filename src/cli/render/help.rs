@@ -416,6 +416,7 @@ pub fn migrate_help(cmd: &str) -> String {
             "A copied public MCP app sandbox origin is removed unless --sandbox-origin supplies a dedicated origin for the new env.",
             "If the config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin is owned by $include, flatten that section before migrating so OCM can reset the origin without changing include ownership.",
             "If `openclaw` is already available on PATH, migrate also binds the imported env to an env-local migrated launcher so you can keep going through OCM immediately.",
+            "Identical and nested configured workspace folders retain their sharing in the imported copy; unrelated folders remain separate.",
             "Use `adopt inspect` or `adopt plan` if you want read-only preview commands before importing.",
         ],
     )
@@ -482,6 +483,7 @@ pub fn adopt_command_help(cmd: &str, action: &str) -> Option<String> {
                 "A copied public MCP app sandbox origin is removed unless --sandbox-origin supplies a dedicated origin for the new env.",
                 "For a default import or explicit --sandbox-origin override, flatten any config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin section owned by $include before OCM rewrites the origin.",
                 "If `openclaw` is already available on PATH, import also binds the env to an env-local migrated launcher so it is immediately runnable through OCM.",
+                "Identical and nested configured workspace folders retain their sharing in the imported copy; unrelated folders remain separate.",
             ],
         )),
         "inspect" => Some(render_leaf(

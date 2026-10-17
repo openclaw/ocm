@@ -53,7 +53,7 @@ pub(crate) struct OpenClawWorkspaceInventory {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ExternalOpenClawWorkspaceSources {
+pub(crate) struct MigrationWorkspaceSources {
     pub(crate) default_workspace: Option<PathBuf>,
     pub(crate) agent_workspaces: BTreeMap<String, PathBuf>,
 }
@@ -199,6 +199,12 @@ impl OpenClawWorkspaceInventory {
             .map(PathBuf::as_path)
     }
 
+    pub(crate) fn agent_workspaces(&self) -> impl Iterator<Item = (&str, &Path)> {
+        self.agent_workspace_roots
+            .iter()
+            .map(|(id, path)| (id.as_str(), path.as_path()))
+    }
+
     pub(crate) fn agent_workspace(&self, agent_id: &str) -> Option<&Path> {
         self.agent_workspace_roots
             .get(&normalize_agent_id(agent_id))
@@ -229,13 +235,13 @@ impl OpenClawWorkspaceInventory {
         self.workspace_roots.iter().map(PathBuf::as_path)
     }
 
-    /// An adopted plain home may use a repository checkout outside its state
-    /// directory. Those configured workspace roots are copied into the new
-    /// environment; config includes remain owned by their original config tree.
-    pub(crate) fn external_workspace_sources_for_migration(
+    /// Admit configured migration workspaces before choosing their copied trees.
+    /// Internal references also participate when an external workspace contains
+    /// the plain home; config includes remain owned by their original tree.
+    pub(crate) fn workspace_sources_for_migration(
         &self,
         source_root: &Path,
-    ) -> Result<ExternalOpenClawWorkspaceSources, String> {
+    ) -> Result<MigrationWorkspaceSources, String> {
         let source_root = clean_path(source_root);
         let canonical_source_root = canonicalize_path_allow_missing(&source_root)?;
 
@@ -254,18 +260,15 @@ impl OpenClawWorkspaceInventory {
             .map(|workspace| {
                 migration_workspace_source(workspace, &source_root, &canonical_source_root)
             })
-            .transpose()?
-            .flatten();
+            .transpose()?;
         let mut agent_workspaces = BTreeMap::new();
         for (agent_id, workspace) in &self.configured_agent_workspace_roots {
-            if let Some(source) =
-                migration_workspace_source(workspace, &source_root, &canonical_source_root)?
-            {
-                agent_workspaces.insert(agent_id.clone(), source);
-            }
+            let source =
+                migration_workspace_source(workspace, &source_root, &canonical_source_root)?;
+            agent_workspaces.insert(agent_id.clone(), source);
         }
 
-        Ok(ExternalOpenClawWorkspaceSources {
+        Ok(MigrationWorkspaceSources {
             default_workspace,
             agent_workspaces,
         })
@@ -360,7 +363,7 @@ fn migration_workspace_source(
     workspace: &Path,
     source_root: &Path,
     canonical_source_root: &Path,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<PathBuf, String> {
     let canonical_workspace = canonicalize_path_allow_missing(workspace)?;
     if canonical_workspace == canonical_source_root {
         return Err(format!(
@@ -375,7 +378,7 @@ fn migration_workspace_source(
             canonical_source_root,
             "workspace",
         )?;
-        return Ok(None);
+        return Ok(canonical_workspace);
     }
     let metadata = fs::metadata(&canonical_workspace).map_err(|error| {
         format!(
@@ -389,7 +392,7 @@ fn migration_workspace_source(
             display_path(workspace)
         ));
     }
-    Ok(Some(canonical_workspace))
+    Ok(canonical_workspace)
 }
 
 pub(crate) fn resolve_env_openclaw_workspaces(
