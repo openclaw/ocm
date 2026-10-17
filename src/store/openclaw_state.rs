@@ -737,7 +737,7 @@ pub(crate) fn clear_copied_runtime_state(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<bool, String> {
-    clear_runtime_state_with_policy(paths, env, runtime, true, &BTreeSet::new())
+    clear_runtime_state_with_policy(paths, env, runtime, true)
 }
 
 pub(crate) fn clear_nonportable_runtime_state(
@@ -745,7 +745,7 @@ pub(crate) fn clear_nonportable_runtime_state(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<bool, String> {
-    clear_runtime_state_with_policy(paths, env, runtime, false, &BTreeSet::new())
+    clear_runtime_state_with_policy(paths, env, runtime, false)
 }
 
 pub(crate) fn clear_copied_runtime_state_preserving_paths(
@@ -754,10 +754,19 @@ pub(crate) fn clear_copied_runtime_state_preserving_paths(
     runtime: OpenClawWorkspaceRuntime<'_>,
     preserved: &BTreeSet<PathBuf>,
 ) -> Result<bool, String> {
-    clear_runtime_state_with_policy(paths, env, runtime, true, preserved)
+    clear_runtime_state_preserving_paths(paths, env, runtime, true, preserved)
 }
 
 fn clear_runtime_state_with_policy(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    copying: bool,
+) -> Result<bool, String> {
+    clear_runtime_state_preserving_paths(paths, env, runtime, copying, &BTreeSet::new())
+}
+
+fn clear_runtime_state_preserving_paths(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
