@@ -352,7 +352,12 @@ pub(super) fn relocate_archived_runtime_state(
     // Admission still applies when no relocation is needed. Registry rows then
     // use destination coordinates while Git retains its original copied bytes.
     let databases = if has_state {
-        relocate_copied_databases(paths, source_roots, DatabasePathRelocation::ArchivedState)?
+        relocate_copied_databases(
+            paths,
+            source_roots,
+            DatabasePathRelocation::ArchivedState,
+            None,
+        )?
     } else {
         BTreeMap::new()
     };
@@ -389,6 +394,7 @@ pub(super) fn relocate_copied_databases(
     paths: &EnvPaths,
     source_roots: &[&Path],
     relocation: DatabasePathRelocation,
+    configured_paths: Option<&OpenClawWorkspaceInventory>,
 ) -> Result<BTreeMap<String, u64>, String> {
     let mut counts = BTreeMap::new();
     let mut visited = BTreeSet::new();
@@ -415,10 +421,43 @@ pub(super) fn relocate_copied_databases(
             selection.read_agent_registry(&database, true)?;
         }
     }
-    // Admit explicit owners before traversal can reach another spelling of an
-    // agent file. A conflict learned from the relocated global registry aborts
-    // the operation through its caller's copied-target rollback.
+    // Default archives omit the global registry but retain configured agent
+    // directories. Select their actual agent database, not arbitrary SQLite
+    // payloads in the directory, and keep the usual history/containment checks.
+    let mut configured_databases = Vec::new();
+    if let Some(configured_paths) = configured_paths {
+        for directory in configured_paths.agent_directory_roots() {
+            // Retained configuration can name a plain file or a missing path.
+            // Neither can contain an agent database; keep its existing data.
+            match fs::metadata(directory) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+            let path = directory.join("openclaw-agent.sqlite");
+            selection.registered_agents.insert(path.clone());
+            configured_databases.push(path);
+        }
+    }
+    // Admit every declared owner before traversal exclusions can hide a
+    // configured or registered active database inside protected history.
+    // Conflicts use the caller's existing copied-target rollback.
     selection.admit_registered_databases(&paths.root)?;
+    for path in configured_databases {
+        if let Some(database) =
+            contained_imported_database(&path, &paths.root, &paths.state_dir, true)?
+        {
+            relocate_archived_database(
+                paths,
+                source_roots,
+                relocation,
+                &database,
+                &mut visited,
+                &mut counts,
+            )?;
+        }
+    }
     let mut directories = vec![paths.root.clone()];
     while let Some(directory) = directories.pop() {
         for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
@@ -2914,7 +2953,8 @@ mod tests {
                 .unwrap();
             let before = fs::read(&history).unwrap();
             let ordinary_before = fs::read(&ordinary).unwrap();
-            let error = relocate_copied_databases(&paths, &[&source], relocation).unwrap_err();
+            let error =
+                relocate_copied_databases(&paths, &[&source], relocation, None).unwrap_err();
             assert!(
                 error.contains("selects integrity-protected history"),
                 "{error}"
@@ -2924,7 +2964,7 @@ mod tests {
 
             fs::remove_file(&selected).unwrap();
             std::os::unix::fs::symlink("../custom/agent.sqlite", &selected).unwrap();
-            let counts = relocate_copied_databases(&paths, &[&source], relocation).unwrap();
+            let counts = relocate_copied_databases(&paths, &[&source], relocation, None).unwrap();
             assert_eq!(counts[".openclaw/custom/agent.sqlite"], 1);
             assert_eq!(fs::read(&history).unwrap(), before);
             let db = Connection::open(ordinary).unwrap();

@@ -67,7 +67,9 @@ impl<'a> EnvironmentService<'a> {
 
         if let Ok(service) = ServiceService::new(self.env, self.cwd).status(name) {
             summary.managed_service_state = Some(service_managed_state(&service));
-            summary.openclaw_state = Some(if service.running {
+            summary.openclaw_state = Some(if service.gateway_state == "unknown" {
+                "unknown".to_string()
+            } else if service.running {
                 "running".to_string()
             } else if service.desired_running {
                 "pending".to_string()

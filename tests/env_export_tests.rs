@@ -72,7 +72,7 @@ fn default_export_retains_alias_identity_for_offline_configuration() {
     let config = json!({
         "agents": {
             "defaults": {"workspace": source.join(".openclaw/workspace")},
-            "entries": {"main": {"agentDir": canonical.join(".openclaw/agents/main/agent")}}
+            "entries": {"main": {"agentDir": canonical.join(".openclaw/custom-agent")}}
         },
         "external": root.child("unrelated")
     })
@@ -82,9 +82,22 @@ fn default_export_retains_alias_identity_for_offline_configuration() {
     write_text(&state.join("openclaw.json"), &config);
     write_text(&state.join("workspace/notes.txt"), &notes);
     write_text(
-        &state.join("agents/main/agent/auth-profiles.json"),
+        &state.join("custom-agent/auth-profiles.json"),
         std::str::from_utf8(auth).unwrap(),
     );
+    let database = state.join("custom-agent/openclaw-agent.sqlite");
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.execute_batch("CREATE TABLE session_nodes (entry_json TEXT NOT NULL)")
+        .unwrap();
+    let mut entry = json!({
+        "sessionRoot": source.join(".openclaw/workspace"),
+        "spawnedCwd": canonical.join(".openclaw/workspace"),
+        "label": canonical.join(".openclaw/workspace")
+    });
+    db.execute("INSERT INTO session_nodes VALUES (?1)", [entry.to_string()])
+        .unwrap();
+    drop(db);
+    let database_before = fs::read(&database).unwrap();
     write_text(&state.join("state/openclaw.sqlite"), "excluded registry");
     let archive = root.child("default.tar");
     let export = run_ocm(
@@ -125,9 +138,10 @@ fn default_export_retains_alias_identity_for_offline_configuration() {
             .exists()
     );
     assert_eq!(
-        fs::read(state.join("agents/main/agent/auth-profiles.json")).unwrap(),
+        fs::read(state.join("custom-agent/auth-profiles.json")).unwrap(),
         auth
     );
+    assert_eq!(fs::read(&database).unwrap(), database_before);
     fs::remove_dir_all(&canonical).unwrap();
     fs::remove_file(&alias).unwrap();
     let target = root.child("restored");
@@ -153,7 +167,7 @@ fn default_export_retains_alias_identity_for_offline_configuration() {
     );
     assert_eq!(
         restored["agents"]["entries"]["main"]["agentDir"],
-        json!(target.join(".openclaw/agents/main/agent"))
+        json!(target.join(".openclaw/custom-agent"))
     );
     assert_eq!(restored["external"], json!(root.child("unrelated")));
     assert_eq!(
@@ -161,8 +175,24 @@ fn default_export_retains_alias_identity_for_offline_configuration() {
         notes.as_bytes()
     );
     assert_eq!(
-        fs::read(target.join(".openclaw/agents/main/agent/auth-profiles.json")).unwrap(),
+        fs::read(target.join(".openclaw/custom-agent/auth-profiles.json")).unwrap(),
         auth
+    );
+    let db = rusqlite::Connection::open_with_flags(
+        target.join(".openclaw/custom-agent/openclaw-agent.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let actual: String = db
+        .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+        .unwrap();
+    entry["sessionRoot"] = json!(target.join(".openclaw/workspace"));
+    entry["spawnedCwd"] = json!(target.join(".openclaw/workspace"));
+    assert_eq!(serde_json::from_str::<Value>(&actual).unwrap(), entry);
+    assert_eq!(
+        db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
     );
     assert!(!target.join(".openclaw/state/openclaw.sqlite").exists());
 }
@@ -815,6 +845,7 @@ fn env_export_import_retains_configured_agent_directories() {
         "identity/source-5",
         "extensions/demo/node_modules/private-agent",
         "workspace/.openclaw/tmp/private-agent",
+        "imports/active-agent",
     ]
     .iter()
     .enumerate()
@@ -850,6 +881,59 @@ fn env_export_import_retains_configured_agent_directories() {
             &state.join("extensions/demo/node_modules/stale.txt"),
             "runtime debris",
         );
+        // This database is retained by agentDir even though default export
+        // omits the global registry that can otherwise discover it.
+        let database = state.join(relative).join("openclaw-agent.sqlite");
+        let db = rusqlite::Connection::open(&database).unwrap();
+        let session_table = if index % 2 == 0 {
+            "session_nodes"
+        } else {
+            "session_entries"
+        };
+        db.execute_batch(&format!(
+            "CREATE TABLE {session_table} (session_key TEXT PRIMARY KEY, entry_json TEXT NOT NULL);
+             CREATE TABLE board_widgets (descriptor_json TEXT, sha256 TEXT, granted_sha TEXT);
+             CREATE TABLE agent_database_leases (owner TEXT);
+             INSERT INTO agent_database_leases VALUES ('retained-owner');",
+        ))
+        .unwrap();
+        let workspace = state.join("workspace");
+        let location = serde_json::to_string(&workspace).unwrap();
+        let entry = format!(
+            r#"{{ "sessionRoot": {location}, "spawnedCwd": {location}, "opaque": {{"sessionRoot": {location}}}, "number": 1e400 }}"#
+        );
+        db.execute(
+            &format!("INSERT INTO {session_table} VALUES ('ordinary', ?1)"),
+            [&entry],
+        )
+        .unwrap();
+        let descriptor = format!(r#"{{"text":{location}}}"#);
+        use sha2::Digest;
+        let hash = sha2::Sha256::digest(descriptor.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        db.execute(
+            "INSERT INTO board_widgets VALUES (?1, ?2, ?2)",
+            rusqlite::params![descriptor, hash],
+        )
+        .unwrap();
+        drop(db);
+        let database_before = fs::read(&database).unwrap();
+        // A different SQLite filename is authored data, not another agent DB.
+        fs::copy(&database, state.join(relative).join("fixture.sqlite")).unwrap();
+        let global = state.join("state/openclaw.sqlite");
+        fs::create_dir_all(global.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(&global).unwrap();
+        db.execute_batch("CREATE TABLE agent_databases (path TEXT)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO agent_databases VALUES (?1)",
+            [database.to_str().unwrap()],
+        )
+        .unwrap();
+        drop(db);
+        let global_before = fs::read(&global).unwrap();
         let config_before = fs::read(state.join("openclaw.json")).unwrap();
         let archive = root.child(&format!("{source_name}.tar"));
         let exported = run_ocm(
@@ -912,6 +996,68 @@ fn env_export_import_retains_configured_agent_directories() {
                 .join("extensions/demo/node_modules/stale.txt")
                 .exists()
         );
+        assert!(
+            !extracted
+                .root_dir
+                .join(".openclaw/state/openclaw.sqlite")
+                .exists()
+        );
+        assert!(!target.join("state/openclaw.sqlite").exists());
+        assert_eq!(fs::read(&database).unwrap(), database_before);
+        assert_eq!(fs::read(&global).unwrap(), global_before);
+        assert_eq!(
+            fs::read(target.join(relative).join("fixture.sqlite")).unwrap(),
+            fs::read(
+                extracted
+                    .root_dir
+                    .join(".openclaw")
+                    .join(relative)
+                    .join("fixture.sqlite")
+            )
+            .unwrap()
+        );
+        let db = rusqlite::Connection::open(target.join(relative).join("openclaw-agent.sqlite"))
+            .unwrap();
+        let expected = entry.replacen(
+            &location,
+            &serde_json::to_string(&target.join("workspace")).unwrap(),
+            2,
+        );
+        assert_eq!(
+            db.query_row(
+                &format!("SELECT entry_json FROM {session_table}"),
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT descriptor_json, sha256, granted_sha FROM board_widgets",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?
+                ))
+            )
+            .unwrap(),
+            (descriptor, hash.clone(), hash)
+        );
+        assert_eq!(
+            db.query_row("SELECT owner FROM agent_database_leases", [], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "retained-owner"
+        );
+        assert_eq!(
+            db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(target.join("openclaw.json")).unwrap()).unwrap();
         assert_eq!(
@@ -928,6 +1074,248 @@ fn env_export_import_retains_configured_agent_directories() {
         );
         assert!(state.join("agents/main/sessions/stale.jsonl").exists());
     }
+}
+
+#[test]
+fn env_default_import_rejects_configured_databases_in_protected_history() {
+    use std::io::Read;
+
+    for source_metadata in [false, true] {
+        for protected in [false, true] {
+            let root = TestDir::new("default-configured-database-ownership");
+            let env = ocm_env(&root);
+            let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+            assert!(created.status.success(), "{}", stderr(&created));
+            let state = root.child("ocm-home/envs/source/.openclaw");
+            let relative = if protected {
+                "skill-workshop/support"
+            } else {
+                "custom-agent"
+            };
+            let directory = state.join(relative);
+            fs::create_dir_all(&directory).unwrap();
+            let config = serde_json::json!({"agents":{"entries":{"main":{
+                "agentDir":format!("${{OPENCLAW_STATE_DIR}}/{relative}")
+            }}}})
+            .to_string();
+            write_text(&state.join("openclaw.json"), &config);
+            let database = directory.join("openclaw-agent.sqlite");
+            let db = rusqlite::Connection::open(&database).unwrap();
+            db.execute_batch("CREATE TABLE session_nodes (entry_json TEXT NOT NULL)")
+                .unwrap();
+            let session_root = state.join("workspace");
+            let entry = serde_json::json!({"sessionRoot":session_root}).to_string();
+            db.execute("INSERT INTO session_nodes VALUES (?1)", [&entry])
+                .unwrap();
+            drop(db);
+            let before = fs::read(&database).unwrap();
+            let original = root.child("source.tar");
+            let exported = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "export",
+                    "source",
+                    "--output",
+                    original.to_str().unwrap(),
+                ],
+            );
+            assert!(exported.status.success(), "{}", stderr(&exported));
+            let archive = if source_metadata {
+                original
+            } else {
+                // Older archives still need ownership admission even when
+                // they provide no roots for rewriting session locations.
+                let legacy = root.child("legacy.tar");
+                let mut input = tar::Archive::new(fs::File::open(original).unwrap());
+                let mut output = tar::Builder::new(fs::File::create(&legacy).unwrap());
+                for item in input.entries().unwrap() {
+                    let mut item = item.unwrap();
+                    let path = item.path().unwrap().into_owned();
+                    let mut header = item.header().clone();
+                    let mut bytes = Vec::new();
+                    item.read_to_end(&mut bytes).unwrap();
+                    if path == std::path::Path::new("meta/env.json") {
+                        let mut metadata: serde_json::Value =
+                            serde_json::from_slice(&bytes).unwrap();
+                        let environment = metadata["env"].as_object_mut().unwrap();
+                        environment.remove("sourceRoot");
+                        environment.remove("canonicalSourceRoot");
+                        bytes = serde_json::to_vec(&metadata).unwrap();
+                    }
+                    header.set_size(bytes.len() as u64);
+                    header.set_cksum();
+                    output
+                        .append_data(&mut header, path, bytes.as_slice())
+                        .unwrap();
+                }
+                output.finish().unwrap();
+                legacy
+            };
+            let archive_before = fs::read(&archive).unwrap();
+            let imported = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "import",
+                    archive.to_str().unwrap(),
+                    "--name",
+                    "target",
+                ],
+            );
+            assert_eq!(
+                imported.status.success(),
+                !protected,
+                "source_metadata={source_metadata}, protected={protected}: {}",
+                stderr(&imported)
+            );
+            let target = root.child("ocm-home/envs/target");
+            let shown = run_ocm(root.path(), &env, &["env", "show", "target"]);
+            assert_eq!(shown.status.success(), !protected);
+            if protected {
+                assert!(stderr(&imported).contains("selects integrity-protected history"));
+                assert!(!target.exists());
+            } else {
+                let db = rusqlite::Connection::open(
+                    target
+                        .join(".openclaw")
+                        .join(relative)
+                        .join("openclaw-agent.sqlite"),
+                )
+                .unwrap();
+                let actual: String = db
+                    .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+                    .unwrap();
+                let expected = if source_metadata {
+                    target.join(".openclaw/workspace")
+                } else {
+                    session_root
+                };
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&actual).unwrap()["sessionRoot"],
+                    expected.to_str().unwrap()
+                );
+            }
+            assert_eq!(fs::read(&database).unwrap(), before);
+            assert_eq!(
+                fs::read(state.join("openclaw.json")).unwrap(),
+                config.as_bytes()
+            );
+            assert_eq!(fs::read(&archive).unwrap(), archive_before);
+        }
+    }
+}
+
+#[test]
+fn env_default_import_removes_target_when_session_relocation_fails() {
+    let root = TestDir::new("default-import-session-rollback");
+    let env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let source = root.child("ocm-home/envs/source");
+    write_text(&source.join(".openclaw/openclaw.json"), "{}\n");
+    let path = source.join(".openclaw/agents/main/agent/openclaw-agent.sqlite");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    // A stored constraint rejects relocation after the target copy was made.
+    db.execute_batch(
+        "CREATE TABLE session_nodes (entry_json TEXT CHECK (instr(entry_json, 'source') > 0))",
+    )
+    .unwrap();
+    let entry = serde_json::json!({"sessionRoot":source.join(".openclaw/workspace")}).to_string();
+    db.execute("INSERT INTO session_nodes VALUES (?1)", [&entry])
+        .unwrap();
+    drop(db);
+    let before = fs::read(&path).unwrap();
+    let archive = root.child("source.tar");
+    let exported = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let registry = root.child("ocm-home/envs.json");
+    let registry_before = fs::read(&registry).unwrap();
+    let imported = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+        ],
+    );
+    assert!(!imported.status.success());
+    assert!(
+        stderr(&imported).contains("failed to relocate imported OpenClaw state database"),
+        "{}",
+        stderr(&imported)
+    );
+    assert!(
+        stderr(&imported).contains("CHECK constraint failed"),
+        "{}",
+        stderr(&imported)
+    );
+    assert!(!root.child("ocm-home/envs/target").exists());
+    assert_eq!(fs::read(registry).unwrap(), registry_before);
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn env_default_import_preserves_non_directory_agent_payload() {
+    let root = TestDir::new("default-import-agent-file");
+    let env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    write_text(
+        &source.join("openclaw.json"),
+        r#"{"agents":{"entries":{"main":{"agentDir":"~/.openclaw/pending-agent"}}}}"#,
+    );
+    write_text(&source.join("pending-agent"), "preserved authored file");
+    let archive = root.child("source.tar");
+    let exported = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let imported = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert_eq!(
+        fs::read(root.child("ocm-home/envs/target/.openclaw/pending-agent")).unwrap(),
+        b"preserved authored file"
+    );
+    assert_eq!(
+        fs::read(source.join("pending-agent")).unwrap(),
+        b"preserved authored file"
+    );
 }
 
 #[cfg(unix)]

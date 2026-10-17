@@ -933,6 +933,7 @@ fn clone_environment_with_policy(
             &target_paths,
             &[&source_paths.root, &canonical_source_root],
             super::openclaw_state::DatabasePathRelocation::ClonedSessions,
+            None,
         )?;
         super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
         copied_worktrees.finish(&target_paths)?;
@@ -1466,6 +1467,17 @@ pub(crate) fn import_environment_with_sandbox_origin(
                     target_runtime,
                     &copied_git.preserved_roots,
                     &copied_git.config_paths,
+                )?;
+                let copied_paths = super::openclaw_workspaces::resolve_env_openclaw_copy_paths(
+                    &target_paths,
+                    env,
+                    target_runtime,
+                )?;
+                super::openclaw_state::relocate_copied_databases(
+                    &target_paths,
+                    &source_roots,
+                    super::openclaw_state::DatabasePathRelocation::ClonedSessions,
+                    Some(&copied_paths),
                 )?;
                 copied_git.finish(&target_paths)?;
                 Default::default()
