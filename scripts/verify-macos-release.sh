@@ -95,10 +95,22 @@ grep -Eq '^Timestamp=' <<<"$metadata" || {
 if [[ "$require_notarization" == "1" ]]; then
   notarized=0
   for attempt in 1 2 3; do
-    if assessment="$(codesign --verify --strict --verbose=2 \
-      --check-notarization --test-requirement '=notarized' "$binary" 2>&1)"; then
+    # The wrapper becomes codesign, so its PID identifies this exact lookup.
+    # FD 3 sends only the marker to the caller's existing stderr capture, then
+    # closes before exec. Keep the command synchronous and its status intact.
+    if assessment="$(/bin/sh -c '
+      printf "OCM_NOTARIZATION_START %s %s\n" "$1" "$$" >&3
+      shift
+      exec 3>&-
+      exec codesign "$@"
+    ' sh "$attempt" --verify --strict --verbose=2 \
+      --check-notarization --test-requirement '=notarized' "$binary" 3>&2 2>&1)"; then
+      printf 'OCM_NOTARIZATION_END %s 0\n' "$attempt" >&2
       notarized=1
       break
+    else
+      status=$?
+      printf 'OCM_NOTARIZATION_END %s %s\n' "$attempt" "$status" >&2
     fi
     printf '%s\n' "$assessment" >&2
     if [[ "$attempt" -lt 3 ]]; then

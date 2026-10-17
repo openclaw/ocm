@@ -1,18 +1,22 @@
 """Real npm installs against a task-local, read-only fixture registry."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
+from datetime import datetime, timezone
 import hashlib
+import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import selectors
 import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from threading import Thread
 import unittest
 from unittest import mock
@@ -109,10 +113,14 @@ def isolated_env(root, url):
     }
 
 
-def run(command, cwd, env, **kwargs):
+def run(command, cwd, env, *, notarization_sha256=None, **kwargs):
+    started = datetime.now(timezone.utc)
     result = subprocess.run(
         command, cwd=cwd, env=env, text=True, capture_output=True, timeout=90, **kwargs
     )
+    ended = datetime.now(timezone.utc)
+    if notarization_sha256 is not None:
+        report_notarization_lookup_errors(result, notarization_sha256, started, ended)
     if result.returncode:
         raise AssertionError(
             f"{command} exited {result.returncode}\n{result.stdout}\n{result.stderr}"
@@ -421,40 +429,254 @@ class MacosTeamIdTests(unittest.TestCase):
                                 smoke(missing, expected_macos_team_id=value)
 
 
-def report_notarization_lookup_errors():
-    # Disclose only numeric lookup errors, preserving the verification failure.
+# Diagnostic data is advisory and never participates in the verifier's verdict.
+NOTARIZATION_LOG_LIMIT = 64 * 1024
+NOTARIZATION_ERROR_LIMIT = 12
+
+
+def notarization_attempts(stderr):
+    if len(stderr) > NOTARIZATION_LOG_LIMIT:
+        raise ValueError("oversized verifier output")
+    attempts = []
+    for line in stderr.splitlines():
+        start = re.fullmatch(r"OCM_NOTARIZATION_START ([1-3]) ([1-9][0-9]{0,9})", line)
+        end = re.fullmatch(r"OCM_NOTARIZATION_END ([1-3]) ([0-9]{1,3})", line)
+        if start:
+            number, pid = map(int, start.groups())
+            if number != len(attempts) + 1 or (attempts and "status" not in attempts[-1]):
+                raise ValueError("invalid attempt order")
+            if any(item["pid"] == pid for item in attempts):
+                raise ValueError("reused attempt PID")
+            attempts.append({"attempt": number, "pid": pid})
+        elif end:
+            number, status = map(int, end.groups())
+            if not attempts or number != len(attempts) or "status" in attempts[-1] or status > 255:
+                raise ValueError("invalid attempt status")
+            attempts[-1]["status"] = status
+    if any("status" not in attempt for attempt in attempts):
+        raise ValueError("incomplete attempt")
+    return attempts
+
+
+def notarization_log(command):
+    # Bound capture while reading, not after unbounded communicate()/JSON input.
+    # This collector runs only after the existing verification child settles.
+    deadline = time.monotonic() + 15
+    data = bytearray()
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as child:
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stdout, selectors.EVENT_READ)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise ValueError("diagnostic timeout")
+                    chunk = os.read(child.stdout.fileno(), 8192)
+                    if not chunk:
+                        break
+                    if len(data) + len(chunk) > NOTARIZATION_LOG_LIMIT:
+                        raise ValueError("diagnostic too large")
+                    data.extend(chunk)
+            if child.wait(timeout=max(0, deadline - time.monotonic())):
+                raise ValueError("diagnostic failed")
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+    return json.loads(data)
+
+
+def report_notarization_lookup_errors(result, binary_sha256, started, ended):
+    # Publish allowlisted fields only; raw captured/system output stays private.
     try:
-        result = subprocess.run(
-            [
-                "/usr/bin/log", "show", "--last", "2m", "--style", "json",
-                "--predicate",
-                'process == "codesign" AND subsystem == "com.apple.securityd" '
-                'AND eventMessage CONTAINS "Error checking with notarization daemon:"',
-            ],
-            text=True, capture_output=True, timeout=15,
-        )
-        if result.returncode:
-            print(f"Notarization diagnostic unavailable: log exit {result.returncode}")
+        if not re.fullmatch(r"[0-9a-f]{64}", binary_sha256):
+            raise ValueError("invalid digest")
+        attempts = notarization_attempts(result.stderr)
+        print("macOS verification: " + json.dumps({
+            "binary_sha256": binary_sha256,
+            "started_utc": started.isoformat(), "ended_utc": ended.isoformat(),
+            "status": result.returncode, "attempts": attempts,
+        }, sort_keys=True))
+        if not attempts:
+            print("Notarization diagnostic unavailable: no observed attempts")
             return
-        entries = json.loads(result.stdout)
+        pids = " OR ".join(f'processID == {attempt["pid"]}' for attempt in attempts)
+        entries = notarization_log([
+            "/usr/bin/log", "show", "--last", "2m", "--style", "json",
+            "--predicate",
+            'process == "codesign" AND subsystem == "com.apple.securityd" '
+            'AND eventMessage CONTAINS "Error checking with notarization daemon:" '
+            f"AND ({pids})",
+        ])
         if not isinstance(entries, list):
             raise ValueError("unexpected log response")
         errors = []
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            message = entry.get("eventMessage")
-            if not isinstance(message, str):
-                continue
-            match = re.fullmatch(
-                r"Error checking with notarization daemon: (-?\d+)",
-                message.strip(),
+            pid, timestamp, message = (
+                entry.get("processID"), entry.get("timestamp"), entry.get("eventMessage")
             )
-            if match:
-                errors.append(int(match.group(1)))
-        print(f"Apple notarization lookup error codes: {errors}")
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+            if type(pid) is not int or not isinstance(timestamp, str) or not isinstance(message, str):
+                continue
+            attempt = next((item for item in attempts if item["pid"] == pid), None)
+            match = re.fullmatch(r"Error checking with notarization daemon: (-?[0-9]{1,10})", message.strip())
+            if attempt is None or match is None:
+                continue
+            try:
+                observed = datetime.fromisoformat(timestamp)
+                matches_time = observed.tzinfo is not None and started <= observed <= ended
+            except ValueError:
+                continue
+            code = int(match.group(1))
+            if not matches_time or not -(2**31) <= code < 2**31:
+                continue
+            errors.append({"attempt": attempt["attempt"], "code": code})
+            if len(errors) == NOTARIZATION_ERROR_LIMIT:
+                break
+        print("Correlated notarization lookup errors (up to 12; phase unknown; not a cause): " + json.dumps(errors))
+    except (OSError, ValueError, RecursionError, subprocess.TimeoutExpired):
         print("Notarization diagnostic unavailable")
+
+
+class NotarizationDiagnosticTests(unittest.TestCase):
+    digest = "a" * 64
+    started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ended = datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc)
+    markers = "OCM_NOTARIZATION_START 1 123\nOCM_NOTARIZATION_END 1 1\n"
+
+    def report(self, entries, *, status=1, stderr=None):
+        result = subprocess.CompletedProcess([], status, "private stdout", stderr or self.markers)
+        output = io.StringIO()
+        with mock.patch(f"{__name__}.notarization_log", return_value=entries), redirect_stdout(output):
+            report_notarization_lookup_errors(result, self.digest, self.started, self.ended)
+        return output.getvalue()
+
+    def test_only_correlates_matching_pid_and_time_and_allowlisted_numeric_errors(self):
+        def event(**changes):
+            return {"processID": 123, "timestamp": "2026-01-01 00:00:30.000000+0000",
+                    "eventMessage": "Error checking with notarization daemon: 51", **changes}
+
+        output = self.report([
+            event(), event(processID=456), event(timestamp="2001-01-01 00:00:30+0000"),
+            event(timestamp="2026-01-01 00:01:01+0000"), event(timestamp="private timestamp"),
+            event(timestamp="2026-01-01 00:00:30"), event(processID="123"),
+            event(eventMessage="Error checking with notarization daemon: private token"),
+            event(eventMessage="private URL/path/token"), None,
+        ])
+        self.assertIn('[{"attempt": 1, "code": 51}]', output)
+        self.assertIn('"pid": 123', output)
+        self.assertIn("phase unknown; not a cause", output)
+        self.assertNotIn("private", output)
+        self.assertNotIn("456", output)
+        self.assertNotIn("2001", output)
+        many = self.report([event()] * 100)
+        self.assertEqual(many.count('"code": 51'), NOTARIZATION_ERROR_LIMIT)
+        self.assertLess(len(many), 2048)
+
+    def test_recovered_success_retains_both_attempts_without_raw_output(self):
+        markers = self.markers + "OCM_NOTARIZATION_START 2 124\nOCM_NOTARIZATION_END 2 0\nprivate path\n"
+        output = self.report([], status=0, stderr=markers)
+        record = json.loads(output.splitlines()[0].removeprefix("macOS verification: "))
+        self.assertEqual(record["status"], 0)
+        self.assertEqual(record["attempts"], [
+            {"attempt": 1, "pid": 123, "status": 1}, {"attempt": 2, "pid": 124, "status": 0},
+        ])
+        self.assertNotIn("private", output)
+
+    def test_malformed_or_unavailable_diagnostics_preserve_run_outcome_and_timeout(self):
+        for status in [0, 17]:
+            for failure in [ValueError("private"), OSError("private"), RecursionError("private"),
+                            subprocess.TimeoutExpired("private", 15)]:
+                with self.subTest(status=status, failure=type(failure)):
+                    result = subprocess.CompletedProcess(["verifier"], status, "", self.markers)
+                    with mock.patch.object(subprocess, "run", return_value=result) as execute, \
+                         mock.patch(f"{__name__}.notarization_log", side_effect=failure), \
+                         redirect_stdout(io.StringIO()) as output:
+                        if status:
+                            with self.assertRaisesRegex(AssertionError, "exited 17"):
+                                run(["verifier"], None, {}, notarization_sha256=self.digest)
+                        else:
+                            self.assertIs(run(["verifier"], None, {}, notarization_sha256=self.digest), result)
+                    self.assertEqual(execute.call_args.kwargs["timeout"], 90)
+                    self.assertIn("Notarization diagnostic unavailable", output.getvalue())
+                    self.assertNotIn("private", output.getvalue())
+        timeout = subprocess.TimeoutExpired("verifier", 90)
+        with mock.patch.object(subprocess, "run", side_effect=timeout), \
+             mock.patch(f"{__name__}.notarization_log") as collect:
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                run(["verifier"], None, {}, notarization_sha256=self.digest)
+            self.assertIs(raised.exception, timeout)
+            collect.assert_not_called()
+        for stderr in [self.markers * 2, self.markers + "OCM_NOTARIZATION_START 2 124\n",
+                       "x" * (NOTARIZATION_LOG_LIMIT + 1)]:
+            self.assertEqual(self.report([], stderr=stderr), "Notarization diagnostic unavailable\n")
+        self.assertIn("diagnostic unavailable", self.report({"private": "data"}))
+
+    def test_collector_bounds_capture_and_settles_its_child(self):
+        cases = [
+            ("print('[]')", False),
+            ("print('x' * 1000000)", True),
+            ("print('not json')", True),
+            ("raise SystemExit(9)", True),
+        ]
+        popen = subprocess.Popen
+        for script, fails in cases:
+            with self.subTest(script=script), mock.patch.object(subprocess, "Popen", wraps=popen) as spawn:
+                if fails:
+                    with self.assertRaises(ValueError):
+                        notarization_log([sys.executable, "-c", script])
+                else:
+                    self.assertEqual(notarization_log([sys.executable, "-c", script]), [])
+        children = []
+        def track(*args, **kwargs):
+            child = popen(*args, **kwargs)
+            children.append(child)
+            return child
+        # Expire the collector's existing budget immediately after spawning.
+        with mock.patch.object(subprocess, "Popen", side_effect=track), \
+             mock.patch.object(time, "monotonic", side_effect=[0, 16]):
+            with self.assertRaisesRegex(ValueError, "timeout"):
+                notarization_log([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.assertIsNotNone(children[0].returncode)
+        self.assertTrue(children[0].stdout.closed)
+
+    def test_verifier_markers_name_the_codesign_pid_and_recovered_status(self):
+        with tempfile.TemporaryDirectory(prefix="ocm-notary-observation-") as temporary:
+            root = Path(temporary)
+            binary = root / "ocm"
+            binary.write_text("fixture")
+            codesign = root / "codesign"
+            codesign.write_text("""#!/bin/sh
+case "$1" in
+  -d) printf '%s\n' 'Identifier=com.openclaw.ocm' 'TeamIdentifier=AB12CD34EF' \
+      'Authority=Developer ID Application: fixture' 'flags=0x10000(runtime)' 'Timestamp=fixture' ;;
+  *) case "$*" in
+       *--check-notarization*)
+         printf '%s\n' "$$" >> "$TEST_PIDS"
+         if [ ! -f "$TEST_ONCE" ]; then touch "$TEST_ONCE"; exit 7; fi ;;
+     esac ;;
+esac
+""")
+            codesign.chmod(0o755)
+            sleep = root / "sleep"
+            sleep.write_text("""#!/bin/sh
+printf '%s\\n' "$1" >> "$TEST_DELAYS"
+""")
+            sleep.chmod(0o755)
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                   "TEST_PIDS": str(root / "pids"), "TEST_ONCE": str(root / "once"),
+                   "TEST_DELAYS": str(root / "delays")}
+            result = subprocess.run([
+                str(release.ROOT / "scripts/verify-macos-release.sh"), "--binary", str(binary),
+                *macos_signature_command("AB12CD34EF"),
+            ], env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            attempts = notarization_attempts(result.stderr)
+            self.assertEqual([item["pid"] for item in attempts],
+                             list(map(int, (root / "pids").read_text().splitlines())))
+            self.assertEqual([item["status"] for item in attempts], [7, 0])
+            self.assertEqual((root / "delays").read_text(), "10\n")
 
 
 def smoke(directory, *, expected_macos_team_id=None):
@@ -485,10 +707,8 @@ def smoke(directory, *, expected_macos_team_id=None):
             )
             binary = installed_native(prefix)
             metadata = json.loads((binary.parents[3] / "release.json").read_bytes())
-            if (
-                hashlib.sha256(binary.read_bytes()).hexdigest()
-                != metadata["binarySha256"]
-            ):
+            binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            if binary_sha256 != metadata["binarySha256"]:
                 raise AssertionError("npm install changed native executable bytes")
             entrypoint = prefix / "bin/ocm"
             result = run([str(entrypoint), "--version"], root, env)
@@ -498,20 +718,17 @@ def smoke(directory, *, expected_macos_team_id=None):
                 )
             run([str(entrypoint), "--help"], root, env)
             if signature_command is not None:
-                try:
-                    run(
-                        [
-                            str(release.ROOT / "scripts/verify-macos-release.sh"),
-                            "--binary",
-                            str(binary),
-                            *signature_command,
-                        ],
-                        root,
-                        env,
-                    )
-                except AssertionError:
-                    report_notarization_lookup_errors()
-                    raise
+                run(
+                    [
+                        str(release.ROOT / "scripts/verify-macos-release.sh"),
+                        "--binary",
+                        str(binary),
+                        *signature_command,
+                    ],
+                    root,
+                    env,
+                    notarization_sha256=binary_sha256,
+                )
                 print("Verified macOS signature and notarization after npm installation")
             print(
                 f"Verified npm install, CLI, and unchanged native bytes on {platform.platform()}"
