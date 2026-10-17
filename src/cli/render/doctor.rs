@@ -19,7 +19,7 @@ pub fn host_doctor(
         KeyValueRow::new(
             "Official releases",
             if summary.official_release_ready {
-                "ready"
+                "baseline ready"
             } else {
                 "blocked"
             },
@@ -40,12 +40,12 @@ pub fn host_doctor(
     if summary.healthy && host_tool_gaps {
         overview.push(KeyValueRow::warning(
             "Status",
-            "OCM can self-manage the missing official release tools on this machine.",
+            "OCM can manage private release tools; compatibility is checked for each selected package.",
         ));
     } else if summary.healthy {
         overview.push(KeyValueRow::success(
             "Status",
-            "This machine can install and run official OpenClaw releases.",
+            "Baseline tools are available; compatibility is checked for each selected OpenClaw package.",
         ));
     } else {
         overview.push(KeyValueRow::danger(

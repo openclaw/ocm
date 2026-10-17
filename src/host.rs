@@ -235,6 +235,29 @@ pub fn verify_official_openclaw_runtime_host(env: &BTreeMap<String, String>) -> 
     verify_official_openclaw_runtime_node(env)
 }
 
+pub(crate) fn verify_package_runtime_node(
+    env: &BTreeMap<String, String>,
+    requirement: &crate::managed_node::NodeRequirement,
+) -> Result<(), String> {
+    let version = node_version(env)?;
+    if requirement.supports(&version) {
+        Ok(())
+    } else {
+        Err(format!(
+            "OpenClaw package requires Node.js {}; found {version}",
+            requirement.description()
+        ))
+    }
+}
+
+pub(crate) fn verify_package_runtime_host(
+    env: &BTreeMap<String, String>,
+    requirement: &crate::managed_node::NodeRequirement,
+) -> Result<(), String> {
+    verify_package_runtime_node(env, requirement)?;
+    npm_version(env).map(|_| ())
+}
+
 pub fn verify_official_openclaw_runtime_support(
     env: &BTreeMap<String, String>,
 ) -> Result<(), String> {
@@ -364,13 +387,13 @@ fn node_check(
             Some(false) => check(
                 "official-release",
                 "Node.js",
-                "Run published OpenClaw releases",
+                "Baseline Node.js availability (package compatibility checked at install and launch)",
                 level,
                 HostCheckStatus::Outdated,
                 HostCheckNotes::new(
                     Some(version.clone()),
                     Some(format!(
-                        "found Node.js {version}; official releases need {OPENCLAW_NODE_VERSION_REQUIREMENT}"
+                        "found Node.js {version}; legacy packages without engines.node use {OPENCLAW_NODE_VERSION_REQUIREMENT}; selected releases are checked against their own requirement"
                     )),
                     Some(node_suggestion(managed_fallback_supported)),
                 ),
@@ -378,15 +401,15 @@ fn node_check(
             Some(true) => check(
                 "official-release",
                 "Node.js",
-                "Run published OpenClaw releases",
+                "Baseline Node.js availability (package compatibility checked at install and launch)",
                 level,
                 HostCheckStatus::Ok,
-                HostCheckNotes::new(Some(version), None, None),
+                HostCheckNotes::new(Some(version), Some("Meets the baseline for legacy packages; each selected package is checked against its own engines.node requirement.".to_string()), None),
             ),
             None => check(
                 "official-release",
                 "Node.js",
-                "Run published OpenClaw releases",
+                "Baseline Node.js availability (package compatibility checked at install and launch)",
                 level,
                 HostCheckStatus::Outdated,
                 HostCheckNotes::new(
@@ -401,7 +424,7 @@ fn node_check(
         Err(detail) => check(
             "official-release",
             "Node.js",
-            "Run published OpenClaw releases",
+            "Baseline Node.js availability (package compatibility checked at install and launch)",
             level,
             HostCheckStatus::Missing,
             HostCheckNotes::new(
@@ -1031,7 +1054,7 @@ fn parse_version_like(version: &str) -> Option<Vec<u64>> {
     Some(out)
 }
 
-fn openclaw_node_version_supported(version: &str) -> Option<bool> {
+pub(crate) fn openclaw_node_version_supported(version: &str) -> Option<bool> {
     let parsed = parse_version_like(version)?;
     let major = *parsed.first()?;
     let minimum = match major {

@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::infra::archive::{extract_tar_gz, extract_zip};
 use crate::infra::download::{download_to_file, normalize_sha256, verify_file_sha256};
@@ -15,6 +16,118 @@ const MANAGED_NODE_VERSION: &str = "24.21.0";
 const INTERNAL_MANAGED_NODE_ARCHIVE_URL_ENV: &str = "OCM_INTERNAL_MANAGED_NODE_ARCHIVE_URL";
 const INTERNAL_MANAGED_NODE_ARCHIVE_SHA256_ENV: &str = "OCM_INTERNAL_MANAGED_NODE_ARCHIVE_SHA256";
 const NODE_DIST_BASE_URL: &str = "https://nodejs.org/dist";
+
+/// Package engines are read from the verified archive at install and the installed
+/// manifest at launch. They are deliberately not copied into runtime metadata.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NodeRequirement {
+    declared: Option<(String, Vec<semver::VersionReq>)>,
+}
+
+impl NodeRequirement {
+    pub(crate) fn from_package(package: &serde_json::Value) -> Result<Self, String> {
+        let Some(value) = package
+            .get("engines")
+            .and_then(|engines| engines.get("node"))
+        else {
+            return Ok(Self::default());
+        };
+        let raw = value
+            .as_str()
+            .ok_or("OpenClaw package engines.node must be a string")?;
+        let ranges = raw
+            .split("||")
+            .map(|range| {
+                // npm joins comparators with whitespace; semver uses commas. Bare
+                // npm versions are exact/wildcard ranges, not Cargo caret ranges.
+                let comparators = range
+                    .split_whitespace()
+                    .map(|part| {
+                        if part.starts_with(|c: char| c.is_ascii_digit() || c == 'v') {
+                            format!("={}", part.trim_start_matches('v'))
+                        } else {
+                            part.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if comparators.is_empty() {
+                    return Err(format!(
+                        "OpenClaw package has an empty Node.js engine range: {raw:?}"
+                    ));
+                }
+                semver::VersionReq::parse(&comparators).map_err(|error| {
+                    format!("unsupported OpenClaw package Node.js engine range {raw:?}: {error}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            declared: Some((raw.to_string(), ranges)),
+        })
+    }
+
+    pub(crate) fn from_manifest(path: &Path) -> Result<Self, String> {
+        let file = fs::File::open(path).map_err(|error| {
+            format!(
+                "failed to read OpenClaw package manifest {}: {error}",
+                display_path(path)
+            )
+        })?;
+        Self::from_reader(file)
+    }
+
+    fn from_reader(reader: impl Read) -> Result<Self, String> {
+        const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err("OpenClaw package manifest exceeds 1 MiB".to_string());
+        }
+        let package = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("failed to parse OpenClaw package manifest: {error}"))?;
+        Self::from_package(&package)
+    }
+
+    pub(crate) fn from_archive(path: &Path) -> Result<Self, String> {
+        let file = fs::File::open(path).map_err(|error| error.to_string())?;
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        let mut requirement = None;
+        for entry in archive.entries().map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry.path().map_err(|error| error.to_string())? != Path::new("package/package.json")
+            {
+                continue;
+            }
+            if requirement.is_some() || !entry.header().entry_type().is_file() {
+                return Err(
+                    "OpenClaw package archive must contain one regular package/package.json"
+                        .to_string(),
+                );
+            }
+            requirement = Some(Self::from_reader(entry)?);
+        }
+        requirement
+            .ok_or_else(|| "OpenClaw package archive is missing package/package.json".to_string())
+    }
+
+    pub(crate) fn supports(&self, version: &str) -> bool {
+        match &self.declared {
+            Some((_, ranges)) => semver::Version::parse(version.trim().trim_start_matches('v'))
+                .is_ok_and(|version| ranges.iter().any(|range| range.matches(&version))),
+            None => crate::host::openclaw_node_version_supported(version) == Some(true),
+        }
+    }
+
+    pub(crate) fn description(&self) -> &str {
+        self.declared
+            .as_ref()
+            .map(|(raw, _)| raw.as_str())
+            .unwrap_or(OPENCLAW_NODE_VERSION_REQUIREMENT)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedNodeToolchain {
@@ -83,6 +196,7 @@ pub(crate) fn managed_node_fallback_detail() -> Result<String, String> {
 pub(crate) fn load_existing_managed_node_toolchain(
     env: &BTreeMap<String, String>,
     cwd: &Path,
+    requirement: &NodeRequirement,
 ) -> Result<Option<ManagedNodeToolchain>, String> {
     let distribution = match managed_node_distribution() {
         Ok(distribution) => distribution,
@@ -97,7 +211,8 @@ pub(crate) fn load_existing_managed_node_toolchain(
         1,
     ));
     for candidate in [root, previous_root] {
-        if let Some((node_bin, npm_cli)) = verify_managed_node_toolchain(&candidate, &distribution)
+        if let Some((node_bin, npm_cli)) =
+            verify_managed_node_toolchain(&candidate, &distribution, requirement)
         {
             return Ok(Some(ManagedNodeToolchain { node_bin, npm_cli }));
         }
@@ -108,6 +223,7 @@ pub(crate) fn load_existing_managed_node_toolchain(
 pub(crate) fn ensure_managed_node_toolchain(
     env: &BTreeMap<String, String>,
     cwd: &Path,
+    requirement: &NodeRequirement,
 ) -> Result<ManagedNodeToolchain, String> {
     let distribution = managed_node_distribution()?;
     let root = managed_node_root(&distribution, env, cwd)?;
@@ -123,8 +239,16 @@ pub(crate) fn ensure_managed_node_toolchain(
 
     // Another OCM process may have completed the same installation while this
     // process waited for the lock, so validate the shared root again here.
-    if let Some(toolchain) = load_existing_managed_node_toolchain(env, cwd)? {
+    if let Some(toolchain) = load_existing_managed_node_toolchain(env, cwd, requirement)? {
         return Ok(toolchain);
+    }
+
+    if !requirement.supports(&distribution.version) {
+        return Err(format!(
+            "OpenClaw package requires Node.js {}; OCM's private Node.js {} is incompatible; install a compatible Node.js and npm on PATH",
+            requirement.description(),
+            distribution.version
+        ));
     }
 
     if root.exists() {
@@ -162,10 +286,10 @@ pub(crate) fn ensure_managed_node_toolchain(
 
         let extracted_root = extract_root.join(&distribution.root_dir_name);
         let Some((node_bin, npm_cli)) =
-            verify_managed_node_toolchain(&extracted_root, &distribution)
+            verify_managed_node_toolchain(&extracted_root, &distribution, requirement)
         else {
             return Err(format!(
-                "managed Node.js archive did not contain the expected files for {}",
+                "managed Node.js archive did not contain a compatible toolchain for {}",
                 distribution.platform_label
             ));
         };
@@ -189,8 +313,9 @@ pub(crate) fn ensure_managed_node_toolchain(
 pub(crate) fn managed_runtime_install_command(
     env: &BTreeMap<String, String>,
     cwd: &Path,
+    requirement: &NodeRequirement,
 ) -> Result<CommandSpec, String> {
-    let toolchain = ensure_managed_node_toolchain(env, cwd)?;
+    let toolchain = ensure_managed_node_toolchain(env, cwd, requirement)?;
     let path_prepend = toolchain.node_bin.parent().map(Path::to_path_buf);
     Ok(CommandSpec {
         program: display_path(&toolchain.node_bin),
@@ -205,13 +330,14 @@ pub(crate) fn managed_runtime_launch_command(
     env: &BTreeMap<String, String>,
     cwd: &Path,
     bootstrap: bool,
+    requirement: &NodeRequirement,
 ) -> Result<CommandSpec, String> {
     let toolchain = if bootstrap {
-        ensure_managed_node_toolchain(env, cwd)?
+        ensure_managed_node_toolchain(env, cwd, requirement)?
     } else {
-        load_existing_managed_node_toolchain(env, cwd)?.ok_or_else(|| {
+        load_existing_managed_node_toolchain(env, cwd, requirement)?.ok_or_else(|| {
             format!(
-                "managed Node.js is not installed yet for OpenClaw package runtimes; rerun a release flow like \"{} start\" or \"{} runtime install --channel stable\"",
+                "compatible managed Node.js is not installed for this OpenClaw package; rerun a release flow like \"{} start\" or \"{} runtime install --channel stable\"",
                 command_example(env),
                 command_example(env)
             )
@@ -417,10 +543,21 @@ fn managed_node_archive_sha256(
 fn verify_managed_node_toolchain(
     root: &Path,
     distribution: &ManagedNodeDistribution,
+    requirement: &NodeRequirement,
 ) -> Option<(PathBuf, PathBuf)> {
     let node_bin = root.join(distribution.node_relative_path);
     let npm_cli = root.join(distribution.npm_cli_relative_path);
-    (node_bin.is_file() && npm_cli.is_file()).then_some((node_bin, npm_cli))
+    if !node_bin.is_file() || !npm_cli.is_file() {
+        return None;
+    }
+    let version = Command::new(&node_bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    (version.status.success() && requirement.supports(&String::from_utf8_lossy(&version.stdout)))
+        .then_some((node_bin, npm_cli))
 }
 
 fn relocate_checked_path(path: &Path, from_root: &Path, to_root: &Path) -> Result<PathBuf, String> {
@@ -479,18 +616,61 @@ mod tests {
         prepend_to_path,
     };
 
+    #[test]
+    fn package_node_requirement_matches_npm_comparators_and_alternatives() {
+        for (engine, accepted, rejected) in [
+            (
+                ">=24.16.0 <25 || >=26.1.0",
+                vec!["24.16.0", "v24.21.0", "26.1.0"],
+                vec!["22.22.3", "24.15.0", "25.9.0", "26.0.0", "24.21.0-rc.1"],
+            ),
+            (">=22.12.0", vec!["22.22.3", "24.15.0"], vec!["22.11.0"]),
+            ("24.21.0", vec!["24.21.0"], vec!["24.21.1"]),
+            ("24.15", vec!["24.15.0", "24.15.1"], vec!["24.16.0"]),
+        ] {
+            let requirement = super::NodeRequirement::from_package(
+                &serde_json::json!({"engines":{"node":engine}}),
+            )
+            .unwrap();
+            for version in accepted {
+                assert!(requirement.supports(version), "{engine}: {version}");
+            }
+            for version in rejected {
+                assert!(!requirement.supports(version), "{engine}: {version}");
+            }
+        }
+        assert!(
+            super::NodeRequirement::from_package(&serde_json::json!({"engines":{"node":23}}))
+                .is_err()
+        );
+        assert!(
+            super::NodeRequirement::from_package(
+                &serde_json::json!({"engines":{"node":">=nonsense"}})
+            )
+            .is_err()
+        );
+        let legacy = super::NodeRequirement::from_package(&serde_json::json!({})).unwrap();
+        assert!(legacy.supports("24.15.0"));
+        assert!(!legacy.supports("23.11.0"));
+    }
+
     #[cfg(windows)]
     #[test]
     #[ignore = "downloads the pinned Windows Node.js distribution"]
     fn windows_managed_node_zip_installs_and_reuses_offline() {
-        use std::process::Command;
+        use std::process::{Command, Stdio};
 
         let fixture = tempfile::tempdir().unwrap();
         let mut env = BTreeMap::from([(
             "OCM_HOME".to_string(),
             fixture.path().join("ocm").to_str().unwrap().to_string(),
         )]);
-        let installed = super::ensure_managed_node_toolchain(&env, fixture.path()).unwrap();
+        let installed = super::ensure_managed_node_toolchain(
+            &env,
+            fixture.path(),
+            &super::NodeRequirement::default(),
+        )
+        .unwrap();
         let node_version = Command::new(&installed.node_bin)
             .arg("--version")
             .output()
@@ -513,7 +693,12 @@ mod tests {
             super::INTERNAL_MANAGED_NODE_ARCHIVE_URL_ENV.to_string(),
             "http://127.0.0.1:1/unavailable.zip".to_string(),
         );
-        let reused = super::ensure_managed_node_toolchain(&env, fixture.path()).unwrap();
+        let reused = super::ensure_managed_node_toolchain(
+            &env,
+            fixture.path(),
+            &super::NodeRequirement::default(),
+        )
+        .unwrap();
         assert_eq!(reused.node_bin, installed.node_bin);
         assert_eq!(reused.npm_cli, installed.npm_cli);
         assert!(

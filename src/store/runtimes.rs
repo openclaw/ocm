@@ -7,13 +7,13 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use crate::host::verify_official_openclaw_runtime_host;
+use crate::host::{verify_official_openclaw_runtime_host, verify_package_runtime_host};
 use crate::infra::download::{
     artifact_file_name_from_url, download_to_file, file_sha256, normalize_file_integrity,
     normalize_sha256, verify_file_integrity, verify_file_sha256,
 };
 use crate::infra::tree_digest::tree_sha256;
-use crate::managed_node::{CommandSpec, managed_runtime_install_command};
+use crate::managed_node::{CommandSpec, NodeRequirement, managed_runtime_install_command};
 use crate::openclaw_repo::ensure_checkout_owned_dependencies;
 use crate::runtime::releases::{
     OpenClawRelease, RuntimeRelease, load_official_openclaw_release_selection,
@@ -971,7 +971,12 @@ fn install_openclaw_package_with_npm(
     env: &BTreeMap<String, String>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
 ) -> Result<(), String> {
-    let host_ready = verify_official_openclaw_runtime_host(env).is_ok();
+    let requirement = if local_adapter.is_some() {
+        NodeRequirement::default()
+    } else {
+        NodeRequirement::from_archive(archive_path)?
+    };
+    let host_ready = verify_package_runtime_host(env, &requirement).is_ok();
     let install_command = if let Some(local_adapter) = local_adapter {
         local_adapter.command.clone()
     } else if host_ready {
@@ -981,7 +986,7 @@ fn install_openclaw_package_with_npm(
             path_prepend: None,
         }
     } else {
-        managed_runtime_install_command(env, cwd)?
+        managed_runtime_install_command(env, cwd, &requirement)?
     };
 
     let mut command = Command::new(&install_command.program);
@@ -1402,7 +1407,7 @@ fn install_local_openclaw_companion(
             path_prepend: None,
         }
     } else {
-        managed_runtime_install_command(context.env, context.cwd)?
+        managed_runtime_install_command(context.env, context.cwd, &NodeRequirement::default())?
     };
     let mut command = Command::new(&install_command.program);
     command

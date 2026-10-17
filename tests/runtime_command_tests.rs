@@ -35,6 +35,14 @@ fn append_tar_file(
 }
 
 fn openclaw_package_tarball(script_body: &str) -> Vec<u8> {
+    openclaw_package_tarball_with_engine(script_body, None)
+}
+
+fn openclaw_package_tarball_with_engine(script_body: &str, engine: Option<&str>) -> Vec<u8> {
+    let mut package = serde_json::json!({"name":"openclaw","version":"2026.3.24","bin":{"openclaw":"openclaw.mjs"}});
+    if let Some(engine) = engine {
+        package["engines"] = serde_json::json!({"node": engine});
+    }
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     {
         let mut builder = Builder::new(&mut encoder);
@@ -47,7 +55,7 @@ fn openclaw_package_tarball(script_body: &str) -> Vec<u8> {
         append_tar_file(
             &mut builder,
             "package/package.json",
-            br#"{"name":"openclaw","version":"2026.3.24","bin":{"openclaw":"openclaw.mjs"}}"#,
+            package.to_string().as_bytes(),
             0o644,
         );
         builder.finish().unwrap();
@@ -3170,6 +3178,146 @@ fn check_managed_node_install(previous_toolchain: bool) {
         managed_node.requests().len(),
         usize::from(!previous_toolchain)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn official_package_engine_controls_install_launch_and_cache_reuse() {
+    const CURRENT_ENGINE: &str = ">=24.16.0 <25 || >=26.1.0";
+    for (host_version, cached_version, cached_name, download, succeeds, engine) in [
+        ("22.22.3", "24.21.0", "24.21.0", false, true, CURRENT_ENGINE),
+        ("24.21.0", "24.15.0", "24.15.0", false, true, CURRENT_ENGINE),
+        ("22.22.3", "24.15.0", "24.15.0", true, true, CURRENT_ENGINE),
+        ("22.22.3", "22.22.3", "24.21.0", true, true, CURRENT_ENGINE),
+        (
+            "22.22.3",
+            "24.15.0",
+            "24.15.0",
+            false,
+            false,
+            CURRENT_ENGINE,
+        ),
+        ("22.22.3", "24.21.0", "24.21.0", true, false, ">=26.1.0"),
+    ] {
+        let root = TestDir::new("package-engine-selection");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_node_and_npm(&root, &mut env, host_version);
+        let managed = install_fake_managed_node_archive(&root, &mut env, "24.21.0");
+        let cache = root.child("ocm-home/toolchains/node");
+        let archive = root.child("cached-node.tar.gz");
+        fs::write(&archive, support::fake_managed_node_archive(cached_version)).unwrap();
+        ocm::infra::archive::extract_tar_gz(&archive, &cache).unwrap();
+        if cached_name != cached_version {
+            let path = fs::read_dir(&cache)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            fs::rename(
+                &path,
+                path.with_file_name(
+                    path.file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .replace(cached_version, cached_name),
+                ),
+            )
+            .unwrap();
+        }
+        if !download {
+            env.insert(
+                "OCM_INTERNAL_MANAGED_NODE_ARCHIVE_URL".into(),
+                "http://127.0.0.1:1/unavailable".into(),
+            );
+        }
+        // A rejected installation must leave unrelated registrations untouched.
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", "preserved", "--path", "/usr/bin/true"],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let registration = runtime_meta_path("preserved", &env, &cwd).unwrap();
+        let before = fs::read(&registration).unwrap();
+        let tarball = openclaw_package_tarball_with_engine(
+            "#!/usr/bin/env node\nconsole.log('stable');\n",
+            Some(engine),
+        );
+        let server =
+            TestHttpServer::serve_bytes("/openclaw.tgz", "application/octet-stream", &tarball);
+        let packument = serde_json::json!({"dist-tags":{"latest":"2026.3.24"}, "versions":{"2026.3.24":{"version":"2026.3.24", "dist":{"tarball":server.url(),"integrity":sha512_integrity(&tarball)}}}}).to_string();
+        let registry =
+            TestHttpServer::serve_bytes("/openclaw", "application/json", packument.as_bytes());
+        env.insert("OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(), registry.url());
+        if host_version != "24.21.0" {
+            env.insert("OCM_TEST_REQUIRE_MANAGED_NODE_ON_PATH".into(), "1".into());
+        }
+        let install = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "install",
+                "stable",
+                "--channel",
+                "stable",
+                "--force",
+                "--json",
+            ],
+        );
+        assert_eq!(
+            install.status.success(),
+            succeeds,
+            "host={host_version} cache={cached_version} download={download}: {}",
+            stderr(&install)
+        );
+        if !succeeds {
+            assert_eq!(fs::read(registration).unwrap(), before);
+            if engine != CURRENT_ENGINE {
+                assert!(
+                    stderr(&install).contains("private Node.js 24.21.0 is incompatible"),
+                    "{}",
+                    stderr(&install)
+                );
+                assert!(managed.requests().is_empty());
+                assert!(cache.read_dir().unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("node-v24.21.0")
+                }));
+            }
+            continue;
+        }
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "engine-check", "--runtime", "stable"],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        let run = run_ocm(
+            &cwd,
+            &env,
+            &["env", "run", "engine-check", "--", "--version"],
+        );
+        assert!(run.status.success(), "{}", stderr(&run));
+        assert_eq!(stdout(&run), "stable\n");
+        assert_eq!(managed.requests().len(), usize::from(download));
+        if host_version == "24.21.0" {
+            let resolve = run_ocm(&cwd, &env, &["env", "resolve", "engine-check", "--json"]);
+            assert!(resolve.status.success(), "{}", stderr(&resolve));
+            assert!(
+                !stdout(&resolve).contains("toolchains/node"),
+                "{}",
+                stdout(&resolve)
+            );
+        }
+    }
 }
 
 #[test]

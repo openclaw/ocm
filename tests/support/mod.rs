@@ -807,13 +807,7 @@ case "$script" in
     fi
 
     /bin/mkdir -p "$prefix/node_modules/openclaw"
-    /bin/cat > "$prefix/node_modules/openclaw/openclaw.mjs" <<'EOF'
-#!/usr/bin/env node
-console.log('stable');
-EOF
-    /bin/cat > "$prefix/node_modules/openclaw/package.json" <<'EOF'
-{{"name":"openclaw","version":"2026.3.24","bin":{{"openclaw":"openclaw.mjs"}}}}
-EOF
+    /usr/bin/tar -xzf "$archive" -C "$prefix/node_modules/openclaw" --strip-components=1 package
     /bin/chmod 755 "$prefix/node_modules/openclaw/openclaw.mjs"
     exit 0
     ;;

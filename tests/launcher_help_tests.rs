@@ -192,11 +192,11 @@ fn doctor_host_help_is_available_from_help_and_flag() {
     assert!(output.contains("--fix <tool>"));
     assert!(output.contains("--yes"));
     assert!(output.contains(
-        "Official release installs prefer host Node.js 22.22.3+, 24.15.0+, or 25.9.0+ and npm."
+        "Official release installs prefer host Node.js and npm that satisfy the selected package engines.node requirement."
     ));
     assert!(
         output.contains(
-            "On supported platforms, OCM can manage a private copy when they are missing."
+            "On supported platforms, OCM can manage a compatible private copy when the host tools are missing or incompatible."
         )
     );
     assert!(output.contains(
@@ -255,7 +255,7 @@ fn start_help_is_available_from_help_and_flag() {
         "Managed services currently support launchd on macOS and systemd --user on Linux."
     ));
     assert!(output.contains(
-        "Official release selectors prefer host Node.js 22.22.3+, 24.15.0+, or 25.9.0+ and npm, and OCM can manage a private copy on supported platforms when they are missing."
+        "Official release selectors prefer host Node.js and npm when compatible with the selected package; OCM can manage a compatible private copy on supported platforms."
     ));
     assert!(output.contains(
         "When start creates a new official-release env interactively, it can offer to install git for repo-aware coding workflows."
@@ -344,7 +344,7 @@ fn setup_help_is_available_from_help_and_flag() {
     assert!(output.contains("ocm setup"));
     assert!(output.contains("Interactive setup"));
     assert!(output.contains(
-        "Official release choices prefer host Node.js 22.22.3+, 24.15.0+, or 25.9.0+ and npm, and OCM can manage a private copy on supported platforms when they are missing."
+        "Official release choices prefer host Node.js and npm when compatible with the selected package; OCM can manage a compatible private copy on supported platforms."
     ));
     assert!(output.contains(
         "If git is missing, setup can offer to install it for repo-aware coding workflows."
@@ -664,11 +664,11 @@ fn runtime_and_service_leaf_help_are_command_specific() {
     assert!(output.contains("--manifest-url <url>"));
     assert!(output.contains("Exactly one install source must be provided."));
     assert!(output.contains(
-        "Official release installs prefer host Node.js 22.22.3+, 24.15.0+, or 25.9.0+ and npm."
+        "Official release installs prefer host Node.js and npm that satisfy the selected package engines.node requirement."
     ));
     assert!(
         output.contains(
-            "On supported platforms, OCM can manage a private copy when they are missing."
+            "On supported platforms, OCM can manage a compatible private copy when the host tools are missing or incompatible."
         )
     );
     assert!(output.contains(
@@ -725,11 +725,11 @@ fn release_install_help_mentions_doctor_host() {
     let output = stdout(&help);
     assert!(output.contains("ocm release install [<name>] (--version <version> | --channel <channel>) [--description <text>] [--force] [--raw] [--json]"));
     assert!(output.contains(
-        "Official release installs prefer host Node.js 22.22.3+, 24.15.0+, or 25.9.0+ and npm."
+        "Official release installs prefer host Node.js and npm that satisfy the selected package engines.node requirement."
     ));
     assert!(
         output.contains(
-            "On supported platforms, OCM can manage a private copy when they are missing."
+            "On supported platforms, OCM can manage a compatible private copy when the host tools are missing or incompatible."
         )
     );
     assert!(output.contains(

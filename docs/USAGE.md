@@ -328,6 +328,16 @@ Runtime registrations and managed directories share a namespace: the registratio
 OCM refuses an installation that would replace another runtime's registration or payload, including with `--force`; choose another name when these paths conflict.
 Names ending in `.json` remain supported when their destinations are available, and `--force` still replaces an unbound runtime of the same name.
 
+### Package runtime Node.js selection
+
+Official package installation reads `engines.node` from the integrity-verified archive before invoking npm.
+Ordinary runtime execution reads the installed package manifest and uses a compatible host Node.js when available, otherwise a compatible private toolchain.
+OCM validates cached executables with `node --version`; older caches remain usable offline for compatible packages.
+If neither the host nor OCM's approved private Node.js version satisfies the package, install a compatible host Node.js and npm before retrying.
+Packages without a declared Node.js engine retain the legacy baseline; source launchers and manually registered commands retain their selected toolchains.
+`doctor host` and its `officialReleaseReady` field describe baseline availability and managed-toolchain support, without resolving any particular package version.
+A ready host check therefore does not guarantee that every selected release is compatible.
+
 ### Use `launcher` when you want a command recipe
 
 Examples:
