@@ -5,6 +5,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout, write_text};
 
@@ -95,7 +96,8 @@ fn env_clone_rebases_session_paths_and_drops_database_owners() {
         let db = Connection::open(&path).unwrap();
         db.execute_batch(
             "CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, entry_json TEXT NOT NULL);
-             CREATE TABLE preserved (value TEXT NOT NULL, payload BLOB NOT NULL);",
+             CREATE TABLE preserved (value TEXT NOT NULL, payload BLOB NOT NULL);
+             CREATE TABLE board_widgets (descriptor_json TEXT, sha256 TEXT, granted_sha TEXT, grant_state TEXT);",
         )
         .unwrap();
         let workspace = if id == 0 {
@@ -109,7 +111,11 @@ fn env_clone_rebases_session_paths_and_drops_database_owners() {
             "spawnedCwd": workspace.join("nested"),
             "external": root.child("external/workspace"),
             "sibling": format!("{}-sibling/workspace", source_root.display()),
-            "label": "retained"
+            "spawnedWorkspaceDir": workspace,
+            "worktree": {"repoRoot": workspace, "canonicalWorkspaceDir": workspace, "branch": workspace},
+            "opaque": {"sessionRoot": workspace},
+            "nativeRuntimeConsent": {"cwd": workspace},
+            "label": format!("retained {}", workspace.display())
         });
         db.execute(
             "INSERT INTO session_nodes VALUES ('agent:main:fixture', ?1)",
@@ -122,6 +128,31 @@ fn env_clone_rebases_session_paths_and_drops_database_owners() {
             [&binary],
         )
         .unwrap();
+        let widget_source = format!(
+            "export default () => {:?};",
+            workspace.display().to_string()
+        );
+        let descriptor =
+            serde_json::json!({"pluginKind":"fixture", "source":widget_source}).to_string();
+        let sha = Sha256::digest(widget_source.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        db.execute(
+            "INSERT INTO board_widgets VALUES (?1, ?2, ?2, 'granted')",
+            rusqlite::params![descriptor, sha],
+        )
+        .unwrap();
+        let precise = format!(
+            r#"{{ "sessionRoot": {}, "opaque": {{"sessionRoot": {}}}, "number": 1e400 }}"#,
+            serde_json::to_string(&workspace).unwrap(),
+            serde_json::to_string(&workspace).unwrap()
+        );
+        db.execute(
+            "INSERT INTO session_nodes VALUES ('precise', ?1)",
+            [&precise],
+        )
+        .unwrap();
         drop(db);
         connection
             .execute(
@@ -129,7 +160,15 @@ fn env_clone_rebases_session_paths_and_drops_database_owners() {
                 rusqlite::params![id.to_string(), path.to_str().unwrap()],
             )
             .unwrap();
-        source_databases.push((path.clone(), fs::read(&path).unwrap(), entry, binary));
+        source_databases.push((
+            path.clone(),
+            fs::read(&path).unwrap(),
+            entry,
+            binary,
+            descriptor,
+            sha,
+            precise,
+        ));
     }
     let history = source_root.join(".openclaw/skill-workshop/history.sqlite");
     fs::create_dir_all(history.parent().unwrap()).unwrap();
@@ -186,15 +225,49 @@ fn env_clone_rebases_session_paths_and_drops_database_owners() {
             .unwrap(),
         42
     );
-    for (relative, (path, before, mut entry, binary)) in databases.iter().zip(source_databases) {
+    for (relative, (path, before, mut entry, binary, descriptor, sha, precise)) in
+        databases.iter().zip(source_databases)
+    {
         assert_eq!(fs::read(&path).unwrap(), before);
         let target = target_root.join(relative);
         let db = Connection::open(&target).unwrap();
         let actual: String = db
-            .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+            .query_row(
+                "SELECT entry_json FROM session_nodes WHERE session_key = 'agent:main:fixture'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         entry["sessionRoot"] = serde_json::json!(target_root.join(".openclaw/workspace"));
         entry["spawnedCwd"] = serde_json::json!(target_root.join(".openclaw/workspace/nested"));
+        entry["spawnedWorkspaceDir"] = serde_json::json!(target_root.join(".openclaw/workspace"));
+        for field in ["repoRoot", "canonicalWorkspaceDir"] {
+            entry["worktree"][field] = serde_json::json!(target_root.join(".openclaw/workspace"));
+        }
+        let widget: (String, String, String, String) = db
+            .query_row(
+                "SELECT descriptor_json, sha256, granted_sha, grant_state FROM board_widgets",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(widget, (descriptor, sha.clone(), sha, "granted".into()));
+        let original_path = serde_json::to_string(&entry["opaque"]["sessionRoot"]).unwrap();
+        let expected_precise = precise.replacen(
+            &original_path,
+            &serde_json::to_string(&target_root.join(".openclaw/workspace")).unwrap(),
+            1,
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT entry_json FROM session_nodes WHERE session_key = 'precise'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            expected_precise
+        );
+
         assert_eq!(serde_json::from_str::<Value>(&actual).unwrap(), entry);
         assert_eq!(
             db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
@@ -1694,14 +1767,17 @@ fn env_clone_rolls_back_a_database_relocation_failure() {
     assert!(create.status.success(), "{}", stderr(&create));
     let source_root = fs::canonicalize(root.child("ocm-home/envs/source")).unwrap();
     let target_root = root.child("ocm-home/envs/target");
-    let database = source_root.join(".openclaw/agents/main/agent/openclaw-agent.sqlite");
+    let database = source_root.join(".openclaw/state/openclaw.sqlite");
     fs::create_dir_all(database.parent().unwrap()).unwrap();
     let db = Connection::open(&database).unwrap();
-    db.execute_batch("CREATE TABLE paths (path TEXT UNIQUE NOT NULL)")
+    db.execute_batch("CREATE TABLE agent_databases (path TEXT UNIQUE NOT NULL)")
         .unwrap();
     for path in [&source_root, &target_root] {
-        db.execute("INSERT INTO paths VALUES (?1)", [path.to_str().unwrap()])
-            .unwrap();
+        db.execute(
+            "INSERT INTO agent_databases VALUES (?1)",
+            [path.to_str().unwrap()],
+        )
+        .unwrap();
     }
     drop(db);
     let before = fs::read(&database).unwrap();

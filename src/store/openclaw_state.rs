@@ -276,16 +276,24 @@ pub(super) fn relocate_archived_runtime_state(
         &paths.root,
         true,
     )?;
-    let databases = relocate_copied_databases(paths, &[source_root])?;
+    let databases =
+        relocate_copied_databases(paths, &[source_root], DatabasePathRelocation::ArchivedState)?;
     Ok(ArchivedRuntimeStateResult {
         changed: changed || databases.values().any(|count| *count != 0),
         databases,
     })
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum DatabasePathRelocation {
+    ArchivedState,
+    ClonedSessions,
+}
+
 pub(super) fn relocate_copied_databases(
     paths: &EnvPaths,
     source_roots: &[&Path],
+    relocation: DatabasePathRelocation,
 ) -> Result<BTreeMap<String, u64>, String> {
     let mut counts = BTreeMap::new();
     let mut visited = BTreeSet::new();
@@ -294,7 +302,14 @@ pub(super) fn relocate_copied_databases(
     // archive may be imported after the original environment has been removed.
     let global = contained_imported_database(&global, &paths.root, true)?;
     if let Some(database) = &global {
-        relocate_archived_database(paths, source_roots, database, &mut visited, &mut counts)?;
+        relocate_archived_database(
+            paths,
+            source_roots,
+            relocation,
+            database,
+            &mut visited,
+            &mut counts,
+        )?;
     }
     let mut selection = OpenClawSqliteCopy {
         state_root: &paths.state_dir,
@@ -318,6 +333,7 @@ pub(super) fn relocate_copied_databases(
                     relocate_archived_database(
                         paths,
                         source_roots,
+                        relocation,
                         &database,
                         &mut visited,
                         &mut counts,
@@ -332,6 +348,7 @@ pub(super) fn relocate_copied_databases(
 fn relocate_archived_database(
     paths: &EnvPaths,
     source_roots: &[&Path],
+    relocation: DatabasePathRelocation,
     database: &Path,
     visited: &mut BTreeSet<PathBuf>,
     counts: &mut BTreeMap<String, u64>,
@@ -342,7 +359,12 @@ fn relocate_archived_database(
     let parent = database.parent().ok_or("imported database has no parent")?;
     let count = with_owner_write_permission(parent, || {
         with_owner_write_permission(database, || {
-            rewrite_database_root_references(database, source_roots, &display_path(&paths.root))
+            rewrite_database_root_references(
+                database,
+                source_roots,
+                &display_path(&paths.root),
+                relocation,
+            )
         })
     })?;
     let root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
@@ -361,6 +383,7 @@ fn rewrite_database_root_references(
     database: &Path,
     source_roots: &[&Path],
     target_root: &str,
+    relocation: DatabasePathRelocation,
 ) -> Result<u64, String> {
     let mut source_roots = source_roots
         .iter()
@@ -428,6 +451,11 @@ fn rewrite_database_root_references(
             {
                 continue;
             }
+            let sessions_only = matches!(relocation, DatabasePathRelocation::ClonedSessions);
+            if sessions_only && !matches!(table.as_str(), "session_nodes" | "agent_databases") {
+                continue;
+            }
+            let session_entry = sessions_only && table == "session_nodes";
             let columns = tx
                 .prepare(
                     "SELECT cid, name FROM pragma_table_xinfo(?1) WHERE hidden = 0 ORDER BY cid",
@@ -435,7 +463,12 @@ fn rewrite_database_root_references(
                 .query_map([&table], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, name)| {
+                    !sessions_only || name == if session_entry { "entry_json" } else { "path" }
+                })
+                .collect::<Vec<_>>();
             let table = quote_sql_identifier(&table);
             let quoted = columns
                 .iter()
@@ -460,22 +493,30 @@ fn rewrite_database_root_references(
                                     .iter()
                                     .any(|suffix| name.ends_with(suffix));
                         let mut replacement = original.to_string();
-                        for source_root in &source_roots {
-                            replacement = if path_column
-                                && (Path::new(&replacement).is_absolute()
-                                    || replacement
-                                        .get(..5)
-                                        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:")))
-                            {
-                                rewrite_path_value(&replacement, source_root, target_root)
-                            } else {
-                                rewrite_runtime_root_references(
-                                    &replacement,
-                                    source_root,
-                                    target_root,
-                                    false,
-                                )?
-                            };
+                        if session_entry {
+                            replacement = rewrite_cloned_session_entry(
+                                original,
+                                &source_roots,
+                                target_root,
+                                false,
+                            )?;
+                        } else {
+                            for source_root in &source_roots {
+                                replacement = if path_column
+                                    && (Path::new(&replacement).is_absolute()
+                                        || replacement.get(..5).is_some_and(|scheme| {
+                                            scheme.eq_ignore_ascii_case("file:")
+                                        })) {
+                                    rewrite_path_value(&replacement, source_root, target_root)
+                                } else {
+                                    rewrite_runtime_root_references(
+                                        &replacement,
+                                        source_root,
+                                        target_root,
+                                        false,
+                                    )?
+                                };
+                            }
                         }
                         if replacement == original {
                             continue;
@@ -526,6 +567,76 @@ fn rewrite_database_root_references(
             display_path(database)
         )
     })
+}
+
+// Clone retains arbitrary user/plugin payloads, including executable content
+// whose approval is bound to its exact bytes. Only session location metadata
+// is relocatable here; splice its strings without reserializing other fields.
+fn rewrite_cloned_session_entry(
+    raw: &str,
+    source_roots: &[String],
+    target_root: &str,
+    worktree: bool,
+) -> Result<String, String> {
+    if !raw.trim_start().starts_with('{')
+        || serde_json::from_str::<serde::de::IgnoredAny>(raw).is_err()
+    {
+        return Ok(raw.to_string());
+    }
+    let mut output = String::with_capacity(raw.len());
+    let mut cursor = raw.find('{').unwrap() + 1;
+    output.push_str(&raw[..cursor]);
+    loop {
+        let tail = raw[cursor..].trim_start_matches(|ch: char| ch.is_whitespace() || ch == ',');
+        if tail.starts_with('}') {
+            output.push_str(&raw[cursor..]);
+            break;
+        }
+        let key_start = raw.len() - tail.len();
+        let key_end = json_value_end(raw, key_start)?;
+        let key: String =
+            serde_json::from_str(&raw[key_start..key_end]).map_err(|error| error.to_string())?;
+        let colon = key_end
+            + raw[key_end..]
+                .find(':')
+                .ok_or("missing session field separator")?;
+        let value_start = raw.len() - raw[colon + 1..].trim_start().len();
+        let value_end = json_value_end(raw, value_start)?;
+        let value = &raw[value_start..value_end];
+        output.push_str(&raw[cursor..value_start]);
+        let path_field = if worktree {
+            matches!(key.as_str(), "repoRoot" | "canonicalWorkspaceDir")
+        } else {
+            matches!(
+                key.as_str(),
+                "sessionRoot" | "spawnedCwd" | "spawnedWorkspaceDir"
+            )
+        };
+        if !worktree && key == "worktree" {
+            output.push_str(&rewrite_cloned_session_entry(
+                value,
+                source_roots,
+                target_root,
+                true,
+            )?);
+        } else if path_field && let Ok(path) = serde_json::from_str::<String>(value) {
+            let replacement = source_roots.iter().find_map(|source_root| {
+                let replacement = rewrite_path_value(&path, source_root, target_root);
+                (replacement != path).then_some(replacement)
+            });
+            if let Some(replacement) = replacement {
+                output.push_str(
+                    &serde_json::to_string(&replacement).map_err(|error| error.to_string())?,
+                );
+            } else {
+                output.push_str(value);
+            }
+        } else {
+            output.push_str(value);
+        }
+        cursor = value_end;
+    }
+    Ok(output)
 }
 
 pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Result<(), String> {

@@ -905,6 +905,7 @@ fn clone_environment_with_policy(
         super::openclaw_state::relocate_copied_databases(
             &target_paths,
             &[&source_paths.root, &canonical_source_root],
+            super::openclaw_state::DatabasePathRelocation::ClonedSessions,
         )?;
         super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
 
