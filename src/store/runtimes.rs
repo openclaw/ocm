@@ -2096,6 +2096,7 @@ fn prepare_runtime_install_target_with_lock(
 ) -> Result<RuntimeInstallTarget, String> {
     let final_meta_path = runtime_meta_path(&name, env, cwd)?;
     let final_install_root = runtime_install_root(&name, env, cwd)?;
+    check_runtime_publication_paths(&name, &final_meta_path, Some(&final_install_root))?;
     let parent = final_install_root
         .parent()
         .ok_or_else(|| format!("runtime install root has no parent: {name}"))?;
@@ -2499,7 +2500,72 @@ fn stage_runtime_from_openclaw_package_archive(
     ))
 }
 
+fn check_runtime_publication_paths(
+    name: &str,
+    meta_path: &Path,
+    install_root: Option<&Path>,
+) -> Result<(), String> {
+    for (path, directory) in
+        std::iter::once((meta_path, false)).chain(install_root.map(|path| (path, true)))
+    {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+            Ok(metadata)
+                if if directory {
+                    metadata.is_dir()
+                } else {
+                    metadata.is_file()
+                } => {}
+            Ok(_) => {
+                return Err(format!(
+                    "runtime \"{name}\" destination conflicts with another runtime or an unexpected filesystem entry: {}; choose another name (--force cannot replace it)",
+                    display_path(path)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lock_runtime_publication_paths(
+    name: &str,
+    meta_path: &Path,
+    installing: bool,
+) -> Result<Vec<ExclusiveFileLock>, String> {
+    // The caller holds this runtime's mutation lock. Its metadata destination
+    // is also the install root of <name>.json; a .json install root can be a
+    // different runtime's metadata. Reuse those owners' existing locks across
+    // the final check and mutation, including staged commits outside the
+    // environment registry lock. Never wait while holding another owner lock.
+    let mut owners = vec![format!("{name}.json")];
+    if installing && name.to_ascii_lowercase().ends_with(".json") && name.len() > 5 {
+        owners.push(name[..name.len() - 5].to_string());
+    }
+    let parent = meta_path
+        .parent()
+        .ok_or_else(|| format!("runtime metadata has no parent: {name}"))?;
+    owners
+        .into_iter()
+        .map(|owner| {
+            super::try_lock_file(&parent.join(format!(".{owner}.lock")), "runtime mutation")?
+                .ok_or_else(|| {
+                    format!(
+                        "runtime {owner:?} is busy with another operation; retry after it finishes"
+                    )
+                })
+        })
+        .collect()
+}
+
 fn publish_runtime(target: RuntimeInstallTarget, meta: RuntimeMeta) -> Result<RuntimeMeta, String> {
+    let _namespace_locks =
+        lock_runtime_publication_paths(&target.name, &target.final_meta_path, true)?;
+    check_runtime_publication_paths(
+        &target.name,
+        &target.final_meta_path,
+        Some(&target.final_install_root),
+    )?;
     let nonce = now_utc().unix_timestamp_nanos();
     let backup_root = target
         .final_install_root
@@ -2633,6 +2699,8 @@ pub(crate) fn add_runtime_with_context(
     let name = validate_name(&options.name, "Runtime name")?;
     let _lock = context.lock_runtime(&name)?;
     let meta_path = runtime_meta_path(&name, env, cwd)?;
+    let _namespace_locks = lock_runtime_publication_paths(&name, &meta_path, false)?;
+    check_runtime_publication_paths(&name, &meta_path, None)?;
     if path_exists(&meta_path) {
         return Err(format!("runtime \"{name}\" already exists"));
     }
@@ -3436,6 +3504,71 @@ mod tests {
         )
         .unwrap();
         (root, env, binary)
+    }
+
+    #[test]
+    fn runtime_publication_rechecks_both_destinations_after_staging() {
+        for metadata_collision in [false, true] {
+            let (root, env, _) = binding_fixture();
+            let cwd = root.path();
+            let name = "candidate.json";
+            let target = super::prepare_runtime_install_target(
+                name.into(),
+                true,
+                super::InstallContext {
+                    env: &env,
+                    cwd,
+                    runtime_guard: None,
+                },
+            )
+            .unwrap();
+            std::fs::create_dir_all(&target.install_files).unwrap();
+            let stage = target.install_root.clone();
+            let collision = if metadata_collision {
+                std::fs::create_dir(&target.final_meta_path).unwrap();
+                let payload = target.final_meta_path.join("payload");
+                std::fs::write(&payload, "foreign runtime").unwrap();
+                payload
+            } else {
+                std::fs::write(&target.final_install_root, "foreign registration").unwrap();
+                target.final_install_root.clone()
+            };
+            let before = std::fs::read(&collision).unwrap();
+            let meta = super::get_runtime("selected", &env, cwd).unwrap();
+            let error = super::publish_runtime(target, meta).unwrap_err();
+            assert!(error.contains("destination conflicts"), "{error}");
+            assert_eq!(std::fs::read(collision).unwrap(), before);
+            assert!(!stage.exists());
+        }
+    }
+
+    #[test]
+    fn runtime_publication_respects_existing_destination_owner_locks() {
+        for owner in ["candidate", "candidate.json.json"] {
+            let (root, env, _) = binding_fixture();
+            let cwd = root.path();
+            let target = super::prepare_runtime_install_target(
+                "candidate.json".into(),
+                false,
+                super::InstallContext {
+                    env: &env,
+                    cwd,
+                    runtime_guard: None,
+                },
+            )
+            .unwrap();
+            std::fs::create_dir_all(&target.install_files).unwrap();
+            let stage = target.install_root.clone();
+            let final_root = target.final_install_root.clone();
+            let final_meta = target.final_meta_path.clone();
+            let _owner = super::try_lock_runtime_mutation(owner, &env, cwd).unwrap();
+            let meta = super::get_runtime("selected", &env, cwd).unwrap();
+            let error = super::publish_runtime(target, meta).unwrap_err();
+            assert!(error.contains("busy with another operation"), "{error}");
+            assert!(!stage.exists());
+            assert!(!final_root.exists());
+            assert!(!final_meta.exists());
+        }
     }
 
     #[test]

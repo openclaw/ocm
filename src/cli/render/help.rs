@@ -2098,6 +2098,7 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Exactly one install source must be provided.",
+                "Runtime metadata and install directories must not conflict with another runtime's paths, even with --force. Choose another name if a destination is occupied.",
                 "Official installs use canonical runtime names unless you reuse the same canonical name explicitly.",
                 "Bound runtimes are reused only when the selected release already matches. Use `ocm upgrade <env>` when OpenClaw bytes must change.",
                 "Official release installs prefer host Node.js 22.22.3+, 24.15.0+, or 25.9.0+ and npm.",

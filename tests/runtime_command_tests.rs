@@ -4026,6 +4026,118 @@ fn official_runtime_install_requires_sha512_integrity_before_download() {
 }
 
 #[test]
+fn runtime_install_preserves_colliding_registrations_and_payloads() {
+    for (existing, candidate, operation) in
+        [("old", "old.json", "add"), ("old.json", "old", "install")]
+    {
+        let root = TestDir::new("runtime-publication-collision");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let source = cwd.join("openclaw");
+        write_executable_script(&source, "#!/bin/sh\nprintf '2026.8.1\\n'\n");
+        let env = ocm_env(&root);
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", operation, existing, "--path", "./openclaw"],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        let bind = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "demo", "--runtime", existing],
+        );
+        assert!(bind.status.success(), "{}", stderr(&bind));
+        let meta_path = runtime_meta_path(existing, &env, &cwd).unwrap();
+        let meta_before = fs::read(&meta_path).unwrap();
+        let binary = if operation == "install" {
+            runtime_install_root(existing, &env, &cwd)
+                .unwrap()
+                .join("files/openclaw")
+        } else {
+            source
+        };
+        let binary_before = fs::read(&binary).unwrap();
+
+        for force in [false, true] {
+            let mut args = vec!["runtime", "install", candidate, "--path", "./openclaw"];
+            if force {
+                args.push("--force");
+            }
+            let install = run_ocm(&cwd, &env, &args);
+            assert!(!install.status.success(), "{}", stdout(&install));
+            assert!(
+                stderr(&install).contains("destination conflicts"),
+                "{}",
+                stderr(&install)
+            );
+            assert_eq!(fs::read(&meta_path).unwrap(), meta_before);
+            assert_eq!(fs::read(&binary).unwrap(), binary_before);
+            let run = run_ocm(&cwd, &env, &["env", "run", "demo", "--", "--version"]);
+            assert!(run.status.success(), "{}", stderr(&run));
+            assert_eq!(stdout(&run), "2026.8.1\n");
+            let unpublished = if operation == "add" {
+                runtime_meta_path(candidate, &env, &cwd).unwrap()
+            } else {
+                runtime_install_root(candidate, &env, &cwd).unwrap()
+            };
+            assert!(!unpublished.exists());
+            for entry in fs::read_dir(meta_path.parent().unwrap()).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(
+                    !name.contains(".stage-") && !name.contains(".backup-"),
+                    "{name}"
+                );
+            }
+        }
+        if operation == "install" {
+            let add = run_ocm(
+                &cwd,
+                &env,
+                &["runtime", "add", candidate, "--path", "./openclaw"],
+            );
+            assert!(!add.status.success());
+            assert!(
+                stderr(&add).contains("destination conflicts"),
+                "{}",
+                stderr(&add)
+            );
+            assert_eq!(fs::read(&binary).unwrap(), binary_before);
+        }
+    }
+}
+
+#[test]
+fn runtime_install_allows_unoccupied_json_names_and_same_name_replacement() {
+    let root = TestDir::new("runtime-publication-json-control");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    write_executable_script(&cwd.join("openclaw"), "#!/bin/sh\nprintf '2026.8.1\\n'\n");
+    let env = ocm_env(&root);
+    for name in ["ordinary", "available.json"] {
+        for force in [false, true] {
+            let mut args = vec!["runtime", "install", name, "--path", "./openclaw"];
+            if force {
+                args.push("--force");
+            }
+            let install = run_ocm(&cwd, &env, &args);
+            assert!(install.status.success(), "{}", stderr(&install));
+            assert!(runtime_meta_path(name, &env, &cwd).unwrap().is_file());
+            assert!(runtime_install_root(name, &env, &cwd).unwrap().is_dir());
+        }
+    }
+    // External registrations do not consume their possible install root.
+    for name in ["external", "external.json"] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", name, "--path", "./openclaw"],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+}
+
+#[test]
 fn runtime_install_force_replaces_an_existing_runtime_definition() {
     let root = TestDir::new("runtime-install-force");
     let cwd = root.child("workspace");
