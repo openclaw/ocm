@@ -3857,7 +3857,7 @@ fn assert_upgrade_rollback_restart_failure(
     write_executable_script(
         std::path::Path::new(launchctl_bin),
         &format!(
-            "#!/bin/sh\nmarker='{}'\ncase \"$1\" in\n  managername)\n    exit 0\n    ;;\n  print)\n    if [ -e \"$marker\" ]; then\n      printf 'Could not find service \\\"%s\\\" in domain for user gui\\n' \"${{2##*/}}\" >&2\n      exit 1\n    fi\n    printf 'path = %s\\nstate = waiting\\n' '{}'\n    exit 0\n    ;;\n  bootout|unload)\n    : > \"$marker\"\n    exit 0\n    ;;\n  bootstrap)\n    echo 'forced bootstrap failure' >&2\n    if [ \"${{OCM_TEST_CODEX_PREFLIGHT:-}}\" = fail ]; then\n      echo 'Authorization: Bearer service-private-token' >&2\n    fi\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
+            "#!/bin/sh\nmarker='{}'\ncase \"$1\" in\n  managername)\n    exit 0\n    ;;\n  print)\n    if [ -e \"$marker\" ]; then\n      printf 'Could not find service \"%s\" in domain for user gui\\n' \"${{2##*/}}\" >&2\n      exit 1\n    fi\n    printf 'path = %s\\nstate = waiting\\n' '{}'\n    exit 0\n    ;;\n  bootout|unload)\n    : > \"$marker\"\n    exit 0\n    ;;\n  bootstrap)\n    echo 'forced bootstrap failure' >&2\n    if [ \"${{OCM_TEST_CODEX_PREFLIGHT:-}}\" = fail ]; then\n      echo 'Authorization: Bearer service-private-token' >&2\n    fi\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
             stopped_marker.display(),
             support::managed_service_definition_path(&env, &cwd, "demo").display(),
         ),
