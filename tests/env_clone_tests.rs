@@ -1755,10 +1755,16 @@ fn env_clone_rejects_internal_workspace_links_under_root_spellings() {
         ("canonical", canonical.clone()),
     ];
     #[cfg(windows)]
-    roots.push((
-        "ordinary-physical",
-        std::path::PathBuf::from(canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap()),
-    ));
+    {
+        roots.push((
+            "ordinary-physical",
+            std::path::PathBuf::from(canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap()),
+        ));
+        roots.push((
+            "verbatim-accepted",
+            std::path::PathBuf::from(format!(r"\\?\{}", source.display())),
+        ));
+    }
     for (spelling, configured_root) in roots.drain(..) {
         for (relative, allowed) in [("owned", true), ("redirect", false)] {
             let config = serde_json::json!({"agents": {"defaults": {"workspace": configured_root.join(".openclaw").join(relative)}}}).to_string();

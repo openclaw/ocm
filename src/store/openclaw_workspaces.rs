@@ -389,15 +389,17 @@ pub(crate) fn resolve_env_openclaw_cleanup_paths(
     let root = clean_path(&paths.root);
     let canonical_root = canonicalize_path_allow_missing(&root)?;
     inventory.agent_directory_roots.retain(|_, directory| {
-        directory.starts_with(&root) || directory.starts_with(&canonical_root)
+        strip_archive_root_prefix(directory, &root).is_some()
+            || strip_archive_root_prefix(directory, &canonical_root).is_some()
     });
     let agents_root = clean_path(&paths.state_dir.join("agents"));
     // Match the paths walked by cleanup even when config uses the accepted
     // canonical spelling of an environment reached through a root alias.
     for directory in inventory.agent_directory_roots.values_mut() {
-        if !directory.starts_with(&root) {
-            *directory = root.join(directory.strip_prefix(&canonical_root).unwrap());
-        }
+        let relative = strip_archive_root_prefix(directory, &root)
+            .or_else(|| strip_archive_root_prefix(directory, &canonical_root))
+            .unwrap();
+        *directory = root.join(relative);
         if *directory == clean_path(&paths.state_dir) {
             return Err(
                 "configured OpenClaw agent directory cannot be the state directory itself"
@@ -638,9 +640,8 @@ fn reject_agent_session_collisions<'a>(
         let Ok(directory) = resolve_configured_path(raw, openclaw_home, "agent directory") else {
             continue;
         };
-        let Ok(relative) = directory
-            .strip_prefix(&root)
-            .or_else(|_| directory.strip_prefix(&canonical_root))
+        let Some(relative) = strip_archive_root_prefix(&directory, &root)
+            .or_else(|| strip_archive_root_prefix(&directory, &canonical_root))
         else {
             continue;
         };
@@ -2033,9 +2034,12 @@ mod tests {
         let canonical = fs::canonicalize(&paths.root).unwrap();
         let mut roots = vec![paths.root.clone(), canonical.clone()];
         #[cfg(windows)]
-        roots.push(PathBuf::from(
-            canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap(),
-        ));
+        {
+            roots.push(PathBuf::from(
+                canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap(),
+            ));
+            roots.push(PathBuf::from(format!(r"\\?\{}", paths.root.display())));
+        }
         for root in roots.drain(..) {
             for agent_directory in [false, true] {
                 for (relative, allowed) in [
