@@ -1,6 +1,7 @@
 use super::*;
 use crate::openclaw_repo::{git_command, git_identity_paths, read_git_pointer};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 
 struct CopiedWorktree {
     id: String,
@@ -24,31 +25,27 @@ struct CopyGraph<'a> {
     commons: BTreeSet<PathBuf>,
     object_dirs: BTreeSet<PathBuf>,
     metadata_dirs: BTreeSet<PathBuf>,
+    resolved_directories: BTreeMap<PathBuf, PathBuf>,
     writes: BTreeMap<PathBuf, Vec<u8>>,
-    configs: BTreeMap<PathBuf, PathBuf>,
+    links: BTreeMap<PathBuf, (PathBuf, PathBuf)>,
+    configs: BTreeMap<(PathBuf, String, String), PathBuf>,
+    config_sections: BTreeMap<(PathBuf, String), String>,
+    config_files: BTreeSet<(PathBuf, PathBuf)>,
     preserved: BTreeSet<PathBuf>,
 }
 
-pub(in crate::store) fn relocate_copied_managed_worktrees(
+/// Finalize recognized managed rows and their copied Git graph.
+/// Mappings describe existing copy operations; this never
+/// acquires missing source data or expands a caller's copy selection.
+pub(in crate::store) fn relocate_copied_worktrees(
     paths: &EnvPaths,
     mappings: &[(&Path, &Path)],
 ) -> Result<BTreeSet<PathBuf>, String> {
-    let Some(database) = contained_imported_database(
+    let database = contained_imported_database(
         &paths.state_dir.join("state/openclaw.sqlite"),
         &paths.root,
         true,
-    )?
-    else {
-        return Ok(BTreeSet::new());
-    };
-    if !is_sqlite_database(&database)? {
-        return Ok(BTreeSet::new());
-    }
-    let db = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|error| error.to_string())?;
-    if !has_table(&db, "worktrees")? {
-        return Ok(BTreeSet::new());
-    }
+    )?;
     let root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
     let mut graph = CopyGraph {
         root,
@@ -58,10 +55,188 @@ pub(in crate::store) fn relocate_copied_managed_worktrees(
         commons: BTreeSet::new(),
         object_dirs: BTreeSet::new(),
         metadata_dirs: BTreeSet::new(),
+        resolved_directories: BTreeMap::new(),
         writes: BTreeMap::new(),
+        links: BTreeMap::new(),
         configs: BTreeMap::new(),
+        config_sections: BTreeMap::new(),
+        config_files: BTreeSet::new(),
         preserved: BTreeSet::new(),
     };
+    let records = read_managed_registry(database.as_deref(), &mut graph)?;
+    if graph.checkouts.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    // The whole required graph has been resolved inside the destination before
+    // changing any pointer. Never ask Git to repair source-selecting pointers.
+    for (link, (original, target)) in &graph.links {
+        with_owner_write_permission(link.parent().ok_or("Git link has no parent")?, || {
+            if fs::read_link(link).map_err(|error| error.to_string())? != *original {
+                return Err("copied Git link changed during finalization".to_string());
+            }
+            fs::remove_file(link).map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, link).map_err(|error| error.to_string())?;
+            #[cfg(windows)]
+            if target.is_dir() {
+                std::os::windows::fs::symlink_dir(git_path(target).as_ref(), link)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                std::os::windows::fs::symlink_file(git_path(target).as_ref(), link)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })?;
+    }
+    for (file, bytes) in &graph.writes {
+        with_owner_write_permission(file, || {
+            fs::write(file, bytes).map_err(|error| error.to_string())
+        })?;
+    }
+    for ((file, key, original), value) in &graph.configs {
+        let mut pattern = String::from("^");
+        for character in original.chars() {
+            if r"\.^$[](){}*+?|".contains(character) {
+                pattern.push('\\');
+            }
+            pattern.push(character);
+        }
+        pattern.push('$');
+        edit_git_config(
+            file,
+            &[
+                "--replace-all",
+                key,
+                &display_path(&git_path(value)),
+                &pattern,
+            ],
+        )?;
+    }
+    for ((file, original), replacement) in &graph.config_sections {
+        rename_git_include_section(file, original, replacement)?;
+    }
+    for (path, expected) in &graph.checkouts {
+        let actual = git_identity_paths(path)?.ok_or("copied Git checkout disappeared")?;
+        if fs::canonicalize(actual.private_dir).map_err(|e| e.to_string())?
+            != fs::canonicalize(&expected.private).map_err(|error| error.to_string())?
+            || fs::canonicalize(actual.common_dir).map_err(|e| e.to_string())?
+                != fs::canonicalize(&expected.common).map_err(|error| error.to_string())?
+            || fs::canonicalize(git_value(path, &["rev-parse", "--show-toplevel"])?)
+                .map_err(|error| error.to_string())?
+                != fs::canonicalize(path).map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "copied Git checkout did not resolve to its destination: {}",
+                display_path(path)
+            ));
+        }
+    }
+    let mut fingerprints = BTreeMap::new();
+    for record in &records {
+        let pending = git_command()
+            .arg("-C")
+            .arg(&record.repo)
+            .args(["show-ref", "--verify", "--quiet"])
+            .arg(format!("refs/openclaw/removals/{}", record.id))
+            .output()
+            .map_err(|error| error.to_string())?;
+        if pending.status.code() != Some(1) {
+            return Err(format!(
+                "cannot copy managed worktree {}: resolve pending Git removal before copying",
+                record.id
+            ));
+        }
+        let common = &graph.checkouts[&record.repo].common;
+        if !fingerprints.contains_key(common) {
+            let output = git_command()
+                .arg("-C")
+                .arg(&record.repo)
+                .args(["config", "--get", "remote.origin.url"])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() && output.status.code() != Some(1) {
+                return Err("failed to read copied repository origin".to_string());
+            }
+            let origin = std::str::from_utf8(&output.stdout)
+                .map_err(|e| e.to_string())?
+                .trim();
+            let canonical_common = fs::canonicalize(common).map_err(|error| error.to_string())?;
+            let digest = Sha256::digest(
+                format!("{}\n{origin}", display_path(&git_path(&canonical_common))).as_bytes(),
+            );
+            fingerprints.insert(
+                common.clone(),
+                digest[..8]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            );
+        }
+    }
+    if let Some(database) = database.filter(|_| !records.is_empty()) {
+        with_owner_write_permission(database.parent().ok_or("database has no parent")?, || {
+            with_owner_write_permission(&database, || {
+                let mut db =
+                    Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                        .map_err(|e| e.to_string())?;
+                db.set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY,
+                    false,
+                )
+                .map_err(|e| e.to_string())?;
+                db.set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+                    false,
+                )
+                .map_err(|e| e.to_string())?;
+                let tx = db.transaction().map_err(|e| e.to_string())?;
+                for record in &records {
+                    tx.execute("UPDATE worktrees SET repo_root = ?1, path = ?2, repo_fingerprint = ?3 WHERE id = ?4",
+                    rusqlite::params![display_path(&git_path(&record.repo)), display_path(&git_path(&record.checkout)), fingerprints[&graph.checkouts[&record.repo].common], record.id])
+                    .map_err(|e| e.to_string())?;
+                }
+                tx.commit().map_err(|e| e.to_string())
+            })
+        })?;
+    }
+    // Retention walks use the caller's root spelling, whereas Git identities
+    // and fingerprints use its canonical spelling, as OpenClaw does.
+    Ok(graph
+        .preserved
+        .into_iter()
+        .filter_map(|path| {
+            path.strip_prefix(&graph.root)
+                .ok()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .map(|relative| paths.root.join(relative))
+        })
+        .collect())
+}
+
+fn read_managed_registry(
+    database: Option<&Path>,
+    graph: &mut CopyGraph<'_>,
+) -> Result<Vec<CopiedWorktree>, String> {
+    let Some(database) = database else {
+        return Ok(Vec::new());
+    };
+    if !is_sqlite_database(database)? {
+        return Ok(Vec::new());
+    }
+    let db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    if !has_table(&db, "worktrees")? {
+        return Ok(Vec::new());
+    }
+    // Path-only historical tables remain the generic SQL relocation owner's
+    // responsibility; they do not identify managed Git ownership.
+    let identity_columns: u32 = db.query_row(
+        "SELECT count(*) FROM pragma_table_info('worktrees') WHERE name IN ('id', 'repo_root', 'path', 'repo_fingerprint')",
+        [], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if identity_columns != 4 {
+        return Ok(Vec::new());
+    }
     let has_removed: bool = db
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('worktrees') WHERE name = 'removed_at')",
@@ -123,121 +298,102 @@ pub(in crate::store) fn relocate_copied_managed_worktrees(
         }
         records.push(CopiedWorktree { id, repo, checkout });
     }
-    drop(db);
-    if records.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    // The whole required graph has been resolved inside the destination before
-    // changing any pointer. Never ask Git to repair source-selecting pointers.
-    for (file, bytes) in &graph.writes {
+    Ok(records)
+}
+
+fn edit_git_config(file: &Path, args: &[&str]) -> Result<(), String> {
+    with_owner_write_permission(file.parent().ok_or("Git config has no parent")?, || {
         with_owner_write_permission(file, || {
-            fs::write(file, bytes).map_err(|error| error.to_string())
-        })?;
+            let output = git_command()
+                .args(["config", "--no-includes", "--file"])
+                .arg(file)
+                .args(args)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err("failed to relocate copied Git path configuration".to_string())
+            }
+        })
+    })
+}
+
+fn rename_git_include_section(
+    file: &Path,
+    original: &str,
+    replacement: &str,
+) -> Result<(), String> {
+    // Git reports section names folded to lowercase, but rename-section uses
+    // the header's original spelling. Let Git parse and rewrite subsections;
+    // inspect only the ASCII section-name tokens to supply that spelling.
+    let bytes = fs::read(file).map_err(|error| error.to_string())?;
+    let mut spellings = BTreeSet::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.trim_ascii_start();
+        if let Some(header) = line.strip_prefix(b"[") {
+            let name = header
+                .iter()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'-')
+                .copied()
+                .collect::<Vec<_>>();
+            if name.eq_ignore_ascii_case(b"includeif") {
+                spellings.insert(String::from_utf8(name).map_err(|error| error.to_string())?);
+            }
+        }
     }
-    for (file, value) in &graph.configs {
-        with_owner_write_permission(file.parent().ok_or("Git config has no parent")?, || {
-            with_owner_write_permission(file, || {
+    let old_suffix = original
+        .strip_prefix("includeif.")
+        .ok_or("invalid Git include section")?;
+    let new_suffix = replacement
+        .strip_prefix("includeif.")
+        .ok_or("invalid Git include section")?;
+    with_owner_write_permission(file.parent().ok_or("Git config has no parent")?, || {
+        with_owner_write_permission(file, || {
+            let mut renamed = false;
+            for spelling in spellings {
                 let output = git_command()
                     .args(["config", "--no-includes", "--file"])
                     .arg(file)
-                    .arg("core.worktree")
-                    .arg(value)
+                    .args([
+                        "--rename-section",
+                        &format!("{spelling}.{old_suffix}"),
+                        &format!("{spelling}.{new_suffix}"),
+                    ])
                     .output()
                     .map_err(|error| error.to_string())?;
-                if output.status.success() {
-                    Ok(())
-                } else {
-                    Err("failed to relocate copied Git worktree configuration".to_string())
-                }
-            })
-        })?;
-    }
-    for (path, expected) in &graph.checkouts {
-        let actual = git_identity_paths(path)?.ok_or("copied Git checkout disappeared")?;
-        if fs::canonicalize(actual.private_dir).map_err(|e| e.to_string())? != expected.private
-            || fs::canonicalize(actual.common_dir).map_err(|e| e.to_string())? != expected.common
-            || Path::new(&git_value(path, &["rev-parse", "--show-toplevel"])?) != path
-        {
-            return Err(format!(
-                "copied Git checkout did not resolve to its destination: {}",
-                display_path(path)
-            ));
-        }
-    }
-    let mut fingerprints = BTreeMap::new();
-    for record in &records {
-        let pending = git_command()
-            .arg("-C")
-            .arg(&record.repo)
-            .args(["show-ref", "--verify", "--quiet"])
-            .arg(format!("refs/openclaw/removals/{}", record.id))
-            .output()
-            .map_err(|error| error.to_string())?;
-        if pending.status.code() != Some(1) {
-            return Err(format!(
-                "cannot copy managed worktree {}: resolve pending Git removal before copying",
-                record.id
-            ));
-        }
-        let common = &graph.checkouts[&record.repo].common;
-        if !fingerprints.contains_key(common) {
-            let output = git_command()
-                .arg("-C")
-                .arg(&record.repo)
-                .args(["config", "--get", "remote.origin.url"])
+                renamed |= output.status.success();
+            }
+            let remaining = git_command()
+                .args(["config", "--no-includes", "--file"])
+                .arg(file)
+                .args(["--get-all", &format!("{original}.path")])
                 .output()
-                .map_err(|e| e.to_string())?;
-            if !output.status.success() && output.status.code() != Some(1) {
-                return Err("failed to read copied repository origin".to_string());
+                .map_err(|error| error.to_string())?;
+            if renamed && remaining.status.code() == Some(1) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "cannot copy managed worktree: could not relocate Git include condition in {}",
+                    display_path(file)
+                ))
             }
-            let origin = std::str::from_utf8(&output.stdout)
-                .map_err(|e| e.to_string())?
-                .trim();
-            let digest = Sha256::digest(format!("{}\n{origin}", display_path(common)).as_bytes());
-            fingerprints.insert(
-                common.clone(),
-                digest[..8]
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>(),
-            );
+        })
+    })
+}
+
+fn git_path(path: &Path) -> Cow<'_, Path> {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return Cow::Owned(PathBuf::from(format!(r"\\{rest}")));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return Cow::Owned(PathBuf::from(rest));
         }
     }
-    with_owner_write_permission(database.parent().ok_or("database has no parent")?, || {
-        with_owner_write_permission(&database, || {
-            let mut db = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_WRITE)
-                .map_err(|e| e.to_string())?;
-            db.set_db_config(
-                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY,
-                false,
-            )
-            .map_err(|e| e.to_string())?;
-            db.set_db_config(
-                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
-                false,
-            )
-            .map_err(|e| e.to_string())?;
-            let tx = db.transaction().map_err(|e| e.to_string())?;
-            for record in &records {
-                tx.execute("UPDATE worktrees SET repo_root = ?1, path = ?2, repo_fingerprint = ?3 WHERE id = ?4",
-                    rusqlite::params![display_path(&record.repo), display_path(&record.checkout), fingerprints[&graph.checkouts[&record.repo].common], record.id])
-                    .map_err(|e| e.to_string())?;
-            }
-            tx.commit().map_err(|e| e.to_string())
-        })
-    })?;
-    // Retention walks use the caller's root spelling, whereas Git identities
-    // and fingerprints use its canonical spelling, as OpenClaw does.
-    Ok(graph
-        .preserved
-        .into_iter()
-        .filter_map(|path| {
-            path.strip_prefix(&graph.root)
-                .ok()
-                .filter(|relative| !relative.as_os_str().is_empty())
-                .map(|relative| paths.root.join(relative))
-        })
-        .collect())
+    Cow::Borrowed(path)
 }
 
 fn has_table(db: &Connection, table: &str) -> Result<bool, String> {
@@ -279,38 +435,103 @@ fn git_value(path: &Path, args: &[&str]) -> Result<String, String> {
 
 impl CopyGraph<'_> {
     fn project(&self, path: &Path) -> Option<PathBuf> {
-        if path.starts_with(&self.root) {
-            return Some(path.to_path_buf());
+        let path = git_path(path);
+        if let Ok(relative) = path.strip_prefix(git_path(&self.root).as_ref()) {
+            return Some(self.root.join(relative));
         }
-        if let Ok(relative) = path.strip_prefix(self.target) {
+        if let Ok(relative) = path.strip_prefix(git_path(self.target).as_ref()) {
             return Some(self.root.join(relative));
         }
         self.mappings
             .iter()
             .filter_map(|(source, target)| {
-                path.strip_prefix(source)
+                path.strip_prefix(git_path(source).as_ref())
                     .ok()
                     .map(|relative| (source.components().count(), target.join(relative)))
             })
             .max_by_key(|(length, _)| *length)
-            .map(|(_, target)| target)
+            .map(|(_, target)| {
+                target
+                    .strip_prefix(self.target)
+                    .map(|relative| self.root.join(relative))
+                    .unwrap_or(target)
+            })
     }
 
-    fn owned(&self, path: &Path) -> Result<PathBuf, String> {
-        let projected = self.project(path).ok_or_else(|| format!("cannot copy managed worktree: required Git path is outside the copied environment: {}", display_path(path)))?;
-        let actual = fs::canonicalize(&projected).map_err(|error| {
-            format!(
-                "cannot copy managed worktree: required Git path is unavailable: {}: {error}",
-                display_path(&projected)
-            )
-        })?;
-        if !actual.starts_with(&self.root) {
-            return Err(format!(
-                "cannot copy managed worktree: Git path escapes the copied environment: {}",
-                display_path(&projected)
-            ));
+    fn owned(&mut self, path: &Path) -> Result<PathBuf, String> {
+        self.resolve_owned(path, 0, false)
+    }
+
+    fn resolve_owned(
+        &mut self,
+        path: &Path,
+        depth: usize,
+        allow_missing: bool,
+    ) -> Result<PathBuf, String> {
+        if depth > 40 {
+            return Err("cannot copy managed worktree: cyclic or excessive Git links".to_string());
         }
-        Ok(actual)
+        let projected = self.project(path).ok_or_else(|| format!("cannot copy managed worktree: required Git path is outside the copied environment: {}", display_path(path)))?;
+        let relative = projected
+            .strip_prefix(&self.root)
+            .or_else(|_| projected.strip_prefix(self.target))
+            .map_err(|_| "cannot copy managed worktree: Git mapping leaves the destination")?;
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            match component {
+                Component::CurDir => continue,
+                Component::ParentDir if current != self.root => {
+                    current.pop();
+                    continue;
+                }
+                Component::Normal(name) => current.push(name),
+                _ => {
+                    return Err(
+                        "cannot copy managed worktree: Git path escapes the copied environment"
+                            .to_string(),
+                    );
+                }
+            }
+            if let Some(resolved) = self.resolved_directories.get(&current) {
+                current = resolved.clone();
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "cannot copy managed worktree: required Git path is unavailable: {}: {error}",
+                        display_path(&current)
+                    ));
+                }
+            };
+            if metadata.is_symlink() {
+                let original = fs::read_link(&current).map_err(|error| error.to_string())?;
+                let value = if original.is_absolute() {
+                    original.clone()
+                } else {
+                    current.parent().unwrap().join(&original)
+                };
+                let target = self.resolve_owned(&value, depth + 1, allow_missing)?;
+                if self.project(&value).as_deref() != Some(value.as_path()) {
+                    self.links
+                        .insert(current.clone(), (original, target.clone()));
+                }
+                self.preserved.insert(target.clone());
+                if target.is_dir() {
+                    self.resolved_directories
+                        .insert(current.clone(), target.clone());
+                }
+                current = target;
+            } else if metadata.is_dir() {
+                self.resolved_directories
+                    .insert(current.clone(), current.clone());
+            }
+        }
+        Ok(current)
     }
 
     fn pointer(
@@ -324,10 +545,20 @@ impl CopyGraph<'_> {
         }
         let file = self.owned(file)?;
         let value = read_git_pointer(&file, base, prefix)?.ok_or("Git pointer disappeared")?;
-        let target = self.owned(&value)?;
+        let target = if file.file_name() == Some(OsStr::new("gitdir")) {
+            // Git infers the checkout from the backlink's parent, so keep the
+            // .git entry name even when that final entry is itself a symlink.
+            let projected = self.project(&value).ok_or_else(|| format!("cannot copy managed worktree: Git backlink is outside the copied environment: {}", display_path(&value)))?;
+            let parent = self.owned(projected.parent().ok_or("Git backlink has no parent")?)?;
+            let entry = parent.join(projected.file_name().ok_or("Git backlink has no name")?);
+            self.owned(&entry)?;
+            entry
+        } else {
+            self.owned(&value)?
+        };
         if clean_path(&value) != target {
             let mut bytes = prefix.to_vec();
-            bytes.extend_from_slice(target.as_os_str().as_encoded_bytes());
+            bytes.extend_from_slice(git_path(&target).as_os_str().as_encoded_bytes());
             bytes.push(b'\n');
             if let Some(previous) = self.writes.insert(file, bytes.clone())
                 && previous != bytes
@@ -368,10 +599,10 @@ impl CopyGraph<'_> {
         self.checkouts.insert(root.clone(), identity.clone());
         self.preserved
             .extend([root.clone(), private.clone(), common.clone()]);
-        self.config_worktree(&private.join("config.worktree"))?;
+        self.config_paths(&private.join("config.worktree"), &private)?;
         if self.commons.insert(common.clone()) {
             self.validate_metadata_links(&common)?;
-            self.config_worktree(&common.join("config"))?;
+            self.config_paths(&common.join("config"), &common)?;
             self.check_locks(&common)?;
             self.alternates(&common.join("objects"))?;
             let slots = common.join("worktrees");
@@ -454,7 +685,7 @@ impl CopyGraph<'_> {
         Ok(())
     }
 
-    fn check_locks(&self, directory: &Path) -> Result<(), String> {
+    fn check_locks(&mut self, directory: &Path) -> Result<(), String> {
         for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let name = entry.file_name();
@@ -467,7 +698,8 @@ impl CopyGraph<'_> {
         }
         let refs = directory.join("refs");
         if git_entry_exists(&refs)? {
-            self.check_ref_locks(&self.owned(&refs)?)?;
+            let refs = self.owned(&refs)?;
+            self.check_ref_locks(&refs)?;
         }
         Ok(())
     }
@@ -492,33 +724,116 @@ impl CopyGraph<'_> {
         Ok(())
     }
 
-    fn config_worktree(&mut self, path: &Path) -> Result<(), String> {
+    fn config_paths(&mut self, path: &Path, git_dir: &Path) -> Result<(), String> {
         if !git_entry_exists(path)? {
             return Ok(());
         }
-        let path = self.owned(path)?;
+        let file = self.owned(path)?;
+        if !self
+            .config_files
+            .insert((file.clone(), git_dir.to_path_buf()))
+        {
+            return Ok(());
+        }
         let output = git_command()
-            .args(["config", "--no-includes", "--file"])
-            .arg(&path)
-            .args(["--get", "core.worktree"])
+            .args(["config", "--no-includes", "--null", "--file"])
+            .arg(&file)
+            .args([
+                "--get-regexp",
+                "^(core\\.worktree|include\\.path|includeif\\..*\\.path)$",
+            ])
             .output()
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
         if output.status.code() == Some(1) {
             return Ok(());
         }
         if !output.status.success() {
-            return Err("cannot read copied Git worktree configuration".to_string());
+            return Err("cannot read copied Git path configuration".to_string());
         }
-        let value = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-        let value = Path::new(value.trim_end_matches(['\r', '\n']));
-        let original = if value.is_absolute() {
-            value.to_path_buf()
-        } else {
-            path.parent().unwrap().join(value)
-        };
-        let target = self.owned(&original)?;
-        if clean_path(&original) != target {
-            self.configs.insert(path, target);
+        let mut values = BTreeMap::<(String, String), usize>::new();
+        for entry in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let split = entry
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .ok_or("invalid Git config output")?;
+            let key = std::str::from_utf8(&entry[..split])
+                .map_err(|error| error.to_string())?
+                .to_string();
+            let value = std::str::from_utf8(&entry[split + 1..])
+                .map_err(|error| error.to_string())?
+                .to_string();
+            *values.entry((key, value)).or_default() += 1;
+        }
+        for ((key, raw), count) in values {
+            let is_worktree = key == "core.worktree";
+            // User/system and runtime-prefix includes keep their existing scope.
+            if !is_worktree && (raw.starts_with('~') || raw.starts_with("%(prefix)")) {
+                continue;
+            }
+            let value = Path::new(&raw);
+            let base = if is_worktree {
+                git_dir
+            } else {
+                file.parent().unwrap()
+            };
+            let original = if value.is_absolute() {
+                value.to_path_buf()
+            } else {
+                base.join(value)
+            };
+            if !is_worktree && self.project(&original).is_none() {
+                continue;
+            }
+            let target = self.resolve_owned(&original, 0, !is_worktree)?;
+            if clean_path(&original) != target {
+                if count != 1 {
+                    return Err(format!(
+                        "cannot copy managed worktree: repeated Git {key} entries require ordered relocation in {}; use equivalent relative paths for those repeated entries before copying",
+                        display_path(&file)
+                    ));
+                }
+                let identity = (file.clone(), key.clone(), raw);
+                if let Some(previous) = self.configs.insert(identity, target.clone())
+                    && previous != target
+                {
+                    return Err("cannot copy managed worktree: shared Git config has conflicting destinations".to_string());
+                }
+            }
+            if !is_worktree {
+                self.preserved.insert(target.clone());
+                self.config_paths(&target, git_dir)?;
+                if let Some(condition) = key
+                    .strip_prefix("includeif.")
+                    .and_then(|key| key.strip_suffix(".path"))
+                {
+                    for kind in ["gitdir:", "gitdir/i:", "worktree:", "worktree/i:"] {
+                        if let Some(pattern) = condition.strip_prefix(kind) {
+                            if Path::new(pattern).is_absolute()
+                                && let Some(mapped) = self.project(Path::new(pattern))
+                            {
+                                let mut mapped = display_path(&git_path(&mapped));
+                                if pattern.ends_with('/') && !mapped.ends_with('/') {
+                                    mapped.push('/');
+                                }
+                                if pattern.ends_with('\\') && !mapped.ends_with('\\') {
+                                    mapped.push('\\');
+                                }
+                                if mapped != pattern {
+                                    self.config_sections.insert(
+                                        (file.clone(), format!("includeif.{condition}")),
+                                        format!("includeif.{kind}{mapped}"),
+                                    );
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }

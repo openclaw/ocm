@@ -807,7 +807,7 @@ fn clone_environment_with_policy(
         validate_nonportable_runtime_state_paths(&target_paths)?;
         let canonical_source_root =
             fs::canonicalize(&source_paths.root).map_err(|error| error.to_string())?;
-        let managed_worktrees = super::openclaw_state::relocate_copied_managed_worktrees(
+        let managed_worktrees = super::openclaw_state::relocate_copied_worktrees(
             &target_paths,
             &[
                 (&source_paths.root, &target_paths.root),

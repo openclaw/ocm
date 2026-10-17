@@ -1806,11 +1806,25 @@ fn env_clone_rolls_back_a_database_relocation_failure() {
     );
 }
 
+fn managed_path_text(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    value.into_owned()
+}
+
 fn managed_git(cwd: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
-        .args(args)
+        .args(args.iter().map(|value| managed_path_text(Path::new(value))))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env(
             "GIT_CONFIG_GLOBAL",
@@ -1932,6 +1946,51 @@ fn env_clone_relocates_complete_managed_git_graph_and_preserves_default_checkout
             &repo,
             &["config", "fixture.authored", source.to_str().unwrap()],
         );
+        if layout.starts_with("configured/") {
+            let settings = source.join(".openclaw/git-settings");
+            managed_git(
+                &repo,
+                &[
+                    "config",
+                    "--file",
+                    settings.to_str().unwrap(),
+                    "core.worktree",
+                    repo.to_str().unwrap(),
+                ],
+            );
+            managed_git(
+                &repo,
+                &[
+                    "config",
+                    "--file",
+                    settings.to_str().unwrap(),
+                    "remote.origin.url",
+                    "https://example.invalid/fixture.git",
+                ],
+            );
+            managed_git(&repo, &["config", "--unset", "core.worktree"]);
+            managed_git(&repo, &["config", "--unset", "remote.origin.url"]);
+            managed_git(
+                &repo,
+                &["config", "include.path", settings.to_str().unwrap()],
+            );
+            let conditional = source.join(".openclaw/git-conditional");
+            managed_git(
+                &repo,
+                &[
+                    "config",
+                    "--file",
+                    conditional.to_str().unwrap(),
+                    "fixture.conditional",
+                    "retained",
+                ],
+            );
+            let key = format!(
+                "includeIf.gitdir:{}/.path",
+                managed_path_text(&source).replace('\\', "/")
+            );
+            managed_git(&repo, &["config", &key, conditional.to_str().unwrap()]);
+        }
         let sibling = source.join(".openclaw/worktrees/old-fingerprint/sibling");
         managed_git(
             &repo,
@@ -1985,6 +2044,13 @@ fn env_clone_relocates_complete_managed_git_graph_and_preserves_default_checkout
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            if layout.starts_with("worktrees/") {
+                let object_store = source.join(".openclaw/object-store");
+                fs::rename(repo.join(".git/objects"), &object_store).unwrap();
+                std::os::unix::fs::symlink(&object_store, repo.join(".git/objects")).unwrap();
+                fs::rename(checkout.join(".git"), checkout.join(".git-pointer")).unwrap();
+                std::os::unix::fs::symlink(".git-pointer", checkout.join(".git")).unwrap();
+            }
             for file in [
                 checkout.join(".git"),
                 source_private.join("gitdir"),
@@ -2002,10 +2068,11 @@ fn env_clone_relocates_complete_managed_git_graph_and_preserves_default_checkout
         let target_repo = target.join(".openclaw/workspace/repository");
         let target_checkout = target.join(&relative);
         let common = fs::canonicalize(target_repo.join(".git")).unwrap();
-        let private = std::path::PathBuf::from(managed_git(
+        let private = fs::canonicalize(managed_git(
             &target_checkout,
             &["rev-parse", "--absolute-git-dir"],
-        ));
+        ))
+        .unwrap();
         assert!(private.starts_with(&target));
         assert_eq!(fs::read(private.join("index")).unwrap(), source_index);
         #[cfg(unix)]
@@ -2023,17 +2090,30 @@ fn env_clone_relocates_complete_managed_git_graph_and_preserves_default_checkout
             }
         }
         if layout.starts_with("worktrees/") {
+            #[cfg(unix)]
+            {
+                assert_eq!(
+                    fs::read_link(target_repo.join(".git/objects")).unwrap(),
+                    target.join(".openclaw/object-store")
+                );
+                assert_eq!(
+                    fs::read_link(repo.join(".git/objects")).unwrap(),
+                    source.join(".openclaw/object-store")
+                );
+            }
             let alternate = target.join(".openclaw/object cache");
             assert!(
                 managed_git(&target_repo, &["count-objects", "-v"])
-                    .contains(alternate.to_str().unwrap())
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("alternate: "))
+                    .any(|path| fs::canonicalize(path).ok() == Some(alternate.clone()))
             );
             let module = target_checkout.join("module");
             let module_git = managed_git(&module, &["rev-parse", "--absolute-git-dir"]);
-            assert!(Path::new(&module_git).starts_with(&target));
+            assert!(fs::canonicalize(module_git).unwrap().starts_with(&target));
             assert_eq!(
-                managed_git(&module, &["rev-parse", "--show-toplevel"]),
-                module.to_str().unwrap()
+                fs::canonicalize(managed_git(&module, &["rev-parse", "--show-toplevel"])).unwrap(),
+                module
             );
             assert_eq!(
                 fs::read_to_string(module.join("library.txt")).unwrap(),
@@ -2050,8 +2130,8 @@ fn env_clone_relocates_complete_managed_git_graph_and_preserves_default_checkout
             common
         );
         assert_eq!(
-            fs::read_to_string(private.join("gitdir")).unwrap().trim(),
-            target_checkout.join(".git").to_str().unwrap()
+            fs::canonicalize(fs::read_to_string(private.join("gitdir")).unwrap().trim()).unwrap(),
+            fs::canonicalize(target_checkout.join(".git")).unwrap()
         );
         assert_eq!(
             fs::read(target_checkout.join("untracked.txt")).unwrap(),
@@ -2059,7 +2139,7 @@ fn env_clone_relocates_complete_managed_git_graph_and_preserves_default_checkout
         );
         assert_eq!(
             managed_git(&target_repo, &["config", "fixture.authored"]),
-            source.to_str().unwrap()
+            managed_path_text(&source)
         );
         assert!(
             target
@@ -2077,14 +2157,32 @@ fn env_clone_relocates_complete_managed_git_graph_and_preserves_default_checkout
             ),
             managed_git(&repo, &["rev-parse", "refs/openclaw/snapshots/fixture"])
         );
+        if layout.starts_with("configured/") {
+            assert!(target.join(".openclaw/git-settings").is_file());
+            assert!(
+                managed_git(
+                    &target_repo,
+                    &["config", "--show-origin", "--get", "remote.origin.url"]
+                )
+                .contains(&managed_path_text(&target.join(".openclaw/git-settings")))
+            );
+            assert_eq!(
+                managed_git(&target_repo, &["config", "fixture.conditional"]),
+                "retained"
+            );
+        }
         let db = Connection::open(target.join(".openclaw/state/openclaw.sqlite")).unwrap();
         let values: (String,String,String,String,String,String,String) = db.query_row(
             "SELECT repo_root,path,repo_fingerprint,branch,base_ref,snapshot_ref,provisioned_paths_json FROM worktrees WHERE id='managed-id'", [],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).unwrap();
-        assert_eq!(values.0, target_repo.to_str().unwrap());
-        assert_eq!(values.1, target_checkout.to_str().unwrap());
+        assert_eq!(fs::canonicalize(values.0).unwrap(), target_repo);
+        assert_eq!(fs::canonicalize(values.1).unwrap(), target_checkout);
         let expected_fingerprint = Sha256::digest(
-            format!("{}\nhttps://example.invalid/fixture.git", common.display()).as_bytes(),
+            format!(
+                "{}\nhttps://example.invalid/fixture.git",
+                managed_path_text(&common)
+            )
+            .as_bytes(),
         );
         assert_eq!(
             values.2,
@@ -2137,6 +2235,7 @@ fn env_clone_rolls_back_unresolvable_or_locked_managed_git_graphs() {
         "git-lock",
         "alternate",
         "lease",
+        "repeated-config",
     ] {
         let root = TestDir::new("clone-managed-unsafe");
         let env = ocm_env(&root);
@@ -2182,6 +2281,21 @@ fn env_clone_rolls_back_unresolvable_or_locked_managed_git_graphs() {
                     &repo.join(".git/objects/info/alternates"),
                     external.to_str().unwrap(),
                 );
+            }
+            "repeated-config" => {
+                let included = source.join(".openclaw/git-settings");
+                write_text(&included, "[fixture]\n value = authored\n");
+                for _ in 0..2 {
+                    managed_git(
+                        &repo,
+                        &[
+                            "config",
+                            "--add",
+                            "include.path",
+                            included.to_str().unwrap(),
+                        ],
+                    );
+                }
             }
             "lease" => {
                 let db = Connection::open(source.join(".openclaw/state/openclaw.sqlite")).unwrap();

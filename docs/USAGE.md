@@ -729,7 +729,8 @@ Clone and upgrade simulation also rebase retained SQLite session paths, includin
 External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.
 Retained managed Git worktrees whose repository and required Git data are inside the copied environment keep their checkout content, including the default `.openclaw/worktrees` layout.
 Clone relocates their registry identity and structural Git links together, preserving session/worktree IDs, branch and snapshot refs, indexes, and authored content.
-It fails and removes the incomplete target when required Git data is missing or external, or copied locks/run ownership remain unresolved; resolve that condition in the source before retrying.
+It retains and relocates owned Git storage links and included configuration needed by those checkouts.
+It fails and removes the incomplete target when required Git data is missing or external, copied locks/run ownership remain unresolved, or structural configuration cannot be relocated without changing ordered values; resolve the reported condition before retrying.
 Clone does not copy external repositories, clear Git locks, or change source registrations.
 
 OCM does not classify a package or project asset as operational merely because it has a SQLite header or filename.

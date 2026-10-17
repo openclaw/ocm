@@ -1,6 +1,6 @@
 mod worktrees;
 
-pub(super) use worktrees::relocate_copied_managed_worktrees;
+pub(super) use worktrees::relocate_copied_worktrees;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
