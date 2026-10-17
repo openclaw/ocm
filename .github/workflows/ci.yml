@@ -68,6 +68,12 @@ jobs:
       - name: Prove local and network file URL relocation
         timeout-minutes: 5
         run: cargo test --locked --lib store::openclaw_state::tests::file_url_relocation_changes_windows_authority -- --exact
+      - name: Prove configured paths under Windows root spellings
+        timeout-minutes: 5
+        run: |
+          cargo test --locked --lib archive_root_prefix_matches_windows_representations -- --nocapture
+          cargo test --locked --lib internal_links_under_root_spellings -- --nocapture
+          cargo test --locked --test env_clone_tests env_clone_rejects_internal_workspace_links_under_root_spellings -- --exact --nocapture
       - name: Prove private config writes
         run: cargo test --locked --lib private_config_
       - name: Prove private Windows UI handoffs

@@ -141,9 +141,8 @@ impl OpenClawWorkspaceInventory {
             let canonical_relative = canonical_preserved_path
                 .strip_prefix(&canonical_archive_root)
                 .map_err(|error| error.to_string())?;
-            if let Ok(relative) = preserved_path
-                .strip_prefix(&archive_root)
-                .or_else(|_| preserved_path.strip_prefix(&canonical_archive_root))
+            if let Some(relative) = strip_archive_root_prefix(preserved_path, &archive_root)
+                .or_else(|| strip_archive_root_prefix(preserved_path, &canonical_archive_root))
             {
                 if relative != canonical_relative {
                     return Err(format!(
@@ -254,6 +253,42 @@ fn cleanup_path_is_agent_runtime(agents_root: &Path, agent_dir: &Path, path: &Pa
     path.starts_with(&sessions)
         || (sessions.starts_with(path)
             && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
+}
+
+// Compare Windows root representations without resolving the authored path:
+// its relative components must remain available to detect internal redirects.
+fn strip_archive_root_prefix<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+
+        let mut components = path.components();
+        for root_component in root.components() {
+            let component = components.next()?;
+            let equal = match (component, root_component) {
+                (Component::Prefix(path), Component::Prefix(root)) => {
+                    match (path.kind(), root.kind()) {
+                        (
+                            Prefix::Disk(a) | Prefix::VerbatimDisk(a),
+                            Prefix::Disk(b) | Prefix::VerbatimDisk(b),
+                        ) => a == b,
+                        (
+                            Prefix::UNC(a, b) | Prefix::VerbatimUNC(a, b),
+                            Prefix::UNC(c, d) | Prefix::VerbatimUNC(c, d),
+                        ) => a == c && b == d,
+                        (a, b) => a == b,
+                    }
+                }
+                (a, b) => a == b,
+            };
+            if !equal {
+                return None;
+            }
+        }
+        Some(components.as_path())
+    }
+    #[cfg(not(windows))]
+    path.strip_prefix(root).ok()
 }
 
 fn validate_internal_migration_path(
@@ -1980,18 +2015,28 @@ mod tests {
         let _ = fs::remove_dir_all(external);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn workspace_inventory_rejects_internal_links_under_both_root_spellings() {
+    fn workspace_inventory_rejects_internal_links_under_root_spellings() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink as symlink_dir;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_dir;
         let temp = tempfile::tempdir().unwrap();
         let physical = fs::canonicalize(temp.path()).unwrap().join("physical");
         let alias = temp.path().join("alias");
         fs::create_dir_all(&physical).unwrap();
-        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        symlink_dir(&physical, &alias).unwrap();
         let paths = super::super::layout::derive_env_paths(alias.join("source"));
         fs::create_dir_all(paths.state_dir.join("owned")).unwrap();
-        std::os::unix::fs::symlink("owned", paths.state_dir.join("redirect")).unwrap();
-        for root in [&paths.root, &fs::canonicalize(&paths.root).unwrap()] {
+        symlink_dir("owned", paths.state_dir.join("redirect")).unwrap();
+        let canonical = fs::canonicalize(&paths.root).unwrap();
+        let mut roots = vec![paths.root.clone(), canonical.clone()];
+        #[cfg(windows)]
+        roots.push(PathBuf::from(
+            canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap(),
+        ));
+        for root in roots.drain(..) {
             for agent_directory in [false, true] {
                 for (relative, allowed) in [
                     ("owned", true),
@@ -2029,6 +2074,43 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn archive_root_prefix_matches_windows_representations() {
+        for (ordinary, verbatim) in [
+            (r"C:\physical\source", r"\\?\C:\physical\source"),
+            (r"\\server\share\source", r"\\?\UNC\server\share\source"),
+        ] {
+            for root in [ordinary, verbatim] {
+                for configured in [ordinary, verbatim] {
+                    let path = Path::new(configured).join(r".openclaw\redirect");
+                    assert_eq!(
+                        strip_archive_root_prefix(&path, Path::new(root)),
+                        Some(Path::new(r".openclaw\redirect")),
+                    );
+                    assert!(
+                        strip_archive_root_prefix(&path, &PathBuf::from(format!("{root}-other")))
+                            .is_none()
+                    );
+                }
+            }
+        }
+        for (path, root) in [
+            (r"C:\physical\source\child", r"\\?\D:\physical\source"),
+            (
+                r"\\server\share\source\child",
+                r"\\?\UNC\server\other\source",
+            ),
+            (
+                r"\\server\share\source\child",
+                r"\\?\UNC\other\share\source",
+            ),
+            (r"C:\physical\source\child", r"\\?\C:\physical\Source"),
+        ] {
+            assert!(strip_archive_root_prefix(Path::new(path), Path::new(root)).is_none());
         }
     }
 

@@ -2830,25 +2830,38 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn runtime_state_cleanup_rejects_internal_links_under_both_root_spellings() {
+    fn runtime_state_cleanup_rejects_internal_links_under_root_spellings() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink as symlink_dir;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_dir;
         for copying in [false, true] {
-            for canonical in [false, true] {
+            for spelling in 0..if cfg!(windows) { 3 } else { 2 } {
                 let temp = tempfile::tempdir().unwrap();
                 let physical = fs::canonicalize(temp.path()).unwrap().join("physical");
                 let alias = temp.path().join("alias");
                 fs::create_dir_all(&physical).unwrap();
-                std::os::unix::fs::symlink(&physical, &alias).unwrap();
+                symlink_dir(&physical, &alias).unwrap();
                 let paths = derive_env_paths(alias.join("source"));
                 let owned = paths.state_dir.join("owned");
                 fs::create_dir_all(&owned).unwrap();
                 fs::write(owned.join("notes.txt"), "workspace").unwrap();
-                std::os::unix::fs::symlink(&owned, paths.state_dir.join("redirect")).unwrap();
-                let configured_root = if canonical {
-                    fs::canonicalize(&paths.root).unwrap()
-                } else {
-                    paths.root.clone()
+                symlink_dir(&owned, paths.state_dir.join("redirect")).unwrap();
+                let configured_root = match spelling {
+                    0 => paths.root.clone(),
+                    1 => fs::canonicalize(&paths.root).unwrap(),
+                    #[cfg(windows)]
+                    2 => PathBuf::from(
+                        fs::canonicalize(&paths.root)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .strip_prefix(r"\\?\")
+                            .unwrap(),
+                    ),
+                    _ => unreachable!(),
                 };
                 let config = serde_json::json!({
                     "agents": {"defaults": {"workspace": configured_root.join(".openclaw/redirect")}}
@@ -2865,7 +2878,7 @@ mod tests {
                     result
                         .as_ref()
                         .is_err_and(|error| error.contains("through a symlink")),
-                    "copying={copying}, canonical={canonical}: {result:?}; workspace_exists={}, pid_exists={}",
+                    "copying={copying}, spelling={spelling}: {result:?}; workspace_exists={}, pid_exists={}",
                     owned.join("notes.txt").exists(),
                     paths.state_dir.join("gateway.pid").exists(),
                 );
