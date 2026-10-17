@@ -78,6 +78,13 @@ impl From<String> for OpenClawCleanupPathError {
     }
 }
 
+#[derive(Clone, Copy)]
+enum OpenClawPathSelection {
+    Workspaces,
+    Copy,
+    Cleanup,
+}
+
 impl OpenClawWorkspaceInventory {
     pub(crate) fn contains(&self, path: &Path) -> bool {
         let path = clean_path(path);
@@ -320,7 +327,8 @@ pub(crate) fn resolve_env_openclaw_workspaces(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<OpenClawWorkspaceInventory, String> {
-    resolve_env_openclaw_paths(paths, env, runtime, false)
+    resolve_env_openclaw_paths(paths, env, runtime, OpenClawPathSelection::Workspaces)
+        .map_err(OpenClawCleanupPathError::into_message)
 }
 
 /// Clone and ordinary archives retain configured agent payloads as well as
@@ -330,7 +338,8 @@ pub(crate) fn resolve_env_openclaw_copy_paths(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<OpenClawWorkspaceInventory, String> {
-    resolve_env_openclaw_paths(paths, env, runtime, true)
+    resolve_env_openclaw_paths(paths, env, runtime, OpenClawPathSelection::Copy)
+        .map_err(OpenClawCleanupPathError::into_message)
 }
 
 /// Cleanup preserves configured payload inside this environment, but neither
@@ -340,7 +349,8 @@ pub(crate) fn resolve_env_openclaw_cleanup_paths(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
-    let mut inventory = resolve_env_openclaw_paths(paths, env, runtime, true)?;
+    let mut inventory =
+        resolve_env_openclaw_paths(paths, env, runtime, OpenClawPathSelection::Cleanup)?;
     let root = clean_path(&paths.root);
     let canonical_root = canonicalize_path_allow_missing(&root)?;
     inventory.agent_directory_roots.retain(|_, directory| {
@@ -360,18 +370,7 @@ pub(crate) fn resolve_env_openclaw_cleanup_paths(
                     .into(),
             );
         }
-        validate_internal_migration_path(directory, &root, &canonical_root, "agent directory")?;
-        if directory.parent().and_then(Path::parent) == Some(agents_root.as_path())
-            && directory.file_name().is_some_and(|name| name == "sessions")
-        {
-            return Err(OpenClawCleanupPathError::AgentSessionCollision(format!(
-                "cannot clean OpenClaw runtime state: configured agent directory overlaps canonical session storage: {}; use a separate agent directory before cleanup",
-                display_path(directory)
-            )));
-        }
     }
-    // Resolve the collision before workspace admission: a drifted workspace
-    // must not let config repair run ahead of this cleanup refusal.
     inventory.archive_relative_roots(&root)?;
     inventory.cleanup_agents_root = Some(agents_root);
     Ok(inventory)
@@ -381,15 +380,15 @@ fn resolve_env_openclaw_paths(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
-    retain_agent_directories: bool,
-) -> Result<OpenClawWorkspaceInventory, String> {
+    selection: OpenClawPathSelection,
+) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
     let mut inventory = resolve_openclaw_workspaces(
         &paths.config_path,
         &paths.state_dir,
         &paths.openclaw_home,
         env,
         runtime,
-        retain_agent_directories,
+        selection,
     )?;
     inventory
         .workspace_roots
@@ -409,8 +408,9 @@ pub(crate) fn resolve_plain_openclaw_workspaces(
         openclaw_home,
         env,
         OpenClawWorkspaceRuntime::default(),
-        false,
-    )?;
+        OpenClawPathSelection::Workspaces,
+    )
+    .map_err(OpenClawCleanupPathError::into_message)?;
     inventory
         .workspace_roots
         .insert(state_dir.join("workspace"));
@@ -454,8 +454,8 @@ fn resolve_openclaw_workspaces(
     openclaw_home: &Path,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
-    retain_agent_directories: bool,
-) -> Result<OpenClawWorkspaceInventory, String> {
+    selection: OpenClawPathSelection,
+) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
     let resolved = load_effective_openclaw_config(config_path)?;
     let config = resolved
         .as_ref()
@@ -475,30 +475,42 @@ fn resolve_openclaw_workspaces(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let configured_default_workspace = default_workspace
-        .map(|workspace| resolve_workspace_path(workspace, openclaw_home))
-        .transpose()?;
-
     let mut agent_ids = entries
         .iter()
         .filter_map(|entry| entry.get("id").and_then(Value::as_str))
         .map(normalize_agent_id)
         .collect::<BTreeSet<_>>();
     agent_ids.insert(default_agent_id.clone());
+    let selected_entries = agent_ids
+        .into_iter()
+        .map(|agent_id| {
+            let entry = entries.iter().find(|entry| {
+                entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| normalize_agent_id(id) == agent_id)
+            });
+            (agent_id, entry)
+        })
+        .collect::<Vec<_>>();
+    if matches!(selection, OpenClawPathSelection::Cleanup) {
+        reject_agent_session_collisions(
+            selected_entries.iter().filter_map(|(_, entry)| *entry),
+            state_dir,
+            openclaw_home,
+        )?;
+    }
+    let configured_default_workspace = default_workspace
+        .map(|workspace| resolve_workspace_path(workspace, openclaw_home))
+        .transpose()?;
 
     let mut workspace_roots = BTreeSet::new();
     let mut agent_directory_roots = BTreeMap::new();
     let mut agent_directory_templates = BTreeMap::new();
     let mut agent_workspace_roots = BTreeMap::new();
     let mut configured_agent_workspace_roots = BTreeMap::new();
-    for agent_id in agent_ids {
-        let entry = entries.iter().find(|entry| {
-            entry
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| normalize_agent_id(id) == agent_id)
-        });
-        if retain_agent_directories
+    for (agent_id, entry) in selected_entries {
+        if !matches!(selection, OpenClawPathSelection::Workspaces)
             && let Some(raw) = entry
                 .and_then(|entry| entry.get("agentDir"))
                 .and_then(Value::as_str)
@@ -510,7 +522,8 @@ fn resolve_openclaw_workspaces(
                 return Err(format!(
                     "configured OpenClaw agent directory cannot be the state directory itself: {}",
                     display_path(&directory)
-                ));
+                )
+                .into());
             }
             if let Some(template) = authored_entries
                 .iter()
@@ -554,7 +567,8 @@ fn resolve_openclaw_workspaces(
             return Err(format!(
                 "configured OpenClaw workspace cannot be the state directory itself: {}",
                 display_path(&workspace)
-            ));
+            )
+            .into());
         }
         workspace_roots.insert(workspace.clone());
         agent_workspace_roots.insert(agent_id, workspace);
@@ -570,6 +584,42 @@ fn resolve_openclaw_workspaces(
         default_agent_id,
         cleanup_agents_root: None,
     })
+}
+
+fn reject_agent_session_collisions<'a>(
+    entries: impl Iterator<Item = &'a Map<String, Value>>,
+    state_dir: &Path,
+    openclaw_home: &Path,
+) -> Result<(), OpenClawCleanupPathError> {
+    let root = clean_path(openclaw_home);
+    let canonical_root = canonicalize_path_allow_missing(&root)?;
+    let agents_root = clean_path(&state_dir.join("agents"));
+    // A different invalid agent or workspace must not hide a known collision
+    // and allow config repair. Preserve those ordinary errors for admission.
+    for entry in entries {
+        let Some(raw) = entry.get("agentDir").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(directory) = resolve_configured_path(raw, openclaw_home, "agent directory") else {
+            continue;
+        };
+        let Ok(relative) = directory
+            .strip_prefix(&root)
+            .or_else(|_| directory.strip_prefix(&canonical_root))
+        else {
+            continue;
+        };
+        let directory = root.join(relative);
+        if directory.parent().and_then(Path::parent) == Some(agents_root.as_path())
+            && directory.file_name().is_some_and(|name| name == "sessions")
+        {
+            return Err(OpenClawCleanupPathError::AgentSessionCollision(format!(
+                "cannot clean OpenClaw runtime state: configured agent directory overlaps canonical session storage: {}; use a separate agent directory before cleanup",
+                display_path(&directory)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn openclaw_config_env(
