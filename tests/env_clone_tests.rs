@@ -2892,3 +2892,39 @@ fn env_clone_copied_git_config_retains_only_required_leaves_inside_runtime_debri
             .exists()
     );
 }
+
+#[test]
+fn env_clone_copied_git_config_relocates_native_bare_repository_includes() {
+    let root = TestDir::new("clone-git-bare-config");
+    let (env, source, _) = copied_config_fixture(&root);
+    let bare = source.join(".openclaw/workspace/bare.git");
+    fs::create_dir(&bare).unwrap();
+    copied_config_git(&bare, &env, &["init", "--bare", "-q"]);
+    let settings = source.join(".openclaw/git-settings/value");
+    write_text(&settings, "[fixture]\n value = copied\n");
+    copied_config_git(
+        &bare,
+        &env,
+        &["config", "include.path", &copied_config_path(&settings)],
+    );
+    let config = fs::read(bare.join("config")).unwrap();
+    let head = fs::read(bare.join("HEAD")).unwrap();
+    let clone = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+    assert!(clone.status.success(), "{}", stderr(&clone));
+    assert_eq!(fs::read(bare.join("config")).unwrap(), config);
+    assert_eq!(fs::read(bare.join("HEAD")).unwrap(), head);
+    let target = source
+        .parent()
+        .unwrap()
+        .join("target/.openclaw/workspace/bare.git");
+    fs::rename(&source, source.with_extension("offline")).unwrap();
+    assert_eq!(
+        copied_config_git(&target, &env, &["rev-parse", "--is-bare-repository"]),
+        "true"
+    );
+    assert_eq!(
+        copied_config_git(&target, &env, &["config", "fixture.value"]),
+        "copied"
+    );
+    assert_eq!(fs::read(target.join("HEAD")).unwrap(), head);
+}

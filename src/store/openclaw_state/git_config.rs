@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use gix_config::AsBStr;
 
 use crate::openclaw_repo::{
-    git_command, git_identity_paths, git_path_from_bytes, normalize_git_file_path,
+    git_command, git_identity_paths, git_path_from_bytes, git_registration_paths,
+    normalize_git_file_path,
 };
 
 use super::{is_integrity_protected_history_destination, with_owner_write_permission};
@@ -199,17 +200,25 @@ pub(in crate::store) fn relocate_workspace_git_config(
         // Reuse the existing decoder, but only consume Git directories already
         // contained in the copy. Relocating source-selecting storage pointers
         // remains the storage owner's responsibility.
-        // A file/directory named .git in ordinary data need not be a repository.
-        // Resolve its structural identity without reading its configuration.
-        if fs::symlink_metadata(path.join(".git")).is_ok()
+        // Native Git validates both ordinary .git entries and bare roots.
+        // The cheap marker check avoids running Git in every copied directory.
+        let entry = path.join(".git");
+        let has_entry = fs::symlink_metadata(&entry).is_ok();
+        let bare_candidate =
+            !has_entry && path.join("HEAD").is_file() && path.join("objects").is_dir();
+        if (has_entry || bare_candidate)
             && git_command()
                 .args(["rev-parse", "--resolve-git-dir"])
-                .arg(git_path(&path.join(".git")))
+                .arg(git_path(if has_entry { &entry } else { &path }))
                 .output()
                 .map_err(|e| e.to_string())?
                 .status
                 .success()
-            && let Some(identity) = git_identity_paths(&path)?
+            && let Some(identity) = if bare_candidate {
+                Some(git_registration_paths(&path)?)
+            } else {
+                git_identity_paths(&path)?
+            }
             && let (Ok(private), Ok(common)) = (
                 owned(&canonical_target, &identity.private_dir),
                 owned(&canonical_target, &identity.common_dir),
@@ -230,6 +239,9 @@ pub(in crate::store) fn relocate_workspace_git_config(
                 private_dir: identity.private_dir,
                 common_dir: identity.common_dir,
             });
+            if bare_candidate {
+                continue; // The repository itself is administrative storage.
+            }
         }
         for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
@@ -516,14 +528,21 @@ fn git_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let raw = path.as_os_str().to_string_lossy();
-        if let Some(path) = raw.strip_prefix(r"\\?\UNC\") {
-            return PathBuf::from(format!(r"\\{path}"));
-        }
-        if let Some(path) = raw.strip_prefix(r"\\?\") {
-            return PathBuf::from(path);
-        }
+        let path = if let Some(path) = raw.strip_prefix(r"\\?\UNC\") {
+            format!("//{path}")
+        } else if let Some(path) = raw.strip_prefix(r"\\?\") {
+            path.to_owned()
+        } else {
+            raw.into_owned()
+        };
+        // Git's relative gitfile resolver finds the parent using '/', including
+        // on Windows. Keep aliases and '..' intact; only normalize separators.
+        PathBuf::from(path.replace('\\', "/"))
     }
-    path.to_path_buf()
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
 }
 
 #[cfg(test)]
@@ -576,7 +595,7 @@ mod tests {
             &[
                 OsStr::new("config"),
                 OsStr::new("--file"),
-                first.as_os_str(),
+                git_path(&first).as_os_str(),
                 OsStr::new("include.path"),
                 git_path(&source.join("nested/decoy")).as_os_str(),
             ],
@@ -592,7 +611,7 @@ mod tests {
             &[
                 OsStr::new("config"),
                 OsStr::new("--file"),
-                decoy.as_os_str(),
+                git_path(&decoy).as_os_str(),
                 OsStr::new("core.worktree"),
                 git_path(&source.join("unrelated")).as_os_str(),
             ],
