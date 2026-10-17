@@ -80,6 +80,12 @@ jobs:
       - name: Prove Windows cleanup preserves credentials and collision precedence
         timeout-minutes: 5
         run: cargo test --locked --test env_cleanup_tests root_spellings -- --nocapture
+      - name: Prove copied Git configuration ownership
+        timeout-minutes: 5
+        run: cargo test --locked --test env_clone_tests env_clone_copied_git_config_ -- --nocapture
+      - name: Prove copied Git configuration ordering
+        timeout-minutes: 5
+        run: cargo test --locked --lib store::openclaw_state::git_config::tests
       - name: Prove private config writes
         run: cargo test --locked --lib private_config_
       - name: Prove private Windows UI handoffs
