@@ -14,7 +14,8 @@ use super::common::path_exists;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_workspaces::{
     OpenClawWorkspaceInventory, OpenClawWorkspaceRuntime, canonicalize_path_allow_missing,
-    resolve_env_openclaw_copy_paths, resolve_env_openclaw_workspaces,
+    resolve_env_openclaw_cleanup_paths, resolve_env_openclaw_copy_paths,
+    resolve_env_openclaw_workspaces,
 };
 
 #[derive(Clone, Debug)]
@@ -42,7 +43,7 @@ pub(crate) fn audit_openclaw_state(
         };
     }
     let runtime = OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port);
-    let workspaces = match resolve_archivable_workspaces(&paths, env, runtime) {
+    let workspaces = match resolve_env_openclaw_cleanup_paths(&paths, env, runtime) {
         Ok(workspaces) => workspaces,
         Err(error) => {
             return OpenClawStateAudit {
@@ -746,13 +747,13 @@ fn clear_runtime_state_with_policy(
     if !path_exists(&paths.state_dir) {
         return Ok(false);
     }
-    let resolve_paths = if copying {
-        resolve_env_openclaw_copy_paths
+    let workspaces = if copying {
+        let inventory = resolve_env_openclaw_copy_paths(paths, env, runtime)?;
+        inventory.archive_relative_roots(&paths.root)?;
+        inventory
     } else {
-        resolve_env_openclaw_workspaces
+        resolve_env_openclaw_cleanup_paths(paths, env, runtime)?
     };
-    let workspaces = resolve_paths(paths, env, runtime)?;
-    workspaces.archive_relative_roots(&paths.root)?;
 
     let mut changed = false;
     for relative_path in runtime_debris_outside_agent_directories(
@@ -3053,14 +3054,10 @@ mod tests {
                     )
                     .unwrap()
                 );
-                if copying {
-                    assert_eq!(
-                        fs::read(agent.join("auth-profiles.json")).unwrap(),
-                        b"auth fixture"
-                    );
-                } else {
-                    assert!(!agent.exists());
-                }
+                assert_eq!(
+                    fs::read(agent.join("auth-profiles.json")).unwrap(),
+                    b"auth fixture"
+                );
                 assert_eq!(fs::read(&paths.config_path).unwrap(), config.as_bytes());
                 assert!(
                     !paths

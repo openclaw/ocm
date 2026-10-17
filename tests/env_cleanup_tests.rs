@@ -343,6 +343,94 @@ fn env_cleanup_yes_clears_inferred_foreign_runtime_state_without_source_metadata
 }
 
 #[test]
+fn env_cleanup_preserves_configured_agent_payload_and_removes_unselected_debris() {
+    for relative in [
+        "extensions/demo/node_modules/private-agent",
+        "custom/private-agent",
+    ] {
+        let root = TestDir::new("cleanup-configured-agent-payload");
+        let cwd = root.path();
+        let env = ocm_env(&root);
+        for name in ["source", "target"] {
+            let created = run_ocm(cwd, &env, &["env", "create", name]);
+            assert!(created.status.success(), "{}", stderr(&created));
+        }
+        let source_config = root.child("ocm-home/envs/source/.openclaw/openclaw.json");
+        crate::support::write_text(&source_config, "{}\n");
+        let source_before = fs::read(&source_config).unwrap();
+        let state = root.child("ocm-home/envs/target/.openclaw");
+        let agent = state.join(relative);
+        let payload = agent.join("auth-profiles.json");
+        // A retained payload may itself quote a source path; it is not runtime
+        // drift and must not keep scheduling resets after the stale session goes.
+        let auth = serde_json::json!({"fixture":true,"source":root.child("ocm-home/envs/source")})
+            .to_string();
+        crate::support::write_text(&payload, &auth);
+        let config = serde_json::json!({
+            "agents":{"entries":{"main":{"agentDir":agent}}}
+        })
+        .to_string();
+        crate::support::write_text(&state.join("openclaw.json"), &config);
+        let stale = state.join("agents/main/sessions/stale.jsonl");
+        crate::support::write_text(
+            &stale,
+            &serde_json::json!({"cwd":root.child("ocm-home/envs/source/.openclaw/workspace")})
+                .to_string(),
+        );
+        let debris = [
+            "extensions/demo/node_modules/unselected/index.js",
+            "extensions/demo/.openclaw-runtime-deps.json",
+            "custom/unselected.txt",
+        ];
+        for relative in debris {
+            crate::support::write_text(&state.join(relative), "debris");
+        }
+        let preview = run_ocm(cwd, &env, &["env", "cleanup", "target", "--json"]);
+        assert!(preview.status.success(), "{}", stderr(&preview));
+        let preview: Value = serde_json::from_str(&stdout(&preview)).unwrap();
+        assert!(preview["actions"].as_array().unwrap().iter().any(|action| {
+            action["kind"] == "reset-openclaw-runtime-state" && action["applied"] == false
+        }));
+        assert!(stale.exists());
+        for relative in debris {
+            assert!(state.join(relative).exists());
+        }
+        assert_eq!(fs::read(&payload).unwrap(), auth.as_bytes());
+        assert_eq!(
+            fs::read(state.join("openclaw.json")).unwrap(),
+            config.as_bytes()
+        );
+
+        let cleanup = run_ocm(cwd, &env, &["env", "cleanup", "target", "--yes", "--json"]);
+        assert!(cleanup.status.success(), "{}", stderr(&cleanup));
+        let cleanup: Value = serde_json::from_str(&stdout(&cleanup)).unwrap();
+        assert!(cleanup["actions"].as_array().unwrap().iter().any(|action| {
+            action["kind"] == "reset-openclaw-runtime-state" && action["applied"] == true
+        }));
+        assert!(!stale.exists());
+        for relative in debris {
+            assert!(!state.join(relative).exists(), "{relative}");
+        }
+        assert_eq!(fs::read(payload).unwrap(), auth.as_bytes());
+        assert_eq!(
+            fs::read(state.join("openclaw.json")).unwrap(),
+            config.as_bytes()
+        );
+        assert_eq!(fs::read(source_config).unwrap(), source_before);
+        let after = run_ocm(cwd, &env, &["env", "cleanup", "target", "--json"]);
+        assert!(after.status.success(), "{}", stderr(&after));
+        let after: Value = serde_json::from_str(&stdout(&after)).unwrap();
+        assert!(
+            !after["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| { action["kind"] == "reset-openclaw-runtime-state" })
+        );
+    }
+}
+
+#[test]
 fn env_cleanup_retains_external_agent_directory_policy() {
     let root = TestDir::new("cleanup-external-agent-directory");
     let cwd = root.path();

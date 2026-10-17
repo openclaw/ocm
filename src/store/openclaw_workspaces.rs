@@ -286,6 +286,36 @@ pub(crate) fn resolve_env_openclaw_copy_paths(
     resolve_env_openclaw_paths(paths, env, runtime, true)
 }
 
+/// Cleanup preserves configured payload inside this environment, but neither
+/// acquires external agent directories nor requires them to be archivable.
+pub(crate) fn resolve_env_openclaw_cleanup_paths(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+) -> Result<OpenClawWorkspaceInventory, String> {
+    let mut inventory = resolve_env_openclaw_paths(paths, env, runtime, true)?;
+    let root = clean_path(&paths.root);
+    let canonical_root = canonicalize_path_allow_missing(&root)?;
+    inventory.agent_directory_roots.retain(|_, directory| {
+        directory.starts_with(&root) || directory.starts_with(&canonical_root)
+    });
+    inventory.archive_relative_roots(&root)?;
+    // Match the paths walked by cleanup even when config uses the accepted
+    // canonical spelling of an environment reached through a root alias.
+    for directory in inventory.agent_directory_roots.values_mut() {
+        if !directory.starts_with(&root) {
+            *directory = root.join(directory.strip_prefix(&canonical_root).unwrap());
+        }
+        if *directory == clean_path(&paths.state_dir) {
+            return Err(
+                "configured OpenClaw agent directory cannot be the state directory itself"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(inventory)
+}
+
 fn resolve_env_openclaw_paths(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
