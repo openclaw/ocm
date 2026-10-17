@@ -1076,6 +1076,138 @@ fn env_export_import_retains_configured_agent_directories() {
 }
 
 #[test]
+fn env_default_import_rejects_configured_databases_in_protected_history() {
+    use std::io::Read;
+
+    for source_metadata in [false, true] {
+        for protected in [false, true] {
+            let root = TestDir::new("default-configured-database-ownership");
+            let env = ocm_env(&root);
+            let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+            assert!(created.status.success(), "{}", stderr(&created));
+            let state = root.child("ocm-home/envs/source/.openclaw");
+            let relative = if protected {
+                "skill-workshop/support"
+            } else {
+                "custom-agent"
+            };
+            let directory = state.join(relative);
+            fs::create_dir_all(&directory).unwrap();
+            let config = serde_json::json!({"agents":{"entries":{"main":{
+                "agentDir":format!("${{OPENCLAW_STATE_DIR}}/{relative}")
+            }}}})
+            .to_string();
+            write_text(&state.join("openclaw.json"), &config);
+            let database = directory.join("openclaw-agent.sqlite");
+            let db = rusqlite::Connection::open(&database).unwrap();
+            db.execute_batch("CREATE TABLE session_nodes (entry_json TEXT NOT NULL)")
+                .unwrap();
+            let session_root = state.join("workspace");
+            let entry = serde_json::json!({"sessionRoot":session_root}).to_string();
+            db.execute("INSERT INTO session_nodes VALUES (?1)", [&entry])
+                .unwrap();
+            drop(db);
+            let before = fs::read(&database).unwrap();
+            let original = root.child("source.tar");
+            let exported = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "export",
+                    "source",
+                    "--output",
+                    original.to_str().unwrap(),
+                ],
+            );
+            assert!(exported.status.success(), "{}", stderr(&exported));
+            let archive = if source_metadata {
+                original
+            } else {
+                // Older archives still need ownership admission even when
+                // they provide no roots for rewriting session locations.
+                let legacy = root.child("legacy.tar");
+                let mut input = tar::Archive::new(fs::File::open(original).unwrap());
+                let mut output = tar::Builder::new(fs::File::create(&legacy).unwrap());
+                for item in input.entries().unwrap() {
+                    let mut item = item.unwrap();
+                    let path = item.path().unwrap().into_owned();
+                    let mut header = item.header().clone();
+                    let mut bytes = Vec::new();
+                    item.read_to_end(&mut bytes).unwrap();
+                    if path == std::path::Path::new("meta/env.json") {
+                        let mut metadata: serde_json::Value =
+                            serde_json::from_slice(&bytes).unwrap();
+                        let environment = metadata["env"].as_object_mut().unwrap();
+                        environment.remove("sourceRoot");
+                        environment.remove("canonicalSourceRoot");
+                        bytes = serde_json::to_vec(&metadata).unwrap();
+                    }
+                    header.set_size(bytes.len() as u64);
+                    header.set_cksum();
+                    output
+                        .append_data(&mut header, path, bytes.as_slice())
+                        .unwrap();
+                }
+                output.finish().unwrap();
+                legacy
+            };
+            let archive_before = fs::read(&archive).unwrap();
+            let imported = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "import",
+                    archive.to_str().unwrap(),
+                    "--name",
+                    "target",
+                ],
+            );
+            assert_eq!(
+                imported.status.success(),
+                !protected,
+                "source_metadata={source_metadata}, protected={protected}: {}",
+                stderr(&imported)
+            );
+            let target = root.child("ocm-home/envs/target");
+            let shown = run_ocm(root.path(), &env, &["env", "show", "target"]);
+            assert_eq!(shown.status.success(), !protected);
+            if protected {
+                assert!(stderr(&imported).contains("selects integrity-protected history"));
+                assert!(!target.exists());
+            } else {
+                let db = rusqlite::Connection::open(
+                    target
+                        .join(".openclaw")
+                        .join(relative)
+                        .join("openclaw-agent.sqlite"),
+                )
+                .unwrap();
+                let actual: String = db
+                    .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+                    .unwrap();
+                let expected = if source_metadata {
+                    target.join(".openclaw/workspace")
+                } else {
+                    session_root
+                };
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&actual).unwrap()["sessionRoot"],
+                    expected.to_str().unwrap()
+                );
+            }
+            assert_eq!(fs::read(&database).unwrap(), before);
+            assert_eq!(
+                fs::read(state.join("openclaw.json")).unwrap(),
+                config.as_bytes()
+            );
+            assert_eq!(fs::read(&archive).unwrap(), archive_before);
+        }
+    }
+}
+
+#[test]
 fn env_default_import_removes_target_when_session_relocation_fails() {
     let root = TestDir::new("default-import-session-rollback");
     let env = ocm_env(&root);

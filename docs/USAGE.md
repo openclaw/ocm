@@ -1015,6 +1015,8 @@ On Windows, ordinary drive/UNC and extended-length spellings of a recorded root 
 Default archives can still retain SQLite sessions in selected agent directories, using current `session_nodes` or legacy `session_entries` storage.
 Import uses the available recorded source identities to relocate their authoritative workspace fields, including databases in configured agent directories, without adding the global state database to the archive.
 Other session JSON, authored content, Board checksums and grants, and integrity-protected history remain unchanged.
+A configured active database inside protected history causes import to fail and removes the partial target before registration.
+This ownership check also applies to older archives without source-root metadata; unrelated history remains unchanged.
 
 State-inclusive export copies configuration files verbatim. Import rewrites
 env-scoped OpenClaw config paths for the new root, including agent workspaces

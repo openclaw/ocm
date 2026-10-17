@@ -335,13 +335,10 @@ pub(super) fn relocate_copied_databases(
             selection.read_agent_registry(&database, true)?;
         }
     }
-    // Admit explicit owners before traversal can reach another spelling of an
-    // agent file. A conflict learned from the relocated global registry aborts
-    // the operation through its caller's copied-target rollback.
-    selection.admit_registered_databases(&paths.root)?;
     // Default archives omit the global registry but retain configured agent
     // directories. Select their actual agent database, not arbitrary SQLite
     // payloads in the directory, and keep the usual history/containment checks.
+    let mut configured_databases = Vec::new();
     if let Some(configured_paths) = configured_paths {
         for directory in configured_paths.agent_directory_roots() {
             // Retained configuration can name a plain file or a missing path.
@@ -354,19 +351,26 @@ pub(super) fn relocate_copied_databases(
             }
             let path = directory.join("openclaw-agent.sqlite");
             selection.registered_agents.insert(path.clone());
-            if selection.contains(&path) {
-                if let Some(database) =
-                    contained_imported_database(&path, &paths.root, &paths.state_dir, true)?
-                {
-                    relocate_archived_database(
-                        paths,
-                        source_roots,
-                        relocation,
-                        &database,
-                        &mut visited,
-                        &mut counts,
-                    )?;
-                }
+            configured_databases.push(path);
+        }
+    }
+    // Admit every declared owner before traversal exclusions can hide a
+    // configured or registered active database inside protected history.
+    // Conflicts use the caller's existing copied-target rollback.
+    selection.admit_registered_databases(&paths.root)?;
+    for path in configured_databases {
+        if selection.contains(&path) {
+            if let Some(database) =
+                contained_imported_database(&path, &paths.root, &paths.state_dir, true)?
+            {
+                relocate_archived_database(
+                    paths,
+                    source_roots,
+                    relocation,
+                    &database,
+                    &mut visited,
+                    &mut counts,
+                )?;
             }
         }
     }

@@ -538,6 +538,7 @@ import clear legacy file-based sessions, logs, backups, and process residue so t
 environment does not share active runtime state with its source. New clones also
 clear copied agent database process leases while keeping the state database,
 durable rows, and source leases unchanged.
+Default import refuses configured active databases inside protected history and removes the partial target before registration, including for archives without source-root metadata.
 
 Use `ocm env export <env> --include-state --output <archive>` to export this
 environment as the same installation, then restore it with
