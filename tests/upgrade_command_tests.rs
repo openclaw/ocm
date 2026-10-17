@@ -1069,13 +1069,15 @@ fn assert_tracked_runtime_upgrade(status: Option<&str>) {
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    // The fake service manager does not publish the initial running observation.
+    write_running_supervisor_runtime(&runtime_path, &ocm_home, "stable", 4242, health_port);
     let registry_path = env_registry_path(&env, &cwd).unwrap();
     let observer_done = Arc::new(AtomicBool::new(false));
     let observer_done_thread = Arc::clone(&observer_done);
     let observer_runtime_path = runtime_path.clone();
     let observer = thread::spawn(move || {
         let mut last_desired_running = true;
-        let mut next_pid = 4242;
+        let mut next_pid = 4243;
         let mut saw_stop = false;
         let mut saw_start = false;
         while !observer_done_thread.load(Ordering::Relaxed) {
@@ -1116,7 +1118,7 @@ fn assert_tracked_runtime_upgrade(status: Option<&str>) {
     assert!(upgrade.status.success(), "{}", stderr(&upgrade));
     let output = stdout(&upgrade);
     assert!(output.contains("outcome=updated"), "{output}");
-    assert!(output.contains("service=started"), "{output}");
+    assert!(output.contains("service=restarted"), "{output}");
     assert!(output.contains("snapshot="), "{output}");
     assert!(output.contains("version=2026.3.25"), "{output}");
     let build_note = if status.is_some() {

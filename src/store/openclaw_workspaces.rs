@@ -49,12 +49,40 @@ pub(crate) struct OpenClawWorkspaceInventory {
     configured_default_workspace: Option<PathBuf>,
     configured_agent_workspace_roots: BTreeMap<String, PathBuf>,
     default_agent_id: String,
+    cleanup_agents_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ExternalOpenClawWorkspaceSources {
     pub(crate) default_workspace: Option<PathBuf>,
     pub(crate) agent_workspaces: BTreeMap<String, PathBuf>,
+}
+
+#[derive(Debug)]
+pub(crate) enum OpenClawCleanupPathError {
+    Inventory(String),
+    AgentSessionCollision(String),
+}
+
+impl OpenClawCleanupPathError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Inventory(message) | Self::AgentSessionCollision(message) => message,
+        }
+    }
+}
+
+impl From<String> for OpenClawCleanupPathError {
+    fn from(message: String) -> Self {
+        Self::Inventory(message)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OpenClawPathSelection {
+    Workspaces,
+    Copy,
+    Cleanup,
 }
 
 impl OpenClawWorkspaceInventory {
@@ -70,9 +98,17 @@ impl OpenClawWorkspaceInventory {
         let path = clean_path(path);
         self.workspace_roots
             .iter()
-            .chain(self.agent_directory_roots.values())
             .any(|root| path == *root || path.starts_with(root))
             || self.config_include_paths.contains(&path)
+            || self.agent_directory_roots.values().any(|root| {
+                path.starts_with(root)
+                    && !self
+                        .cleanup_agents_root
+                        .as_ref()
+                        .is_some_and(|agents_root| {
+                            cleanup_path_is_agent_runtime(agents_root, root, &path)
+                        })
+            })
     }
 
     pub(crate) fn has_descendant(&self, path: &Path) -> bool {
@@ -113,9 +149,8 @@ impl OpenClawWorkspaceInventory {
             let canonical_relative = canonical_preserved_path
                 .strip_prefix(&canonical_archive_root)
                 .map_err(|error| error.to_string())?;
-            if let Ok(relative) = preserved_path
-                .strip_prefix(&archive_root)
-                .or_else(|_| preserved_path.strip_prefix(&canonical_archive_root))
+            if let Some(relative) = strip_archive_root_prefix(preserved_path, &archive_root)
+                .or_else(|| strip_archive_root_prefix(preserved_path, &canonical_archive_root))
             {
                 if relative != canonical_relative {
                     return Err(format!(
@@ -210,6 +245,60 @@ impl OpenClawWorkspaceInventory {
     }
 }
 
+fn cleanup_path_is_agent_runtime(agents_root: &Path, agent_dir: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(agents_root) else {
+        return false;
+    };
+    let Some(agent_id) = relative.components().next() else {
+        return true;
+    };
+    let sessions = agents_root.join(agent_id).join("sessions");
+    if sessions == agent_dir || !sessions.starts_with(agent_dir) {
+        return false;
+    }
+    // Session storage has its own location, independent of agentDir. A broad
+    // agent payload root must not hide that runtime subtree or its parents.
+    path.starts_with(&sessions)
+        || (sessions.starts_with(path)
+            && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
+}
+
+// Compare Windows root representations without resolving the authored path:
+// its relative components must remain available to detect internal redirects.
+fn strip_archive_root_prefix<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+
+        let mut components = path.components();
+        for root_component in root.components() {
+            let component = components.next()?;
+            let equal = match (component, root_component) {
+                (Component::Prefix(path), Component::Prefix(root)) => {
+                    match (path.kind(), root.kind()) {
+                        (
+                            Prefix::Disk(a) | Prefix::VerbatimDisk(a),
+                            Prefix::Disk(b) | Prefix::VerbatimDisk(b),
+                        ) => a == b,
+                        (
+                            Prefix::UNC(a, b) | Prefix::VerbatimUNC(a, b),
+                            Prefix::UNC(c, d) | Prefix::VerbatimUNC(c, d),
+                        ) => a == c && b == d,
+                        (a, b) => a == b,
+                    }
+                }
+                (a, b) => a == b,
+            };
+            if !equal {
+                return None;
+            }
+        }
+        Some(components.as_path())
+    }
+    #[cfg(not(windows))]
+    path.strip_prefix(root).ok()
+}
+
 fn validate_internal_migration_path(
     path: &Path,
     source_root: &Path,
@@ -281,7 +370,8 @@ pub(crate) fn resolve_env_openclaw_workspaces(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<OpenClawWorkspaceInventory, String> {
-    resolve_env_openclaw_paths(paths, env, runtime, false)
+    resolve_env_openclaw_paths(paths, env, runtime, OpenClawPathSelection::Workspaces)
+        .map_err(OpenClawCleanupPathError::into_message)
 }
 
 /// Clone and ordinary archives retain configured agent payloads as well as
@@ -291,22 +381,59 @@ pub(crate) fn resolve_env_openclaw_copy_paths(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<OpenClawWorkspaceInventory, String> {
-    resolve_env_openclaw_paths(paths, env, runtime, true)
+    resolve_env_openclaw_paths(paths, env, runtime, OpenClawPathSelection::Copy)
+        .map_err(OpenClawCleanupPathError::into_message)
+}
+
+/// Cleanup preserves configured payload inside this environment, but neither
+/// acquires external agent directories nor requires them to be archivable.
+pub(crate) fn resolve_env_openclaw_cleanup_paths(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
+    let mut inventory =
+        resolve_env_openclaw_paths(paths, env, runtime, OpenClawPathSelection::Cleanup)?;
+    let root = clean_path(&paths.root);
+    let canonical_root = canonicalize_path_allow_missing(&root)?;
+    inventory.agent_directory_roots.retain(|_, directory| {
+        strip_archive_root_prefix(directory, &root).is_some()
+            || strip_archive_root_prefix(directory, &canonical_root).is_some()
+    });
+    let agents_root = clean_path(&paths.state_dir.join("agents"));
+    // Match the paths walked by cleanup even when config uses the accepted
+    // canonical spelling of an environment reached through a root alias.
+    for directory in inventory.agent_directory_roots.values_mut() {
+        let relative = strip_archive_root_prefix(directory, &root)
+            .or_else(|| strip_archive_root_prefix(directory, &canonical_root))
+            .unwrap();
+        *directory = root.join(relative);
+        if *directory == clean_path(&paths.state_dir) {
+            return Err(
+                "configured OpenClaw agent directory cannot be the state directory itself"
+                    .to_string()
+                    .into(),
+            );
+        }
+    }
+    inventory.archive_relative_roots(&root)?;
+    inventory.cleanup_agents_root = Some(agents_root);
+    Ok(inventory)
 }
 
 fn resolve_env_openclaw_paths(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
-    retain_agent_directories: bool,
-) -> Result<OpenClawWorkspaceInventory, String> {
+    selection: OpenClawPathSelection,
+) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
     let mut inventory = resolve_openclaw_workspaces(
         &paths.config_path,
         &paths.state_dir,
         &paths.openclaw_home,
         env,
         runtime,
-        retain_agent_directories,
+        selection,
     )?;
     inventory
         .workspace_roots
@@ -326,8 +453,9 @@ pub(crate) fn resolve_plain_openclaw_workspaces(
         openclaw_home,
         env,
         OpenClawWorkspaceRuntime::default(),
-        false,
-    )?;
+        OpenClawPathSelection::Workspaces,
+    )
+    .map_err(OpenClawCleanupPathError::into_message)?;
     inventory
         .workspace_roots
         .insert(state_dir.join("workspace"));
@@ -371,8 +499,8 @@ fn resolve_openclaw_workspaces(
     openclaw_home: &Path,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
-    retain_agent_directories: bool,
-) -> Result<OpenClawWorkspaceInventory, String> {
+    selection: OpenClawPathSelection,
+) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
     let resolved = load_effective_openclaw_config(config_path)?;
     let config = resolved
         .as_ref()
@@ -392,30 +520,42 @@ fn resolve_openclaw_workspaces(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let configured_default_workspace = default_workspace
-        .map(|workspace| resolve_workspace_path(workspace, openclaw_home))
-        .transpose()?;
-
     let mut agent_ids = entries
         .iter()
         .filter_map(|entry| entry.get("id").and_then(Value::as_str))
         .map(normalize_agent_id)
         .collect::<BTreeSet<_>>();
     agent_ids.insert(default_agent_id.clone());
+    let selected_entries = agent_ids
+        .into_iter()
+        .map(|agent_id| {
+            let entry = entries.iter().find(|entry| {
+                entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| normalize_agent_id(id) == agent_id)
+            });
+            (agent_id, entry)
+        })
+        .collect::<Vec<_>>();
+    if matches!(selection, OpenClawPathSelection::Cleanup) {
+        reject_agent_session_collisions(
+            selected_entries.iter().filter_map(|(_, entry)| *entry),
+            state_dir,
+            openclaw_home,
+        )?;
+    }
+    let configured_default_workspace = default_workspace
+        .map(|workspace| resolve_workspace_path(workspace, openclaw_home))
+        .transpose()?;
 
     let mut workspace_roots = BTreeSet::new();
     let mut agent_directory_roots = BTreeMap::new();
     let mut agent_directory_templates = BTreeMap::new();
     let mut agent_workspace_roots = BTreeMap::new();
     let mut configured_agent_workspace_roots = BTreeMap::new();
-    for agent_id in agent_ids {
-        let entry = entries.iter().find(|entry| {
-            entry
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| normalize_agent_id(id) == agent_id)
-        });
-        if retain_agent_directories
+    for (agent_id, entry) in selected_entries {
+        if !matches!(selection, OpenClawPathSelection::Workspaces)
             && let Some(raw) = entry
                 .and_then(|entry| entry.get("agentDir"))
                 .and_then(Value::as_str)
@@ -427,7 +567,8 @@ fn resolve_openclaw_workspaces(
                 return Err(format!(
                     "configured OpenClaw agent directory cannot be the state directory itself: {}",
                     display_path(&directory)
-                ));
+                )
+                .into());
             }
             if let Some(template) = authored_entries
                 .iter()
@@ -471,7 +612,8 @@ fn resolve_openclaw_workspaces(
             return Err(format!(
                 "configured OpenClaw workspace cannot be the state directory itself: {}",
                 display_path(&workspace)
-            ));
+            )
+            .into());
         }
         workspace_roots.insert(workspace.clone());
         agent_workspace_roots.insert(agent_id, workspace);
@@ -485,7 +627,43 @@ fn resolve_openclaw_workspaces(
         configured_default_workspace,
         configured_agent_workspace_roots,
         default_agent_id,
+        cleanup_agents_root: None,
     })
+}
+
+fn reject_agent_session_collisions<'a>(
+    entries: impl Iterator<Item = &'a Map<String, Value>>,
+    state_dir: &Path,
+    openclaw_home: &Path,
+) -> Result<(), OpenClawCleanupPathError> {
+    let root = clean_path(openclaw_home);
+    let canonical_root = canonicalize_path_allow_missing(&root)?;
+    let agents_root = clean_path(&state_dir.join("agents"));
+    // A different invalid agent or workspace must not hide a known collision
+    // and allow config repair. Preserve those ordinary errors for admission.
+    for entry in entries {
+        let Some(raw) = entry.get("agentDir").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(directory) = resolve_configured_path(raw, openclaw_home, "agent directory") else {
+            continue;
+        };
+        let Some(relative) = strip_archive_root_prefix(&directory, &root)
+            .or_else(|| strip_archive_root_prefix(&directory, &canonical_root))
+        else {
+            continue;
+        };
+        let directory = root.join(relative);
+        if directory.parent().and_then(Path::parent) == Some(agents_root.as_path())
+            && directory.file_name().is_some_and(|name| name == "sessions")
+        {
+            return Err(OpenClawCleanupPathError::AgentSessionCollision(format!(
+                "cannot clean OpenClaw runtime state: configured agent directory overlaps canonical session storage: {}; use a separate agent directory before cleanup",
+                display_path(&directory)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn openclaw_config_env(
@@ -1846,18 +2024,31 @@ mod tests {
         let _ = fs::remove_dir_all(external);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn workspace_inventory_rejects_internal_links_under_both_root_spellings() {
+    fn workspace_inventory_rejects_internal_links_under_root_spellings() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink as symlink_dir;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_dir;
         let temp = tempfile::tempdir().unwrap();
         let physical = fs::canonicalize(temp.path()).unwrap().join("physical");
         let alias = temp.path().join("alias");
         fs::create_dir_all(&physical).unwrap();
-        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        symlink_dir(&physical, &alias).unwrap();
         let paths = super::super::layout::derive_env_paths(alias.join("source"));
         fs::create_dir_all(paths.state_dir.join("owned")).unwrap();
-        std::os::unix::fs::symlink("owned", paths.state_dir.join("redirect")).unwrap();
-        for root in [&paths.root, &fs::canonicalize(&paths.root).unwrap()] {
+        symlink_dir("owned", paths.state_dir.join("redirect")).unwrap();
+        let canonical = fs::canonicalize(&paths.root).unwrap();
+        let mut roots = vec![paths.root.clone(), canonical.clone()];
+        #[cfg(windows)]
+        {
+            roots.push(PathBuf::from(
+                canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap(),
+            ));
+            roots.push(PathBuf::from(format!(r"\\?\{}", paths.root.display())));
+        }
+        for root in roots.drain(..) {
             for agent_directory in [false, true] {
                 for (relative, allowed) in [
                     ("owned", true),
@@ -1895,6 +2086,43 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn archive_root_prefix_matches_windows_representations() {
+        for (ordinary, verbatim) in [
+            (r"C:\physical\source", r"\\?\C:\physical\source"),
+            (r"\\server\share\source", r"\\?\UNC\server\share\source"),
+        ] {
+            for root in [ordinary, verbatim] {
+                for configured in [ordinary, verbatim] {
+                    let path = Path::new(configured).join(r".openclaw\redirect");
+                    assert_eq!(
+                        strip_archive_root_prefix(&path, Path::new(root)),
+                        Some(Path::new(r".openclaw\redirect")),
+                    );
+                    assert!(
+                        strip_archive_root_prefix(&path, &PathBuf::from(format!("{root}-other")))
+                            .is_none()
+                    );
+                }
+            }
+        }
+        for (path, root) in [
+            (r"C:\physical\source\child", r"\\?\D:\physical\source"),
+            (
+                r"\\server\share\source\child",
+                r"\\?\UNC\server\other\source",
+            ),
+            (
+                r"\\server\share\source\child",
+                r"\\?\UNC\other\share\source",
+            ),
+            (r"C:\physical\source\child", r"\\?\C:\physical\Source"),
+        ] {
+            assert!(strip_archive_root_prefix(Path::new(path), Path::new(root)).is_none());
         }
     }
 
