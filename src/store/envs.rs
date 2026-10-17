@@ -1157,6 +1157,25 @@ pub fn export_environment(
     })
 }
 
+// These are identities recorded on the exporting host, not paths to open on
+// this host. In particular, POSIX import must accept Windows drive/UNC roots.
+fn archive_source_root_is_absolute(root: &Path) -> bool {
+    let Some(root) = root.to_str().filter(|root| !root.contains('\0')) else {
+        return false;
+    };
+    let bytes = root.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    let unc = root.strip_prefix(r"\\").is_some_and(|rest| {
+        let mut parts = rest.split(['/', '\\']);
+        parts.next().is_some_and(|part| !part.is_empty())
+            && parts.next().is_some_and(|part| !part.is_empty())
+    });
+    root.starts_with('/') || drive || unc
+}
+
 pub fn import_environment(
     options: ImportEnvironmentOptions,
     env: &BTreeMap<String, String>,
@@ -1211,8 +1230,10 @@ pub(crate) fn import_environment_with_sandbox_origin(
             .collect();
         if let Some(canonical) = extracted.metadata.env.canonical_source_root.as_deref() {
             let canonical = Path::new(canonical);
-            if source_roots.first().is_none_or(|root| !root.is_absolute())
-                || !canonical.is_absolute()
+            if source_roots
+                .first()
+                .is_none_or(|root| !archive_source_root_is_absolute(root))
+                || !archive_source_root_is_absolute(canonical)
                 || canonical
                     .components()
                     .any(|part| matches!(part, std::path::Component::ParentDir))

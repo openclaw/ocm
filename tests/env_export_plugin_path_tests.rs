@@ -1351,6 +1351,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         let summary: Value = serde_json::from_str(&stdout(&import)).unwrap();
         assert_eq!(summary["statePathsRewritten"], true);
     }
+    assert_portable_archive_source_identities();
 }
 
 #[cfg(unix)]
@@ -1693,7 +1694,16 @@ fn state_archive_relocates_both_root_identities_after_the_source_disappears() {
         if !nested_alias {
             // An optional alias identity cannot turn an absent or relative
             // original root into ownership of arbitrary configuration strings.
-            for (index, invalid_root) in [None, Some(""), Some("relative")].into_iter().enumerate()
+            for (index, invalid_root) in [
+                None,
+                Some(""),
+                Some("relative"),
+                Some(r"C:relative"),
+                Some(r"\root-relative"),
+                Some(r"\\server"),
+            ]
+            .into_iter()
+            .enumerate()
             {
                 let mut metadata = extracted.metadata.clone();
                 metadata.env.source_root = invalid_root.map(str::to_string);
@@ -1844,5 +1854,84 @@ fn state_archive_relocates_both_root_identities_after_the_source_disappears() {
             .unwrap()
             .to_string();
         assert_eq!(legacy["urls"], format!("{url} {url}"));
+    }
+}
+
+// Called by the existing relocation test selected by native Windows CI as well
+// as the full POSIX suite. The payload is portable; only source syntax differs.
+fn assert_portable_archive_source_identities() {
+    use ocm::infra::archive::{EnvArchiveMetadata, extract_env_archive, write_env_archive};
+    use serde_json::Value;
+
+    let root = TestDir::new("archive-source-host-syntax");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    write_text(
+        &source.join(".openclaw/openclaw.json"),
+        r#"{"marker":"relative-literal"}"#,
+    );
+    write_text(
+        &source.join(".openclaw/workspace/notes.txt"),
+        "portable bytes\n",
+    );
+    let archive = root.child("original.tar");
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    let extracted =
+        extract_env_archive::<EnvArchiveMetadata>(&archive, &root.child("extracted")).unwrap();
+    for (label, source_root, canonical) in [
+        ("posix", "/portable/source", "/portable/physical"),
+        ("drive", r"C:\portable\source", r"\\?\C:\portable\physical"),
+        (
+            "unc",
+            r"\\server\share\source",
+            r"\\?\UNC\server\share\physical",
+        ),
+    ] {
+        for extended in [false, true] {
+            let mut metadata = extracted.metadata.clone();
+            metadata.env.source_root = Some(source_root.to_string());
+            metadata.env.canonical_source_root = extended.then(|| canonical.to_string());
+            let name = format!("{label}-{extended}");
+            let archive = root.child(format!("{name}.tar"));
+            write_env_archive(&metadata, &extracted.root_dir, &archive).unwrap();
+            let target = root.child(format!("import-{name}"));
+            let import = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "import",
+                    archive.to_str().unwrap(),
+                    "--name",
+                    &name,
+                    "--root",
+                    target.to_str().unwrap(),
+                    "--json",
+                ],
+            );
+            assert!(import.status.success(), "{name}: {}", stderr(&import));
+            let config: Value =
+                serde_json::from_slice(&fs::read(target.join(".openclaw/openclaw.json")).unwrap())
+                    .unwrap();
+            assert_eq!(config["marker"], "relative-literal");
+            assert_eq!(
+                fs::read(target.join(".openclaw/workspace/notes.txt")).unwrap(),
+                b"portable bytes\n"
+            );
+        }
     }
 }

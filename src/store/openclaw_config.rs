@@ -1257,6 +1257,9 @@ fn rewrite_env_root_paths_from_roots(
             if let [source] = source_roots {
                 return rewrite_env_root_string(raw, source, target_root);
             }
+            if !Path::new(raw).is_absolute() {
+                return false;
+            }
             // New archives carry both identities. No source filesystem lookup
             // or second pass over rewritten destination strings is needed.
             for source in source_roots {
