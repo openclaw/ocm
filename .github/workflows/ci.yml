@@ -141,10 +141,10 @@ jobs:
       - run: npm install --global --ignore-scripts npm@11.19.1
       - name: Test npm packaging, recovery, launcher, and isolated installation lifecycle
         run: python3 -B -m unittest discover -s scripts/tests -p 'test_npm_*.py'
-      # Temporary workaround for actions/runner-images#14924 on disposable Intel VMs.
+      # Temporary workaround for actions/runner-images#14924 on disposable macOS VMs.
       # Remove after the runner fix is qualified with the unchanged strict fixture.
-      - name: Use TCP fallback for Intel notarization lookups
-        if: matrix.os == 'macos-15-intel'
+      - name: Use TCP fallback for macOS notarization lookups
+        if: matrix.os == 'macos-15-intel' || matrix.os == 'macos-15'
         run: |
           echo "block return out quick proto udp from any to any port 443" | sudo pfctl -f -
           sudo pfctl -E
