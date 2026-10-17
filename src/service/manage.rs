@@ -199,6 +199,15 @@ pub fn stop_service(
     update_service(name, ServiceUpdate::Stop, env, cwd)
 }
 
+pub(crate) fn stop_service_with_observation(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    observe: impl FnOnce(&mut ServiceActionSummary) -> Result<(), String>,
+) -> Result<ServiceActionSummary, String> {
+    update_service_with_observation(name, ServiceUpdate::Stop, env, cwd, observe)
+}
+
 pub fn restart_service(
     name: &str,
     options: ServiceRestartOptions,
@@ -547,24 +556,41 @@ fn update_service_with_observation(
             cwd,
         ));
     }
-    let (mut summary, warnings) =
-        wait_for_action_summary(name, action, env, cwd).map_err(|error| {
-            if daemon_mutation_attempted {
-                // Activation completed; an observation-only failure must not
-                // undo its accepted effects or tear down the daemon.
-                error
-            } else {
-                rollback_service_update(
-                    error,
-                    &change,
-                    &supervisor,
-                    &daemon_before,
-                    daemon_mutation_attempted,
-                    env,
-                    cwd,
-                )
-            }
-        })?;
+    let (summary, warnings) = wait_for_action_summary(name, action, env, cwd).map_err(|error| {
+        if daemon_mutation_attempted {
+            // Activation completed; an observation-only failure must not
+            // undo its accepted effects or tear down the daemon.
+            error
+        } else {
+            rollback_service_update(
+                error,
+                &change,
+                &supervisor,
+                &daemon_before,
+                daemon_mutation_attempted,
+                env,
+                cwd,
+            )
+        }
+    })?;
+    let mut summary = service_action_summary(action, summary, warnings);
+    let mut observe = Some(observe);
+    if matches!(update, ServiceUpdate::Stop) {
+        // Maintenance must establish quiescence before teardown. A failed read
+        // restores the policy through this transaction, without activating a
+        // daemon whose current state is unknown.
+        if let Err(error) = observe.take().expect("observation is available")(&mut summary) {
+            return Err(rollback_service_update(
+                error,
+                &change,
+                &supervisor,
+                &daemon_before,
+                daemon_mutation_attempted,
+                env,
+                cwd,
+            ));
+        }
+    }
     let should_remove_daemon =
         if matches!(update, ServiceUpdate::Stop | ServiceUpdate::Uninstall) && !summary.running {
             match supervisor.has_desired_running_services() {
@@ -596,13 +622,18 @@ fn update_service_with_observation(
                 cwd,
             ));
         }
-        summary = super::inspect::service_status_fast(name, env, cwd)?;
+        summary = service_action_summary(
+            action,
+            super::inspect::service_status_fast(name, env, cwd)?,
+            summary.warnings,
+        );
     }
-    let mut summary = service_action_summary(action, summary, warnings);
     // Readiness can wait for a Gateway; it must not block independent service
     // operations on the shared daemon lifecycle lock.
     drop(_lifecycle_lock);
-    if let Err(error) = observe(&mut summary) {
+    if let Some(observe) = observe
+        && let Err(error) = observe(&mut summary)
+    {
         if daemon_mutation_attempted {
             return Err(error);
         }

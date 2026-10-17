@@ -502,14 +502,7 @@ pub fn enable_fake_daemon_gateway_admission(
     root: &TestDir,
     env: &mut BTreeMap<String, String>,
 ) -> ocm::supervisor::SupervisorGatewayAdmission {
-    let (started_at, process_scope) = fixture_process_ownership();
-    let capability =
-        serde_json::from_value::<ocm::supervisor::SupervisorGatewayAdmission>(serde_json::json!({
-            "version": 11,
-            "process": { "pid": std::process::id(), "startedAt": started_at },
-            "processScope": process_scope,
-        }))
-        .unwrap();
+    let capability = fake_daemon_gateway_admission();
     env.insert(
         "OCM_TEST_NATIVE_DAEMON_PID".to_string(),
         std::process::id().to_string(),
@@ -528,6 +521,19 @@ pub fn enable_fake_daemon_gateway_admission(
         &ocm::store::supervisor_runtime_path(env, root.path()).unwrap(),
         &runtime,
     );
+    capability
+}
+
+/// Current process identity for a synthetic daemon owned by this test process.
+pub fn fake_daemon_gateway_admission() -> ocm::supervisor::SupervisorGatewayAdmission {
+    let (started_at, process_scope) = fixture_process_ownership();
+    let capability =
+        serde_json::from_value::<ocm::supervisor::SupervisorGatewayAdmission>(serde_json::json!({
+            "version": 11,
+            "process": { "pid": std::process::id(), "startedAt": started_at },
+            "processScope": process_scope,
+        }))
+        .unwrap();
     capability
 }
 

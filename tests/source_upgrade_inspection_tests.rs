@@ -1523,6 +1523,62 @@ fn source_failure_does_not_restore_old_state_over_unverified_source() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn failed_source_update_keeps_unknown_service_recovery_unresolved() {
+    let root = TestDir::new("source-recovery-observation");
+    let (mut env, mut state) = execution_fixture(&root, false);
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+    env.insert("OCM_TEST_MAINTENANCE_TARGET".into(), "demo".into());
+    support::install_fake_launchctl(&root, &mut env);
+    let identity = support::enable_fake_daemon_gateway_admission(&root, &mut env);
+    write_text(
+        &root.child("identity.json"),
+        &serde_json::to_string(&identity).unwrap(),
+    );
+    write_text(&root.child("mode"), "post-update-error");
+    support::write_executable_script(
+        &root.child("fake-bin/launchctl"),
+        include_str!("fixtures/maintenance_service_manager.py"),
+    );
+    let installed = run_ocm(root.path(), &env, &["service", "install", "demo", "--json"]);
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    state["exitCode"] = json!(1);
+    state["result"]["status"] = json!("error");
+    state["result"]["reason"] = json!("fixture native failure");
+    state["result"]["recovery"] = json!({"serviceRestartSafe":false});
+    write_text(&root.child("native.json"), &state.to_string());
+    let registry = root.child("ocm-home/envs.json");
+    let before = fs::read(&registry).unwrap();
+    write_text(&root.child("launchctl.log"), "");
+    let output = run_ocm(root.path(), &env, &["upgrade", "demo", "--json"]);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["outcome"], "failed");
+    let note = value["note"].as_str().unwrap();
+    assert!(
+        note.contains("recovery and service state remain unresolved"),
+        "{note}"
+    );
+    assert!(
+        note.contains("stopping the failed service also failed"),
+        "{note}"
+    );
+    assert!(note.contains("cannot confirm quiescence"), "{note}");
+    assert!(!note.contains("service remains stopped"), "{note}");
+    assert_eq!(fs::read(registry).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(root.child("ocm-home/envs/demo/.openclaw/source-witness")).unwrap(),
+        "native-result"
+    );
+    let log = fs::read_to_string(root.child("launchctl.log")).unwrap();
+    assert!(
+        !log.contains("bootstrap") && !log.contains("bootout") && !log.contains("unload"),
+        "{log}"
+    );
+    assert!(root.child("observed-fault").exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn source_verification_falls_back_only_for_inconclusive_local_status() {
     for scenario in [
         "cold",

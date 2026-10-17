@@ -25,9 +25,18 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::support::{
-    TestDir, TestHttpServer, install_fake_launchctl, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script, write_json_replacing_path, write_text,
+    TestDir, TestHttpServer, install_fake_launchctl as install_base_fake_launchctl, ocm_env,
+    path_string, run_ocm, stderr, stdout, write_executable_script, write_json_replacing_path,
+    write_text,
 };
+
+fn install_fake_launchctl(root: &TestDir, env: &mut std::collections::BTreeMap<String, String>) {
+    install_base_fake_launchctl(root, env);
+    env.insert(
+        "OCM_TEST_NATIVE_DAEMON_PID".into(),
+        std::process::id().to_string(),
+    );
+}
 
 fn write_running_snapshot_service(
     root: &TestDir,
@@ -44,7 +53,7 @@ fn write_running_snapshot_service(
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: env.get("OCM_HOME").unwrap().clone(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: None,
+        gateway_admission: Some(support::fake_daemon_gateway_admission()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "source".to_string(),
@@ -83,7 +92,7 @@ fn write_empty_snapshot_service(runtime_path: &Path, ocm_home: &str) {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: None,
+        gateway_admission: Some(support::fake_daemon_gateway_admission()),
         updated_at: now_utc(),
         services: Vec::new(),
         children: Vec::new(),
@@ -1166,7 +1175,7 @@ fn env_snapshot_restore_recovers_the_displaced_root_when_acceptance_fails() {
     let launchctl_bin = env.get("OCM_INTERNAL_LAUNCHCTL_BIN").unwrap();
     write_executable_script(
         Path::new(launchctl_bin),
-        "#!/bin/sh\ncase \"$1\" in\n  managername) exit 0 ;;\n  print) exit 1 ;;\n  bootstrap) echo 'forced acceptance failure' >&2; exit 1 ;;\n  *) exit 0 ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\n  managername) exit 0 ;;\n  print) printf 'Could not find service \"%s\" in domain for user gui\\n' \"${2##*/}\" >&2; exit 1 ;;\n  bootstrap) echo 'forced acceptance failure' >&2; exit 1 ;;\n  *) exit 0 ;;\nesac\n",
     );
 
     let restore = run_ocm(
@@ -1398,6 +1407,10 @@ fn snapshot_restore_sync_failure_restores_data_and_policy() {
             if present {
                 let install = run_ocm(&cwd, &env, &["service", "install", "source"]);
                 assert!(install.status.success(), "{}", stderr(&install));
+                write_empty_snapshot_service(
+                    &supervisor_runtime_path(&env, &cwd).unwrap(),
+                    env.get("OCM_HOME").unwrap(),
+                );
             }
             write_text(&notes, "pre-restore-current-state");
             let before = get_environment("source", &env, &cwd).unwrap();
@@ -1996,6 +2009,10 @@ fn env_snapshot_create_preserves_already_stopped_enabled_policy() {
     assert!(create.status.success(), "{}", stderr(&create));
     let installed = run_ocm(&cwd, &env, &["service", "install", "source"]);
     assert!(installed.status.success(), "{}", stderr(&installed));
+    write_empty_snapshot_service(
+        &supervisor_runtime_path(&env, &cwd).unwrap(),
+        env.get("OCM_HOME").unwrap(),
+    );
 
     fs::write(root.child("launchctl.log"), "").unwrap();
     let snapshot = run_ocm(
