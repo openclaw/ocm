@@ -58,6 +58,26 @@ pub(crate) struct ExternalOpenClawWorkspaceSources {
     pub(crate) agent_workspaces: BTreeMap<String, PathBuf>,
 }
 
+#[derive(Debug)]
+pub(crate) enum OpenClawCleanupPathError {
+    Inventory(String),
+    AgentSessionCollision(String),
+}
+
+impl OpenClawCleanupPathError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Inventory(message) | Self::AgentSessionCollision(message) => message,
+        }
+    }
+}
+
+impl From<String> for OpenClawCleanupPathError {
+    fn from(message: String) -> Self {
+        Self::Inventory(message)
+    }
+}
+
 impl OpenClawWorkspaceInventory {
     pub(crate) fn contains(&self, path: &Path) -> bool {
         let path = clean_path(path);
@@ -319,14 +339,14 @@ pub(crate) fn resolve_env_openclaw_cleanup_paths(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
-) -> Result<OpenClawWorkspaceInventory, String> {
+) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
     let mut inventory = resolve_env_openclaw_paths(paths, env, runtime, true)?;
     let root = clean_path(&paths.root);
     let canonical_root = canonicalize_path_allow_missing(&root)?;
     inventory.agent_directory_roots.retain(|_, directory| {
         directory.starts_with(&root) || directory.starts_with(&canonical_root)
     });
-    inventory.archive_relative_roots(&root)?;
+    let agents_root = clean_path(&paths.state_dir.join("agents"));
     // Match the paths walked by cleanup even when config uses the accepted
     // canonical spelling of an environment reached through a root alias.
     for directory in inventory.agent_directory_roots.values_mut() {
@@ -336,11 +356,24 @@ pub(crate) fn resolve_env_openclaw_cleanup_paths(
         if *directory == clean_path(&paths.state_dir) {
             return Err(
                 "configured OpenClaw agent directory cannot be the state directory itself"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
+        validate_internal_migration_path(directory, &root, &canonical_root, "agent directory")?;
+        if directory.parent().and_then(Path::parent) == Some(agents_root.as_path())
+            && directory.file_name().is_some_and(|name| name == "sessions")
+        {
+            return Err(OpenClawCleanupPathError::AgentSessionCollision(format!(
+                "cannot clean OpenClaw runtime state: configured agent directory overlaps canonical session storage: {}; use a separate agent directory before cleanup",
+                display_path(directory)
+            )));
+        }
     }
-    inventory.cleanup_agents_root = Some(clean_path(&paths.state_dir.join("agents")));
+    // Resolve the collision before workspace admission: a drifted workspace
+    // must not let config repair run ahead of this cleanup refusal.
+    inventory.archive_relative_roots(&root)?;
+    inventory.cleanup_agents_root = Some(agents_root);
     Ok(inventory)
 }
 

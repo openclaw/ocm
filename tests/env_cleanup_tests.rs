@@ -433,6 +433,88 @@ fn env_cleanup_preserves_configured_agent_payload_and_removes_unselected_debris(
 }
 
 #[test]
+fn env_cleanup_refuses_agent_session_collision_before_config_repair() {
+    let root = TestDir::new("cleanup-agent-session-collision");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    for (name, port) in [("source", "19789"), ("target", "19790")] {
+        let created = run_ocm(cwd, &env, &["env", "create", name, "--port", port]);
+        assert!(created.status.success(), "{}", stderr(&created));
+    }
+    let state = root.child("ocm-home/envs/target/.openclaw");
+    let sessions = state.join("agents/main/sessions");
+    let source_config = root.child("ocm-home/envs/source/.openclaw/openclaw.json");
+    let files = [
+        (source_config, "{}\n".to_string()),
+        (
+            sessions.join("auth-profiles.json"),
+            "auth fixture".to_string(),
+        ),
+        (
+            sessions.join("stale.jsonl"),
+            serde_json::json!({
+                "cwd":root.child("ocm-home/envs/source/.openclaw/workspace")
+            })
+            .to_string(),
+        ),
+        (
+            state.join("openclaw.json"),
+            serde_json::json!({
+                "agents":{
+                    "entries":{"main":{"agentDir":sessions}},
+                    "defaults":{"workspace":root.child("ocm-home/envs/source/.openclaw/workspace")}
+                },
+                "gateway":{"port":19789}
+            })
+            .to_string(),
+        ),
+        (
+            state.join("extensions/demo/.openclaw-runtime-deps.json"),
+            "{}".to_string(),
+        ),
+        (
+            state.join("extensions/demo/node_modules/index.js"),
+            "generated".to_string(),
+        ),
+    ];
+    for (path, contents) in &files {
+        crate::support::write_text(path, contents);
+    }
+    for args in [
+        vec!["env", "cleanup", "target", "--json"],
+        vec!["env", "cleanup", "target", "--yes", "--json"],
+        vec!["env", "cleanup", "--all", "--yes", "--json"],
+    ] {
+        let cleanup = run_ocm(cwd, &env, &args);
+        assert!(!cleanup.status.success());
+        assert!(
+            stderr(&cleanup)
+                .contains("configured agent directory overlaps canonical session storage"),
+            "{}",
+            stderr(&cleanup)
+        );
+        for (path, contents) in &files {
+            assert_eq!(
+                fs::read(path).unwrap(),
+                contents.as_bytes(),
+                "{}",
+                path.display()
+            );
+        }
+    }
+    let doctor = run_ocm(cwd, &env, &["env", "doctor", "target", "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let doctor: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert_eq!(doctor["healthy"], false);
+    assert!(doctor["issues"].as_array().unwrap().iter().any(|issue| {
+        issue
+            .as_str()
+            .unwrap()
+            .contains("configured agent directory overlaps canonical session storage")
+    }));
+}
+
+#[test]
 fn env_cleanup_retains_external_agent_directory_policy() {
     let root = TestDir::new("cleanup-external-agent-directory");
     let cwd = root.path();
