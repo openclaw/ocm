@@ -2817,7 +2817,7 @@ fn copied_config_fixture(
 }
 
 #[test]
-fn migration_copied_git_config_preserves_projected_history() {
+fn env_clone_copied_git_config_preserves_migration_projected_history() {
     for case in ["config", "structural", "ordinary"] {
         if cfg!(windows) && case == "structural" {
             continue;
