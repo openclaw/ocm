@@ -328,3 +328,163 @@ fn state_import_relocates_registered_database_text_and_preserves_other_values() 
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn state_import_preserves_history_reached_through_database_aliases() {
+    use std::io::Read;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use support::{run_ocm, stderr, stdout};
+
+    for (selection, relative) in [
+        ("global", "skill-workshop/support/history.sqlite"),
+        ("agent", "skill-workshop/support/history.sqlite"),
+        ("registered", "skill-workshop/support/history.sqlite"),
+        ("none", "skill-workshop/support/history.sqlite"),
+        ("global", "logs/config-audit.jsonl"),
+        ("global", "custom/history.sqlite"),
+    ] {
+        let root = TestDir::new("import-protected-database-alias");
+        let env = ocm_env(&root);
+        let run = |args: &[&str]| {
+            let output = run_ocm(root.path(), &env, args);
+            assert!(output.status.success(), "{}", stderr(&output));
+            serde_json::from_str::<serde_json::Value>(&stdout(&output)).unwrap()
+        };
+        let source = root.child("source");
+        run(&[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+            "--json",
+        ]);
+        let state = source.join(".openclaw");
+        let history = state.join(relative);
+        fs::create_dir_all(history.parent().unwrap()).unwrap();
+        let db = Connection::open(&history).unwrap();
+        db.execute_batch("CREATE TABLE paths (path TEXT NOT NULL)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO paths VALUES (?1)",
+            [source.join("payload").to_str().unwrap()],
+        )
+        .unwrap();
+        drop(db);
+        let selected = match selection {
+            "global" => Some(state.join("state/openclaw.sqlite")),
+            "agent" => Some(state.join("agents/main/agent/openclaw-agent.sqlite")),
+            "registered" => Some(state.join("selected/history.sqlite")),
+            _ => None,
+        };
+        if let Some(selected) = selected {
+            fs::create_dir_all(selected.parent().unwrap()).unwrap();
+            let prefix = if selection == "agent" {
+                "../../.."
+            } else {
+                ".."
+            };
+            symlink(format!("{prefix}/{relative}"), selected).unwrap();
+        }
+        if selection == "registered" {
+            fs::create_dir_all(state.join("state")).unwrap();
+            let db = Connection::open(state.join("state/openclaw.sqlite")).unwrap();
+            db.execute_batch("CREATE TABLE agent_databases (path TEXT); INSERT INTO agent_databases VALUES ('selected/history.sqlite')").unwrap();
+        }
+        fs::set_permissions(&history, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(history.parent().unwrap(), fs::Permissions::from_mode(0o500)).unwrap();
+        let before = fs::read(&history).unwrap();
+        let archive = root.child("state.tar");
+        run(&[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            archive.to_str().unwrap(),
+            "--json",
+        ]);
+        let archive_bytes = fs::read(&archive).unwrap();
+        let mut tar = tar::Archive::new(archive_bytes.as_slice());
+        let mut archived = Vec::new();
+        for entry in tar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap() == Path::new("root/.openclaw").join(relative) {
+                entry.read_to_end(&mut archived).unwrap();
+                break;
+            }
+        }
+        assert!(!archived.is_empty());
+        fs::rename(&source, root.child("offline")).unwrap();
+        let physical = root.child("physical");
+        fs::create_dir(&physical).unwrap();
+        symlink(&physical, root.child("alias")).unwrap();
+        let target = root.child("alias/imported");
+        let imported = run(&[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "imported",
+            "--root",
+            target.to_str().unwrap(),
+            "--json",
+        ]);
+        let copied = target.join(".openclaw").join(relative);
+        let protected = relative != "custom/history.sqlite";
+        if protected {
+            assert_eq!(
+                fs::read(&copied).unwrap(),
+                archived,
+                "{selection}: {relative}"
+            );
+            assert!(
+                imported["databasePathsRewritten"]
+                    .get(format!(".openclaw/{relative}"))
+                    .is_none()
+            );
+        } else {
+            let db =
+                Connection::open_with_flags(&copied, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            let path: String = db
+                .query_row("SELECT path FROM paths", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(path, target.join("payload").display().to_string());
+            assert_eq!(
+                imported["databasePathsRewritten"][format!(".openclaw/{relative}")],
+                1
+            );
+        }
+        assert_eq!(
+            fs::read(root.child("offline/.openclaw").join(relative)).unwrap(),
+            before
+        );
+        assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+        assert_eq!(
+            fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            fs::metadata(copied.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+        run(&["env", "show", "imported", "--json"]);
+        for parent in [
+            copied.parent().unwrap().to_path_buf(),
+            root.child("offline/.openclaw")
+                .join(relative)
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        ] {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+}
