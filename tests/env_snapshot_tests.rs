@@ -3266,6 +3266,11 @@ fn snapshots_refuse_retained_target_ownership_until_exact_recovery() {
     let id = saved["id"].as_str().unwrap();
     write_text(&marker, "current");
     let publisher = support::enable_fake_daemon_gateway_admission(&root, &mut env);
+    ocm::supervisor::SupervisorService::new(&env, cwd)
+        .install_daemon()
+        .unwrap();
+    let definition = support::managed_service_definition_path(&env, cwd, "source");
+    fs::remove_file(root.child("launchctl-print.txt")).unwrap();
     let mut original = serde_json::to_value(&publisher).unwrap();
     original["process"]["startedAt"] = "previous-generation".into();
     let path = supervisor_runtime_path(&env, cwd).unwrap();
@@ -3284,9 +3289,17 @@ fn snapshots_refuse_retained_target_ownership_until_exact_recovery() {
     for native in ["absent", "stopped", "running"] {
         let print = root.child("launchctl-print.txt");
         if native != "absent" {
+            let pid = if native == "running" {
+                format!("pid = {}\n", std::process::id())
+            } else {
+                String::new()
+            };
             write_text(
                 &print,
-                &format!("state = {native}\npid = {}\n", std::process::id()),
+                &format!(
+                    "state = {native}\n{pid}path = {}\n",
+                    path_string(&definition)
+                ),
             );
         }
         for args in [
