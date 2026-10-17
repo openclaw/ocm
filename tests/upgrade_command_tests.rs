@@ -7564,6 +7564,90 @@ fn upgrade_keeps_a_stopped_installed_service_stopped() {
 }
 
 #[test]
+fn upgrade_dry_runs_accept_an_environment_named_batch() {
+    let root = TestDir::new("upgrade-batch-name");
+    let env = ocm_env(&root);
+    let runtime = root.child("manual-openclaw");
+    write_executable_script(&runtime, &recording_openclaw_script("2026.8.1"));
+    let add = run_ocm(
+        root.path(),
+        &env,
+        &["runtime", "add", "manual", "--path", &path_string(&runtime)],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    for name in ["demo", "batch"] {
+        let create = run_ocm(
+            root.path(),
+            &env,
+            &["env", "create", name, "--runtime", "manual"],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
+
+    let bounded_upgrade = |args: &[&str]| -> Value {
+        let mut child = Command::new(support::ocm_test_binary_path())
+            .current_dir(root.path())
+            .env_clear()
+            .envs(&env)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("upgrade timed out: {args:?}; {}", stderr(&output));
+            }
+            sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        serde_json::from_str(&stdout(&output)).unwrap()
+    };
+    let all = bounded_upgrade(&["upgrade", "--all", "--dry-run", "--json"]);
+    assert_eq!(all["count"], 2);
+    assert_eq!(all["skipped"], 2);
+    assert_eq!(all["failed"], 0);
+    let fleet = bounded_upgrade(&[
+        "upgrade",
+        "batch",
+        "--runtime",
+        "manual",
+        "--envs",
+        "batch,demo",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(fleet["outcome"], "dry-run");
+    assert_eq!(fleet["results"].as_array().unwrap().len(), 2);
+    assert!(fleet["journalPath"].is_null());
+    let ordinary = bounded_upgrade(&["upgrade", "demo", "--dry-run", "--json"]);
+    assert_eq!(ordinary["outcome"], "manual-runtime");
+    let snapshots = run_ocm(
+        root.path(),
+        &env,
+        &["env", "snapshot", "list", "--all", "--json"],
+    );
+    assert!(snapshots.status.success(), "{}", stderr(&snapshots));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&snapshots)).unwrap(),
+        serde_json::json!([])
+    );
+    assert!(!root.child("ocm-home/upgrade-batches").exists());
+    for name in ["demo", "batch"] {
+        let shown = run_ocm(root.path(), &env, &["env", "show", name, "--json"]);
+        assert!(shown.status.success(), "{}", stderr(&shown));
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&shown)).unwrap()["defaultRuntime"],
+            "manual"
+        );
+    }
+}
+
+#[test]
 fn upgrade_batch_dry_run_creates_no_journal_snapshot_or_runtime_change() {
     let root = TestDir::new("upgrade-fast-batch-dry-run");
     let cwd = root.child("workspace");

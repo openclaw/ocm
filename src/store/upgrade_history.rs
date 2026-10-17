@@ -168,11 +168,19 @@ pub(crate) fn lock_upgrade_transaction(
     cwd: &Path,
 ) -> Result<ExclusiveFileLock, String> {
     let env_name = validate_name(env_name, "Environment name")?;
+    // Keep existing lock identities for running older processes, except the name
+    // that aliases the global lock (including on case-insensitive filesystems).
+    // Environment names cannot start with '.', so this path cannot alias one.
+    let lock_name = if env_name.eq_ignore_ascii_case("batch") {
+        format!(".{env_name}.lock")
+    } else {
+        format!("{env_name}.lock")
+    };
     let path = super::ensure_store(env, cwd)?
         .home
         .join("locks")
         .join("upgrades")
-        .join(format!("{env_name}.lock"));
+        .join(lock_name);
     lock_file(&path, "upgrade transaction")
 }
 
@@ -708,27 +716,80 @@ mod tests {
 
     #[test]
     fn upgrade_transaction_lock_serializes_the_same_environment() {
-        let (root, env) = test_env("transaction-lock");
-        let cwd = root.as_path();
-        let first = lock_upgrade_transaction("demo", &env, cwd).unwrap();
-        let (acquired_tx, acquired_rx) = mpsc::channel();
-        let thread_env = env.clone();
-        let thread_cwd = root.clone();
-        let waiter = thread::spawn(move || {
-            let _second =
-                lock_upgrade_transaction("demo", &thread_env, thread_cwd.as_path()).unwrap();
-            acquired_tx.send(()).unwrap();
-        });
+        for name in ["demo", "batch", "Batch", "BATCH"] {
+            let (root, env) = test_env("transaction-lock");
+            let cwd = root.as_path();
+            let first = lock_upgrade_transaction(name, &env, cwd).unwrap();
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let thread_env = env.clone();
+            let thread_cwd = root.clone();
+            let waiter = thread::spawn(move || {
+                let _second =
+                    lock_upgrade_transaction(name, &thread_env, thread_cwd.as_path()).unwrap();
+                acquired_tx.send(()).unwrap();
+            });
 
-        assert!(
-            acquired_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err()
-        );
-        drop(first);
-        acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        waiter.join().unwrap();
+            assert!(
+                acquired_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err()
+            );
+            drop(first);
+            acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            waiter.join().unwrap();
 
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn upgrade_global_locks_allow_batch_named_transactions() {
+        for name in ["batch", "Batch", "BATCH"] {
+            for exclusive in [false, true] {
+                let (root, env) = test_env("batch-transaction-lock");
+                let batch = exclusive.then(|| lock_upgrade_batch(&env, &root).unwrap());
+                let participant =
+                    (!exclusive).then(|| lock_upgrade_participant(&env, &root).unwrap());
+                let (acquired_tx, acquired_rx) = mpsc::channel();
+                let thread_root = root.clone();
+                let waiter = thread::spawn(move || {
+                    let _transaction = lock_upgrade_transaction(name, &env, &thread_root).unwrap();
+                    acquired_tx.send(()).unwrap();
+                });
+                let acquired = acquired_rx.recv_timeout(Duration::from_secs(2));
+                // Release the global lock and join even if the paths collide.
+                drop(batch);
+                drop(participant);
+                waiter.join().unwrap();
+                let _ = std::fs::remove_dir_all(root);
+                assert!(
+                    acquired.is_ok(),
+                    "{name}, exclusive global lock: {exclusive}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn upgrade_locks_preserve_legacy_global_and_ordinary_paths() {
+        use fs2::FileExt;
+
+        let (root, env) = test_env("legacy-locks");
+        let batch = lock_upgrade_batch(&env, &root).unwrap();
+        let transaction = lock_upgrade_transaction("demo", &env, &root).unwrap();
+        for name in ["batch", "demo"] {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join(format!("ocm/locks/upgrades/{name}.lock")))
+                .unwrap();
+            assert_eq!(
+                FileExt::try_lock_exclusive(&file).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        drop(transaction);
+        drop(batch);
         let _ = std::fs::remove_dir_all(root);
     }
 
