@@ -48,6 +48,103 @@ fn read_plugin_registry(path: &Path, folded: bool) -> Value {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn env_clone_preserves_historical_leases_through_parent_aliases() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for (directory, alias, workshop_alias, protected) in [
+        ("skill-workshop/support", true, false, true),
+        ("skill-workshop/support", false, false, true),
+        ("workspace/history-store/support", true, true, true),
+        ("workspace/active", true, false, false),
+    ] {
+        let root = TestDir::new("clone-historical-leases");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let state = root.child("ocm-home/envs/source/.openclaw");
+        let relative = Path::new(directory).join("openclaw.sqlite");
+        let source = state.join(&relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let db = Connection::open(&source).unwrap();
+        // No plugin index or session tables: only lease cleanup can change rows.
+        db.execute_batch(
+            "CREATE TABLE agent_database_leases (lease_id TEXT PRIMARY KEY);
+             INSERT INTO agent_database_leases VALUES ('retained-owner');
+             CREATE TABLE durable_fixture (value TEXT);
+             INSERT INTO durable_fixture VALUES ('preserved');",
+        )
+        .unwrap();
+        drop(db);
+        let mode = if protected { 0o440 } else { 0o600 };
+        fs::set_permissions(&source, fs::Permissions::from_mode(mode)).unwrap();
+        let alias_target = if workshop_alias {
+            symlink("workspace/history-store", state.join("skill-workshop")).unwrap();
+            "skill-workshop/support"
+        } else {
+            directory
+        };
+        if alias {
+            symlink(alias_target, state.join("state")).unwrap();
+        }
+        let before = fs::read(&source).unwrap();
+        let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+        assert!(clone.status.success(), "{}", stderr(&clone));
+        let target_state = root.child("ocm-home/envs/target/.openclaw");
+        let copied = target_state.join(&relative);
+        assert_eq!(fs::read(&source).unwrap(), before);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+        assert_eq!(
+            fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+        if protected {
+            assert_eq!(fs::read(&copied).unwrap(), before);
+        }
+        if alias {
+            assert_eq!(
+                fs::read_link(target_state.join("state")).unwrap(),
+                Path::new(alias_target)
+            );
+        }
+        if workshop_alias {
+            assert_eq!(
+                fs::read_link(target_state.join("skill-workshop")).unwrap(),
+                Path::new("workspace/history-store")
+            );
+        }
+        let db = Connection::open_with_flags(&copied, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+        let leases: Vec<String> = db
+            .prepare("SELECT lease_id FROM agent_database_leases")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            leases,
+            if protected {
+                vec!["retained-owner"]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(
+            db.query_row("SELECT value FROM durable_fixture", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
+    }
+}
+
 #[test]
 fn env_clone_rebases_session_paths_and_drops_database_owners() {
     for table in ["session_nodes", "session_entries"] {

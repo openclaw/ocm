@@ -1620,14 +1620,18 @@ pub(super) fn relocate_cloned_plugin_index_paths(
 }
 
 pub(super) fn clear_cloned_agent_database_leases(target: &EnvPaths) -> Result<(), String> {
-    let Some(database_path) = contained_imported_database(
-        &target.state_dir.join("state/openclaw.sqlite"),
-        &target.root,
-        false,
-    )?
+    let selected_database = target.state_dir.join("state/openclaw.sqlite");
+    let Some(database_path) = contained_imported_database(&selected_database, &target.root, false)?
     else {
         return Ok(());
     };
+    if is_integrity_protected_history_destination(
+        &target.state_dir,
+        &selected_database,
+        &database_path,
+    )? {
+        return Ok(());
+    }
     if !is_sqlite_database(&database_path)? {
         return Ok(());
     }
