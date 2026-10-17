@@ -15,8 +15,7 @@ use crate::store::{
     create_environment_with_validated_runtime, export_environment, get_environment,
     get_runtime_verified, import_environment, list_environments, lock_environment_operation,
     now_utc, remove_environment_locked, resolve_config_gateway_port,
-    resolve_effective_gateway_ports, resolve_env_gateway_port, save_environment,
-    set_environment_service_policy,
+    resolve_effective_gateway_ports, save_environment, set_environment_service_policy,
 };
 use crate::supervisor::sync_supervisor_env_if_present;
 
@@ -355,25 +354,6 @@ impl<'a> EnvironmentService<'a> {
         Ok(meta)
     }
 
-    pub(crate) fn apply_effective_gateway_ports(
-        &self,
-        envs: Vec<EnvMeta>,
-    ) -> Result<Vec<EnvMeta>, String> {
-        let effective_ports = resolve_effective_gateway_ports(&envs, self.env);
-
-        envs.into_iter()
-            .map(|mut meta| {
-                if let Some(port) = resolve_env_gateway_port(&meta) {
-                    meta.gateway_port = Some(port);
-                } else if let Some(port) = effective_ports.get(&meta.name).copied() {
-                    meta.gateway_port = Some(port);
-                    meta.gateway_port_auto_assigned = true;
-                }
-                Ok(meta)
-            })
-            .collect()
-    }
-
     pub fn create(&self, options: CreateEnvironmentOptions) -> Result<EnvMeta, String> {
         let meta = create_environment_with_validated_runtime(options, self.env, self.cwd)?;
         sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
@@ -588,9 +568,9 @@ impl<'a> EnvironmentService<'a> {
 
         effective_ports
             .get(&target.name)
-            .copied()
+            .cloned()
+            .ok_or_else(|| format!("failed to resolve gateway port for env \"{}\"", target.name))?
             .map(|port| (port, "computed"))
-            .ok_or_else(|| format!("failed to resolve gateway port for env \"{}\"", target.name))
     }
 }
 

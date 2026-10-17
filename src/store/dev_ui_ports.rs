@@ -220,6 +220,30 @@ mod tests {
     }
 
     #[test]
+    fn dev_ui_selection_survives_unrelated_gateway_exhaustion() {
+        let root = tempfile::tempdir().unwrap();
+        let env = environment(root.path());
+        let original = create("original", &env, root.path());
+        let mut metas: Vec<_> = (18_789..=65_535)
+            .step_by(111)
+            .map(|port| {
+                let mut meta = original.clone();
+                meta.name = format!("reserved-{port}");
+                meta.gateway_port = Some(port);
+                meta
+            })
+            .collect();
+        let mut legacy = original.clone();
+        legacy.name = "legacy".to_string();
+        legacy.gateway_port = None;
+        metas.push(legacy);
+        let port =
+            super::super::gateway_ports::choose_source_ui_port(&original, &metas, &[5173], &env)
+                .unwrap();
+        assert!((5174..18_789).contains(&port));
+    }
+
+    #[test]
     fn dev_ui_ports_survive_old_writers_restore_clone_and_removal() {
         let root = tempfile::tempdir().unwrap();
         let env = environment(root.path());
@@ -262,8 +286,8 @@ mod tests {
         );
         let metas = list_environments(&env, root.path()).unwrap();
         assert_ne!(
-            crate::store::gateway_ports::choose_available_gateway_port(port, &metas, &env),
-            port
+            crate::store::gateway_ports::choose_available_gateway_port(port, &metas, &env).ok(),
+            Some(port)
         );
         let mut legacy = original.clone();
         legacy.name = "legacy".to_string();
@@ -275,11 +299,13 @@ mod tests {
         let baseline = crate::store::gateway_ports::resolve_effective_gateway_ports(
             &legacy_envs,
             &env,
-        )["legacy"];
+        )["legacy"]
+            .clone()
+            .unwrap();
         legacy_envs[0].dev_ui_port = Some(baseline);
         let effective =
             crate::store::gateway_ports::resolve_effective_gateway_ports(&legacy_envs, &env);
-        let legacy_port = effective["legacy"];
+        let legacy_port = effective["legacy"].clone().unwrap();
         let (start, end) = crate::store::gateway_ports::openclaw_port_family_range(legacy_port);
         assert!(!(start..=end).contains(&baseline));
         crate::store::restore_env_snapshot(

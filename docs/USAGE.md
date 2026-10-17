@@ -725,6 +725,8 @@ before writing the destination. Check the recorded source with `ocm env show
 ocm env clone mira rowan
 ```
 
+Automatic Gateway port selection searches upward from the preferred port through 65535, preserving existing environment and dev UI reservations. If no candidate remains, creation, cloning, or archive import fails without registering an environment or creating its destination root; it does not wrap to a lower port.
+
 Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Configured agent directories inside the environment retain their payloads through clone and ordinary export/import, including custom and nested locations.
 Agent directories remain separate from workspaces; external locations and paths reached through symlinks are rejected by these copy operations.
 Upgrade simulation rejects an identity-dependent agent directory supplied by an include shared with unrelated configuration fields; give those consumers separate include files before retrying.
@@ -1006,6 +1008,7 @@ writes; raw database sidecars are omitted. Databases and other files are not
 captured in one atomic transaction.
 
 Default export accepts configured workspaces under an aliased environment root using either the accepted root spelling or its canonical path.
+On Windows, ordinary and extended-length prefixes are equivalent representations of those same roots.
 Equivalent spellings select the same owned content and omit each workspace's `.openclaw/tmp` runtime debris.
 Other root spellings retain the default export refusal, even when another alias resolves inside the environment.
 External workspaces, the environment root itself and workspace paths redirected by internal symlinks remain refused.
@@ -1117,6 +1120,14 @@ ocm env doctor mira
 ocm env cleanup mira --yes
 ocm env repair-marker mira
 ```
+
+Runtime-state cleanup preserves configured agent directories inside the environment, including their authentication and state files beneath generated plugin dependencies.
+It still removes stale sessions and unselected generated files beside those directories.
+Configuring an agent directory above `agents/<id>/sessions` preserves agent payload beside that subtree without hiding its stale sessions from cleanup.
+If an agent directory is exactly `agents/<id>/sessions`, cleanup preview and apply refuse the conflicting ownership before changing any configuration or data.
+Use a separate agent directory before retrying cleanup; `env doctor` reports the conflict.
+External configured agent directories remain untouched and do not prevent this cleanup.
+Run `ocm env cleanup mira --json` to preview the actions before applying them with `--yes`.
 
 ### Remove or destroy
 

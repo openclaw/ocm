@@ -98,6 +98,33 @@ function capture(child) {
 }
 function sessionPath(name) { return path.join(env.OCM_HOME, 'source-watch', name + '.session'); }
 function session(name) { return JSON.parse(fs.readFileSync(sessionPath(name), 'utf8')); }
+function reportNamedStopFailure(record, controllerOutputClosed) {
+  const context = {
+    controller: {
+      exitCode: record.controller.exitCode,
+      signalCode: record.controller.signalCode,
+      outputClosed: controllerOutputClosed,
+    },
+  };
+  try {
+    const current = session(record.name);
+    const error = current.completion?.error;
+    context.session = {
+      read: 'ok',
+      closed: typeof current.closed === 'boolean' ? current.closed : null,
+      completion: current.completion == null ? 'absent' : error == null ? 'success' : 'error',
+      // Completion errors can contain command output or paths. Emit only this
+      // known OS error verbatim; never copy arbitrary text, URLs, or grants.
+      completionError: error == null ? null : error === 'Access is denied. (os error 5)' ? error : '[redacted]',
+      retainedUiChildRoles: ['gateway', 'ui', 'command'].filter(role => current.ui?.children?.[role] != null),
+    };
+  } catch (error) {
+    // A missing/unreadable record must not hide the original stop assertion.
+    context.session = {read: error instanceof SyntaxError ? 'invalid-json' :
+      ['ENOENT', 'EACCES', 'EPERM'].includes(error.code) ? error.code : 'unavailable'};
+  }
+  console.error('Named stop failure context: ' + JSON.stringify(context));
+}
 async function start(name, watching = true, withUi = false, defaults = false) {
   assert.ok(!defaults || (watching && withUi));
   const takeover = watching && !defaults;
@@ -410,6 +437,7 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     assert.equal(session(normal.name).closed, false);
     fs.rmSync(hold);
     await waitFor(stopping.closed, () => 'Named stop did not complete\n' + stopping.output());
+    if (stopping.child.exitCode !== 0) reportNamedStopFailure(normal, controllerOutputClosed);
     assert.equal(stopping.child.exitCode, 0, stopping.output());
     const stopped = JSON.parse(stopping.stdout());
     assert.equal(stopped.envName, normal.name);

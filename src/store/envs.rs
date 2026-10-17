@@ -645,18 +645,16 @@ fn create_environment_with_runtime_validation(
         }
     }
 
+    let gateway_port_auto_assigned = options.gateway_port.is_none();
+    let gateway_port = Some(match options.gateway_port {
+        Some(port) => port,
+        None => choose_available_gateway_port(DEFAULT_GATEWAY_PORT, &registry.envs, env)?,
+    });
+
     ensure_dir(&paths.root)?;
     ensure_dir(&paths.state_dir)?;
     ensure_dir(&paths.workspace_dir)?;
 
-    let gateway_port_auto_assigned = options.gateway_port.is_none();
-    let gateway_port = options.gateway_port.or_else(|| {
-        Some(choose_available_gateway_port(
-            DEFAULT_GATEWAY_PORT,
-            &registry.envs,
-            env,
-        ))
-    });
     let created_at = now_utc();
     let meta = EnvMeta {
         upgrade_independent_paths: Vec::new(),
@@ -798,6 +796,7 @@ fn clone_environment_with_policy(
         OpenClawWorkspaceRuntime::for_env(&source.name, source.gateway_port),
     )?;
     source_workspaces.archive_relative_roots(&source_paths.root)?;
+    let gateway_port = choose_cloned_gateway_port(&source, &registry.envs, env)?;
     let result = (|| {
         copy_dir_with_sqlite_snapshots(
             &source_paths.root,
@@ -806,7 +805,6 @@ fn clone_environment_with_policy(
         )?;
         validate_nonportable_runtime_state_paths(&target_paths)?;
         let created_at = now_utc();
-        let gateway_port = choose_cloned_gateway_port(&source, &registry.envs, env);
         let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
         let config_rewrite = match policy {
             CloneEnvironmentPolicy::Standard => {
@@ -1064,11 +1062,12 @@ fn choose_cloned_gateway_port(
     source: &EnvMeta,
     envs: &[EnvMeta],
     env: &BTreeMap<String, String>,
-) -> u32 {
+) -> Result<u32, String> {
     let effective_ports = resolve_effective_gateway_ports(envs, env);
     let preferred = effective_ports
         .get(&source.name)
-        .copied()
+        .cloned()
+        .transpose()?
         .or_else(|| resolve_env_gateway_port(source))
         .unwrap_or(DEFAULT_GATEWAY_PORT);
 
@@ -1341,14 +1340,14 @@ pub(crate) fn import_environment_with_sandbox_origin(
             env,
             OpenClawWorkspaceRuntime::for_env(&source_name, extracted.metadata.env.gateway_port),
         )?;
+        let preferred_gateway_port = extracted
+            .metadata
+            .env
+            .gateway_port
+            .unwrap_or(DEFAULT_GATEWAY_PORT);
+        let gateway_port =
+            choose_available_gateway_port(preferred_gateway_port, &registry.envs, env)?;
         let imported = (|| {
-            let preferred_gateway_port = extracted
-                .metadata
-                .env
-                .gateway_port
-                .unwrap_or(DEFAULT_GATEWAY_PORT);
-            let gateway_port =
-                choose_available_gateway_port(preferred_gateway_port, &registry.envs, env);
             let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
             if extracted.metadata.include_state {
                 super::common::copy_dir_preserving_permissions(
