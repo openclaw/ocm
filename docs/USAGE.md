@@ -988,8 +988,9 @@ including session metadata, recorded file paths, worktree records, and plugin
 receipts, plus the runtime JSON/JSONL and text files handled by plain-home migration.
 It retains sessions, logs, leases, and other durable state. Unchanged values and
 binary payload columns (including compressed records) retain their bytes. Other
-workspace files and integrity-protected history also retain their bytes. Every other file
-outside the config and state-reference rewrites stays byte-identical to the archive.
+workspace files and integrity-protected history also retain their bytes.
+Authored Board tabs and widgets retain their content, checksums, and associated metadata unchanged, even when their text mentions the original environment root.
+Every other file outside the config and state-reference rewrites stays byte-identical to the archive.
 Migration and state-inclusive import share root-reference matching for plain
 paths, file URLs, and existing runtime text. A root must end at a path component
 boundary; sibling names that share its prefix remain unchanged. On POSIX,

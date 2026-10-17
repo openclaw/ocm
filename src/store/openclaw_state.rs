@@ -417,6 +417,14 @@ fn rewrite_database_root_references(
         tx.execute_batch("CREATE TEMP TABLE ocm_root_rewrites (column_id INTEGER, original TEXT COLLATE BINARY, replacement TEXT NOT NULL, PRIMARY KEY(column_id, original)) WITHOUT ROWID")?;
         let mut changed = 0;
         for table in tables {
+            // Board rows are authored content and its bound checksums/metadata,
+            // not runtime locations. Preserve them together, including paths
+            // quoted in widget source, descriptors, titles, or declarations.
+            if table.eq_ignore_ascii_case("board_tabs")
+                || table.eq_ignore_ascii_case("board_widgets")
+            {
+                continue;
+            }
             let columns = tx
                 .prepare(
                     "SELECT cid, name FROM pragma_table_xinfo(?1) WHERE hidden = 0 ORDER BY cid",

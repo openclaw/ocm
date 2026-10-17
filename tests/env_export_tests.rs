@@ -78,6 +78,21 @@ fn env_export_json_reports_the_custom_archive_path() {
 fn env_export_include_state_round_trips_committed_sqlite_state() {
     use rusqlite::{Connection, OpenFlags};
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+
+    fn board_rows(db: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut query = db
+            .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+            .unwrap();
+        let columns = query.column_count();
+        query
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
 
     let root = TestDir::new("env-export-state");
     let cwd = root.child("workspace");
@@ -86,6 +101,70 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
     let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
     assert!(create.status.success(), "{}", stderr(&create));
     let source = root.child("ocm-home/envs/source/.openclaw");
+    let board_path = source.join("agents/main/agent/openclaw-agent.sqlite");
+    fs::create_dir_all(board_path.parent().unwrap()).unwrap();
+    let board = Connection::open(&board_path).unwrap();
+    board.execute_batch(
+        "CREATE TABLE board_tabs (tab_id TEXT PRIMARY KEY, title TEXT, revision INTEGER);
+         CREATE TABLE board_widgets (name TEXT PRIMARY KEY, content_kind TEXT, descriptor_json TEXT,
+            sha256 TEXT, granted_sha TEXT, grant_state TEXT, manifest TEXT, title TEXT, revision INTEGER);"
+    ).unwrap();
+    let title = format!("Saved example: {}", source.join("workspace").display());
+    board
+        .execute("INSERT INTO board_tabs VALUES ('main', ?1, 7)", [&title])
+        .unwrap();
+    // Registered content hashes the authored source; plugin and MCP descriptors
+    // hash their serialized descriptor. All can contain paths as content.
+    let authored_source = json!({"type":"text", "text":title}).to_string();
+    let descriptors = [
+        (
+            "registered",
+            "plugin",
+            json!({"pluginKind":"canvas", "source":authored_source}).to_string(),
+        ),
+        (
+            "plugin",
+            "plugin",
+            json!({"pluginKind":"notes", "props":{"text":title}}).to_string(),
+        ),
+        (
+            "mcp",
+            "mcp-app",
+            json!({"serverName":"notes", "resourceUri":"ui://notes", "toolResult":{"text":title}})
+                .to_string(),
+        ),
+    ];
+    for (name, kind, descriptor) in &descriptors {
+        let hash_input = if *name == "registered" {
+            &authored_source
+        } else {
+            descriptor
+        };
+        let checksum = Sha256::digest(hash_input.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let granted = *name != "plugin";
+        board
+            .execute(
+                "INSERT INTO board_widgets VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 3)",
+                rusqlite::params![
+                    name,
+                    kind,
+                    descriptor,
+                    checksum,
+                    granted.then_some(&checksum),
+                    if granted { "granted" } else { "none" },
+                    json!({"contentOwner":name, "grantSemanticsVersion":2}).to_string(),
+                    title
+                ],
+            )
+            .unwrap();
+    }
+    let original_tabs = board_rows(&board, "board_tabs");
+    let original_widgets = board_rows(&board, "board_widgets");
+    drop(board);
+    let original_board_bytes = fs::read(&board_path).unwrap();
     let database = source.join("state/openclaw.sqlite");
     fs::create_dir_all(database.parent().unwrap()).unwrap();
     let connection = Connection::open(&database).unwrap();
@@ -315,6 +394,49 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
         let target = root.child(format!("ocm-home/envs/{name}/.openclaw"));
         let target_db = target.join("state/openclaw.sqlite");
         assert_eq!(target_db.exists(), include_state);
+        let board = Connection::open_with_flags(
+            target.join("agents/main/agent/openclaw-agent.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(board_rows(&board, "board_tabs"), original_tabs);
+        assert_eq!(board_rows(&board, "board_widgets"), original_widgets);
+        for (name, _, _) in &descriptors {
+            let (descriptor, checksum): (String, String) = board
+                .query_row(
+                    "SELECT descriptor_json, sha256 FROM board_widgets WHERE name = ?1",
+                    [name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let hash_input = if *name == "registered" {
+                serde_json::from_str::<Value>(&descriptor).unwrap()["source"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            } else {
+                descriptor
+            };
+            assert_eq!(
+                Sha256::digest(hash_input.as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+                checksum
+            );
+        }
+        assert_eq!(
+            board
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        let original = if include_state {
+            root.child("source-offline/agents/main/agent/openclaw-agent.sqlite")
+        } else {
+            board_path.clone()
+        };
+        assert_eq!(fs::read(original).unwrap(), original_board_bytes);
         if !include_state {
             continue;
         }
