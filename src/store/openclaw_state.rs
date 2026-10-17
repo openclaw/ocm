@@ -1,3 +1,9 @@
+pub(in crate::store) mod git_config;
+
+mod worktrees;
+
+pub(super) use worktrees::relocate_copied_worktrees;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -122,8 +128,12 @@ pub(crate) fn openclaw_env_archive_options(
         paths,
         &workspaces,
     )?);
-    let excluded_path_roots =
-        runtime_debris_outside_agent_directories(&paths.root, &workspaces, excluded_path_roots)?;
+    let excluded_path_roots = runtime_debris_outside_preserved_paths(
+        &paths.root,
+        &workspaces,
+        &BTreeSet::new(),
+        excluded_path_roots,
+    )?;
     Ok(EnvArchiveOptions {
         should_skip_path: should_skip_openclaw_env_archive_path,
         included_path_roots,
@@ -736,11 +746,46 @@ pub(crate) fn clear_nonportable_runtime_state(
     clear_runtime_state_with_policy(paths, env, runtime, false)
 }
 
+pub(crate) fn clear_copied_runtime_state_preserving_paths(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    preserved_roots: &BTreeSet<PathBuf>,
+    preserved_files: &BTreeSet<PathBuf>,
+) -> Result<bool, String> {
+    clear_runtime_state_preserving_paths(
+        paths,
+        env,
+        runtime,
+        true,
+        preserved_roots,
+        preserved_files,
+    )
+}
+
 fn clear_runtime_state_with_policy(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
     copying: bool,
+) -> Result<bool, String> {
+    clear_runtime_state_preserving_paths(
+        paths,
+        env,
+        runtime,
+        copying,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+}
+
+fn clear_runtime_state_preserving_paths(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    copying: bool,
+    preserved_roots: &BTreeSet<PathBuf>,
+    preserved_files: &BTreeSet<PathBuf>,
 ) -> Result<bool, String> {
     validate_nonportable_runtime_state_paths(paths)?;
     if !path_exists(&paths.state_dir) {
@@ -751,17 +796,33 @@ fn clear_runtime_state_with_policy(
     } else {
         resolve_env_openclaw_workspaces
     };
-    let workspaces = resolve_paths(paths, env, runtime)?;
+    let mut workspaces = resolve_paths(paths, env, runtime)?;
+    workspaces.preserve_copied_roots(preserved_roots);
     workspaces.archive_relative_roots(&paths.root)?;
+    workspaces.preserve_copied_config_paths(preserved_files);
 
     let mut changed = false;
-    for relative_path in runtime_debris_outside_agent_directories(
+    for relative_path in runtime_debris_outside_preserved_paths(
         &paths.state_dir,
         &workspaces,
+        preserved_roots,
         openclaw_extension_runtime_debris_roots(&paths.state_dir)?,
     )? {
-        remove_path(&paths.state_dir.join(relative_path))?;
-        changed = true;
+        let path = paths.state_dir.join(relative_path);
+        // Forced dependency cleanup retains only the requested config leaves,
+        // not a surrounding workspace's otherwise durable payload.
+        if preserved_files.contains(&path) {
+            continue;
+        }
+        if preserved_files.iter().any(|leaf| leaf.starts_with(&path)) {
+            changed |=
+                clear_parent_preserving(&path, &|path| preserved_files.contains(path), &|path| {
+                    preserved_files.iter().any(|leaf| leaf.starts_with(path))
+                })?;
+        } else {
+            remove_path(&path)?;
+            changed = true;
+        }
     }
     let entries = fs::read_dir(&paths.state_dir).map_err(|error| error.to_string())?;
     for entry in entries {
@@ -1581,32 +1642,63 @@ fn is_integrity_protected_history_destination(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.to_string()),
     };
-    let mut entries = super::dev_sources::existing_source_path_entries(resolution_path)?;
-    entries.insert(destination.to_path_buf());
+    let entries = super::dev_sources::existing_source_path_entries(resolution_path)?
+        .into_iter()
+        .filter_map(|entry| {
+            fs::canonicalize(&entry)
+                .ok()
+                .map(|resolved| (entry, resolved))
+        })
+        .collect();
     // A protected namespace can itself be an alias into the owned copy. Keep
     // its logical role for both the destination and intermediate file links.
-    let namespaces = ["skill-workshop", "logs", "audit"]
+    let namespaces = integrity_protected_history_namespaces(&state_root)
         .into_iter()
-        .filter_map(|name| {
-            let logical = state_root.join(name);
+        .filter_map(|logical| {
             fs::canonicalize(&logical)
                 .ok()
                 .map(|resolved| (logical, resolved))
         })
         .collect::<Vec<_>>();
-    Ok(entries.iter().any(|entry| {
-        let protected = is_integrity_protected_history_path(&state_root, entry)
-            || namespaces.iter().any(|(logical, resolved)| {
-                entry.strip_prefix(resolved).is_ok_and(|relative| {
-                    is_integrity_protected_history_path(&state_root, &logical.join(relative))
-                })
-            });
-        // An alias traversed only to leave it with '..' does not make the
-        // resulting ordinary destination part of that history.
-        protected
-            && (entry == destination
-                || fs::canonicalize(entry).is_ok_and(|root| destination.starts_with(root)))
-    }))
+    Ok(
+        is_integrity_protected_history_destination_from_observations(
+            &state_root,
+            destination,
+            &entries,
+            &namespaces,
+        ),
+    )
+}
+
+fn integrity_protected_history_namespaces(state_root: &Path) -> [PathBuf; 3] {
+    ["skill-workshop", "logs", "audit"].map(|name| state_root.join(name))
+}
+
+// Callers establish containment and supply forward resolution observations.
+// Copy planners can supply projected paths without following old source links.
+fn is_integrity_protected_history_destination_from_observations(
+    state_root: &Path,
+    destination: &Path,
+    entries: &BTreeMap<PathBuf, PathBuf>,
+    namespaces: &[(PathBuf, PathBuf)],
+) -> bool {
+    std::iter::once((destination, destination))
+        .chain(
+            entries
+                .iter()
+                .map(|(entry, resolved)| (entry.as_path(), resolved.as_path())),
+        )
+        .any(|(entry, resolved)| {
+            let protected = is_integrity_protected_history_path(&state_root, entry)
+                || namespaces.iter().any(|(logical, resolved)| {
+                    entry.strip_prefix(resolved).is_ok_and(|relative| {
+                        is_integrity_protected_history_path(&state_root, &logical.join(relative))
+                    })
+                });
+            // An alias traversed only to leave it with '..' does not make the
+            // resulting ordinary destination part of that history.
+            protected && (entry == destination || destination.starts_with(resolved))
+        })
 }
 
 // OpenClaw validates these historical bytes against its audit checkpoints.
@@ -2245,7 +2337,17 @@ fn clear_parent_preserving_workspaces(
     root: &Path,
     workspaces: &OpenClawWorkspaceInventory,
 ) -> Result<bool, String> {
-    if workspaces.contains(root) {
+    clear_parent_preserving(root, &|path| workspaces.contains(path), &|path| {
+        workspaces.has_descendant(path)
+    })
+}
+
+fn clear_parent_preserving(
+    root: &Path,
+    contains: &impl Fn(&Path) -> bool,
+    has_descendant: &impl Fn(&Path) -> bool,
+) -> Result<bool, String> {
+    if contains(root) {
         return Ok(false);
     }
 
@@ -2254,12 +2356,12 @@ fn clear_parent_preserving_workspaces(
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
-        if workspaces.contains(&path) {
+        if contains(&path) {
             continue;
         }
         let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-        if metadata.is_dir() && workspaces.has_descendant(&path) {
-            changed |= clear_parent_preserving_workspaces(&path, workspaces)?;
+        if metadata.is_dir() && has_descendant(&path) {
+            changed |= clear_parent_preserving(&path, contains, has_descendant)?;
             continue;
         }
         remove_path(&path)?;
@@ -2409,18 +2511,20 @@ fn openclaw_workspace_archive_excluded_path_roots(
         .collect()
 }
 
-fn runtime_debris_outside_agent_directories(
+fn runtime_debris_outside_preserved_paths(
     root: &Path,
     paths: &OpenClawWorkspaceInventory,
+    copied_roots: &BTreeSet<PathBuf>,
     candidates: BTreeSet<PathBuf>,
 ) -> Result<BTreeSet<PathBuf>, String> {
-    // Inventory admission already rejected internal redirects. Compare owned
-    // agent roots and debris candidates using the same root spelling.
-    let agent_roots = paths
+    // Inventory admission and Git preparation establish ownership. Compare all
+    // preserved roots and debris candidates using the same root spelling.
+    let preserved = paths
         .agent_directory_roots()
+        .chain(copied_roots.iter().map(PathBuf::as_path))
         .map(canonicalize_path_allow_missing)
         .collect::<Result<Vec<_>, _>>()?;
-    if agent_roots.is_empty() {
+    if preserved.is_empty() {
         return Ok(candidates);
     }
     let canonical_root = canonicalize_path_allow_missing(root)?;
@@ -2428,10 +2532,10 @@ fn runtime_debris_outside_agent_directories(
     let mut debris = BTreeSet::new();
     while let Some(relative) = pending.pop() {
         let path = canonical_root.join(&relative);
-        if agent_roots.iter().any(|root| path.starts_with(root)) {
+        if preserved.iter().any(|root| path.starts_with(root)) {
             continue;
         }
-        if agent_roots.iter().any(|root| root.starts_with(&path)) {
+        if preserved.iter().any(|root| root.starts_with(&path)) {
             let entries = match fs::read_dir(&path) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,

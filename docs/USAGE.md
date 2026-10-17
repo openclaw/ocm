@@ -728,6 +728,13 @@ ocm env clone mira rowan
 Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Configured agent directories inside the environment retain their payloads through clone and ordinary export/import, including custom and nested locations.
 Agent directories remain separate from workspaces; external locations and paths reached through symlinks are rejected by these copy operations.
 Upgrade simulation rejects an identity-dependent agent directory supplied by an include shared with unrelated configuration fields; give those consumers separate include files before retrying.
+Git repositories whose administrative directories are already contained in retained workspaces rebase owned core.worktree and include paths to the destination.
+Copied configuration referenced by these repositories survives cleanup without retaining unrelated siblings or acquiring external files.
+Git continues to select conditional includes, and authored predicates, repeated-entry order, comments and unrelated signing/remote settings remain intact.
+Relative values keep Git's containing-file or Git-directory context; external references and inactive missing or invalid includes remain unchanged unless their path maps to copied content.
+Config files retain their copied permissions; unsafe ownership, active invalid configuration, required writes into protected history, or configuration locks fail the clone before registration and roll back its target.
+Linked-worktree registrations and other Git storage pointers retain their separate copy handling.
+
 Clone does not copy dev source bindings. The usual next step is:
 
 ```bash
@@ -741,6 +748,11 @@ The source stays running and its database contents are not rewritten.
 Clone and upgrade simulation also rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
 This includes legacy live session entries that OpenClaw migrates into its current session store.
 External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.
+Retained managed Git worktrees whose repository and required Git data are inside the copied environment keep their checkout content, including the default `.openclaw/worktrees` layout.
+Clone relocates their registry identity and structural Git links together, preserving session/worktree IDs, branch and snapshot refs, indexes, and authored content.
+It retains and relocates owned Git storage links needed by those checkouts.
+It fails and removes the incomplete target when required Git data is missing or external, copied locks/run ownership remain unresolved, or a required Git write would change integrity-protected history; resolve the reported condition before retrying.
+Clone does not copy external repositories, clear Git locks, or change source registrations.
 Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 The same active-state ownership check applies to migration and its existing import rollback.
 
