@@ -2460,21 +2460,32 @@ fn replacement_retains_claims_until_exact_operator_recovery() {
     write_executable_script(
         &gateway,
         &format!(
-            r#"#!/usr/bin/env python3
-import http.server, os, pathlib, sys, threading, time
-if sys.argv[1:3] == ['gateway', 'restart-handoff']: sys.exit(64)
-root = pathlib.Path({})
-name = os.environ['OCM_ACTIVE_ENV']
-if name == 'source':
-    class Health(http.server.BaseHTTPRequestHandler):
-        def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
-        def log_message(self, *args): pass
-    server = http.server.HTTPServer(('127.0.0.1', int(os.environ['OPENCLAW_GATEWAY_PORT'])), Health)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-with (root / ('started-' + name)).open('a') as f: f.write(str(os.getpid()) + '\n')
-while not (root / ('exit-' + name)).exists():
-    with (root / ('beats-' + name)).open('a') as f: f.write('beat\n')
-    time.sleep(.03)
+            r#"#!/bin/sh
+exec node - "$@" <<'NODE'
+const fs = require('node:fs');
+const http = require('node:http');
+const path = require('node:path');
+if (process.argv[2] === 'gateway' && process.argv[3] === 'restart-handoff') process.exit(64);
+const root = {};
+const name = process.env.OCM_ACTIVE_ENV;
+const file = prefix => path.join(root, prefix + name);
+const beat = () => {{
+    if (fs.existsSync(file('exit-'))) process.exit(0);
+    fs.appendFileSync(file('beats-'), 'beat\n');
+}};
+const started = () => {{
+    fs.appendFileSync(file('started-'), `${{process.pid}}\n`);
+    beat();
+    setInterval(beat, 30);
+}};
+if (name === 'source') {{
+    http.createServer((request, response) => {{
+        response.writeHead(200); response.end('ok');
+    }}).listen(Number(process.env.OPENCLAW_GATEWAY_PORT), '127.0.0.1', started);
+}} else {{
+    started();
+}}
+NODE
 "#,
             serde_json::to_string(&path_string(root.path())).unwrap()
         ),
@@ -2514,7 +2525,8 @@ while not (root / ('exit-' + name)).exists():
                 &root.child(format!("beats-{name}")),
                 Duration::from_secs(10)
             ),
-            "child {name} did not execute; runtime={initial}; stderr={}",
+            "child {name} did not execute; initial={initial}; current={}; stderr={}",
+            fs::read_to_string(&runtime_path).unwrap_or_default(),
             initial["children"]
                 .as_array()
                 .unwrap()
