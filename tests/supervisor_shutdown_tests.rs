@@ -379,3 +379,81 @@ fn owned_group_shutdown_settles_term_and_kill_paths() {
         );
     }
 }
+
+#[test]
+fn post_reap_uncertainty_can_recover_after_group_disappears() {
+    use ocm::supervisor::SupervisorService;
+    use std::os::unix::process::CommandExt;
+    struct OwnedProbe(Child);
+    impl Drop for OwnedProbe {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut fixture = ShutdownFixture::new();
+    let before = fixture.start();
+    let target = child_pid(&before, "target");
+    let mut unreaped = OwnedProbe(
+        Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(target as i32)
+            .spawn()
+            .unwrap(),
+    );
+    SupervisorService::new(&fixture.env, &fixture.cwd)
+        .request_child_restart("target")
+        .unwrap();
+    let retained = fixture.wait_for_cleanup_error(target);
+    let initial_error = retained["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["envName"] == "target")
+        .unwrap()["lastError"]
+        .as_str()
+        .unwrap();
+    eprintln!("first_cleanup_error={initial_error}");
+    assert!(
+        initial_error.contains("still exists after child exit")
+            || initial_error.contains("failed verifying process group"),
+        "probe missed the post-reap boundary"
+    );
+    unreaped.0.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let absent = unsafe { libc::kill(-(target as i32), 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if absent {
+            break;
+        }
+        assert!(Instant::now() < deadline, "probe group did not disappear");
+        sleep(Duration::from_millis(20));
+    }
+    let signals_before_retry = fs::read(fixture.root.child("signals.log")).unwrap();
+    SupervisorService::new(&fixture.env, &fixture.cwd)
+        .request_child_restart("target")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut after = fixture.runtime();
+    while child_pid(&after, "target") == target && Instant::now() < deadline {
+        sleep(Duration::from_millis(20));
+        after = fixture.runtime();
+    }
+    fixture.assert_heartbeat_advances("sibling");
+    assert_eq!(
+        fs::read(fixture.root.child("signals.log")).unwrap(),
+        signals_before_retry,
+        "a post-reap retry must not signal the released group identity"
+    );
+    eprintln!(
+        "original_group_absent=true; old_target={target}; observed_target={}; services={}",
+        child_pid(&after, "target"),
+        after["services"]
+    );
+    assert_ne!(
+        child_pid(&after, "target"),
+        target,
+        "fresh restart cannot retire an already-reaped child after cleanup uncertainty resolves"
+    );
+}

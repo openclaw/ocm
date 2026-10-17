@@ -1476,6 +1476,7 @@ struct RunningSupervisorChild {
     restart_handoff_support: RestartHandoffSupport,
     started_at: Instant,
     cleanup_error: Option<(String, OffsetDateTime)>,
+    reaped_status: Option<ExitStatus>,
 }
 
 #[derive(Clone)]
@@ -1548,6 +1549,7 @@ fn spawn_running_child(
         restart_handoff_support,
         started_at: Instant::now(),
         cleanup_error: None,
+        reaped_status: None,
     })
 }
 
@@ -2701,7 +2703,7 @@ fn retain_supervisor_cleanup_error(
 }
 
 fn stop_supervisor_child(running_child: &mut RunningSupervisorChild) -> Result<ExitStatus, String> {
-    match stop_owned_supervisor_child(&mut running_child.child) {
+    match stop_owned_supervisor_child(&mut running_child.child, &mut running_child.reaped_status) {
         Ok(status) => {
             running_child.cleanup_error = None;
             Ok(status)
@@ -2710,7 +2712,17 @@ fn stop_supervisor_child(running_child: &mut RunningSupervisorChild) -> Result<E
     }
 }
 
-fn stop_owned_supervisor_child(child: &mut Child) -> Result<ExitStatus, String> {
+fn stop_owned_supervisor_child(
+    child: &mut Child,
+    reaped_status: &mut Option<ExitStatus>,
+) -> Result<ExitStatus, String> {
+    if let Some(status) = *reaped_status {
+        // A previous attempt already released custody. Retry only observation;
+        // never send another signal to this potentially reused PID or group.
+        #[cfg(unix)]
+        wait_for_supervisor_process_group_absence(child.id())?;
+        return Ok(status);
+    }
     #[cfg(unix)]
     {
         // WNOWAIT keeps even an exited leader's PID reserved through the last
@@ -2774,32 +2786,33 @@ fn stop_owned_supervisor_child(child: &mut Child) -> Result<ExitStatus, String> 
     let status = child
         .wait()
         .map_err(|error| format!("failed reaping child {}: {error}", child.id()))?;
+    *reaped_status = Some(status);
     #[cfg(unix)]
-    {
-        // Reaping releases the identity anchor. From here on, only inspect:
-        // never signal a group that could now have been reused. Require the
-        // kernel's absence result, not an empty snapshot of former members.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let observed = unsafe { libc::kill(-(child.id() as libc::pid_t), 0) };
-            let error = std::io::Error::last_os_error();
-            if observed == -1 && error.raw_os_error() == Some(libc::ESRCH) {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(if observed == -1 {
-                    format!(
-                        "failed verifying process group {} is absent: {error}",
-                        child.id()
-                    )
-                } else {
-                    format!("process group {} still exists after child exit", child.id())
-                });
-            }
-            sleep(Duration::from_millis(50));
-        }
-    }
+    wait_for_supervisor_process_group_absence(child.id())?;
     Ok(status)
+}
+
+#[cfg(unix)]
+fn wait_for_supervisor_process_group_absence(process_group: u32) -> Result<(), String> {
+    // Reaping releases the identity anchor. From here on, only inspect:
+    // never signal a group that could now have been reused. Require the
+    // kernel's absence result, not an empty snapshot of former members.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let observed = unsafe { libc::kill(-(process_group as libc::pid_t), 0) };
+        let error = std::io::Error::last_os_error();
+        if observed == -1 && error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(if observed == -1 {
+                format!("failed verifying process group {process_group} is absent: {error}")
+            } else {
+                format!("process group {process_group} still exists after child exit")
+            });
+        }
+        sleep(Duration::from_millis(50));
+    }
 }
 
 fn supervisor_child_exited(child: &mut Child) -> Result<bool, String> {
@@ -4394,6 +4407,7 @@ mod tests {
                     ),
                     started_at: Instant::now(),
                     cleanup_error: None,
+                    reaped_status: None,
                 },
             )]));
             let mut active = SupervisorState {
