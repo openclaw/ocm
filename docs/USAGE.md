@@ -479,6 +479,12 @@ daemon as absent without treating that absence as a fault. Leave it absent while
 the envs should stay stopped; `ocm service start <env>` recreates it when needed.
 `refresh-daemon` requires an existing daemon and is not an installation command.
 
+If the daemon reports `cleanup is unverified`, it retains the affected child in its runtime ownership record and does not start a replacement for that child during the current daemon run.
+A failed signal, process inspection, or bounded wait is not evidence that the old process group stopped.
+Other environments can continue to run or stop.
+Resolve the reported operating-system error before requesting another restart; do not delete the runtime record or signal a saved PID without verifying its current identity.
+A daemon shutdown with unresolved cleanup returns an error.
+
 Starting a service requires a successful manager observation or confirmed absence of the OCM daemon.
 If the manager cannot be queried or reports an unknown process state, OCM refuses activation and preserves the existing daemon and other environment services.
 Retry after restoring manager access; `ocm service status` remains available for best-effort inspection.
@@ -523,6 +529,13 @@ sibling environment does not revive it. An explicit restart of that environment,
 a changed launch definition, or a new daemon run can start it again. Stopping the
 service removes its inactive runtime record so snapshot maintenance can verify
 that the environment is quiescent.
+
+Snapshot and upgrade maintenance check the target's supervisor ownership before capturing or replacing its state.
+A failed service-manager read, a running daemon without a current runtime observation, or a runtime identity mismatch fails maintenance before mutation; stored stopped intent alone is insufficient.
+If this check fails while pausing a running target, OCM restores its prior service intent without restarting the shared daemon.
+Resolve the reported observation problem and retry; for a daemon without process identity, refresh it from the current installation during an authorized maintenance window.
+These checks cover the native service observation and the supervisor's planned and recorded target ownership.
+They cannot discover older workloads that were never recorded or processes outside the supervisor's owned cleanup scope; refreshing the daemon does not prove those processes stopped.
 
 Restart-handoff capability and consume helpers have a 15-second completion budget that includes stdout and stderr collection, followed by bounded cleanup.
 If a descendant keeps either output open, OCM stops the helper's owned process group on Unix and closes its readers before continuing sibling supervision.
@@ -715,6 +728,13 @@ ocm env clone mira rowan
 Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Configured agent directories inside the environment retain their payloads through clone and ordinary export/import, including custom and nested locations.
 Agent directories remain separate from workspaces; external locations and paths reached through symlinks are rejected by these copy operations.
 Upgrade simulation rejects an identity-dependent agent directory supplied by an include shared with unrelated configuration fields; give those consumers separate include files before retrying.
+Git repositories whose administrative directories are already contained in retained workspaces rebase owned core.worktree and include paths to the destination.
+Copied configuration referenced by these repositories survives cleanup without retaining unrelated siblings or acquiring external files.
+Git continues to select conditional includes, and authored predicates, repeated-entry order, comments and unrelated signing/remote settings remain intact.
+Relative values keep Git's containing-file or Git-directory context; external references and inactive missing or invalid includes remain unchanged unless their path maps to copied content.
+Config files retain their copied permissions; unsafe ownership, active invalid configuration, required writes into protected history, or configuration locks fail the clone before registration and roll back its target.
+Linked-worktree registrations and other Git storage pointers retain their separate copy handling.
+
 Clone does not copy dev source bindings. The usual next step is:
 
 ```bash
@@ -726,12 +746,15 @@ Agent database paths recorded in the source shared-state registry are also inclu
 Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
 The source stays running and its database contents are not rewritten.
 Clone and upgrade simulation also rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
+This includes legacy live session entries that OpenClaw migrates into its current session store.
 External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.
 Retained managed Git worktrees whose repository and required Git data are inside the copied environment keep their checkout content, including the default `.openclaw/worktrees` layout.
 Clone relocates their registry identity and structural Git links together, preserving session/worktree IDs, branch and snapshot refs, indexes, and authored content.
-It retains and relocates owned Git storage links and included configuration needed by those checkouts.
-It fails and removes the incomplete target when required Git data is missing or external, copied locks/run ownership remain unresolved, or structural configuration cannot be relocated without changing ordered values; resolve the reported condition before retrying.
+It retains and relocates owned Git storage links needed by those checkouts.
+It fails and removes the incomplete target when required Git data is missing or external, copied locks/run ownership remain unresolved, or a required Git write would change integrity-protected history; resolve the reported condition before retrying.
 Clone does not copy external repositories, clear Git locks, or change source registrations.
+Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
+The same active-state ownership check applies to migration and its existing import rollback.
 
 OCM does not classify a package or project asset as operational merely because it has a SQLite header or filename.
 Unregistered custom database locations and opaque package, project, import, audit, and Workshop payloads retain their existing copy behavior.
@@ -994,6 +1017,8 @@ root is captured as a coherent committed snapshot, including uncheckpointed WAL
 writes; raw database sidecars are omitted. Databases and other files are not
 captured in one atomic transaction.
 
+New archives, with or without `--include-state`, retain the accepted source root and its captured canonical path in optional `env.canonicalSourceRoot` metadata. Configuration relocation uses both recorded roots without requiring the original source or alias to exist; state-inclusive runtime-reference relocation uses the same identities. Older archives keep their existing import behavior. The archive format remains version 1, and older readers ignore the optional field. Source identities may use POSIX, Windows drive, or UNC syntax; the extension preserves acceptance of portable foreign-platform contents without adding translation of platform-specific payload paths. On Windows, ordinary drive/UNC and extended-length spellings of a recorded root relocate together.
+
 State-inclusive export copies configuration files verbatim. Import rewrites
 env-scoped OpenClaw config paths for the new root, including agent workspaces
 and agent directories, through the same rules as an ordinary import. It also
@@ -1007,6 +1032,9 @@ receipts, plus the runtime JSON/JSONL and text files handled by plain-home migra
 It retains sessions, logs, leases, and other durable state. Unchanged values and
 binary payload columns (including compressed records) retain their bytes. Other
 workspace files and integrity-protected history also retain their bytes.
+Import refuses a selected active database that resolves to protected history and removes the partial target before registration, instead of preserving stale runtime state or changing historical bytes.
+Unselected history and ordinary unprotected database aliases remain supported.
+The ownership check also applies when restoring to the original root or importing an archive without source-root metadata.
 Authored Board tabs and widgets retain their content, checksums, and associated metadata unchanged, even when their text mentions the original environment root.
 Every other file outside the config and state-reference rewrites stays byte-identical to the archive.
 Migration and state-inclusive import share root-reference matching for plain
@@ -1026,6 +1054,7 @@ and dangling links retain their targets without copying external contents.
 Import relocates selected Git repositories and linked worktrees to the destination before registering the environment.
 Their required Git storage must be present inside the copied archive; an incomplete graph or unresolved copied lock fails import and removes the incomplete target without modifying the archive or source.
 Git indexes, branches, snapshot refs, authored files, and protected history retain their contents.
+Ordinary-import cleanup retains the selected configuration files and links required by those Git repositories.
 Use `--include-state` when managed-session registry continuity is needed: ordinary archives still omit `.openclaw/state/openclaw.sqlite` and only retain their existing selected files.
 
 State-inclusive archives are created with private access. Import preserves
@@ -1350,3 +1379,27 @@ Examples:
 - `ocm help runtime`
 - `ocm help launcher`
 - `ocm help service`
+
+## Retained service ownership recovery
+
+A replacement background daemon preserves unresolved runtime children and service rows from its predecessor, including pending rows whose child PID was never published. It refuses to start another child for those targets while allowing unrelated environments to progress. Service status reports retained ownership as `gatewayState: "unknown"`, not a verified running or stopped process. An old listener answering a health check does not make a replacement Start succeed. Snapshot capture and restore, service restart, and foreground dev startup also refuse an unresolved target claim, including after Stop or native daemon exit. Exact recovery releases that restriction for the target without blocking unrelated environments.
+
+First stop the target's running intent and inspect the claim:
+
+```sh
+ocm service stop mira
+ocm service recover mira
+ocm service recover mira --json
+```
+
+Independently inspect and stop every process belonging to that old workload, including detached workers and any child whose PID was never published. Then use the token printed by that inspection:
+
+```sh
+ocm service recover mira --acknowledge-stopped-processes --if-claim <token>
+```
+
+The acknowledgement is your assertion that those processes stopped; OCM does not certify process absence. Stop must also have removed the target from the persisted supervisor plan; an incomplete policy synchronization remains a refusal. It rejects visible conflicts: running intent, a live recorded PID or process group, a live original publisher, missing publisher identity, changed process scope, a changed claim/environment, an incompatible live daemon, or an observation failure. A reused PID is a conservative veto; OCM never signals it. Empty process observations do not replace your confirmation, especially for pending records or detached descendants.
+
+Recovery releases only the inspected claim. It preserves environment data, current stopped intent (including after an incomplete restore), and unrelated siblings. It never starts or stops the native daemon, kills processes, or starts a service. The same command works with a compatible live replacement or an absent daemon whose recorded publisher is conclusively gone. A changed token requires a fresh inspection. JSON reports `operatorAcknowledged: true`, `released: true`, `processAbsenceVerified: false`, and `desiredRunning: false` on success. Start the service separately only when wanted and after any failed data recovery has been resolved.
+
+Existing runtime fields remain readable; the optional `retainedOwnership` metadata preserves each inherited claim's identity and original publisher. Running older daemons cannot perform this recovery. Running an older daemon again can reintroduce its ownership-loss bug; downgrade safety is not provided by the new metadata. Records without usable publisher identity or with a foreign scope remain refused. An unreadable ownership record also remains a refusal when the native daemon is stopped or absent; preserve the damaged record rather than treating it as empty ownership. A no-claim result does not establish absence for a legacy child that was never recorded. Foreground `dev stop --acknowledge-stopped-processes` owns a separate session and cannot release a background claim.

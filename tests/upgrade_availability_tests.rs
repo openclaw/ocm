@@ -245,10 +245,11 @@ fn write_running_supervisor_runtime(
     let stdout_path = path_string(&log_root.join("demo.stdout.log"));
     let stderr_path = path_string(&log_root.join("demo.stderr.log"));
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: None,
+        gateway_admission: Some(support::fake_daemon_gateway_admission()),
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -283,10 +284,11 @@ fn write_running_supervisor_runtime(
 
 fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: None,
+        gateway_admission: Some(support::fake_daemon_gateway_admission()),
         updated_at: now_utc(),
         services: Vec::new(),
         children: Vec::new(),
@@ -427,6 +429,10 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
         "launchd".to_string(),
     );
     install_fake_launchctl(&root, &mut env);
+    env.insert(
+        "OCM_TEST_NATIVE_DAEMON_PID".into(),
+        std::process::id().to_string(),
+    );
 
     let start = run_ocm(
         &cwd,

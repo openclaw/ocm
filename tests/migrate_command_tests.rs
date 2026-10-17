@@ -1971,6 +1971,125 @@ fn migration_snapshots_registered_databases_and_preserves_workspace_assets() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn migration_rejects_registered_history_aliases_to_the_global_database() {
+    use std::os::unix::fs::symlink;
+
+    for (adopt, absolute, wal, protected) in [
+        (false, false, false, true),
+        (true, true, false, true),
+        (false, true, true, true),
+        (true, false, true, true),
+        (true, false, true, false),
+    ] {
+        let root = TestDir::new("migration-registered-history-alias");
+        let env = ocm_env(&root);
+        let source = root.child("plain-home");
+        let target = root.child("target");
+        fs::create_dir_all(source.join("state")).unwrap();
+        fs::create_dir_all(source.join("workspace")).unwrap();
+        fs::write(source.join("openclaw.json"), "{}").unwrap();
+        let plugin = source.join("extensions/demo");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("index.js"), "fixture").unwrap();
+        let database = source.join("state/openclaw.sqlite");
+        let db = Connection::open(&database).unwrap();
+        if wal {
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                .unwrap();
+        }
+        db.execute_batch(
+            "CREATE TABLE agent_databases(path TEXT);
+             CREATE TABLE installed_plugin_index(index_key TEXT PRIMARY KEY, install_records_json TEXT NOT NULL);",
+        )
+        .unwrap();
+        let relative = if protected {
+            "skill-workshop/support/history.sqlite"
+        } else {
+            "custom/history.sqlite"
+        };
+        let history = source.join(relative);
+        fs::create_dir_all(history.parent().unwrap()).unwrap();
+        symlink(
+            if protected {
+                "../../state/openclaw.sqlite"
+            } else {
+                "../state/openclaw.sqlite"
+            },
+            &history,
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO agent_databases VALUES (?1)",
+            [if absolute {
+                history.display().to_string()
+            } else {
+                relative.into()
+            }],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1)",
+            [serde_json::json!({"demo": {"source": "path", "installPath": plugin}}).to_string()],
+        )
+        .unwrap();
+        let source_files = [
+            database.clone(),
+            database.with_file_name("openclaw.sqlite-wal"),
+        ]
+        .into_iter()
+        .filter(|path| path.exists())
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+        let mut args = if adopt {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "target",
+                source.to_str().unwrap(),
+            ]
+        } else {
+            vec!["migrate", "target", source.to_str().unwrap()]
+        };
+        args.extend(["--root", target.to_str().unwrap(), "--json"]);
+        let output = run_ocm(root.path(), &env, &args);
+        assert_eq!(output.status.success(), !protected, "{}", stderr(&output));
+        let shown = run_ocm(root.path(), &env, &["env", "show", "target", "--json"]);
+        assert_eq!(shown.status.success(), !protected);
+        if protected {
+            assert!(stderr(&output).contains("selects integrity-protected history"));
+            assert!(!target.exists());
+        } else {
+            let copied = Connection::open(target.join(".openclaw").join(relative)).unwrap();
+            let records: String = copied
+                .query_row(
+                    "SELECT install_records_json FROM installed_plugin_index",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let records: serde_json::Value = serde_json::from_str(&records).unwrap();
+            assert_eq!(
+                records["demo"]["installPath"],
+                target
+                    .join(".openclaw/extensions/demo")
+                    .display()
+                    .to_string()
+            );
+        }
+        for (path, bytes) in source_files {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert!(history.is_symlink());
+        drop(db);
+    }
+}
+
 #[test]
 fn migration_rolls_back_an_unreadable_sqlite_snapshot() {
     let root = TestDir::new("migration-invalid-sqlite");

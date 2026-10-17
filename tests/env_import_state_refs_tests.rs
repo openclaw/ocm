@@ -9,6 +9,152 @@ use rusqlite::{Connection, params};
 
 use support::{TestDir, ocm_env};
 
+#[cfg(unix)]
+#[test]
+fn state_import_admits_databases_when_no_root_relocation_is_needed() {
+    use std::io::Read;
+    use std::os::unix::fs::symlink;
+    use support::{run_ocm, stderr, stdout};
+
+    for source_metadata in [true, false] {
+        for protected in [true, false] {
+            let root = TestDir::new("import-without-root-relocation");
+            let mut env = ocm_env(&root);
+            let source = root.child("source");
+            let created = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "create",
+                    "source",
+                    "--root",
+                    source.to_str().unwrap(),
+                ],
+            );
+            assert!(created.status.success(), "{}", stderr(&created));
+            let relative = if protected {
+                "skill-workshop/support/history.sqlite"
+            } else {
+                "state/openclaw.sqlite"
+            };
+            let state = source.join(".openclaw");
+            let database = state.join(relative);
+            fs::create_dir_all(database.parent().unwrap()).unwrap();
+            let db = Connection::open(&database).unwrap();
+            db.execute_batch("CREATE TABLE paths(path TEXT)").unwrap();
+            db.execute(
+                "INSERT INTO paths VALUES (?1)",
+                [source.join("payload").display().to_string()],
+            )
+            .unwrap();
+            drop(db);
+            if protected {
+                fs::create_dir(state.join("state")).unwrap();
+                symlink(
+                    "../skill-workshop/support/history.sqlite",
+                    state.join("state/openclaw.sqlite"),
+                )
+                .unwrap();
+            }
+            let before = fs::read(&database).unwrap();
+            let archive = root.child("state.tar");
+            let exported = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "export",
+                    "source",
+                    "--include-state",
+                    "--output",
+                    archive.to_str().unwrap(),
+                ],
+            );
+            assert!(exported.status.success(), "{}", stderr(&exported));
+            let original_archive = fs::read(&archive).unwrap();
+            let mut input = tar::Archive::new(original_archive.as_slice());
+            let mut output = tar::Builder::new(Vec::new());
+            let mut archived_database = Vec::new();
+            for entry in input.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().into_owned();
+                let mut header = entry.header().clone();
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                if path == Path::new("meta/env.json") && !source_metadata {
+                    let mut metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    metadata["env"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("sourceRoot");
+                    metadata["env"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("canonicalSourceRoot");
+                    bytes = serde_json::to_vec(&metadata).unwrap();
+                    header.set_size(bytes.len() as u64);
+                    header.set_cksum();
+                }
+                if path == Path::new("root/.openclaw").join(relative) {
+                    archived_database = bytes.clone();
+                }
+                output.append(&header, bytes.as_slice()).unwrap();
+            }
+            assert!(!archived_database.is_empty());
+            let archive_bytes = output.into_inner().unwrap();
+            fs::write(&archive, &archive_bytes).unwrap();
+            fs::rename(&source, root.child("offline")).unwrap();
+            env.insert(
+                "OCM_HOME".into(),
+                root.child("fresh-registry").display().to_string(),
+            );
+            let imported = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "import",
+                    archive.to_str().unwrap(),
+                    "--name",
+                    "restored",
+                    "--root",
+                    source.to_str().unwrap(),
+                    "--json",
+                ],
+            );
+            assert_eq!(
+                imported.status.success(),
+                !protected,
+                "{}",
+                stderr(&imported)
+            );
+            let shown = run_ocm(root.path(), &env, &["env", "show", "restored", "--json"]);
+            assert_eq!(shown.status.success(), !protected);
+            if protected {
+                assert!(stderr(&imported).contains("selects integrity-protected history"));
+                assert!(!source.exists());
+            } else {
+                assert_eq!(
+                    fs::read(source.join(".openclaw").join(relative)).unwrap(),
+                    archived_database
+                );
+                let summary: serde_json::Value = serde_json::from_str(&stdout(&imported)).unwrap();
+                let rewritten = summary["databasePathsRewritten"].as_object().unwrap();
+                assert!(rewritten.values().all(|count| count.as_u64() == Some(0)));
+                if !source_metadata {
+                    assert!(rewritten.is_empty());
+                }
+            }
+            assert_eq!(
+                fs::read(root.child("offline/.openclaw").join(relative)).unwrap(),
+                before
+            );
+            assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+        }
+    }
+}
+
 #[test]
 fn state_import_relocates_registered_database_text_and_preserves_other_values() {
     for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
@@ -173,13 +319,20 @@ fn state_import_relocates_registered_database_text_and_preserves_other_values() 
         )
         .unwrap();
         fs::rename(source_root, root.child("source-offline")).unwrap();
+        // A fresh registry can import below an archive's former source root.
+        // Discovery must not project an already-rewritten registry path twice.
+        let mut import_env = env.clone();
+        import_env.insert(
+            "OCM_HOME".into(),
+            root.child("fresh-import").display().to_string(),
+        );
         let imported = import_environment(
             ImportEnvironmentOptions {
                 archive: export.archive_path,
                 name: Some("copy".into()),
-                root: None,
+                root: Some(source_root.join("copy").display().to_string()),
             },
-            &env,
+            &import_env,
             root.path(),
         )
         .unwrap();
@@ -326,5 +479,288 @@ fn state_import_relocates_registered_database_text_and_preserves_other_values() 
             fs::read(root.child("source-offline/.openclaw/custom/history.sqlite")).unwrap(),
             before
         );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn state_import_preserves_history_reached_through_database_aliases() {
+    use std::io::Read;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use support::{run_ocm, stderr, stdout};
+
+    for (selection, relative, namespace_alias, needs_change) in [
+        (
+            "global",
+            "skill-workshop/support/history.sqlite",
+            false,
+            true,
+        ),
+        (
+            "agent",
+            "skill-workshop/support/history.sqlite",
+            false,
+            true,
+        ),
+        (
+            "registered",
+            "skill-workshop/support/history.sqlite",
+            false,
+            true,
+        ),
+        ("none", "skill-workshop/support/history.sqlite", false, true),
+        ("global", "logs/config-audit.jsonl", false, true),
+        ("global", "custom/history.sqlite", false, true),
+        (
+            "global",
+            "skill-workshop/support/history.sqlite",
+            true,
+            true,
+        ),
+        ("global", "logs/config-audit.jsonl", true, true),
+        ("global", "audit/system-agent.jsonl", true, true),
+        (
+            "global",
+            "skill-workshop/support/history.sqlite",
+            false,
+            false,
+        ),
+        (
+            "registered-direct",
+            "skill-workshop/support/history.sqlite",
+            false,
+            false,
+        ),
+    ] {
+        let root = TestDir::new("import-protected-database-alias");
+        let env = ocm_env(&root);
+        let run = |args: &[&str]| {
+            let output = run_ocm(root.path(), &env, args);
+            assert!(output.status.success(), "{}", stderr(&output));
+            serde_json::from_str::<serde_json::Value>(&stdout(&output)).unwrap()
+        };
+        let source = root.child("source");
+        run(&[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+            "--json",
+        ]);
+        let state = source.join(".openclaw");
+        let (namespace, suffix) = relative.split_once('/').unwrap();
+        if namespace_alias {
+            fs::create_dir(source.join("history-store")).unwrap();
+            symlink("../history-store", state.join(namespace)).unwrap();
+        }
+        let history = state.join(relative);
+        fs::create_dir_all(history.parent().unwrap()).unwrap();
+        let db = Connection::open(&history).unwrap();
+        db.execute_batch("CREATE TABLE paths (path TEXT NOT NULL)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO paths VALUES (?1)",
+            [if needs_change {
+                source.join("payload").display().to_string()
+            } else {
+                "preserved history".into()
+            }],
+        )
+        .unwrap();
+        let registered_ordinary = selection == "global" && relative != "custom/history.sqlite";
+        if registered_ordinary {
+            let ordinary = state.join("custom/registered.sqlite");
+            fs::create_dir_all(ordinary.parent().unwrap()).unwrap();
+            let agent = Connection::open(&ordinary).unwrap();
+            agent
+                .execute_batch("CREATE TABLE paths (path TEXT)")
+                .unwrap();
+            agent
+                .execute(
+                    "INSERT INTO paths VALUES (?1)",
+                    [source.join("payload").to_str().unwrap()],
+                )
+                .unwrap();
+            db.execute_batch("CREATE TABLE agent_databases (path TEXT)")
+                .unwrap();
+            db.execute(
+                "INSERT INTO agent_databases VALUES (?1)",
+                [if needs_change {
+                    ordinary.display().to_string()
+                } else {
+                    "custom/registered.sqlite".into()
+                }],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let selected = match selection {
+            "global" => Some(state.join("state/openclaw.sqlite")),
+            "agent" => Some(state.join("agents/main/agent/openclaw-agent.sqlite")),
+            "registered" => Some(state.join("selected/history.sqlite")),
+            _ => None,
+        };
+        if let Some(selected) = selected {
+            fs::create_dir_all(selected.parent().unwrap()).unwrap();
+            let prefix = if selection == "agent" {
+                "../../.."
+            } else {
+                ".."
+            };
+            symlink(format!("{prefix}/{relative}"), selected).unwrap();
+        }
+        if selection.starts_with("registered") {
+            fs::create_dir_all(state.join("state")).unwrap();
+            let db = Connection::open(state.join("state/openclaw.sqlite")).unwrap();
+            db.execute_batch("CREATE TABLE agent_databases (path TEXT)")
+                .unwrap();
+            db.execute(
+                "INSERT INTO agent_databases VALUES (?1)",
+                [if selection == "registered-direct" {
+                    relative
+                } else {
+                    "selected/history.sqlite"
+                }],
+            )
+            .unwrap();
+        }
+        fs::set_permissions(&history, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(history.parent().unwrap(), fs::Permissions::from_mode(0o500)).unwrap();
+        let before = fs::read(&history).unwrap();
+        let archive = root.child("state.tar");
+        run(&[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            archive.to_str().unwrap(),
+            "--json",
+        ]);
+        let archive_bytes = fs::read(&archive).unwrap();
+        let mut tar = tar::Archive::new(archive_bytes.as_slice());
+        let archived_path = if namespace_alias {
+            Path::new("root/history-store").join(suffix)
+        } else {
+            Path::new("root/.openclaw").join(relative)
+        };
+        let mut archived = Vec::new();
+        for entry in tar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap() == archived_path {
+                entry.read_to_end(&mut archived).unwrap();
+                break;
+            }
+        }
+        assert!(!archived.is_empty());
+        fs::rename(&source, root.child("offline")).unwrap();
+        let physical = root.child("physical");
+        fs::create_dir(&physical).unwrap();
+        symlink(&physical, root.child("alias")).unwrap();
+        let target = root.child("alias/imported");
+        let output = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "import",
+                archive.to_str().unwrap(),
+                "--name",
+                "imported",
+                "--root",
+                target.to_str().unwrap(),
+                "--json",
+            ],
+        );
+        let protected = relative != "custom/history.sqlite";
+        if protected && selection != "none" {
+            assert!(!output.status.success());
+            assert!(
+                stderr(&output).contains("selects integrity-protected history"),
+                "{}",
+                stderr(&output)
+            );
+            assert!(!target.exists());
+            let shown = run_ocm(root.path(), &env, &["env", "show", "imported", "--json"]);
+            assert!(!shown.status.success());
+            let original = root.child("offline/.openclaw").join(relative);
+            assert_eq!(fs::read(&original).unwrap(), before);
+            assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+            assert_eq!(
+                fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+            assert_eq!(
+                fs::metadata(original.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o500
+            );
+            fs::set_permissions(
+                original.parent().unwrap(),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            continue;
+        }
+        assert!(output.status.success(), "{}", stderr(&output));
+        let imported: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        let copied = target.join(".openclaw").join(relative);
+        if protected {
+            assert_eq!(
+                fs::read(&copied).unwrap(),
+                archived,
+                "{selection}: {relative}"
+            );
+            assert!(
+                imported["databasePathsRewritten"]
+                    .get(format!(".openclaw/{relative}"))
+                    .is_none()
+            );
+        } else {
+            let db =
+                Connection::open_with_flags(&copied, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            let path: String = db
+                .query_row("SELECT path FROM paths", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(path, target.join("payload").display().to_string());
+            assert_eq!(
+                imported["databasePathsRewritten"][format!(".openclaw/{relative}")],
+                1
+            );
+        }
+        assert_eq!(
+            fs::read(root.child("offline/.openclaw").join(relative)).unwrap(),
+            before
+        );
+        assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+        assert_eq!(
+            fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            fs::metadata(copied.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+        run(&["env", "show", "imported", "--json"]);
+        for parent in [
+            copied.parent().unwrap().to_path_buf(),
+            root.child("offline/.openclaw")
+                .join(relative)
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        ] {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 }

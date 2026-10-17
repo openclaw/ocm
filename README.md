@@ -212,6 +212,8 @@ Stop the session before changing UI mode.
 
 If you already have a plain `~/.openclaw` home you care about, use `ocm migrate <env>` instead of starting fresh. `setup` and `start` now point that out when they detect an existing plain OpenClaw home.
 
+After an abrupt background daemon exit, a replacement preserves unresolved service ownership instead of starting another child for that environment. Inspect it with `ocm service recover <env>` after stopping its service intent. Recovery requires the displayed exact-claim token and your explicit confirmation that all old processes stopped; it never kills processes or restarts siblings. See [retained service ownership recovery](docs/USAGE.md#retained-service-ownership-recovery) for the checks and limits.
+
 ## Common paths
 
 ### Use the latest stable release
@@ -516,6 +518,7 @@ Skill Workshop bundles also retain their original bytes, including drafts, suppo
 files, proposal metadata, and rollback receipts. OpenClaw owns their stored hashes
 and target relocation; OCM preserves the historical paths and excludes them from
 copied-runtime-reference diagnostics.
+Migration refuses an active state database that resolves to protected history and rolls back the partial import; passive history and ordinary unprotected database aliases remain supported.
 
 When a configured agent workspace is a repository checkout outside the plain
 OpenClaw home, including through a symlink, migration copies that workspace into
@@ -546,6 +549,8 @@ anywhere under the root are captured as coherent committed snapshots, including
 WAL writes; raw database sidecars are omitted. Each database is captured
 independently, not as one transaction across the environment.
 
+New archives, with or without `--include-state`, retain the accepted source root and its captured canonical path in optional `env.canonicalSourceRoot` metadata. Configuration relocation uses both recorded roots without requiring the original source or alias to exist; state-inclusive runtime-reference relocation uses the same identities. Older archives keep their existing import behavior. The archive format remains version 1, and older readers ignore the optional field. Source identities may use POSIX, Windows drive, or UNC syntax; the extension preserves acceptance of portable foreign-platform contents without adding translation of platform-specific payload paths. On Windows, ordinary drive/UNC and extended-length spellings of a recorded root relocate together.
+
 State-inclusive export copies configuration files verbatim. Import rewrites
 env-scoped OpenClaw config paths for the new root, including agent workspaces
 and agent directories, through the same rules as an ordinary import. It also
@@ -559,6 +564,9 @@ receipts, plus the runtime JSON/JSONL and text files handled by plain-home migra
 It retains sessions, logs, leases, and other durable state. Unchanged values and
 binary payload columns (including compressed records) retain their bytes. Other
 workspace files and integrity-protected history also retain their bytes.
+Import refuses a selected active database that resolves to protected history and removes the partial target before registration, instead of preserving stale runtime state or changing historical bytes.
+Unselected history and ordinary unprotected database aliases remain supported.
+The ownership check also applies when restoring to the original root or importing an archive without source-root metadata.
 Authored Board tabs and widgets retain their content, checksums, and associated metadata unchanged, even when their text mentions the original environment root.
 Every other file outside the config and state-reference rewrites stays byte-identical to the archive.
 Migration and state-inclusive import share root-reference matching for plain
@@ -604,9 +612,10 @@ Clone and upgrade simulation also rebase retained SQLite session paths, includin
 External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.
 Retained managed Git worktrees whose repository and required Git data are inside the copied environment keep their checkout content, including the default `.openclaw/worktrees` layout.
 Clone relocates their registry identity and structural Git links together, preserving session/worktree IDs, branch and snapshot refs, indexes, and authored content.
-It retains and relocates owned Git storage links and included configuration needed by those checkouts.
-It fails and removes the incomplete target when required Git data is missing or external, copied locks/run ownership remain unresolved, or structural configuration cannot be relocated without changing ordered values; resolve the reported condition before retrying.
+It retains and relocates owned Git storage links needed by those checkouts.
+It fails and removes the incomplete target when required Git data is missing or external, copied locks/run ownership remain unresolved, or a required Git write would change integrity-protected history; resolve the reported condition before retrying.
 Clone does not copy external repositories, clear Git locks, or change source registrations.
+Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 
 For clone, migration, and adoption, OCM does not classify a package or project
 asset as operational merely because it has a SQLite header or filename.

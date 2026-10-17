@@ -4427,6 +4427,7 @@ fn dev_status_reports_dev_envs() {
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -7760,6 +7761,7 @@ fn dev_watch_aborts_and_restores_policy_when_service_stop_times_out() {
     let stdout_path = path_string(&root.child("demo.stdout.log"));
     let stderr_path = path_string(&root.child("demo.stderr.log"));
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -7993,4 +7995,212 @@ fn dev_watch_force_temporarily_takes_over_and_restores_the_background_service() 
     let node_log = fs::read_to_string(root.child("node.log")).unwrap();
     assert!(node_log.contains("scripts/watch-node.mjs"));
     assert!(node_log.contains("gateway run --port"));
+}
+
+#[cfg(unix)]
+fn seed_retained_dev_service(
+    root: &TestDir,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Value {
+    let path = supervisor_runtime_path(env, root.path()).unwrap();
+    let mut runtime: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut publisher = runtime["gatewayAdmission"].clone();
+    publisher["process"]["startedAt"] = "previous-generation".into();
+    runtime["services"] = serde_json::json!([{
+        "envName":"demo", "bindingKind":"runtime", "bindingName":"stable",
+        "gatewayState":"pending", "restartCount":0, "childPort":21901,
+        "pid":null, "stdoutPath":"out", "stderrPath":"err"
+    }]);
+    runtime["retainedOwnership"] = serde_json::json!([{
+        "envName":"demo", "claimId":"retained-pending-dev", "publisher":publisher
+    }]);
+    support::write_json_replacing_path(&path, &runtime);
+    runtime
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_admission_refuses_retained_ownership_until_exact_recovery() {
+    for force in [false, true] {
+        for ui in [false, true] {
+            let root = TestDir::new(&format!("retained-dev-admission-{force}-{ui}"));
+            let repo = init_openclaw_repo(&root);
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let mut env = service_env_with_gateway_admission(&root);
+            install_fake_dev_runners(&root, &mut env);
+            if force {
+                create_runtime_backed_env(&cwd, &env);
+            } else {
+                create_owned_dev_env(&repo, "demo", &env, &cwd);
+            }
+            let runtime = seed_retained_dev_service(&root, &env);
+            let path = supervisor_runtime_path(&env, &cwd).unwrap();
+            let registry = fs::read(root.child("ocm-home/envs.json")).unwrap();
+            let repo_arg = path_string(&repo);
+            let args = [
+                "dev",
+                "demo",
+                "--repo",
+                &repo_arg,
+                if force { "--force" } else { "--no-watch" },
+                if ui { "--ui" } else { "--no-ui" },
+            ];
+            let refused = run_ocm(&cwd, &env, &args);
+            assert!(!refused.status.success());
+            assert!(
+                stderr(&refused).contains("retained service ownership"),
+                "{}",
+                stderr(&refused)
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+                runtime
+            );
+            assert_eq!(
+                fs::read(root.child("ocm-home/envs.json")).unwrap(),
+                registry
+            );
+            assert!(!root.child("node.log").exists());
+            assert!(!source_watch_override_path(&root, "demo").exists());
+            if !ui {
+                let mut offline = runtime.clone();
+                offline["gatewayAdmission"] = runtime["retainedOwnership"][0]["publisher"].clone();
+                support::write_json_replacing_path(&path, &offline);
+                let inspected = run_ocm(&cwd, &env, &["service", "recover", "demo", "--json"]);
+                assert!(inspected.status.success(), "{}", stderr(&inspected));
+                let inspected: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+                let ack = run_ocm(
+                    &cwd,
+                    &env,
+                    &[
+                        "service",
+                        "recover",
+                        "demo",
+                        "--acknowledge-stopped-processes",
+                        "--if-claim",
+                        inspected["claimToken"].as_str().unwrap(),
+                    ],
+                );
+                assert!(ack.status.success(), "{}", stderr(&ack));
+                let accepted = run_ocm(&cwd, &env, &args);
+                assert!(accepted.status.success(), "{}", stderr(&accepted));
+                assert!(
+                    fs::read_to_string(root.child("node.log"))
+                        .unwrap()
+                        .contains("gateway run")
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_final_spawn_refuses_claim_published_during_preparation() {
+    let _ui_guard = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for force in [false, true] {
+        for ui in [false, true] {
+            let root = TestDir::new(&format!("retained-dev-final-{force}-{ui}"));
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let mut env = service_env_with_gateway_admission(&root);
+            let repo = if ui {
+                prepare_initial_ui_repo(&root, &mut env)
+            } else {
+                let repo = init_openclaw_repo(&root);
+                install_probe_aware_fake_dev_runners(&root, &mut env);
+                declare_source_tooling(&repo);
+                for tool in ["tsx", "tsdown", "chokidar"] {
+                    write_resolvable_source_tool(&repo, tool);
+                }
+                repo
+            };
+            if force {
+                create_runtime_backed_env(&cwd, &env);
+            } else {
+                let worktree = create_owned_dev_env(&repo, "demo", &env, &cwd);
+                if !ui {
+                    declare_source_tooling(&worktree);
+                    for tool in ["tsx", "tsdown", "chokidar"] {
+                        write_resolvable_source_tool(&worktree, tool);
+                    }
+                }
+            }
+            if force {
+                let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+                assert!(started.status.success(), "{}", stderr(&started));
+            }
+            let ready = root.child(if ui {
+                "ui-probe-ready"
+            } else {
+                "probe.started"
+            });
+            let release = root.child("preparation.release");
+            if ui {
+                fs::write(root.child("ui-probe-hold"), "hold").unwrap();
+            } else {
+                let node = root.child("fake-dev-bin/node");
+                let script = fs::read_to_string(&node).unwrap();
+                let marker = "if [ \"$6\" = ocm-source-dependencies ]; then";
+                assert!(script.contains(marker));
+                write_executable_script(&node, &script.replacen(marker, &format!("{marker}\nprintf ready > '{}'\nwhile [ ! -f '{}' ]; do /bin/sleep 0.02; done\n", path_string(&ready), path_string(&release)), 1));
+            }
+            let repo_arg = path_string(&repo);
+            let mut preparation = DevWatchFixture::spawn(
+                &root,
+                &cwd,
+                &env,
+                &[
+                    "dev",
+                    "demo",
+                    "--repo",
+                    &repo_arg,
+                    if force { "--force" } else { "--no-watch" },
+                    if ui { "--ui" } else { "--no-ui" },
+                ],
+            );
+            if !wait_for_path(&ready, Duration::from_secs(30)) {
+                let output = preparation.finish();
+                panic!(
+                    "preparation did not reach barrier (force={force}, ui={ui}): {}",
+                    stderr(&output)
+                );
+            }
+            let runtime = seed_retained_dev_service(&root, &env);
+            let registry = fs::read(root.child("ocm-home/envs.json")).unwrap();
+            if ui {
+                fs::remove_file(root.child("ui-probe-hold")).unwrap();
+            } else {
+                fs::write(&release, "release").unwrap();
+            }
+            let refused = preparation.wait_without_release();
+            assert!(
+                !refused.status.success(),
+                "foreground spawned after retained publication"
+            );
+            assert!(
+                stderr(&refused).contains("retained service ownership"),
+                "{}",
+                stderr(&refused)
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(
+                    &fs::read(supervisor_runtime_path(&env, &cwd).unwrap()).unwrap()
+                )
+                .unwrap(),
+                runtime
+            );
+            assert_eq!(
+                fs::read(root.child("ocm-home/envs.json")).unwrap(),
+                registry
+            );
+            assert!(!root.child("gateway.json").exists());
+            assert!(!root.child("ui.json").exists());
+            assert!(!root.child("node.log").exists());
+            assert!(!source_watch_override_path(&root, "demo").exists());
+        }
+    }
 }

@@ -450,7 +450,7 @@ fn complete_migration_import(
         fs::remove_dir_all(&target_paths.state_dir).map_err(|error| error.to_string())?;
     }
 
-    let mut copying = OpenClawDirectoryCopy::new(source_home)?;
+    let mut copying = OpenClawDirectoryCopy::new(source_home, source_home)?;
     copying.copy(source_home, &target_paths.state_dir)?;
     external_workspace_plan.copy_and_rewrite_config(&target_paths.config_path, &mut copying)?;
     reject_include_owned_sandbox_origin(&target_paths.config_path)?;
