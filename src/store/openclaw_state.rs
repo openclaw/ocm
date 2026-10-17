@@ -537,16 +537,38 @@ pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Resu
     Ok(())
 }
 
+pub(crate) fn clear_copied_runtime_state(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+) -> Result<bool, String> {
+    clear_runtime_state_with_policy(paths, env, runtime, true)
+}
+
 pub(crate) fn clear_nonportable_runtime_state(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<bool, String> {
+    clear_runtime_state_with_policy(paths, env, runtime, false)
+}
+
+fn clear_runtime_state_with_policy(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    copying: bool,
+) -> Result<bool, String> {
     validate_nonportable_runtime_state_paths(paths)?;
     if !path_exists(&paths.state_dir) {
         return Ok(false);
     }
-    let workspaces = resolve_env_openclaw_copy_paths(paths, env, runtime)?;
+    let resolve_paths = if copying {
+        resolve_env_openclaw_copy_paths
+    } else {
+        resolve_env_openclaw_workspaces
+    };
+    let workspaces = resolve_paths(paths, env, runtime)?;
     workspaces.archive_relative_roots(&paths.root)?;
 
     let mut changed = false;

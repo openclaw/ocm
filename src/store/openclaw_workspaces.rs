@@ -36,12 +36,14 @@ impl<'a> OpenClawWorkspaceRuntime<'a> {
 pub(crate) struct EffectiveOpenClawConfig {
     pub(crate) value: Value,
     pub(crate) include_paths: BTreeSet<PathBuf>,
+    pub(crate) include_scopes: BTreeMap<PathBuf, BTreeSet<Vec<String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OpenClawWorkspaceInventory {
     workspace_roots: BTreeSet<PathBuf>,
     agent_directory_roots: BTreeMap<String, PathBuf>,
+    agent_directory_templates: BTreeMap<String, PathBuf>,
     config_include_paths: BTreeSet<PathBuf>,
     agent_workspace_roots: BTreeMap<String, PathBuf>,
     configured_default_workspace: Option<PathBuf>,
@@ -134,6 +136,16 @@ impl OpenClawWorkspaceInventory {
         self.agent_directory_roots
             .get(&normalize_agent_id(agent_id))
             .map(PathBuf::as_path)
+    }
+
+    pub(crate) fn agent_directories(&self) -> impl Iterator<Item = (&str, &Path)> {
+        self.agent_directory_roots
+            .iter()
+            .map(|(id, path)| (id.as_str(), path.as_path()))
+    }
+
+    pub(crate) fn agent_directory_templates(&self) -> &BTreeMap<String, PathBuf> {
+        &self.agent_directory_templates
     }
 
     pub(crate) fn agent_directory_roots(&self) -> impl Iterator<Item = &Path> {
@@ -327,11 +339,18 @@ pub(crate) fn load_effective_openclaw_config(
         )
     })?;
     let mut processor = IncludeProcessor::new(config_root)?;
-    let value = processor.process(value, config_path, 0, &mut vec![clean_path(config_path)])?;
+    let value = processor.process(
+        value,
+        config_path,
+        0,
+        &mut vec![clean_path(config_path)],
+        &[],
+    )?;
 
     Ok(Some(EffectiveOpenClawConfig {
         value,
         include_paths: processor.include_paths,
+        include_scopes: processor.include_scopes,
     }))
 }
 
@@ -350,6 +369,7 @@ fn resolve_openclaw_workspaces(
         .unwrap_or_else(|| Value::Object(Map::new()));
     let mut config_env = openclaw_config_env(env, openclaw_home, state_dir, config_path, runtime);
     apply_openclaw_config_env(&config, &mut config_env);
+    let authored_entries = agent_entries(&config);
     let config = resolve_config_env_vars(config, &config_env);
     let config_include_paths = resolved
         .map(|resolved| resolved.include_paths)
@@ -374,6 +394,7 @@ fn resolve_openclaw_workspaces(
 
     let mut workspace_roots = BTreeSet::new();
     let mut agent_directory_roots = BTreeMap::new();
+    let mut agent_directory_templates = BTreeMap::new();
     let mut agent_workspace_roots = BTreeMap::new();
     let mut configured_agent_workspace_roots = BTreeMap::new();
     for agent_id in agent_ids {
@@ -396,6 +417,19 @@ fn resolve_openclaw_workspaces(
                     "configured OpenClaw agent directory cannot be the state directory itself: {}",
                     display_path(&directory)
                 ));
+            }
+            if let Some(template) = authored_entries
+                .iter()
+                .find(|entry| {
+                    entry
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| normalize_agent_id(id) == agent_id)
+                })
+                .and_then(|entry| entry.get("agentDir"))
+                .and_then(Value::as_str)
+            {
+                agent_directory_templates.insert(template.to_string(), directory.clone());
             }
             agent_directory_roots.insert(agent_id.clone(), directory);
         }
@@ -434,6 +468,7 @@ fn resolve_openclaw_workspaces(
     Ok(OpenClawWorkspaceInventory {
         workspace_roots,
         agent_directory_roots,
+        agent_directory_templates,
         config_include_paths,
         agent_workspace_roots,
         configured_default_workspace,
@@ -885,6 +920,7 @@ struct IncludeProcessor {
     root_dir: PathBuf,
     canonical_root_dir: PathBuf,
     include_paths: BTreeSet<PathBuf>,
+    include_scopes: BTreeMap<PathBuf, BTreeSet<Vec<String>>>,
 }
 
 impl IncludeProcessor {
@@ -895,6 +931,7 @@ impl IncludeProcessor {
             root_dir,
             canonical_root_dir,
             include_paths: BTreeSet::new(),
+            include_scopes: BTreeMap::new(),
         })
     }
 
@@ -904,23 +941,35 @@ impl IncludeProcessor {
         containing_file: &Path,
         depth: usize,
         stack: &mut Vec<PathBuf>,
+        scope: &[String],
     ) -> Result<Value, String> {
         match value {
             Value::Array(values) => values
                 .into_iter()
-                .map(|value| self.process(value, containing_file, depth, stack))
+                .enumerate()
+                .map(|(index, value)| {
+                    let mut child_scope = scope.to_vec();
+                    child_scope.push(index.to_string());
+                    self.process(value, containing_file, depth, stack, &child_scope)
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array),
             Value::Object(mut object) => {
                 let Some(include) = object.remove("$include") else {
                     let mut resolved = Map::new();
                     for (key, value) in object {
-                        resolved.insert(key, self.process(value, containing_file, depth, stack)?);
+                        let mut child_scope = scope.to_vec();
+                        child_scope.push(key.clone());
+                        resolved.insert(
+                            key,
+                            self.process(value, containing_file, depth, stack, &child_scope)?,
+                        );
                     }
                     return Ok(Value::Object(resolved));
                 };
 
-                let included = self.resolve_include(include, containing_file, depth, stack)?;
+                let included =
+                    self.resolve_include(include, containing_file, depth, stack, scope)?;
                 if object.is_empty() {
                     return Ok(included);
                 }
@@ -933,7 +982,12 @@ impl IncludeProcessor {
 
                 let mut siblings = Map::new();
                 for (key, value) in object {
-                    siblings.insert(key, self.process(value, containing_file, depth, stack)?);
+                    let mut child_scope = scope.to_vec();
+                    child_scope.push(key.clone());
+                    siblings.insert(
+                        key,
+                        self.process(value, containing_file, depth, stack, &child_scope)?,
+                    );
                 }
                 Ok(deep_merge(included, Value::Object(siblings)))
             }
@@ -947,9 +1001,10 @@ impl IncludeProcessor {
         containing_file: &Path,
         depth: usize,
         stack: &mut Vec<PathBuf>,
+        scope: &[String],
     ) -> Result<Value, String> {
         match include {
-            Value::String(path) => self.load_include(&path, containing_file, depth, stack),
+            Value::String(path) => self.load_include(&path, containing_file, depth, stack, scope),
             Value::Array(paths) => {
                 let mut merged = Value::Object(Map::new());
                 for path in paths {
@@ -958,7 +1013,7 @@ impl IncludeProcessor {
                     })?;
                     merged = deep_merge(
                         merged,
-                        self.load_include(path, containing_file, depth, stack)?,
+                        self.load_include(path, containing_file, depth, stack, scope)?,
                     );
                 }
                 Ok(merged)
@@ -973,6 +1028,7 @@ impl IncludeProcessor {
         containing_file: &Path,
         depth: usize,
         stack: &mut Vec<PathBuf>,
+        scope: &[String],
     ) -> Result<Value, String> {
         if depth >= MAX_INCLUDE_DEPTH {
             return Err(format!(
@@ -994,8 +1050,12 @@ impl IncludeProcessor {
             read_regular_text_file(&resolved, "OpenClaw include", Some(MAX_INCLUDE_FILE_BYTES))?;
         let parsed = parse_json5(&raw, &resolved, "OpenClaw include")?;
         self.include_paths.insert(resolved.clone());
+        self.include_scopes
+            .entry(resolved.clone())
+            .or_default()
+            .insert(scope.to_vec());
         stack.push(resolved.clone());
-        let result = self.process(parsed, &resolved, depth + 1, stack);
+        let result = self.process(parsed, &resolved, depth + 1, stack, scope);
         stack.pop();
         result
     }

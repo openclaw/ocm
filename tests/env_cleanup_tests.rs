@@ -341,3 +341,34 @@ fn env_cleanup_yes_clears_inferred_foreign_runtime_state_without_source_metadata
     assert!(!target_state.join("agents/main/sessions").exists());
     assert!(!target_state.join("logs").exists());
 }
+
+#[test]
+fn env_cleanup_retains_external_agent_directory_policy() {
+    let root = TestDir::new("cleanup-external-agent-directory");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    for name in ["source", "target"] {
+        let created = run_ocm(cwd, &env, &["env", "create", name]);
+        assert!(created.status.success(), "{}", stderr(&created));
+    }
+    let state = root.child("ocm-home/envs/target/.openclaw");
+    let external = root.child("external-agent/models.json");
+    crate::support::write_text(&external, "external payload");
+    crate::support::write_text(
+        &state.join("openclaw.json"),
+        &serde_json::json!({
+            "agents":{"entries":{"main":{"agentDir":external.parent().unwrap()}}}
+        })
+        .to_string(),
+    );
+    let stale = state.join("agents/main/sessions/stale.jsonl");
+    crate::support::write_text(
+        &stale,
+        &serde_json::json!({"cwd":root.child("ocm-home/envs/source/.openclaw/workspace")})
+            .to_string(),
+    );
+    let cleanup = run_ocm(cwd, &env, &["env", "cleanup", "target", "--yes"]);
+    assert!(cleanup.status.success(), "{}", stderr(&cleanup));
+    assert!(!stale.exists());
+    assert_eq!(fs::read(external).unwrap(), b"external payload");
+}

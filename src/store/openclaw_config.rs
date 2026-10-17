@@ -385,6 +385,87 @@ pub(crate) fn rewrite_openclaw_config_includes_for_target(
     Ok(changed)
 }
 
+pub(crate) fn rewrite_included_agent_directories_for_target(
+    config_path: &Path,
+    source_paths: &OpenClawWorkspaceInventory,
+    source_root: &Path,
+    target_root: &Path,
+) -> Result<bool, String> {
+    let replacements = source_paths
+        .agent_directory_templates()
+        .iter()
+        .filter(|(template, _)| workspace_uses_changing_runtime_identity(template))
+        .map(|(template, path)| {
+            let relative = path
+                .strip_prefix(source_root)
+                .map_err(|error| error.to_string())?;
+            Ok((
+                template.clone(),
+                display_path(&clean_path(&target_root.join(relative))),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    if replacements.is_empty() {
+        return Ok(false);
+    }
+    let Some(effective) = load_effective_openclaw_config(config_path)? else {
+        return Ok(false);
+    };
+    let mut scopes = effective.include_scopes;
+    scopes.insert(config_path.to_path_buf(), BTreeSet::from([Vec::new()]));
+    let mut changed = false;
+    for (path, scopes) in scopes {
+        let Some(mut value) = read_config_value(&path)? else {
+            continue;
+        };
+        let mut file_changed = false;
+        for mut scope in scopes {
+            file_changed |=
+                rewrite_agent_directory_templates(&mut value, &mut scope, &replacements);
+        }
+        if file_changed {
+            write_config_value(&path, &value)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn rewrite_agent_directory_templates(
+    value: &mut Value,
+    scope: &mut Vec<String>,
+    replacements: &BTreeMap<String, String>,
+) -> bool {
+    if scope.len() == 4
+        && scope[0] == "agents"
+        && matches!(scope[1].as_str(), "entries" | "list")
+        && scope[3] == "agentDir"
+        && let Some(replacement) = value.as_str().and_then(|raw| replacements.get(raw))
+    {
+        *value = Value::String(replacement.clone());
+        return true;
+    }
+    let mut changed = false;
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                scope.push(key.clone());
+                changed |= rewrite_agent_directory_templates(child, scope, replacements);
+                scope.pop();
+            }
+        }
+        Value::Array(array) => {
+            for (index, child) in array.iter_mut().enumerate() {
+                scope.push(index.to_string());
+                changed |= rewrite_agent_directory_templates(child, scope, replacements);
+                scope.pop();
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
 pub(crate) fn rewrite_identity_bound_workspace_paths_for_target(
     config_path: &Path,
     source_workspaces: &OpenClawWorkspaceInventory,

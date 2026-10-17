@@ -584,8 +584,8 @@ flag and imports without included state retain their existing selection,
 configuration rewriting, and cleanup behavior.
 
 Clone and imports without state reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
-Clone and imports without state remove individual agent directory links from
-the copy without changing their linked source data.
+Clone and imports without state remove unconfigured agent directory links from the copy without changing their linked source data.
+Configured agent directories inside the environment retain their payloads through clone and ordinary export/import; configured external or symlinked directories are rejected.
 
 Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite snapshots for recognized operational databases: shared state and quarantine, canonical agent stores, legacy `memory/*.sqlite` stores, and the default Workboard, Team Reports, Logbook, and active Matrix account state stores.
 Agent database paths recorded in the source shared-state registry are also included when the existing copy traverses them.
