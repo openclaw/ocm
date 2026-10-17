@@ -767,32 +767,48 @@ pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Resu
     Ok(())
 }
 
-pub(super) fn clear_copied_runtime_state_preserving_paths(
+pub(crate) fn clear_nonportable_runtime_state(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+) -> Result<bool, String> {
+    clear_runtime_state_with_policy(paths, env, runtime, false)
+}
+
+pub(crate) fn clear_copied_runtime_state_preserving_paths(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
     preserved_roots: &BTreeSet<PathBuf>,
     preserved_files: &BTreeSet<PathBuf>,
 ) -> Result<bool, String> {
-    clear_runtime_state_with_policy(paths, env, runtime, true, preserved_roots, preserved_files)
-}
-
-pub(crate) fn clear_nonportable_runtime_state(
-    paths: &EnvPaths,
-    env: &BTreeMap<String, String>,
-    runtime: OpenClawWorkspaceRuntime<'_>,
-) -> Result<bool, String> {
-    clear_runtime_state_with_policy(
+    clear_runtime_state_preserving_paths(
         paths,
         env,
         runtime,
-        false,
+        true,
+        preserved_roots,
+        preserved_files,
+    )
+}
+
+fn clear_runtime_state_with_policy(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    copying: bool,
+) -> Result<bool, String> {
+    clear_runtime_state_preserving_paths(
+        paths,
+        env,
+        runtime,
+        copying,
         &BTreeSet::new(),
         &BTreeSet::new(),
     )
 }
 
-fn clear_runtime_state_with_policy(
+fn clear_runtime_state_preserving_paths(
     paths: &EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
@@ -2973,8 +2989,6 @@ mod tests {
                     &BTreeMap::new(),
                     OpenClawWorkspaceRuntime::default(),
                     copying,
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
                 );
                 assert!(
                     result
@@ -3176,8 +3190,6 @@ mod tests {
                         &BTreeMap::new(),
                         OpenClawWorkspaceRuntime::default(),
                         copying,
-                        &BTreeSet::new(),
-                        &BTreeSet::new(),
                     )
                     .unwrap()
                 );

@@ -883,6 +883,22 @@ fn assert_imported_git_graphs(cases: &[(bool, bool, bool, ImportGitLayout)]) {
         let copied_repository = target.join(repository.strip_prefix(&source).unwrap());
         let copied_checkout = target.join(checkout.strip_prefix(&source).unwrap());
         let common = fs::canonicalize(copied_repository.join(".git")).unwrap();
+        git(
+            &copied_repository,
+            &["worktree", "lock", copied_checkout.to_str().unwrap()],
+        );
+        assert!(common.join("worktrees/task/locked").exists());
+        assert!(
+            !offline
+                .join(private.strip_prefix(&source).unwrap())
+                .join("locked")
+                .exists()
+        );
+        git(
+            &copied_repository,
+            &["worktree", "unlock", copied_checkout.to_str().unwrap()],
+        );
+        assert!(!common.join("worktrees/task/locked").exists());
         let actual_common = git(&copied_checkout, &["rev-parse", "--git-common-dir"]);
         assert_eq!(
             fs::canonicalize(copied_checkout.join(actual_common)).unwrap(),
