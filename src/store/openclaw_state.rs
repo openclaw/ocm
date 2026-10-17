@@ -1,3 +1,5 @@
+pub(in crate::store) mod git_config;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -687,7 +689,7 @@ pub(crate) fn clear_copied_runtime_state(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<bool, String> {
-    clear_runtime_state_with_policy(paths, env, runtime, true)
+    clear_runtime_state_with_policy(paths, env, runtime, true, &BTreeSet::new())
 }
 
 pub(crate) fn clear_nonportable_runtime_state(
@@ -695,7 +697,16 @@ pub(crate) fn clear_nonportable_runtime_state(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<bool, String> {
-    clear_runtime_state_with_policy(paths, env, runtime, false)
+    clear_runtime_state_with_policy(paths, env, runtime, false, &BTreeSet::new())
+}
+
+pub(crate) fn clear_copied_runtime_state_preserving_paths(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    preserved: &BTreeSet<PathBuf>,
+) -> Result<bool, String> {
+    clear_runtime_state_with_policy(paths, env, runtime, true, preserved)
 }
 
 fn clear_runtime_state_with_policy(
@@ -703,6 +714,7 @@ fn clear_runtime_state_with_policy(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
     copying: bool,
+    preserved: &BTreeSet<PathBuf>,
 ) -> Result<bool, String> {
     validate_nonportable_runtime_state_paths(paths)?;
     if !path_exists(&paths.state_dir) {
@@ -713,8 +725,9 @@ fn clear_runtime_state_with_policy(
     } else {
         resolve_env_openclaw_workspaces
     };
-    let workspaces = resolve_paths(paths, env, runtime)?;
+    let mut workspaces = resolve_paths(paths, env, runtime)?;
     workspaces.archive_relative_roots(&paths.root)?;
+    workspaces.preserve_copied_config_paths(preserved);
 
     let mut changed = false;
     for relative_path in runtime_debris_outside_agent_directories(
@@ -722,8 +735,20 @@ fn clear_runtime_state_with_policy(
         &workspaces,
         openclaw_extension_runtime_debris_roots(&paths.state_dir)?,
     )? {
-        remove_path(&paths.state_dir.join(relative_path))?;
-        changed = true;
+        let path = paths.state_dir.join(relative_path);
+        // Forced dependency cleanup retains only the requested config leaves,
+        // not a surrounding workspace's otherwise durable payload.
+        if preserved.contains(&path) {
+            continue;
+        }
+        if preserved.iter().any(|leaf| leaf.starts_with(&path)) {
+            changed |= clear_parent_preserving(&path, &|path| preserved.contains(path), &|path| {
+                preserved.iter().any(|leaf| leaf.starts_with(path))
+            })?;
+        } else {
+            remove_path(&path)?;
+            changed = true;
+        }
     }
     let entries = fs::read_dir(&paths.state_dir).map_err(|error| error.to_string())?;
     for entry in entries {
@@ -2207,7 +2232,17 @@ fn clear_parent_preserving_workspaces(
     root: &Path,
     workspaces: &OpenClawWorkspaceInventory,
 ) -> Result<bool, String> {
-    if workspaces.contains(root) {
+    clear_parent_preserving(root, &|path| workspaces.contains(path), &|path| {
+        workspaces.has_descendant(path)
+    })
+}
+
+fn clear_parent_preserving(
+    root: &Path,
+    contains: &impl Fn(&Path) -> bool,
+    has_descendant: &impl Fn(&Path) -> bool,
+) -> Result<bool, String> {
+    if contains(root) {
         return Ok(false);
     }
 
@@ -2216,12 +2251,12 @@ fn clear_parent_preserving_workspaces(
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
-        if workspaces.contains(&path) {
+        if contains(&path) {
             continue;
         }
         let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-        if metadata.is_dir() && workspaces.has_descendant(&path) {
-            changed |= clear_parent_preserving_workspaces(&path, workspaces)?;
+        if metadata.is_dir() && has_descendant(&path) {
+            changed |= clear_parent_preserving(&path, contains, has_descendant)?;
             continue;
         }
         remove_path(&path)?;
@@ -2806,6 +2841,7 @@ mod tests {
                     &BTreeMap::new(),
                     OpenClawWorkspaceRuntime::default(),
                     copying,
+                    &BTreeSet::new(),
                 );
                 assert!(
                     result

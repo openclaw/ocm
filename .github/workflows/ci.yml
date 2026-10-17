@@ -68,6 +68,11 @@ jobs:
       - name: Prove local and network file URL relocation
         timeout-minutes: 5
         run: cargo test --locked --lib store::openclaw_state::tests::file_url_relocation_changes_windows_authority -- --exact
+      - name: Prove copied Git configuration ownership
+        timeout-minutes: 5
+        run: |
+          cargo test --locked --test env_clone_tests env_clone_copied_git_config_ -- --nocapture
+          cargo test --locked --lib store::openclaw_state::git_config::tests
       - name: Prove private config writes
         run: cargo test --locked --lib private_config_
       - name: Prove private Windows UI handoffs
