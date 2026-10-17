@@ -2323,6 +2323,94 @@ fn daemon_run_persists_live_runtime_children() {
     assert_eq!(cleared["gatewayAdmission"], gateway_admission);
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_publishes_dynamic_pending_ownership_before_starting_the_child() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-dynamic-publication");
+    let (cwd, env, launcher_marker, _) = setup_daemon_run_fixture_with_child_sleep(&root, 60);
+    let service = EnvironmentService::new(&env, &cwd);
+    let supervisor = SupervisorService::new(&env, &cwd);
+    supervisor.sync().unwrap();
+    let state = read_persisted_service_state(&root.child("ocm-home/supervisor/state.json"));
+    let stdout_path = Path::new(
+        state["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["envName"] == "demo")
+            .unwrap()["stdoutPath"]
+            .as_str()
+            .unwrap(),
+    );
+    let fifo = std::ffi::CString::new(stdout_path.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    service.set_service_running("demo", false).unwrap();
+    supervisor.sync().unwrap();
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial =
+        wait_for_runtime_children(&runtime_path, 1, Some("prod"), Duration::from_secs(10));
+    // Add exactly one new due child after the sibling's startup has settled;
+    // an initial pending plan or earlier due sibling must not mask the gap.
+    service.set_service_running("demo", true).unwrap();
+    supervisor.sync().unwrap();
+    let pending =
+        wait_for_runtime_service_state(&runtime_path, "demo", "pending", Duration::from_secs(5));
+    let started_before_release = launcher_marker.exists();
+    let admission = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.child("ocm-home/source-watch/demo.admission"))
+        .unwrap();
+    let admission_held = FileExt::try_lock_exclusive(&admission).is_err();
+    // Opening the read end releases spawn's stdout open without a production
+    // test hook. Keep it open until the child has exited.
+    let reader = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(stdout_path)
+        .unwrap();
+    let runtime =
+        wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(10));
+    let started = wait_for_file(&launcher_marker, Duration::from_secs(5));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let admission_released = loop {
+        if FileExt::try_lock_exclusive(&admission).is_ok() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        sleep(Duration::from_millis(10));
+    };
+    drop(admission);
+    stop_process(&mut daemon);
+    drop(reader);
+
+    let initial = initial.expect("sibling did not settle");
+    let pending = pending.expect("new target had no pending ownership before spawn");
+    assert!(pending["pid"].is_null());
+    assert!(!started_before_release);
+    assert!(
+        admission_held,
+        "admission was released before PID publication"
+    );
+    let runtime = runtime.expect("dynamic target did not start");
+    assert!(started);
+    assert_eq!(
+        runtime_child_pid(&initial, "prod"),
+        runtime_child_pid(&runtime, "prod")
+    );
+    assert!(
+        admission_released,
+        "admission remained held after PID publication"
+    );
+    assert!(wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5)).is_some());
+}
+
 #[test]
 fn daemon_run_once_executes_planned_children() {
     let _guard = daemon_runtime_test_lock();

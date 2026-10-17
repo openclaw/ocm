@@ -2616,6 +2616,17 @@ fn start_due_children(
                 return Err(error.clone());
             }
             let admission = admit_supervisor_child_start(&next_child.spec, env, cwd)?;
+            // Dynamic reconciliation may have queued this target only in memory.
+            // Publish its pending ownership before execution can outlive us, and
+            // keep admission through the running PID publication below.
+            write_supervisor_runtime_state(
+                &runtime_path,
+                &ocm_home,
+                running,
+                pending,
+                inactive,
+                gateway_admission,
+            )?;
             let child = spawn_running_child(
                 next_child.spec.clone(),
                 next_child.restart_count,
@@ -3721,6 +3732,119 @@ mod tests {
                 .expect("time went backwards")
                 .as_nanos()
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dynamic_child_publication_failure_prevents_spawn_and_allows_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([
+            ("HOME".to_string(), display_path(&root.path().join("home"))),
+            (
+                "OCM_HOME".to_string(),
+                display_path(&root.path().join("store")),
+            ),
+            (
+                "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+                "unsupported".to_string(),
+            ),
+        ]);
+        let service = EnvironmentService::new(&env, root.path());
+        let meta = service
+            .create(crate::env::CreateEnvironmentOptions {
+                name: "demo".to_string(),
+                root: None,
+                gateway_port: None,
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: None,
+                dev: None,
+                protected: false,
+            })
+            .unwrap();
+        crate::store::set_environment_service_policy(
+            &meta.name,
+            Some(true),
+            Some(true),
+            &env,
+            root.path(),
+        )
+        .unwrap();
+        let mut spec = child_spec("demo", meta.gateway_port.unwrap());
+        spec.binary_path = Some("/bin/sleep".to_string());
+        spec.args = vec!["60".to_string()];
+        spec.restart_handoff_pid_bound = false;
+        spec.run_dir = display_path(root.path());
+        spec.stdout_path = display_path(&root.path().join("stdout.log"));
+        spec.stderr_path = display_path(&root.path().join("stderr.log"));
+        spec.process_env = env.clone();
+        spec.process_env
+            .insert("OPENCLAW_STATE_DIR".to_string(), display_path(root.path()));
+        let runtime_path = supervisor_runtime_path(&env, root.path()).unwrap();
+        fs::create_dir_all(&runtime_path).unwrap();
+        let admission = SupervisorGatewayAdmission::current().unwrap();
+        let mut pending = BTreeMap::from([(
+            "demo".to_string(),
+            pending_supervisor_child(spec.clone(), None, 0, 0, 0, None, None),
+        )]);
+        let mut running = BTreeMap::new();
+        let mut inactive = BTreeMap::new();
+        let failed = start_due_children(
+            &mut running,
+            &mut pending,
+            &mut inactive,
+            &env,
+            root.path(),
+            &admission,
+        );
+        // Opening the child logs is the first spawn operation, even if the
+        // process is stopped before its executable has time to run.
+        assert!(
+            !Path::new(&spec.stdout_path).exists(),
+            "publication failure reached spawn"
+        );
+        assert!(failed.unwrap());
+        assert!(running.is_empty());
+        assert_eq!(pending["demo"].restart_count, 1);
+        assert!(
+            pending["demo"]
+                .last_error
+                .as_ref()
+                .unwrap()
+                .contains("directory")
+        );
+        assert_eq!(inactive["demo"].gateway_state, "backoff");
+
+        fs::remove_dir(&runtime_path).unwrap();
+        pending.get_mut("demo").unwrap().retry_at = Instant::now();
+        assert!(
+            start_due_children(
+                &mut running,
+                &mut pending,
+                &mut inactive,
+                &env,
+                root.path(),
+                &admission
+            )
+            .unwrap()
+        );
+        let mut child = running.remove("demo").unwrap();
+        let pid = child.child.id();
+        let runtime = read_json::<SupervisorRuntimeState>(&runtime_path);
+        stop_supervisor_child(&mut child);
+        let runtime = runtime.unwrap();
+        assert_eq!(runtime.children[0].pid, pid);
+        assert_eq!(runtime.services[0].gateway_state, "running");
+        assert_eq!(runtime.services[0].restart_count, 1);
+        assert!(pending.is_empty());
+        assert!(inactive.is_empty());
+        assert!(
+            service
+                .try_lock_gateway_admission("demo")
+                .unwrap()
+                .is_some()
+        );
     }
 
     fn write_executable_fixture(path: &Path, body: &[u8]) {
