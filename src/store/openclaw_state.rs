@@ -286,8 +286,12 @@ pub(super) fn relocate_archived_runtime_state(
     };
     // Ownership admission still applies when no root relocation is needed or
     // the archive predates source-root metadata.
-    let databases =
-        relocate_copied_databases(paths, source_roots, DatabasePathRelocation::ArchivedState)?;
+    let databases = relocate_copied_databases(
+        paths,
+        source_roots,
+        DatabasePathRelocation::ArchivedState,
+        None,
+    )?;
     Ok(ArchivedRuntimeStateResult {
         changed: changed || databases.values().any(|count| *count != 0),
         databases,
@@ -304,6 +308,7 @@ pub(super) fn relocate_copied_databases(
     paths: &EnvPaths,
     source_roots: &[&Path],
     relocation: DatabasePathRelocation,
+    configured_paths: Option<&OpenClawWorkspaceInventory>,
 ) -> Result<BTreeMap<String, u64>, String> {
     let mut counts = BTreeMap::new();
     let mut visited = BTreeSet::new();
@@ -334,6 +339,37 @@ pub(super) fn relocate_copied_databases(
     // agent file. A conflict learned from the relocated global registry aborts
     // the operation through its caller's copied-target rollback.
     selection.admit_registered_databases(&paths.root)?;
+    // Default archives omit the global registry but retain configured agent
+    // directories. Select their actual agent database, not arbitrary SQLite
+    // payloads in the directory, and keep the usual history/containment checks.
+    if let Some(configured_paths) = configured_paths {
+        for directory in configured_paths.agent_directory_roots() {
+            // Retained configuration can name a plain file or a missing path.
+            // Neither can contain an agent database; keep its existing data.
+            match fs::metadata(directory) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+            let path = directory.join("openclaw-agent.sqlite");
+            selection.registered_agents.insert(path.clone());
+            if selection.contains(&path) {
+                if let Some(database) =
+                    contained_imported_database(&path, &paths.root, &paths.state_dir, true)?
+                {
+                    relocate_archived_database(
+                        paths,
+                        source_roots,
+                        relocation,
+                        &database,
+                        &mut visited,
+                        &mut counts,
+                    )?;
+                }
+            }
+        }
+    }
     let mut directories = vec![paths.root.clone()];
     while let Some(directory) = directories.pop() {
         for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
@@ -2735,7 +2771,8 @@ mod tests {
                 .unwrap();
             let before = fs::read(&history).unwrap();
             let ordinary_before = fs::read(&ordinary).unwrap();
-            let error = relocate_copied_databases(&paths, &[&source], relocation).unwrap_err();
+            let error =
+                relocate_copied_databases(&paths, &[&source], relocation, None).unwrap_err();
             assert!(
                 error.contains("selects integrity-protected history"),
                 "{error}"
@@ -2745,7 +2782,7 @@ mod tests {
 
             fs::remove_file(&selected).unwrap();
             std::os::unix::fs::symlink("../custom/agent.sqlite", &selected).unwrap();
-            let counts = relocate_copied_databases(&paths, &[&source], relocation).unwrap();
+            let counts = relocate_copied_databases(&paths, &[&source], relocation, None).unwrap();
             assert_eq!(counts[".openclaw/custom/agent.sqlite"], 1);
             assert_eq!(fs::read(&history).unwrap(), before);
             let db = Connection::open(ordinary).unwrap();
