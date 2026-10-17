@@ -394,7 +394,7 @@ fn env_cleanup_preserves_configured_agent_payload_under_root_spellings() {
             crate::support::write_text(&source_config, "{}\n");
             let source_before = fs::read(&source_config).unwrap();
             let state = target.join(".openclaw");
-            let agent = state.join(relative);
+            let agent = state.join(relative.split('/').collect::<std::path::PathBuf>());
             let payload = agent.join("auth-profiles.json");
             // A retained payload may itself quote a source path; it is not runtime
             // drift and must not keep scheduling resets after the stale session goes.
