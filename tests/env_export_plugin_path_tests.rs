@@ -1467,6 +1467,8 @@ fn state_import_refuses_a_receipt_conflict_without_replacing_other_rows() {
 #[cfg(unix)]
 #[test]
 fn state_import_bounds_directory_handles_for_deep_runtime_state() {
+    // Allow the 111-listener Gateway probe plus fixed overhead, while the
+    // directory depth still exceeds the descriptor limit to catch retained handles.
     let root = TestDir::new("state-import-deep-runtime");
     let env = ocm_env(&root);
     let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
@@ -1474,7 +1476,7 @@ fn state_import_bounds_directory_handles_for_deep_runtime_state() {
     let source = root.child("ocm-home/envs/source");
     let target = root.child("ocm-home/envs/copy");
     let relative: std::path::PathBuf = std::iter::once(".openclaw/agents/main/sessions")
-        .chain(std::iter::repeat_n("d", 96))
+        .chain(std::iter::repeat_n("d", 320))
         .collect();
     write_text(
         &source.join(&relative).join("path.json"),
@@ -1498,7 +1500,7 @@ fn state_import_bounds_directory_handles_for_deep_runtime_state() {
     );
     assert!(export.status.success(), "{}", stderr(&export));
     let output = std::process::Command::new("/bin/sh")
-        .args(["-c", "ulimit -n 64 && exec \"$@\"", "import-limit"])
+        .args(["-c", "ulimit -n 256 && exec \"$@\"", "import-limit"])
         .arg(support::ocm_test_binary_path())
         .args(["env", "import", "deep.tar", "--name", "copy"])
         .current_dir(root.path())
