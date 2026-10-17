@@ -320,15 +320,10 @@ pub(super) fn relocate_copied_databases(
             selection.read_agent_registry(&database, true)?;
         }
     }
-    // Admit explicit owners before traversal can reach another spelling of the
-    // same file. Passive history remains excluded, but a protected registration
-    // must not be silently skipped or first written through its canonical path.
-    let root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
-    for selected in &selection.registered_agents {
-        if fs::canonicalize(selected).is_ok_and(|path| path.starts_with(&root)) {
-            contained_imported_database(selected, &paths.root, &paths.state_dir, true)?;
-        }
-    }
+    // Admit explicit owners before traversal can reach another spelling of an
+    // agent file. A conflict learned from the relocated global registry aborts
+    // the operation through its caller's copied-target rollback.
+    selection.admit_registered_databases(&paths.root)?;
     let mut directories = vec![paths.root.clone()];
     while let Some(directory) = directories.pop() {
         for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
@@ -2023,6 +2018,18 @@ pub(super) struct OpenClawSqliteCopy<'a> {
 }
 
 impl<'a> OpenClawSqliteCopy<'a> {
+    pub(super) fn admit_registered_databases(&self, owned_root: &Path) -> Result<(), String> {
+        let root = fs::canonicalize(owned_root).map_err(|error| error.to_string())?;
+        for selected in &self.registered_agents {
+            if fs::canonicalize(selected)
+                .is_ok_and(|path| path.starts_with(&root) && path.is_file())
+            {
+                contained_imported_database(selected, owned_root, self.state_root, true)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn new(state_root: &'a Path) -> Result<Self, String> {
         let mut selection = Self {
             state_root,

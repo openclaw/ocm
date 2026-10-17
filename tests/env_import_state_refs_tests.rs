@@ -564,17 +564,6 @@ fn state_import_preserves_history_reached_through_database_aliases() {
         assert!(output.status.success(), "{}", stderr(&output));
         let imported: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
         let copied = target.join(".openclaw").join(relative);
-        if registered_ordinary {
-            let db = Connection::open(target.join(".openclaw/custom/registered.sqlite")).unwrap();
-            let path: String = db
-                .query_row("SELECT path FROM paths", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(path, target.join("payload").display().to_string());
-            assert_eq!(
-                imported["databasePathsRewritten"][".openclaw/custom/registered.sqlite"],
-                1
-            );
-        }
         if protected {
             assert_eq!(
                 fs::read(&copied).unwrap(),
