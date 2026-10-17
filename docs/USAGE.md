@@ -726,6 +726,7 @@ Agent database paths recorded in the source shared-state registry are also inclu
 Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
 The source stays running and its database contents are not rewritten.
 Clone and upgrade simulation also rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
+This includes legacy live session entries that OpenClaw migrates into its current session store.
 External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.
 
 OCM does not classify a package or project asset as operational merely because it has a SQLite header or filename.

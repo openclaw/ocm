@@ -452,10 +452,18 @@ fn rewrite_database_root_references(
                 continue;
             }
             let sessions_only = matches!(relocation, DatabasePathRelocation::ClonedSessions);
-            if sessions_only && !matches!(table.as_str(), "session_nodes" | "agent_databases") {
+            if sessions_only
+                && !matches!(
+                    table.as_str(),
+                    "session_nodes" | "session_entries" | "agent_databases"
+                )
+            {
                 continue;
             }
-            let session_entry = sessions_only && table == "session_nodes";
+            // Older agent databases store live entries here; OpenClaw migrates
+            // their entry_json directly into session_nodes on first open.
+            let session_entry =
+                sessions_only && matches!(table.as_str(), "session_nodes" | "session_entries");
             let columns = tx
                 .prepare(
                     "SELECT cid, name FROM pragma_table_xinfo(?1) WHERE hidden = 0 ORDER BY cid",

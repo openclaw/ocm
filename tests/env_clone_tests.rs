@@ -50,6 +50,12 @@ fn read_plugin_registry(path: &Path, folded: bool) -> Value {
 
 #[test]
 fn env_clone_rebases_session_paths_and_drops_database_owners() {
+    for table in ["session_nodes", "session_entries"] {
+        assert_clone_rebases_session_paths_and_drops_database_owners(table);
+    }
+}
+
+fn assert_clone_rebases_session_paths_and_drops_database_owners(table: &str) {
     let root = TestDir::new("clone-database-owners");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -101,11 +107,11 @@ fn env_clone_rebases_session_paths_and_drops_database_owners() {
         let path = source_root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let db = Connection::open(&path).unwrap();
-        db.execute_batch(
-            "CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, entry_json TEXT NOT NULL);
+        db.execute_batch(&format!(
+            "CREATE TABLE {table} (session_key TEXT PRIMARY KEY, entry_json TEXT NOT NULL);
              CREATE TABLE preserved (value TEXT NOT NULL, payload BLOB NOT NULL);
              CREATE TABLE board_widgets (descriptor_json TEXT, sha256 TEXT, granted_sha TEXT, grant_state TEXT);",
-        )
+        ))
         .unwrap();
         let workspace = if id == 0 {
             source_root.join(".openclaw/workspace")
@@ -125,7 +131,7 @@ fn env_clone_rebases_session_paths_and_drops_database_owners() {
             "label": format!("retained {}", workspace.display())
         });
         db.execute(
-            "INSERT INTO session_nodes VALUES ('agent:main:fixture', ?1)",
+            &format!("INSERT INTO {table} VALUES ('agent:main:fixture', ?1)"),
             [entry.to_string()],
         )
         .unwrap();
@@ -156,7 +162,7 @@ fn env_clone_rebases_session_paths_and_drops_database_owners() {
             serde_json::to_string(&workspace).unwrap()
         );
         db.execute(
-            "INSERT INTO session_nodes VALUES ('precise', ?1)",
+            &format!("INSERT INTO {table} VALUES ('precise', ?1)"),
             [&precise],
         )
         .unwrap();
@@ -240,7 +246,7 @@ fn env_clone_rebases_session_paths_and_drops_database_owners() {
         let db = Connection::open(&target).unwrap();
         let actual: String = db
             .query_row(
-                "SELECT entry_json FROM session_nodes WHERE session_key = 'agent:main:fixture'",
+                &format!("SELECT entry_json FROM {table} WHERE session_key = 'agent:main:fixture'"),
                 [],
                 |row| row.get(0),
             )
@@ -267,7 +273,7 @@ fn env_clone_rebases_session_paths_and_drops_database_owners() {
         );
         assert_eq!(
             db.query_row(
-                "SELECT entry_json FROM session_nodes WHERE session_key = 'precise'",
+                &format!("SELECT entry_json FROM {table} WHERE session_key = 'precise'"),
                 [],
                 |row| row.get::<_, String>(0)
             )
