@@ -276,16 +276,16 @@ pub(super) fn relocate_archived_runtime_state(
         &paths.root,
         true,
     )?;
-    let databases = relocate_archived_databases(paths, source_root)?;
+    let databases = relocate_copied_databases(paths, &[source_root])?;
     Ok(ArchivedRuntimeStateResult {
         changed: changed || databases.values().any(|count| *count != 0),
         databases,
     })
 }
 
-fn relocate_archived_databases(
+pub(super) fn relocate_copied_databases(
     paths: &EnvPaths,
-    source_root: &Path,
+    source_roots: &[&Path],
 ) -> Result<BTreeMap<String, u64>, String> {
     let mut counts = BTreeMap::new();
     let mut visited = BTreeSet::new();
@@ -294,7 +294,7 @@ fn relocate_archived_databases(
     // archive may be imported after the original environment has been removed.
     let global = contained_imported_database(&global, &paths.root, true)?;
     if let Some(database) = &global {
-        relocate_archived_database(paths, source_root, database, &mut visited, &mut counts)?;
+        relocate_archived_database(paths, source_roots, database, &mut visited, &mut counts)?;
     }
     let mut selection = OpenClawSqliteCopy {
         state_root: &paths.state_dir,
@@ -317,7 +317,7 @@ fn relocate_archived_databases(
                 if let Some(database) = contained_imported_database(&path, &paths.root, true)? {
                     relocate_archived_database(
                         paths,
-                        source_root,
+                        source_roots,
                         &database,
                         &mut visited,
                         &mut counts,
@@ -331,7 +331,7 @@ fn relocate_archived_databases(
 
 fn relocate_archived_database(
     paths: &EnvPaths,
-    source_root: &Path,
+    source_roots: &[&Path],
     database: &Path,
     visited: &mut BTreeSet<PathBuf>,
     counts: &mut BTreeMap<String, u64>,
@@ -342,11 +342,7 @@ fn relocate_archived_database(
     let parent = database.parent().ok_or("imported database has no parent")?;
     let count = with_owner_write_permission(parent, || {
         with_owner_write_permission(database, || {
-            rewrite_database_root_references(
-                database,
-                &display_path(source_root),
-                &display_path(&paths.root),
-            )
+            rewrite_database_root_references(database, source_roots, &display_path(&paths.root))
         })
     })?;
     let root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
@@ -363,9 +359,16 @@ fn quote_sql_identifier(name: &str) -> String {
 
 fn rewrite_database_root_references(
     database: &Path,
-    source_root: &str,
+    source_roots: &[&Path],
     target_root: &str,
 ) -> Result<u64, String> {
+    let mut source_roots = source_roots
+        .iter()
+        .map(|root| display_path(root))
+        .collect::<Vec<_>>();
+    // Match a nested lexical alias before its shorter canonical root.
+    source_roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+    source_roots.dedup();
     let rewrite = || -> Result<u64, Box<dyn std::error::Error>> {
         let mut db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         // Stored callbacks and cascades must not modify unrelated values.
@@ -456,21 +459,24 @@ fn rewrite_database_root_references(
                                 || ["Path", "Dir", "Root", "_path", "_dir", "_root"]
                                     .iter()
                                     .any(|suffix| name.ends_with(suffix));
-                        let replacement = if path_column
-                            && (Path::new(original).is_absolute()
-                                || original
-                                    .get(..5)
-                                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:")))
-                        {
-                            rewrite_path_value(original, source_root, target_root)
-                        } else {
-                            rewrite_runtime_root_references(
-                                original,
-                                source_root,
-                                target_root,
-                                false,
-                            )?
-                        };
+                        let mut replacement = original.to_string();
+                        for source_root in &source_roots {
+                            replacement = if path_column
+                                && (Path::new(&replacement).is_absolute()
+                                    || replacement
+                                        .get(..5)
+                                        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:")))
+                            {
+                                rewrite_path_value(&replacement, source_root, target_root)
+                            } else {
+                                rewrite_runtime_root_references(
+                                    &replacement,
+                                    source_root,
+                                    target_root,
+                                    false,
+                                )?
+                            };
+                        }
                         if replacement == original {
                             continue;
                         }

@@ -898,6 +898,14 @@ fn clone_environment_with_policy(
         };
 
         super::openclaw_state::relocate_cloned_plugin_index_paths(&source_paths, &target_paths)?;
+        // Sessions may store canonical paths even when the environment root
+        // was registered through an alias (for example /var on macOS).
+        let canonical_source_root =
+            fs::canonicalize(&source_paths.root).map_err(|error| error.to_string())?;
+        super::openclaw_state::relocate_copied_databases(
+            &target_paths,
+            &[&source_paths.root, &canonical_source_root],
+        )?;
         super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
 
         let meta = EnvMeta {
@@ -1744,6 +1752,15 @@ mod tests {
             "CREATE TABLE agent_database_leases (lease_id TEXT PRIMARY KEY, owner_pid INTEGER NOT NULL);
              INSERT INTO agent_database_leases VALUES ('copied-source-owner', 1);",
         ).unwrap();
+        connection
+            .execute_batch("CREATE TABLE session_nodes (entry_json TEXT NOT NULL);")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_nodes VALUES (?1)",
+                [json!({"sessionRoot": source_paths.workspace_dir, "spawnedCwd": source_paths.workspace_dir}).to_string()],
+            )
+            .unwrap();
         let source_database_before = fs::read(&database).unwrap();
         let source_wal_before = fs::read(database.with_extension("sqlite-wal")).unwrap();
         let source_connection = connection;
@@ -1824,6 +1841,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!(lease_count, 0);
+        let session: String = connection
+            .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+            .unwrap();
+        let session: Value = serde_json::from_str(&session).unwrap();
+        for field in ["sessionRoot", "spawnedCwd"] {
+            assert_eq!(
+                session[field],
+                target_paths.workspace_dir.display().to_string()
+            );
+        }
+
         let document: String = connection.query_row(
             "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'",
             [],

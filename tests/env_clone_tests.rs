@@ -48,7 +48,7 @@ fn read_plugin_registry(path: &Path, folded: bool) -> Value {
 }
 
 #[test]
-fn env_clone_drops_database_owners_without_changing_source_or_durable_state() {
+fn env_clone_rebases_session_paths_and_drops_database_owners() {
     let root = TestDir::new("clone-database-owners");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -77,6 +77,72 @@ fn env_clone_drops_database_owners_without_changing_source_or_durable_state() {
         "INSERT INTO agent_database_leases VALUES ('live', 'fixture', '/source/agent.sqlite', ?1, NULL, 1)",
         [std::process::id()],
     ).unwrap();
+    let source_root = fs::canonicalize(root.child("ocm-home/envs/source")).unwrap();
+    let target_root = root.child("ocm-home/envs/target");
+    connection
+        .execute_batch(
+            "CREATE TABLE agent_databases (agent_id TEXT PRIMARY KEY, path TEXT NOT NULL);",
+        )
+        .unwrap();
+    let databases = [
+        ".openclaw/agents/main/agent/openclaw-agent.sqlite",
+        ".openclaw/workspace/custom/agent.sqlite",
+    ];
+    let mut source_databases = Vec::new();
+    for (id, relative) in databases.iter().enumerate() {
+        let path = source_root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, entry_json TEXT NOT NULL);
+             CREATE TABLE preserved (value TEXT NOT NULL, payload BLOB NOT NULL);",
+        )
+        .unwrap();
+        let workspace = if id == 0 {
+            source_root.join(".openclaw/workspace")
+        } else {
+            root.child("ocm-home/envs/source/.openclaw/workspace")
+        };
+        let entry = serde_json::json!({
+            "sessionId": "fixture-session",
+            "sessionRoot": workspace,
+            "spawnedCwd": workspace.join("nested"),
+            "external": root.child("external/workspace"),
+            "sibling": format!("{}-sibling/workspace", source_root.display()),
+            "label": "retained"
+        });
+        db.execute(
+            "INSERT INTO session_nodes VALUES ('agent:main:fixture', ?1)",
+            [entry.to_string()],
+        )
+        .unwrap();
+        let binary = workspace.to_string_lossy().as_bytes().to_vec();
+        db.execute(
+            "INSERT INTO preserved VALUES ('keep user state', ?1)",
+            [&binary],
+        )
+        .unwrap();
+        drop(db);
+        connection
+            .execute(
+                "INSERT INTO agent_databases VALUES (?1, ?2)",
+                rusqlite::params![id.to_string(), path.to_str().unwrap()],
+            )
+            .unwrap();
+        source_databases.push((path.clone(), fs::read(&path).unwrap(), entry, binary));
+    }
+    let history = source_root.join(".openclaw/skill-workshop/history.sqlite");
+    fs::create_dir_all(history.parent().unwrap()).unwrap();
+    let db = Connection::open(&history).unwrap();
+    db.execute_batch("CREATE TABLE history (path TEXT NOT NULL)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO history VALUES (?1)",
+        [source_root.to_str().unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let history_before = fs::read(&history).unwrap();
     let before = fs::read(&source).unwrap();
     let wal_before = fs::read(source.with_extension("sqlite-wal")).unwrap();
     let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
@@ -119,6 +185,46 @@ fn env_clone_drops_database_owners_without_changing_source_or_durable_state() {
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
         42
+    );
+    for (relative, (path, before, mut entry, binary)) in databases.iter().zip(source_databases) {
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let target = target_root.join(relative);
+        let db = Connection::open(&target).unwrap();
+        let actual: String = db
+            .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+            .unwrap();
+        entry["sessionRoot"] = serde_json::json!(target_root.join(".openclaw/workspace"));
+        entry["spawnedCwd"] = serde_json::json!(target_root.join(".openclaw/workspace/nested"));
+        assert_eq!(serde_json::from_str::<Value>(&actual).unwrap(), entry);
+        assert_eq!(
+            db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            db.query_row("SELECT value, payload FROM preserved", [], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?
+            )))
+            .unwrap(),
+            ("keep user state".into(), binary)
+        );
+    }
+    let registered: Vec<String> = copied
+        .prepare("SELECT path FROM agent_databases ORDER BY agent_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        registered,
+        databases.map(|relative| target_root.join(relative).display().to_string())
+    );
+    assert_eq!(fs::read(&history).unwrap(), history_before);
+    assert_eq!(
+        fs::read(target_root.join(".openclaw/skill-workshop/history.sqlite")).unwrap(),
+        history_before
     );
 }
 
@@ -1577,4 +1683,42 @@ fn env_clone_rejects_external_configured_agent_directories_before_copying() {
                 .is_symlink()
         );
     }
+}
+
+#[test]
+fn env_clone_rolls_back_a_database_relocation_failure() {
+    let root = TestDir::new("clone-database-relocation-failure");
+    let env = ocm_env(&root);
+    let cwd = root.path();
+    let create = run_ocm(cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source_root = fs::canonicalize(root.child("ocm-home/envs/source")).unwrap();
+    let target_root = root.child("ocm-home/envs/target");
+    let database = source_root.join(".openclaw/agents/main/agent/openclaw-agent.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let db = Connection::open(&database).unwrap();
+    db.execute_batch("CREATE TABLE paths (path TEXT UNIQUE NOT NULL)")
+        .unwrap();
+    for path in [&source_root, &target_root] {
+        db.execute("INSERT INTO paths VALUES (?1)", [path.to_str().unwrap()])
+            .unwrap();
+    }
+    drop(db);
+    let before = fs::read(&database).unwrap();
+    let clone = run_ocm(cwd, &env, &["env", "clone", "source", "target"]);
+    assert!(!clone.status.success());
+    assert!(
+        stderr(&clone).contains("failed to relocate"),
+        "{}",
+        stderr(&clone)
+    );
+    assert_eq!(fs::read(&database).unwrap(), before);
+    assert!(!target_root.exists());
+    let show = run_ocm(cwd, &env, &["env", "show", "target"]);
+    assert!(!show.status.success());
+    assert!(
+        stderr(&show).contains("does not exist"),
+        "{}",
+        stderr(&show)
+    );
 }

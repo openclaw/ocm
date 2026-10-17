@@ -595,6 +595,8 @@ Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite s
 Agent database paths recorded in the source shared-state registry are also included when the existing copy traverses them.
 Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
 The source stays running and its database contents are not rewritten.
+Clone and upgrade simulation also rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
+External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.
 
 For clone, migration, and adoption, OCM does not classify a package or project
 asset as operational merely because it has a SQLite header or filename.
