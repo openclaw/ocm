@@ -1905,6 +1905,34 @@ fn assert_portable_archive_source_identities() {
             let mut metadata = extracted.metadata.clone();
             metadata.env.source_root = Some(source_root.to_string());
             metadata.env.canonical_source_root = extended.then(|| canonical.to_string());
+            #[cfg(windows)]
+            let native_records = if label == "posix" {
+                Vec::new()
+            } else {
+                let ordinary = if label == "drive" {
+                    r"C:\portable\physical"
+                } else {
+                    r"\\server\share\physical"
+                };
+                let rows = vec![
+                    ("lexical", format!(r"{source_root}\active")),
+                    ("canonical-extended", format!(r"{canonical}\active")),
+                    ("canonical-node", format!(r"{ordinary}\active")),
+                    ("sibling", format!(r"{ordinary}-sibling\active")),
+                ];
+                let database = extracted.root_dir.join(".openclaw/state/openclaw.sqlite");
+                fs::create_dir_all(database.parent().unwrap()).unwrap();
+                let db = rusqlite::Connection::open(database).unwrap();
+                db.execute_batch("DROP TABLE IF EXISTS paths; CREATE TABLE paths (id TEXT PRIMARY KEY, path TEXT, payload BLOB);").unwrap();
+                for (id, value) in &rows {
+                    db.execute(
+                        "INSERT INTO paths VALUES (?1, ?2, ?3)",
+                        rusqlite::params![id, value, value.as_bytes()],
+                    )
+                    .unwrap();
+                }
+                rows
+            };
             let name = format!("{label}-{extended}");
             let archive = root.child(format!("{name}.tar"));
             write_env_archive(&metadata, &extracted.root_dir, &archive).unwrap();
@@ -1928,6 +1956,28 @@ fn assert_portable_archive_source_identities() {
                 serde_json::from_slice(&fs::read(target.join(".openclaw/openclaw.json")).unwrap())
                     .unwrap();
             assert_eq!(config["marker"], "relative-literal");
+            #[cfg(windows)]
+            if !native_records.is_empty() {
+                let db = rusqlite::Connection::open(target.join(".openclaw/state/openclaw.sqlite"))
+                    .unwrap();
+                for (id, original) in native_records {
+                    let (value, payload): (String, Vec<u8>) = db
+                        .query_row(
+                            "SELECT path, payload FROM paths WHERE id = ?1",
+                            [id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .unwrap();
+                    let relocated = id == "lexical" || (extended && id.starts_with("canonical-"));
+                    let expected = if relocated {
+                        target.join("active").to_str().unwrap().to_string()
+                    } else {
+                        original.clone()
+                    };
+                    assert_eq!(value, expected, "{name}: {id}");
+                    assert_eq!(payload, original.as_bytes());
+                }
+            }
             assert_eq!(
                 fs::read(target.join(".openclaw/workspace/notes.txt")).unwrap(),
                 b"portable bytes\n"

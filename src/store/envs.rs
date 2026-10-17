@@ -1113,10 +1113,7 @@ pub fn export_environment(
         env: ArchivedEnvMeta {
             name: meta.name.clone(),
             source_root: Some(meta.root.clone()),
-            canonical_source_root: canonical_root
-                .as_ref()
-                .filter(|root| *root != &env_paths.root)
-                .map(|root| display_path(root)),
+            canonical_source_root: canonical_root.as_ref().map(|root| display_path(root)),
             gateway_port: meta.gateway_port,
             gateway_port_auto_assigned: meta.gateway_port_auto_assigned,
             service_enabled: meta.service_enabled,
@@ -1174,6 +1171,21 @@ fn archive_source_root_is_absolute(root: &Path) -> bool {
             && parts.next().is_some_and(|part| !part.is_empty())
     });
     root.starts_with('/') || drive || unc
+}
+
+#[cfg(windows)]
+fn ordinary_windows_archive_root(root: &Path) -> Option<PathBuf> {
+    let root = root.to_str()?;
+    if let Some(unc) = root.strip_prefix(r"\\?\UNC\") {
+        return Some(PathBuf::from(format!(r"\\{unc}")));
+    }
+    let drive = root.strip_prefix(r"\\?\")?;
+    let bytes = drive.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\'))
+    .then(|| PathBuf::from(drive))
 }
 
 pub fn import_environment(
@@ -1245,6 +1257,21 @@ pub(crate) fn import_environment_with_sandbox_origin(
             }
             source_roots.push(canonical);
         }
+        // Rust records extended-length Windows paths, while Node realpath
+        // returns ordinary drive/UNC spelling. Both denote the captured root.
+        // Only new identity-bearing archives gain these equivalent spellings;
+        // legacy archives keep their existing relocation behavior.
+        #[cfg(windows)]
+        let ordinary_roots: Vec<_> = if extracted.metadata.env.canonical_source_root.is_some() {
+            source_roots
+                .iter()
+                .filter_map(|root| ordinary_windows_archive_root(root))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        #[cfg(windows)]
+        source_roots.extend(ordinary_roots.iter().map(PathBuf::as_path));
         // Match each original reference once, preferring its most specific root.
         source_roots.sort_by_key(|root| std::cmp::Reverse(root.as_os_str().len()));
         source_roots.dedup();
