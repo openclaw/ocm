@@ -1346,6 +1346,12 @@ pub(crate) fn import_environment_with_sandbox_origin(
             let config_rewrite = super::openclaw_config::rewrite_archived_openclaw_config(
                 &target_paths,
                 &source_roots,
+                extracted
+                    .metadata
+                    .env
+                    .canonical_source_root
+                    .as_deref()
+                    .map(Path::new),
                 Some(gateway_port),
                 sandbox_origin.as_deref(),
             )?;

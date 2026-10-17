@@ -291,12 +291,14 @@ enum SandboxOriginPolicy<'a> {
 pub(super) fn rewrite_archived_openclaw_config(
     target_paths: &EnvPaths,
     source_roots: &[&Path],
+    canonical_source_root: Option<&Path>,
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
     rewrite_openclaw_config_with_root_mappings(
         target_paths,
         source_roots,
+        canonical_source_root,
         &target_paths.root,
         gateway_port,
         SandboxOriginPolicy::NewEnvironment(sandbox_origin),
@@ -316,6 +318,7 @@ fn rewrite_openclaw_config_with_root_mapping(
     rewrite_openclaw_config_with_root_mappings(
         target_paths,
         &source_roots,
+        None,
         target_root,
         gateway_port,
         sandbox_origin_policy,
@@ -325,6 +328,7 @@ fn rewrite_openclaw_config_with_root_mapping(
 fn rewrite_openclaw_config_with_root_mappings(
     target_paths: &EnvPaths,
     source_roots: &[&Path],
+    canonical_source_root: Option<&Path>,
     target_root: &Path,
     gateway_port: Option<u32>,
     sandbox_origin_policy: SandboxOriginPolicy<'_>,
@@ -346,7 +350,12 @@ fn rewrite_openclaw_config_with_root_mappings(
 
     let mut changed = false;
     let mut outcome = OpenClawConfigRewriteOutcome::default();
-    changed |= rewrite_env_root_paths_from_roots(&mut value, source_roots, target_root);
+    changed |= rewrite_env_root_paths_from_roots(
+        &mut value,
+        source_roots,
+        canonical_source_root,
+        target_root,
+    );
     changed |= rewrite_workspace_field_if_env_scoped(
         &mut value,
         &target_paths.root,
@@ -1244,37 +1253,60 @@ fn read_gateway_port(value: &Value) -> Option<u32> {
 }
 
 fn rewrite_env_root_paths(value: &mut Value, source_root: &Path, target_root: &Path) -> bool {
-    rewrite_env_root_paths_from_roots(value, &[source_root], target_root)
+    rewrite_env_root_paths_from_roots(value, &[source_root], None, target_root)
 }
 
 fn rewrite_env_root_paths_from_roots(
     value: &mut Value,
     source_roots: &[&Path],
+    canonical_source_root: Option<&Path>,
     target_root: &Path,
 ) -> bool {
     match value {
         Value::String(raw) => {
-            if let [source] = source_roots {
+            if let [source] = source_roots
+                && canonical_source_root.is_none()
+            {
                 return rewrite_env_root_string(raw, source, target_root);
             }
             if !Path::new(raw).is_absolute() {
                 return false;
             }
-            // New archives carry both identities. No source filesystem lookup
-            // or second pass over rewritten destination strings is needed.
+            // Prefer recorded identities, which also work after source removal.
+            // Never run a second pass over a rewritten destination value.
             for source in source_roots {
                 if let Ok(suffix) = Path::new(raw).strip_prefix(source) {
                     *raw = display_path(&clean_path(&target_root.join(suffix)));
                     return true;
                 }
             }
+            // Preserve other live aliases of the captured canonical source.
+            // Do not re-resolve sourceRoot: its alias may have been retargeted
+            // since export, and must not give external paths new ownership.
+            if let Some(source) = canonical_source_root
+                && let Some(original) = normalize_path_allow_missing(Path::new(raw))
+                && let Ok(suffix) = original.strip_prefix(source)
+            {
+                *raw = display_path(&clean_path(&target_root.join(suffix)));
+                return true;
+            }
             false
         }
         Value::Array(values) => values.iter_mut().fold(false, |changed, nested| {
-            rewrite_env_root_paths_from_roots(nested, source_roots, target_root) || changed
+            rewrite_env_root_paths_from_roots(
+                nested,
+                source_roots,
+                canonical_source_root,
+                target_root,
+            ) || changed
         }),
         Value::Object(values) => values.values_mut().fold(false, |changed, nested| {
-            rewrite_env_root_paths_from_roots(nested, source_roots, target_root) || changed
+            rewrite_env_root_paths_from_roots(
+                nested,
+                source_roots,
+                canonical_source_root,
+                target_root,
+            ) || changed
         }),
         _ => false,
     }

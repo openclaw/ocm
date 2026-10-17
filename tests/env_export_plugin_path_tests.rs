@@ -1935,3 +1935,101 @@ fn assert_portable_archive_source_identities() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn state_import_preserves_workspaces_reached_through_other_live_aliases() {
+    use serde_json::{Value, json};
+    use std::os::unix::fs::symlink;
+
+    let root = TestDir::new("archive-other-live-alias");
+    let env = ocm_env(&root);
+    let fixture = fs::canonicalize(root.path()).unwrap();
+    let physical = fixture.join("physical");
+    let external = fixture.join("external");
+    fs::create_dir_all(&physical).unwrap();
+    fs::create_dir_all(external.join("source")).unwrap();
+    let accepted = fixture.join("accepted");
+    let alternate = fixture.join("alternate");
+    let outside = fixture.join("outside-alias");
+    symlink(&physical, &accepted).unwrap();
+    symlink(&physical, &alternate).unwrap();
+    symlink(&external, &outside).unwrap();
+    let source = accepted.join("source");
+    let create = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let state = physical.join("source/.openclaw");
+    let original = format!(
+        "keep {}/source/authored and {}/authored\n",
+        physical.display(),
+        source.display()
+    );
+    write_text(&state.join("custom-workspace/notes.txt"), &original);
+    let external_path = outside.join("source/data.txt");
+    write_text(&external_path, "external bytes");
+    let config = json!({"agents":{"defaults":{"workspace":alternate.join("source/.openclaw/custom-workspace")}}, "plugin":{"path":external_path}}).to_string();
+    write_text(&state.join("openclaw.json"), &config);
+    let archive = fixture.join("state.tar");
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    // The accepted alias now points at unrelated data. Only the recorded
+    // canonical source can establish ownership through the other live alias.
+    fs::remove_file(&accepted).unwrap();
+    symlink(&external, &accepted).unwrap();
+    let target = fixture.join("imported");
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "imported",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    let imported: Value =
+        serde_json::from_slice(&fs::read(target.join(".openclaw/openclaw.json")).unwrap()).unwrap();
+    assert_eq!(
+        imported["agents"]["defaults"]["workspace"],
+        target.join(".openclaw/custom-workspace").to_str().unwrap()
+    );
+    assert_eq!(imported["plugin"]["path"], external_path.to_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(target.join(".openclaw/custom-workspace/notes.txt")).unwrap(),
+        original
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("custom-workspace/notes.txt")).unwrap(),
+        original
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("openclaw.json")).unwrap(),
+        config
+    );
+    assert_eq!(fs::read_to_string(external_path).unwrap(), "external bytes");
+}
