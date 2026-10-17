@@ -807,7 +807,7 @@ case "$script" in
     fi
 
     /bin/mkdir -p "$prefix/node_modules/openclaw"
-    /usr/bin/tar -xzf "$archive" -C "$prefix/node_modules/openclaw" --strip-components=1 package
+    PATH=/usr/bin:/bin /usr/bin/tar -xzf "$archive" -C "$prefix/node_modules/openclaw" --strip-components=1 package || exit $?
     /bin/chmod 755 "$prefix/node_modules/openclaw/openclaw.mjs"
     exit 0
     ;;
