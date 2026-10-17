@@ -87,8 +87,15 @@ fn env_clone_rebases_session_paths_and_drops_database_owners() {
         .unwrap();
     let databases = [
         ".openclaw/agents/main/agent/openclaw-agent.sqlite",
-        ".openclaw/workspace/custom/agent.sqlite",
+        ".openclaw/private-agent/agent.sqlite",
     ];
+    write_text(
+        &source_root.join(".openclaw/openclaw.json"),
+        &serde_json::json!({"agents":{"entries":{"main":{"agentDir":
+            root.child("ocm-home/envs/source/.openclaw/private-agent")
+        }}}})
+        .to_string(),
+    );
     let mut source_databases = Vec::new();
     for (id, relative) in databases.iter().enumerate() {
         let path = source_root.join(relative);
