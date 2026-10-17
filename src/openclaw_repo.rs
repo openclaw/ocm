@@ -962,7 +962,11 @@ pub(crate) fn git_registration_entries(common: &Path, root: &Path) -> Result<Vec
     Ok(entries)
 }
 
-fn read_git_pointer(path: &Path, base: &Path, prefix: &[u8]) -> Result<Option<PathBuf>, String> {
+pub(crate) fn read_git_pointer(
+    path: &Path,
+    base: &Path,
+    prefix: &[u8],
+) -> Result<Option<PathBuf>, String> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1047,7 +1051,7 @@ fn trim_git_line(output: &[u8]) -> &[u8] {
     output.strip_suffix(b"\r").unwrap_or(output)
 }
 
-fn normalize_git_file_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_git_file_path(path: &Path) -> PathBuf {
     let Some(parent) = path.parent() else {
         return clean_path(path);
     };
@@ -1059,12 +1063,12 @@ fn normalize_git_file_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn git_path_from_bytes(path: &[u8]) -> Result<OsString, String> {
+pub(crate) fn git_path_from_bytes(path: &[u8]) -> Result<OsString, String> {
     Ok(OsString::from_vec(path.to_vec()))
 }
 
 #[cfg(not(unix))]
-fn git_path_from_bytes(path: &[u8]) -> Result<OsString, String> {
+pub(crate) fn git_path_from_bytes(path: &[u8]) -> Result<OsString, String> {
     String::from_utf8(path.to_vec())
         .map(OsString::from)
         .map_err(|_| "git returned a non-UTF-8 path".to_string())

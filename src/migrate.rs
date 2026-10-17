@@ -8,8 +8,8 @@ use serde::Serialize;
 use crate::env::{CreateEnvironmentOptions, EnvImportSummary, EnvironmentService};
 use crate::launcher::{AddLauncherOptions, LauncherService};
 use crate::store::{
-    OpenClawDirectoryCopy, OpenClawWorkspaceRuntime, default_env_root, derive_env_paths,
-    display_path, list_environments, normalize_new_environment_sandbox_origin,
+    MigrationWorkspaceCopy, OpenClawDirectoryCopy, OpenClawWorkspaceRuntime, default_env_root,
+    derive_env_paths, display_path, list_environments, normalize_new_environment_sandbox_origin,
     prepare_migrated_runtime_state, reject_include_owned_agent_workspaces,
     reject_include_owned_sandbox_origin, resolve_plain_openclaw_workspaces, resolve_user_home,
     rewrite_external_workspace_paths_for_migration, rewrite_openclaw_config_for_migration,
@@ -61,6 +61,7 @@ struct MigratedLauncherSpec {
 #[derive(Clone, Debug)]
 struct ExternalWorkspaceCopy {
     source: PathBuf,
+    source_alias: PathBuf,
     target: PathBuf,
 }
 
@@ -68,9 +69,22 @@ struct ExternalWorkspaceCopy {
 struct ExternalWorkspaceCopyPlan {
     default_workspace: Option<ExternalWorkspaceCopy>,
     agent_workspaces: BTreeMap<String, ExternalWorkspaceCopy>,
+    copies: Vec<ExternalWorkspaceCopy>,
 }
 
 impl ExternalWorkspaceCopyPlan {
+    fn session_mappings(&self) -> Vec<MigrationWorkspaceCopy<'_>> {
+        self.default_workspace
+            .iter()
+            .chain(self.agent_workspaces.values())
+            .map(|copy| MigrationWorkspaceCopy {
+                source: &copy.source,
+                source_alias: &copy.source_alias,
+                target: &copy.target,
+            })
+            .collect()
+    }
+
     fn for_migration(
         source_home: &Path,
         target_paths: &crate::store::EnvPaths,
@@ -82,14 +96,15 @@ impl ExternalWorkspaceCopyPlan {
                 display_path(source_home)
             )
         })?;
-        let sources = resolve_plain_openclaw_workspaces(&source_home, env)?
-            .external_workspace_sources_for_migration(&source_home)?;
+        let inventory = resolve_plain_openclaw_workspaces(&source_home, env)?;
+        let sources = inventory.workspace_sources_for_migration(&source_home)?;
         let canonical_target_root = canonicalize_path_allow_missing(&target_paths.root)?;
         let mut plan = Self::default();
         if let Some(source) = sources.default_workspace {
             plan.default_workspace = Some(ExternalWorkspaceCopy {
                 target: target_paths.state_dir.join("workspaces/default"),
-                source,
+                source: source.canonical,
+                source_alias: source.configured,
             });
         }
         for (agent_id, source) in sources.agent_workspaces {
@@ -100,7 +115,8 @@ impl ExternalWorkspaceCopyPlan {
                         .state_dir
                         .join("workspaces/agents")
                         .join(agent_id),
-                    source,
+                    source: source.canonical,
+                    source_alias: source.configured,
                 },
             );
         }
@@ -119,7 +135,63 @@ impl ExternalWorkspaceCopyPlan {
                 ));
             }
         }
+        // Choose only maximal admitted external trees. Iteration order gives an
+        // identical root its default destination first, then the first agent ID.
+        let workspaces = plan
+            .default_workspace
+            .iter()
+            .chain(plan.agent_workspaces.values())
+            .collect::<Vec<_>>();
+        for workspace in &workspaces {
+            if workspace.source.starts_with(&source_home)
+                || workspaces.iter().any(|other| {
+                    workspace.source != other.source && workspace.source.starts_with(&other.source)
+                })
+                || plan
+                    .copies
+                    .iter()
+                    .any(|copy| copy.source == workspace.source)
+            {
+                continue;
+            }
+            plan.copies.push((*workspace).clone());
+        }
+        // Leave ordinary internal references to the existing config relocation,
+        // which preserves authored environment-variable templates.
+        plan.default_workspace = plan.default_workspace.and_then(|mut workspace| {
+            workspace.target = project_workspace(&plan.copies, &workspace.source)?;
+            Some(workspace)
+        });
+        plan.agent_workspaces.retain(|_, workspace| {
+            let Some(target) = project_workspace(&plan.copies, &workspace.source) else {
+                return false;
+            };
+            workspace.target = target;
+            true
+        });
+        // Implicit agent workspaces normally follow the rewritten default.
+        // An outer copy can also contain an implicit workspace in the plain home;
+        // retain that relationship without admitting another source tree.
+        for (agent_id, source_alias) in inventory.agent_workspaces() {
+            let source = canonicalize_path_allow_missing(source_alias)?;
+            if let Some(target) = project_workspace(&plan.copies, &source) {
+                plan.agent_workspaces.insert(
+                    agent_id.to_string(),
+                    ExternalWorkspaceCopy {
+                        source,
+                        source_alias: source_alias.to_path_buf(),
+                        target,
+                    },
+                );
+            }
+        }
         Ok(plan)
+    }
+
+    fn workspace_copies(&self) -> impl Iterator<Item = (&Path, &Path)> {
+        self.copies
+            .iter()
+            .map(|copy| (copy.source.as_path(), copy.target.as_path()))
     }
 
     fn copy_and_rewrite_config(
@@ -132,13 +204,8 @@ impl ExternalWorkspaceCopyPlan {
         let state_dir = config_path
             .parent()
             .ok_or("missing imported state directory")?;
-        for workspace in self
-            .default_workspace
-            .iter()
-            .chain(self.agent_workspaces.values())
-        {
-            let relative = workspace
-                .target
+        for (source, target) in self.workspace_copies() {
+            let relative = target
                 .strip_prefix(state_dir)
                 .map_err(|error| error.to_string())?;
             let mut parent = state_dir.to_path_buf();
@@ -147,14 +214,11 @@ impl ExternalWorkspaceCopyPlan {
                 parent.push(component);
                 reject_workspace_destination_link(&parent)?;
             }
-            reject_workspace_copy_destination_links(&workspace.source, &workspace.target)?;
+            reject_workspace_copy_destination_links(source, target)?;
         }
         remove_copied_external_default_workspace_link(config_path)?;
-        if let Some(workspace) = &self.default_workspace {
-            copying.copy(&workspace.source, &workspace.target)?;
-        }
-        for workspace in self.agent_workspaces.values() {
-            copying.copy(&workspace.source, &workspace.target)?;
+        for (source, target) in self.workspace_copies() {
+            copying.copy(source, target)?;
         }
         let agent_workspaces = self
             .agent_workspaces
@@ -170,6 +234,18 @@ impl ExternalWorkspaceCopyPlan {
         )?;
         Ok(())
     }
+}
+
+fn project_workspace(copies: &[ExternalWorkspaceCopy], source: &Path) -> Option<PathBuf> {
+    copies.iter().find_map(|copy| {
+        source.strip_prefix(&copy.source).ok().map(|relative| {
+            if relative.as_os_str().is_empty() {
+                copy.target.clone()
+            } else {
+                copy.target.join(relative)
+            }
+        })
+    })
 }
 
 fn reject_workspace_destination_link(path: &Path) -> Result<(), String> {
@@ -450,6 +526,12 @@ fn complete_migration_import(
         fs::remove_dir_all(&target_paths.state_dir).map_err(|error| error.to_string())?;
     }
 
+    // Stored config and session paths are absolute even when the CLI source is relative.
+    // Keep the source's spelling, including aliases, while resolving it as copying does.
+    let absolute_source_home =
+        std::path::absolute(source_home).map_err(|error| error.to_string())?;
+    let source_home = absolute_source_home.as_path();
+    let canonical_source_home = fs::canonicalize(source_home).map_err(|error| error.to_string())?;
     let mut copying = OpenClawDirectoryCopy::new(source_home, source_home)?;
     copying.copy(source_home, &target_paths.state_dir)?;
     external_workspace_plan.copy_and_rewrite_config(&target_paths.config_path, &mut copying)?;
@@ -463,6 +545,9 @@ fn complete_migration_import(
     let runtime_state = prepare_migrated_runtime_state(
         target_paths,
         source_home,
+        &canonical_source_home,
+        copying.databases(),
+        &external_workspace_plan.session_mappings(),
         env,
         OpenClawWorkspaceRuntime::for_env(&created.name, created.gateway_port),
     )?;
