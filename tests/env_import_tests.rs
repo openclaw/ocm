@@ -103,10 +103,11 @@ fn env_import_restores_an_archive_with_a_new_name_and_root() {
     let source_state = root.child("ocm-home/envs/source/.openclaw");
     write_text(
         &source_state.join("openclaw.json"),
-        &format!(
-            r#"{{"agents":{{"list":[{{"id":"main","default":true}},{{"id":"ops","workspace":"{}"}}]}}}}"#,
-            source_state.join("team/ops").display()
-        ),
+        &serde_json::json!({"agents":{"list":[
+            {"id":"main","default":true},
+            {"id":"ops","workspace":source_state.join("team/ops")}
+        ]}})
+        .to_string(),
     );
     write_text(
         &source_state.join("team/ops/custom.txt"),
@@ -373,10 +374,11 @@ fn env_import_rewrites_openclaw_config_for_the_new_root() {
     let source_root = root.child("ocm-home/envs/source");
     fs::write(
         source_root.join(".openclaw/openclaw.json"),
-        format!(
-            "{{\n  \"agents\": {{\n    \"defaults\": {{\n      \"workspace\": \"{}\"\n    }}\n  }},\n  \"gateway\": {{\n    \"port\": 19789\n  }}\n}}\n",
-            source_root.join(".openclaw/workspace").display()
-        ),
+        serde_json::json!({
+            "agents":{"defaults":{"workspace":source_root.join(".openclaw/workspace")}},
+            "gateway":{"port":19789}
+        })
+        .to_string(),
     )
     .unwrap();
 
@@ -656,4 +658,439 @@ fn env_import_keeps_agent_auth_but_drops_live_runtime_state() {
     assert!(!target_state.join("agents/main/sessions").exists());
     assert!(!target_state.join("logs").exists());
     assert!(!target_state.join("openclaw.json.bak").exists());
+}
+
+#[test]
+fn env_import_owns_selected_git_graphs_and_rolls_back_incomplete_graphs() {
+    assert_imported_git_graphs(&[
+        (false, false, false, ImportGitLayout::Selected),
+        (false, true, false, ImportGitLayout::Selected),
+        (true, false, false, ImportGitLayout::Selected),
+        (true, true, false, ImportGitLayout::Selected),
+        (true, false, true, ImportGitLayout::Selected),
+    ]);
+}
+
+#[test]
+fn env_import_maps_original_git_pointers_when_target_overlaps_old_source() {
+    assert_imported_git_graphs(&[
+        (false, false, false, ImportGitLayout::NestedTarget),
+        (true, false, false, ImportGitLayout::NestedTarget),
+    ]);
+}
+
+#[test]
+fn env_import_preserves_an_ordinary_archive_root_checkout() {
+    assert_imported_git_graphs(&[(false, false, false, ImportGitLayout::EnvironmentRoot)]);
+}
+
+#[derive(Clone, Copy)]
+enum ImportGitLayout {
+    Selected,
+    NestedTarget,
+    EnvironmentRoot,
+}
+
+fn assert_imported_git_graphs(cases: &[(bool, bool, bool, ImportGitLayout)]) {
+    use rusqlite::{Connection, params};
+    use sha2::{Digest, Sha256};
+
+    for &(include_state, incomplete, protected_history, layout) in cases {
+        let nested = matches!(layout, ImportGitLayout::NestedTarget);
+        let root_checkout = matches!(layout, ImportGitLayout::EnvironmentRoot);
+        if protected_history && !cfg!(unix) {
+            continue;
+        }
+        let fixture = TestDir::new("import-copied-git");
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let env = ocm_env(&fixture);
+        let source = root.join("source");
+        let target = if nested {
+            source.join("projects")
+        } else {
+            root.join("target")
+        };
+        let created = run_ocm(
+            &root,
+            &env,
+            &[
+                "env",
+                "create",
+                "source",
+                "--root",
+                source.to_str().unwrap(),
+            ],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        // These repositories are selected outside configured workspaces.
+        let repository = if root_checkout {
+            source.clone()
+        } else {
+            source.join("projects/repository")
+        };
+        let checkout = source.join(if include_state {
+            ".openclaw/worktrees/task"
+        } else {
+            "projects/task"
+        });
+        fs::create_dir_all(&repository).unwrap();
+        let git = |path: &Path, args: &[&str]| import_git(path, &env, args);
+        git(&repository, &["init", "-q"]);
+        write_text(&repository.join("authored.txt"), "authored content\n");
+        git(&repository, &["add", "authored.txt"]);
+        git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        git(
+            &repository,
+            &["worktree", "add", "-qb", "task", checkout.to_str().unwrap()],
+        );
+        git(
+            &repository,
+            &["update-ref", "refs/snapshots/archive", "HEAD"],
+        );
+        let retained_config = source.join(".openclaw/credentials/copied-git.conf");
+        if !include_state && !incomplete && !root_checkout {
+            fs::create_dir_all(retained_config.parent().unwrap()).unwrap();
+            fs::write(&retained_config, "[fixture]\n\tretained = selected\n").unwrap();
+            fs::write(
+                retained_config.with_file_name("unrelated.cache"),
+                "runtime debris",
+            )
+            .unwrap();
+            git(
+                &repository,
+                &["config", "include.path", retained_config.to_str().unwrap()],
+            );
+            assert_eq!(
+                git(&checkout, &["config", "--get", "fixture.retained"]),
+                "selected"
+            );
+        }
+        let private = repository.join(".git/worktrees/task");
+        let index = fs::read(private.join("index")).unwrap();
+        if incomplete {
+            write_text(
+                &private.join("commondir"),
+                source.join("missing-git").to_str().unwrap(),
+            );
+        }
+        let pointer = fs::read(checkout.join(".git")).unwrap();
+        let database = source.join(".openclaw/state/openclaw.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let db = Connection::open(&database).unwrap();
+        db.execute_batch("CREATE TABLE worktrees (id TEXT PRIMARY KEY, repo_fingerprint TEXT, repo_root TEXT, path TEXT, branch TEXT, base_ref TEXT, snapshot_ref TEXT);").unwrap();
+        db.execute("INSERT INTO worktrees VALUES ('bound', 'old-fingerprint', ?1, ?2, 'task', 'HEAD', 'refs/snapshots/archive')", params![repository.to_str(), checkout.to_str()]).unwrap();
+        drop(db);
+        let database_bytes = fs::read(&database).unwrap();
+        let historical = source.join(".openclaw/skill-workshop/snapshot/.git");
+        write_text(&historical, "gitdir: /historical/uncopied/storage\n");
+        let protected_config = source.join(".openclaw/skill-workshop/support/git-config");
+        #[cfg(unix)]
+        if protected_history {
+            fs::create_dir_all(protected_config.parent().unwrap()).unwrap();
+            git(
+                &repository,
+                &["config", "core.worktree", repository.to_str().unwrap()],
+            );
+            fs::rename(repository.join(".git/config"), &protected_config).unwrap();
+            std::os::unix::fs::symlink(&protected_config, repository.join(".git/config")).unwrap();
+        }
+        let protected_bytes = protected_history.then(|| fs::read(&protected_config).unwrap());
+        let archive = root.join("source.tar");
+        let mut args = vec![
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ];
+        if include_state {
+            args.push("--include-state");
+        }
+        let exported = run_ocm(&root, &env, &args);
+        assert!(exported.status.success(), "{}", stderr(&exported));
+        assert_eq!(fs::read(&database).unwrap(), database_bytes);
+        let archive_bytes = fs::read(&archive).unwrap();
+        let offline = root.join("offline");
+        fs::rename(&source, &offline).unwrap();
+        let mut import_env = env.clone();
+        if nested {
+            import_env.insert(
+                "OCM_HOME".into(),
+                root.join("import-store").display().to_string(),
+            );
+        }
+        let imported = run_ocm(
+            &root,
+            &import_env,
+            &[
+                "env",
+                "import",
+                archive.to_str().unwrap(),
+                "--name",
+                "target",
+                "--root",
+                target.to_str().unwrap(),
+                "--json",
+            ],
+        );
+        assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+        assert_eq!(
+            fs::read(offline.join(database.strip_prefix(&source).unwrap())).unwrap(),
+            database_bytes
+        );
+        assert_eq!(
+            fs::read(
+                offline
+                    .join(checkout.strip_prefix(&source).unwrap())
+                    .join(".git")
+            )
+            .unwrap(),
+            pointer
+        );
+        if let Some(bytes) = &protected_bytes {
+            assert_eq!(
+                fs::read(offline.join(protected_config.strip_prefix(&source).unwrap())).unwrap(),
+                *bytes
+            );
+        }
+        if incomplete || protected_history {
+            assert!(!imported.status.success(), "{}", stdout(&imported));
+            assert!(
+                stderr(&imported).contains(if incomplete {
+                    "missing-git"
+                } else {
+                    "integrity-protected history"
+                }),
+                "{}",
+                stderr(&imported)
+            );
+            assert!(!target.exists(), "incomplete import remained");
+            let listed = run_ocm(&root, &import_env, &["env", "list", "--json"]);
+            assert!(listed.status.success(), "{}", stderr(&listed));
+            assert!(!stdout(&listed).contains(target.to_str().unwrap()));
+            continue;
+        }
+        assert!(imported.status.success(), "{}", stderr(&imported));
+        let copied_repository = target.join(repository.strip_prefix(&source).unwrap());
+        let copied_checkout = target.join(checkout.strip_prefix(&source).unwrap());
+        let common = fs::canonicalize(copied_repository.join(".git")).unwrap();
+        git(
+            &copied_repository,
+            &["worktree", "lock", copied_checkout.to_str().unwrap()],
+        );
+        assert!(common.join("worktrees/task/locked").exists());
+        assert!(
+            !offline
+                .join(private.strip_prefix(&source).unwrap())
+                .join("locked")
+                .exists()
+        );
+        git(
+            &copied_repository,
+            &["worktree", "unlock", copied_checkout.to_str().unwrap()],
+        );
+        assert!(!common.join("worktrees/task/locked").exists());
+        let actual_common = git(&copied_checkout, &["rev-parse", "--git-common-dir"]);
+        assert_eq!(
+            fs::canonicalize(copied_checkout.join(actual_common)).unwrap(),
+            common
+        );
+        assert_eq!(
+            git(&copied_checkout, &["symbolic-ref", "--short", "HEAD"]),
+            "task"
+        );
+        assert_eq!(
+            git(&copied_repository, &["rev-parse", "refs/snapshots/archive"]),
+            git(&copied_checkout, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            fs::read(common.join("worktrees/task/index")).unwrap(),
+            index
+        );
+        assert_eq!(
+            fs::read_to_string(copied_checkout.join("authored.txt")).unwrap(),
+            "authored content\n"
+        );
+        if !include_state && !root_checkout {
+            let config = target.join(retained_config.strip_prefix(&source).unwrap());
+            assert_eq!(
+                fs::read_to_string(&config).unwrap(),
+                "[fixture]\n\tretained = selected\n"
+            );
+            assert!(!config.with_file_name("unrelated.cache").exists());
+            assert_eq!(
+                git(&copied_checkout, &["config", "--get", "fixture.retained"]),
+                "selected"
+            );
+        }
+        let copied_database = target.join(".openclaw/state/openclaw.sqlite");
+        assert_eq!(copied_database.exists(), include_state);
+        if include_state {
+            let db = Connection::open(&copied_database).unwrap();
+            let row: (String, String, String, String, String, String, String) = db.query_row("SELECT id, repo_root, path, repo_fingerprint, branch, base_ref, snapshot_ref FROM worktrees", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))).unwrap();
+            assert_eq!(
+                fs::canonicalize(&row.1).unwrap(),
+                fs::canonicalize(&copied_repository).unwrap()
+            );
+            assert_eq!(
+                fs::canonicalize(&row.2).unwrap(),
+                fs::canonicalize(&copied_checkout).unwrap()
+            );
+            assert!(!row.1.starts_with(r"\\?\"));
+            assert!(!row.2.starts_with(r"\\?\"));
+            let registered_common = Path::new(&row.1).join(".git");
+            let fingerprint =
+                Sha256::digest(format!("{}\n", registered_common.display()).as_bytes())[..8]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+            assert_eq!(
+                row,
+                (
+                    "bound".into(),
+                    row.1.clone(),
+                    row.2.clone(),
+                    fingerprint,
+                    "task".into(),
+                    "HEAD".into(),
+                    "refs/snapshots/archive".into()
+                )
+            );
+            assert_eq!(
+                db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+            assert_eq!(
+                fs::read(target.join(historical.strip_prefix(&source).unwrap())).unwrap(),
+                b"gitdir: /historical/uncopied/storage\n"
+            );
+            let summary: Value = serde_json::from_str(&stdout(&imported)).unwrap();
+            let database_key = Path::new(".openclaw").join("state").join("openclaw.sqlite");
+            assert_eq!(
+                summary["databasePathsRewritten"][database_key.to_str().unwrap()],
+                2,
+                "{summary}"
+            );
+        }
+    }
+}
+
+fn import_git_argument(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(path) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{path}");
+        }
+        if let Some(path) = value.strip_prefix(r"\\?\") {
+            return path.to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn import_git(
+    path: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    args: &[&str],
+) -> String {
+    let result = std::process::Command::new("git")
+        .arg("-C")
+        .arg(import_git_argument(&path.to_string_lossy()))
+        .args(args.iter().map(|value| import_git_argument(value)))
+        .env_clear()
+        .envs(env)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", stderr(&result));
+    stdout(&result).trim().to_string()
+}
+
+#[test]
+fn env_import_preserves_selected_bare_repository() {
+    let fixture = TestDir::new("import-selected-bare-git");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let target = root.join("target");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let repository = source.join("projects/bare");
+    fs::create_dir_all(&repository).unwrap();
+    import_git(&repository, &env, &["init", "-q"]);
+    import_git(&repository, &env, &["config", "core.bare", "true"]);
+    assert_eq!(
+        import_git(&repository, &env, &["rev-parse", "--is-bare-repository"]),
+        "true"
+    );
+    let before = fs::read(repository.join(".git/config")).unwrap();
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let archive_before = fs::read(&archive).unwrap();
+    let offline = root.join("offline");
+    fs::rename(&source, &offline).unwrap();
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert_eq!(fs::read(archive).unwrap(), archive_before);
+    assert_eq!(
+        fs::read(offline.join("projects/bare/.git/config")).unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read(target.join("projects/bare/.git/config")).unwrap(),
+        before
+    );
+    assert_eq!(
+        import_git(
+            &target.join("projects/bare"),
+            &env,
+            &["rev-parse", "--is-bare-repository"]
+        ),
+        "true"
+    );
 }

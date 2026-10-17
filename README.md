@@ -585,6 +585,11 @@ Import refuses to update a database outside the copied root; internal database
 links are retained.
 Owned file and directory links use relative targets in the archive; external
 and dangling links retain their targets without copying external contents.
+Import relocates selected Git repositories and linked worktrees to the destination before registering the environment.
+Their required Git storage must be present inside the copied archive; an incomplete graph or unresolved copied lock fails import and removes the incomplete target without modifying the archive or source.
+Git indexes, branches, snapshot refs, authored files, and protected history retain their contents.
+Use `--include-state` when managed-session registry continuity is needed: ordinary archives still omit `.openclaw/state/openclaw.sqlite` and only retain their existing selected files.
+
 State-inclusive archives are created with private access. Import preserves
 directory modes under a private environment root and leaves it stopped;
 export leaves the source unchanged.

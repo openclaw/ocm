@@ -61,6 +61,7 @@ pub(in crate::store) fn relocate_copied_worktrees(
     paths: &EnvPaths,
     mappings: &[(&Path, &Path)],
     mut contexts: Vec<CopiedGitConfigContext>,
+    copied_git_roots: &[PathBuf],
 ) -> Result<CopiedWorktrees, String> {
     let database_path = paths.state_dir.join("state/openclaw.sqlite");
     let database =
@@ -80,6 +81,9 @@ pub(in crate::store) fn relocate_copied_worktrees(
         links: BTreeMap::new(),
         preserved: BTreeSet::new(),
     };
+    for root in copied_git_roots {
+        graph.checkout(root)?;
+    }
     let records = read_managed_registry(database.as_deref(), &mut graph)?;
     if let Some(database) = database.as_ref().filter(|_| !records.is_empty())
         && graph.owned(&database_path)? != *database
@@ -201,15 +205,35 @@ impl CopiedWorktrees {
             }
         }
         validate_copied_git_config(&paths.root, &self.contexts)?;
+        let managed_roots = self
+            .records
+            .iter()
+            .flat_map(|record| [&record.repo, &record.checkout])
+            .collect::<BTreeSet<_>>();
         for (path, expected) in &self.checkouts {
             let actual = git_identity_paths(path)?.ok_or("copied Git checkout disappeared")?;
+            let checkout_matches = match git_value(path, &["rev-parse", "--show-toplevel"]) {
+                Ok(top) => {
+                    fs::canonicalize(top).map_err(|error| error.to_string())?
+                        == fs::canonicalize(path).map_err(|error| error.to_string())?
+                }
+                Err(error) => {
+                    // A selected repository may be bare, but a managed binding
+                    // must still identify its expected working checkout.
+                    if !managed_roots.contains(path)
+                        && git_value(path, &["rev-parse", "--is-bare-repository"])? == "true"
+                    {
+                        true
+                    } else {
+                        return Err(error);
+                    }
+                }
+            };
             if fs::canonicalize(actual.private_dir).map_err(|e| e.to_string())?
                 != fs::canonicalize(&expected.private).map_err(|error| error.to_string())?
                 || fs::canonicalize(actual.common_dir).map_err(|e| e.to_string())?
                     != fs::canonicalize(&expected.common).map_err(|error| error.to_string())?
-                || fs::canonicalize(git_value(path, &["rev-parse", "--show-toplevel"])?)
-                    .map_err(|error| error.to_string())?
-                    != fs::canonicalize(path).map_err(|error| error.to_string())?
+                || !checkout_matches
             {
                 return Err(format!(
                     "copied Git checkout did not resolve to its destination: {}",
@@ -309,8 +333,7 @@ fn read_managed_registry(
     if !is_sqlite_database(database)? {
         return Ok(Vec::new());
     }
-    let db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|error| error.to_string())?;
+    let db = open_copied_database_readonly(database)?;
     if !has_table(&db, "worktrees")? {
         return Ok(Vec::new());
     }
@@ -491,6 +514,11 @@ impl CopyGraph<'_> {
         if let Ok(relative) = path.strip_prefix(native_path(self.target).as_ref()) {
             return Some(self.root.join(relative));
         }
+        self.project_source(&path)
+    }
+
+    fn project_source(&self, path: &Path) -> Option<PathBuf> {
+        let path = native_path(path);
         self.mappings
             .iter()
             .filter_map(|(source, target)| {
@@ -505,6 +533,17 @@ impl CopyGraph<'_> {
                     .map(|relative| self.root.join(relative))
                     .unwrap_or(target)
             })
+    }
+
+    // Stored absolute values still name the source even when the destination
+    // is nested under that former root. Relative values use their copied base.
+    // Keep this separate from already-relocated registry and selected paths.
+    fn project_copied_value(&self, value: &Path, base: &Path) -> Option<PathBuf> {
+        if value.is_absolute() {
+            self.project_source(value).or_else(|| self.project(value))
+        } else {
+            self.project(&base.join(value))
+        }
     }
 
     fn owned(&mut self, path: &Path) -> Result<PathBuf, String> {
@@ -561,14 +600,17 @@ impl CopyGraph<'_> {
                 } else {
                     current.parent().unwrap().join(&original)
                 };
-                let target = self.resolve_owned(&value, depth + 1, record)?;
+                let projected = self
+                    .project_copied_value(&original, current.parent().unwrap())
+                    .ok_or_else(|| format!("cannot copy managed worktree: required Git path is outside the copied environment: {}", display_path(&value)))?;
+                let target = self.resolve_owned(&projected, depth + 1, record)?;
                 if record {
                     // Retain every encountered role, including relative file
                     // aliases that need no link rewrite. Cached directories
                     // keep these observations from their initial resolution.
                     self.resolved_aliases
                         .insert(current.clone(), target.clone());
-                    if self.project(&value).as_deref() != Some(value.as_path()) {
+                    if projected != value {
                         self.links
                             .insert(current.clone(), (original, target.clone()));
                     }
@@ -598,17 +640,25 @@ impl CopyGraph<'_> {
         }
         let is_backlink = file.file_name() == Some(OsStr::new("gitdir"));
         let file = self.owned(file)?;
-        let value = read_git_pointer(&file, base, prefix)?.ok_or("Git pointer disappeared")?;
+        // An empty base preserves the stored value's original relativity.
+        let original =
+            read_git_pointer(&file, Path::new(""), prefix)?.ok_or("Git pointer disappeared")?;
+        let value = base.join(&original);
+        let projected = self.project_copied_value(&original, base).ok_or_else(|| {
+            format!(
+                "cannot copy managed worktree: Git pointer is outside the copied environment: {}",
+                display_path(&value)
+            )
+        })?;
         let target = if is_backlink {
             // Git infers the checkout from the backlink's parent, so keep the
             // .git entry name even when that final entry is itself a symlink.
-            let projected = self.project(&value).ok_or_else(|| format!("cannot copy managed worktree: Git backlink is outside the copied environment: {}", display_path(&value)))?;
             let parent = self.owned(projected.parent().ok_or("Git backlink has no parent")?)?;
             let entry = parent.join(projected.file_name().ok_or("Git backlink has no name")?);
             self.owned(&entry)?;
             entry
         } else {
-            self.owned(&value)?
+            self.owned(&projected)?
         };
         if clean_path(&value) != target {
             let mut bytes = prefix.to_vec();
@@ -797,12 +847,8 @@ impl CopyGraph<'_> {
             };
             #[cfg(not(unix))]
             let path = PathBuf::from(String::from_utf8(raw).map_err(|e| e.to_string())?);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                objects.join(path)
-            };
-            let target = self.owned(&path)?;
+            let projected = self.project_copied_value(&path, &objects).ok_or_else(|| format!("cannot copy managed worktree: Git alternate is outside the copied environment: {}", display_path(&path)))?;
+            let target = self.owned(&projected)?;
             self.alternates(&target)?;
             updated.push(b'"');
             for byte in git_path(&target).as_os_str().as_encoded_bytes() {
@@ -819,5 +865,99 @@ impl CopyGraph<'_> {
             self.writes.insert(file, updated);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_git_graph_relocates_offline_without_managed_registry() {
+        for path_only_table in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let temp_root = fs::canonicalize(temp.path()).unwrap();
+            let source = temp_root.join("plain-home");
+            let repository = temp_root.join("separate-workspace");
+            let target = derive_env_paths(&temp_root.join("target"));
+            fs::create_dir_all(&repository).unwrap();
+            let git = |path: &Path, args: &[&str]| {
+                let output = git_command()
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env(
+                        "GIT_CONFIG_GLOBAL",
+                        if cfg!(windows) { "NUL" } else { "/dev/null" },
+                    )
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&repository, &["init", "-q"]);
+            fs::write(repository.join("file"), "content").unwrap();
+            git(&repository, &["add", "file"]);
+            git(
+                &repository,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+            );
+            let checkout = source.join("worktrees/task");
+            fs::create_dir_all(checkout.parent().unwrap()).unwrap();
+            git(
+                &repository,
+                &["worktree", "add", "-qb", "task", checkout.to_str().unwrap()],
+            );
+            super::super::super::common::copy_dir_recursive(&source, &target.state_dir).unwrap();
+            super::super::super::common::copy_dir_recursive(&repository, &target.workspace_dir)
+                .unwrap();
+            let db_path = target.state_dir.join("state/openclaw.sqlite");
+            let before = if path_only_table {
+                fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+                let db = Connection::open(&db_path).unwrap();
+                db.execute_batch("CREATE TABLE worktrees (path TEXT); INSERT INTO worktrees VALUES ('historical path');").unwrap();
+                drop(db);
+                Some(fs::read(&db_path).unwrap())
+            } else {
+                None
+            };
+            fs::remove_dir_all(&source).unwrap();
+            fs::remove_dir_all(&repository).unwrap();
+            let retained = relocate_copied_worktrees(
+                &target,
+                &[
+                    (&source, &target.state_dir),
+                    (&repository, &target.workspace_dir),
+                ],
+                Vec::new(),
+                std::slice::from_ref(&target.workspace_dir),
+            )
+            .unwrap();
+            let retained_roots = retained.preserved_roots.clone();
+            retained.finish(&target).unwrap();
+            let copied_checkout = target.state_dir.join("worktrees/task");
+            let identity = git_identity_paths(&copied_checkout).unwrap().unwrap();
+            assert_eq!(
+                fs::canonicalize(identity.common_dir).unwrap(),
+                fs::canonicalize(target.workspace_dir.join(".git")).unwrap()
+            );
+            assert!(retained_roots.contains(&copied_checkout));
+            git(&copied_checkout, &["status", "--porcelain"]);
+            if let Some(before) = before {
+                assert_eq!(fs::read(db_path).unwrap(), before);
+            }
+        }
     }
 }

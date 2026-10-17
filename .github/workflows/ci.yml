@@ -65,6 +65,9 @@ jobs:
       - name: Prove imported state path relocation
         timeout-minutes: 5
         run: cargo test --locked --test env_export_plugin_path_tests state_import_relocates_plugin_receipts_and_runtime_references_only -- --exact
+      - name: Prove imported Git ownership
+        timeout-minutes: 5
+        run: cargo test --locked --test env_import_tests -- --nocapture
       - name: Prove local and network file URL relocation
         timeout-minutes: 5
         run: cargo test --locked --lib store::openclaw_state::tests::file_url_relocation_changes_windows_authority -- --exact
