@@ -34,12 +34,13 @@ struct CopyGraph<'a> {
     preserved: BTreeSet<PathBuf>,
 }
 
-/// Finalize recognized managed rows and their copied Git graph.
+/// Finalize caller-selected copied Git roots and recognized managed rows.
 /// Mappings describe existing copy operations; this never
 /// acquires missing source data or expands a caller's copy selection.
 pub(in crate::store) fn relocate_copied_worktrees(
     paths: &EnvPaths,
     mappings: &[(&Path, &Path)],
+    copied_git_roots: &[PathBuf],
 ) -> Result<BTreeSet<PathBuf>, String> {
     let database = contained_imported_database(
         &paths.state_dir.join("state/openclaw.sqlite"),
@@ -63,6 +64,9 @@ pub(in crate::store) fn relocate_copied_worktrees(
         config_files: BTreeSet::new(),
         preserved: BTreeSet::new(),
     };
+    for root in copied_git_roots {
+        graph.checkout(root)?;
+    }
     let records = read_managed_registry(database.as_deref(), &mut graph)?;
     if graph.checkouts.is_empty() {
         return Ok(BTreeSet::new());
@@ -223,8 +227,7 @@ fn read_managed_registry(
     if !is_sqlite_database(database)? {
         return Ok(Vec::new());
     }
-    let db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|error| error.to_string())?;
+    let db = open_copied_database_readonly(database)?;
     if !has_table(&db, "worktrees")? {
         return Ok(Vec::new());
     }
@@ -875,5 +878,96 @@ impl CopyGraph<'_> {
             self.writes.insert(file, updated.into_bytes());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_git_graph_relocates_offline_without_managed_registry() {
+        for path_only_table in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let temp_root = fs::canonicalize(temp.path()).unwrap();
+            let source = temp_root.join("plain-home");
+            let repository = temp_root.join("separate-workspace");
+            let target = derive_env_paths(&temp_root.join("target"));
+            fs::create_dir_all(&repository).unwrap();
+            let git = |path: &Path, args: &[&str]| {
+                let output = git_command()
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env(
+                        "GIT_CONFIG_GLOBAL",
+                        if cfg!(windows) { "NUL" } else { "/dev/null" },
+                    )
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&repository, &["init", "-q"]);
+            fs::write(repository.join("file"), "content").unwrap();
+            git(&repository, &["add", "file"]);
+            git(
+                &repository,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+            );
+            let checkout = source.join("worktrees/task");
+            fs::create_dir_all(checkout.parent().unwrap()).unwrap();
+            git(
+                &repository,
+                &["worktree", "add", "-qb", "task", checkout.to_str().unwrap()],
+            );
+            super::super::super::common::copy_dir_recursive(&source, &target.state_dir).unwrap();
+            super::super::super::common::copy_dir_recursive(&repository, &target.workspace_dir)
+                .unwrap();
+            let db_path = target.state_dir.join("state/openclaw.sqlite");
+            let before = if path_only_table {
+                fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+                let db = Connection::open(&db_path).unwrap();
+                db.execute_batch("CREATE TABLE worktrees (path TEXT); INSERT INTO worktrees VALUES ('historical path');").unwrap();
+                drop(db);
+                Some(fs::read(&db_path).unwrap())
+            } else {
+                None
+            };
+            fs::remove_dir_all(&source).unwrap();
+            fs::remove_dir_all(&repository).unwrap();
+            let retained = relocate_copied_worktrees(
+                &target,
+                &[
+                    (&source, &target.state_dir),
+                    (&repository, &target.workspace_dir),
+                ],
+                std::slice::from_ref(&target.workspace_dir),
+            )
+            .unwrap();
+            let copied_checkout = target.state_dir.join("worktrees/task");
+            let identity = git_identity_paths(&copied_checkout).unwrap().unwrap();
+            assert_eq!(
+                fs::canonicalize(identity.common_dir).unwrap(),
+                fs::canonicalize(target.workspace_dir.join(".git")).unwrap()
+            );
+            assert!(retained.contains(&copied_checkout));
+            git(&copied_checkout, &["status", "--porcelain"]);
+            if let Some(before) = before {
+                assert_eq!(fs::read(db_path).unwrap(), before);
+            }
+        }
     }
 }

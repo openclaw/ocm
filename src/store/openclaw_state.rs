@@ -260,6 +260,72 @@ pub(super) struct ArchivedRuntimeStateResult {
     pub databases: BTreeMap<String, u64>,
 }
 
+pub(super) fn finalize_archived_worktrees(
+    paths: &EnvPaths,
+    source_roots: &[&Path],
+) -> Result<(), String> {
+    let mut directories = vec![paths.root.clone()];
+    let mut git_roots = BTreeSet::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if is_integrity_protected_history_path(&paths.state_dir, &path) {
+                continue;
+            }
+            if entry.file_name() == ".git" {
+                if is_copied_git_entry(
+                    &path,
+                    entry.file_type().map_err(|error| error.to_string())?,
+                )? {
+                    git_roots.insert(directory.clone());
+                }
+            } else if entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+            {
+                // Only inspect the copied tree. Links do not select external
+                // content, and Git's administrative storage is not a checkout.
+                directories.push(path);
+            }
+        }
+    }
+    let mappings: Vec<_> = source_roots
+        .iter()
+        .map(|source| (*source, paths.root.as_path()))
+        .collect();
+    relocate_copied_worktrees(paths, &mappings, &git_roots.into_iter().collect::<Vec<_>>())?;
+    Ok(())
+}
+
+fn is_copied_git_entry(path: &Path, kind: fs::FileType) -> Result<bool, String> {
+    if kind.is_symlink() {
+        return Ok(true);
+    }
+    if kind.is_file() {
+        let mut prefix = Vec::new();
+        fs::File::open(path)
+            .map_err(|error| error.to_string())?
+            .take(8)
+            .read_to_end(&mut prefix)
+            .map_err(|error| error.to_string())?;
+        return Ok(prefix == b"gitdir: ");
+    }
+    if !kind.is_dir() {
+        return Ok(false);
+    }
+    // Packages can contain a .git/HEAD fixture without a Git repository.
+    // Recognize administrative storage without following any of its links;
+    // registered managed checkouts still receive the graph's strict validation.
+    let present = |name: &str| match fs::symlink_metadata(path.join(name)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    };
+    Ok(present("HEAD")? && (present("objects")? || present("commondir")?))
+}
+
 pub(super) fn relocate_archived_runtime_state(
     paths: &EnvPaths,
     source_root: &Path,
@@ -1912,6 +1978,19 @@ fn contained_imported_database(
     Ok(Some(canonical_database))
 }
 
+fn open_copied_database_readonly(database: &Path) -> Result<Connection, String> {
+    // The copied database is a closed snapshot with no WAL. Ordinary read-only
+    // WAL connections can create sidecars merely while discovering its schema.
+    let mut location =
+        url::Url::from_file_path(database).map_err(|_| "invalid copied database path")?;
+    location.set_query(Some("immutable=1"));
+    Connection::open_with_flags(
+        location.as_str(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn relocatable_plugin_path(
     path: &Path,
     source_state_root: &Path,
@@ -1977,17 +2056,10 @@ impl<'a> OpenClawSqliteCopy<'a> {
 
     fn read_agent_registry(&mut self, database: &Path, archived: bool) -> Result<(), String> {
         let db = if archived {
-            // This is a closed snapshot in the private import copy, with no WAL.
-            // Read-only WAL connections otherwise create sidecars on discovery.
-            let mut location =
-                url::Url::from_file_path(database).map_err(|_| "invalid imported database path")?;
-            location.set_query(Some("immutable=1"));
-            Connection::open_with_flags(
-                location.as_str(),
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-            )
+            open_copied_database_readonly(database)
         } else {
             Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| error.to_string())
         }
         .map_err(|error| format!("failed to inspect OpenClaw SQLite owners: {error}"))?;
         let has_registry: bool = db.query_row(

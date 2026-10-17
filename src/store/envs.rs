@@ -813,6 +813,7 @@ fn clone_environment_with_policy(
                 (&source_paths.root, &target_paths.root),
                 (&canonical_source_root, &target_paths.root),
             ],
+            &[],
         )?;
         let created_at = now_utc();
         let gateway_port = choose_cloned_gateway_port(&source, &registry.envs, env);
@@ -1360,12 +1361,21 @@ pub(crate) fn import_environment_with_sandbox_origin(
             } else {
                 Default::default()
             };
+            if !extracted.metadata.include_state {
+                clear_copied_runtime_state(&target_paths, env, target_runtime)?;
+            }
+            let source_roots: Vec<_> = extracted
+                .metadata
+                .env
+                .source_root
+                .as_deref()
+                .map(Path::new)
+                .into_iter()
+                .collect();
+            super::openclaw_state::finalize_archived_worktrees(&target_paths, &source_roots)?;
             if let Some(permissions) = &config_directory_permissions {
                 fs::set_permissions(&target_paths.state_dir, permissions.clone())
                     .map_err(|error| error.to_string())?;
-            }
-            if !extracted.metadata.include_state {
-                clear_copied_runtime_state(&target_paths, env, target_runtime)?;
             }
 
             let created_at = now_utc();
