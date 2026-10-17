@@ -141,18 +141,19 @@ impl ExternalWorkspaceCopyPlan {
             }
             plan.copies.push((*workspace).clone());
         }
-        for workspace in plan
-            .default_workspace
-            .iter_mut()
-            .chain(plan.agent_workspaces.values_mut())
-        {
-            workspace.target =
-                project_workspace(&plan.copies, &workspace.source).unwrap_or_else(|| {
-                    target_paths
-                        .state_dir
-                        .join(workspace.source.strip_prefix(&source_home).unwrap())
-                });
-        }
+        // Leave ordinary internal references to the existing config relocation,
+        // which preserves authored environment-variable templates.
+        plan.default_workspace = plan.default_workspace.and_then(|mut workspace| {
+            workspace.target = project_workspace(&plan.copies, &workspace.source)?;
+            Some(workspace)
+        });
+        plan.agent_workspaces.retain(|_, workspace| {
+            let Some(target) = project_workspace(&plan.copies, &workspace.source) else {
+                return false;
+            };
+            workspace.target = target;
+            true
+        });
         // Implicit agent workspaces normally follow the rewritten default.
         // An outer copy can also contain an implicit workspace in the plain home;
         // retain that relationship without admitting another source tree.
