@@ -161,9 +161,25 @@ fn default_export_selects_equivalent_workspace_root_spellings() {
 
     let linked = ".openclaw/linked-workspace";
     std::os::unix::fs::symlink(source.join(workspace_paths[0]), source.join(linked)).unwrap();
-    for (index, configured_root) in [&source, &canonical].into_iter().enumerate() {
+    let other_alias = root.child("other-alias");
+    std::os::unix::fs::symlink(&physical, &other_alias).unwrap();
+    for (index, (workspace, error)) in [
+        (source.join(linked), "through a symlink"),
+        (canonical.join(linked), "through a symlink"),
+        (
+            other_alias.join("source").join(workspace_paths[0]),
+            "unsupported environment root spelling",
+        ),
+        (
+            other_alias.join("source").join(linked),
+            "unsupported environment root spelling",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let config = serde_json::json!({"agents": {
-            "defaults": {"workspace": configured_root.join(linked)}
+            "defaults": {"workspace": workspace}
         }})
         .to_string();
         write_text(&source.join(".openclaw/openclaw.json"), &config);
@@ -180,11 +196,7 @@ fn default_export_selects_equivalent_workspace_root_spellings() {
             ],
         );
         assert!(!export.status.success());
-        assert!(
-            stderr(&export).contains("through a symlink"),
-            "{}",
-            stderr(&export)
-        );
+        assert!(stderr(&export).contains(error), "{}", stderr(&export));
         assert!(!output.exists());
         assert_eq!(
             fs::read(source.join(".openclaw/openclaw.json")).unwrap(),

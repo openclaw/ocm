@@ -1005,6 +1005,7 @@ captured in one atomic transaction.
 
 Default export accepts configured workspaces under an aliased environment root using either the accepted root spelling or its canonical path.
 Equivalent spellings select the same owned content and omit each workspace's `.openclaw/tmp` runtime debris.
+Other root spellings retain the default export refusal, even when another alias resolves inside the environment.
 External workspaces, the environment root itself and workspace paths redirected by internal symlinks remain refused.
 
 New archives, with or without `--include-state`, retain the accepted source root and its captured canonical path in optional `env.canonicalSourceRoot` metadata. Configuration relocation uses both recorded roots without requiring the original source or alias to exist; state-inclusive runtime-reference relocation uses the same identities. Older archives keep their existing import behavior. The archive format remains version 1, and older readers ignore the optional field. Source identities may use POSIX, Windows drive, or UNC syntax; the extension preserves acceptance of portable foreign-platform contents without adding translation of platform-specific payload paths. On Windows, ordinary drive/UNC and extended-length spellings of a recorded root relocate together.

@@ -86,6 +86,7 @@ impl OpenClawWorkspaceInventory {
                 .iter()
                 .chain(self.agent_directory_roots.values())
                 .chain(self.config_include_paths.iter()),
+            false,
         )
     }
 
@@ -93,13 +94,15 @@ impl OpenClawWorkspaceInventory {
         &self,
         archive_root: &Path,
     ) -> Result<BTreeSet<PathBuf>, String> {
-        self.archive_relative_path_roots(archive_root, self.workspace_roots.iter())
+        // Default export adds only the canonical spelling to its accepted-root policy.
+        self.archive_relative_path_roots(archive_root, self.workspace_roots.iter(), true)
     }
 
     fn archive_relative_path_roots<'a>(
         &self,
         archive_root: &Path,
         preserved_paths: impl Iterator<Item = &'a PathBuf>,
+        require_root_spelling: bool,
     ) -> Result<BTreeSet<PathBuf>, String> {
         let archive_root = clean_path(archive_root);
         let canonical_archive_root = canonicalize_path_allow_missing(&archive_root)?;
@@ -121,10 +124,16 @@ impl OpenClawWorkspaceInventory {
             let canonical_relative = canonical_preserved_path
                 .strip_prefix(&canonical_archive_root)
                 .map_err(|error| error.to_string())?;
-            if let Ok(relative) = preserved_path
+            let relative = preserved_path
                 .strip_prefix(&archive_root)
-                .or_else(|_| preserved_path.strip_prefix(&canonical_archive_root))
-            {
+                .or_else(|_| preserved_path.strip_prefix(&canonical_archive_root));
+            if require_root_spelling && relative.is_err() {
+                return Err(format!(
+                    "configured OpenClaw workspace uses an unsupported environment root spelling: {}",
+                    display_path(preserved_path)
+                ));
+            }
+            if let Ok(relative) = relative {
                 if relative != canonical_relative {
                     return Err(format!(
                         "cannot safely preserve configured OpenClaw workspace, agent directory, or config include through a symlink: {}",
