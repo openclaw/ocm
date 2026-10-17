@@ -1758,6 +1758,41 @@ mod tests {
         assert!(!nested.exists());
         assert_eq!(fs::read(&registry).unwrap(), registry_before);
 
+        let root_config = fs::read(&source_paths.config_path).unwrap();
+        let shared = json!({
+            "$include": "./config/base.json",
+            "plugins": {"entries": {"demo": {"config": {"outputDir": {"$include": "./config/agent-dir.json"}}}}}
+        });
+        let shared_raw = serde_json::to_vec(&shared).unwrap();
+        fs::write(&source_paths.config_path, &shared_raw).unwrap();
+        let error = clone_environment_for_simulation(
+            CloneEnvironmentOptions {
+                source_name: "source".to_string(),
+                name: "shared-simulation".to_string(),
+                root: None,
+            },
+            &env,
+            &cwd,
+        )
+        .unwrap_err();
+        assert!(error.contains("shared OpenClaw include"), "{error}");
+        assert!(!root.join("ocm-home/envs/shared-simulation").exists());
+        assert_eq!(fs::read(&source_paths.config_path).unwrap(), shared_raw);
+        assert_eq!(
+            fs::read_to_string(include_dir.join("agent-dir.json")).unwrap(),
+            agent_include
+        );
+        let effective = super::super::openclaw_workspaces::load_effective_openclaw_config(
+            &source_paths.config_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            effective.value["plugins"]["entries"]["demo"]["config"]["outputDir"],
+            agent_template
+        );
+        fs::write(&source_paths.config_path, root_config).unwrap();
+
         let simulation = clone_environment_for_simulation(
             CloneEnvironmentOptions {
                 source_name: "source".to_string(),

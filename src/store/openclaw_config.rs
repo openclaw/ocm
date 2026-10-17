@@ -415,16 +415,26 @@ pub(crate) fn rewrite_included_agent_directories_for_target(
     scopes.insert(config_path.to_path_buf(), BTreeSet::from([Vec::new()]));
     let mut changed = false;
     for (path, scopes) in scopes {
-        let Some(mut value) = read_config_value(&path)? else {
+        let Some(value) = read_config_value(&path)? else {
             continue;
         };
-        let mut file_changed = false;
+        let mut rewritten = None;
         for mut scope in scopes {
-            file_changed |=
-                rewrite_agent_directory_templates(&mut value, &mut scope, &replacements);
+            let mut candidate = value.clone();
+            rewrite_agent_directory_templates(&mut candidate, &mut scope, &replacements);
+            if rewritten
+                .as_ref()
+                .is_some_and(|previous| previous != &candidate)
+            {
+                return Err(format!(
+                    "cannot safely rewrite identity-bound agent directory in shared OpenClaw include {}; separate agent and non-agent include consumers before simulation",
+                    display_path(&path)
+                ));
+            }
+            rewritten = Some(candidate);
         }
-        if file_changed {
-            write_config_value(&path, &value)?;
+        if let Some(rewritten) = rewritten.filter(|rewritten| *rewritten != value) {
+            write_config_value(&path, &rewritten)?;
             changed = true;
         }
     }
