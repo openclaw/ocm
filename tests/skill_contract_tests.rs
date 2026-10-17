@@ -4,49 +4,115 @@ fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("failed to read {path}: {error}"))
 }
 
+fn normalize(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 #[test]
-fn release_validation_requires_isolated_package_shaped_runs() {
+fn release_validation_is_manual_and_worksheet_driven() {
     let skill = read("skills/openclaw-release-validation/SKILL.md");
-    let paths = read("skills/openclaw-release-validation/references/release-validation-paths.md");
-    let matrix = read("docs/OPENCLAW_RELEASE_SCENARIO_MATRIX.md");
-    let combined = format!("{skill}\n{paths}\n{matrix}");
-    let normalized = combined.to_lowercase();
+    let worksheet = read("skills/openclaw-release-validation/assets/validation-worksheet.md");
+    let normalized = normalize(&skill);
 
     for required in [
-        "\"$ocm_bin\" runtime build-local",
-        "immutable",
-        "detached worktree",
-        "run id",
-        "package-shaped runtime",
+        "disable-model-invocation: true",
+        "one editable markdown worksheet",
+        "finish validation",
+        "https://docs.openclaw.ai/maturity/scorecard.md",
+        "complete catalog",
+        "do not use a cached or hardcoded surface list",
+        "resolve relative taxonomy links",
+        "rank exactly five priority surfaces",
+        "change count and breadth",
+        "change size and complexity",
+        "maturity expectations",
+        "group every user-visible or upgrade-sensitive item",
+        "your changes in this release",
+        "priority surfaces to test",
+        "other surfaces to test",
+        "`### [surface](taxonomy-url)`",
+        "| **maturity score** | <maturity-label> |",
+        "| **what changed** | <release-theme> |",
+        "| **recommended testing** | <exercise-or-em-dash> |",
+        "| **testing notes** | |",
+        "testing notes** value cell truly empty",
+        "no placeholder text or hidden comment",
+        "every priority surface must have a real recommended exercise",
+        "bounded operator workflow",
+        "exact action, the observable pass condition",
+        "runnable ocm-scoped command",
+        "`ocm @<test-env> -- onboard`",
+        "`ocm @<test-env> -- tui`",
+        "`ocm @<test-env> -- channels status --probe`",
+        "no notable changes in this release.",
+        "dominant themes across the surface's complete group",
+        "do not include issue, pr, commit, or workflow examples",
+        "a handful of links misrepresents the full release surface",
+        "`gh api user`",
+        "enumerate every pr authored by that login",
+        "complete linked list",
+        "current tester's complete authored-pr list",
+        "counts as tested only when tester-authored text appears in its **testing notes** row",
+        "rows are campaign guidance, never test evidence",
+        "empty testing notes value means untouched",
+        "one final release-analysis comment",
+        "only the surfaces with non-empty testing notes cells",
+        "do not report the other table rows as evidence",
     ] {
         assert!(
             normalized.contains(required),
             "release-validation contract must mention {required:?}"
         );
     }
-    assert!(
-        normalized.contains("only for the s02") || normalized.contains("limited to the s02"),
-        "direct source execution must be limited to the S02 smoke check"
-    );
+
+    assert!(worksheet.contains("{{RELEASE_NOTES_URL}}"));
+    assert!(worksheet.contains("{{SCORECARD_URL}}"));
+    assert!(worksheet.contains("{{TAXONOMY_URL}}"));
+    assert!(!worksheet.contains("{{RELEASE_PRIORITIES}}"));
+    assert!(worksheet.contains("## Upgrade findings"));
+    assert!(worksheet.contains("## Your changes in this release"));
+    assert!(worksheet.contains("## Priority surfaces to test"));
+    assert!(worksheet.contains("## Other surfaces to test"));
+    assert!(worksheet.contains("> [!NOTE]"));
+    assert!(worksheet.contains("derived from the live"));
+    assert!(worksheet.contains("**Score bands:** Experimental 0–50%"));
+    assert!(worksheet.contains("empty Testing notes cell"));
+    assert!(worksheet.contains("source for the final"));
+    assert!(!worksheet.contains("<!-- Add notes below. -->"));
+    assert!(!worksheet.contains("## Surface notes"));
+    assert!(!worksheet.contains("## Private operator notes"));
+    assert!(!worksheet.contains("## Release findings"));
+    assert!(!worksheet.contains("| | |"));
+    assert_eq!(worksheet.matches("\n### ").count(), 0);
+    assert_eq!(worksheet.matches("\n#### ").count(), 0);
+
+    let changes = worksheet.find("## Your changes in this release").unwrap();
+    let priority = worksheet.find("## Priority surfaces to test").unwrap();
+    let callout = worksheet.find("> [!NOTE]").unwrap();
+    let other = worksheet.find("## Other surfaces to test").unwrap();
+    assert!(changes < priority && priority < callout && callout < other);
 }
 
 #[test]
-fn release_validation_distinguishes_session_and_secret_boundaries() {
+fn release_validation_preserves_state_and_private_boundaries() {
     let release_skill = read("skills/openclaw-release-validation/SKILL.md");
     let operator_skill = read("skills/ocm-operator/SKILL.md");
     let cookbook = read("skills/ocm-operator/references/command-cookbook.md");
     let safety = read("skills/ocm-operator/references/safety-and-state.md");
-    let matrix = read("docs/OPENCLAW_RELEASE_SCENARIO_MATRIX.md");
-    let combined = format!("{release_skill}\n{operator_skill}\n{cookbook}\n{safety}\n{matrix}");
-    let normalized = combined.to_lowercase();
+    let combined = format!("{release_skill}\n{operator_skill}\n{cookbook}\n{safety}");
+    let normalized = normalize(&combined);
 
     for required in [
-        "secret-bearing",
-        "explicit authorization",
-        "dedicated test account",
-        "ocm adopt import",
-        "sessions, logs, and backups",
-        "redact",
+        "ocm adopt import --name",
+        "sessions and other real user state are preserved",
+        "keep the source unchanged",
+        "stop the current credential owner",
+        "keep ocm, copying, local tooling, setup, and cleanup problems in the conversation only",
+        "never enter the worksheet or github comment",
+        "remove local paths",
     ] {
         assert!(
             normalized.contains(required),
@@ -62,8 +128,7 @@ fn operator_recipes_use_current_cli_and_safe_cleanup_contracts() {
     let safety = read("skills/ocm-operator/references/safety-and-state.md");
     let paths = read("skills/ocm-operator/references/local-paths.md");
     let release_skill = read("skills/openclaw-release-validation/SKILL.md");
-    let release_paths =
-        read("skills/openclaw-release-validation/references/release-validation-paths.md");
+    let worksheet = read("skills/openclaw-release-validation/assets/validation-worksheet.md");
     let matrix = read("docs/OPENCLAW_RELEASE_SCENARIO_MATRIX.md");
 
     assert!(usage.contains("ocm logs mira --stream error"));
@@ -72,34 +137,14 @@ fn operator_recipes_use_current_cli_and_safe_cleanup_contracts() {
     assert!(safety.contains("git -C /path/to/worktree status --short"));
     assert!(!safety.contains("worktree remove --force"));
     assert!(paths.contains("set -euo pipefail"));
-    assert!(paths.contains("status --porcelain"));
-    assert!(paths.contains("rev-parse HEAD"));
-    assert!(paths.contains("OCM_BIN="));
-    assert!(!paths.contains("ocm_bin="));
-    assert!(paths.contains("export OCM_HOME="));
-    assert!(paths.contains("run_root=\"$(mktemp -d"));
-    assert!(paths.contains("run_id=\"${run_root##*/}\""));
-    assert!(!paths.contains("date -u +%Y%m%dT%H%M%SZ"));
-    assert!(paths.contains("pnpm install --frozen-lockfile"));
+    assert!(release_skill.contains("ocm env list --json"));
+    assert!(release_skill.contains("ocm runtime install --version"));
+    assert!(release_skill.contains("ocm runtime verify <runtime-name> --json"));
     assert!(
-        paths.matches("status --porcelain").count() >= 3,
-        "release recipe must prove cleanliness before and after packaging"
+        release_skill.contains("ocm upgrade <test-env> --runtime <runtime-name> --dry-run --json")
     );
-    assert!(paths.contains("git clone --no-checkout"));
-    assert!(paths.contains("--reference-if-able"));
-    assert!(paths.contains("--dissociate"));
-    assert!(!paths.contains("git -C \"$source_repo\" fetch"));
-    assert!(paths.contains("runtime which"));
-    assert!(!paths.contains("$HOME/.ocm/runtimes"));
-    assert!(release_skill.contains("OCM_BIN=<ocm-repo>/target/debug/ocm"));
-    assert!(release_skill.contains("\"$OCM_BIN\" runtime build-local"));
-    assert!(release_skill.contains("\"$OCM_BIN\" runtime verify"));
-    assert!(release_skill.contains("\"$OCM_BIN\" runtime remove"));
-    assert!(release_skill.contains("\"$OCM_BIN\" @<env> --"));
-    assert!(release_skill.contains("pnpm install --frozen-lockfile"));
-    assert!(release_skill.contains("git status --porcelain"));
-    assert!(!release_skill.contains("`ocm "));
-    assert!(!release_paths.contains("`ocm "));
+    assert!(release_skill.contains("ocm start <test-env> --runtime <runtime-name> --json"));
+    assert!(release_skill.contains("ocm @<test-env> -- --version"));
     assert!(matrix.contains("OCM_BIN="));
     assert!(matrix.contains("/target/debug/ocm"));
     assert!(matrix.contains("\"$OCM_BIN\" runtime build-local"));
@@ -107,7 +152,7 @@ fn operator_recipes_use_current_cli_and_safe_cleanup_contracts() {
     assert!(!matrix.contains("`ocm "));
     assert!(matrix.contains("run-owned package runtime is removed"));
     assert!(
-        [&paths, &release_skill, &release_paths, &matrix]
+        [&paths, &release_skill, &worksheet, &matrix]
             .iter()
             .all(|document| !document.contains("/Users/")),
         "release-validation docs must not publish machine-local home paths"
