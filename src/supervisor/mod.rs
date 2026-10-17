@@ -3832,7 +3832,7 @@ mod tests {
         let mut child = running.remove("demo").unwrap();
         let pid = child.child.id();
         let runtime = read_json::<SupervisorRuntimeState>(&runtime_path);
-        stop_supervisor_child(&mut child);
+        stop_supervisor_child(&mut child).unwrap();
         let runtime = runtime.unwrap();
         assert_eq!(runtime.children[0].pid, pid);
         assert_eq!(runtime.services[0].gateway_state, "running");
