@@ -30,7 +30,7 @@ use super::layout::{
 use super::{
     OpenClawWorkspaceRuntime, audit_openclaw_state, clear_nonportable_runtime_state,
     get_environment, list_environments, now_utc, remove_upgrade_recovery_for_snapshot,
-    rewrite_openclaw_config_for_target, save_environment,
+    rewrite_openclaw_config_for_target,
 };
 
 const UPGRADE_CHECKPOINT_KIND: &str = "ocm-env-upgrade-checkpoint-v1";
@@ -643,6 +643,7 @@ fn prepare_env_snapshot_restore_with_binding(
     let staging_dir = operation.legacy_staging_root.clone();
     let candidate_root = operation.candidate_root.clone();
     let backup_root = operation.backup_root.clone();
+    let mut rollback_attempted = false;
 
     let result = (|| {
         let (mut restored, legacy_archive) = if snapshot.storage_kind == STORAGE_TAR_ARCHIVE {
@@ -787,12 +788,14 @@ fn prepare_env_snapshot_restore_with_binding(
                 independent: independent.clone(),
             }),
             Err(error) => {
+                rollback_attempted = true;
                 match reinstate_displaced_environment_root(
                     &current_paths.root,
                     renamed.then_some(backup_root.as_path()),
                     &operation.rejected_root,
                     current.clone(),
                     &independent,
+                    runtime_guard,
                     env,
                     cwd,
                 ) {
@@ -811,10 +814,19 @@ fn prepare_env_snapshot_restore_with_binding(
         }
     })();
 
-    if result.is_err() && !path_exists(&backup_root) {
+    if result.is_err() && !rollback_attempted && !path_exists(&backup_root) {
         let _ = remove_tree_if_present(&operation.root);
     }
-    result
+    result.map_err(|error| {
+        if path_exists(&operation.root) {
+            format!(
+                "{error}; restore operation retained at {}",
+                display_path(&operation.root)
+            )
+        } else {
+            error
+        }
+    })
 }
 
 pub(crate) fn commit_env_snapshot_restore(
@@ -833,18 +845,24 @@ pub(crate) fn commit_env_snapshot_restore(
 
 pub(crate) fn rollback_env_snapshot_restore(
     transaction: EnvSnapshotRestoreTransaction,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<Option<String>, String> {
+    let retained_note = transaction.retained_operation_note();
     reinstate_displaced_environment_root(
         &transaction.restored_root,
         transaction.displaced_root.as_deref(),
         &transaction.rejected_root,
         transaction.original,
         &transaction.independent,
+        runtime_guard,
         env,
         cwd,
-    )?;
+    )
+    .map_err(|error| {
+        format!("restoring the pre-restore environment failed: {error}; {retained_note}")
+    })?;
     Ok(
         remove_tree_if_present(&transaction.operation_root)
             .err()
@@ -863,6 +881,7 @@ fn reinstate_displaced_environment_root(
     rejected_root: &Path,
     original: EnvMeta,
     independent: &[PathBuf],
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<(), String> {
@@ -875,7 +894,9 @@ fn reinstate_displaced_environment_root(
             rejected_root,
             independent,
         )?;
-        if let Err(error) = save_environment(original, env, cwd) {
+        if let Err(error) =
+            super::save_environment_with_runtime_guard(original, runtime_guard, env, cwd)
+        {
             super::checkpoint_scope::replace_owned_entries(
                 restored_root,
                 rejected_root,
@@ -885,7 +906,9 @@ fn reinstate_displaced_environment_root(
             .map_err(|compensation| {
                 format!("{error}; scoped restore compensation failed: {compensation}")
             })?;
-            return Err(error);
+            return Err(format!(
+                "failed to restore the environment registry entry; the restored owned entries were reinstated: {error}"
+            ));
         }
         return Ok(());
     }
@@ -915,7 +938,9 @@ fn reinstate_displaced_environment_root(
         ));
     }
 
-    if let Err(error) = save_environment(original, env, cwd) {
+    if let Err(error) =
+        super::save_environment_with_runtime_guard(original, runtime_guard, env, cwd)
+    {
         let mut compensation_errors = Vec::new();
         if let Some(displaced_root) = displaced_root
             && let Err(compensation_error) = fs::rename(restored_root, displaced_root)

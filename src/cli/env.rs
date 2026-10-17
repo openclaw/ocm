@@ -1043,7 +1043,7 @@ impl Cli {
                                 );
                                 if let Err(rollback_error) = rollback_result {
                                     error.push_str(&format!(
-                                        "; restoring the displaced environment root also failed: {rollback_error}"
+                                        "; snapshot rollback requires attention: {rollback_error}"
                                     ));
                                 }
                                 if let Err(restore_error) = service_restore_result {

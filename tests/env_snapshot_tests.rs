@@ -1190,6 +1190,117 @@ fn env_snapshot_restore_recovers_the_displaced_root_when_acceptance_fails() {
     assert_eq!(operation_namespaces, 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn snapshot_restore_sync_failure_restores_data_and_policy() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for direct in [false, true] {
+        for (present, deny) in [(true, true), (true, false), (false, true)] {
+            let root = TestDir::new("snapshot-sync-rollback");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let mut env = ocm_env(&root);
+            env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+            install_fake_launchctl(&root, &mut env);
+            for args in [
+                vec!["launcher", "add", "stable", "--command", "openclaw"],
+                vec!["env", "create", "source", "--launcher", "stable"],
+            ] {
+                let result = run_ocm(&cwd, &env, &args);
+                assert!(result.status.success(), "{}", stderr(&result));
+            }
+            let notes = root.child("ocm-home/envs/source/.openclaw/workspace/notes.txt");
+            write_text(&notes, "snapshot-state");
+            let snapshot = run_ocm(
+                &cwd,
+                &env,
+                &["env", "snapshot", "create", "source", "--json"],
+            );
+            assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+            let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+            let snapshot_id = snapshot["id"].as_str().unwrap();
+            if present {
+                let install = run_ocm(&cwd, &env, &["service", "install", "source"]);
+                assert!(install.status.success(), "{}", stderr(&install));
+            }
+            write_text(&notes, "pre-restore-current-state");
+            let before = get_environment("source", &env, &cwd).unwrap();
+            let supervisor = root.child("ocm-home/supervisor");
+            fs::create_dir_all(&supervisor).unwrap();
+            let state_before = fs::read(supervisor.join("state.json")).ok();
+            assert_eq!(state_before.is_some(), present);
+            let permissions = fs::metadata(&supervisor).unwrap().permissions();
+            if deny {
+                fs::set_permissions(&supervisor, fs::Permissions::from_mode(0o555)).unwrap();
+                assert_eq!(
+                    fs::write(supervisor.join("write-probe"), b"")
+                        .unwrap_err()
+                        .kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+            let result = if direct {
+                EnvironmentService::new(&env, &cwd)
+                    .restore_snapshot(ocm::env::RestoreEnvSnapshotOptions {
+                        env_name: "source".into(),
+                        snapshot_id: snapshot_id.into(),
+                    })
+                    .map(|_| ())
+            } else {
+                let output = run_ocm(
+                    &cwd,
+                    &env,
+                    &[
+                        "env",
+                        "snapshot",
+                        "restore",
+                        "source",
+                        snapshot_id,
+                        "--json",
+                    ],
+                );
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(stderr(&output))
+                }
+            };
+            fs::set_permissions(&supervisor, permissions).unwrap();
+            let after = get_environment("source", &env, &cwd).unwrap();
+            if present && deny {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("failed supervisor synchronization"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("pre-restore environment root and registry were restored"),
+                    "{error}"
+                );
+                assert_eq!(
+                    fs::read_to_string(&notes).unwrap(),
+                    "pre-restore-current-state"
+                );
+                assert_eq!(after.service_enabled, before.service_enabled);
+                assert_eq!(after.service_running, before.service_running);
+                assert_eq!(after.default_launcher, before.default_launcher);
+                assert_eq!(fs::read(supervisor.join("state.json")).ok(), state_before);
+            } else {
+                result.unwrap();
+                assert_eq!(fs::read_to_string(&notes).unwrap(), "snapshot-state");
+                assert!(!after.service_enabled);
+            }
+            assert!(
+                !fs::read_dir(root.child("ocm-home/envs"))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
+            );
+        }
+    }
+}
+
 #[test]
 fn env_snapshot_restore_remains_compatible_with_legacy_tar_metadata() {
     let root = TestDir::new("env-snapshot-legacy-tar");

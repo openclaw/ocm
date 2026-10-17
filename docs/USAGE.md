@@ -931,6 +931,13 @@ Restore:
 ocm env snapshot restore mira <snapshot>
 ```
 
+Restore retains the displaced environment until supervisor synchronization and managed-service acceptance succeed.
+If synchronization fails, OCM attempts to restore the pre-restore root and registry before returning the error and restoring any quiesced service.
+An error distinguishes a failed rollback from restored data that still needs supervisor resynchronization or cleanup.
+If rollback cannot finish, the error identifies the retained restore operation directory and the failed recovery step; inspect the active environment and the retained `displaced` and `rejected` trees before retrying, and preserve that directory until recovery is verified.
+If only cleanup fails after acceptance or rollback, the reported directory contains leftover operation data; remove it only after verifying the active environment and any needed recovery copies.
+These directories can contain credentials and other private environment data.
+
 Remove:
 
 ```bash

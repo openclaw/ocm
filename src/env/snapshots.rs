@@ -240,21 +240,16 @@ impl<'a> EnvironmentService<'a> {
         &self,
         options: RestoreEnvSnapshotOptions,
     ) -> Result<EnvSnapshotRestoreSummary, String> {
-        let env_name = options.env_name.clone();
-        let transaction = prepare_env_snapshot_restore(options, self.env, self.cwd)?;
-        let summary = commit_env_snapshot_restore(transaction);
-        sync_supervisor_env_if_present(self.env, self.cwd, &env_name)?;
-        Ok(summary)
+        let transaction = self.prepare_snapshot_restore_locked(options)?;
+        Ok(self.commit_snapshot_restore_locked(transaction))
     }
 
     pub(crate) fn prepare_snapshot_restore_locked(
         &self,
         options: RestoreEnvSnapshotOptions,
     ) -> Result<EnvSnapshotRestoreTransaction, String> {
-        let env_name = options.env_name.clone();
         let transaction = prepare_env_snapshot_restore(options, self.env, self.cwd)?;
-        sync_supervisor_env_if_present(self.env, self.cwd, &env_name)?;
-        Ok(transaction)
+        self.sync_snapshot_restore_locked(transaction, None)
     }
 
     pub(crate) fn prepare_upgrade_snapshot_restore_locked(
@@ -262,10 +257,28 @@ impl<'a> EnvironmentService<'a> {
         options: RestoreEnvSnapshotOptions,
         runtime_guard: Option<&crate::store::RuntimeMutationGuard>,
     ) -> Result<EnvSnapshotRestoreTransaction, String> {
-        let env_name = options.env_name.clone();
         let transaction =
             prepare_upgrade_snapshot_restore(options, runtime_guard, self.env, self.cwd)?;
-        sync_supervisor_env_if_present(self.env, self.cwd, &env_name)?;
+        self.sync_snapshot_restore_locked(transaction, runtime_guard)
+    }
+
+    fn sync_snapshot_restore_locked(
+        &self,
+        transaction: EnvSnapshotRestoreTransaction,
+        runtime_guard: Option<&crate::store::RuntimeMutationGuard>,
+    ) -> Result<EnvSnapshotRestoreTransaction, String> {
+        let env_name = &transaction.summary.env_name;
+        if let Err(sync_error) = sync_supervisor_env_if_present(self.env, self.cwd, env_name) {
+            let error = format!("snapshot restore failed supervisor synchronization: {sync_error}");
+            return Err(
+                match self.rollback_snapshot_restore_with_guard_locked(transaction, runtime_guard) {
+                    Ok(()) => {
+                        format!("{error}; pre-restore environment root and registry were restored")
+                    }
+                    Err(rollback_error) => format!("{error}; {rollback_error}"),
+                },
+            );
+        }
         Ok(transaction)
     }
 
@@ -280,17 +293,27 @@ impl<'a> EnvironmentService<'a> {
         &self,
         transaction: EnvSnapshotRestoreTransaction,
     ) -> Result<(), String> {
+        self.rollback_snapshot_restore_with_guard_locked(transaction, None)
+    }
+
+    fn rollback_snapshot_restore_with_guard_locked(
+        &self,
+        transaction: EnvSnapshotRestoreTransaction,
+        runtime_guard: Option<&crate::store::RuntimeMutationGuard>,
+    ) -> Result<(), String> {
         let env_name = transaction.summary.env_name.clone();
-        let cleanup_warning = rollback_env_snapshot_restore(transaction, self.env, self.cwd)?;
+        let cleanup_warning =
+            rollback_env_snapshot_restore(transaction, runtime_guard, self.env, self.cwd)?;
         let sync_result = sync_supervisor_env_if_present(self.env, self.cwd, &env_name).map(|_| ());
-        match (cleanup_warning, sync_result) {
+        let result = match (cleanup_warning, sync_result) {
             (None, Ok(())) => Ok(()),
             (Some(cleanup_warning), Ok(())) => Err(cleanup_warning),
-            (None, Err(sync_error)) => Err(sync_error),
+            (None, Err(sync_error)) => Err(format!("supervisor resync failed: {sync_error}")),
             (Some(cleanup_warning), Err(sync_error)) => Err(format!(
                 "{cleanup_warning}; supervisor resync also failed: {sync_error}"
             )),
-        }
+        };
+        result.map_err(|error| format!("pre-restore environment root and registry were restored; recovery requires attention: {error}"))
     }
 
     pub fn remove_snapshot(
@@ -351,6 +374,229 @@ mod tests {
     use super::{EnvSnapshotSummary, select_snapshot_prune_candidates};
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
+
+    fn restore_fixture(
+        scoped: bool,
+    ) -> (
+        tempfile::TempDir,
+        std::collections::BTreeMap<String, String>,
+        super::RestoreEnvSnapshotOptions,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let env = std::collections::BTreeMap::from([
+            (
+                "OCM_HOME".into(),
+                root.path().join("ocm-home").to_string_lossy().into_owned(),
+            ),
+            (
+                "HOME".into(),
+                root.path().join("home").to_string_lossy().into_owned(),
+            ),
+        ]);
+        let meta = crate::store::create_environment(
+            crate::env::CreateEnvironmentOptions {
+                name: "source".into(),
+                root: None,
+                gateway_port: Some(19789),
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: None,
+                dev: None,
+                protected: false,
+            },
+            &env,
+            root.path(),
+        )
+        .unwrap();
+        let marker = std::path::Path::new(&meta.root).join("marker");
+        std::fs::write(&marker, "snapshot").unwrap();
+        let preparation = if scoped {
+            let mut meta = meta.clone();
+            meta.upgrade_independent_paths = vec!["project".into()];
+            crate::store::save_environment(meta.clone(), &env, root.path()).unwrap();
+            std::fs::create_dir_all(std::path::Path::new(&meta.root).join("project")).unwrap();
+            crate::store::prepare_upgrade_checkpoint_capture("source", &env, root.path()).unwrap()
+        } else {
+            crate::store::prepare_env_snapshot_capture("source", &env, root.path()).unwrap()
+        };
+        let snapshot = crate::store::create_env_snapshot_from_preparation(
+            super::CreateEnvSnapshotOptions {
+                env_name: "source".into(),
+                label: None,
+            },
+            None,
+            preparation,
+            &env,
+            root.path(),
+        )
+        .unwrap();
+        std::fs::write(&marker, "current").unwrap();
+        if scoped {
+            std::fs::write(
+                std::path::Path::new(&meta.root).join("project/independent"),
+                "keep current",
+            )
+            .unwrap();
+        }
+        (
+            root,
+            env,
+            super::RestoreEnvSnapshotOptions {
+                env_name: "source".into(),
+                snapshot_id: snapshot.id,
+            },
+        )
+    }
+
+    #[test]
+    fn upgrade_restore_sync_failure_rolls_back_with_the_held_runtime_guard() {
+        for scoped in [false, true] {
+            let (root, env, options) = restore_fixture(scoped);
+            let service = super::EnvironmentService::new(&env, root.path());
+            let mut original = service.get("source").unwrap();
+            original.default_runtime = Some("current".into());
+            crate::store::save_environment(original.clone(), &env, root.path()).unwrap();
+            let guard = crate::store::lock_runtime_mutation("current", &env, root.path()).unwrap();
+            // A real filesystem write failure, without changing permissions or service state.
+            let state = crate::store::supervisor_state_path(&env, root.path()).unwrap();
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::write(state.join("obstruction"), "keep").unwrap();
+            let error = service
+                .prepare_upgrade_snapshot_restore_locked(options, Some(&guard))
+                .unwrap_err();
+            assert!(
+                error.contains("pre-restore environment root and registry were restored"),
+                "{error}"
+            );
+            assert_eq!(
+                service.get("source").unwrap().default_runtime,
+                original.default_runtime
+            );
+            assert_eq!(
+                std::fs::read_to_string(std::path::Path::new(&original.root).join("marker"))
+                    .unwrap(),
+                "current"
+            );
+            assert!(
+                !std::fs::read_dir(root.path().join("ocm-home/envs"))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
+            );
+            if scoped {
+                assert_eq!(
+                    std::fs::read_to_string(
+                        root.path().join("ocm-home/envs/source/project/independent")
+                    )
+                    .unwrap(),
+                    "keep current"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restore_rollback_failure_reports_retained_custody_and_actual_root() {
+        for scoped in [false, true] {
+            let (root, env, options) = restore_fixture(scoped);
+            let service = super::EnvironmentService::new(&env, root.path());
+            let transaction =
+                crate::store::prepare_env_snapshot_restore(options, &env, root.path()).unwrap();
+            let operation = std::fs::read_dir(root.path().join("ocm-home/envs"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
+                .unwrap()
+                .path();
+            let registry = crate::store::env_registry_path(&env, root.path()).unwrap();
+            std::fs::remove_file(&registry).unwrap();
+            std::fs::create_dir(&registry).unwrap();
+            let error = service
+                .rollback_snapshot_restore_locked(transaction)
+                .unwrap_err();
+            assert!(
+            error.contains(
+                if scoped { "failed to restore the environment registry entry; the restored owned entries were reinstated" } else { "failed to restore the environment registry entry; the restored root was reinstated" }
+            ),
+            "{error}"
+        );
+            assert!(
+                error.contains(&format!(
+                    "restore operation retained at {}",
+                    operation.display()
+                )),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("ocm-home/envs/source/marker")).unwrap(),
+                "snapshot"
+            );
+            assert_eq!(
+                std::fs::read_to_string(operation.join("displaced/marker")).unwrap(),
+                "current"
+            );
+            if scoped {
+                assert_eq!(
+                    std::fs::read_to_string(
+                        root.path().join("ocm-home/envs/source/project/independent")
+                    )
+                    .unwrap(),
+                    "keep current"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restored_data_is_reported_separately_from_rejected_tree_cleanup_failure() {
+        let (root, env, options) = restore_fixture(false);
+        let service = super::EnvironmentService::new(&env, root.path());
+        let transaction =
+            crate::store::prepare_env_snapshot_restore(options, &env, root.path()).unwrap();
+        let marker = root.path().join("ocm-home/envs/source/marker");
+        assert!(
+            std::process::Command::new("/usr/bin/chflags")
+                .arg("uchg")
+                .arg(&marker)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = service
+            .rollback_snapshot_restore_locked(transaction)
+            .unwrap_err();
+        let operation = std::fs::read_dir(root.path().join("ocm-home/envs"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
+            .unwrap()
+            .path();
+        let rejected_marker = operation.join("rejected/marker");
+        assert!(
+            std::process::Command::new("/usr/bin/chflags")
+                .arg("nouchg")
+                .arg(&rejected_marker)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            error.contains("pre-restore environment root and registry were restored"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&operation.to_string_lossy().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("could not be removed"), "{error}");
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "current");
+        assert_eq!(
+            std::fs::read_to_string(rejected_marker).unwrap(),
+            "snapshot"
+        );
+    }
 
     #[test]
     fn snapshot_prune_selection_keeps_the_newest_snapshots_per_environment() {
