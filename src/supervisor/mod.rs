@@ -3888,6 +3888,10 @@ mod tests {
             .insert("OPENCLAW_STATE_DIR".to_string(), display_path(root.path()));
         let runtime_path = supervisor_runtime_path(&env, root.path()).unwrap();
         fs::create_dir_all(&runtime_path).unwrap();
+        let mut desired = supervisor_state(Vec::new());
+        desired.ocm_home = env["OCM_HOME"].clone();
+        desired.children = vec![spec.clone()];
+        write_json(&runtime_path.with_file_name("state.json"), &desired).unwrap();
         let admission = SupervisorGatewayAdmission::current().unwrap();
         let mut pending = BTreeMap::from([(
             "demo".to_string(),
