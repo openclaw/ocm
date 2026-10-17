@@ -554,3 +554,132 @@ fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhe
         String::from_utf8_lossy(&executed.stderr)
     );
 }
+
+#[test]
+fn env_export_import_retains_configured_agent_directories() {
+    let root = TestDir::new("export-configured-agent-directories");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    for (index, relative) in [
+        "custom-agent",
+        "agents/main/private-agent",
+        "agents/main/sessions/private-agent",
+        "agents/main/agent",
+        "workspace/private-agent",
+        "identity/source-5",
+        "extensions/demo/node_modules/private-agent",
+        "workspace/.openclaw/tmp/private-agent",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let source_name = format!("source-{index}");
+        let target_name = format!("target-{index}");
+        let created = run_ocm(cwd, &env, &["env", "create", &source_name]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let state = root.child(&format!("ocm-home/envs/{source_name}/.openclaw"));
+        let agent_dir = if index == 5 {
+            "${OPENCLAW_STATE_DIR}/identity/${OCM_ACTIVE_ENV}".to_string()
+        } else {
+            state.join(relative).to_str().unwrap().to_string()
+        };
+        write_text(
+            &state.join("openclaw.json"),
+            &serde_json::json!({"agents":{"entries":{"main":{"agentDir":agent_dir}}}}).to_string(),
+        );
+        write_text(
+            &state.join(relative).join("models.json"),
+            "{\"providers\":{}}",
+        );
+        write_text(&state.join("workspace/notes.txt"), "workspace");
+        write_text(
+            &state.join("agents/main/sessions/stale.jsonl"),
+            "runtime debris",
+        );
+        write_text(
+            &state.join("extensions/demo/.openclaw-runtime-deps.json"),
+            "{}",
+        );
+        write_text(
+            &state.join("extensions/demo/node_modules/stale.txt"),
+            "runtime debris",
+        );
+        let config_before = fs::read(state.join("openclaw.json")).unwrap();
+        let archive = root.child(&format!("{source_name}.tar"));
+        let exported = run_ocm(
+            cwd,
+            &env,
+            &[
+                "env",
+                "export",
+                &source_name,
+                "--output",
+                archive.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            exported.status.success(),
+            "{relative}: {}",
+            stderr(&exported)
+        );
+        let extract_dir = root.child(&format!("extract-{index}"));
+        let extracted = extract_env_archive::<EnvArchiveMetadata>(&archive, &extract_dir).unwrap();
+        assert_eq!(
+            fs::read(
+                extracted
+                    .root_dir
+                    .join(".openclaw")
+                    .join(relative)
+                    .join("models.json")
+            )
+            .unwrap(),
+            b"{\"providers\":{}}"
+        );
+        let imported = run_ocm(
+            cwd,
+            &env,
+            &[
+                "env",
+                "import",
+                archive.to_str().unwrap(),
+                "--name",
+                &target_name,
+            ],
+        );
+        assert!(
+            imported.status.success(),
+            "{relative}: {}",
+            stderr(&imported)
+        );
+        let target = root.child(&format!("ocm-home/envs/{target_name}/.openclaw"));
+        assert_eq!(
+            fs::read(target.join(relative).join("models.json")).unwrap(),
+            b"{\"providers\":{}}"
+        );
+        assert_eq!(
+            fs::read(target.join("workspace/notes.txt")).unwrap(),
+            b"workspace"
+        );
+        assert!(!target.join("agents/main/sessions/stale.jsonl").exists());
+        assert!(
+            !target
+                .join("extensions/demo/node_modules/stale.txt")
+                .exists()
+        );
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(target.join("openclaw.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["agents"]["entries"]["main"]["agentDir"],
+            target.join(relative).to_str().unwrap()
+        );
+        assert_eq!(
+            fs::read(state.join("openclaw.json")).unwrap(),
+            config_before
+        );
+        assert_eq!(
+            fs::read(state.join(relative).join("models.json")).unwrap(),
+            b"{\"providers\":{}}"
+        );
+        assert!(state.join("agents/main/sessions/stale.jsonl").exists());
+    }
+}

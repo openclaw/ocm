@@ -699,7 +699,9 @@ before writing the destination. Check the recorded source with `ocm env show
 ocm env clone mira rowan
 ```
 
-Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Clone does not copy dev source bindings. The usual next step is:
+Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Configured agent directories inside the environment retain their payloads through clone and ordinary export/import, including custom and nested locations.
+Agent directories remain separate from workspaces; external locations and paths reached through symlinks are rejected by these copy operations.
+Clone does not copy dev source bindings. The usual next step is:
 
 ```bash
 ocm start rowan
@@ -725,7 +727,7 @@ same plugin isolation applies to upgrade simulation clones.
 
 Clone (including upgrade simulation) and import require real directories at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` when those entries exist.
 Symlinks, including dangling links, and other file types at those traversal boundaries are refused before copied-state rewrites or cleanup; the source stays unchanged and no target is registered.
-Individual agent directory links are still removed from the copy without changing the linked data.
+Unconfigured agent directory links are still removed from the copy without changing the linked data.
 
 While an environment upgrade can still replace or restore a runtime, new bindings to that runtime fail with a busy/retry error.
 This includes environment creation, rebinding, cloning, importing, and restoring a snapshot with a different runtime binding.

@@ -782,7 +782,7 @@ fn clone_environment_with_policy(
         reject_include_owned_sandbox_origin(&source_paths.config_path)?;
         reject_include_owned_agent_workspaces(&source_paths.config_path)?;
     }
-    let source_workspaces = resolve_env_openclaw_workspaces(
+    let source_workspaces = super::openclaw_workspaces::resolve_env_openclaw_copy_paths(
         &source_paths,
         env,
         OpenClawWorkspaceRuntime::for_env(&source.name, source.gateway_port),
@@ -812,6 +812,7 @@ fn clone_environment_with_policy(
                     &source_workspaces,
                     &source_paths.root,
                     &target_paths.root,
+                    &source_paths.root,
                 )?;
                 verify_copied_workspaces_remain_preserved(
                     &source_workspaces,
@@ -819,6 +820,7 @@ fn clone_environment_with_policy(
                     &target_paths,
                     env,
                     target_runtime,
+                    &source_paths.root,
                 )?;
                 clear_nonportable_runtime_state(&target_paths, env, target_runtime)?;
                 outcome
@@ -843,6 +845,7 @@ fn clone_environment_with_policy(
                     &target_paths,
                     env,
                     target_runtime,
+                    &source_paths.root,
                 )?;
                 clear_simulation_runtime_state_preserving_includes(
                     &target_paths,
@@ -863,6 +866,7 @@ fn clone_environment_with_policy(
                     &source_workspaces,
                     &source_paths.root,
                     &target_paths.root,
+                    &source_paths.root,
                 )?;
                 verify_copied_workspaces_remain_preserved(
                     &source_workspaces,
@@ -870,6 +874,7 @@ fn clone_environment_with_policy(
                     &target_paths,
                     env,
                     target_runtime,
+                    &source_paths.root,
                 )?;
                 clear_nonportable_runtime_state(&target_paths, env, target_runtime)?;
                 outcome
@@ -963,8 +968,14 @@ fn verify_copied_workspaces_remain_preserved(
     target_paths: &super::layout::EnvPaths,
     env: &BTreeMap<String, String>,
     target_runtime: OpenClawWorkspaceRuntime<'_>,
+    source_agent_root: &Path,
 ) -> Result<(), String> {
-    let target_workspaces = resolve_env_openclaw_workspaces(target_paths, env, target_runtime)?;
+    let resolve_copy_paths = if source_workspaces.agent_directory_roots().next().is_some() {
+        super::openclaw_workspaces::resolve_env_openclaw_copy_paths
+    } else {
+        resolve_env_openclaw_workspaces
+    };
+    let target_workspaces = resolve_copy_paths(target_paths, env, target_runtime)?;
     for source_workspace in source_workspaces.workspace_roots() {
         let Ok(relative) = source_workspace.strip_prefix(source_root) else {
             continue;
@@ -974,6 +985,21 @@ fn verify_copied_workspaces_remain_preserved(
             return Err(format!(
                 "rewritten OpenClaw workspace configuration would stop preserving copied workspace data at {}; flatten or make the workspace path independent of changing environment identity",
                 display_path(&copied_workspace)
+            ));
+        }
+    }
+    for source_agent in source_workspaces.agent_directory_roots() {
+        let Ok(relative) = source_agent
+            .strip_prefix(source_root)
+            .or_else(|_| source_agent.strip_prefix(source_agent_root))
+        else {
+            continue;
+        };
+        let copied_agent = clean_path(&target_paths.root.join(relative));
+        if path_exists(&copied_agent) && !target_workspaces.contains(&copied_agent) {
+            return Err(format!(
+                "rewritten OpenClaw agent configuration would stop preserving copied agent data at {}; flatten or make the agent directory independent of changing environment identity",
+                display_path(&copied_agent)
             ));
         }
     }
@@ -1194,7 +1220,12 @@ pub(crate) fn import_environment_with_sandbox_origin(
         };
         reject_include_owned_sandbox_origin(&extracted_paths.config_path)?;
         reject_include_owned_agent_workspaces(&extracted_paths.config_path)?;
-        let extracted_workspaces = resolve_env_openclaw_workspaces(
+        let resolve_copy_paths = if extracted.metadata.include_state {
+            resolve_env_openclaw_workspaces
+        } else {
+            super::openclaw_workspaces::resolve_env_openclaw_copy_paths
+        };
+        let extracted_workspaces = resolve_copy_paths(
             &extracted_paths,
             env,
             OpenClawWorkspaceRuntime::for_env(&source_name, extracted.metadata.env.gateway_port),
@@ -1237,6 +1268,13 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 &extracted_workspaces,
                 &extracted.root_dir,
                 &target_paths.root,
+                extracted
+                    .metadata
+                    .env
+                    .source_root
+                    .as_deref()
+                    .map(Path::new)
+                    .unwrap_or(&extracted.root_dir),
             )?;
             verify_copied_workspaces_remain_preserved(
                 &extracted_workspaces,
@@ -1244,6 +1282,13 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 &target_paths,
                 env,
                 target_runtime,
+                extracted
+                    .metadata
+                    .env
+                    .source_root
+                    .as_deref()
+                    .map(Path::new)
+                    .unwrap_or(&extracted.root_dir),
             )?;
             let state_rewrite = if extracted.metadata.include_state {
                 if let Some(source_root) = extracted.metadata.env.source_root.as_deref() {

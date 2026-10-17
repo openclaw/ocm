@@ -1425,3 +1425,156 @@ fn env_clone_rolls_back_an_unreadable_sqlite_snapshot() {
     assert_eq!(entries[0]["name"], "source");
     assert_eq!(fs::read(&database).unwrap(), invalid);
 }
+
+#[test]
+fn env_clone_retains_configured_agent_directories() {
+    let root = TestDir::new("clone-configured-agent-directories");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    for (index, relative) in [
+        "custom-agent",
+        "agents/main/private-agent",
+        "agents/main/sessions/private-agent",
+        "agents/main/agent",
+        "workspace/private-agent",
+        "identity/source-5",
+        "extensions/demo/node_modules/private-agent",
+        "workspace/.openclaw/tmp/private-agent",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let source_name = format!("source-{index}");
+        let target_name = format!("target-{index}");
+        let created = run_ocm(cwd, &env, &["env", "create", &source_name]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let source = root.child(&format!("ocm-home/envs/{source_name}"));
+        let state = source.join(".openclaw");
+        let agent_dir = if index == 5 {
+            "${OPENCLAW_STATE_DIR}/identity/${OCM_ACTIVE_ENV}".to_string()
+        } else {
+            state.join(relative).to_str().unwrap().to_string()
+        };
+        let agents = if index % 2 == 0 {
+            serde_json::json!({"entries":{"main":{"agentDir":agent_dir}}})
+        } else {
+            serde_json::json!({"list":[{"id":"main","agentDir":agent_dir}]})
+        };
+        write_text(
+            &state.join("openclaw.json"),
+            &serde_json::json!({"agents":agents}).to_string(),
+        );
+        write_text(
+            &state.join(relative).join("models.json"),
+            "{\"providers\":{}}",
+        );
+        write_text(&state.join("workspace/notes.txt"), "workspace");
+        write_text(
+            &state.join("agents/main/sessions/stale.jsonl"),
+            "runtime debris",
+        );
+        write_text(
+            &state.join("custom-agent-lookalike/stale.txt"),
+            "runtime debris",
+        );
+        write_text(
+            &state.join("extensions/demo/.openclaw-runtime-deps.json"),
+            "{}",
+        );
+        write_text(
+            &state.join("extensions/demo/node_modules/stale.txt"),
+            "runtime debris",
+        );
+        let config_before = fs::read(state.join("openclaw.json")).unwrap();
+        let cloned = run_ocm(cwd, &env, &["env", "clone", &source_name, &target_name]);
+        assert!(cloned.status.success(), "{relative}: {}", stderr(&cloned));
+        let target = root.child(&format!("ocm-home/envs/{target_name}/.openclaw"));
+        assert_eq!(
+            fs::read(target.join(relative).join("models.json")).unwrap(),
+            b"{\"providers\":{}}"
+        );
+        assert_eq!(
+            fs::read(target.join("workspace/notes.txt")).unwrap(),
+            b"workspace"
+        );
+        assert!(!target.join("agents/main/sessions/stale.jsonl").exists());
+        assert!(
+            !target
+                .join("extensions/demo/node_modules/stale.txt")
+                .exists()
+        );
+        assert!(!target.join("custom-agent-lookalike").exists());
+        let config: Value =
+            serde_json::from_slice(&fs::read(target.join("openclaw.json")).unwrap()).unwrap();
+        let configured = if index % 2 == 0 {
+            &config["agents"]["entries"]["main"]["agentDir"]
+        } else {
+            &config["agents"]["list"][0]["agentDir"]
+        };
+        assert_eq!(configured, target.join(relative).to_str().unwrap());
+        assert_eq!(
+            fs::read(state.join("openclaw.json")).unwrap(),
+            config_before
+        );
+        assert_eq!(
+            fs::read(state.join(relative).join("models.json")).unwrap(),
+            b"{\"providers\":{}}"
+        );
+        assert!(state.join("agents/main/sessions/stale.jsonl").exists());
+    }
+}
+
+#[test]
+fn env_clone_rejects_external_configured_agent_directories_before_copying() {
+    let root = TestDir::new("clone-external-agent-directory");
+    let env = ocm_env(&root);
+    let cwd = root.path();
+    let created = run_ocm(cwd, &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let external = root.child("external-agent");
+    write_text(&external.join("models.json"), "external payload");
+    let state = root.child("ocm-home/envs/source/.openclaw");
+    write_text(
+        &state.join("openclaw.json"),
+        &serde_json::json!({"agents":{"entries":{"main":{"agentDir":external}}}}).to_string(),
+    );
+    let cloned = run_ocm(cwd, &env, &["env", "clone", "source", "target"]);
+    assert!(!cloned.status.success());
+    assert!(
+        stderr(&cloned).contains("outside the environment root"),
+        "{}",
+        stderr(&cloned)
+    );
+    assert!(!root.child("ocm-home/envs/target").exists());
+    assert_eq!(
+        fs::read(external.join("models.json")).unwrap(),
+        b"external payload"
+    );
+    #[cfg(unix)]
+    {
+        let linked = state.join("linked-agent");
+        std::os::unix::fs::symlink(&external, &linked).unwrap();
+        write_text(
+            &state.join("openclaw.json"),
+            &serde_json::json!({"agents":{"list":[{"id":"main","agentDir":linked}]}}).to_string(),
+        );
+        let cloned = run_ocm(cwd, &env, &["env", "clone", "source", "linked-target"]);
+        assert!(!cloned.status.success());
+        assert!(
+            stderr(&cloned).contains("outside the environment root"),
+            "{}",
+            stderr(&cloned)
+        );
+        assert!(!root.child("ocm-home/envs/linked-target").exists());
+        assert_eq!(
+            fs::read(external.join("models.json")).unwrap(),
+            b"external payload"
+        );
+        assert!(
+            fs::symlink_metadata(&linked)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+}

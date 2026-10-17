@@ -13,7 +13,8 @@ use crate::infra::archive::{EnvArchiveEntryKind, EnvArchiveOptions};
 use super::common::path_exists;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_workspaces::{
-    OpenClawWorkspaceInventory, OpenClawWorkspaceRuntime, resolve_env_openclaw_workspaces,
+    OpenClawWorkspaceInventory, OpenClawWorkspaceRuntime, resolve_env_openclaw_copy_paths,
+    resolve_env_openclaw_workspaces,
 };
 
 #[derive(Clone, Debug)]
@@ -114,13 +115,15 @@ pub(crate) fn openclaw_env_archive_options(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<EnvArchiveOptions, String> {
-    let workspaces = resolve_env_openclaw_workspaces(paths, env, runtime)?;
+    let workspaces = resolve_env_openclaw_copy_paths(paths, env, runtime)?;
     let included_path_roots = workspaces.archive_relative_roots(&paths.root)?;
     let mut excluded_path_roots = openclaw_archive_excluded_path_roots(paths, false)?;
     excluded_path_roots.extend(openclaw_workspace_archive_excluded_path_roots(
         paths,
         &workspaces,
     )?);
+    let excluded_path_roots =
+        runtime_debris_outside_agent_directories(&paths.root, &workspaces, excluded_path_roots)?;
     Ok(EnvArchiveOptions {
         should_skip_path: should_skip_openclaw_env_archive_path,
         included_path_roots,
@@ -543,10 +546,15 @@ pub(crate) fn clear_nonportable_runtime_state(
     if !path_exists(&paths.state_dir) {
         return Ok(false);
     }
-    let workspaces = resolve_archivable_workspaces(paths, env, runtime)?;
+    let workspaces = resolve_env_openclaw_copy_paths(paths, env, runtime)?;
+    workspaces.archive_relative_roots(&paths.root)?;
 
     let mut changed = false;
-    for relative_path in openclaw_extension_runtime_debris_roots(&paths.state_dir)? {
+    for relative_path in runtime_debris_outside_agent_directories(
+        &paths.state_dir,
+        &workspaces,
+        openclaw_extension_runtime_debris_roots(&paths.state_dir)?,
+    )? {
         remove_path(&paths.state_dir.join(relative_path))?;
         changed = true;
     }
@@ -2108,6 +2116,41 @@ fn openclaw_workspace_archive_excluded_path_roots(
             Ok(relative_root.join(".openclaw/tmp"))
         })
         .collect()
+}
+
+fn runtime_debris_outside_agent_directories(
+    root: &Path,
+    paths: &OpenClawWorkspaceInventory,
+    candidates: BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let mut pending = candidates.into_iter().collect::<Vec<_>>();
+    let mut debris = BTreeSet::new();
+    while let Some(relative) = pending.pop() {
+        let path = root.join(&relative);
+        if paths
+            .agent_directory_roots()
+            .any(|root| path.starts_with(root))
+        {
+            continue;
+        }
+        if paths
+            .agent_directory_roots()
+            .any(|root| root.starts_with(&path))
+        {
+            let entries = match fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            for entry in entries {
+                let entry = entry.map_err(|error| error.to_string())?;
+                pending.push(relative.join(entry.file_name()));
+            }
+        } else {
+            debris.insert(relative);
+        }
+    }
+    Ok(debris)
 }
 
 fn openclaw_extension_runtime_debris_roots(state_dir: &Path) -> Result<BTreeSet<PathBuf>, String> {

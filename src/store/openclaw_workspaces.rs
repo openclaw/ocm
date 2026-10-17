@@ -41,6 +41,7 @@ pub(crate) struct EffectiveOpenClawConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OpenClawWorkspaceInventory {
     workspace_roots: BTreeSet<PathBuf>,
+    agent_directory_roots: BTreeMap<String, PathBuf>,
     config_include_paths: BTreeSet<PathBuf>,
     agent_workspace_roots: BTreeMap<String, PathBuf>,
     configured_default_workspace: Option<PathBuf>,
@@ -59,6 +60,7 @@ impl OpenClawWorkspaceInventory {
         let path = clean_path(path);
         self.workspace_roots
             .iter()
+            .chain(self.agent_directory_roots.values())
             .any(|root| path == *root || path.starts_with(root))
             || self.config_include_paths.contains(&path)
     }
@@ -67,6 +69,7 @@ impl OpenClawWorkspaceInventory {
         let path = clean_path(path);
         self.workspace_roots
             .iter()
+            .chain(self.agent_directory_roots.values())
             .chain(self.config_include_paths.iter())
             .any(|root| root.starts_with(&path))
     }
@@ -82,6 +85,7 @@ impl OpenClawWorkspaceInventory {
         for preserved_path in self
             .workspace_roots
             .iter()
+            .chain(self.agent_directory_roots.values())
             .chain(self.config_include_paths.iter())
         {
             let canonical_preserved_path = canonicalize_path_allow_missing(preserved_path)?;
@@ -89,7 +93,7 @@ impl OpenClawWorkspaceInventory {
                 || !canonical_preserved_path.starts_with(&canonical_archive_root)
             {
                 return Err(format!(
-                    "cannot safely preserve configured OpenClaw workspace or config include that resolves outside the environment root: {} (resolved: {}; environment root resolves to: {})",
+                    "cannot safely preserve configured OpenClaw workspace, agent directory, or config include that resolves outside the environment root: {} (resolved: {}; environment root resolves to: {})",
                     display_path(preserved_path),
                     display_path(&canonical_preserved_path),
                     display_path(&canonical_archive_root)
@@ -102,7 +106,7 @@ impl OpenClawWorkspaceInventory {
             if let Ok(relative) = preserved_path.strip_prefix(&archive_root) {
                 if relative != canonical_relative {
                     return Err(format!(
-                        "cannot safely preserve configured OpenClaw workspace or config include through a symlink: {}",
+                        "cannot safely preserve configured OpenClaw workspace, agent directory, or config include through a symlink: {}",
                         display_path(preserved_path)
                     ));
                 }
@@ -124,6 +128,16 @@ impl OpenClawWorkspaceInventory {
         self.agent_workspace_roots
             .get(&normalize_agent_id(agent_id))
             .map(PathBuf::as_path)
+    }
+
+    pub(crate) fn agent_directory(&self, agent_id: &str) -> Option<&Path> {
+        self.agent_directory_roots
+            .get(&normalize_agent_id(agent_id))
+            .map(PathBuf::as_path)
+    }
+
+    pub(crate) fn agent_directory_roots(&self) -> impl Iterator<Item = &Path> {
+        self.agent_directory_roots.values().map(PathBuf::as_path)
     }
 
     pub(crate) fn workspace_roots(&self) -> impl Iterator<Item = &Path> {
@@ -244,12 +258,32 @@ pub(crate) fn resolve_env_openclaw_workspaces(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<OpenClawWorkspaceInventory, String> {
+    resolve_env_openclaw_paths(paths, env, runtime, false)
+}
+
+/// Clone and ordinary archives retain configured agent payloads as well as
+/// workspaces. Migration and state relocation keep their existing policy.
+pub(crate) fn resolve_env_openclaw_copy_paths(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+) -> Result<OpenClawWorkspaceInventory, String> {
+    resolve_env_openclaw_paths(paths, env, runtime, true)
+}
+
+fn resolve_env_openclaw_paths(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    retain_agent_directories: bool,
+) -> Result<OpenClawWorkspaceInventory, String> {
     let mut inventory = resolve_openclaw_workspaces(
         &paths.config_path,
         &paths.state_dir,
         &paths.openclaw_home,
         env,
         runtime,
+        retain_agent_directories,
     )?;
     inventory
         .workspace_roots
@@ -269,6 +303,7 @@ pub(crate) fn resolve_plain_openclaw_workspaces(
         openclaw_home,
         env,
         OpenClawWorkspaceRuntime::default(),
+        false,
     )?;
     inventory
         .workspace_roots
@@ -306,6 +341,7 @@ fn resolve_openclaw_workspaces(
     openclaw_home: &Path,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
+    retain_agent_directories: bool,
 ) -> Result<OpenClawWorkspaceInventory, String> {
     let resolved = load_effective_openclaw_config(config_path)?;
     let config = resolved
@@ -337,17 +373,33 @@ fn resolve_openclaw_workspaces(
     agent_ids.insert(default_agent_id.clone());
 
     let mut workspace_roots = BTreeSet::new();
+    let mut agent_directory_roots = BTreeMap::new();
     let mut agent_workspace_roots = BTreeMap::new();
     let mut configured_agent_workspace_roots = BTreeMap::new();
     for agent_id in agent_ids {
-        let explicit = entries
-            .iter()
-            .find(|entry| {
-                entry
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| normalize_agent_id(id) == agent_id)
-            })
+        let entry = entries.iter().find(|entry| {
+            entry
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| normalize_agent_id(id) == agent_id)
+        });
+        if retain_agent_directories
+            && let Some(raw) = entry
+                .and_then(|entry| entry.get("agentDir"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            let directory = resolve_configured_path(raw, openclaw_home, "agent directory")?;
+            if directory == clean_path(state_dir) {
+                return Err(format!(
+                    "configured OpenClaw agent directory cannot be the state directory itself: {}",
+                    display_path(&directory)
+                ));
+            }
+            agent_directory_roots.insert(agent_id.clone(), directory);
+        }
+        let explicit = entry
             .and_then(|entry| entry.get("workspace"))
             .and_then(Value::as_str)
             .map(str::trim)
@@ -381,6 +433,7 @@ fn resolve_openclaw_workspaces(
     }
     Ok(OpenClawWorkspaceInventory {
         workspace_roots,
+        agent_directory_roots,
         config_include_paths,
         agent_workspace_roots,
         configured_default_workspace,
@@ -799,9 +852,17 @@ pub(crate) fn normalize_agent_id(value: &str) -> String {
 }
 
 fn resolve_workspace_path(raw: &str, openclaw_home: &Path) -> Result<PathBuf, String> {
+    resolve_configured_path(raw, openclaw_home, "workspace")
+}
+
+fn resolve_configured_path(
+    raw: &str,
+    openclaw_home: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
     let trimmed = raw.trim();
     if trimmed.contains('\0') {
-        return Err("OpenClaw workspace path must not contain null bytes".to_string());
+        return Err(format!("OpenClaw {label} path must not contain null bytes"));
     }
     let expanded = match trimmed {
         "~" => openclaw_home.to_path_buf(),
@@ -814,7 +875,7 @@ fn resolve_workspace_path(raw: &str, openclaw_home: &Path) -> Result<PathBuf, St
     };
     if !expanded.is_absolute() {
         return Err(format!(
-            "cannot safely preserve relative OpenClaw workspace path \"{trimmed}\"; configure an absolute path or a path under ~"
+            "cannot safely preserve relative OpenClaw {label} path \"{trimmed}\"; configure an absolute path or a path under ~"
         ));
     }
     Ok(clean_path(&expanded))
@@ -1175,6 +1236,54 @@ mod tests {
         assert_eq!(ids, vec!["main", "ops", "local"]);
         assert_eq!(resolved.include_paths.len(), 3);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copy_inventory_retains_agent_directories_without_treating_them_as_workspaces() {
+        let root = test_root("agent-directories");
+        let paths = super::super::layout::derive_env_paths(&root);
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        fs::write(
+            &paths.config_path,
+            r#"{
+            "env": {"vars": {"AGENT_CHILD": "private-agent"}},
+            "agents": {"$include": "agents.json5"}
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            paths.state_dir.join("agents.json5"),
+            r#"{
+            entries: {main: {agentDir: "${OPENCLAW_STATE_DIR}/agents/main/${AGENT_CHILD}"}},
+            list: [{id: "ignored", agentDir: "/external/ignored"}]
+        }"#,
+        )
+        .unwrap();
+        let inventory = resolve_env_openclaw_copy_paths(
+            &paths,
+            &test_env(),
+            OpenClawWorkspaceRuntime::default(),
+        )
+        .unwrap();
+        let agent_dir = paths.state_dir.join("agents/main/private-agent");
+        assert!(inventory.contains(&agent_dir.join("models.json")));
+        assert!(inventory.has_descendant(&paths.state_dir.join("agents/main")));
+        assert!(!inventory.contains(&paths.state_dir.join("agents/main/private-agent-other")));
+        assert!(!inventory.workspace_roots().any(|root| root == agent_dir));
+        assert!(
+            inventory
+                .archive_relative_roots(&paths.root)
+                .unwrap()
+                .contains(Path::new(".openclaw/agents/main/private-agent"))
+        );
+        let old_policy = resolve_env_openclaw_workspaces(
+            &paths,
+            &test_env(),
+            OpenClawWorkspaceRuntime::default(),
+        )
+        .unwrap();
+        assert!(!old_policy.contains(&agent_dir));
         let _ = fs::remove_dir_all(root);
     }
 

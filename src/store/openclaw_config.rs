@@ -5,8 +5,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
 use serde_json::json;
+use serde_json::{Map, Value};
 use url::{Host, Url};
 
 use crate::env::EnvMeta;
@@ -390,6 +390,7 @@ pub(crate) fn rewrite_identity_bound_workspace_paths_for_target(
     source_workspaces: &OpenClawWorkspaceInventory,
     source_root: &Path,
     target_root: &Path,
+    source_agent_root: &Path,
 ) -> Result<bool, String> {
     let Some(mut value) = read_config_value(config_path)? else {
         return Ok(false);
@@ -425,6 +426,13 @@ pub(crate) fn rewrite_identity_bound_workspace_paths_for_target(
             let Some(entry) = entry.as_object_mut() else {
                 continue;
             };
+            changed |= rewrite_identity_bound_agent_directory(
+                entry,
+                source_workspaces.agent_directory(agent_id),
+                source_root,
+                source_agent_root,
+                target_root,
+            )?;
             let identity_bound = entry
                 .get("workspace")
                 .and_then(Value::as_str)
@@ -450,9 +458,16 @@ pub(crate) fn rewrite_identity_bound_workspace_paths_for_target(
             let Some(entry) = entry.as_object_mut() else {
                 continue;
             };
-            let Some(agent_id) = entry.get("id").and_then(Value::as_str) else {
+            let Some(agent_id) = entry.get("id").and_then(Value::as_str).map(str::to_owned) else {
                 continue;
             };
+            changed |= rewrite_identity_bound_agent_directory(
+                entry,
+                source_workspaces.agent_directory(&agent_id),
+                source_root,
+                source_agent_root,
+                target_root,
+            )?;
             let identity_bound = entry
                 .get("workspace")
                 .and_then(Value::as_str)
@@ -460,7 +475,7 @@ pub(crate) fn rewrite_identity_bound_workspace_paths_for_target(
             if !identity_bound {
                 continue;
             }
-            let Some(source_workspace) = source_workspaces.agent_workspace(agent_id) else {
+            let Some(source_workspace) = source_workspaces.agent_workspace(&agent_id) else {
                 continue;
             };
             let target_workspace =
@@ -477,6 +492,33 @@ pub(crate) fn rewrite_identity_bound_workspace_paths_for_target(
         write_config_value(config_path, &value)?;
     }
     Ok(changed)
+}
+
+fn rewrite_identity_bound_agent_directory(
+    entry: &mut Map<String, Value>,
+    source_directory: Option<&Path>,
+    source_root: &Path,
+    source_agent_root: &Path,
+    target_root: &Path,
+) -> Result<bool, String> {
+    if !entry
+        .get("agentDir")
+        .and_then(Value::as_str)
+        .is_some_and(workspace_uses_changing_runtime_identity)
+    {
+        return Ok(false);
+    }
+    let Some(source_directory) = source_directory else {
+        return Ok(false);
+    };
+    let relative = source_directory.strip_prefix(source_root).or_else(|_| source_directory.strip_prefix(source_agent_root)).map_err(|_| {
+        format!("cannot rewrite identity-bound OpenClaw agent directory outside the source environment root: {}", display_path(source_directory))
+    })?;
+    entry.insert(
+        "agentDir".to_string(),
+        Value::String(display_path(&clean_path(&target_root.join(relative)))),
+    );
+    Ok(true)
 }
 
 fn rebase_workspace_path(
