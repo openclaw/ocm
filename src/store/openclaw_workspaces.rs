@@ -80,16 +80,32 @@ impl OpenClawWorkspaceInventory {
         &self,
         archive_root: &Path,
     ) -> Result<BTreeSet<PathBuf>, String> {
+        self.archive_relative_path_roots(
+            archive_root,
+            self.workspace_roots
+                .iter()
+                .chain(self.agent_directory_roots.values())
+                .chain(self.config_include_paths.iter()),
+        )
+    }
+
+    pub(crate) fn workspace_archive_relative_roots(
+        &self,
+        archive_root: &Path,
+    ) -> Result<BTreeSet<PathBuf>, String> {
+        self.archive_relative_path_roots(archive_root, self.workspace_roots.iter())
+    }
+
+    fn archive_relative_path_roots<'a>(
+        &self,
+        archive_root: &Path,
+        preserved_paths: impl Iterator<Item = &'a PathBuf>,
+    ) -> Result<BTreeSet<PathBuf>, String> {
         let archive_root = clean_path(archive_root);
         let canonical_archive_root = canonicalize_path_allow_missing(&archive_root)?;
         let mut relative_roots = BTreeSet::new();
 
-        for preserved_path in self
-            .workspace_roots
-            .iter()
-            .chain(self.agent_directory_roots.values())
-            .chain(self.config_include_paths.iter())
-        {
+        for preserved_path in preserved_paths {
             let canonical_preserved_path = canonicalize_path_allow_missing(preserved_path)?;
             if canonical_preserved_path == canonical_archive_root
                 || !canonical_preserved_path.starts_with(&canonical_archive_root)
@@ -105,7 +121,10 @@ impl OpenClawWorkspaceInventory {
             let canonical_relative = canonical_preserved_path
                 .strip_prefix(&canonical_archive_root)
                 .map_err(|error| error.to_string())?;
-            if let Ok(relative) = preserved_path.strip_prefix(&archive_root) {
+            if let Ok(relative) = preserved_path
+                .strip_prefix(&archive_root)
+                .or_else(|_| preserved_path.strip_prefix(&canonical_archive_root))
+            {
                 if relative != canonical_relative {
                     return Err(format!(
                         "cannot safely preserve configured OpenClaw workspace, agent directory, or config include through a symlink: {}",

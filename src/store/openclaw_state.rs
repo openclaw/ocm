@@ -2272,20 +2272,11 @@ fn openclaw_workspace_archive_excluded_path_roots(
     paths: &EnvPaths,
     workspaces: &OpenClawWorkspaceInventory,
 ) -> Result<BTreeSet<PathBuf>, String> {
-    let archive_root = clean_path(&paths.root);
-    workspaces
-        .workspace_roots()
-        .map(|workspace_root| {
-            let workspace_root = clean_path(workspace_root);
-            let relative_root = workspace_root.strip_prefix(&archive_root).map_err(|_| {
-                format!(
-                    "configured OpenClaw workspace is outside the environment root: {}",
-                    display_path(&workspace_root)
-                )
-            })?;
-            Ok(relative_root.join(".openclaw/tmp"))
-        })
-        .collect()
+    Ok(workspaces
+        .workspace_archive_relative_roots(&paths.root)?
+        .into_iter()
+        .map(|relative_root| relative_root.join(".openclaw/tmp"))
+        .collect())
 }
 
 fn runtime_debris_outside_agent_directories(
