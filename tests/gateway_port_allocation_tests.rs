@@ -122,4 +122,40 @@ fn exhausted_create_and_legacy_resolution_return_errors_without_writes() {
         );
         assert_eq!(fs::read(&registry_path).unwrap(), before);
     }
+    // Disabled legacy environments do not need an endpoint for service planning.
+    // Their exhaustion must not block status for a sibling with an explicit port.
+    let status = run_ocm(
+        root.path(),
+        &env,
+        &["service", "status", "reserved-18789", "--json"],
+    );
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert_eq!(fs::read(&registry_path).unwrap(), before);
+
+    // Leave only the last TCP port available. The first legacy environment
+    // keeps that valid assignment even when a later legacy environment fails.
+    let entries = registry["envs"].as_array_mut().unwrap();
+    let last_reservation = entries
+        .iter_mut()
+        .find(|meta| meta["gatewayPort"] == 65_520)
+        .unwrap();
+    last_reservation["gatewayPort"] = json!(65_424);
+    let mut later = entries.last().unwrap().clone();
+    later["name"] = json!("z-legacy");
+    later["root"] = json!(root.child("z-legacy").to_str().unwrap());
+    entries.push(later);
+    fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    let before = fs::read(&registry_path).unwrap();
+    let earlier = run_ocm(root.path(), &env, &["env", "show", "legacy", "--json"]);
+    assert!(earlier.status.success(), "{}", stderr(&earlier));
+    let shown: Value = serde_json::from_slice(&earlier.stdout).unwrap();
+    assert_eq!(shown["gatewayPort"], 65_535);
+    let later = run_ocm(root.path(), &env, &["env", "show", "z-legacy", "--json"]);
+    assert!(!later.status.success());
+    assert!(
+        stderr(&later).contains("no available Gateway port"),
+        "{}",
+        stderr(&later)
+    );
+    assert_eq!(fs::read(&registry_path).unwrap(), before);
 }

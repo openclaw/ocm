@@ -1063,10 +1063,11 @@ fn choose_cloned_gateway_port(
     envs: &[EnvMeta],
     env: &BTreeMap<String, String>,
 ) -> Result<u32, String> {
-    let effective_ports = resolve_effective_gateway_ports(envs, env)?;
+    let effective_ports = resolve_effective_gateway_ports(envs, env);
     let preferred = effective_ports
         .get(&source.name)
-        .copied()
+        .cloned()
+        .transpose()?
         .or_else(|| resolve_env_gateway_port(source))
         .unwrap_or(DEFAULT_GATEWAY_PORT);
 

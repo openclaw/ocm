@@ -912,7 +912,6 @@ impl<'a> SupervisorService<'a> {
         let env_service = EnvironmentService::new(&child_env, self.cwd);
         let mut envs = list_environments(self.env, self.cwd)?;
         envs.sort_by(|left, right| left.name.cmp(&right.name));
-        let envs = env_service.apply_effective_gateway_ports(envs)?;
 
         let mut children = Vec::new();
         let mut skipped_envs = Vec::new();

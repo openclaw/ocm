@@ -26,7 +26,7 @@ pub(crate) fn resolve_config_gateway_port(meta: &EnvMeta) -> Option<u32> {
 pub(crate) fn resolve_effective_gateway_ports(
     envs: &[EnvMeta],
     env: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, u32>, String> {
+) -> BTreeMap<String, Result<u32, String>> {
     let mut sorted = envs.to_vec();
     sorted.sort_by(|left, right| {
         left.created_at
@@ -42,21 +42,30 @@ pub(crate) fn resolve_effective_gateway_ports(
     for meta in &sorted {
         if let Some(port) = resolve_env_gateway_port(meta) {
             reserve_openclaw_port_family(port, &mut claimed);
-            effective.insert(meta.name.clone(), port);
+            effective.insert(meta.name.clone(), Ok(port));
         }
     }
 
+    let mut allocation_error: Option<String> = None;
     for meta in &sorted {
         if effective.contains_key(&meta.name) {
             continue;
         }
 
-        let port = next_available_gateway_port(DEFAULT_GATEWAY_PORT, &claimed)?;
-        reserve_openclaw_port_family(port, &mut claimed);
+        let port = match &allocation_error {
+            Some(error) => Err(error.clone()),
+            None => next_available_gateway_port(DEFAULT_GATEWAY_PORT, &claimed),
+        };
+        match &port {
+            Ok(port) => reserve_openclaw_port_family(*port, &mut claimed),
+            // Reservations only grow during this pass; do not repeat an
+            // exhausted search for every remaining legacy environment.
+            Err(error) => allocation_error = Some(error.clone()),
+        }
         effective.insert(meta.name.clone(), port);
     }
 
-    Ok(effective)
+    effective
 }
 
 pub(crate) fn choose_available_gateway_port(
@@ -64,12 +73,12 @@ pub(crate) fn choose_available_gateway_port(
     envs: &[EnvMeta],
     env: &BTreeMap<String, String>,
 ) -> Result<u32, String> {
-    let effective = resolve_effective_gateway_ports(envs, env)?;
+    let effective = resolve_effective_gateway_ports(envs, env);
     let mut claimed = BTreeSet::new();
     reserve_foreign_openclaw_port_family(env, &mut claimed);
     reserve_dev_ui_ports(envs, &mut claimed);
-    for port in effective.values().copied() {
-        reserve_openclaw_port_family(port, &mut claimed);
+    for port in effective.into_values() {
+        reserve_openclaw_port_family(port?, &mut claimed);
     }
 
     next_available_gateway_port(preferred_port.max(DEFAULT_GATEWAY_PORT), &claimed)
@@ -99,9 +108,9 @@ pub(super) fn choose_source_ui_port(
 ) -> Result<u32, String> {
     let mut claimed = BTreeSet::new();
     reserve_foreign_openclaw_port_family(env, &mut claimed);
-    for port in resolve_effective_gateway_ports(envs, env)?
-        .values()
-        .copied()
+    for port in resolve_effective_gateway_ports(envs, env)
+        .into_values()
+        .filter_map(Result::ok)
     {
         reserve_openclaw_port_family(port, &mut claimed);
     }

@@ -398,9 +398,13 @@ fn clone_environment_skips_busy_ports_when_assigning_a_new_identity() {
     fs::create_dir_all(&cwd).unwrap();
     let env = ocm_env(&root);
 
-    let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    // Leave room above the source family, and occupy the first candidate
+    // beyond that reservation so this exercises the socket availability check.
+    let occupied = (30_000..40_000)
+        .find_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
+        .unwrap();
     let occupied_port = u32::from(occupied.local_addr().unwrap().port());
-    let source_port = occupied_port.saturating_sub(1).max(1024);
+    let source_port = occupied_port - 111;
 
     let source = create_environment(
         CreateEnvironmentOptions {
