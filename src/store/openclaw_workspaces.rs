@@ -49,6 +49,7 @@ pub(crate) struct OpenClawWorkspaceInventory {
     configured_default_workspace: Option<PathBuf>,
     configured_agent_workspace_roots: BTreeMap<String, PathBuf>,
     default_agent_id: String,
+    cleanup_agents_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -62,9 +63,17 @@ impl OpenClawWorkspaceInventory {
         let path = clean_path(path);
         self.workspace_roots
             .iter()
-            .chain(self.agent_directory_roots.values())
             .any(|root| path == *root || path.starts_with(root))
             || self.config_include_paths.contains(&path)
+            || self.agent_directory_roots.values().any(|root| {
+                path.starts_with(root)
+                    && !self
+                        .cleanup_agents_root
+                        .as_ref()
+                        .is_some_and(|agents_root| {
+                            cleanup_path_is_agent_runtime(agents_root, root, &path)
+                        })
+            })
     }
 
     pub(crate) fn has_descendant(&self, path: &Path) -> bool {
@@ -202,6 +211,24 @@ impl OpenClawWorkspaceInventory {
     }
 }
 
+fn cleanup_path_is_agent_runtime(agents_root: &Path, agent_dir: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(agents_root) else {
+        return false;
+    };
+    let Some(agent_id) = relative.components().next() else {
+        return true;
+    };
+    let sessions = agents_root.join(agent_id).join("sessions");
+    if sessions == agent_dir || !sessions.starts_with(agent_dir) {
+        return false;
+    }
+    // Session storage has its own location, independent of agentDir. A broad
+    // agent payload root must not hide that runtime subtree or its parents.
+    path.starts_with(&sessions)
+        || (sessions.starts_with(path)
+            && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
+}
+
 fn validate_internal_migration_path(
     path: &Path,
     source_root: &Path,
@@ -313,6 +340,7 @@ pub(crate) fn resolve_env_openclaw_cleanup_paths(
             );
         }
     }
+    inventory.cleanup_agents_root = Some(clean_path(&paths.state_dir.join("agents")));
     Ok(inventory)
 }
 
@@ -507,6 +535,7 @@ fn resolve_openclaw_workspaces(
         configured_default_workspace,
         configured_agent_workspace_roots,
         default_agent_id,
+        cleanup_agents_root: None,
     })
 }
 

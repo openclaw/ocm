@@ -347,6 +347,8 @@ fn env_cleanup_preserves_configured_agent_payload_and_removes_unselected_debris(
     for relative in [
         "extensions/demo/node_modules/private-agent",
         "custom/private-agent",
+        "agents/main",
+        "agents",
     ] {
         let root = TestDir::new("cleanup-configured-agent-payload");
         let cwd = root.path();

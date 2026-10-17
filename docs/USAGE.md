@@ -1117,6 +1117,7 @@ ocm env repair-marker mira
 
 Runtime-state cleanup preserves configured agent directories inside the environment, including their authentication and state files beneath generated plugin dependencies.
 It still removes stale sessions and unselected generated files beside those directories.
+Configuring an agent directory above `agents/<id>/sessions` preserves agent payload beside that subtree without hiding its stale sessions from cleanup.
 External configured agent directories remain untouched and do not prevent this cleanup.
 Run `ocm env cleanup mira --json` to preview the actions before applying them with `--yes`.
 
