@@ -1406,7 +1406,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                     .map(Path::new)
                     .unwrap_or(&extracted.root_dir),
             )?;
-            let state_rewrite = if extracted.metadata.include_state && !source_roots.is_empty() {
+            let state_rewrite = if extracted.metadata.include_state {
                 super::openclaw_state::relocate_archived_runtime_state(
                     &target_paths,
                     &source_roots,

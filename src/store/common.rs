@@ -294,7 +294,7 @@ pub(crate) fn copy_dir_with_sqlite_snapshots(
     destination: &Path,
     state_root: &Path,
 ) -> Result<(), String> {
-    OpenClawDirectoryCopy::new(state_root)?.copy(source, destination)
+    OpenClawDirectoryCopy::new(state_root, source)?.copy(source, destination)
 }
 
 // One operation retains destination ownership through every migration overlay.
@@ -305,9 +305,13 @@ pub(crate) struct OpenClawDirectoryCopy<'a> {
 }
 
 impl<'a> OpenClawDirectoryCopy<'a> {
-    pub(crate) fn new(state_root: &'a Path) -> Result<Self, String> {
+    pub(crate) fn new(state_root: &'a Path, owned_root: &Path) -> Result<Self, String> {
+        let selection = OpenClawSqliteCopy::new(state_root)?;
+        // Reuse discovered source owners before copying. In particular, a
+        // protected registry alias may point back to the ordinary global file.
+        selection.admit_registered_databases(owned_root)?;
         Ok(Self {
-            selection: OpenClawSqliteCopy::new(state_root)?,
+            selection,
             databases: HashSet::new(),
         })
     }

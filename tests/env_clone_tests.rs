@@ -1892,3 +1892,237 @@ fn env_clone_rolls_back_a_database_relocation_failure() {
         stderr(&show)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn env_clone_refuses_active_plugin_history_and_preserves_ordinary_aliases() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for folded in [false, true] {
+        for placement in [
+            "protected-alias",
+            "protected-unaliased",
+            "protected-namespace-alias",
+            "protected-isolated",
+            "protected-empty",
+            "protected-external",
+            "ordinary-alias",
+        ] {
+            let root = TestDir::new("clone-plugin-history");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = ocm_env(&root);
+            let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source/.openclaw");
+            let target = root.child("ocm-home/envs/target/.openclaw");
+            let protected = placement != "ordinary-alias";
+            let parent = if placement == "protected-namespace-alias" {
+                "workspace/history-store/support"
+            } else if protected {
+                "skill-workshop/support"
+            } else {
+                "workspace/ordinary"
+            };
+            let relative = Path::new(parent).join("openclaw.sqlite");
+            let database = source.join(&relative);
+            let plugin_path = match placement {
+                "protected-isolated" => target.join("extensions/demo"),
+                "protected-external" => root.child("external-plugin"),
+                _ => source.join("extensions/demo"),
+            };
+            let records = if placement == "protected-empty" {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"demo": {"source": "path", "installPath": plugin_path}})
+            };
+            write_text(&source.join("extensions/demo/index.js"), "plugin payload");
+            // No lease or session tables: only plugin relocation can change this database.
+            seed_plugin_registry(&database, folded, records.clone());
+            let alias = if placement == "protected-namespace-alias" {
+                symlink("workspace/history-store", source.join("skill-workshop")).unwrap();
+                "skill-workshop/support"
+            } else {
+                parent
+            };
+            if placement != "protected-unaliased" {
+                symlink(alias, source.join("state")).unwrap();
+            }
+            let mode = if protected { 0o440 } else { 0o640 };
+            fs::set_permissions(&database, fs::Permissions::from_mode(mode)).unwrap();
+            let before = fs::read(&database).unwrap();
+            let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+            assert_eq!(fs::read(&database).unwrap(), before);
+            if protected && placement != "protected-unaliased" {
+                assert!(!clone.status.success(), "{}", stdout(&clone));
+                assert!(
+                    stderr(&clone).contains("selects integrity-protected history"),
+                    "{}",
+                    stderr(&clone)
+                );
+                assert!(!target.parent().unwrap().exists());
+                assert!(
+                    !run_ocm(&cwd, &env, &["env", "show", "target"])
+                        .status
+                        .success()
+                );
+                assert_eq!(
+                    fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+                continue;
+            }
+            assert!(
+                clone.status.success(),
+                "placement={placement} folded={folded}: {}",
+                stderr(&clone)
+            );
+            let copied = target.join(&relative);
+            let actual = read_plugin_registry(&copied, folded);
+            if protected {
+                assert_eq!(actual, records);
+                assert_eq!(fs::read(&copied).unwrap(), before);
+            } else {
+                assert_eq!(
+                    actual["demo"]["installPath"],
+                    target.join("extensions/demo").to_str().unwrap()
+                );
+                assert_ne!(fs::read(&copied).unwrap(), before);
+            }
+            assert_eq!(fs::read(&database).unwrap(), before);
+            for path in [&database, &copied] {
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+            }
+            if placement != "protected-unaliased" {
+                assert_eq!(
+                    fs::read_link(target.join("state")).unwrap(),
+                    Path::new(alias)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_refuses_active_history_and_preserves_ordinary_lease_cleanup() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for (directory, alias, workshop_alias, protected) in [
+        ("skill-workshop/support", true, false, true),
+        ("skill-workshop/support", false, false, true),
+        ("workspace/history-store/support", true, true, true),
+        ("workspace/active", true, false, false),
+    ] {
+        let root = TestDir::new("clone-historical-leases");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let state = root.child("ocm-home/envs/source/.openclaw");
+        let relative = Path::new(directory).join("openclaw.sqlite");
+        let source = state.join(&relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let db = Connection::open(&source).unwrap();
+        // No plugin index or session tables: only lease cleanup can change rows.
+        db.execute_batch(
+            "CREATE TABLE agent_database_leases (
+                 lease_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, path TEXT NOT NULL,
+                 owner_pid INTEGER NOT NULL, owner_start_time INTEGER, opened_at INTEGER NOT NULL
+             ) STRICT;
+             CREATE TABLE durable_fixture (value TEXT);
+             INSERT INTO durable_fixture VALUES ('preserved');",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO agent_database_leases VALUES ('retained-owner', 'main', ?1, ?2, NULL, 1)",
+            rusqlite::params![source.to_str().unwrap(), std::process::id()],
+        )
+        .unwrap();
+        drop(db);
+        let mode = if protected { 0o440 } else { 0o600 };
+        fs::set_permissions(&source, fs::Permissions::from_mode(mode)).unwrap();
+        let alias_target = if workshop_alias {
+            symlink("workspace/history-store", state.join("skill-workshop")).unwrap();
+            "skill-workshop/support"
+        } else {
+            directory
+        };
+        if alias {
+            symlink(alias_target, state.join("state")).unwrap();
+        }
+        let before = fs::read(&source).unwrap();
+        let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+        let conflict = protected && alias;
+        assert_eq!(clone.status.success(), !conflict, "{}", stderr(&clone));
+        if conflict {
+            assert!(
+                stderr(&clone).contains("selects integrity-protected history"),
+                "{}",
+                stderr(&clone)
+            );
+            assert_eq!(fs::read(&source).unwrap(), before);
+            assert_eq!(
+                fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert!(!root.child("ocm-home/envs/target").exists());
+            let show = run_ocm(&cwd, &env, &["env", "show", "target"]);
+            assert!(!show.status.success(), "{}", stdout(&show));
+            continue;
+        }
+        let target_state = root.child("ocm-home/envs/target/.openclaw");
+        let copied = target_state.join(&relative);
+        assert_eq!(fs::read(&source).unwrap(), before);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+        assert_eq!(
+            fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+        if protected {
+            assert_eq!(fs::read(&copied).unwrap(), before);
+        }
+        if alias {
+            assert_eq!(
+                fs::read_link(target_state.join("state")).unwrap(),
+                Path::new(alias_target)
+            );
+        }
+        if workshop_alias {
+            assert_eq!(
+                fs::read_link(target_state.join("skill-workshop")).unwrap(),
+                Path::new("workspace/history-store")
+            );
+        }
+        let db = Connection::open_with_flags(&copied, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+        let leases: Vec<String> = db
+            .prepare("SELECT lease_id FROM agent_database_leases")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            leases,
+            if protected {
+                vec!["retained-owner"]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(
+            db.query_row("SELECT value FROM durable_fixture", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
+    }
+}
