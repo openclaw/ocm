@@ -449,22 +449,47 @@ fn dev_watch_checks_launchd_ownership_without_searching_path_for_id() {
 
 #[test]
 fn dev_watch_allows_confirmed_stopped_and_unloaded_daemons() {
-    let fixture = AdmissionFixture::new("dev-daemon-stopped");
-    fixture.set_manager_state("stopped", 0);
-    fs::write(&fixture.runtime, "{old runtime record").unwrap();
-    let stopped = fixture.watch();
-    assert!(stopped.status.success(), "{}", stderr(&stopped));
-    assert!(fixture.definition.exists());
+    for unloaded in [false, true] {
+        let fixture = AdmissionFixture::new(&format!("dev-daemon-stopped-{unloaded}"));
+        fixture.set_manager_state("stopped", 0);
+        if unloaded {
+            let absent = if fixture.launchd {
+                "#!/bin/sh\nprintf 'Could not find service \"ai.openclaw.ocm\" in domain for user gui\\n' >&2\nexit 113\n"
+            } else {
+                "#!/bin/sh\nprintf 'LoadState=not-found\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\n'\nexit 4\n"
+            };
+            write_executable_script(&fixture.query, absent);
+        }
+        // Native absence does not make unreadable ownership an empty record.
+        let damaged = b"{old runtime record";
+        fs::write(&fixture.runtime, damaged).unwrap();
+        let registry_path = env_registry_path(&fixture.env, &fixture.cwd).unwrap();
+        let registry = fs::read(&registry_path).unwrap();
+        let refused = fixture.watch();
+        assert!(!refused.status.success());
+        assert_eq!(fs::read(&fixture.runtime).unwrap(), damaged);
+        assert_eq!(fs::read(&registry_path).unwrap(), registry);
+        assert!(!fixture.root.child("node.log").exists());
+        assert!(
+            !fixture
+                .root
+                .child("ocm-home/source-watch/demo.session")
+                .exists()
+        );
 
-    let absent = if cfg!(target_os = "macos") {
-        "#!/bin/sh\nprintf 'Could not find service \"ai.openclaw.ocm\" in domain for user gui\\n' >&2\nexit 113\n"
-    } else {
-        "#!/bin/sh\nprintf 'LoadState=not-found\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\n'\nexit 4\n"
-    };
-    write_executable_script(&fixture.query, absent);
-    let unloaded = fixture.watch();
-    assert!(unloaded.status.success(), "{}", stderr(&unloaded));
-    assert!(fixture.definition.exists());
+        // A valid empty legacy record needs no live-daemon capability.
+        write_json_replacing_path(
+            &fixture.runtime,
+            &json!({
+                "kind":"ocm-supervisor-runtime", "ocmHome":fixture.env["OCM_HOME"],
+                "updatedAt":"2026-01-01T00:00:00Z", "children":[], "services":[]
+            }),
+        );
+        let allowed = fixture.watch();
+        assert!(allowed.status.success(), "{}", stderr(&allowed));
+        assert!(fixture.definition.exists());
+        assert!(fixture.root.child("node.log").exists());
+    }
 }
 
 #[test]
@@ -660,6 +685,36 @@ fn assert_saved_dev_plan_revalidation(borrowed: bool) {
         if case == "missing-source" {
             fs::rename(&retained_source, &worktree).unwrap();
         }
+        // Each independent fault leaves a published pending/refused claim when
+        // its daemon is killed. Settle that exact claim before the next daemon;
+        // replacement must not erase it merely because this fixture never ran.
+        EnvironmentService::new(&fixture.env, &fixture.cwd)
+            .set_service_running("source-env", false)
+            .unwrap();
+        let inspected = run_ocm(
+            &fixture.cwd,
+            &fixture.env,
+            &["service", "recover", "source-env", "--json"],
+        );
+        assert!(inspected.status.success(), "{}", stderr(&inspected));
+        let inspected: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+        let recovered = run_ocm(
+            &fixture.cwd,
+            &fixture.env,
+            &[
+                "service",
+                "recover",
+                "source-env",
+                "--acknowledge-stopped-processes",
+                "--if-claim",
+                inspected["claimToken"].as_str().unwrap(),
+            ],
+        );
+        assert!(recovered.status.success(), "{}", stderr(&recovered));
+        assert!(
+            !command_log.exists(),
+            "{case} executed during claim recovery"
+        );
     }
 }
 

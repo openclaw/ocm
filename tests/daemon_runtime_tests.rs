@@ -28,7 +28,15 @@ fn daemon_runtime_test_lock() -> MutexGuard<'static, ()> {
 }
 
 fn spawn_daemon_process(cwd: &Path, env: &BTreeMap<String, String>) -> Child {
-    let mut command = Command::new(ocm_test_binary_path());
+    // Publish the real process ID before exec can start a Gateway that calls
+    // back into OCM. The fake manager reads it independently of runtime.json.
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "if [ -n \"$OCM_TEST_NATIVE_DAEMON_PID_FILE\" ]; then printf '%s\\n' \"$$\" > \"$OCM_TEST_NATIVE_DAEMON_PID_FILE\" || exit 1; fi; exec \"$@\"",
+        "ocm-daemon-fixture",
+    ]);
+    command.arg(ocm_test_binary_path());
     command.current_dir(cwd);
     command.args(["__daemon", "run"]);
     command.env_clear();
@@ -1814,7 +1822,14 @@ fn service_start_failure_preserves_live_sibling(ordinal: usize, reply: &str) {
         );
         assert!(marker.exists());
         assert!(daemon.try_wait().unwrap().is_none());
-        assert!(process_exists(pid as u32));
+        assert!(
+            process_exists(pid as u32),
+            "sibling exited after observation fault ordinal={ordinal}, reply={reply:?}; initial={initial}; current={}; stderr={}; stops={}",
+            fs::read_to_string(&runtime_path).unwrap_or_default(),
+            fs::read_to_string(initial["children"][0]["stderrPath"].as_str().unwrap())
+                .unwrap_or_default(),
+            fs::read_to_string(&stopped_path).unwrap_or_default(),
+        );
         assert_eq!(persisted_child(&state_path, "sibling"), before);
         let status = run_ocm(&cwd, &env, &["service", "status", "sibling", "--json"]);
         assert!(status.status.success(), "{}", stderr(&status));
@@ -2321,6 +2336,405 @@ fn daemon_run_persists_live_runtime_children() {
             .is_some_and(|value| !value.is_empty())
     );
     assert_eq!(cleared["gatewayAdmission"], gateway_admission);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_publishes_dynamic_pending_ownership_before_starting_the_child() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-dynamic-publication");
+    let (cwd, env, launcher_marker, _) = setup_daemon_run_fixture_with_child_sleep(&root, 60);
+    let service = EnvironmentService::new(&env, &cwd);
+    let supervisor = SupervisorService::new(&env, &cwd);
+    supervisor.sync().unwrap();
+    let state = read_persisted_service_state(&root.child("ocm-home/supervisor/state.json"));
+    let stdout_path = Path::new(
+        state["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["envName"] == "demo")
+            .unwrap()["stdoutPath"]
+            .as_str()
+            .unwrap(),
+    );
+    let fifo = std::ffi::CString::new(stdout_path.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    service.set_service_running("demo", false).unwrap();
+    supervisor.sync().unwrap();
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial =
+        wait_for_runtime_children(&runtime_path, 1, Some("prod"), Duration::from_secs(10));
+    // Add exactly one new due child after the sibling's startup has settled;
+    // an initial pending plan or earlier due sibling must not mask the gap.
+    service.set_service_running("demo", true).unwrap();
+    supervisor.sync().unwrap();
+    let pending =
+        wait_for_runtime_service_state(&runtime_path, "demo", "pending", Duration::from_secs(5));
+    let started_before_release = launcher_marker.exists();
+    let admission = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.child("ocm-home/source-watch/demo.admission"))
+        .unwrap();
+    let admission_held = FileExt::try_lock_exclusive(&admission).is_err();
+    // Opening the read end releases spawn's stdout open without a production
+    // test hook. Keep it open until the child has exited.
+    let reader = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(stdout_path)
+        .unwrap();
+    let runtime =
+        wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(10));
+    let started = wait_for_file(&launcher_marker, Duration::from_secs(5));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let admission_released = loop {
+        if FileExt::try_lock_exclusive(&admission).is_ok() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        sleep(Duration::from_millis(10));
+    };
+    drop(admission);
+    stop_process(&mut daemon);
+    drop(reader);
+
+    let initial = initial.expect("sibling did not settle");
+    let pending = pending.expect("new target had no pending ownership before spawn");
+    assert!(pending["pid"].is_null());
+    assert!(!started_before_release);
+    assert!(
+        admission_held,
+        "admission was released before PID publication"
+    );
+    let runtime = runtime.expect("dynamic target did not start");
+    assert!(started);
+    assert_eq!(
+        runtime_child_pid(&initial, "prod"),
+        runtime_child_pid(&runtime, "prod")
+    );
+    assert!(
+        admission_released,
+        "admission remained held after PID publication"
+    );
+    assert!(wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5)).is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn replacement_retains_claims_until_exact_operator_recovery() {
+    let _guard = daemon_runtime_test_lock();
+    struct OwnedReplacement {
+        root: TestDir,
+        daemons: Vec<Child>,
+        inherited_pids: Vec<u32>,
+    }
+    impl Drop for OwnedReplacement {
+        fn drop(&mut self) {
+            for name in ["source", "sibling", "extra"] {
+                let _ = fs::write(self.root.child(format!("exit-{name}")), "exit");
+            }
+            for daemon in &mut self.daemons {
+                if daemon.try_wait().ok().flatten().is_none() {
+                    stop_process(daemon);
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.inherited_pids.iter().any(|pid| process_exists(*pid))
+                && Instant::now() < deadline
+            {
+                sleep(Duration::from_millis(30));
+            }
+        }
+    }
+    let mut fixture = OwnedReplacement {
+        root: TestDir::new("replacement-retained-claims"),
+        daemons: Vec::new(),
+        inherited_pids: Vec::new(),
+    };
+    let root = &fixture.root;
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(root);
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+    install_fake_launchctl(root, &mut env);
+    let gateway = root.child("bin/ownership-gateway");
+    write_executable_script(
+        &gateway,
+        &format!(
+            r#"#!/bin/sh
+exec node - "$@" <<'NODE'
+const fs = require('node:fs');
+const http = require('node:http');
+const path = require('node:path');
+if (process.argv[2] === 'gateway' && process.argv[3] === 'restart-handoff') process.exit(64);
+const root = {};
+const name = process.env.OCM_ACTIVE_ENV;
+const file = prefix => path.join(root, prefix + name);
+const beat = () => {{
+    if (fs.existsSync(file('exit-'))) process.exit(0);
+    fs.appendFileSync(file('beats-'), 'beat\n');
+}};
+const started = () => {{
+    fs.appendFileSync(file('started-'), `${{process.pid}}\n`);
+    beat();
+    setInterval(beat, 30);
+}};
+if (name === 'source') {{
+    http.createServer((request, response) => {{
+        response.writeHead(200); response.end('ok');
+    }}).listen(Number(process.env.OPENCLAW_GATEWAY_PORT), '127.0.0.1', started);
+}} else {{
+    started();
+}}
+NODE
+"#,
+            serde_json::to_string(&path_string(root.path())).unwrap()
+        ),
+    );
+    let added = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "retained",
+            "--command",
+            &format!("exec {}", path_string(&gateway)),
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    for name in ["source", "sibling", "extra"] {
+        let created = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", name, "--launcher", "retained"],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        set_service_enabled(&cwd, &env, name, name != "extra");
+    }
+    let service = SupervisorService::new(&env, &cwd);
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    fixture.daemons.push(spawn_daemon_process(&cwd, &env));
+    let initial =
+        wait_for_runtime_children(&runtime_path, 2, Some("source"), Duration::from_secs(10))
+            .unwrap();
+    for name in ["source", "sibling"] {
+        assert!(
+            wait_for_file(
+                &root.child(format!("beats-{name}")),
+                Duration::from_secs(10)
+            ),
+            "child {name} did not execute; initial={initial}; current={}; stderr={}",
+            fs::read_to_string(&runtime_path).unwrap_or_default(),
+            initial["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["envName"] == name)
+                .and_then(|row| row["stderrPath"].as_str())
+                .map(|path| fs::read_to_string(path).unwrap_or_default())
+                .unwrap_or_default()
+        );
+    }
+    let original_pid = runtime_child_pid(&initial, "source").unwrap();
+    fixture.inherited_pids = initial["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|child| child["pid"].as_u64().unwrap() as u32)
+        .collect();
+    fixture.daemons[0].kill().unwrap();
+    fixture.daemons[0].wait().unwrap();
+    fs::remove_file(root.child("launchctl-print.txt")).unwrap();
+    let stopped = run_ocm(&cwd, &env, &["service", "stop", "source"]);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+
+    fixture.daemons.push(spawn_daemon_process(&cwd, &env));
+    let replacement_pid = fixture.daemons[1].id();
+    fs::write(
+        root.child("launchctl-print.txt"),
+        format!(
+            "state = running\npid = {replacement_pid}\npath = {}\n",
+            path_string(&support::managed_service_definition_path(
+                &env, &cwd, "source"
+            ))
+        ),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let retained = loop {
+        let value: Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+        if value["gatewayAdmission"]["process"]["pid"] == replacement_pid {
+            break value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement never published ownership"
+        );
+        sleep(Duration::from_millis(25));
+    };
+    assert_eq!(runtime_child_pid(&retained, "source"), Some(original_pid));
+    assert_eq!(retained["retainedOwnership"].as_array().unwrap().len(), 2);
+    let claims = retained["retainedOwnership"].clone();
+    let before_beats = fs::metadata(root.child("beats-source")).unwrap().len();
+    // A newly requested sibling must run while both inherited targets stay fenced.
+    set_service_enabled(&cwd, &env, "extra", true);
+    ocm::supervisor::sync_supervisor_env_if_present(&env, &cwd, "extra").unwrap();
+    let extra = wait_for_runtime_children(&runtime_path, 3, Some("extra"), Duration::from_secs(10))
+        .unwrap();
+    let extra_pid = runtime_child_pid(&extra, "extra").unwrap();
+    assert_eq!(extra["retainedOwnership"], claims);
+    assert!(fs::metadata(root.child("beats-source")).unwrap().len() > before_beats);
+    assert_eq!(
+        fs::read_to_string(root.child("started-source"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(root.child("started-sibling"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    let inspected = run_ocm(&cwd, &env, &["service", "recover", "source", "--json"]);
+    assert!(inspected.status.success(), "{}", stderr(&inspected));
+    let inspected: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    let token = inspected["claimToken"].as_str().unwrap();
+    let refused = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "service",
+            "recover",
+            "source",
+            "--acknowledge-stopped-processes",
+            "--if-claim",
+            token,
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("occupied"));
+    let status = run_ocm(&cwd, &env, &["service", "status", "source", "--json"]);
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["gatewayState"], "unknown");
+    assert_eq!(status["running"], false);
+    assert!(status["childPid"].is_null());
+    // Do not accept the old child as a successful Start.
+    let mut readiness_env = env.clone();
+    readiness_env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
+    let started = run_ocm(
+        &cwd,
+        &readiness_env,
+        &["service", "start", "source", "--json"],
+    );
+    assert!(!started.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&started.stdout).unwrap()["gatewayReady"],
+        false
+    );
+    let stopped = run_ocm(&cwd, &env, &["service", "stop", "source"]);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+
+    fs::write(
+        root.child("exit-source"),
+        "operator independently stopped old workload",
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process_exists(original_pid as u32) && Instant::now() < deadline {
+        sleep(Duration::from_millis(30));
+    }
+    assert!(!process_exists(original_pid as u32));
+    let calls_before = fs::read_to_string(root.child("launchctl.log")).unwrap();
+    let acknowledged = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "service",
+            "recover",
+            "source",
+            "--acknowledge-stopped-processes",
+            "--if-claim",
+            token,
+            "--json",
+        ],
+    );
+    assert!(acknowledged.status.success(), "{}", stderr(&acknowledged));
+    let result: Value = serde_json::from_slice(&acknowledged.stdout).unwrap();
+    assert_eq!(result["released"], true);
+    assert_eq!(result["operatorAcknowledged"], true);
+    assert_eq!(result["processAbsenceVerified"], false);
+    assert_eq!(result["desiredRunning"], false);
+    let calls = fs::read_to_string(root.child("launchctl.log")).unwrap();
+    assert!(
+        !calls[calls_before.len()..]
+            .lines()
+            .any(|line| line.starts_with("boot") || line.starts_with("unload"))
+    );
+    // A sibling write and normal replacement shutdown cannot resurrect the claim.
+    service.request_child_restart("extra").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let runtime: Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+        assert!(runtime_child_pid(&runtime, "source").is_none());
+        assert!(
+            !runtime["services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["envName"] == "source")
+        );
+        assert!(
+            !runtime["retainedOwnership"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["envName"] == "source")
+        );
+        if runtime_child_pid(&runtime, "extra").is_some_and(|pid| pid != extra_pid) {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        sleep(Duration::from_millis(30));
+    }
+    stop_process(&mut fixture.daemons[1]);
+    fs::remove_file(root.child("launchctl-print.txt")).unwrap();
+    let final_state: Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+    assert_eq!(
+        final_state["retainedOwnership"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(final_state["retainedOwnership"][0]["envName"], "sibling");
+    assert!(runtime_child_pid(&final_state, "source").is_none());
+    // A second daemon replacement preserves the same sibling claim ID.
+    fixture.daemons.push(spawn_daemon_process(&cwd, &env));
+    let second =
+        wait_for_runtime_children(&runtime_path, 2, Some("extra"), Duration::from_secs(10))
+            .unwrap();
+    assert_eq!(
+        second["retainedOwnership"],
+        final_state["retainedOwnership"]
+    );
+    assert!(runtime_child_pid(&second, "source").is_none());
+    assert!(
+        !second["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["envName"] == "source")
+    );
 }
 
 #[test]

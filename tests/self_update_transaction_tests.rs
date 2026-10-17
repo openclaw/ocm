@@ -74,6 +74,9 @@ fn build_candidate(root: &TestDir) -> PathBuf {
         .args(["build", "--locked", "--offline", "--bin", "ocm"])
         .current_dir(&package)
         .env("CARGO_TARGET_DIR", package.join("target"))
+        // Debug info adds large payloads to each mandatory integrity check but
+        // does not exercise the update lifecycle. Keep the real source build.
+        .env("CARGO_PROFILE_DEV_DEBUG", "0")
         .output()
         .unwrap();
     assert!(
@@ -300,6 +303,15 @@ setInterval(() => {{
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("self-update receipt: {}", self.receipt());
+            for name in ["update.log", "daemon.log", "manager.log"] {
+                eprintln!(
+                    "{name}: {}",
+                    fs::read_to_string(self.root.child(name)).unwrap_or_default()
+                );
+            }
+        }
         // Exact owned PID, from this fixture's manager. Graceful daemon shutdown
         // also reaps its gateway group; no host service or unrelated process.
         if let Ok(pid) = fs::read_to_string(self.root.child("daemon.pid")) {

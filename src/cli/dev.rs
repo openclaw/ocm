@@ -1222,6 +1222,8 @@ impl Cli {
         let env_service = self.environment_service();
         let _operation = env_service.lock_operation(env_name)?;
         self.ensure_source_watch_env_matches(env_name, lease)?;
+        crate::supervisor::SupervisorService::new(&self.env, &self.cwd)
+            .ensure_retained_ownership_recovered(env_name)?;
         let revision =
             crate::store::environment_service_policy_revision(env_name, &self.env, &self.cwd)?;
         if lease.service_policy_revision() != Some(revision) {
@@ -2062,6 +2064,32 @@ impl Cli {
         )
     }
 
+    fn lock_source_watch_gateway_spawn(
+        &self,
+        name: &str,
+    ) -> Result<
+        (
+            crate::store::ExclusiveFileLock,
+            crate::store::ExclusiveFileLock,
+        ),
+        String,
+    > {
+        let supervisor = crate::supervisor::SupervisorService::new(&self.env, &self.cwd);
+        // Settle a current daemon's terminal row without blocking its writer.
+        supervisor.ensure_background_gateway_quiescent(name, "foreground startup")?;
+        let publication = supervisor.lock_state_publication()?;
+        // A supervisor spawn publishes while holding admission. Never wait for
+        // that guard while holding the publication lock it needs to finish.
+        let admission = self
+            .environment_service()
+            .try_lock_gateway_admission(name)?
+            .ok_or_else(|| {
+                format!("Gateway admission for env {name} is busy; retry foreground startup")
+            })?;
+        supervisor.ensure_foreground_gateway_unowned(name)?;
+        Ok((publication, admission))
+    }
+
     fn run_source_gateway_watch(
         &self,
         meta: &EnvMeta,
@@ -2111,6 +2139,7 @@ impl Cli {
 
         let mut process_guard = SourceWatchProcessGuard::new()?;
         process_guard.configure_command(&mut command)?;
+        let spawn_admission = self.lock_source_watch_gateway_spawn(&meta.name)?;
         lease.begin_child_spawn()?;
         let mut child = command.spawn().map_err(|error| {
             source_watch_spawn_error(lease, format!("failed to run \"node\": {error}"))
@@ -2180,6 +2209,7 @@ impl Cli {
                 ));
             }
         };
+        drop(spawn_admission);
         let start_result = source_watch_cancelled(lease, stop_requested).and_then(|cancelled| {
             if cancelled {
                 Ok(())

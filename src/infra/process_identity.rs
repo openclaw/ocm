@@ -35,9 +35,9 @@ pub(crate) fn process_group_members(group: u32) -> Result<Vec<ProcessObservation
     let output = Command::new("/bin/ps")
         .args(["-axo", "pid=,pgid="])
         .output()
-        .map_err(|error| format!("failed listing source watch process groups: {error}"))?;
+        .map_err(|error| format!("failed listing process groups: {error}"))?;
     if !output.status.success() {
-        return Err("failed listing source watch process groups".to_string());
+        return Err("failed listing process groups".to_string());
     }
     let mut members = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -50,7 +50,7 @@ pub(crate) fn process_group_members(group: u32) -> Result<Vec<ProcessObservation
         }
         let pid = pid
             .parse::<u32>()
-            .map_err(|error| format!("invalid source watch group member: {error}"))?;
+            .map_err(|error| format!("invalid process group member: {error}"))?;
         if let Some(process) = observe_process(pid)?
             && process.running
             && process.process_group == Some(group)

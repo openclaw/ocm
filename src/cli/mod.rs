@@ -680,6 +680,7 @@ impl Cli {
         }
 
         if !(group == "dev" && action == "status")
+            && !(group == "service" && action == "recover")
             && let Err(error) = ensure_store(&cli.env, &cli.cwd)
         {
             cli.stderr_line(format!("ocm: {error}"));

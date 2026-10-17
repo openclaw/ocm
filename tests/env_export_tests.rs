@@ -43,6 +43,130 @@ fn env_export_writes_the_default_archive_path() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn default_export_retains_alias_identity_for_offline_configuration() {
+    use serde_json::{Value, json};
+
+    let root = TestDir::new("default-export-offline-alias");
+    let env = ocm_env(&root);
+    let physical = root.child("physical");
+    let alias = root.child("alias");
+    fs::create_dir_all(&physical).unwrap();
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    let source = alias.join("source");
+    let create = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let canonical = fs::canonicalize(&source).unwrap();
+    let state = source.join(".openclaw");
+    let config = json!({
+        "agents": {
+            "defaults": {"workspace": source.join(".openclaw/workspace")},
+            "entries": {"main": {"agentDir": canonical.join(".openclaw/agents/main/agent")}}
+        },
+        "external": root.child("unrelated")
+    })
+    .to_string();
+    let notes = format!("authored {}\n", canonical.display());
+    let auth = b"{\"profiles\":{}}\n";
+    write_text(&state.join("openclaw.json"), &config);
+    write_text(&state.join("workspace/notes.txt"), &notes);
+    write_text(
+        &state.join("agents/main/agent/auth-profiles.json"),
+        std::str::from_utf8(auth).unwrap(),
+    );
+    write_text(&state.join("state/openclaw.sqlite"), "excluded registry");
+    let archive = root.child("default.tar");
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    let extracted =
+        extract_env_archive::<EnvArchiveMetadata>(&archive, &root.child("extracted")).unwrap();
+    assert!(!extracted.metadata.include_state);
+    assert_eq!(
+        extracted.metadata.env.source_root.as_deref(),
+        source.to_str()
+    );
+    assert_eq!(
+        extracted.metadata.env.canonical_source_root.as_deref(),
+        canonical.to_str()
+    );
+    assert_eq!(
+        fs::read(state.join("openclaw.json")).unwrap(),
+        config.as_bytes()
+    );
+    assert_eq!(
+        fs::read(extracted.root_dir.join(".openclaw/openclaw.json")).unwrap(),
+        config.as_bytes()
+    );
+    assert!(
+        !extracted
+            .root_dir
+            .join(".openclaw/state/openclaw.sqlite")
+            .exists()
+    );
+    assert_eq!(
+        fs::read(state.join("agents/main/agent/auth-profiles.json")).unwrap(),
+        auth
+    );
+    fs::remove_dir_all(&canonical).unwrap();
+    fs::remove_file(&alias).unwrap();
+    let target = root.child("restored");
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "restored",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    let restored: Value =
+        serde_json::from_slice(&fs::read(target.join(".openclaw/openclaw.json")).unwrap()).unwrap();
+    assert_eq!(
+        restored["agents"]["defaults"]["workspace"],
+        json!(target.join(".openclaw/workspace"))
+    );
+    assert_eq!(
+        restored["agents"]["entries"]["main"]["agentDir"],
+        json!(target.join(".openclaw/agents/main/agent"))
+    );
+    assert_eq!(restored["external"], json!(root.child("unrelated")));
+    assert_eq!(
+        fs::read(target.join(".openclaw/workspace/notes.txt")).unwrap(),
+        notes.as_bytes()
+    );
+    assert_eq!(
+        fs::read(target.join(".openclaw/agents/main/agent/auth-profiles.json")).unwrap(),
+        auth
+    );
+    assert!(!target.join(".openclaw/state/openclaw.sqlite").exists());
+}
+
 #[test]
 fn env_export_json_reports_the_custom_archive_path() {
     let root = TestDir::new("env-export-json");

@@ -205,6 +205,7 @@ fn dev_rebind_refusals_preserve_the_binding_and_policy() {
     let runtime_path = supervisor_runtime_path(&env, root.path()).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".into(),
         ocm_home: env["OCM_HOME"].clone(),
         daemon_version: None,
@@ -413,7 +414,16 @@ fn dev_rebind_retains_ui_port_and_serves_new_code_with_saved_conversation() {
         &root,
         root.path(),
         &env,
-        &["dev", "demo", "--repo", &path_string(&repo)],
+        // Other fixture stores probe from 18789 upward even while this
+        // environment is stopped. Keep its retained family below that range.
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--port",
+            "16789",
+        ],
     );
     let gateway = initial_ui_process(&root, "gateway", &mut controller);
     let ui = initial_ui_process(&root, "ui", &mut controller);
@@ -439,6 +449,20 @@ fn dev_rebind_retains_ui_port_and_serves_new_code_with_saved_conversation() {
     fs::write(&entry, &code).unwrap();
     fs::remove_dir_all(&repo).unwrap();
     let target = fs::canonicalize(target).unwrap();
+    let registry = ocm::store::env_registry_path(&env, root.path()).unwrap();
+    let previous_binding = fs::read(&registry).unwrap();
+    let occupied =
+        std::net::TcpListener::bind(("127.0.0.1", saved.gateway_port.unwrap() as u16 + 1)).unwrap();
+    let refused = rebind(root.path(), &env, &target);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("Gateway port family is in use"));
+    assert_eq!(fs::read(&registry).unwrap(), previous_binding);
+    assert_eq!(fs::read(&paths.config_path).unwrap(), config);
+    assert_eq!(
+        fs::read_to_string(&conversation).unwrap(),
+        "saved synthetic conversation"
+    );
+    drop(occupied);
     let rebound = rebind(root.path(), &env, &target);
     assert!(rebound.status.success(), "{}", stderr(&rebound));
     assert_eq!(
@@ -501,6 +525,14 @@ fn dev_rebind_waits_for_stopped_history_retirement() {
         );
         assert!(created.status.success(), "{}", stderr(&created));
     }
+    // Setup advertised this test process as a synthetic empty daemon. Retire
+    // that fixture record before launching the actual publisher; a real live
+    // publisher must never be replaced just because its current rows are empty.
+    let runtime_path = supervisor_runtime_path(&env, root.path()).unwrap();
+    let setup_runtime: SupervisorRuntimeState =
+        serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+    assert!(setup_runtime.children.is_empty() && setup_runtime.services.is_empty());
+    fs::remove_file(&runtime_path).unwrap();
     let mut daemon = DevWatchFixture::spawn_caller(&root, root.path(), &env, &["__daemon", "run"]);
     let pid = daemon.child.as_ref().unwrap().id();
     env.insert("OCM_TEST_NATIVE_DAEMON_PID".into(), pid.to_string());
@@ -518,6 +550,14 @@ fn dev_rebind_waits_for_stopped_history_retirement() {
     let runtime_path = supervisor_runtime_path(&env, root.path()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
+        if !runtime_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "daemon never published its runtime"
+            );
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        }
         let runtime: SupervisorRuntimeState =
             serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
         if runtime.services.iter().any(|service| {

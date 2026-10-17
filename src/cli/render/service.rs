@@ -7,6 +7,50 @@ use crate::service::{
 };
 use crate::supervisor::SupervisorDaemonRefreshSummary;
 
+pub fn service_recovery(summary: &crate::supervisor::ServiceRecoverySummary) -> Vec<String> {
+    if summary.released {
+        return vec![format!(
+            "Released retained service ownership for {} using your acknowledgement; service intent remains stopped.",
+            summary.env_name
+        )];
+    }
+    let mut lines = vec![format!("Service ownership recovery: {}", summary.env_name)];
+    if let Some(token) = &summary.claim_token {
+        lines.push(format!("Claim token: {token}"));
+        for child in &summary.children {
+            lines.push(format!(
+                "Recorded child: PID {}, {}:{}",
+                child.pid, child.binding_kind, child.binding_name
+            ));
+        }
+        for service in &summary.services {
+            lines.push(format!(
+                "Recorded service: {}:{}; state {}; PID {:?}",
+                service.binding_kind, service.binding_name, service.gateway_state, service.pid
+            ));
+        }
+        if let Some(publisher) = &summary.publisher {
+            lines.push(format!(
+                "Original publisher: {}",
+                serde_json::to_string(publisher).unwrap_or_default()
+            ));
+        } else {
+            lines.push("Original publisher identity is missing.".into());
+        }
+        lines.push("OCM cannot establish that detached or unpublished processes stopped. Confirm this independently before acknowledging this claim.".into());
+        lines.push(format!("After independent confirmation: ocm service recover {} --acknowledge-stopped-processes --if-claim {token}", summary.env_name));
+    } else {
+        lines.push("No retained claim was found. This does not certify absence of previously unrecorded processes.".into());
+    }
+    lines.extend(
+        summary
+            .blockers
+            .iter()
+            .map(|reason| format!("Recovery refused: {reason}")),
+    );
+    lines
+}
+
 fn ocm_service_state(installed: bool, loaded: bool, running: bool) -> &'static str {
     if running {
         "running"

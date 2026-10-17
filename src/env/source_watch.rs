@@ -755,8 +755,17 @@ impl<'a> EnvironmentService<'a> {
             .is_service_preparation()
             .then(|| supervisor.lock_state_publication())
             .transpose()?;
-        let _admission_lock = self.lock_gateway_admission(&env_name)?;
+        let _admission_lock = if mode.is_service_preparation() {
+            // An admitted supervisor child publishes under the state lock.
+            // Never wait for its admission while excluding that publication.
+            self.try_lock_gateway_admission(&env_name)?.ok_or_else(|| {
+                format!("Gateway admission for env {env_name} is busy; retry service preparation")
+            })?
+        } else {
+            self.lock_gateway_admission(&env_name)?
+        };
         supervisor.ensure_source_watch_daemon_compatible()?;
+        supervisor.ensure_retained_ownership_recovered(&env_name)?;
         // Source upgrades exclude new users before any watch preparation begins.
         // Publish the starting lease under that same registry exclusion.
         let _registry_lock = crate::store::lock_env_registry(self.env, self.cwd)?;
@@ -1697,6 +1706,41 @@ mod tests {
             SourceWatchState::Starting
         ));
         lease.acknowledge_stopped_processes().unwrap();
+    }
+
+    #[test]
+    fn service_preparation_does_not_wait_for_admission_under_publication_lock() {
+        use std::collections::BTreeMap;
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([
+            (
+                "OCM_HOME".into(),
+                root.path().join("ocm").display().to_string(),
+            ),
+            ("OCM_INTERNAL_SERVICE_MANAGER".into(), "unsupported".into()),
+        ]);
+        let service = EnvironmentService::new(&env, root.path());
+        let admission = service.lock_gateway_admission("demo").unwrap();
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let service = &service;
+            let path = root.path();
+            scope.spawn(move || {
+                let result = service
+                    .acquire_source_watch_lease(
+                        "demo",
+                        path,
+                        false,
+                        SourceWatchMode::ServicePreparation,
+                    )
+                    .err();
+                let _ = send.send(result);
+            });
+            let result = receive.recv_timeout(Duration::from_secs(2));
+            // Always release the owner before joining, including on regression.
+            drop(admission);
+            assert!(result.unwrap().unwrap().contains("Gateway admission"));
+        });
     }
 
     #[cfg(unix)]

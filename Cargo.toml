@@ -21,6 +21,7 @@ name = "ocm"
 path = "src/main.rs"
 
 [dependencies]
+gix-config = { version = "=0.62.0", default-features = false, features = ["sha256"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 plist = { version = "1.10", default-features = false }

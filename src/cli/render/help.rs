@@ -1197,6 +1197,10 @@ pub fn service_help(cmd: &str) -> String {
                     ),
                     ("stop", "Stop one env gateway without disabling it"),
                     (
+                        "recover",
+                        "Inspect or acknowledge retained service ownership",
+                    ),
+                    (
                         "restart",
                         "Restart one env gateway under the background service",
                     ),
@@ -2380,6 +2384,36 @@ pub fn service_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             vec![format!("{cmd} service stop mira")],
             &[],
+        ),
+        "recover" => render_leaf(
+            "Recover retained service ownership",
+            "Inspect one old claim, then release only that claim using the operator's confirmation that all its processes stopped.",
+            vec![
+                format!("{cmd} service recover <env> [--json]"),
+                format!(
+                    "{cmd} service recover <env> --acknowledge-stopped-processes --if-claim <token> [--json]"
+                ),
+            ],
+            &[
+                (
+                    "--acknowledge-stopped-processes",
+                    "Assert that all old processes, including detached or unpublished children, stopped",
+                ),
+                (
+                    "--if-claim <token>",
+                    "Require the exact claim and environment from the inspection",
+                ),
+                ("--json", "Print the claim or acknowledgement as JSON"),
+            ],
+            vec![
+                format!("{cmd} service stop mira"),
+                format!("{cmd} service recover mira"),
+            ],
+            &[
+                "Recovery preserves stopped intent and never signals processes or restarts the daemon or siblings.",
+                "OCM rejects observed conflicts; acknowledgement is an operator assertion, not machine-verified absence.",
+                "Missing publisher identity, changed process scope or a live incompatible daemon prevents recovery. Previously unrecorded history is not covered.",
+            ],
         ),
         "restart" => render_leaf(
             "Restart an env under the background service",
