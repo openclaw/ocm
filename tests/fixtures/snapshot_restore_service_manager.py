@@ -45,7 +45,7 @@ if args[0]=='bootstrap':
             print('forced snapshot acceptance failure',file=sys.stderr)
             sys.exit(1)
         event('service-restart-admitted')
-    printed.write_text('state = running\npid = '+os.environ['OCM_TEST_NATIVE_DAEMON_PID']+'\n')
+    printed.write_text('state = running\npid = '+os.environ['OCM_TEST_NATIVE_DAEMON_PID']+'\npath = '+args[-1]+'\n')
     runtime();sys.exit(0)
 if args[0] in ('bootout','unload'):
     if (case/'fault-path').exists() and (case/'mode').read_text().endswith('unload-fails'):
@@ -53,6 +53,13 @@ if args[0] in ('bootout','unload'):
         sys.exit(1)
     printed.unlink(missing_ok=True);runtime();sys.exit(0)
 if args[0]=='print':
+    if (case/'fault-path').exists() and not metadata()['serviceRunning']:
+        mode = (case/'mode').read_text()
+        if mode.endswith('foreign-path') or mode.endswith('missing-path'):
+            if mode.endswith('foreign-path'):
+                print('path = '+str(case/'old-home/Library/LaunchAgents/ai.openclaw.ocm.plist'))
+            print('state = running\npid = '+os.environ['OCM_TEST_NATIVE_DAEMON_PID'])
+            sys.exit(0)
     if ((case/'fault-path').exists() and (case/'mode').read_text().endswith('observation-fails')
             and not metadata()['serviceRunning']):
         print('forced manager observation failure', file=sys.stderr)

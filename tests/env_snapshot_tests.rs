@@ -1211,6 +1211,8 @@ fn snapshot_restore_service_resumption_requires_recovered_data() {
         "full-incomplete-sync-fails",
         "full-incomplete-unload-fails",
         "full-incomplete-observation-fails",
+        "full-incomplete-foreign-path",
+        "full-incomplete-missing-path",
         "cleanup-warning",
     ] {
         let root = TestDir::new("snapshot-service-recovery");
@@ -1291,7 +1293,10 @@ fn snapshot_restore_service_resumption_requires_recovered_data() {
             assert_eq!(events.len(), 1, "{events:?}");
             assert!(!current.service_running);
             assert!(stderr(&restored).contains("automatic service resumption withheld"));
-            if mode.ends_with("sync-fails") || mode.ends_with("observation-fails") {
+            if mode.ends_with("sync-fails")
+                || mode.ends_with("observation-fails")
+                || mode.ends_with("-path")
+            {
                 assert!(stderr(&restored).contains("quiescing the managed service also failed"));
             }
             assert_eq!(fs::read_to_string(&marker).unwrap(), "snapshot-state\n");

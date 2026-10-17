@@ -23,7 +23,8 @@ use crate::infra::process_identity::{
 };
 use crate::infra::shell::apply_external_supervision_hint;
 use crate::service::inspect::{
-    ManagedJobObservation, inspect_job, inspect_job_for_activation, observe_job_for_source_watch,
+    LaunchdJobStatus, ManagedJobObservation, inspect_job, inspect_job_for_activation,
+    inspect_job_for_recovery, observe_job_for_source_watch,
 };
 use crate::service::platform::{
     ManagedServiceDefinition, ManagedServiceEnablement, ServiceManagerKind,
@@ -588,7 +589,11 @@ impl<'a> SupervisorService<'a> {
 
     fn inspect_with_checked_daemon(&self, checked: bool) -> Result<SupervisorInspection, String> {
         let state = self.build_state()?;
-        let daemon = self.daemon_summary("status", checked)?;
+        let daemon = if checked {
+            self.daemon_summary_with_inspector("status", inspect_job_for_recovery)?
+        } else {
+            self.daemon_status()?
+        };
         let runtime = if daemon.running {
             self.read_runtime_state()?
         } else {
@@ -1039,6 +1044,20 @@ impl<'a> SupervisorService<'a> {
         action: &str,
         checked: bool,
     ) -> Result<SupervisorDaemonSummary, String> {
+        self.daemon_summary_with_inspector(action, |label, path, env| {
+            if checked {
+                inspect_job_for_activation(label, path, env)
+            } else {
+                Ok(inspect_job(label, path, env))
+            }
+        })
+    }
+
+    fn daemon_summary_with_inspector(
+        &self,
+        action: &str,
+        inspect: impl FnOnce(&str, &Path, &BTreeMap<String, String>) -> Result<LaunchdJobStatus, String>,
+    ) -> Result<SupervisorDaemonSummary, String> {
         ensure_store(self.env, self.cwd)?;
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let state_path = supervisor_state_path(self.env, self.cwd)?;
@@ -1046,11 +1065,7 @@ impl<'a> SupervisorService<'a> {
         let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;
         let stdout_path = logs_dir.join("daemon.stdout.log");
         let stderr_path = logs_dir.join("daemon.stderr.log");
-        let status = if checked {
-            inspect_job_for_activation(&identity.label, &identity.definition_path, self.env)?
-        } else {
-            inspect_job(&identity.label, &identity.definition_path, self.env)
-        };
+        let status = inspect(&identity.label, &identity.definition_path, self.env)?;
         let enablement =
             if status.loaded && service_manager_kind(self.env) == ServiceManagerKind::Launchd {
                 managed_service_enablement(&identity.label, self.env)?

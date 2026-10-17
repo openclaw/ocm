@@ -521,14 +521,23 @@ fn service_state_label(installed: bool, desired_running: bool, running: bool) ->
     }
 }
 
+#[derive(Clone, Copy)]
+enum JobInspection {
+    Informational,
+    Activation,
+    Recovery,
+}
+
 pub(crate) fn inspect_job(
     label: &str,
     service_path: &Path,
     env: &BTreeMap<String, String>,
 ) -> LaunchdJobStatus {
-    inspect_job_inner(label, service_path, env, false).unwrap_or_else(|_| LaunchdJobStatus {
-        installed: service_path.exists(),
-        ..LaunchdJobStatus::default()
+    inspect_job_inner(label, service_path, env, JobInspection::Informational).unwrap_or_else(|_| {
+        LaunchdJobStatus {
+            installed: service_path.exists(),
+            ..LaunchdJobStatus::default()
+        }
     })
 }
 
@@ -539,17 +548,28 @@ pub(crate) fn inspect_job_for_activation(
     service_path: &Path,
     env: &BTreeMap<String, String>,
 ) -> Result<LaunchdJobStatus, String> {
-    inspect_job_inner(label, service_path, env, true).map_err(|error| {
+    inspect_job_inner(label, service_path, env, JobInspection::Activation).map_err(|error| {
         format!("{error}; activation was refused to preserve running services. Restore service-manager access or wait for its state to settle, then retry")
     })
+}
+
+/// Recovery must not turn a positively observed foreign/unknown loaded job
+/// into absence. Informational and activation stale-job handling stays separate.
+pub(crate) fn inspect_job_for_recovery(
+    label: &str,
+    service_path: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<LaunchdJobStatus, String> {
+    inspect_job_inner(label, service_path, env, JobInspection::Recovery)
 }
 
 fn inspect_job_inner(
     label: &str,
     service_path: &Path,
     env: &BTreeMap<String, String>,
-    checked: bool,
+    inspection: JobInspection,
 ) -> Result<LaunchdJobStatus, String> {
+    let checked = !matches!(inspection, JobInspection::Informational);
     let mut status = LaunchdJobStatus {
         installed: service_path.exists(),
         ..LaunchdJobStatus::default()
@@ -593,7 +613,9 @@ fn inspect_job_inner(
                     return Err(unknown());
                 }
             }
-            discard_stale_loaded_job(service_path, &mut status);
+            if !matches!(inspection, JobInspection::Recovery) {
+                discard_stale_loaded_job(service_path, &mut status);
+            }
         }
         ServiceManagerKind::SystemdUser => {
             let output = Command::new(systemctl_binary(env))
@@ -635,9 +657,22 @@ fn inspect_job_inner(
                     return Err(unknown());
                 }
             }
-            discard_stale_loaded_job(service_path, &mut status);
+            if !matches!(inspection, JobInspection::Recovery) {
+                discard_stale_loaded_job(service_path, &mut status);
+            }
         }
         ServiceManagerKind::Unsupported => {}
+    }
+    if matches!(inspection, JobInspection::Recovery)
+        && status.loaded
+        && !status
+            .definition_path
+            .as_deref()
+            .is_some_and(|path| service_paths_match(path, service_path))
+    {
+        return Err(format!(
+            "managed service {label} has an unverified definition path"
+        ));
     }
     Ok(status)
 }
@@ -958,5 +993,91 @@ mod tests {
         assert!(!status.running);
         assert_eq!(status.pid, None);
         assert_eq!(status.state.as_deref(), Some("stale"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn recovery_checks_loaded_ownership_without_changing_activation_or_status() {
+        use std::collections::BTreeMap;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        for launchd in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = root.path().join("manager");
+            fs::write(&manager, "#!/bin/sh\nif [ \"$1\" = managername ]; then exit 0; fi\nif [ \"$(cat \"${0%/*}/exit\")\" = 1 ]; then cat \"${0%/*}/observation\" >&2; exit 1; fi\ncat \"${0%/*}/observation\"\n").unwrap();
+            fs::set_permissions(&manager, fs::Permissions::from_mode(0o700)).unwrap();
+            let expected = root.path().join("current-definition");
+            let mut env = BTreeMap::new();
+            env.insert(
+                "OCM_INTERNAL_SERVICE_MANAGER".into(),
+                if launchd { "launchd" } else { "systemd-user" }.into(),
+            );
+            env.insert(
+                if launchd {
+                    "OCM_INTERNAL_LAUNCHCTL_BIN"
+                } else {
+                    "OCM_INTERNAL_SYSTEMCTL_BIN"
+                }
+                .into(),
+                manager.display().to_string(),
+            );
+            for path in [
+                Some(expected.display().to_string()),
+                Some(
+                    root.path()
+                        .join("previous-definition")
+                        .display()
+                        .to_string(),
+                ),
+                None,
+            ] {
+                let observation = if launchd {
+                    format!(
+                        "{}state = running\npid = {}\n",
+                        path.as_ref()
+                            .map(|path| format!("path = {path}\n"))
+                            .unwrap_or_default(),
+                        std::process::id()
+                    )
+                } else {
+                    format!(
+                        "LoadState=loaded\nUnitFileState=enabled\nActiveState=active\nSubState=running\nMainPID={}\n{}",
+                        std::process::id(),
+                        path.as_ref()
+                            .map(|path| format!("FragmentPath={path}\n"))
+                            .unwrap_or_default()
+                    )
+                };
+                fs::write(root.path().join("observation"), observation).unwrap();
+                fs::write(root.path().join("exit"), "0").unwrap();
+                let recovery = super::inspect_job_for_recovery("ai.openclaw.ocm", &expected, &env);
+                if path.as_deref() == Some(expected.to_str().unwrap()) {
+                    let recovery = recovery.unwrap();
+                    assert!(recovery.running);
+                    assert_eq!(recovery.pid, Some(std::process::id()));
+                } else {
+                    assert!(recovery.unwrap_err().contains("unverified definition path"));
+                }
+                let informational = super::inspect_job("ai.openclaw.ocm", &expected, &env);
+                let activation =
+                    super::inspect_job_for_activation("ai.openclaw.ocm", &expected, &env).unwrap();
+                // The two pre-existing consumers still discard only a known mismatched path.
+                let foreign = path.is_some() && path.as_deref() != Some(expected.to_str().unwrap());
+                assert_eq!(informational.running, !foreign);
+                assert_eq!(activation.running, !foreign);
+            }
+            let absent = if launchd {
+                "Could not find service \"ai.openclaw.ocm\" in domain for user gui\n"
+            } else {
+                "LoadState=not-found\nActiveState=inactive\nMainPID=0\n"
+            };
+            fs::write(root.path().join("observation"), absent).unwrap();
+            fs::write(root.path().join("exit"), if launchd { "1" } else { "0" }).unwrap();
+            assert!(
+                !super::inspect_job_for_recovery("ai.openclaw.ocm", &expected, &env)
+                    .unwrap()
+                    .running
+            );
+        }
     }
 }
