@@ -1221,6 +1221,11 @@ fn snapshot_restore_service_resumption_requires_recovered_data() {
         env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
         env.insert("OCM_TEST_VERSION".into(), env!("CARGO_PKG_VERSION").into());
         install_fake_launchctl(&root, &mut env);
+        let admission = crate::support::enable_fake_daemon_gateway_admission(&root, &mut env);
+        env.insert(
+            "OCM_TEST_GATEWAY_ADMISSION".into(),
+            serde_json::to_string(&admission).unwrap(),
+        );
         for args in [
             vec!["launcher", "add", "stable", "--command", "openclaw"],
             vec!["env", "create", "source", "--launcher", "stable"],

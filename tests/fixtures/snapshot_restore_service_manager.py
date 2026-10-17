@@ -20,7 +20,7 @@ def runtime():
     active=printed.exists() and meta['serviceEnabled'] and meta['serviceRunning']
     port=meta.get('gatewayPort') or 18789
     shared={'envName':'source','bindingKind':'launcher','bindingName':'stable','pid':4242,'restartCount':0,'childPort':port,'stdoutPath':str(case/'stdout.log'),'stderrPath':str(case/'stderr.log')}
-    data={'kind':'ocm-supervisor-runtime','ocmHome':str(home),'daemonVersion':os.environ['OCM_TEST_VERSION'],'updatedAt':datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),'children':[shared] if active else [],'services':[dict(shared,gatewayState='running',restartHandoff='none')] if active else []}
+    data={'kind':'ocm-supervisor-runtime','ocmHome':str(home),'daemonVersion':os.environ['OCM_TEST_VERSION'],'gatewayAdmission':json.loads(os.environ['OCM_TEST_GATEWAY_ADMISSION']),'updatedAt':datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),'children':[shared] if active else [],'services':[dict(shared,gatewayState='running',restartHandoff='none')] if active else []}
     p=home/'supervisor/runtime.json'
     p.parent.mkdir(parents=True,exist_ok=True)
     tmp=p.with_suffix('.fixture-tmp')
@@ -45,7 +45,7 @@ if args[0]=='bootstrap':
             print('forced snapshot acceptance failure',file=sys.stderr)
             sys.exit(1)
         event('service-restart-admitted')
-    printed.write_text('state = running\npid = 23613\n')
+    printed.write_text('state = running\npid = '+os.environ['OCM_TEST_NATIVE_DAEMON_PID']+'\n')
     runtime();sys.exit(0)
 if args[0] in ('bootout','unload'):
     if (case/'fault-path').exists() and (case/'mode').read_text().endswith('unload-fails'):

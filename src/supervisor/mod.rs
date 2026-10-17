@@ -265,6 +265,23 @@ impl SupervisorGatewayAdmission {
             process_scope: process_scope_id()?,
         })
     }
+    fn verify_process(&self, pid: u32) -> Result<(), String> {
+        if self.process_scope != process_scope_id()? {
+            return Err(
+                "the daemon runtime record belongs to another boot or process namespace"
+                    .to_string(),
+            );
+        }
+        let process = observe_process(pid)?
+            .ok_or_else(|| "the observed daemon process exited before admission".to_string())?;
+        if !process.running || process.identity != self.process {
+            return Err(
+                "the daemon runtime record does not identify the current managed process"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +604,15 @@ impl<'a> SupervisorService<'a> {
                     "supervisor runtime observation does not belong to this store".to_string(),
                 );
             }
+            runtime
+                .gateway_admission
+                .as_ref()
+                .ok_or("running supervisor has no process identity in its runtime observation")?
+                .verify_process(
+                    daemon
+                        .pid
+                        .ok_or("running supervisor has no observed process ID")?,
+                )?;
         }
 
         Ok(SupervisorInspection {
@@ -1200,20 +1226,7 @@ impl<'a> SupervisorService<'a> {
                     "the running daemon uses an unsupported Gateway admission version".to_string(),
                 );
             }
-            if capability.process_scope != process_scope_id()? {
-                return Err(
-                    "the daemon runtime record belongs to another boot or process namespace"
-                        .to_string(),
-                );
-            }
-            let process = observe_process(pid)?
-                .ok_or_else(|| "the observed daemon process exited before admission".to_string())?;
-            if !process.running || process.identity != capability.process {
-                return Err(
-                    "the daemon runtime record does not identify the current managed process"
-                        .to_string(),
-                );
-            }
+            capability.verify_process(pid)?;
             Ok(())
         })();
         result.map_err(|error| {
