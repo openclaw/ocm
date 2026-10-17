@@ -479,7 +479,7 @@ daemon as absent without treating that absence as a fault. Leave it absent while
 the envs should stay stopped; `ocm service start <env>` recreates it when needed.
 `refresh-daemon` requires an existing daemon and is not an installation command.
 
-If the daemon reports `cleanup is unverified`, it retains the affected child in its runtime ownership record and does not start a replacement for that child.
+If the daemon reports `cleanup is unverified`, it retains the affected child in its runtime ownership record and does not start a replacement for that child during the current daemon run.
 A failed signal, process inspection, or bounded wait is not evidence that the old process group stopped.
 Other environments can continue to run or stop.
 Resolve the reported operating-system error before requesting another restart; do not delete the runtime record or signal a saved PID without verifying its current identity.

@@ -2717,16 +2717,16 @@ fn stop_owned_supervisor_child(child: &mut Child) -> Result<ExitStatus, String> 
         // group signal. ECHILD is uncertainty, never permission to signal a PID
         // whose identity may already have been reused.
         supervisor_child_exited(child)?;
-        for signal in ["-TERM", "-KILL"] {
+        for signal in ["-TERM", "-STOP", "-KILL"] {
             let process_group = format!("-{}", child.id());
             let signaled = Command::new("kill")
                 .args([signal, "--", &process_group])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
-            // Some systems reject signals to zombie-only groups. Independent
-            // live-member observation can establish their settlement, but a
-            // failed command or probe must never establish absence by itself.
+            // Some systems reject signals to zombie-only groups. The census
+            // can avoid waiting on them, but only the native absence check
+            // after reaping below can establish completed cleanup.
             if !matches!(&signaled, Ok(status) if status.success())
                 && supervisor_process_group_exists(child.id())?
             {
@@ -2739,22 +2739,22 @@ fn stop_owned_supervisor_child(child: &mut Child) -> Result<ExitStatus, String> 
                     }
                 ));
             }
+            if signal == "-STOP" {
+                continue;
+            }
             let deadline = Instant::now() + Duration::from_secs(1);
-            let settled = loop {
-                if !supervisor_process_group_exists(child.id())? {
-                    break true;
-                }
+            while supervisor_process_group_exists(child.id())? {
                 if Instant::now() >= deadline {
                     if signal == "-KILL" {
                         return Err(format!("process group {} did not stop", child.id()));
                     }
-                    break false;
+                    break;
                 }
                 sleep(Duration::from_millis(50));
-            };
-            if settled {
-                break;
             }
+            // A TERM-era snapshot can miss a member that forks and exits while
+            // it is read. Always perform final STOP/KILL while the unreaped
+            // leader reserves the group identity, as source-watch cleanup does.
         }
     }
     // A direct child may have left its original group. Keep that cleanup and
@@ -2771,9 +2771,35 @@ fn stop_owned_supervisor_child(child: &mut Child) -> Result<ExitStatus, String> 
         }
         sleep(Duration::from_millis(50));
     }
-    child
+    let status = child
         .wait()
-        .map_err(|error| format!("failed reaping child {}: {error}", child.id()))
+        .map_err(|error| format!("failed reaping child {}: {error}", child.id()))?;
+    #[cfg(unix)]
+    {
+        // Reaping releases the identity anchor. From here on, only inspect:
+        // never signal a group that could now have been reused. Require the
+        // kernel's absence result, not an empty snapshot of former members.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let observed = unsafe { libc::kill(-(child.id() as libc::pid_t), 0) };
+            let error = std::io::Error::last_os_error();
+            if observed == -1 && error.raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(if observed == -1 {
+                    format!(
+                        "failed verifying process group {} is absent: {error}",
+                        child.id()
+                    )
+                } else {
+                    format!("process group {} still exists after child exit", child.id())
+                });
+            }
+            sleep(Duration::from_millis(50));
+        }
+    }
+    Ok(status)
 }
 
 fn supervisor_child_exited(child: &mut Child) -> Result<bool, String> {

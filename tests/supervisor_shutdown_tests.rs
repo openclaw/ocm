@@ -367,7 +367,10 @@ fn owned_group_shutdown_settles_term_and_kill_paths() {
         assert!(fixture.stop().success());
         assert!(fixture.runtime()["children"].as_array().unwrap().is_empty());
         let signals = fs::read_to_string(fixture.root.child("signals.log")).unwrap();
-        assert_eq!(signals.contains("-KILL"), ignore_term, "{signals}");
+        assert!(
+            signals.contains("-STOP") && signals.contains("-KILL"),
+            "{signals}"
+        );
         let before = [fixture.heartbeat("target"), fixture.heartbeat("sibling")];
         sleep(Duration::from_millis(150));
         assert_eq!(
