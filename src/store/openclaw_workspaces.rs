@@ -1201,7 +1201,7 @@ fn sanitize_plain_object(object: Map<String, Value>) -> Map<String, Value> {
         .collect()
 }
 
-fn canonicalize_path_allow_missing(path: &Path) -> Result<PathBuf, String> {
+pub(super) fn canonicalize_path_allow_missing(path: &Path) -> Result<PathBuf, String> {
     let mut existing = path;
     let mut missing = Vec::<OsString>::new();
     loop {
