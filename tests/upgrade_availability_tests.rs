@@ -245,6 +245,7 @@ fn write_running_supervisor_runtime(
     let stdout_path = path_string(&log_root.join("demo.stdout.log"));
     let stderr_path = path_string(&log_root.join("demo.stderr.log"));
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -283,6 +284,7 @@ fn write_running_supervisor_runtime(
 
 fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),

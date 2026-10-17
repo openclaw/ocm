@@ -515,6 +515,7 @@ pub fn enable_fake_daemon_gateway_admission(
         std::process::id().to_string(),
     );
     let runtime = ocm::supervisor::SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: env.get("OCM_HOME").unwrap().clone(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),

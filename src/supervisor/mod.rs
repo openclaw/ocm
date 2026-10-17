@@ -42,6 +42,9 @@ use crate::store::{
 };
 
 mod openclaw_handoff;
+mod ownership;
+
+pub use ownership::{ServiceRecoverySummary, SupervisorRetainedOwnership};
 
 use openclaw_handoff::{
     RestartHandoffConsumeResult, RestartHandoffSupport, consume_restart_handoff,
@@ -237,7 +240,7 @@ pub struct SupervisorRuntimeChild {
     pub stderr_path: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupervisorRuntimeState {
     pub kind: String,
@@ -250,9 +253,11 @@ pub struct SupervisorRuntimeState {
     pub updated_at: OffsetDateTime,
     pub services: Vec<SupervisorRuntimeService>,
     pub children: Vec<SupervisorRuntimeChild>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_ownership: Option<Vec<SupervisorRetainedOwnership>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupervisorGatewayAdmission {
     version: u32,
@@ -330,6 +335,7 @@ pub struct SupervisorInspection {
     pub skipped_envs: Vec<SkippedSupervisorEnv>,
     pub runtime_children: Vec<SupervisorRuntimeChild>,
     pub runtime_services: Vec<SupervisorRuntimeService>,
+    pub retained_envs: BTreeSet<String>,
 }
 
 pub struct SupervisorService<'a> {
@@ -474,6 +480,9 @@ impl<'a> SupervisorService<'a> {
         let Some(observed) = self.live_runtime_state()? else {
             return Ok(false);
         };
+        if observed.retained_envs().contains(env_name) {
+            return Ok(false);
+        }
         let Some(child) = observed
             .children
             .iter()
@@ -514,6 +523,12 @@ impl<'a> SupervisorService<'a> {
     /// Confirm absence through the owned daemon's observations, not desired flags.
     /// Mutation decisions must retain the environment operation lock.
     pub(crate) fn stopped_launch_observed(&self, env_name: &str) -> Result<bool, String> {
+        if self
+            .read_runtime_state()?
+            .is_some_and(|r| r.retained_envs().contains(env_name))
+        {
+            return Ok(false);
+        }
         let observed = self.live_runtime_state()?;
         if observed.is_none() && self.daemon_status()?.running {
             return Ok(false);
@@ -596,14 +611,15 @@ impl<'a> SupervisorService<'a> {
         } else {
             self.daemon_status()?
         };
-        // Daemon exit does not acknowledge shutdown of its separately grouped
-        // children. Recovery must retain those records until the owner retires
-        // them; ordinary informational inspection keeps its existing semantics.
-        let runtime = if checked || daemon.running {
+        // Checked recovery also retains legacy rows after daemon exit. Ordinary
+        // display exposes inherited claims identified by the replacement writer.
+        let runtime = (if daemon.running || checked {
             self.read_runtime_state()?
         } else {
-            None
-        };
+            // Preserve best-effort display for old, unreadable stopped records.
+            self.read_runtime_state().ok().flatten()
+        })
+        .filter(|runtime| checked || daemon.running || !runtime.retained_envs().is_empty());
 
         if checked && let Some(runtime) = &runtime {
             if runtime.kind != SUPERVISOR_RUNTIME_KIND || runtime.ocm_home != daemon.ocm_home {
@@ -628,6 +644,10 @@ impl<'a> SupervisorService<'a> {
         }
 
         Ok(SupervisorInspection {
+            retained_envs: runtime
+                .as_ref()
+                .map(|r| r.retained_envs())
+                .unwrap_or_default(),
             daemon,
             daemon_version: runtime
                 .as_ref()
@@ -1280,7 +1300,11 @@ impl<'a> SupervisorService<'a> {
             return Ok(None);
         }
 
-        Ok(Some(read_json::<SupervisorRuntimeState>(&runtime_path)?))
+        let runtime = read_json::<SupervisorRuntimeState>(&runtime_path)?;
+        if runtime.retained_ownership.is_some() {
+            runtime.validate_ownership(&display_path(&resolve_ocm_home(self.env, self.cwd)?))?;
+        }
+        Ok(Some(runtime))
     }
 
     fn run_once(
@@ -3016,6 +3040,7 @@ fn admit_supervisor_child_start(
         .try_lock_gateway_admission(&spec.env_name)?
         .ok_or_else(|| format!("gateway admission for env \"{}\" is busy", spec.env_name))?;
     service.ensure_source_watch_allows_service(&spec.env_name)?;
+    SupervisorService::new(env, cwd).ensure_no_retained_ownership(&spec.env_name)?;
     if spec.binding_kind == "source-watch" {
         return Err(format!(
             "refusing to start env \"{}\": its saved service plan belongs to a source-watch session; start the background service again after watch exits to resolve its registered binding",
@@ -3424,9 +3449,9 @@ fn write_supervisor_runtime_state(
     );
     services.sort_by(|left, right| left.env_name.cmp(&right.env_name));
 
-    write_json(
+    ownership::write_runtime(
         runtime_path,
-        &SupervisorRuntimeState {
+        SupervisorRuntimeState {
             kind: SUPERVISOR_RUNTIME_KIND.to_string(),
             ocm_home: ocm_home.to_string(),
             daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -3434,6 +3459,7 @@ fn write_supervisor_runtime_state(
             updated_at: now_utc(),
             services,
             children,
+            retained_ownership: Some(Vec::new()),
         },
     )
 }

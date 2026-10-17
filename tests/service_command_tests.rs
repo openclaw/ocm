@@ -59,6 +59,227 @@ fn setup_launcher_env(cwd: &Path, env: &BTreeMap<String, String>) {
     assert!(created.status.success(), "{}", stderr(&created));
 }
 
+#[cfg(unix)]
+#[test]
+fn service_recover_inspection_does_not_create_a_store() {
+    let root = TestDir::new("service-recover-read-only");
+    let env = launchd_env(&root);
+    fs::remove_dir(&env["OCM_HOME"]).unwrap();
+    let output = run_ocm(
+        root.path(),
+        &env,
+        &["service", "recover", "missing", "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("does not exist"));
+    assert!(!Path::new(&env["OCM_HOME"]).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn service_recover_guards_and_acknowledges_an_exact_offline_claim() {
+    let root = TestDir::new("service-recover-exact-claim");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = launchd_env(&root);
+    setup_launcher_env(&cwd, &env);
+    let capability = support::enable_fake_daemon_gateway_admission(&root, &mut env);
+    env.remove("OCM_TEST_NATIVE_DAEMON_PID");
+    let path = supervisor_runtime_path(&env, &cwd).unwrap();
+    let mut publisher = serde_json::to_value(capability).unwrap();
+    // A known different birth, not a claim that the live test process exited.
+    publisher["process"]["startedAt"] = json!("older-publisher-generation");
+    let row = json!({"envName":"demo", "bindingKind":"launcher", "bindingName":"stable",
+        "gatewayState":"pending", "restartCount":0,"childPort":18789,"pid":null,
+        "stdoutPath":"test.stdout", "stderrPath":"test.stderr", "lastExitCode":null,
+        "lastError":null,"lastEventAt":null,"nextRetryAt":null});
+    let mut sibling = row.clone();
+    sibling["envName"] = json!("sibling");
+    let original = json!({"kind":"ocm-supervisor-runtime", "ocmHome":env["OCM_HOME"],
+        "daemonVersion":"0.3.4", "gatewayAdmission":publisher,
+        "updatedAt":"2026-01-01T00:00:00Z", "services":[row,sibling], "children":[]});
+    support::write_json_replacing_path(&path, &original);
+    let inspect = || {
+        let output = run_ocm(&cwd, &env, &["service", "recover", "demo", "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let ack = |token: &str| {
+        run_ocm(
+            &cwd,
+            &env,
+            &[
+                "service",
+                "recover",
+                "demo",
+                "--acknowledge-stopped-processes",
+                "--if-claim",
+                token,
+                "--json",
+            ],
+        )
+    };
+    let inspection = inspect();
+    assert_eq!(inspection["blockers"], json!([]));
+    let token = inspection["claimToken"].as_str().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+        original,
+        "inspection must be read-only"
+    );
+    for args in [
+        vec![
+            "service",
+            "recover",
+            "demo",
+            "--acknowledge-stopped-processes",
+        ],
+        vec!["service", "recover", "demo", "--if-claim", token],
+    ] {
+        assert!(!run_ocm(&cwd, &env, &args).status.success());
+    }
+    for (field, value, message) in [
+        ("gatewayAdmission", Value::Null, "publisher identity"),
+        ("ocmHome", json!("foreign-store"), "another store"),
+    ] {
+        let mut changed = original.clone();
+        changed[field] = value;
+        support::write_json_replacing_path(&path, &changed);
+        let output = ack(token);
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains(message) || stderr(&output).contains("changed"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            changed
+        );
+    }
+    let mut changed = original.clone();
+    changed["gatewayAdmission"]["processScope"] = json!("foreign-scope");
+    support::write_json_replacing_path(&path, &changed);
+    let inspection = inspect();
+    let rejected = ack(inspection["claimToken"].as_str().unwrap());
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("another process scope"));
+
+    // A reused bare PID is only a veto; no signal or identity inference.
+    let mut changed = original.clone();
+    changed["services"][0]["pid"] = json!(std::process::id());
+    support::write_json_replacing_path(&path, &changed);
+    let inspection = inspect();
+    let rejected = ack(inspection["claimToken"].as_str().unwrap());
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("occupied"));
+
+    // False registry intent is insufficient while an old desired plan can requeue it.
+    support::write_json_replacing_path(&path, &original);
+    EnvironmentService::new(&env, &cwd)
+        .set_service_policy("demo", Some(true), Some(true))
+        .unwrap();
+    ocm::supervisor::SupervisorService::new(&env, &cwd)
+        .sync()
+        .unwrap();
+    let mut stopped_meta = EnvironmentService::new(&env, &cwd).get("demo").unwrap();
+    stopped_meta.service_running = false;
+    ocm::store::save_environment(stopped_meta, &env, &cwd).unwrap();
+    let refused = ack(token);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("desired supervisor plan"));
+    assert!(
+        !EnvironmentService::new(&env, &cwd)
+            .get("demo")
+            .unwrap()
+            .service_running
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+        original
+    );
+    ocm::supervisor::SupervisorService::new(&env, &cwd)
+        .sync()
+        .unwrap();
+
+    // Change the inspected generation while native observation is in flight.
+    support::write_json_replacing_path(&path, &original);
+    let manager = root.child("fake-bin/launchctl");
+    let original_manager = fs::read_to_string(&manager).unwrap();
+    let entered = root.child("recovery-observation-entered");
+    let release = root.child("recovery-observation-release");
+    write_executable_script(&manager, &original_manager.replacen("#!/bin/sh\n", &format!("#!/bin/sh\nif [ \"$1\" = print ]; then touch '{}'; while [ ! -f '{}' ]; do sleep 0.01; done; fi\n", path_string(&entered), path_string(&release)), 1));
+    let racing_env = env.clone();
+    let racing_cwd = cwd.clone();
+    let racing_token = token.to_string();
+    let attempt = thread::spawn(move || {
+        run_ocm(
+            &racing_cwd,
+            &racing_env,
+            &[
+                "service",
+                "recover",
+                "demo",
+                "--acknowledge-stopped-processes",
+                "--if-claim",
+                &racing_token,
+            ],
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !entered.exists() && Instant::now() < deadline {
+        sleep(Duration::from_millis(10));
+    }
+    let observed_barrier = entered.exists();
+    let mut racing = original.clone();
+    racing["retainedOwnership"] = json!([{"envName":"demo","claimId":"concurrent-generation","publisher":original["gatewayAdmission"]}]);
+    support::write_json_replacing_path(&path, &racing);
+    fs::write(&release, "release native observation").unwrap();
+    let rejected = attempt.join().unwrap();
+    write_executable_script(&manager, &original_manager);
+    assert!(observed_barrier);
+    assert!(!rejected.status.success());
+    assert!(
+        stderr(&rejected).contains("changed during recovery"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+        racing
+    );
+
+    // Same rows, newer inherited generation: the old acknowledgement cannot apply.
+    let mut changed = original.clone();
+    changed["retainedOwnership"] = json!([{"envName":"demo","claimId":"newer-generation","publisher":original["gatewayAdmission"]}]);
+    support::write_json_replacing_path(&path, &changed);
+    assert!(!ack(token).status.success());
+    let inspection = inspect();
+    let new_token = inspection["claimToken"].as_str().unwrap();
+    let success = ack(new_token);
+    assert!(success.status.success(), "{}", stderr(&success));
+    let result: Value = serde_json::from_slice(&success.stdout).unwrap();
+    assert_eq!(result["released"], true);
+    assert_eq!(result["operatorAcknowledged"], true);
+    assert_eq!(result["processAbsenceVerified"], false);
+    assert_eq!(result["desiredRunning"], false);
+    let after: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(after["services"], json!([original["services"][1]]));
+    assert!(
+        !ack(new_token).status.success(),
+        "old confirmation must not clear another claim"
+    );
+
+    // The legacy offline path also preserves and identifies sibling evidence.
+    support::write_json_replacing_path(&path, &original);
+    let success = ack(token);
+    assert!(success.status.success(), "{}", stderr(&success));
+    let after: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(after["retainedOwnership"].as_array().unwrap().len(), 1);
+    assert_eq!(after["retainedOwnership"][0]["envName"], "sibling");
+    assert_eq!(after["services"], json!([original["services"][1]]));
+}
+
 fn setup_launcher_env_on_available_port(cwd: &Path, env: &BTreeMap<String, String>) {
     setup_launcher_env(cwd, env);
     // Healthy status must not depend on the shared default port staying unused.
@@ -115,6 +336,7 @@ fn setup_gateway_aware_restart_fixture(
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: env.get("OCM_HOME").unwrap().clone(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -1980,6 +2202,7 @@ fn service_status_ignores_stale_runtime_children_when_the_daemon_is_down() {
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let stale_runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -2029,6 +2252,7 @@ fn service_status_reports_clean_backoff_as_restarting_without_issue() {
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let retry_at = now_utc();
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -2078,6 +2302,7 @@ fn service_status_keeps_failed_backoff_as_issue() {
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),

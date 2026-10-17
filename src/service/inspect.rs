@@ -115,6 +115,7 @@ struct ServiceSnapshot {
     skipped_envs: BTreeMap<String, String>,
     runtime_children: BTreeMap<String, SupervisorRuntimeChild>,
     runtime_services: BTreeMap<String, SupervisorRuntimeService>,
+    retained_envs: std::collections::BTreeSet<String>,
 }
 
 pub fn list_services(
@@ -179,9 +180,11 @@ fn load_service_snapshot(
         skipped_envs,
         runtime_children,
         runtime_services,
+        retained_envs,
     } = supervisor.inspect()?;
 
     Ok(ServiceSnapshot {
+        retained_envs,
         daemon,
         daemon_version,
         planned_children: planned_children
@@ -229,22 +232,34 @@ fn build_service_summary(
     let installed = meta.service_enabled;
     let desired_running = meta.service_running;
     let loaded = installed && (daemon.loaded || daemon.running);
-    let running = runtime_child.is_some();
+    let retained = snapshot.retained_envs.contains(&meta.name);
+    let running = runtime_child.is_some() && !retained;
     let foreign_listener = !running && tcp_port_reachable(gateway_port);
-    let gateway_state = runtime_service
-        .map(reported_gateway_state)
-        .unwrap_or_else(|| service_state_label(installed, desired_running, running));
-    let issue = service_issue(ServiceIssueContext {
-        installed,
-        desired_running,
-        daemon,
-        gateway_state: &gateway_state,
-        gateway_port,
-        foreign_listener,
-        skipped_reason,
-        runtime_service,
-        resolved_issue,
-    });
+    let gateway_state = if retained {
+        "unknown".to_string()
+    } else {
+        runtime_service
+            .map(reported_gateway_state)
+            .unwrap_or_else(|| service_state_label(installed, desired_running, running))
+    };
+    let issue = if retained {
+        Some(format!(
+            "env {} has unresolved retained service ownership; inspect it with `ocm service recover {}`",
+            meta.name, meta.name
+        ))
+    } else {
+        service_issue(ServiceIssueContext {
+            installed,
+            desired_running,
+            daemon,
+            gateway_state: &gateway_state,
+            gateway_port,
+            foreign_listener,
+            skipped_reason,
+            runtime_service,
+            resolved_issue,
+        })
+    };
 
     Ok(ServiceSummary {
         env_name: meta.name.clone(),
@@ -332,7 +347,7 @@ fn build_service_summary(
         ocm_service_version: version.service_version,
         ocm_service_version_status: version.status,
         ocm_service_version_note: version.note,
-        child_pid: runtime_child.map(|child| child.pid),
+        child_pid: runtime_child.filter(|_| !retained).map(|child| child.pid),
         child_restart_count: runtime_service.map(|child| child.restart_count),
         child_port: runtime_child.map(|child| child.child_port),
         last_exit_code: runtime_service.and_then(|service| service.last_exit_code),

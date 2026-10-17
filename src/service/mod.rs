@@ -70,6 +70,20 @@ impl<'a> ServiceService<'a> {
         self.stop_locked(name)
     }
 
+    pub(crate) fn recover_ownership(
+        &self,
+        name: &str,
+        expected_claim: Option<&str>,
+    ) -> Result<crate::supervisor::ServiceRecoverySummary, String> {
+        let _operation = if expected_claim.is_some() {
+            Some(crate::env::EnvironmentService::new(self.env, self.cwd).lock_operation(name)?)
+        } else {
+            None
+        };
+        crate::supervisor::SupervisorService::new(self.env, self.cwd)
+            .recover_ownership(name, expected_claim)
+    }
+
     pub(crate) fn stop_locked(&self, name: &str) -> Result<ServiceActionSummary, String> {
         manage::stop_service(name, self.env, self.cwd)
     }

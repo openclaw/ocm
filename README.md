@@ -212,6 +212,8 @@ Stop the session before changing UI mode.
 
 If you already have a plain `~/.openclaw` home you care about, use `ocm migrate <env>` instead of starting fresh. `setup` and `start` now point that out when they detect an existing plain OpenClaw home.
 
+After an abrupt background daemon exit, a replacement preserves unresolved service ownership instead of starting another child for that environment. Inspect it with `ocm service recover <env>` after stopping its service intent. Recovery requires the displayed exact-claim token and your explicit confirmation that all old processes stopped; it never kills processes or restarts siblings. See [retained service ownership recovery](docs/USAGE.md#retained-service-ownership-recovery) for the checks and limits.
+
 ## Common paths
 
 ### Use the latest stable release

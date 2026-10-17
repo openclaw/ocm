@@ -4427,6 +4427,7 @@ fn dev_status_reports_dev_envs() {
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -7760,6 +7761,7 @@ fn dev_watch_aborts_and_restores_policy_when_service_stop_times_out() {
     let stdout_path = path_string(&root.child("demo.stdout.log"));
     let stderr_path = path_string(&root.child("demo.stderr.log"));
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),

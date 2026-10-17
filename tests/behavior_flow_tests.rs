@@ -210,6 +210,7 @@ fn supervised_gateway_restart_requires_negotiated_external_handoff() {
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let runtime_state = |restart_handoff: &str| SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: path_string(&root.child("ocm-home")),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),

@@ -205,6 +205,7 @@ fn dev_rebind_refusals_preserve_the_binding_and_policy() {
     let runtime_path = supervisor_runtime_path(&env, root.path()).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".into(),
         ocm_home: env["OCM_HOME"].clone(),
         daemon_version: None,
@@ -524,6 +525,14 @@ fn dev_rebind_waits_for_stopped_history_retirement() {
         );
         assert!(created.status.success(), "{}", stderr(&created));
     }
+    // Setup advertised this test process as a synthetic empty daemon. Retire
+    // that fixture record before launching the actual publisher; a real live
+    // publisher must never be replaced just because its current rows are empty.
+    let runtime_path = supervisor_runtime_path(&env, root.path()).unwrap();
+    let setup_runtime: SupervisorRuntimeState =
+        serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+    assert!(setup_runtime.children.is_empty() && setup_runtime.services.is_empty());
+    fs::remove_file(&runtime_path).unwrap();
     let mut daemon = DevWatchFixture::spawn_caller(&root, root.path(), &env, &["__daemon", "run"]);
     let pid = daemon.child.as_ref().unwrap().id();
     env.insert("OCM_TEST_NATIVE_DAEMON_PID".into(), pid.to_string());
@@ -541,6 +550,14 @@ fn dev_rebind_waits_for_stopped_history_retirement() {
     let runtime_path = supervisor_runtime_path(&env, root.path()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
+        if !runtime_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "daemon never published its runtime"
+            );
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        }
         let runtime: SupervisorRuntimeState =
             serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
         if runtime.services.iter().any(|service| {

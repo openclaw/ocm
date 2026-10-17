@@ -40,6 +40,7 @@ fn write_running_snapshot_service(
     let stdout_path = path_string(&root.child("source.stdout.log"));
     let stderr_path = path_string(&root.child("source.stderr.log"));
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: env.get("OCM_HOME").unwrap().clone(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -78,6 +79,7 @@ fn write_running_snapshot_service(
 
 fn write_empty_snapshot_service(runtime_path: &Path, ocm_home: &str) {
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),

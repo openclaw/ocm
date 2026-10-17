@@ -87,6 +87,7 @@ fn gateway_owned_operation_waits_for_pid_publication(snapshot: bool) {
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     let publish = |pid: Option<u32>| {
         let runtime = SupervisorRuntimeState {
+            retained_ownership: None,
             kind: "ocm-supervisor-runtime".into(),
             ocm_home: env["OCM_HOME"].clone(),
             daemon_version: Some(env!("CARGO_PKG_VERSION").into()),

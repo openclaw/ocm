@@ -1347,3 +1347,27 @@ Examples:
 - `ocm help runtime`
 - `ocm help launcher`
 - `ocm help service`
+
+## Retained service ownership recovery
+
+A replacement background daemon preserves unresolved runtime children and service rows from its predecessor, including pending rows whose child PID was never published. It refuses to start another child for those targets while allowing unrelated environments to progress. Service status reports retained ownership as `gatewayState: "unknown"`, not a verified running or stopped process. An old listener answering a health check does not make a replacement Start succeed.
+
+First stop the target's running intent and inspect the claim:
+
+```sh
+ocm service stop mira
+ocm service recover mira
+ocm service recover mira --json
+```
+
+Independently inspect and stop every process belonging to that old workload, including detached workers and any child whose PID was never published. Then use the token printed by that inspection:
+
+```sh
+ocm service recover mira --acknowledge-stopped-processes --if-claim <token>
+```
+
+The acknowledgement is your assertion that those processes stopped; OCM does not certify process absence. Stop must also have removed the target from the persisted supervisor plan; an incomplete policy synchronization remains a refusal. It rejects visible conflicts: running intent, a live recorded PID or process group, a live original publisher, missing publisher identity, changed process scope, a changed claim/environment, an incompatible live daemon, or an observation failure. A reused PID is a conservative veto; OCM never signals it. Empty process observations do not replace your confirmation, especially for pending records or detached descendants.
+
+Recovery releases only the inspected claim. It preserves environment data, current stopped intent (including after an incomplete restore), and unrelated siblings. It never starts or stops the native daemon, kills processes, or starts a service. The same command works with a compatible live replacement or an absent daemon whose recorded publisher is conclusively gone. A changed token requires a fresh inspection. JSON reports `operatorAcknowledged: true`, `released: true`, `processAbsenceVerified: false`, and `desiredRunning: false` on success. Start the service separately only when wanted and after any failed data recovery has been resolved.
+
+Existing runtime fields remain readable; the optional `retainedOwnership` metadata preserves each inherited claim's identity and original publisher. Running older daemons cannot perform this recovery. Running an older daemon again can reintroduce its ownership-loss bug; downgrade safety is not provided by the new metadata. Records without usable publisher identity or with a foreign scope remain refused. A no-claim result does not establish absence for a legacy child that was never recorded. Foreground `dev stop --acknowledge-stopped-processes` owns a separate session and cannot release a background claim.

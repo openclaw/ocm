@@ -137,6 +137,29 @@ impl Cli {
         Ok(code)
     }
 
+    fn handle_service_recover(&self, args: Vec<String>) -> Result<i32, String> {
+        let (args, json_flag, _) = self.consume_human_output_flags(args, "service recover")?;
+        let (args, acknowledge) = Self::consume_flag(args, "--acknowledge-stopped-processes");
+        let (args, token) = Self::consume_option(args, "--if-claim")?;
+        if acknowledge != token.is_some() {
+            return Err(
+                "service recover requires --acknowledge-stopped-processes and --if-claim together"
+                    .into(),
+            );
+        }
+        let name = args.first().ok_or("service recover requires <env>")?;
+        Self::assert_no_extra_args(&args[1..])?;
+        let summary = self
+            .service_service()
+            .recover_ownership(name, token.as_deref())?;
+        if json_flag {
+            self.print_json(&summary)?;
+        } else {
+            self.stdout_lines(render::service::service_recovery(&summary));
+        }
+        Ok(0)
+    }
+
     pub(super) fn handle_service_uninstall(&self, args: Vec<String>) -> Result<i32, String> {
         let (args, json_flag, profile) =
             self.consume_human_output_flags(args, "service uninstall")?;
@@ -188,6 +211,7 @@ impl Cli {
             "status" => self.handle_service_status(rest),
             "start" => self.handle_service_start(rest),
             "stop" => self.handle_service_stop(rest),
+            "recover" => self.handle_service_recover(rest),
             "restart" => self.handle_service_restart(rest),
             "refresh-daemon" => self.handle_service_refresh_daemon(rest),
             "uninstall" => self.handle_service_uninstall(rest),

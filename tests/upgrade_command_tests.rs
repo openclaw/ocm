@@ -135,6 +135,7 @@ fn write_running_supervisor_binding(
                 .collect()
         });
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -173,6 +174,7 @@ fn write_running_supervisor_binding(
 
 fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -192,6 +194,7 @@ fn write_backoff_supervisor_runtime(
 ) {
     let log_root = runtime_path.parent().unwrap();
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),

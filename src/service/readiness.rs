@@ -59,7 +59,10 @@ fn wait_for_gateway_readiness_with_timeout(
             });
         }
 
-        if matches!(status.gateway_state.as_str(), "backoff" | "stopped") {
+        if matches!(
+            status.gateway_state.as_str(),
+            "backoff" | "stopped" | "unknown"
+        ) {
             if status.gateway_state == "backoff"
                 && should_wait_for_scheduled_gateway_retry(
                     &mut permitted_retry_count,
