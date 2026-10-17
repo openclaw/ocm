@@ -337,13 +337,16 @@ fn state_import_preserves_history_reached_through_database_aliases() {
 
     use support::{run_ocm, stderr, stdout};
 
-    for (selection, relative) in [
-        ("global", "skill-workshop/support/history.sqlite"),
-        ("agent", "skill-workshop/support/history.sqlite"),
-        ("registered", "skill-workshop/support/history.sqlite"),
-        ("none", "skill-workshop/support/history.sqlite"),
-        ("global", "logs/config-audit.jsonl"),
-        ("global", "custom/history.sqlite"),
+    for (selection, relative, namespace_alias) in [
+        ("global", "skill-workshop/support/history.sqlite", false),
+        ("agent", "skill-workshop/support/history.sqlite", false),
+        ("registered", "skill-workshop/support/history.sqlite", false),
+        ("none", "skill-workshop/support/history.sqlite", false),
+        ("global", "logs/config-audit.jsonl", false),
+        ("global", "custom/history.sqlite", false),
+        ("global", "skill-workshop/support/history.sqlite", true),
+        ("global", "logs/config-audit.jsonl", true),
+        ("global", "audit/system-agent.jsonl", true),
     ] {
         let root = TestDir::new("import-protected-database-alias");
         let env = ocm_env(&root);
@@ -362,6 +365,11 @@ fn state_import_preserves_history_reached_through_database_aliases() {
             "--json",
         ]);
         let state = source.join(".openclaw");
+        let (namespace, suffix) = relative.split_once('/').unwrap();
+        if namespace_alias {
+            fs::create_dir(source.join("history-store")).unwrap();
+            symlink("../history-store", state.join(namespace)).unwrap();
+        }
         let history = state.join(relative);
         fs::create_dir_all(history.parent().unwrap()).unwrap();
         let db = Connection::open(&history).unwrap();
@@ -430,10 +438,15 @@ fn state_import_preserves_history_reached_through_database_aliases() {
         ]);
         let archive_bytes = fs::read(&archive).unwrap();
         let mut tar = tar::Archive::new(archive_bytes.as_slice());
+        let archived_path = if namespace_alias {
+            Path::new("root/history-store").join(suffix)
+        } else {
+            Path::new("root/.openclaw").join(relative)
+        };
         let mut archived = Vec::new();
         for entry in tar.entries().unwrap() {
             let mut entry = entry.unwrap();
-            if entry.path().unwrap() == Path::new("root/.openclaw").join(relative) {
+            if entry.path().unwrap() == archived_path {
                 entry.read_to_end(&mut archived).unwrap();
                 break;
             }

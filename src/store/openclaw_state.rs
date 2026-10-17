@@ -297,15 +297,16 @@ pub(super) fn relocate_copied_databases(
 ) -> Result<BTreeMap<String, u64>, String> {
     let mut counts = BTreeMap::new();
     let mut visited = BTreeSet::new();
-    let global = paths.state_dir.join("state/openclaw.sqlite");
+    let global_path = paths.state_dir.join("state/openclaw.sqlite");
     // Relocate registry paths before selecting additional agent databases. The
     // archive may be imported after the original environment has been removed.
-    let global = contained_imported_database(&global, &paths.root, true)?;
+    let global = contained_imported_database(&global_path, &paths.root, true)?;
     if let Some(database) = &global {
         relocate_archived_database(
             paths,
             source_roots,
             relocation,
+            &global_path,
             database,
             &mut visited,
             &mut counts,
@@ -334,6 +335,7 @@ pub(super) fn relocate_copied_databases(
                         paths,
                         source_roots,
                         relocation,
+                        &path,
                         &database,
                         &mut visited,
                         &mut counts,
@@ -349,6 +351,7 @@ fn relocate_archived_database(
     paths: &EnvPaths,
     source_roots: &[&Path],
     relocation: DatabasePathRelocation,
+    selected_path: &Path,
     database: &Path,
     visited: &mut BTreeSet<PathBuf>,
     counts: &mut BTreeMap<String, u64>,
@@ -356,11 +359,10 @@ fn relocate_archived_database(
     if !visited.insert(database.to_path_buf()) {
         return Ok(());
     }
-    // Selection uses lexical paths, but a contained alias can resolve into
-    // immutable history. Classify the resolved destination before any writes,
-    // using the same root spelling returned by the containment check.
-    let state_root = fs::canonicalize(&paths.state_dir).map_err(|error| error.to_string())?;
-    if is_integrity_protected_history_path(&state_root, database) || !is_sqlite_database(database)?
+    // Classify the selected path before changing permissions or opening SQLite
+    // for writing, retaining protected roles along contained aliases.
+    if is_integrity_protected_history_destination(&paths.state_dir, selected_path, database)?
+        || !is_sqlite_database(database)?
     {
         return Ok(());
     }
@@ -1519,6 +1521,47 @@ fn is_integrity_protected_history_path(state_root: &Path, path: &Path) -> bool {
         || is_legacy_audit_history_path(state_root, path)
 }
 
+// Use only after containment establishes the actual write destination. For a
+// symlink entry replacement, resolve its parent and pass parent/name as the
+// destination, without following the old leaf. Keep lexical tree walkers pure.
+fn is_integrity_protected_history_destination(
+    state_root: &Path,
+    resolution_path: &Path,
+    destination: &Path,
+) -> Result<bool, String> {
+    let state_root = match fs::canonicalize(state_root) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut entries = super::dev_sources::existing_source_path_entries(resolution_path)?;
+    entries.insert(destination.to_path_buf());
+    // A protected namespace can itself be an alias into the owned copy. Keep
+    // its logical role for both the destination and intermediate file links.
+    let namespaces = ["skill-workshop", "logs", "audit"]
+        .into_iter()
+        .filter_map(|name| {
+            let logical = state_root.join(name);
+            fs::canonicalize(&logical)
+                .ok()
+                .map(|resolved| (logical, resolved))
+        })
+        .collect::<Vec<_>>();
+    Ok(entries.iter().any(|entry| {
+        let protected = is_integrity_protected_history_path(&state_root, entry)
+            || namespaces.iter().any(|(logical, resolved)| {
+                entry.strip_prefix(resolved).is_ok_and(|relative| {
+                    is_integrity_protected_history_path(&state_root, &logical.join(relative))
+                })
+            });
+        // An alias traversed only to leave it with '..' does not make the
+        // resulting ordinary destination part of that history.
+        protected
+            && (entry == destination
+                || fs::canonicalize(entry).is_ok_and(|root| destination.starts_with(root)))
+    }))
+}
+
 // OpenClaw validates these historical bytes against its audit checkpoints.
 // Paths in them are provenance, not runtime references to relocate or repair.
 fn is_legacy_audit_history_path(state_root: &Path, path: &Path) -> bool {
@@ -2583,6 +2626,66 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_history_destination_keeps_alias_roles_and_ordinary_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join(".openclaw");
+        let history = temp.path().join("history");
+        let ordinary = temp.path().join("ordinary.sqlite");
+        let unprotected = temp.path().join("unprotected.sqlite");
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(&history).unwrap();
+        fs::write(&ordinary, b"fixture").unwrap();
+        fs::write(&unprotected, b"unprotected fixture").unwrap();
+        symlink("../history", state.join("logs")).unwrap();
+        symlink("../ordinary.sqlite", history.join("config-audit.jsonl")).unwrap();
+        let classify = |path: &Path| {
+            is_integrity_protected_history_destination(
+                &state,
+                path,
+                &fs::canonicalize(path).unwrap(),
+            )
+            .unwrap()
+        };
+        let selected = state.join("selected.sqlite");
+        symlink("logs/config-audit.jsonl", &selected).unwrap();
+        assert!(classify(&selected));
+        assert!(!classify(&unprotected));
+
+        fs::remove_file(&selected).unwrap();
+        fs::create_dir(state.join("skill-workshop")).unwrap();
+        symlink("../../history", state.join("skill-workshop/support")).unwrap();
+        symlink("skill-workshop/support/config-audit.jsonl", &selected).unwrap();
+        assert!(classify(&selected));
+
+        fs::remove_file(&selected).unwrap();
+        symlink("skill-workshop/support/../unprotected.sqlite", &selected).unwrap();
+        assert!(!classify(&selected));
+        assert!(
+            !is_integrity_protected_history_destination(
+                &temp.path().join("absent"),
+                &ordinary,
+                &ordinary
+            )
+            .unwrap()
+        );
+        let protected_entry = state.join("logs/config-audit.jsonl.migrated");
+        symlink("missing", &protected_entry).unwrap();
+        let parent = protected_entry.parent().unwrap();
+        let destination = fs::canonicalize(parent)
+            .unwrap()
+            .join(protected_entry.file_name().unwrap());
+        assert!(is_integrity_protected_history_destination(&state, parent, &destination).unwrap());
+        let ordinary_entry = fs::canonicalize(&state).unwrap().join("ordinary-link");
+        symlink("missing", &ordinary_entry).unwrap();
+        assert!(
+            !is_integrity_protected_history_destination(&state, &state, &ordinary_entry).unwrap()
+        );
+    }
 
     #[cfg(unix)]
     #[test]
