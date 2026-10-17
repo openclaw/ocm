@@ -28,7 +28,15 @@ fn daemon_runtime_test_lock() -> MutexGuard<'static, ()> {
 }
 
 fn spawn_daemon_process(cwd: &Path, env: &BTreeMap<String, String>) -> Child {
-    let mut command = Command::new(ocm_test_binary_path());
+    // Publish the real process ID before exec can start a Gateway that calls
+    // back into OCM. The fake manager reads it independently of runtime.json.
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "if [ -n \"$OCM_TEST_NATIVE_DAEMON_PID_FILE\" ]; then printf '%s\\n' \"$$\" > \"$OCM_TEST_NATIVE_DAEMON_PID_FILE\" || exit 1; fi; exec \"$@\"",
+        "ocm-daemon-fixture",
+    ]);
+    command.arg(ocm_test_binary_path());
     command.current_dir(cwd);
     command.args(["__daemon", "run"]);
     command.env_clear();

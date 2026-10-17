@@ -15,7 +15,7 @@ runtime_path = home / "supervisor/runtime.json"
 with (case / "launchctl.log").open("a") as log:
     log.write(" ".join(args) + "\n")
 if args[0] == "bootstrap":
-    loaded.write_text(f"state = running\npid = {os.environ['OCM_TEST_NATIVE_DAEMON_PID']}\n")
+    loaded.write_text(f"state = running\npid = {os.environ['OCM_TEST_NATIVE_DAEMON_PID']}\npath = {args[-1]}\n")
 if args[0] in ("bootout", "unload"):
     loaded.unlink(missing_ok=True)
     sys.exit(0)
