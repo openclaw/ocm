@@ -2576,6 +2576,63 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_state_cleanup_rejects_internal_links_under_both_root_spellings() {
+        for copying in [false, true] {
+            for canonical in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let physical = fs::canonicalize(temp.path()).unwrap().join("physical");
+                let alias = temp.path().join("alias");
+                fs::create_dir_all(&physical).unwrap();
+                std::os::unix::fs::symlink(&physical, &alias).unwrap();
+                let paths = derive_env_paths(alias.join("source"));
+                let owned = paths.state_dir.join("owned");
+                fs::create_dir_all(&owned).unwrap();
+                fs::write(owned.join("notes.txt"), "workspace").unwrap();
+                std::os::unix::fs::symlink(&owned, paths.state_dir.join("redirect")).unwrap();
+                let configured_root = if canonical {
+                    fs::canonicalize(&paths.root).unwrap()
+                } else {
+                    paths.root.clone()
+                };
+                let config = serde_json::json!({
+                    "agents": {"defaults": {"workspace": configured_root.join(".openclaw/redirect")}}
+                }).to_string();
+                fs::write(&paths.config_path, &config).unwrap();
+                fs::write(paths.state_dir.join("gateway.pid"), "123").unwrap();
+                let result = clear_runtime_state_with_policy(
+                    &paths,
+                    &BTreeMap::new(),
+                    OpenClawWorkspaceRuntime::default(),
+                    copying,
+                );
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|error| error.contains("through a symlink")),
+                    "copying={copying}, canonical={canonical}: {result:?}; workspace_exists={}, pid_exists={}",
+                    owned.join("notes.txt").exists(),
+                    paths.state_dir.join("gateway.pid").exists(),
+                );
+                assert_eq!(fs::read(&paths.config_path).unwrap(), config.as_bytes());
+                assert_eq!(fs::read(owned.join("notes.txt")).unwrap(), b"workspace");
+                assert_eq!(
+                    fs::read(paths.state_dir.join("gateway.pid")).unwrap(),
+                    b"123"
+                );
+                assert!(paths.state_dir.join("redirect").is_symlink());
+                let error = resolve_archivable_workspaces(
+                    &paths,
+                    &BTreeMap::new(),
+                    OpenClawWorkspaceRuntime::default(),
+                )
+                .unwrap_err();
+                assert!(error.contains("through a symlink"), "{error}");
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn file_url_relocation_changes_windows_authority() {

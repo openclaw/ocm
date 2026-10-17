@@ -1716,6 +1716,87 @@ fn env_clone_retains_configured_agent_directories() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn env_clone_rejects_internal_workspace_links_under_both_root_spellings() {
+    let root = TestDir::new("clone-internal-workspace-link");
+    let env = ocm_env(&root);
+    let physical = root.child("physical");
+    let alias = root.child("alias");
+    fs::create_dir_all(&physical).unwrap();
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    let source = alias.join("source");
+    let created = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    write_text(&state.join("owned/notes.txt"), "workspace");
+    write_text(
+        &state.join("agents/main/sessions/old.jsonl"),
+        "source session",
+    );
+    std::os::unix::fs::symlink("owned", state.join("redirect")).unwrap();
+    let canonical = fs::canonicalize(&source).unwrap();
+    for (spelling, configured_root) in [("accepted", &source), ("canonical", &canonical)] {
+        for (relative, allowed) in [("owned", true), ("redirect", false)] {
+            let config = serde_json::json!({"agents": {"defaults": {"workspace": configured_root.join(".openclaw").join(relative)}}}).to_string();
+            write_text(&state.join("openclaw.json"), &config);
+            let name = format!("{spelling}-{relative}");
+            let target = root.child(&format!("ocm-home/envs/{name}"));
+            let cloned = run_ocm(root.path(), &env, &["env", "clone", "source", &name]);
+            if allowed {
+                assert!(cloned.status.success(), "{}", stderr(&cloned));
+                assert_eq!(
+                    fs::read(target.join(".openclaw/owned/notes.txt")).unwrap(),
+                    b"workspace"
+                );
+                assert!(
+                    !target
+                        .join(".openclaw/agents/main/sessions/old.jsonl")
+                        .exists()
+                );
+            } else {
+                assert!(!cloned.status.success());
+                assert!(
+                    stderr(&cloned).contains("through a symlink"),
+                    "{}",
+                    stderr(&cloned)
+                );
+                assert!(!target.exists());
+                let shown = run_ocm(root.path(), &env, &["env", "show", &name]);
+                assert!(!shown.status.success());
+                assert!(
+                    stderr(&shown).contains("does not exist"),
+                    "{}",
+                    stderr(&shown)
+                );
+            }
+            assert_eq!(
+                fs::read(state.join("openclaw.json")).unwrap(),
+                config.as_bytes()
+            );
+            assert_eq!(
+                fs::read(state.join("owned/notes.txt")).unwrap(),
+                b"workspace"
+            );
+            assert_eq!(
+                fs::read(state.join("agents/main/sessions/old.jsonl")).unwrap(),
+                b"source session"
+            );
+            assert!(state.join("redirect").is_symlink());
+        }
+    }
+}
+
 #[test]
 fn env_clone_rejects_external_configured_agent_directories_before_copying() {
     let root = TestDir::new("clone-external-agent-directory");

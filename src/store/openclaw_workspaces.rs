@@ -105,7 +105,10 @@ impl OpenClawWorkspaceInventory {
             let canonical_relative = canonical_preserved_path
                 .strip_prefix(&canonical_archive_root)
                 .map_err(|error| error.to_string())?;
-            if let Ok(relative) = preserved_path.strip_prefix(&archive_root) {
+            if let Ok(relative) = preserved_path
+                .strip_prefix(&archive_root)
+                .or_else(|_| preserved_path.strip_prefix(&canonical_archive_root))
+            {
                 if relative != canonical_relative {
                     return Err(format!(
                         "cannot safely preserve configured OpenClaw workspace, agent directory, or config include through a symlink: {}",
@@ -1837,33 +1840,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn workspace_inventory_rejects_internal_workspace_symlinks() {
-        let root = test_root("internal-symlink");
-        let paths = super::super::layout::derive_env_paths(&root);
-        let target = paths.state_dir.join("team/ops");
-        let linked = paths.state_dir.join("linked");
-        fs::create_dir_all(&target).unwrap();
-        std::os::unix::fs::symlink(&target, &linked).unwrap();
-        fs::write(
-            &paths.config_path,
-            format!(
-                "{{\"agents\":{{\"defaults\":{{\"workspace\":\"{}\"}}}}}}",
-                linked.display()
-            ),
-        )
-        .unwrap();
-
-        let inventory = resolve_env_openclaw_workspaces(
-            &paths,
-            &test_env(),
-            OpenClawWorkspaceRuntime::default(),
-        )
-        .unwrap();
-        assert!(inventory.contains(&linked));
-        let error = inventory.archive_relative_roots(&paths.root).unwrap_err();
-        assert!(error.contains("through a symlink"), "{error}");
-
-        let _ = fs::remove_dir_all(root);
+    fn workspace_inventory_rejects_internal_links_under_both_root_spellings() {
+        let temp = tempfile::tempdir().unwrap();
+        let physical = fs::canonicalize(temp.path()).unwrap().join("physical");
+        let alias = temp.path().join("alias");
+        fs::create_dir_all(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        let paths = super::super::layout::derive_env_paths(alias.join("source"));
+        fs::create_dir_all(paths.state_dir.join("owned")).unwrap();
+        std::os::unix::fs::symlink("owned", paths.state_dir.join("redirect")).unwrap();
+        for root in [&paths.root, &fs::canonicalize(&paths.root).unwrap()] {
+            for agent_directory in [false, true] {
+                for (relative, allowed) in [
+                    ("owned", true),
+                    ("owned/missing", true),
+                    ("redirect", false),
+                    ("redirect/missing", false),
+                ] {
+                    let configured = root.join(".openclaw").join(relative);
+                    let agents = if agent_directory {
+                        serde_json::json!({"list": [{"id": "main", "agentDir": configured}]})
+                    } else {
+                        serde_json::json!({"defaults": {"workspace": configured}})
+                    };
+                    fs::write(
+                        &paths.config_path,
+                        serde_json::json!({"agents": agents}).to_string(),
+                    )
+                    .unwrap();
+                    let inventory = resolve_env_openclaw_copy_paths(
+                        &paths,
+                        &test_env(),
+                        OpenClawWorkspaceRuntime::default(),
+                    )
+                    .unwrap();
+                    let result = inventory.archive_relative_roots(&paths.root);
+                    if allowed {
+                        assert!(
+                            result
+                                .unwrap()
+                                .contains(&PathBuf::from(".openclaw").join(relative))
+                        );
+                    } else {
+                        let error = result.unwrap_err();
+                        assert!(error.contains("through a symlink"), "{error}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
