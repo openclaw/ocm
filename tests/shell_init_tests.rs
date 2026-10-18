@@ -15,8 +15,8 @@ fn init_zsh_prints_an_ocm_use_helper() {
     assert!(init.status.success(), "{}", stderr(&init));
     let output = stdout(&init);
     assert!(output.contains("ocm_use() {"));
-    assert!(output.contains("SHELL=zsh command"));
-    assert!(output.contains("command 'ocm' env use \"$@\""));
+    assert!(output.contains("command env SHELL=zsh"));
+    assert!(output.contains("'ocm' env use \"$@\""));
     assert!(output.contains("eval \"$script\""));
 }
 
@@ -33,10 +33,10 @@ fn init_bash_and_sh_print_shell_specific_posix_helpers() {
         let output = stdout(&init);
         assert!(output.contains("ocm_use() {"), "{shell}");
         assert!(
-            output.contains(&format!("SHELL={shell} command")),
+            output.contains(&format!("command env SHELL={shell}")),
             "{shell}"
         );
-        assert!(output.contains("command 'ocm' env use \"$@\""), "{shell}");
+        assert!(output.contains("'ocm' env use \"$@\""), "{shell}");
         assert!(output.contains("eval \"$script\""), "{shell}");
     }
 }
@@ -52,8 +52,8 @@ fn init_fish_prints_a_fish_specific_helper() {
     assert!(init.status.success(), "{}", stderr(&init));
     let output = stdout(&init);
     assert!(output.contains("function ocm_use"));
-    assert!(output.contains("set -lx SHELL fish"));
-    assert!(output.contains("command 'ocm' env use $argv"));
+    assert!(output.contains("command env SHELL=fish"));
+    assert!(output.contains("'ocm' env use $argv"));
     assert!(output.contains("eval $script"));
 }
 
@@ -68,8 +68,8 @@ fn init_defaults_to_zsh_without_a_shell_hint() {
     assert!(init.status.success(), "{}", stderr(&init));
     let output = stdout(&init);
     assert!(output.contains("ocm_use() {"));
-    assert!(output.contains("SHELL=zsh command"));
-    assert!(output.contains("command 'ocm' env use \"$@\""));
+    assert!(output.contains("command env SHELL=zsh"));
+    assert!(output.contains("'ocm' env use \"$@\""));
 }
 
 #[test]
@@ -84,8 +84,8 @@ fn init_defaults_to_fish_when_shell_env_points_to_fish() {
     assert!(init.status.success(), "{}", stderr(&init));
     let output = stdout(&init);
     assert!(output.contains("function ocm_use"));
-    assert!(output.contains("set -lx SHELL fish"));
-    assert!(output.contains("command 'ocm' env use $argv"));
+    assert!(output.contains("command env SHELL=fish"));
+    assert!(output.contains("'ocm' env use $argv"));
 }
 
 #[cfg(unix)]
@@ -122,6 +122,7 @@ fn posix_helpers_keep_the_selected_shell_and_preserve_the_caller() {
 set -- 'caller one' 'caller two'
 before_options=$-
 before_shell=$SHELL
+readonly SHELL
 ocm_use demo || exit 10
 [ "$OCM_ACTIVE_ENV" = demo ] || exit 11
 [ -n "$OPENCLAW_HOME" ] || exit 12

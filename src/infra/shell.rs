@@ -253,14 +253,14 @@ pub fn render_use_script(
 fn render_init_posix(command: &str, shell: &str) -> String {
     let command = quote_posix(command);
     format!(
-        "ocm_use() {{\n  script=\"$(SHELL={shell} command {command} env use \"$@\")\" || return $?\n  eval \"$script\"\n}}\n"
+        "ocm_use() {{\n  script=\"$(command env SHELL={shell} {command} env use \"$@\")\" || return $?\n  eval \"$script\"\n}}\n"
     )
 }
 
 fn render_init_fish(command: &str) -> String {
     let command = quote_fish(command);
     format!(
-        "function ocm_use\n    set -lx SHELL fish\n    set -l script (command {command} env use $argv)\n    or return $status\n    eval $script\nend\n"
+        "function ocm_use\n    set -l script (command env SHELL=fish {command} env use $argv)\n    or return $status\n    eval $script\nend\n"
     )
 }
 
