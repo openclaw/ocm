@@ -487,7 +487,7 @@ bindings before registration. Older OCM readers refuse these records. Refresh an
 incompatible daemon with the command above; unchanged bindings and confirmed
 stopped or unloaded managers remain usable.
 
-Removal, pruning, destroy, and simulation cleanup preserve other registered dev sources and the Git metadata they need. Remove dependent dev environments before deleting their containing environment or worktree.
+Removal, pruning, destroy, and simulation cleanup preserve other registered and active temporary dev sources and the Git metadata they need, even with `--force`. Remove dependent dev environments, or stop temporary sessions with `ocm dev stop <env>`, before deleting their containing environment or worktree.
 
 ### Try beta or pin a specific release
 

@@ -489,10 +489,14 @@ fn borrowed_source_footprint(source: &Path) -> Result<SourceFootprint, String> {
     Ok(footprint)
 }
 
-pub(crate) fn ensure_environment_removal_preserves_dev_sources(
+// The caller holds registry exclusion through its destructive operation. This
+// fences new source generations and dev rebinding while their footprints are
+// selected. Temporary ownership expires with the foreground generation.
+pub(crate) fn protected_dev_source_footprints<'a>(
     target: &EnvMeta,
-    envs: &[EnvMeta],
-) -> Result<(), String> {
+    envs: &'a [EnvMeta],
+    service: &crate::env::EnvironmentService<'_>,
+) -> Result<Vec<(&'a EnvMeta, SourceFootprint)>, String> {
     let mut footprints = Vec::new();
     for meta in envs.iter().filter(|meta| {
         meta.name != target.name
@@ -501,17 +505,44 @@ pub(crate) fn ensure_environment_removal_preserves_dev_sources(
                 .as_ref()
                 .is_some_and(|dev| dev.borrowed_source_root().is_some())
     }) {
-        if let Some(footprint) = registered_dev_source_footprint(meta, envs)? {
-            footprints.push((meta.name.as_str(), footprint));
+        let footprint = if meta.dev.is_some() {
+            registered_dev_source_footprint(meta, envs)?
+        } else if let Some(source) = service.temporary_source_watch_source_root(meta)? {
+            let mut footprint = inspect_source_footprint(&source)?;
+            footprint.content_roots.insert(source);
+            Some(footprint)
+        } else {
+            None
+        };
+        if let Some(footprint) = footprint {
+            footprints.push((meta, footprint));
         }
     }
+    Ok(footprints)
+}
+
+pub(crate) fn ensure_environment_removal_preserves_dev_sources(
+    target: &EnvMeta,
+    envs: &[EnvMeta],
+    service: &crate::env::EnvironmentService<'_>,
+) -> Result<(), String> {
+    let footprints = protected_dev_source_footprints(target, envs, service)?;
     if footprints.is_empty() {
         return Ok(());
     }
     let removal = DevSourceRemoval::environment(target)?;
     for (owner, footprint) in footprints {
         if let Some(path) = removal.affected_path(&footprint)? {
-            return Err(source_removal_error(&target.name, owner, path));
+            if owner.dev.is_none() {
+                return Err(format!(
+                    "cleanup for env {} would affect active temporary dev source for env {} at {}; run `ocm dev stop {}` first",
+                    target.name,
+                    owner.name,
+                    display_path(path),
+                    owner.name
+                ));
+            }
+            return Err(source_removal_error(&target.name, &owner.name, path));
         }
     }
     Ok(())

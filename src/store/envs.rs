@@ -1591,7 +1591,11 @@ pub(crate) fn remove_environment_locked(
 
     let paths = derive_env_paths(Path::new(&meta.root));
 
-    super::dev_sources::ensure_environment_removal_preserves_dev_sources(&meta, &registry.envs)?;
+    super::dev_sources::ensure_environment_removal_preserves_dev_sources(
+        &meta,
+        &registry.envs,
+        &source_service,
+    )?;
     // Preliminary cleanup shares this registry lock through final deletion.
     // It must not call back into registry-mutating operations.
     before_remove(&meta)?;

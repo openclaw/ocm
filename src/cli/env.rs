@@ -1269,7 +1269,11 @@ impl Cli {
         let mut blockers = Vec::new();
         let source_blocked = if let Err(error) =
             crate::store::with_locked_environments(&self.env, &self.cwd, |envs| {
-                crate::store::ensure_environment_removal_preserves_dev_sources(&env_meta, envs)
+                crate::store::ensure_environment_removal_preserves_dev_sources(
+                    &env_meta,
+                    envs,
+                    &self.environment_service(),
+                )
             }) {
             blockers.push(error);
             true

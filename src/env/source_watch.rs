@@ -503,6 +503,29 @@ impl<'a> EnvironmentService<'a> {
         Ok(None)
     }
 
+    // Caller holds registry exclusion. Temporary owners have no durable dev
+    // binding; an unfinished generation with no identifiable source is not
+    // evidence that destructive cleanup is independent of it.
+    pub(crate) fn temporary_source_watch_source_root(
+        &self,
+        env: &super::EnvMeta,
+    ) -> Result<Option<PathBuf>, String> {
+        if env.dev.is_some() {
+            return Ok(None);
+        }
+        if let Some(root) = self.source_watch_source_root(env)? {
+            return Ok(Some(root));
+        }
+        self.ensure_source_watch_stopped(&env.name)
+            .map_err(|error| {
+                format!(
+                    "cannot establish temporary dev source ownership for env {}: {error}",
+                    env.name
+                )
+            })?;
+        Ok(None)
+    }
+
     pub(crate) fn observe_source_watch_lease(
         &self,
         env_name: &str,
@@ -1639,6 +1662,10 @@ mod tests {
             service.observe_source_watch("demo").unwrap(),
             SourceWatchState::Starting
         ));
+        let meta = service.get("demo").unwrap();
+        let registry = crate::store::lock_env_registry(&env, root.path()).unwrap();
+        assert!(service.temporary_source_watch_source_root(&meta).is_err());
+        drop(registry);
         lease.acknowledge_stopped_processes().unwrap();
         drop(lease);
         worker.join().unwrap();

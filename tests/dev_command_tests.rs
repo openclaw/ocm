@@ -5678,6 +5678,121 @@ fn foreground_preparation_preserves_newer_service_policy() {
 
 #[cfg(unix)]
 #[test]
+fn removal_preserves_active_temporary_sources_and_git_metadata() {
+    for layout in ["nested", "git-dir", "disjoint"] {
+        let root = TestDir::new(&format!("temporary-source-removal-{layout}"));
+        let mut repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env(&root);
+        let (started, _, _) = install_blocking_fake_dev_runners(&root, &mut env);
+        create_runtime_backed_env(&cwd, &env);
+        let created = run_ocm(&cwd, &env, &["env", "create", "container"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let container = get_environment("container", &env, &cwd).unwrap();
+        let container_root = Path::new(&container.root);
+        if layout == "nested" {
+            let nested = container_root.join("checkout");
+            fs::rename(&repo, &nested).unwrap();
+            repo = nested;
+        } else if layout == "git-dir" {
+            let git_dir = container_root.join("source.git");
+            fs::rename(repo.join(".git"), &git_dir).unwrap();
+            fs::write(
+                repo.join(".git"),
+                format!("gitdir: {}\n", git_dir.display()),
+            )
+            .unwrap();
+        }
+        // Exercise the supported alias selection, with the actual source and
+        // external Git storage still supplying the removal footprint.
+        let alias = root.child("selected-source");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        let sentinel = repo.join("SENTINEL");
+        fs::write(&sentinel, "uncommitted source\n").unwrap();
+        let mut watch = DevWatchFixture::spawn(
+            &root,
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&alias),
+                "--watch",
+                "--force",
+                "--no-ui",
+            ],
+        );
+        assert!(wait_for_path(&started, Duration::from_secs(30)));
+        let override_path = source_watch_override_path(&root, "demo");
+        let ownership = fs::read(&override_path).unwrap();
+        let binding = get_environment("demo", &env, &cwd).unwrap();
+        assert!(binding.dev.is_none());
+        let own = run_ocm(&cwd, &env, &["env", "remove", "demo", "--force"]);
+        assert!(!own.status.success());
+        assert!(
+            stderr(&own).contains("unfinished ownership"),
+            "{}",
+            stderr(&own)
+        );
+        if layout == "disjoint" {
+            let removed = run_ocm(&cwd, &env, &["env", "remove", "container"]);
+            assert!(removed.status.success(), "{}", stderr(&removed));
+            assert!(!container_root.exists());
+        } else {
+            let registry_path = root.child("ocm-home/envs.json");
+            let registry = fs::read(&registry_path).unwrap();
+            for force in [false, true] {
+                let mut args = vec!["env", "remove", "container"];
+                if force {
+                    args.push("--force");
+                }
+                let refused = run_ocm(&cwd, &env, &args);
+                assert!(!refused.status.success());
+                assert!(
+                    stderr(&refused).contains("active temporary dev source for env demo"),
+                    "{}",
+                    stderr(&refused)
+                );
+                assert_eq!(fs::read(&registry_path).unwrap(), registry);
+                assert!(container_root.exists());
+            }
+            let preview = run_ocm(&cwd, &env, &["env", "destroy", "container", "--json"]);
+            assert!(
+                stdout(&preview).contains("active temporary dev source for env demo"),
+                "{} {}",
+                stdout(&preview),
+                stderr(&preview)
+            );
+            assert_eq!(fs::read(&registry_path).unwrap(), registry);
+        }
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            "uncommitted source\n"
+        );
+        assert_eq!(fs::read(&override_path).unwrap(), ownership);
+        assert!(watch.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        let git = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(git.status.success(), "{}", stderr(&git));
+        let completed = watch.finish();
+        assert!(completed.status.success(), "{}", stderr(&completed));
+        assert_eq!(read_source_watch_session(&root)["closed"], true);
+        if layout != "disjoint" {
+            let removed = run_ocm(&cwd, &env, &["env", "remove", "container"]);
+            assert!(removed.status.success(), "{}", stderr(&removed));
+            assert!(!container_root.exists());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn temporary_foreground_cleanup_preserves_current_service_policy() {
     assert_foreground_cleanup_preserves_current_policy(false);
 }

@@ -719,6 +719,15 @@ When OCM reports that it cannot resolve or inspect a registered source, it stops
 before writing the destination. Check the recorded source with `ocm env show
 <env>`, restore that checkout's path or access permissions, then retry.
 
+Removal, pruning, destroy, and simulation cleanup also protect checkouts and Git
+metadata used by another environment's active temporary source session, including
+`ocm dev <env> --repo <checkout> --watch --force`. A containing cleanup refuses
+before changing state, even with `--force`; run `ocm dev stop <env>` for the
+identified temporary owner first. Disjoint sources do not block cleanup, and a
+completed temporary session does not reserve its old checkout. If an unfinished
+session's source cannot be established, finish or recover that session before
+retrying cleanup.
+
 ### Clone an environment
 
 ```bash
