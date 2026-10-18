@@ -1,5 +1,6 @@
 use super::git_config::{
-    CopiedGitConfigContext, git_path, relocate_copied_git_config, validate_copied_git_config,
+    CopiedGitConfigContext, git_path, relocate_copied_git_config,
+    relocate_copied_git_config_with_history_roots, validate_copied_git_config,
 };
 use super::*;
 use crate::openclaw_repo::{git_command, git_identity_paths, read_git_pointer};
@@ -60,8 +61,18 @@ struct CopyGraph<'a> {
 pub(in crate::store) fn relocate_copied_worktrees(
     paths: &EnvPaths,
     mappings: &[(&Path, &Path)],
+    contexts: Vec<CopiedGitConfigContext>,
+    copied_git_roots: &[PathBuf],
+) -> Result<CopiedWorktrees, String> {
+    relocate_copied_worktrees_with_history_roots(paths, mappings, contexts, copied_git_roots, &[])
+}
+
+pub(in crate::store) fn relocate_copied_worktrees_with_history_roots(
+    paths: &EnvPaths,
+    mappings: &[(&Path, &Path)],
     mut contexts: Vec<CopiedGitConfigContext>,
     copied_git_roots: &[PathBuf],
+    projected_state_roots: &[PathBuf],
 ) -> Result<CopiedWorktrees, String> {
     let database_path = paths.state_dir.join("state/openclaw.sqlite");
     let database =
@@ -91,32 +102,34 @@ pub(in crate::store) fn relocate_copied_worktrees(
         return Err("copied managed registry changed during finalization".to_string());
     }
     // The copied footprint need not contain a state directory.
-    let state_root = derive_env_paths(&graph.root).state_dir;
-    let namespaces = integrity_protected_history_namespaces(&state_root)
-        .into_iter()
-        .filter_map(|logical| {
-            graph
-                .resolve_owned(&logical, 0, false)
-                .ok()
-                .map(|resolved| (logical, resolved))
-        })
-        .collect::<Vec<_>>();
-    for path in graph
-        .writes
-        .keys()
-        .chain(graph.links.keys())
-        .chain(database.as_ref().filter(|_| !records.is_empty()))
-    {
-        if is_integrity_protected_history_destination_from_observations(
-            &state_root,
-            path,
-            &graph.resolved_aliases,
-            &namespaces,
-        ) {
-            return Err(format!(
-                "cannot copy managed worktree: required Git relocation would modify integrity-protected history at {}",
-                display_path(path)
-            ));
+    let history_roots = copied_history_state_roots(&graph.root, projected_state_roots)?;
+    for state_root in &history_roots {
+        let namespaces = integrity_protected_history_namespaces(state_root)
+            .into_iter()
+            .filter_map(|logical| {
+                graph
+                    .resolve_owned(&logical, 0, false)
+                    .ok()
+                    .map(|resolved| (logical, resolved))
+            })
+            .collect::<Vec<_>>();
+        for path in graph
+            .writes
+            .keys()
+            .chain(graph.links.keys())
+            .chain(database.as_ref().filter(|_| !records.is_empty()))
+        {
+            if is_integrity_protected_history_destination_from_observations(
+                state_root,
+                path,
+                &graph.resolved_aliases,
+                &namespaces,
+            ) {
+                return Err(format!(
+                    "cannot copy managed worktree: required Git relocation would modify integrity-protected history at {}",
+                    display_path(path)
+                ));
+            }
         }
     }
     // The whole required graph has been resolved inside the destination before
@@ -169,7 +182,16 @@ pub(in crate::store) fn relocate_copied_worktrees(
         .iter()
         .map(|(source, target)| (source.to_path_buf(), target.to_path_buf()))
         .collect::<Vec<_>>();
-    let config_paths = relocate_copied_git_config(&paths.root, &config_mappings, &contexts)?;
+    let config_paths = if projected_state_roots.is_empty() {
+        relocate_copied_git_config(&paths.root, &config_mappings, &contexts)?
+    } else {
+        relocate_copied_git_config_with_history_roots(
+            &paths.root,
+            &config_mappings,
+            &contexts,
+            projected_state_roots,
+        )?
+    };
     // Retention walks use the caller's root spelling, whereas Git identities
     // and fingerprints use its canonical spelling, as OpenClaw does.
     let preserved_roots = graph

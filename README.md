@@ -530,6 +530,9 @@ Each maximal configured external folder is copied once; nested workspaces use th
 For identical roots, the default workspace destination takes precedence, followed by agent ID order.
 An outer workspace that contains the plain home also supplies the copied agent workspace locations inside that home; runtime state still lives in the managed environment's `.openclaw` directory.
 The copy of the home inside that outer workspace is ordinary workspace content, not a second active runtime home.
+Protected history from the original home remains byte-preserved in that copy as well.
+Retained SQLite session locations, in-home legacy session headers and managed Git worktree bindings follow these workspace projections; active in-home database references keep using the fixed state directory.
+Worktree IDs and checkout content are preserved, and required Git storage must already exist in the copied files; a relocation failure rolls back the import.
 Config `$include` files still must remain inside the plain home because OCM does not take ownership of external config.
 
 If migration reports a `copied destination symlink`, it refuses the workspace copy and removes the partial import.

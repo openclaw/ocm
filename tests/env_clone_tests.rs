@@ -2836,6 +2836,121 @@ fn copied_config_fixture(
 }
 
 #[test]
+fn env_clone_copied_git_config_preserves_migration_projected_history() {
+    for case in ["config", "structural", "ordinary"] {
+        if cfg!(windows) && case == "structural" {
+            continue;
+        }
+        for adopt in [false, true] {
+            let root = TestDir::new("migration-projected-git-history");
+            let env = ocm_env(&root);
+            let outer = root.child("outer");
+            let source = outer.join("home");
+            let state = source.join(".openclaw");
+            let (repo, checkout) = seed_managed_checkout(&source, ".openclaw/worktrees/task");
+            write_text(
+                &state.join("openclaw.json"),
+                &serde_json::json!({
+                    "agents":{"defaults":{"workspace":outer},"list":[
+                        {"id":"main","default":true},
+                        {"id":"twin","workspace":state.join("workspace")}
+                    ]}
+                })
+                .to_string(),
+            );
+            let history = if case == "ordinary" {
+                outer.join("example/.openclaw/skill-workshop")
+            } else {
+                state.join("skill-workshop")
+            };
+            let selected = history.join("support/selected");
+            fs::create_dir_all(selected.parent().unwrap()).unwrap();
+            if case == "structural" {
+                #[cfg(unix)]
+                {
+                    let private = std::path::PathBuf::from(managed_git(
+                        &checkout,
+                        &["rev-parse", "--absolute-git-dir"],
+                    ));
+                    fs::rename(private.join("gitdir"), &selected).unwrap();
+                    std::os::unix::fs::symlink(
+                        "../../../../../skill-workshop/support/selected",
+                        private.join("gitdir"),
+                    )
+                    .unwrap();
+                }
+            } else {
+                let child = history.join("support/child");
+                write_text(&child, "[fixture]\n retained = yes\n");
+                copied_config_git(
+                    &repo,
+                    &env,
+                    &[
+                        "config",
+                        "--file",
+                        &copied_config_path(&selected),
+                        "include.path",
+                        &copied_config_path(&child),
+                    ],
+                );
+                copied_config_git(
+                    &repo,
+                    &env,
+                    &["config", "include.path", &copied_config_path(&selected)],
+                );
+            }
+            let before = file_bytes(&outer);
+            let target = root.child("target");
+            let mut args = if adopt {
+                vec!["adopt", "import", "--name", "target"]
+            } else {
+                vec!["migrate", "target"]
+            };
+            args.extend([state.to_str().unwrap(), "--root", target.to_str().unwrap()]);
+            let output = run_ocm(root.path(), &env, &args);
+            if case == "ordinary" {
+                assert!(output.status.success(), "{}", stderr(&output));
+                let copied_outer = target.join(".openclaw/workspaces/default");
+                let copied_repo = copied_outer.join(repo.strip_prefix(&outer).unwrap());
+                assert_eq!(
+                    copied_config_git(
+                        &copied_repo,
+                        &env,
+                        &[
+                            "config",
+                            "--file",
+                            &copied_config_path(
+                                &copied_outer.join(selected.strip_prefix(&outer).unwrap())
+                            ),
+                            "include.path",
+                        ]
+                    ),
+                    copied_config_path(
+                        &copied_outer
+                            .join(history.strip_prefix(&outer).unwrap())
+                            .join("support/child")
+                    )
+                );
+            } else {
+                assert!(!output.status.success(), "{case} unexpectedly imported");
+                assert!(
+                    stderr(&output).contains("integrity-protected history"),
+                    "{}",
+                    stderr(&output)
+                );
+                assert!(!target.exists());
+                assert!(
+                    !run_ocm(root.path(), &env, &["env", "show", "target"])
+                        .status
+                        .success()
+                );
+            }
+            assert_eq!(file_bytes(&outer), before, "{case} changed its source");
+        }
+    }
+}
+
+#[test]
 fn env_clone_copied_git_config_preserves_order_conditions_and_source_independence() {
     let root = TestDir::new("clone-git-config");
     let (env, source, repo) = copied_config_fixture(&root);

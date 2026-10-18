@@ -495,7 +495,12 @@ fn assert_imported_plain_openclaw_home(
     let log_text = fs::read_to_string(imported_state.join("logs/app.log")).unwrap();
     let backup_text = fs::read_to_string(imported_state.join("openclaw.json.bak")).unwrap();
     assert!(session_text.contains(&imported_state.join("workspace").display().to_string()));
-    assert!(session_text.contains(&imported_state.join("logs/app.log").display().to_string()));
+    assert!(
+        session_text.contains(&imported_state.join("logs/app.log").display().to_string()),
+        "source={}; target={}; session={session_text}",
+        source_home.display(),
+        imported_state.display()
+    );
     assert!(!session_text.contains(&source_home.display().to_string()));
     assert!(log_text.contains(&imported_state.join("workspace").display().to_string()));
     assert!(!log_text.contains(&source_home.display().to_string()));
@@ -2264,6 +2269,16 @@ fn migration_snapshots_registered_databases_and_preserves_workspace_assets() {
                 CREATE TABLE durable (value TEXT); INSERT INTO durable VALUES ('committed');",
             )
             .unwrap();
+            db.execute_batch("CREATE TABLE session_nodes (entry_json TEXT);")
+                .unwrap();
+            db.execute(
+                "INSERT INTO session_nodes VALUES (?1)",
+                [
+                    serde_json::json!({"sessionRoot": source.join("workspaces/default")})
+                        .to_string(),
+                ],
+            )
+            .unwrap();
             connections.push(db);
         }
         connections[0]
@@ -2337,6 +2352,13 @@ fn migration_snapshots_registered_databases_and_preserves_workspace_assets() {
                     .get::<_, String>(0))
                     .unwrap(),
                 "committed"
+            );
+            let entry: String = db
+                .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&entry).unwrap()["sessionRoot"],
+                serde_json::json!(root.child("ocm-home/envs/target/.openclaw/workspaces/default"))
             );
             assert_eq!(
                 db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
@@ -2633,4 +2655,567 @@ fn migrate_relocates_complete_root_references_and_preserves_siblings() {
         fs::read(target.join("agents/main/agent/posix.json")).unwrap(),
         fs::read(source.join("agents/main/agent/posix.json")).unwrap()
     );
+}
+
+#[test]
+fn migration_rebases_retained_sqlite_sessions_to_the_copied_state_root() {
+    for (adopt, source_form) in [
+        (false, "absolute"),
+        (false, "relative"),
+        (true, "parent"),
+        (false, "alias"),
+        (false, "workspace-alias"),
+        (true, "nested-link"),
+        (false, "direct-link"),
+        (false, "target-spelling"),
+        (false, "embedded-target"),
+    ] {
+        #[cfg(not(unix))]
+        if matches!(
+            source_form,
+            "alias"
+                | "workspace-alias"
+                | "nested-link"
+                | "direct-link"
+                | "target-spelling"
+                | "embedded-target"
+        ) {
+            continue;
+        }
+        let root = TestDir::new("migration-sqlite-session-paths");
+        let source = root.child("legacy/.openclaw");
+        seed_plain_openclaw_home(&source);
+        let alias = root.child("legacy-alias");
+        #[cfg(unix)]
+        if matches!(
+            source_form,
+            "alias" | "nested-link" | "target-spelling" | "embedded-target"
+        ) {
+            std::os::unix::fs::symlink(source.parent().unwrap(), &alias).unwrap();
+        }
+        let alias_source = alias.join(".openclaw");
+        let workspace_alias = root.child("workspace-alias");
+        #[cfg(unix)]
+        if source_form == "workspace-alias" {
+            std::os::unix::fs::symlink(source.join("workspace"), &workspace_alias).unwrap();
+        }
+        #[cfg(unix)]
+        if matches!(source_form, "nested-link" | "direct-link") {
+            fs::create_dir_all(source.join("links")).unwrap();
+            std::os::unix::fs::symlink(source.join("workspace"), source.join("links/workspace"))
+                .unwrap();
+        }
+        let stored_workspace = match source_form {
+            "alias" | "target-spelling" | "embedded-target" => alias_source.join("workspace"),
+            "workspace-alias" => workspace_alias,
+            "nested-link" => alias_source.join("links/workspace"),
+            "direct-link" => source.join("links/workspace"),
+            _ => source.join("workspace"),
+        };
+        if matches!(source_form, "workspace-alias" | "nested-link") {
+            let config_path = source.join("openclaw.json");
+            let mut config: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+            config["agents"]["defaults"]["workspace"] = serde_json::json!(stored_workspace);
+            fs::write(config_path, config.to_string()).unwrap();
+        }
+        let legacy_path = source.join("agents/main/sessions/main.jsonl");
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&legacy_path).unwrap()).unwrap();
+        legacy["cwd"] = serde_json::json!(stored_workspace);
+        fs::write(legacy_path, format!("{legacy}\n")).unwrap();
+        let spawned_cwd = stored_workspace.join("project");
+        let external = root.child("external-project");
+        let sibling = source.with_file_name(".openclaw-other").join("workspace");
+        let mut entry = serde_json::json!({
+            "sessionId": "retained-session",
+            "sessionRoot": stored_workspace,
+            "spawnedCwd": spawned_cwd,
+            "externalPath": external,
+            "siblingPath": sibling,
+            "label": format!("Authored label mentioning {}", source.display()),
+            "systemPrompt": format!("Preserve source text: {}", source.display())
+        });
+        #[cfg(unix)]
+        if source_form == "direct-link" {
+            fs::create_dir_all(&external).unwrap();
+            std::os::unix::fs::symlink(&external, source.join("links/external")).unwrap();
+            std::os::unix::fs::symlink(
+                root.child("missing-external"),
+                source.join("links/dangling"),
+            )
+            .unwrap();
+            entry["worktree"] = serde_json::json!({
+                "repoRoot": source.join("links/external"),
+                "canonicalWorkspaceDir": source.join("links/dangling/child")
+            });
+        }
+        let databases = [
+            "agents/main/agent/openclaw-agent.sqlite",
+            "workspace/custom-agent.db",
+            "skill-workshop/retained.db",
+        ];
+        let authored = format!(
+            "console.log({:?});",
+            source.join("workspace").display().to_string()
+        );
+        let authored_hash = Sha256::digest(authored.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        for relative in databases {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let db = Connection::open(path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, entry_json TEXT NOT NULL);",
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO session_nodes VALUES ('retained', ?1)",
+                [entry.to_string()],
+            )
+            .unwrap();
+            db.execute_batch("CREATE TABLE board_widgets (descriptor_json TEXT, sha256 TEXT, granted_sha TEXT, grant_state TEXT);").unwrap();
+            db.execute(
+                "INSERT INTO board_widgets VALUES (?1, ?2, ?2, 'granted')",
+                params![
+                    serde_json::json!({"source": authored}).to_string(),
+                    authored_hash
+                ],
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(source.join("state")).unwrap();
+        let registry = Connection::open(source.join("state/openclaw.sqlite")).unwrap();
+        registry
+            .execute_batch("CREATE TABLE agent_databases (path TEXT NOT NULL);")
+            .unwrap();
+        // Protected history remains copied data. Registering it as active state
+        // is rejected by the shared ownership policy before migration writes.
+        // Keep both active spellings: their proven whole-state aliases also
+        // relocate literal legacy references that are not typed path fields.
+        for registered in [
+            stored_workspace.join("custom-agent.db"),
+            source.join("workspace/custom-agent.db"),
+        ] {
+            registry
+                .execute(
+                    "INSERT INTO agent_databases VALUES (?1)",
+                    [registered.to_str().unwrap()],
+                )
+                .unwrap();
+        }
+        drop(registry);
+        let originals: Vec<_> = databases
+            .iter()
+            .chain(["state/openclaw.sqlite"].iter())
+            .map(|relative| (*relative, fs::read(source.join(relative)).unwrap()))
+            .collect();
+        let mut target_root = root.child("ocm-home/envs/target");
+        #[cfg(unix)]
+        if matches!(source_form, "target-spelling" | "embedded-target") {
+            let outside = root.child("outside");
+            fs::create_dir_all(&outside).unwrap();
+            if source_form == "target-spelling" {
+                std::os::unix::fs::symlink(outside, source.join("escape")).unwrap();
+                target_root = source.join("escape/target");
+            } else {
+                target_root = outside.join(format!("={}/target", source.display()));
+            }
+            fs::write(
+                source.join("logs/app.log"),
+                format!(
+                    "cwd={}\nuri={}\nmixed={} source={}\nroot={}\nquoted=\"{}\"\nangle=<{}>\n",
+                    stored_workspace.display(),
+                    url::Url::from_file_path(&stored_workspace).unwrap(),
+                    target_root.join(".openclaw/workspace").display(),
+                    stored_workspace.display(),
+                    url::Url::from_file_path(&alias_source).unwrap(),
+                    url::Url::from_file_path(&alias_source).unwrap(),
+                    url::Url::from_file_path(&alias_source).unwrap()
+                ),
+            )
+            .unwrap();
+        }
+        let env = ocm_env(&root);
+        let cwd = root.child("cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let source_argument = match source_form {
+            "relative" => "legacy/.openclaw",
+            "parent" => "../legacy/.openclaw",
+            "alias" | "target-spelling" | "embedded-target" => alias_source.to_str().unwrap(),
+            _ => source.to_str().unwrap(),
+        };
+        let cwd = if source_form == "parent" {
+            cwd.as_path()
+        } else {
+            root.path()
+        };
+        let mut args = if adopt {
+            vec!["adopt", "import", "--name", "target", source_argument]
+        } else {
+            vec!["migrate", "target", source_argument]
+        };
+        if matches!(source_form, "target-spelling" | "embedded-target") {
+            args.extend(["--root", target_root.to_str().unwrap()]);
+        }
+        let output = run_ocm(cwd, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let target = target_root.join(".openclaw");
+        if matches!(source_form, "target-spelling" | "embedded-target") {
+            let log = fs::read_to_string(target.join("logs/app.log")).unwrap();
+            assert_eq!(
+                log,
+                format!(
+                    "cwd={}\nuri={}\nmixed={} source={}\nroot={}\nquoted=\"{}\"\nangle=<{}>\n",
+                    target.join("workspace").display(),
+                    url::Url::from_file_path(target.join("workspace")).unwrap(),
+                    target.join("workspace").display(),
+                    target.join("workspace").display(),
+                    url::Url::from_file_path(&target).unwrap(),
+                    url::Url::from_file_path(&target).unwrap(),
+                    url::Url::from_file_path(&target).unwrap()
+                )
+            );
+            let legacy: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(target.join("agents/main/sessions/main.jsonl")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(legacy["cwd"], serde_json::json!(target.join("workspace")));
+        } else {
+            assert_imported_plain_openclaw_home(&target, &source);
+        }
+        let mut expected = entry;
+        expected["sessionRoot"] = serde_json::json!(target.join("workspace"));
+        expected["spawnedCwd"] = serde_json::json!(target.join("workspace/project"));
+        for relative in &databases[..2] {
+            let db = Connection::open(target.join(relative)).unwrap();
+            let actual: String = db
+                .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+                .unwrap();
+            let actual: serde_json::Value = serde_json::from_str(&actual).unwrap();
+            assert_eq!(actual, expected, "{source_form}");
+            assert_eq!(
+                fs::canonicalize(actual["sessionRoot"].as_str().unwrap()).unwrap(),
+                fs::canonicalize(target.join("workspace")).unwrap(),
+                "{source_form}"
+            );
+            let payload: (String, String, String, String) = db
+                .query_row(
+                    "SELECT descriptor_json, sha256, granted_sha, grant_state FROM board_widgets",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                payload,
+                (
+                    serde_json::json!({"source": authored}).to_string(),
+                    authored_hash.clone(),
+                    authored_hash.clone(),
+                    "granted".to_string()
+                )
+            );
+            assert_eq!(
+                db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+        }
+        let registry = Connection::open(target.join("state/openclaw.sqlite")).unwrap();
+        let registered: String = registry
+            .query_row(
+                "SELECT path FROM agent_databases ORDER BY rowid LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registered, target.join(databases[1]).to_str().unwrap());
+        assert_eq!(
+            fs::read(target.join(databases[2])).unwrap(),
+            fs::read(source.join(databases[2])).unwrap()
+        );
+        for (relative, before) in originals {
+            assert_eq!(fs::read(source.join(relative)).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn migration_rebases_sessions_through_shared_workspace_projections() {
+    for (adopt, home_parent) in [(false, false), (true, false), (false, true), (true, true)] {
+        let root = TestDir::new("migration-shared-session-projections");
+        let shared = root.child("shared");
+        let source = if home_parent {
+            shared.join("plain-home")
+        } else {
+            root.child("plain-home")
+        };
+        let workspace = if home_parent {
+            source.join("workspace")
+        } else {
+            shared.join("project")
+        };
+        let other = root.child("other");
+        let outside = root.child("uncopied");
+        for path in [
+            source.join("agents/main/agent"),
+            source.join("state"),
+            workspace.clone(),
+            other.clone(),
+            outside.clone(),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(
+            source.join("openclaw.json"),
+            serde_json::json!({
+                "agents": {"defaults": {"workspace": shared}, "list": [
+                    {"id":"main", "default":true},
+                    {"id":"twin", "workspace":shared},
+                    {"id":"nested", "workspace":workspace.clone()},
+                    {"id":"other", "workspace":other}
+                ]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let agent_path = source.join("agents/main/agent/openclaw-agent.sqlite");
+        let db = Connection::open(&agent_path).unwrap();
+        db.execute_batch("CREATE TABLE schema_meta(meta_key TEXT PRIMARY KEY, role TEXT, agent_id TEXT);
+            INSERT INTO schema_meta VALUES ('primary', 'agent', 'main');
+            CREATE TABLE session_nodes(session_key TEXT PRIMARY KEY, entry_json TEXT NOT NULL) WITHOUT ROWID;").unwrap();
+        // Identical JSON follows the same copied workspace across the shared store.
+        // Access principals and session keys do not select another destination.
+        let entry = serde_json::json!({
+            "sessionRoot": workspace.clone(),
+            "spawnedCwd": workspace.join("missing-child"),
+            "spawnedWorkspaceDir": url::Url::from_directory_path(workspace.clone()).unwrap().as_str(),
+            "owner": {"actor": {"id":"twin"}},
+            "label": format!("Authored {}", shared.display()),
+            "worktree": {"repoRoot": outside, "canonicalWorkspaceDir": workspace.clone()}
+        }).to_string();
+        for key in [
+            "agent:main:retained",
+            "agent:twin:retained",
+            "agent:nested:retained",
+            "agent:other:retained",
+            "legacy",
+        ] {
+            db.execute(
+                "INSERT INTO session_nodes VALUES (?1, ?2)",
+                params![key, entry],
+            )
+            .unwrap();
+        }
+        db.execute_batch("CREATE TABLE session_entries AS SELECT * FROM session_nodes;")
+            .unwrap();
+        drop(db);
+        let external_database = shared.join("retained.db");
+        Connection::open(&external_database)
+            .unwrap()
+            .execute_batch("CREATE TABLE durable(value TEXT); INSERT INTO durable VALUES ('keep');")
+            .unwrap();
+        let registry_path = source.join("state/openclaw.sqlite");
+        let registry = Connection::open(&registry_path).unwrap();
+        registry.execute_batch("CREATE TABLE agent_databases(agent_id TEXT, path TEXT, PRIMARY KEY(agent_id,path)) WITHOUT ROWID;").unwrap();
+        for agent in ["main", "twin"] {
+            registry
+                .execute(
+                    "INSERT INTO agent_databases VALUES (?1, ?2)",
+                    params![agent, external_database.to_str().unwrap()],
+                )
+                .unwrap();
+        }
+        registry
+            .execute(
+                "INSERT INTO agent_databases VALUES ('internal', ?1)",
+                [agent_path.to_str().unwrap()],
+            )
+            .unwrap();
+        drop(registry);
+        let legacy_path = source.join("agents/main/sessions/retained.jsonl");
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        let legacy_header = serde_json::json!({
+            "type":"session", "version":3, "id":"retained-legacy-session",
+            "timestamp":"2026-10-17T12:00:00.000Z", "cwd":workspace,
+            "metadata":{"cwd":workspace}
+        });
+        let legacy_other = serde_json::json!({"type":"custom", "cwd":workspace});
+        fs::write(
+            &legacy_path,
+            format!("[\"session\"]\n{legacy_header}\n{legacy_other}\n"),
+        )
+        .unwrap();
+        let originals = [
+            &agent_path,
+            &registry_path,
+            &external_database,
+            &legacy_path,
+        ]
+        .map(|path| fs::read(path).unwrap());
+        let target_root = root.child("target");
+        let mut args = if adopt {
+            vec!["adopt", "import", "--name", "target"]
+        } else {
+            vec!["migrate", "target"]
+        };
+        args.extend([
+            source.to_str().unwrap(),
+            "--root",
+            target_root.to_str().unwrap(),
+        ]);
+        let output = run_ocm(root.path(), &ocm_env(&root), &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let target = target_root.join(".openclaw");
+        let legacy =
+            fs::read_to_string(target.join("agents/main/sessions/retained.jsonl")).unwrap();
+        let events = legacy
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let mut expected_header = legacy_header;
+        let mut expected_other = legacy_other;
+        if home_parent {
+            expected_header["cwd"] =
+                serde_json::json!(target.join("workspaces/default/plain-home/workspace"));
+            // Only the recognized top-level header location changes projection.
+            expected_header["metadata"]["cwd"] = serde_json::json!(target.join("workspace"));
+            expected_other["cwd"] = serde_json::json!(target.join("workspace"));
+        }
+        assert_eq!(
+            events,
+            vec![
+                serde_json::json!(["session"]),
+                expected_header,
+                expected_other
+            ]
+        );
+        let copied =
+            Connection::open(target.join("agents/main/agent/openclaw-agent.sqlite")).unwrap();
+        for (key, relative) in [
+            ("agent:main:retained", "workspaces/default/project"),
+            ("agent:twin:retained", "workspaces/default/project"),
+            ("agent:nested:retained", "workspaces/default/project"),
+            ("agent:other:retained", "workspaces/default/project"),
+            ("legacy", "workspaces/default/project"),
+        ] {
+            let relative = if home_parent {
+                "workspaces/default/plain-home/workspace"
+            } else {
+                relative
+            };
+            for table in ["session_nodes", "session_entries"] {
+                let raw: String = copied
+                    .query_row(
+                        &format!("SELECT entry_json FROM {table} WHERE session_key=?1"),
+                        [key],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let mut expected: serde_json::Value = serde_json::from_str(&entry).unwrap();
+                expected["sessionRoot"] = serde_json::json!(target.join(relative));
+                expected["spawnedCwd"] =
+                    serde_json::json!(target.join(relative).join("missing-child"));
+                expected["spawnedWorkspaceDir"] = serde_json::json!(
+                    url::Url::from_directory_path(target.join(relative))
+                        .unwrap()
+                        .as_str()
+                );
+                expected["worktree"]["canonicalWorkspaceDir"] =
+                    serde_json::json!(target.join(relative));
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&raw).unwrap(),
+                    expected,
+                    "{table}: {key}"
+                );
+            }
+        }
+        let registry = Connection::open(target.join("state/openclaw.sqlite")).unwrap();
+        let internal_database: String = registry
+            .query_row(
+                "SELECT path FROM agent_databases WHERE agent_id = 'internal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            Path::new(&internal_database),
+            target.join("agents/main/agent/openclaw-agent.sqlite")
+        );
+        for (agent, relative) in [
+            ("main", "workspaces/default/retained.db"),
+            ("twin", "workspaces/default/retained.db"),
+        ] {
+            let path: String = registry
+                .query_row(
+                    "SELECT path FROM agent_databases WHERE agent_id=?1",
+                    [agent],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(Path::new(&path), target.join(relative));
+            let copied = Connection::open(path).unwrap();
+            assert_eq!(
+                copied
+                    .query_row("SELECT value FROM durable", [], |row| row
+                        .get::<_, String>(0))
+                    .unwrap(),
+                "keep"
+            );
+        }
+        for (path, original) in [
+            &agent_path,
+            &registry_path,
+            &external_database,
+            &legacy_path,
+        ]
+        .into_iter()
+        .zip(originals)
+        {
+            assert_eq!(fs::read(path).unwrap(), original);
+        }
+    }
+}
+
+#[test]
+fn migration_rolls_back_a_database_relocation_conflict() {
+    let root = TestDir::new("migration-sqlite-relocation-conflict");
+    let source = root.child("legacy/.openclaw");
+    seed_plain_openclaw_home(&source);
+    let target = root.child("ocm-home/envs/target/.openclaw");
+    let path = source.join("agents/main/agent/openclaw-agent.sqlite");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TABLE session_nodes (entry_json TEXT UNIQUE ON CONFLICT REPLACE);")
+        .unwrap();
+    for workspace in [source.join("workspace"), target.join("workspace")] {
+        db.execute(
+            "INSERT INTO session_nodes VALUES (?1)",
+            [serde_json::json!({"sessionRoot": workspace}).to_string()],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let before = fs::read(&path).unwrap();
+    let env = ocm_env(&root);
+    let output = run_ocm(
+        root.path(),
+        &env,
+        &["migrate", "target", source.to_str().unwrap()],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("failed to relocate imported OpenClaw state database"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!root.child("ocm-home/envs/target").exists());
+    let listing = run_ocm(root.path(), &env, &["env", "list", "--json"]);
+    assert!(listing.status.success(), "{}", stderr(&listing));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout(&listing)).unwrap(),
+        serde_json::json!([])
+    );
+    assert_eq!(fs::read(path).unwrap(), before);
 }

@@ -54,8 +54,14 @@ pub(crate) struct OpenClawWorkspaceInventory {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MigrationWorkspaceSources {
-    pub(crate) default_workspace: Option<PathBuf>,
-    pub(crate) agent_workspaces: BTreeMap<String, PathBuf>,
+    pub(crate) default_workspace: Option<MigrationWorkspaceSource>,
+    pub(crate) agent_workspaces: BTreeMap<String, MigrationWorkspaceSource>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MigrationWorkspaceSource {
+    pub(crate) canonical: PathBuf,
+    pub(crate) configured: PathBuf,
 }
 
 #[derive(Debug)]
@@ -363,7 +369,7 @@ fn migration_workspace_source(
     workspace: &Path,
     source_root: &Path,
     canonical_source_root: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<MigrationWorkspaceSource, String> {
     let canonical_workspace = canonicalize_path_allow_missing(workspace)?;
     if canonical_workspace == canonical_source_root {
         return Err(format!(
@@ -378,7 +384,10 @@ fn migration_workspace_source(
             canonical_source_root,
             "workspace",
         )?;
-        return Ok(canonical_workspace);
+        return Ok(MigrationWorkspaceSource {
+            canonical: canonical_workspace,
+            configured: workspace.to_path_buf(),
+        });
     }
     let metadata = fs::metadata(&canonical_workspace).map_err(|error| {
         format!(
@@ -392,7 +401,10 @@ fn migration_workspace_source(
             display_path(workspace)
         ));
     }
-    Ok(canonical_workspace)
+    Ok(MigrationWorkspaceSource {
+        canonical: canonical_workspace,
+        configured: workspace.to_path_buf(),
+    })
 }
 
 pub(crate) fn resolve_env_openclaw_workspaces(

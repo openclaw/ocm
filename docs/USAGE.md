@@ -747,6 +747,18 @@ Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite s
 Agent database paths recorded in the source shared-state registry are also included when the existing copy traverses them.
 Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
 The source stays running and its database contents are not rewritten.
+
+Plain-home migration (`migrate` and `adopt import`) rebases retained SQLite session locations and database registry paths into the copied state directory and configured external workspace copies, including filesystem aliases.
+Session locations follow the actual shared workspace projection, while in-home database registry paths stay in the fixed copied state directory.
+When a configured workspace contains the original home, its workspace locations select the enclosing workspace copy; active runtime databases still use the new `.openclaw` state directory.
+Recognized legacy session headers with an in-home `cwd` follow the same workspace projection; other legacy text and external references keep their existing relocation policy.
+It maps resolved locations so internal links do not leave retained sessions pointing back at the source; references outside the copied roots and unresolved links remain unchanged.
+It uses the copy operation's recorded database destinations, including registered databases already copied from external workspaces, without copying additional external contents.
+Authored database payloads, approval and integrity metadata, and protected history remain unchanged; the source databases are never rewritten.
+The original home's history protection also applies when those files are carried into an enclosing workspace copy.
+Retained managed Git worktree bindings stay consistent with the copied repositories and checkouts, preserving session/worktree IDs and checkout content.
+Required copied Git configuration survives cleanup, and registry paths, structural Git links and selected configuration must agree before migration succeeds.
+A required database or Git relocation failure rolls back the new environment without acquiring additional external Git data or changing source registrations.
 Clone and upgrade simulation also rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
 This includes legacy live session entries that OpenClaw migrates into its current session store.
 External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.

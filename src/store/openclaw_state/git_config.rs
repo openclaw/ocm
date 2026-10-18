@@ -9,8 +9,11 @@ use crate::openclaw_repo::{
     normalize_git_file_path,
 };
 
-use super::{is_integrity_protected_history_destination, with_owner_write_permission};
-use crate::store::layout::{EnvPaths, derive_env_paths, display_path};
+use super::{
+    copied_history_state_roots, is_integrity_protected_history_destination,
+    with_owner_write_permission,
+};
+use crate::store::layout::{EnvPaths, display_path};
 use crate::store::openclaw_workspaces::OpenClawWorkspaceInventory;
 
 /// The caller supplies already isolated Git directories, not source-selecting pointers.
@@ -29,11 +32,20 @@ pub(in crate::store) fn relocate_copied_git_config(
     mappings: &[(PathBuf, PathBuf)],
     contexts: &[CopiedGitConfigContext],
 ) -> Result<BTreeSet<PathBuf>, String> {
+    relocate_copied_git_config_with_history_roots(root, mappings, contexts, &[])
+}
+
+pub(in crate::store) fn relocate_copied_git_config_with_history_roots(
+    root: &Path,
+    mappings: &[(PathBuf, PathBuf)],
+    contexts: &[CopiedGitConfigContext],
+    projected_state_roots: &[PathBuf],
+) -> Result<BTreeSet<PathBuf>, String> {
     if contexts.is_empty() {
         return Ok(BTreeSet::new());
     }
     let canonical_root = fs::canonicalize(root).map_err(|e| e.to_string())?;
-    let state_root = derive_env_paths(&canonical_root).state_dir;
+    let history_roots = copied_history_state_roots(&canonical_root, projected_state_roots)?;
     let mut retained = BTreeSet::new();
     let mut visited = BTreeMap::new();
     for context in contexts {
@@ -44,7 +56,7 @@ pub(in crate::store) fn relocate_copied_git_config(
         if config.exists() {
             edit_config(
                 &canonical_root,
-                &state_root,
+                &history_roots,
                 &config,
                 &context.private_dir,
                 mappings,
@@ -92,7 +104,7 @@ pub(in crate::store) fn relocate_copied_git_config(
                 {
                     if edit_config(
                         &canonical_root,
-                        &state_root,
+                        &history_roots,
                         &path,
                         &context.private_dir,
                         mappings,
@@ -180,10 +192,17 @@ pub(in crate::store) fn copied_workspace_git_contexts(
         (source.root.clone(), target.root.clone()),
         (canonical_source, target.root.clone()),
     ];
-    let mut pending = workspaces
+    let roots = workspaces
         .workspace_roots()
-        .filter_map(|path| project(path, &mappings))
-        .collect::<Vec<_>>();
+        .filter_map(|path| project(path, &mappings));
+    copied_destination_git_contexts(target, roots)
+}
+
+pub(in crate::store) fn copied_destination_git_contexts(
+    target: &EnvPaths,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Result<Vec<CopiedGitConfigContext>, String> {
+    let mut pending = roots.into_iter().collect::<Vec<_>>();
     let mut seen = BTreeSet::new();
     let mut metadata_roots = BTreeSet::new();
     let canonical_target = fs::canonicalize(&target.root).map_err(|e| e.to_string())?;
@@ -373,7 +392,7 @@ fn read_config_paths(file: &Path) -> Result<Vec<ConfigPath>, String> {
 
 fn edit_config(
     root: &Path,
-    state_root: &Path,
+    history_roots: &BTreeSet<PathBuf>,
     path: &Path,
     private_dir: &Path,
     mappings: &[(PathBuf, PathBuf)],
@@ -413,8 +432,12 @@ fn edit_config(
         }
     }
     if !edits.is_empty() {
-        if is_integrity_protected_history_destination(state_root, path, &file)? {
-            return Err("copied Git configuration would modify integrity-protected history".into());
+        for state_root in history_roots {
+            if is_integrity_protected_history_destination(state_root, path, &file)? {
+                return Err(
+                    "copied Git configuration would modify integrity-protected history".into(),
+                );
+            }
         }
         // Git locks the selected filename, which may be an alias. Check both
         // that name and the canonical file, including later selected aliases.

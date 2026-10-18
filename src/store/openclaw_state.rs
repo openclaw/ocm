@@ -2,9 +2,10 @@ pub(in crate::store) mod git_config;
 
 mod worktrees;
 
+use worktrees::relocate_copied_worktrees_with_history_roots;
 pub(super) use worktrees::{CopiedWorktrees, relocate_copied_worktrees};
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
@@ -18,6 +19,7 @@ use crate::infra::archive::{EnvArchiveEntryKind, EnvArchiveOptions};
 
 use super::common::path_exists;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
+use super::openclaw_config::normalize_path_allow_missing;
 use super::openclaw_workspaces::{
     OpenClawCleanupPathError, OpenClawWorkspaceInventory, OpenClawWorkspaceRuntime,
     canonicalize_path_allow_missing, resolve_env_openclaw_cleanup_paths,
@@ -35,6 +37,12 @@ pub(crate) struct OpenClawStateAudit {
 pub(crate) struct MigratedRuntimeStateResult {
     pub changed: bool,
     pub external_plugin_ids: Vec<String>,
+}
+
+pub(crate) struct MigrationWorkspaceCopy<'a> {
+    pub source: &'a Path,
+    pub source_alias: &'a Path,
+    pub target: &'a Path,
 }
 
 pub(crate) fn audit_openclaw_state(
@@ -230,23 +238,25 @@ pub(crate) fn should_skip_openclaw_env_archive_path(
 pub(crate) fn prepare_migrated_runtime_state(
     paths: &EnvPaths,
     source_state_root: &Path,
+    canonical_source_state_root: &Path,
+    copied_databases: &HashSet<PathBuf>,
+    workspace_copies: &[MigrationWorkspaceCopy<'_>],
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<MigratedRuntimeStateResult, String> {
     if !path_exists(&paths.state_dir) {
         return Ok(MigratedRuntimeStateResult::default());
     }
-    let workspaces = resolve_archivable_workspaces(paths, env, runtime)?;
+    let mut workspaces = resolve_archivable_workspaces(paths, env, runtime)?;
 
+    let source_roots = [source_state_root, canonical_source_state_root];
+    let mut aliases = MigrationPathAliases {
+        canonical_root: canonical_source_state_root,
+        roots: source_roots.into_iter().map(Path::to_path_buf).collect(),
+        workspace_copies,
+        copied_databases,
+    };
     let mut changed = false;
-    changed |= rewrite_runtime_state_root_refs(
-        &paths.state_dir,
-        &paths.config_path,
-        &workspaces,
-        &[source_state_root],
-        &paths.state_dir,
-        false,
-    )?;
     let plugin_paths = relocate_installed_plugin_index_paths(
         &paths.state_dir.join("state/openclaw.sqlite"),
         source_state_root,
@@ -254,12 +264,86 @@ pub(crate) fn prepare_migrated_runtime_state(
         PluginPathRelocation::Imported,
     )?;
     changed |= plugin_paths.changed;
+    let mut databases = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    // Copy ownership includes registered databases materialized by workspace
+    // overlays. Relocate their session fields without interpreting authored data.
+    for database in copied_databases.iter().collect::<BTreeSet<_>>() {
+        if let Some(database) =
+            contained_imported_database(database, &paths.root, &paths.state_dir, false)?
+        {
+            relocate_archived_database(
+                paths,
+                &source_roots,
+                &paths.state_dir,
+                DatabasePathRelocation::ClonedSessions,
+                &database,
+                &mut visited,
+                &mut databases,
+                Some(&mut aliases),
+            )?;
+        }
+    }
+    changed |= databases.values().any(|count| *count != 0);
+    // A workspace containing the source home carries a complete second tree.
+    // Git paths follow that workspace projection; the active database above
+    // remains in the fixed state copy independently of this graph mapping.
+    let graph_state_root = aliases
+        .workspace_destination(canonical_source_state_root)
+        .unwrap_or_else(|| paths.state_dir.clone());
+    let mappings = aliases
+        .roots
+        .iter()
+        .map(|source| (source.as_path(), graph_state_root.as_path()))
+        .chain(
+            workspace_copies
+                .iter()
+                .flat_map(|copy| [(copy.source, copy.target), (copy.source_alias, copy.target)]),
+        )
+        .collect::<Vec<_>>();
+    let git_contexts = git_config::copied_destination_git_contexts(
+        paths,
+        workspaces.workspace_roots().map(Path::to_path_buf),
+    )?;
+    let managed_worktrees = relocate_copied_worktrees_with_history_roots(
+        paths,
+        &mappings,
+        git_contexts,
+        &[],
+        &[graph_state_root.clone()],
+    )?;
+    changed |=
+        !managed_worktrees.preserved_roots.is_empty() || !managed_worktrees.config_paths.is_empty();
+    workspaces.preserve_copied_roots(&managed_worktrees.preserved_roots);
+    workspaces.preserve_copied_config_paths(&managed_worktrees.config_paths);
+    // Stored eligible paths can reveal another spelling of the same source
+    // (for example a logical cwd alias lost by current_dir). Apply only roots
+    // whose identity was proved, also to legacy literal text and log references.
+    let mut rewritten_roots = BTreeSet::new();
+    while let Some(source_root) = aliases
+        .roots
+        .difference(&rewritten_roots)
+        .max_by_key(|root| root.as_os_str().len())
+        .cloned()
+    {
+        changed |= rewrite_runtime_state_root_refs(
+            &paths.state_dir,
+            &paths.config_path,
+            &workspaces,
+            &[&source_root],
+            &paths.state_dir,
+            false,
+            Some(&mut aliases),
+        )?;
+        rewritten_roots.insert(source_root);
+    }
     changed |= clear_volatile_runtime_state(
         &paths.state_dir,
         &paths.state_dir,
         &paths.config_path,
         &workspaces,
     )?;
+    managed_worktrees.finish(paths)?;
     Ok(MigratedRuntimeStateResult {
         changed,
         external_plugin_ids: plugin_paths.external_plugin_ids,
@@ -383,6 +467,7 @@ pub(super) fn relocate_archived_runtime_state(
             source_roots,
             &paths.root,
             true,
+            None,
         )?
     } else {
         false
@@ -416,10 +501,12 @@ pub(super) fn relocate_copied_databases(
         relocate_archived_database(
             paths,
             source_roots,
+            &paths.root,
             relocation,
             database,
             &mut visited,
             &mut counts,
+            None,
         )?;
     }
     let mut selection = OpenClawSqliteCopy {
@@ -461,10 +548,12 @@ pub(super) fn relocate_copied_databases(
             relocate_archived_database(
                 paths,
                 source_roots,
+                &paths.root,
                 relocation,
                 &database,
                 &mut visited,
                 &mut counts,
+                None,
             )?;
         }
     }
@@ -483,10 +572,12 @@ pub(super) fn relocate_copied_databases(
                     relocate_archived_database(
                         paths,
                         source_roots,
+                        &paths.root,
                         relocation,
                         &database,
                         &mut visited,
                         &mut counts,
+                        None,
                     )?;
                 }
             }
@@ -498,10 +589,12 @@ pub(super) fn relocate_copied_databases(
 fn relocate_archived_database(
     paths: &EnvPaths,
     source_roots: &[&Path],
+    target_root: &Path,
     relocation: DatabasePathRelocation,
     database: &Path,
     visited: &mut BTreeSet<PathBuf>,
     counts: &mut BTreeMap<String, u64>,
+    aliases: Option<&mut MigrationPathAliases<'_>>,
 ) -> Result<(), String> {
     if source_roots.is_empty() {
         return Ok(());
@@ -515,8 +608,9 @@ fn relocate_archived_database(
             rewrite_database_root_references(
                 database,
                 source_roots,
-                &display_path(&paths.root),
+                &display_path(target_root),
                 relocation,
+                aliases,
             )
         })
     })?;
@@ -528,6 +622,90 @@ fn relocate_archived_database(
     Ok(())
 }
 
+struct MigrationPathAliases<'a> {
+    canonical_root: &'a Path,
+    roots: BTreeSet<PathBuf>,
+    workspace_copies: &'a [MigrationWorkspaceCopy<'a>],
+    copied_databases: &'a HashSet<PathBuf>,
+}
+
+impl MigrationPathAliases<'_> {
+    fn rewrite(&mut self, value: &str, target_root: &str) -> Option<String> {
+        self.rewrite_path(value, target_root, false)
+    }
+
+    fn rewrite_path(
+        &mut self,
+        value: &str,
+        target_root: &str,
+        include_workspaces: bool,
+    ) -> Option<String> {
+        let path = if Path::new(value).is_absolute() {
+            PathBuf::from(value)
+        } else {
+            url::Url::parse(value).ok()?.to_file_path().ok()?
+        };
+        // A missing descendant is relocatable, but a dangling or cyclic link
+        // does not establish which workspace owns the stored path.
+        if path
+            .ancestors()
+            .take_while(|path| !path.exists())
+            .any(|path| {
+                fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+            })
+        {
+            return None;
+        }
+        let resolved = normalize_path_allow_missing(&path)?;
+        let destination = include_workspaces
+            .then(|| self.workspace_destination(&resolved))
+            .flatten()
+            .or_else(|| {
+                resolved
+                    .strip_prefix(self.canonical_root)
+                    .ok()
+                    .map(|relative| Path::new(target_root).join(relative))
+            })?;
+        let replacement =
+            rewrite_path_value(value, &[display_path(&path)], &display_path(&destination));
+        if replacement == value {
+            return None;
+        }
+        // Whole-state aliases can also identify roots in legacy literal logs.
+        // A descendant alias still maps above without such a root spelling.
+        if let Some(root) = path
+            .ancestors()
+            .find(|root| normalize_path_allow_missing(root).as_deref() == Some(self.canonical_root))
+        {
+            self.roots.insert(root.to_path_buf());
+        }
+        Some(replacement)
+    }
+
+    fn workspace_destination(&self, path: &Path) -> Option<PathBuf> {
+        // The producer coalesces overlapping sources, so every binding for the
+        // same physical path projects to the same copied location.
+        self.workspace_copies.iter().find_map(|copy| {
+            path.strip_prefix(copy.source)
+                .ok()
+                .map(|relative| clean_path(&copy.target.join(relative)))
+        })
+    }
+
+    fn rewrite_database_path(&mut self, value: &str, target_root: &str) -> Option<String> {
+        if let Some(replacement) = self.rewrite(value, target_root) {
+            return Some(replacement);
+        }
+        let replacement = self.rewrite_path(value, target_root, true)?;
+        let path = if Path::new(&replacement).is_absolute() {
+            PathBuf::from(&replacement)
+        } else {
+            url::Url::parse(&replacement).ok()?.to_file_path().ok()?
+        };
+        self.copied_databases.contains(&path).then_some(replacement)
+    }
+}
+
 fn quote_sql_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -537,6 +715,7 @@ fn rewrite_database_root_references(
     source_roots: &[&Path],
     target_root: &str,
     relocation: DatabasePathRelocation,
+    mut aliases: Option<&mut MigrationPathAliases<'_>>,
 ) -> Result<u64, String> {
     let mut source_roots = source_roots
         .iter()
@@ -545,7 +724,7 @@ fn rewrite_database_root_references(
     // Match a nested lexical alias before its shorter canonical root.
     source_roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
     source_roots.dedup();
-    let rewrite = || -> Result<u64, Box<dyn std::error::Error>> {
+    let mut rewrite = || -> Result<u64, Box<dyn std::error::Error>> {
         let mut db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         // Stored callbacks and cascades must not modify unrelated values.
         db.set_db_config(
@@ -617,14 +796,15 @@ fn rewrite_database_root_references(
             // their entry_json directly into session_nodes on first open.
             let session_entry =
                 sessions_only && matches!(table.as_str(), "session_nodes" | "session_entries");
-            let columns = tx
+            let table_columns = tx
                 .prepare(
                     "SELECT cid, name FROM pragma_table_xinfo(?1) WHERE hidden = 0 ORDER BY cid",
                 )?
                 .query_map([&table], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            let columns = table_columns
                 .into_iter()
                 .filter(|(_, name)| {
                     !sessions_only || name == if session_entry { "entry_json" } else { "path" }
@@ -654,12 +834,17 @@ fn rewrite_database_root_references(
                                     .iter()
                                     .any(|suffix| name.ends_with(suffix));
                         let replacement = if session_entry {
-                            rewrite_cloned_session_entry(
+                            rewrite_session_location_fields(
                                 original,
                                 &source_roots,
                                 target_root,
-                                false,
+                                SessionLocationFields::Entry,
+                                aliases.as_deref_mut(),
                             )?
+                        } else if let Some(aliases) = aliases.as_deref_mut() {
+                            aliases
+                                .rewrite_database_path(original, target_root)
+                                .unwrap_or_else(|| original.to_string())
                         } else if path_column
                             && (Path::new(original).is_absolute()
                                 || original
@@ -673,6 +858,7 @@ fn rewrite_database_root_references(
                                 &source_roots,
                                 target_root,
                                 false,
+                                None,
                             )?
                         };
                         if replacement == original {
@@ -729,11 +915,19 @@ fn rewrite_database_root_references(
 // Clone retains arbitrary user/plugin payloads, including executable content
 // whose approval is bound to its exact bytes. Only session location metadata
 // is relocatable here; splice its strings without reserializing other fields.
-fn rewrite_cloned_session_entry(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionLocationFields {
+    Entry,
+    Worktree,
+    LegacyHeader,
+}
+
+fn rewrite_session_location_fields(
     raw: &str,
     source_roots: &[String],
     target_root: &str,
-    worktree: bool,
+    fields: SessionLocationFields,
+    mut aliases: Option<&mut MigrationPathAliases<'_>>,
 ) -> Result<String, String> {
     if !raw.trim_start().starts_with('{')
         || serde_json::from_str::<serde::de::IgnoredAny>(raw).is_err()
@@ -761,24 +955,41 @@ fn rewrite_cloned_session_entry(
         let value_end = json_value_end(raw, value_start)?;
         let value = &raw[value_start..value_end];
         output.push_str(&raw[cursor..value_start]);
-        let path_field = if worktree {
-            matches!(key.as_str(), "repoRoot" | "canonicalWorkspaceDir")
-        } else {
-            matches!(
+        let path_field = match fields {
+            SessionLocationFields::Worktree => {
+                matches!(key.as_str(), "repoRoot" | "canonicalWorkspaceDir")
+            }
+            SessionLocationFields::Entry => matches!(
                 key.as_str(),
                 "sessionRoot" | "spawnedCwd" | "spawnedWorkspaceDir"
-            )
+            ),
+            SessionLocationFields::LegacyHeader => key == "cwd",
         };
-        if !worktree && key == "worktree" {
-            output.push_str(&rewrite_cloned_session_entry(
+        if fields == SessionLocationFields::Entry && key == "worktree" {
+            output.push_str(&rewrite_session_location_fields(
                 value,
                 source_roots,
                 target_root,
-                true,
+                SessionLocationFields::Worktree,
+                aliases.as_deref_mut(),
             )?);
         } else if path_field && let Ok(path) = serde_json::from_str::<String>(value) {
-            let replacement = rewrite_path_value(&path, source_roots, target_root);
-            if replacement != path {
+            let replacement = if let Some(aliases) = aliases.as_deref_mut() {
+                // Legacy headers already eligible for in-home relocation must
+                // follow their workspace copy. External legacy references keep
+                // their existing policy, independent of SQLite session fields.
+                if fields == SessionLocationFields::LegacyHeader
+                    && aliases.rewrite(&path, target_root).is_none()
+                {
+                    None
+                } else {
+                    aliases.rewrite_path(&path, target_root, true)
+                }
+            } else {
+                let replacement = rewrite_path_value(&path, source_roots, target_root);
+                (replacement != path).then_some(replacement)
+            };
+            if let Some(replacement) = replacement {
                 output.push_str(
                     &serde_json::to_string(&replacement).map_err(|error| error.to_string())?,
                 );
@@ -949,6 +1160,7 @@ fn rewrite_runtime_state_root_refs(
     source_state_roots: &[&Path],
     target_state_root: &Path,
     archived: bool,
+    aliases: Option<&mut MigrationPathAliases<'_>>,
 ) -> Result<bool, String> {
     let mut changed = false;
     let source_roots = source_state_roots
@@ -965,6 +1177,7 @@ fn rewrite_runtime_state_root_refs(
         &target_root,
         archived,
         &mut changed,
+        aliases,
     )?;
     Ok(changed)
 }
@@ -978,6 +1191,7 @@ fn rewrite_runtime_state_root_refs_inner(
     target_root: &str,
     archived: bool,
     changed: &mut bool,
+    mut aliases: Option<&mut MigrationPathAliases<'_>>,
 ) -> Result<(), String> {
     if !path_exists(root) {
         return Ok(());
@@ -1005,6 +1219,7 @@ fn rewrite_runtime_state_root_refs_inner(
                 target_root,
                 archived,
                 changed,
+                aliases.as_deref_mut(),
             )?;
             continue;
         }
@@ -1012,7 +1227,7 @@ fn rewrite_runtime_state_root_refs_inner(
             continue;
         }
 
-        if archived && is_sqlite_database(&path)? {
+        if is_sqlite_database(&path)? {
             // SQLite values are handled through their owning table, never as text.
             continue;
         }
@@ -1028,8 +1243,13 @@ fn rewrite_runtime_state_root_refs_inner(
                 name.split('.')
                     .any(|part| matches!(part, "jsonl" | "ndjson"))
             });
-        let rewritten =
-            rewrite_runtime_root_references(&raw, source_roots, target_root, json_lines)?;
+        let rewritten = rewrite_runtime_root_references(
+            &raw,
+            source_roots,
+            target_root,
+            json_lines,
+            aliases.as_deref_mut(),
+        )?;
         if rewritten == raw {
             continue;
         }
@@ -1050,11 +1270,12 @@ fn rewrite_runtime_root_references(
     source_roots: &[String],
     target_root: &str,
     json_lines: bool,
+    mut aliases: Option<&mut MigrationPathAliases<'_>>,
 ) -> Result<String, String> {
     if !json_lines {
         let document = serde_json::from_str::<serde::de::IgnoredAny>(raw);
         if document.is_ok() {
-            return rewrite_root_reference_value(raw, source_roots, target_root);
+            return rewrite_root_reference_value(raw, source_roots, target_root, aliases);
         }
         if document.is_err_and(|error| error.is_eof())
             && raw.trim_start().starts_with(['{', '[', '"'])
@@ -1067,6 +1288,12 @@ fn rewrite_runtime_root_references(
     let mut output = String::with_capacity(raw.len());
     let mut text_start = 0;
     let mut offset = 0;
+    let mut session_header_seen = false;
+    #[derive(serde::Deserialize)]
+    struct HeaderKind {
+        #[serde(rename = "type")]
+        kind: String,
+    }
     for line in raw.split_inclusive('\n') {
         let parsed = serde_json::from_str::<serde::de::IgnoredAny>(line);
         let complete = parsed.is_ok();
@@ -1076,12 +1303,32 @@ fn rewrite_runtime_root_references(
                 &raw[text_start..offset],
                 source_roots,
                 target_root,
+                aliases.is_some(),
             ));
             if complete {
+                let header = if json_lines
+                    && !session_header_seen
+                    && aliases.is_some()
+                    && line.trim_start().starts_with('{')
+                    && serde_json::from_str::<HeaderKind>(line)
+                        .is_ok_and(|header| header.kind == "session")
+                {
+                    session_header_seen = true;
+                    Some(rewrite_session_location_fields(
+                        line,
+                        source_roots,
+                        target_root,
+                        SessionLocationFields::LegacyHeader,
+                        aliases.as_deref_mut(),
+                    )?)
+                } else {
+                    None
+                };
                 output.push_str(&rewrite_root_reference_value(
-                    line,
+                    header.as_deref().unwrap_or(line),
                     source_roots,
                     target_root,
+                    aliases.as_deref_mut(),
                 )?);
             } else {
                 output.push_str(line);
@@ -1094,6 +1341,7 @@ fn rewrite_runtime_root_references(
         &raw[text_start..],
         source_roots,
         target_root,
+        aliases.is_some(),
     ));
     Ok(output)
 }
@@ -1102,6 +1350,7 @@ fn rewrite_root_reference_value(
     raw: &str,
     source_roots: &[String],
     target_root: &str,
+    mut aliases: Option<&mut MigrationPathAliases<'_>>,
 ) -> Result<String, String> {
     if serde_json::from_str::<serde::de::IgnoredAny>(raw).is_ok() {
         // Preserve authored JSON bytes around the relocated strings, including
@@ -1132,6 +1381,7 @@ fn rewrite_root_reference_value(
                         &raw[start..end],
                         source_roots,
                         target_root,
+                        aliases.is_some(),
                     )?);
                 }
                 cursor = end;
@@ -1149,9 +1399,20 @@ fn rewrite_root_reference_value(
             {
                 // A JSON path is one filename; whitespace is not an argument
                 // separator, including escaped newlines within that filename.
-                rewrite_path_value(&value, source_roots, target_root)
+                if let Some(aliases) = aliases.as_deref_mut() {
+                    aliases
+                        .rewrite(&value, target_root)
+                        .unwrap_or(value.clone())
+                } else {
+                    rewrite_path_value(&value, source_roots, target_root)
+                }
             } else {
-                rewrite_root_reference_value(&value, source_roots, target_root)?
+                rewrite_root_reference_value(
+                    &value,
+                    source_roots,
+                    target_root,
+                    aliases.as_deref_mut(),
+                )?
             };
             if replacement != value {
                 output.push_str(
@@ -1186,17 +1447,24 @@ fn rewrite_root_reference_value(
                 line,
                 source_roots,
                 target_root,
+                aliases.as_deref_mut(),
             )?);
         }
         return Ok(output);
     }
-    Ok(rewrite_rooted_text(raw, source_roots, target_root))
+    Ok(rewrite_rooted_text(
+        raw,
+        source_roots,
+        target_root,
+        aliases.is_some(),
+    ))
 }
 
 fn rewrite_opaque_json_string(
     raw: &str,
     source_roots: &[String],
     target_root: &str,
+    preserve_target: bool,
 ) -> Result<String, String> {
     let bytes = raw.as_bytes();
     let utf16_escape = |at: usize| -> Option<u16> {
@@ -1246,7 +1514,7 @@ fn rewrite_opaque_json_string(
             decoded,
             if index < count { "\0" } else { "" }
         );
-        let rewritten = rewrite_rooted_text(&guarded, source_roots, target_root);
+        let rewritten = rewrite_rooted_text(&guarded, source_roots, target_root, preserve_target);
         let rewritten =
             &rewritten[usize::from(start > 1)..rewritten.len() - usize::from(index < count)];
         if rewritten == decoded {
@@ -1376,7 +1644,12 @@ fn plain_root_references(
         .collect()
 }
 
-fn rewrite_rooted_text(raw: &str, source_roots: &[String], target_root: &str) -> String {
+fn rewrite_rooted_text(
+    raw: &str,
+    source_roots: &[String],
+    target_root: &str,
+    preserve_target: bool,
+) -> String {
     // File URLs have their own escaping and authority rules. Preserve other URL
     // components and never interpret an external URL as a local command path.
     let quoted = quoted_value_ranges(raw);
@@ -1384,12 +1657,46 @@ fn rewrite_rooted_text(raw: &str, source_roots: &[String], target_root: &str) ->
     let mut urls = Vec::new();
     let mut edits = Vec::new();
     let starts: Vec<_> = file_url_starts(raw).collect();
+    // Migration may visit several equivalent source spellings. Protect the
+    // destination root before discovering boundaries, including source-like
+    // substrings inside a file URL's destination spelling.
+    let mut target_spans = Vec::new();
+    if preserve_target {
+        target_spans.extend(
+            plain_root_references(raw, target_root, &quoted, &starts)
+                .into_iter()
+                .map(|start| start..start + target_root.len()),
+        );
+        if let Ok(target_url) = url::Url::from_file_path(target_root) {
+            for &start in &starts {
+                // This only protects token boundaries inside the URI's root.
+                // The complete framed URI still decides ownership below.
+                if let Some(length) = file_url_root_prefix_length(&raw[start..], &target_url) {
+                    let end = start + length;
+                    if url::Url::parse(&raw[start..end])
+                        .ok()
+                        .and_then(|url| url.to_file_path().ok())
+                        .as_deref()
+                        == Some(Path::new(target_root))
+                    {
+                        target_spans.push(start..end);
+                    }
+                }
+            }
+        }
+        target_spans.sort_unstable_by_key(|range| range.start);
+    }
     let mut plain: Vec<_> = source_roots
         .iter()
         .flat_map(|root| {
             plain_root_references(raw, root, &quoted, &starts)
                 .into_iter()
                 .map(|start| (start, root.len()))
+        })
+        .filter(|(start, _)| {
+            target_spans[..target_spans.partition_point(|range| range.start <= *start)]
+                .last()
+                .is_none_or(|range| *start >= range.end)
         })
         .collect();
     plain.sort_unstable_by_key(|(start, len)| (*start, std::cmp::Reverse(*len)));
@@ -1487,9 +1794,11 @@ fn rewrite_rooted_text(raw: &str, source_roots: &[String], target_root: &str) ->
         // replacement so a bare-root URL gets the same boundary as a child URL.
         value_end = start + raw[start..value_end].trim_end_matches([' ', '\t']).len();
         let range = start..value_end;
-        if let Some(relocated) = source_roots
-            .iter()
-            .find_map(|root| rewrite_file_url(&raw[range.clone()], root, target_root))
+        if !(preserve_target
+            && rewrite_file_url(&raw[range.clone()], target_root, target_root).is_some())
+            && let Some(relocated) = source_roots
+                .iter()
+                .find_map(|root| rewrite_file_url(&raw[range.clone()], root, target_root))
         {
             edits.push((range.clone(), relocated));
         }
@@ -1556,20 +1865,7 @@ fn uri_path_prefix_length(raw: &str, prefix: &str) -> Option<usize> {
     raw.is_char_boundary(offset).then_some(offset)
 }
 
-fn rewrite_file_url(value: &str, source_root: &str, target_root: &str) -> Option<String> {
-    if value.chars().any(char::is_control) {
-        return None;
-    }
-    let url = url::Url::parse(value).ok()?;
-    let path = url.to_file_path().ok()?;
-    let source_url = url::Url::from_file_path(source_root).ok()?;
-    let canonical_source = source_url.to_file_path().ok()?;
-    let path = path.to_str()?;
-    let canonical_source = canonical_source.to_str()?;
-    let relocated = relocate_rooted_path(path, canonical_source, target_root)?;
-    // URL parsing establishes ownership; splice only the encoded root in the
-    // original representation so filenames, query data and surrounding text
-    // retain their bytes instead of being serialized again.
+fn file_url_root_prefix_length(value: &str, source_url: &url::Url) -> Option<usize> {
     let after_scheme = value.get(5..)?;
     let raw_path = if after_scheme.as_bytes().get(..2).is_some_and(|prefix| {
         prefix
@@ -1588,7 +1884,25 @@ fn rewrite_file_url(value: &str, source_root: &str, target_root: &str) -> Option
             source_url.path()
         };
     let prefix_length = uri_path_prefix_length(raw_path, source_path)?;
-    let suffix = &raw_path[prefix_length..];
+    Some(value.len() - raw_path.len() + prefix_length)
+}
+
+fn rewrite_file_url(value: &str, source_root: &str, target_root: &str) -> Option<String> {
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    let url = url::Url::parse(value).ok()?;
+    let path = url.to_file_path().ok()?;
+    let source_url = url::Url::from_file_path(source_root).ok()?;
+    let canonical_source = source_url.to_file_path().ok()?;
+    let path = path.to_str()?;
+    let canonical_source = canonical_source.to_str()?;
+    let relocated = relocate_rooted_path(path, canonical_source, target_root)?;
+    // URL parsing establishes ownership; splice only the encoded root in the
+    // original representation so filenames, query data and surrounding text
+    // retain their bytes instead of being serialized again.
+    let prefix_length = file_url_root_prefix_length(value, &source_url)?;
+    let suffix = &value[prefix_length..];
     if !suffix.is_empty() && !suffix.starts_with(['?', '#']) {
         let mut offset = 0;
         if !std::path::is_separator(char::from(decoded_uri_byte(
@@ -1708,6 +2022,25 @@ fn is_integrity_protected_history_path(state_root: &Path, path: &Path) -> bool {
     path.strip_prefix(state_root)
         .is_ok_and(|relative| relative.starts_with("skill-workshop"))
         || is_legacy_audit_history_path(state_root, path)
+}
+
+// A known source state can also occur inside a copied enclosing workspace.
+// Preserve its history role in every actual projection without discovering
+// unrelated directories that merely resemble an OpenClaw home.
+fn copied_history_state_roots(
+    owned_root: &Path,
+    projected_state_roots: &[PathBuf],
+) -> Result<BTreeSet<PathBuf>, String> {
+    std::iter::once(derive_env_paths(owned_root).state_dir)
+        .chain(projected_state_roots.iter().cloned())
+        .map(|root| {
+            let root = canonicalize_path_allow_missing(&root)?;
+            if !root.starts_with(owned_root) {
+                return Err("copied history root escapes the destination".into());
+            }
+            Ok(root)
+        })
+        .collect()
 }
 
 // Use only after containment establishes the actual write destination. For a
@@ -2401,11 +2734,15 @@ fn clear_volatile_runtime_state(
         }
 
         let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        let file_name = entry.file_name();
         if metadata.is_dir() && workspaces.has_descendant(&path) {
-            changed |= clear_volatile_runtime_state(state_root, &path, config_path, workspaces)?;
+            changed |= if should_remove_volatile_runtime_path(&file_name, true) {
+                clear_parent_preserving_workspaces(&path, workspaces)?
+            } else {
+                clear_volatile_runtime_state(state_root, &path, config_path, workspaces)?
+            };
             continue;
         }
-        let file_name = entry.file_name();
         if should_remove_volatile_runtime_path(&file_name, metadata.is_dir()) {
             remove_path(&path)?;
             changed = true;
@@ -3439,6 +3776,8 @@ mod tests {
             std::env::temp_dir().join(format!("ocm-openclaw-state-migrate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp);
         let source_state_root = temp.join("legacy-home/.openclaw");
+        fs::create_dir_all(&source_state_root).unwrap();
+        let canonical_source_state_root = fs::canonicalize(&source_state_root).unwrap();
         let paths = derive_env_paths(temp.join("target"));
         fs::create_dir_all(paths.workspace_dir.join("notes")).unwrap();
         fs::create_dir_all(paths.state_dir.join("workspace-clawforce/tmp")).unwrap();
@@ -3446,9 +3785,20 @@ mod tests {
         fs::create_dir_all(paths.state_dir.join("agents/main/sessions")).unwrap();
         fs::create_dir_all(paths.state_dir.join("logs")).unwrap();
         fs::create_dir_all(paths.state_dir.join("run")).unwrap();
+        fs::create_dir_all(paths.state_dir.join("tmp/copied-config")).unwrap();
+        fs::write(
+            paths.state_dir.join("tmp/copied-config/retained.json"),
+            "{}\n",
+        )
+        .unwrap();
+        fs::write(
+            paths.state_dir.join("tmp/copied-config/unrelated.txt"),
+            "discard\n",
+        )
+        .unwrap();
         fs::write(
             &paths.config_path,
-            r#"{"agents":{"list":[{"id":"main","default":true},{"id":"clawforce"}]}}"#,
+            r#"{"$include":"tmp/copied-config/retained.json","agents":{"list":[{"id":"main","default":true},{"id":"clawforce"}]}}"#,
         )
         .unwrap();
         fs::write(paths.workspace_dir.join("notes/todo.txt"), "keep\n").unwrap();
@@ -3487,6 +3837,9 @@ mod tests {
         let changed = prepare_migrated_runtime_state(
             &paths,
             &source_state_root,
+            &canonical_source_state_root,
+            &HashSet::new(),
+            &[],
             &BTreeMap::new(),
             OpenClawWorkspaceRuntime::default(),
         )
@@ -3509,6 +3862,16 @@ mod tests {
         assert!(paths.state_dir.join("openclaw.json.bak").exists());
         assert!(!paths.state_dir.join("gateway.pid").exists());
         assert!(!paths.state_dir.join("run").exists());
+        assert_eq!(
+            fs::read(paths.state_dir.join("tmp/copied-config/retained.json")).unwrap(),
+            b"{}\n"
+        );
+        assert!(
+            !paths
+                .state_dir
+                .join("tmp/copied-config/unrelated.txt")
+                .exists()
+        );
 
         let session_raw =
             fs::read_to_string(paths.state_dir.join("agents/main/sessions/main.jsonl")).unwrap();
