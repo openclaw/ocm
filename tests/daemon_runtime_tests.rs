@@ -3039,6 +3039,67 @@ fn env_import_preserves_unrelated_supervisor_child_specs() {
 }
 
 #[test]
+fn child_restart_request_preserves_saved_siblings_when_resolution_fails() {
+    let _guard = daemon_runtime_test_lock();
+    for unresolved in [false, true] {
+        let root = TestDir::new("restart-request-saved-sibling");
+        let (cwd, mut env) = setup_service_fixture(&root);
+        let state_path = root.child("ocm-home/supervisor/state.json");
+        let service = SupervisorService::new(&env, &cwd);
+        service.sync().unwrap();
+        let sibling_request = service.request_child_restart("prod").unwrap();
+        let old_target_request = service.request_child_restart("demo").unwrap();
+        let sibling = persisted_child(&state_path, "prod");
+        if unresolved {
+            fs::remove_file(root.child("bin/openclaw")).unwrap();
+        }
+        env.insert("NODE_OPTIONS".into(), "--max-old-space-size=2048".into());
+        let service = SupervisorService::new(&env, &cwd);
+        let target_request = service.request_child_restart("demo").unwrap();
+        let state = read_persisted_service_state(&state_path);
+        let children = state["children"].as_array().unwrap();
+        assert_eq!(
+            children.iter().find(|child| child["envName"] == "prod"),
+            Some(&sibling),
+            "target publication dropped or changed saved sibling; unresolved={unresolved}"
+        );
+        assert_eq!(
+            persisted_child(&state_path, "demo")["processEnv"]["NODE_OPTIONS"],
+            "--max-old-space-size=2048"
+        );
+        let requests = state["restartRequests"].as_array().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["envName"] == "prod"
+                    && request["requestId"] == sibling_request)
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["envName"] == "demo"
+                    && request["requestId"] == target_request)
+        );
+        assert_ne!(target_request, old_target_request);
+        assert!(
+            !state["skippedEnvs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["envName"] == "prod")
+        );
+
+        // An unresolved target must still fail, without rewriting its saved plan.
+        if unresolved {
+            let before = fs::read(&state_path).unwrap();
+            assert!(service.request_child_restart("prod").is_err());
+            assert_eq!(fs::read(&state_path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
 fn child_restart_request_rebuilds_missing_or_stale_state() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("restart-request-rebuilds-state");
@@ -4067,8 +4128,20 @@ PYTHON
     stop_process(&mut daemon);
 }
 
+#[cfg(unix)]
 #[test]
 fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child() {
+    check_service_restart_preserves_sibling(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn service_restart_preserves_running_sibling_with_missing_runtime() {
+    check_service_restart_preserves_sibling(true);
+}
+
+#[cfg(unix)]
+fn check_service_restart_preserves_sibling(unresolved: bool) {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("daemon-targeted-service-restart");
     let cwd = root.child("workspace");
@@ -4077,6 +4150,7 @@ fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child(
     install_fake_systemd_tools(&root, &mut env);
     let service = SupervisorService::new(&env, &cwd);
     let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let state_path = root.child("ocm-home/supervisor/state.json");
 
     let rescue_started = root.child("rescue-started.txt");
     let rescue_stopped = root.child("rescue-stopped.txt");
@@ -4117,18 +4191,18 @@ fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child(
         "{}",
         stderr(&rescue_launcher)
     );
-    let main_launcher = run_ocm(
+    let main_runtime = run_ocm(
         &cwd,
         &env,
         &[
-            "launcher",
+            "runtime",
             "add",
             "main",
-            "--command",
+            "--path",
             &path_string(&main_script),
         ],
     );
-    assert!(main_launcher.status.success(), "{}", stderr(&main_launcher));
+    assert!(main_runtime.status.success(), "{}", stderr(&main_runtime));
 
     let rescue_env = run_ocm(
         &cwd,
@@ -4137,7 +4211,7 @@ fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child(
     );
     assert!(rescue_env.status.success(), "{}", stderr(&rescue_env));
     set_service_enabled(&cwd, &env, "rescue", true);
-    let main_env = run_ocm(&cwd, &env, &["env", "create", "main", "--launcher", "main"]);
+    let main_env = run_ocm(&cwd, &env, &["env", "create", "main", "--runtime", "main"]);
     assert!(main_env.status.success(), "{}", stderr(&main_env));
     set_service_enabled(&cwd, &env, "main", true);
     service.sync().unwrap();
@@ -4151,6 +4225,10 @@ fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child(
     let rescue_pid = runtime_child_pid(&initial_runtime, "rescue").unwrap();
     let main_pid = runtime_child_pid(&initial_runtime, "main").unwrap();
 
+    let saved_sibling = persisted_child(&state_path, "main");
+    if unresolved {
+        fs::remove_file(&main_script).unwrap();
+    }
     let mut restart_env = env.clone();
     restart_env.insert(
         "NODE_OPTIONS".to_string(),
@@ -4161,6 +4239,20 @@ fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child(
         &restart_env,
         &["service", "restart", "rescue", "--json"],
     );
+    let restarted = wait_for_runtime_child_pid_change(
+        &runtime_path,
+        "rescue",
+        rescue_pid,
+        "main",
+        main_pid,
+        Duration::from_secs(10),
+    );
+    let final_state = read_persisted_service_state(&state_path);
+    let sibling_was_stopped = main_stopped.exists();
+    let sibling_alive = process_exists(main_pid as u32);
+    let sibling_start_count = fs::read_to_string(&main_started).unwrap().lines().count();
+    let target_was_stopped = rescue_stopped.exists();
+    stop_process(&mut daemon);
     assert!(restart.status.success(), "{}", stderr(&restart));
     let restart_body: serde_json::Value = serde_json::from_slice(&restart.stdout).unwrap();
     assert!(
@@ -4173,25 +4265,25 @@ fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child(
                 .unwrap()
                 .contains("used the legacy direct supervisor restart path"))
     );
-    let restarted = wait_for_runtime_child_pid_change(
-        &runtime_path,
-        "rescue",
-        rescue_pid,
-        "main",
-        main_pid,
-        Duration::from_secs(10),
-    )
-    .expect("targeted restart did not replace only the requested child");
+    let restarted = restarted.expect("targeted restart did not replace only the requested child");
+    assert!(sibling_alive);
+    assert_eq!(sibling_start_count, 1);
+    assert_eq!(
+        final_state["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["envName"] == "main"),
+        Some(&saved_sibling)
+    );
 
     assert_eq!(runtime_child_pid(&restarted, "main"), Some(main_pid));
     assert_ne!(runtime_child_pid(&restarted, "rescue"), Some(rescue_pid));
-    assert!(wait_for_file(&rescue_stopped, Duration::from_secs(5)));
+    assert!(target_was_stopped);
     assert!(
-        !main_stopped.exists(),
+        !sibling_was_stopped,
         "sibling child was stopped by targeted restart"
     );
-
-    stop_process(&mut daemon);
 }
 
 // Own cleanup even when a regression assertion fails while a sibling stays live.

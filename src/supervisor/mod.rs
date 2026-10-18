@@ -858,8 +858,11 @@ impl<'a> SupervisorService<'a> {
         let _lock = lock_supervisor_state(&state_path)?;
         let mut state = self.build_state()?;
         if let Ok(persisted_state) = read_json::<SupervisorState>(&state_path) {
-            preserve_persisted_child_specs_except(&mut state, persisted_state.children, name);
-            preserve_restart_requests(&mut state, persisted_state.restart_requests);
+            merge_targeted_supervisor_state(
+                &mut state,
+                persisted_state,
+                &BTreeSet::from([name.to_string()]),
+            );
         }
         if active_child_spec(&state, name).is_none() {
             return Err(format!(
@@ -1800,25 +1803,6 @@ fn preserve_persisted_restart_requests(state_path: &Path, state: &mut Supervisor
     };
 
     preserve_restart_requests(state, persisted_state.restart_requests);
-}
-
-fn preserve_persisted_child_specs_except(
-    state: &mut SupervisorState,
-    persisted_children: Vec<SupervisorChildSpec>,
-    refreshed_env_name: &str,
-) {
-    let persisted = persisted_children
-        .into_iter()
-        .map(|child| (child.env_name.clone(), child))
-        .collect::<BTreeMap<_, _>>();
-    for child in &mut state.children {
-        if child.env_name == refreshed_env_name {
-            continue;
-        }
-        if let Some(persisted_child) = persisted.get(&child.env_name) {
-            *child = persisted_child.clone();
-        }
-    }
 }
 
 fn merge_targeted_supervisor_state(
