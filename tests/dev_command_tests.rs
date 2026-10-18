@@ -1795,6 +1795,94 @@ fn dev_ui_resolves_native_config_once_and_reuses_the_captured_target() {
     }
 }
 
+#[test]
+fn dev_ui_native_config_publishes_complete_pid() {
+    let root = TestDir::new("dev-ui-config-pid-publication");
+    let config = root.child("openclaw.json");
+    fs::write(&config, r#"{"gateway":{"controlUi":{}}}"#).unwrap();
+    let fixture = root.child("dev-ui-fixture.cjs");
+    fs::write(&fixture, include_str!("support/dev_ui.cjs")).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert("OCM_TEST_DEV_UI_DIR".into(), path_string(root.path()));
+    env.insert("OPENCLAW_CONFIG_PATH".into(), path_string(&config));
+    let mut attempts = String::new();
+    for attempt in 1..=2 {
+        env.insert("OCM_TEST_CONFIG_ATTEMPT".into(), attempt.to_string());
+        let child = Command::new("node")
+            .args([
+                "-e",
+                r#"
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const root = process.env.OCM_TEST_DEV_UI_DIR;
+const published = path.join(root, `config-attempt-${process.env.OCM_TEST_CONFIG_ATTEMPT}`);
+const appendFile = fs.appendFileSync;
+const writeFile = fs.writeFileSync;
+let appends = 0;
+let pidWrites = 0;
+setTimeout(() => { throw new Error('config fixture did not finish'); }, 5000).unref();
+fs.appendFileSync = (destination, data, ...options) => {
+  if (destination !== path.join(root, 'config-attempts')) return appendFile(destination, data, ...options);
+  appends++;
+  const fd = fs.openSync(destination, 'a');
+  try {
+    assert.equal(fs.existsSync(published), false, 'PID published before attempt was recorded');
+    appendFile(fd, data, ...options);
+  } finally {
+    fs.closeSync(fd);
+  }
+};
+fs.writeFileSync = (destination, data, ...options) => {
+  if (data !== String(process.pid)) return writeFile(destination, data, ...options);
+  pidWrites++;
+  const fd = fs.openSync(destination, 'w');
+  try {
+    assert.equal(fs.fstatSync(fd).size, 0);
+    assert.equal(fs.existsSync(published), false, 'empty PID record was published');
+    fs.writeSync(fd, data.slice(0, 1));
+    assert.equal(fs.existsSync(published), false, 'partial PID record was published');
+    writeFile(fd, data.slice(1), ...options);
+  } finally {
+    fs.closeSync(fd);
+  }
+};
+require(process.argv[1]);
+assert.equal(appends, 1, 'the actual config attempt append must be observed');
+assert.equal(pidWrites, 1, 'the actual config PID write must be observed');
+"#,
+                &path_string(&fixture),
+                "config",
+                "get",
+                "gateway.controlUi.basePath",
+                "--json",
+            ])
+            .current_dir(root.path())
+            .env_clear()
+            .envs(&env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(
+            fs::read_to_string(root.child(format!("config-attempt-{attempt}")))
+                .unwrap()
+                .parse::<u32>()
+                .unwrap(),
+            pid
+        );
+        attempts.push_str(&format!("{pid}\n"));
+        assert_eq!(
+            fs::read_to_string(root.child("config-attempts")).unwrap(),
+            attempts
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn dev_ui_native_config_failures_and_cancellation_preserve_private_output_and_state() {
@@ -1842,14 +1930,17 @@ fn dev_ui_native_config_failures_and_cancellation_preserve_private_output_and_st
         let mut controller =
             DevWatchFixture::spawn(&root, &repo, &env, &["dev", "demo", "--no-watch", "--ui"]);
         assert!(wait_for_path(
-            &root.child("config-attempts"),
+            &root.child("config-attempt-1"),
             Duration::from_secs(10)
         ));
-        let query_pid = fs::read_to_string(root.child("config-attempts"))
+        let query_pid = fs::read_to_string(root.child("config-attempt-1"))
             .unwrap()
-            .trim()
             .parse::<u32>()
             .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.child("config-attempts")).unwrap(),
+            format!("{query_pid}\n")
+        );
         if variant == "cancel" {
             let stopped = run_dev_stop(&repo, &env);
             assert!(stopped.status.success(), "{}", stderr(&stopped));

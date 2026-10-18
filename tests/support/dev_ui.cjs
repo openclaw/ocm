@@ -48,7 +48,12 @@ if (role === "config") {
   if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(["config", "get", "gateway.controlUi.basePath", "--json"])) {
     throw new Error("unexpected native config read");
   }
-  fs.appendFileSync(file("config-attempts"), `${process.pid}\n`);
+  const attempts = file("config-attempts");
+  fs.appendFileSync(attempts, `${process.pid}\n`);
+  const count = fs.readFileSync(attempts, "utf8").trim().split("\n").length;
+  const temporary = file(`config-attempt-${count}.${process.pid}.tmp`);
+  fs.writeFileSync(temporary, String(process.pid));
+  fs.renameSync(temporary, file(`config-attempt-${count}`));
   process.stderr.write("synthetic-private-config-diagnostic\n");
   process.once("SIGTERM", () => process.exit(143));
   const timer = setInterval(() => {
