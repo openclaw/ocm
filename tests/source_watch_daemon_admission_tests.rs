@@ -172,7 +172,7 @@ impl AdmissionFixture {
 
     fn start_daemon(&mut self) -> Value {
         self.spawn_daemon();
-        self.suspend_daemon(Duration::from_secs(5))
+        self.suspend_daemon(Duration::from_secs(5), |_| {})
     }
 
     fn spawn_daemon(&mut self) {
@@ -193,7 +193,11 @@ impl AdmissionFixture {
         self.set_manager_state("running", pid);
     }
 
-    fn suspend_daemon(&mut self, timeout: Duration) -> Value {
+    fn suspend_daemon(
+        &mut self,
+        timeout: Duration,
+        publication_acquired: impl FnOnce(&fs::File),
+    ) -> Value {
         let pid = self.daemon.as_ref().unwrap().id();
         let publication = fs::OpenOptions::new()
             .read(true)
@@ -228,6 +232,7 @@ impl AdmissionFixture {
                     }
                     Err(error) => panic!("cannot exclude daemon publication: {error}"),
                 }
+                publication_acquired(&publication);
                 // The direct Child remains unreaped and owns this PID.
                 assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
                 while Instant::now() < deadline {
@@ -240,6 +245,9 @@ impl AdmissionFixture {
                             self.daemon.take();
                             panic!("empty daemon exited before fixture suspension");
                         }
+                        // Closing this file alone can leave the lock held by a
+                        // concurrent fork's copy until that child execs.
+                        FileExt::unlock(&publication).unwrap();
                         return runtime;
                     }
                     if waited < 0 {
@@ -366,8 +374,13 @@ fn daemon_suspension_excludes_publication_and_cleans_up_on_timeout() {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
             let result = std::panic::catch_unwind(move || {
-                fixture.suspend_daemon(Duration::from_secs(1));
-                fixture
+                let mut inherited_publication = None;
+                fixture.suspend_daemon(Duration::from_secs(1), |publication| {
+                    // A concurrent fork retains this same open file description
+                    // until exec, even after the fixture closes its own file.
+                    inherited_publication = Some(publication.try_clone().unwrap());
+                });
+                (fixture, inherited_publication.unwrap())
             });
             let _ = tx.send(result);
         });
@@ -382,7 +395,7 @@ fn daemon_suspension_excludes_publication_and_cleans_up_on_timeout() {
         let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         worker.join().unwrap();
         if release_publication {
-            let fixture = result.unwrap();
+            let (fixture, inherited_publication) = result.unwrap();
             // Both the publication lock and the other locks needed by borrowed
             // registration must be available while this real daemon is stopped.
             publication.try_lock_exclusive().unwrap();
@@ -400,6 +413,7 @@ fn daemon_suspension_excludes_publication_and_cleans_up_on_timeout() {
                     .unwrap();
                 lock.try_lock_exclusive().unwrap();
             }
+            drop(inherited_publication);
             drop(fixture);
         } else {
             let panic = result.err().expect("busy publication did not time out");
