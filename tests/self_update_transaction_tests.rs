@@ -160,6 +160,7 @@ const cp = require('node:child_process');
 const root = {root};
 const binary = {binary};
 const pidFile = root + '/daemon.pid';
+const definitionFile = root + '/daemon.definition';
 const args = process.argv.slice(2);
 const sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const alive = pid => {{ try {{ process.kill(pid, 0); return true; }} catch {{ return false; }} }};
@@ -169,7 +170,7 @@ if (args[0] === 'print-disabled' || args[0] === 'enable') process.exit(0);
 if (args[0] === 'print') {{
   if (/^(gui|user)\/[0-9]+$/.test(args[1])) process.exit(0);
   const pid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, 'utf8')) : 0;
-  if (pid && alive(pid)) {{ console.log('state = running\npid = ' + pid); process.exit(0); }}
+  if (pid && alive(pid)) {{ console.log('state = running\npid = ' + pid + '\npath = ' + fs.readFileSync(definitionFile, 'utf8')); process.exit(0); }}
   console.error('Could not find service "' + args[1].split('/').pop() + '" in domain for user gui'); process.exit(1);
 }}
 if (args[0] === 'bootout' || args[0] === 'unload') {{
@@ -192,6 +193,7 @@ if (args[0] === 'bootstrap') {{
     console.error('injected candidate activation failure'); process.exit(1);
   }}
   if (fs.existsSync(root + '/fail-all')) {{ console.error('injected persistent failure'); process.exit(1); }}
+  fs.writeFileSync(definitionFile, args[2]);
   const log = fs.openSync(root + '/daemon.log', 'a');
   const child = cp.spawn(binary, ['__daemon', 'run'], {{env: {env}, detached:true, stdio:['ignore',log,log]}});
   fs.writeFileSync(pidFile, String(child.pid)); child.unref(); process.exit(0);

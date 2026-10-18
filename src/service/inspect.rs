@@ -271,7 +271,8 @@ fn build_service_summary(
     };
     let issue = if let Some(issue) = &snapshot.observation_issue {
         Some(format!(
-            "waiting for current supervisor runtime observation: {issue}"
+            "waiting for current supervisor runtime observation: {issue}; retry `ocm service start {}` after the supervisor finishes starting",
+            meta.name
         ))
     } else if retained {
         Some(format!(
