@@ -5018,11 +5018,19 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
         "plain",
         "plain-wrapper",
     ];
-    // macOS /bin/sh forwards dot arguments to the sourced script. Linux sh may
-    // not (for example, dash), so its portable controls exercise the executable
-    // wrapper and the resolver tests independently protect Unix dot selection.
+    // macOS /bin/sh supports source/builtin and forwards sourcing arguments.
+    // Other sh implementations may not (for example, dash); their portable
+    // controls use the executable wrapper, with Unix selection covered below
+    // the shell boundary by the resolver tests.
     #[cfg(target_os = "macos")]
-    let modes = modes.into_iter().chain(["dot", "dot-quoted"]);
+    let modes = modes.into_iter().chain([
+        "dot",
+        "dot-quoted",
+        "source",
+        "source-quoted",
+        "builtin-source",
+        "builtin-source-quoted",
+    ]);
     for mode in modes {
         let root = TestDir::new("service-readiness-builtins");
         let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
@@ -5055,6 +5063,10 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
             "eval-quoted" => format!("eval '{}'", path_string(&script)),
             "dot" => format!(". {}", path_string(&wrapper)),
             "dot-quoted" => format!(". '{}'", path_string(&wrapper)),
+            "source" => format!("source {}", path_string(&wrapper)),
+            "source-quoted" => format!("source '{}'", path_string(&wrapper)),
+            "builtin-source" => format!("builtin source {}", path_string(&wrapper)),
+            "builtin-source-quoted" => format!("builtin source '{}'", path_string(&wrapper)),
             "plain-wrapper" => path_string(&wrapper),
             _ => path_string(&script),
         };
@@ -5129,9 +5141,12 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
             "{mode}"
         );
         assert!(
-            std::env::split_paths(child["processEnv"]["PATH"].as_str().unwrap())
-                .all(|path| !path.join("exec").is_file() && !path.join("eval").is_file()),
-            "fixture must not provide external exec or eval commands"
+            std::env::split_paths(child["processEnv"]["PATH"].as_str().unwrap()).all(|path| [
+                "exec", "eval", "source", "builtin"
+            ]
+            .iter()
+            .all(|program| !path.join(program).is_file())),
+            "fixture must not provide external shell builtin commands"
         );
         if mode == "plain" {
             assert_eq!(child["binaryPath"], path_string(&script));

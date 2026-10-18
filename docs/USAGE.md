@@ -356,7 +356,8 @@ Use a launcher when you want:
 - something that is not just a published OpenClaw release
 
 On Unix, recipes beginning with the `exec`, `eval`, or `.` (dot-source) shell builtin use the shell for managed services as well as `env run`, with or without quotes in the recipe. In particular, `eval` retains its shell evaluation semantics, and `. /path/to/wrapper.sh` sources the wrapper instead of trying to execute `.` as a program.
-Arguments following a dot-source command are handled by the selected `sh`; forwarding them into the sourced script is not portable across all shells. For portable argument forwarding, use an executable wrapper that invokes OpenClaw with `"$@"` and register the wrapper path directly.
+Recipes beginning with `source` or `builtin` (including `builtin source`) also retain shell execution, including when the wrapper path is unquoted. These forms require a shell that supports them; OCM does not select a different shell to make them available. Foreground `env run` uses `sh` from PATH, while managed services use `/bin/sh`.
+Sourcing support and argument forwarding depend on those shells. For example, macOS `/bin/sh` supports `source` and `builtin source` and forwards arguments into the sourced script, while other `sh` implementations may not. For portable argument forwarding, use an executable wrapper that invokes OpenClaw with `"$@"` and register the wrapper path directly.
 Plain executable recipes still run directly under the supervisor.
 
 ### The simple rule
