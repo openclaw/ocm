@@ -124,16 +124,35 @@ impl OpenClawWorkspaceInventory {
         &self,
         archive_root: &Path,
     ) -> Result<BTreeSet<PathBuf>, String> {
+        self.archive_relative_path_roots(
+            archive_root,
+            self.workspace_roots
+                .iter()
+                .chain(self.agent_directory_roots.values())
+                .chain(self.config_include_paths.iter()),
+            false,
+        )
+    }
+
+    pub(crate) fn workspace_archive_relative_roots(
+        &self,
+        archive_root: &Path,
+    ) -> Result<BTreeSet<PathBuf>, String> {
+        // Default export adds only the canonical spelling to its accepted-root policy.
+        self.archive_relative_path_roots(archive_root, self.workspace_roots.iter(), true)
+    }
+
+    fn archive_relative_path_roots<'a>(
+        &self,
+        archive_root: &Path,
+        preserved_paths: impl Iterator<Item = &'a PathBuf>,
+        require_root_spelling: bool,
+    ) -> Result<BTreeSet<PathBuf>, String> {
         let archive_root = clean_path(archive_root);
         let canonical_archive_root = canonicalize_path_allow_missing(&archive_root)?;
         let mut relative_roots = BTreeSet::new();
 
-        for preserved_path in self
-            .workspace_roots
-            .iter()
-            .chain(self.agent_directory_roots.values())
-            .chain(self.config_include_paths.iter())
-        {
+        for preserved_path in preserved_paths {
             let canonical_preserved_path = canonicalize_path_allow_missing(preserved_path)?;
             if canonical_preserved_path == canonical_archive_root
                 || !canonical_preserved_path.starts_with(&canonical_archive_root)
@@ -149,9 +168,17 @@ impl OpenClawWorkspaceInventory {
             let canonical_relative = canonical_preserved_path
                 .strip_prefix(&canonical_archive_root)
                 .map_err(|error| error.to_string())?;
-            if let Some(relative) = strip_archive_root_prefix(preserved_path, &archive_root)
-                .or_else(|| strip_archive_root_prefix(preserved_path, &canonical_archive_root))
-            {
+            let relative = strip_archive_root_prefix(preserved_path, &archive_root)
+                .or_else(|| strip_archive_root_prefix(preserved_path, &canonical_archive_root));
+            if require_root_spelling && relative.is_none() {
+                return Err(format!(
+                    "configured OpenClaw workspace uses an unsupported environment root spelling: {}; use the accepted root {} or canonical root {} in the workspace configuration, then retry export",
+                    display_path(preserved_path),
+                    display_path(&archive_root),
+                    display_path(&canonical_archive_root)
+                ));
+            }
+            if let Some(relative) = relative {
                 if relative != canonical_relative {
                     return Err(format!(
                         "cannot safely preserve configured OpenClaw workspace, agent directory, or config include through a symlink: {}",
@@ -2073,19 +2100,48 @@ mod tests {
                         OpenClawWorkspaceRuntime::default(),
                     )
                     .unwrap();
-                    let result = inventory.archive_relative_roots(&paths.root);
-                    if allowed {
-                        assert!(
-                            result
-                                .unwrap()
-                                .contains(&PathBuf::from(".openclaw").join(relative))
-                        );
-                    } else {
-                        let error = result.unwrap_err();
-                        assert!(error.contains("through a symlink"), "{error}");
+                    let mut results = vec![inventory.archive_relative_roots(&paths.root)];
+                    if !agent_directory {
+                        results.push(inventory.workspace_archive_relative_roots(&paths.root));
+                    }
+                    for result in results {
+                        if allowed {
+                            assert!(
+                                result
+                                    .unwrap()
+                                    .contains(&PathBuf::from(".openclaw").join(relative))
+                            );
+                        } else {
+                            let error = result.unwrap_err();
+                            assert!(error.contains("through a symlink"), "{error}");
+                        }
                     }
                 }
             }
+        }
+
+        let other_alias = temp.path().join("other-alias");
+        symlink_dir(&physical, &other_alias).unwrap();
+        for relative in ["owned", "redirect"] {
+            let configured = other_alias.join("source/.openclaw").join(relative);
+            fs::write(
+                &paths.config_path,
+                serde_json::json!({"agents": {"defaults": {"workspace": configured}}}).to_string(),
+            )
+            .unwrap();
+            let inventory = resolve_env_openclaw_copy_paths(
+                &paths,
+                &test_env(),
+                OpenClawWorkspaceRuntime::default(),
+            )
+            .unwrap();
+            let error = inventory
+                .workspace_archive_relative_roots(&paths.root)
+                .unwrap_err();
+            assert!(
+                error.contains("unsupported environment root spelling"),
+                "{error}"
+            );
         }
     }
 

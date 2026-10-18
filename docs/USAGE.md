@@ -1019,6 +1019,12 @@ root is captured as a coherent committed snapshot, including uncheckpointed WAL
 writes; raw database sidecars are omitted. Databases and other files are not
 captured in one atomic transaction.
 
+Default export accepts configured workspaces under an aliased environment root using either the accepted root spelling or its canonical path.
+On Windows, ordinary and extended-length prefixes are equivalent representations of those same roots.
+Equivalent spellings select the same owned content and omit each workspace's `.openclaw/tmp` runtime debris.
+Other root spellings retain the default export refusal, even when another alias resolves inside the environment.
+External workspaces, the environment root itself and workspace paths redirected by internal symlinks remain refused.
+
 New archives, with or without `--include-state`, retain the accepted source root and its captured canonical path in optional `env.canonicalSourceRoot` metadata.
 Configuration relocation uses both recorded roots without requiring the original source or alias to exist; state-inclusive runtime-reference relocation uses the same identities.
 Older archives retain their existing source-root matching rules.

@@ -1972,21 +1972,21 @@ impl HistoryGatewayPort {
     fn reserve() -> Self {
         use std::net::TcpListener;
 
+        let (automatic_first, automatic_last) = Self::automatic_port_range();
         // Match the gateway's complete base..=base+110 port family. Keep its
         // claim while this fixture stops and restarts its actual listener.
-        // Some kernels assign ephemeral ports sequentially, so a conflicting
-        // family can require more than 110 candidates before reaching its end.
-        for _ in 0..u16::MAX {
-            let base = TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = base.local_addr().unwrap().port();
-            let Some(end) = port.checked_add(110) else {
+        // Automatic health clients must not leave sockets in this family while
+        // the gateway is stopped. Probing alone cannot exclude later clients.
+        for port in 1024..=(u16::MAX - 110) {
+            let end = port + 110;
+            if port <= automatic_last && end >= automatic_first {
                 continue;
-            };
+            }
             let mut claimed = HISTORY_GATEWAY_PORTS.lock().unwrap();
             if claimed.iter().any(|other| port.abs_diff(*other) <= 110) {
                 continue;
             }
-            let family: Result<Vec<_>, _> = ((port + 1)..=end)
+            let family: Result<Vec<_>, _> = (port..=end)
                 .map(|port| TcpListener::bind(("127.0.0.1", port)))
                 .collect();
             if family.is_ok() {
@@ -1995,7 +1995,36 @@ impl HistoryGatewayPort {
                 return Self(port);
             }
         }
-        panic!("no available gateway port family for history fixture");
+        panic!("no available gateway port family outside {automatic_first}..={automatic_last}");
+    }
+
+    fn automatic_port_range() -> (u16, u16) {
+        #[cfg(target_os = "linux")]
+        let raw = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .expect("read automatic TCP port range for history fixture");
+        #[cfg(target_os = "macos")]
+        let raw = {
+            let output = Command::new("/usr/sbin/sysctl")
+                .args([
+                    "-n",
+                    "net.inet.ip.portrange.first",
+                    "net.inet.ip.portrange.last",
+                ])
+                .output()
+                .expect("read automatic TCP port range for history fixture");
+            assert!(output.status.success(), "{}", stderr(&output));
+            stdout(&output)
+        };
+        let ports: Vec<u16> = raw
+            .split_whitespace()
+            .map(|port| port.parse().expect("valid automatic TCP port range"))
+            .collect();
+        assert_eq!(
+            ports.len(),
+            2,
+            "expected automatic TCP range endpoints: {raw}"
+        );
+        (ports[0].min(ports[1]), ports[0].max(ports[1]))
     }
 }
 
