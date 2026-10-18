@@ -242,13 +242,12 @@ impl OpenClawWorkspaceInventory {
         &self,
         source_root: &Path,
     ) -> Result<MigrationWorkspaceSources, String> {
-        let source_root = clean_path(source_root);
-        let canonical_source_root = canonicalize_path_allow_missing(&source_root)?;
+        let canonical_source_root = canonicalize_path_allow_missing(source_root)?;
 
         for include_path in &self.config_include_paths {
             validate_internal_migration_path(
                 include_path,
-                &source_root,
+                source_root,
                 &canonical_source_root,
                 "config include",
             )?;
@@ -258,13 +257,13 @@ impl OpenClawWorkspaceInventory {
             .configured_default_workspace
             .as_deref()
             .map(|workspace| {
-                migration_workspace_source(workspace, &source_root, &canonical_source_root)
+                migration_workspace_source(workspace, source_root, &canonical_source_root)
             })
             .transpose()?;
         let mut agent_workspaces = BTreeMap::new();
         for (agent_id, workspace) in &self.configured_agent_workspace_roots {
             let source =
-                migration_workspace_source(workspace, &source_root, &canonical_source_root)?;
+                migration_workspace_source(workspace, source_root, &canonical_source_root)?;
             agent_workspaces.insert(agent_id.clone(), source);
         }
 
@@ -348,7 +347,8 @@ fn validate_internal_migration_path(
     let canonical_relative = canonical_path
         .strip_prefix(canonical_source_root)
         .map_err(|error| error.to_string())?;
-    if let Ok(relative) = path.strip_prefix(source_root)
+    if let Some(relative) = strip_archive_root_prefix(path, source_root)
+        .or_else(|| strip_archive_root_prefix(path, canonical_source_root))
         && relative != canonical_relative
     {
         return Err(format!(

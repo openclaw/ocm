@@ -525,6 +525,7 @@ OpenClaw home, including through a symlink, migration copies that workspace into
 the new environment and rewrites the imported config to use the copy. The source
 home and repository remain unchanged.
 Agents using identical or nested workspace folders retain that sharing in the copy, including configured aliases of the same folder.
+Aliases of the source home remain supported; workspace links inside that home are checked before their paths are projected into a shared copy.
 Each maximal configured external folder is copied once; nested workspaces use the corresponding subfolder, while unrelated folders remain separate.
 For identical roots, the default workspace destination takes precedence, followed by agent ID order.
 An outer workspace that contains the plain home also supplies the copied agent workspace locations inside that home; runtime state still lives in the managed environment's `.openclaw` directory.

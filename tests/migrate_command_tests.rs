@@ -1233,6 +1233,192 @@ fn migration_preserves_sharing_through_configured_workspace_aliases() {
     }
 }
 
+#[cfg(any(unix, windows))]
+fn migration_source_inventory(
+    root: &Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, (u32, Vec<u8>)> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        result: &mut std::collections::BTreeMap<std::path::PathBuf, (u32, Vec<u8>)>,
+    ) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        let value = if metadata.file_type().is_symlink() {
+            format!("link:{}", fs::read_link(path).unwrap().display()).into_bytes()
+        } else if metadata.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                visit(root, &entry.unwrap().path(), result);
+            }
+            b"directory".to_vec()
+        } else {
+            fs::read(path).unwrap()
+        };
+        #[cfg(unix)]
+        let mode = metadata.permissions().mode();
+        #[cfg(windows)]
+        let mode = u32::from(metadata.permissions().readonly());
+        result.insert(
+            path.strip_prefix(root).unwrap().to_path_buf(),
+            (mode, value),
+        );
+    }
+    let mut result = std::collections::BTreeMap::new();
+    visit(root, root, &mut result);
+    result
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn migration_preserves_internal_redirect_refusal_under_root_spellings() {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as symlink_dir;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_dir;
+
+    #[derive(Clone, Copy, Debug)]
+    enum RootSpelling {
+        Canonical,
+        Alias,
+        #[cfg(unix)]
+        ParentTraversal,
+        #[cfg(windows)]
+        Ordinary,
+    }
+    use RootSpelling::*;
+    let mut spellings = vec![(Canonical, Canonical), (Alias, Alias), (Alias, Canonical)];
+    #[cfg(unix)]
+    spellings.push((ParentTraversal, Canonical));
+    #[cfg(windows)]
+    spellings.extend([
+        (Ordinary, Ordinary),
+        (Ordinary, Canonical),
+        (Canonical, Ordinary),
+    ]);
+    for (source_spelling, config_spelling) in spellings.drain(..) {
+        for enclosing in [false, true] {
+            for redirect in [false, true] {
+                for adopt in [false, true] {
+                    let root = TestDir::new("migrate-root-spellings");
+                    let outer = root.child("outer");
+                    let home = outer.join(".openclaw");
+                    fs::create_dir_all(home.join("owned")).unwrap();
+                    fs::write(home.join("owned/notes.txt"), "source payload").unwrap();
+                    symlink_dir("owned", home.join("redirect")).unwrap();
+                    let canonical = fs::canonicalize(&home).unwrap();
+                    let alias = root.child("home-alias");
+                    symlink_dir(&canonical, &alias).unwrap();
+                    let alias_target = fs::read_link(&alias).unwrap();
+                    let spelling = |form| match form {
+                        Canonical => canonical.clone(),
+                        Alias => alias.clone(),
+                        #[cfg(unix)]
+                        ParentTraversal => {
+                            let anchor = outer.join("anchor");
+                            fs::create_dir_all(&anchor).unwrap();
+                            let link = root.child("parent-link");
+                            symlink_dir(&anchor, &link).unwrap();
+                            link.join("../.openclaw")
+                        }
+                        #[cfg(windows)]
+                        Ordinary => std::path::PathBuf::from(
+                            canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap(),
+                        ),
+                    };
+                    let source = spelling(source_spelling);
+                    let parent_link_target = fs::read_link(root.child("parent-link")).ok();
+                    let configured =
+                        spelling(config_spelling).join(if redirect { "redirect" } else { "owned" });
+                    let mut config = serde_json::json!({"agents":{"entries":{
+                        "inner":{"workspace":configured}
+                    }}});
+                    if enclosing {
+                        config["agents"]["defaults"] = serde_json::json!({"workspace":outer});
+                    }
+                    fs::write(home.join("openclaw.json"), config.to_string()).unwrap();
+                    let before = migration_source_inventory(&outer);
+                    let env = ocm_env(&root);
+                    let args = if adopt {
+                        vec![
+                            "adopt",
+                            "import",
+                            "--name",
+                            "mira",
+                            source.to_str().unwrap(),
+                        ]
+                    } else {
+                        vec!["migrate", "mira", source.to_str().unwrap()]
+                    };
+                    let output = run_ocm(root.path(), &env, &args);
+                    let scenario = format!(
+                        "source={source_spelling:?}, config={config_spelling:?}, enclosing={enclosing}, redirect={redirect}, adopt={adopt}"
+                    );
+                    let target = root.child("ocm-home/envs/mira");
+                    if redirect {
+                        assert_eq!(
+                            output.status.code(),
+                            Some(1),
+                            "{scenario}: {}",
+                            stdout(&output)
+                        );
+                        assert!(
+                            stderr(&output).contains("through a symlink"),
+                            "{scenario}: {}",
+                            stderr(&output)
+                        );
+                        assert!(!target.exists(), "{scenario}");
+                        let registry = root.child("ocm-home/envs.json");
+                        if registry.exists() {
+                            let value: serde_json::Value =
+                                serde_json::from_slice(&fs::read(registry).unwrap()).unwrap();
+                            assert_eq!(value["envs"], serde_json::json!([]), "{scenario}");
+                        }
+                    } else {
+                        assert!(output.status.success(), "{scenario}: {}", stderr(&output));
+                        let imported: serde_json::Value = serde_json::from_slice(
+                            &fs::read(target.join(".openclaw/openclaw.json")).unwrap(),
+                        )
+                        .unwrap();
+                        let workspace = Path::new(
+                            imported["agents"]["entries"]["inner"]["workspace"]
+                                .as_str()
+                                .unwrap(),
+                        );
+                        assert_eq!(
+                            fs::read_to_string(workspace.join("notes.txt")).unwrap(),
+                            "source payload",
+                            "{scenario}"
+                        );
+                        if enclosing {
+                            let outer_copy = Path::new(
+                                imported["agents"]["defaults"]["workspace"]
+                                    .as_str()
+                                    .unwrap(),
+                            );
+                            assert_eq!(workspace, outer_copy.join(".openclaw/owned"), "{scenario}");
+                            fs::write(workspace.join("shared-write.txt"), "target write").unwrap();
+                            assert_eq!(
+                                fs::read_to_string(
+                                    outer_copy.join(".openclaw/owned/shared-write.txt")
+                                )
+                                .unwrap(),
+                                "target write",
+                                "{scenario}"
+                            );
+                        }
+                    }
+                    assert_eq!(migration_source_inventory(&outer), before, "{scenario}");
+                    assert_eq!(fs::read_link(&alias).unwrap(), alias_target, "{scenario}");
+                    assert_eq!(
+                        fs::read_link(root.child("parent-link")).ok(),
+                        parent_link_target,
+                        "{scenario}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn migrate_copies_deep_external_workspaces_with_bounded_directory_handles() {
@@ -1292,29 +1478,6 @@ fn migrate_copies_deep_external_workspaces_with_bounded_directory_handles() {
 #[cfg(unix)]
 #[test]
 fn migrate_rejects_copied_workspace_destination_links_without_changing_originals() {
-    use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
-
-    fn inventory(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-        fn visit(root: &Path, path: &Path, result: &mut BTreeMap<PathBuf, Vec<u8>>) {
-            let metadata = fs::symlink_metadata(path).unwrap();
-            let value = if metadata.file_type().is_symlink() {
-                format!("link:{}", fs::read_link(path).unwrap().display()).into_bytes()
-            } else if metadata.is_dir() {
-                for entry in fs::read_dir(path).unwrap() {
-                    visit(root, &entry.unwrap().path(), result);
-                }
-                b"directory".to_vec()
-            } else {
-                fs::read(path).unwrap()
-            };
-            result.insert(path.strip_prefix(root).unwrap().to_path_buf(), value);
-        }
-        let mut result = BTreeMap::new();
-        visit(root, root, &mut result);
-        result
-    }
-
     for agent in [false, true] {
         for layout in ["parent", "workspace", "nested", "file", "dangling"] {
             let root = TestDir::new("migrate-copied-workspace-destination-link");
@@ -1375,9 +1538,9 @@ fn migrate_rejects_copied_workspace_destination_links_without_changing_originals
             )
             .unwrap();
             let before = [
-                inventory(&source),
-                inventory(&selected),
-                inventory(&unrelated),
+                migration_source_inventory(&source),
+                migration_source_inventory(&selected),
+                migration_source_inventory(&unrelated),
             ];
             let env = ocm_env(&root);
             let output = run_ocm(
@@ -1398,9 +1561,9 @@ fn migrate_rejects_copied_workspace_destination_links_without_changing_originals
             assert_eq!(
                 before,
                 [
-                    inventory(&source),
-                    inventory(&selected),
-                    inventory(&unrelated)
+                    migration_source_inventory(&source),
+                    migration_source_inventory(&selected),
+                    migration_source_inventory(&unrelated)
                 ],
                 "agent={agent}, layout={layout}"
             );

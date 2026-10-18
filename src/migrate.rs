@@ -77,14 +77,15 @@ impl ExternalWorkspaceCopyPlan {
         target_paths: &crate::store::EnvPaths,
         env: &BTreeMap<String, String>,
     ) -> Result<Self, String> {
-        let source_home = fs::canonicalize(source_home).map_err(|error| {
+        let canonical_source_home = fs::canonicalize(source_home).map_err(|error| {
             format!(
                 "failed to resolve plain OpenClaw home {}: {error}",
                 display_path(source_home)
             )
         })?;
-        let inventory = resolve_plain_openclaw_workspaces(&source_home, env)?;
-        let sources = inventory.workspace_sources_for_migration(&source_home)?;
+        let inventory = resolve_plain_openclaw_workspaces(&canonical_source_home, env)?;
+        // Admission needs the supplied root spelling as well as its filesystem identity.
+        let sources = inventory.workspace_sources_for_migration(source_home)?;
         let canonical_target_root = canonicalize_path_allow_missing(&target_paths.root)?;
         let mut plan = Self::default();
         if let Some(source) = sources.default_workspace {
@@ -128,7 +129,7 @@ impl ExternalWorkspaceCopyPlan {
             .chain(plan.agent_workspaces.values())
             .collect::<Vec<_>>();
         for workspace in &workspaces {
-            if workspace.source.starts_with(&source_home)
+            if workspace.source.starts_with(&canonical_source_home)
                 || workspaces.iter().any(|other| {
                     workspace.source != other.source && workspace.source.starts_with(&other.source)
                 })
