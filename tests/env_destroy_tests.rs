@@ -1641,74 +1641,124 @@ fn env_destroy_ignores_its_invocation_wrapper_when_the_command_mentions_the_targ
 #[cfg(unix)]
 #[test]
 fn env_destroy_partial_apply_preserves_completed_process_count() {
-    let root = TestDir::new("env-destroy-partial-process-count");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let mut env = ocm_launchd_env(&root);
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
-    let created = run_ocm(&cwd, &env, &["env", "create", "demo"]);
-    assert!(created.status.success(), "{}", stderr(&created));
+    for reverse_handles in [false, true] {
+        let root = TestDir::new("env-destroy-partial-process-count");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_launchd_env(&root);
 
-    let mut first = Command::new("python3")
-        .current_dir(root.child("ocm-home/envs/demo"))
-        .args(["-c", "import time; time.sleep(60)"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut second = Command::new("python3")
-        .current_dir(root.child("ocm-home/envs/demo"))
-        .args(["-c", "import time; time.sleep(60)"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    sleep(Duration::from_millis(100));
+        let created = run_ocm(&cwd, &env, &["env", "create", "demo"]);
+        assert!(created.status.success(), "{}", stderr(&created));
 
-    let preview = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--json"]);
-    assert!(preview.status.success(), "{}", stderr(&preview));
-    let preview_json: serde_json::Value = serde_json::from_str(&stdout(&preview)).unwrap();
-    assert_eq!(preview_json["processCount"], 2);
-    let guard = preview_json["stateToken"].as_str().unwrap();
+        let spawn = || {
+            OwnedChild(
+                Command::new("python3")
+                    .current_dir(root.child("ocm-home/envs/demo"))
+                    .args(["-c", "import time; time.sleep(60)"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let mut children = [spawn(), spawn()];
+        let created_pids = [children[0].0.id(), children[1].0.id()];
+        // Exercise both handle orders without relying on the OS's PID allocation.
+        children.sort_by_key(|child| child.0.id());
+        if reverse_handles {
+            children.swap(0, 1);
+        }
+        let [first, second] = &mut children;
+        let handle_pids = [first.0.id(), second.0.id()];
+        // associated_processes_once currently orders equal-depth siblings by PID.
+        // Select the later candidate for this fault; creation order is not a contract.
+        let (ordinary, resistant) = if first.0.id() < second.0.id() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let context = format!(
+            "created={created_pids:?}, handles={handle_pids:?}, resistant={}",
+            resistant.0.id()
+        );
+        sleep(Duration::from_millis(100));
 
-    let bin_dir = root.child("selective-kill-bin");
-    fs::create_dir_all(&bin_dir).unwrap();
-    let kill_script = format!(
-        "#!/bin/sh\nif [ \"$2\" = \"{}\" ]; then exit 0; fi\nexec /bin/kill \"$@\"\n",
-        second.id()
-    );
-    write_executable_script(&bin_dir.join("kill"), &kill_script);
-    prepend_fake_bin(&mut env, &bin_dir);
+        let preview = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--json"]);
+        let preview_context = format!(
+            "{context}; preview status={}, stdout={}, stderr={}",
+            preview.status,
+            stdout(&preview),
+            stderr(&preview)
+        );
+        assert!(preview.status.success(), "{preview_context}");
+        let preview_json: serde_json::Value = serde_json::from_str(&stdout(&preview))
+            .unwrap_or_else(|error| panic!("{error}; {preview_context}"));
+        assert_eq!(preview_json["processCount"], 2, "{preview_context}");
+        let guard = preview_json["stateToken"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing state token; {preview_context}"));
 
-    let destroy = run_ocm(
-        &cwd,
-        &env,
-        &[
-            "env",
-            "destroy",
-            "demo",
-            "--yes",
-            "--if-state-token",
-            guard,
-            "--json",
-        ],
-    );
-    assert!(!destroy.status.success());
-    let destroy_json: serde_json::Value = serde_json::from_str(&stdout(&destroy)).unwrap();
-    assert_eq!(destroy_json["code"], "partial_apply");
-    assert_eq!(destroy_json["processesTerminated"], 1);
-    let _ = first.wait();
-    assert!(first.try_wait().unwrap().is_some());
-    assert!(second.try_wait().unwrap().is_none());
+        let bin_dir = root.child("selective-kill-bin");
+        let signal_log = root.child("signals.log");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let kill_script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  -TERM|-KILL) printf '%s\\n' \"$*\" >> \"$OCM_TEST_SIGNAL_LOG\" ;;\nesac\nif [ \"$2\" = \"{}\" ]; then exit 0; fi\nexec /bin/kill \"$@\"\n",
+            resistant.0.id()
+        );
+        write_executable_script(&bin_dir.join("kill"), &kill_script);
+        env.insert("OCM_TEST_SIGNAL_LOG".to_string(), path_string(&signal_log));
+        prepend_fake_bin(&mut env, &bin_dir);
 
-    let _ = Command::new("/bin/kill")
-        .args(["-KILL", &second.id().to_string()])
-        .status();
-    let _ = second.wait();
-    let cleanup = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--yes"]);
-    assert!(cleanup.status.success(), "{}", stderr(&cleanup));
+        let destroy = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "destroy",
+                "demo",
+                "--yes",
+                "--if-state-token",
+                guard,
+                "--json",
+            ],
+        );
+        // Record only teardown signals, not the repeated liveness probes.
+        let signals = fs::read_to_string(&signal_log).unwrap_or_default();
+        let signals = signals.lines().take(16).collect::<Vec<_>>().join("\n");
+        let context = format!(
+            "{context}; destroy status={}, stdout={}, stderr={}; signals:\n{signals}",
+            destroy.status,
+            stdout(&destroy),
+            stderr(&destroy)
+        );
+        assert!(!destroy.status.success(), "{context}");
+        let destroy_json: serde_json::Value = serde_json::from_str(&stdout(&destroy))
+            .unwrap_or_else(|error| panic!("{error}; {context}"));
+        assert_eq!(destroy_json["code"], "partial_apply", "{context}");
+        assert_eq!(destroy_json["processesTerminated"], 1, "{context}");
+        assert!(
+            ordinary.0.try_wait().unwrap().is_some(),
+            "ordinary child should have exited; {context}"
+        );
+        assert!(
+            resistant.0.try_wait().unwrap().is_none(),
+            "resistant child should still be alive; {context}"
+        );
+
+        resistant.0.kill().unwrap();
+        resistant.0.wait().unwrap();
+        let cleanup = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--yes"]);
+        assert!(cleanup.status.success(), "{context}; {}", stderr(&cleanup));
+    }
 }
 
 #[cfg(unix)]
