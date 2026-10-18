@@ -544,13 +544,11 @@ fn update_service_with_observation(
     {
         supervisor.require_durable_daemon_executable()?;
     }
-    let previous_restart_pid = if matches!(update, ServiceUpdate::Restart) {
-        let before = supervisor.inspect()?;
-        before
-            .runtime_children
-            .iter()
-            .find(|child| child.env_name == name && !before.retained_envs.contains(name))
-            .map(|child| child.pid)
+    let previous_restart_pid = if matches!(update, ServiceUpdate::Restart) && daemon_before.running
+    {
+        // Use the checked daemon observation above. Informational inspection
+        // can hide runtime children when a later service-manager read fails.
+        supervisor.runtime_child_pid(name)?
     } else {
         None
     };

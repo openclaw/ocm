@@ -1484,6 +1484,43 @@ fn stopped_target_restart_preserves_an_unresolvable_sibling_plan() {
 }
 
 #[test]
+fn stopped_restart_does_not_lose_child_on_transient_manager_read_failure() {
+    let root = TestDir::new("restart-transient-observation");
+    let (cwd, mut env, _) = setup_gateway_aware_restart_fixture(&root, "legacy");
+    env.remove("OCM_ACTIVE_ENV");
+    env.remove("OPENCLAW_SERVICE_KIND");
+    let service = EnvironmentService::new(&env, &cwd);
+    let mut meta = service.get("demo").unwrap();
+    meta.service_running = false;
+    ocm::store::save_environment(meta, &env, &cwd).unwrap();
+    ocm::supervisor::SupervisorService::new(&env, &cwd)
+        .sync()
+        .unwrap();
+    let manager = root.child("fake-bin/launchctl");
+    let original = fs::read_to_string(&manager).unwrap();
+    let count = root.child("restart-print-count");
+    let fault = format!(
+        "#!/bin/sh\nif [ \"$1\" = print ]; then\n  n=0\n  if [ -f '{}' ]; then read -r n < '{}'; fi\n  n=$((n + 1))\n  printf '%s\\n' \"$n\" > '{}'\n  if [ \"$n\" = 2 ]; then printf 'temporary inspection failure\\n' >&2; exit 1; fi\nfi\n",
+        path_string(&count),
+        path_string(&count),
+        path_string(&count)
+    );
+    write_executable_script(&manager, &original.replacen("#!/bin/sh\n", &fault, 1));
+    let output = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+    assert!(
+        !output.status.success(),
+        "restart certified an unobserved replacement: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr(&output).contains("activation was refused"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!service.get("demo").unwrap().service_running);
+}
+
+#[test]
 fn service_restart_requests_immediate_recovery_handoff_without_self_deadlock() {
     let root = TestDir::new("service-restart-gateway-aware");
     let (cwd, env, invocation_log) = setup_gateway_aware_restart_fixture(&root, "protocol-v1");

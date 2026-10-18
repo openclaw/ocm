@@ -1292,7 +1292,6 @@ impl<'a> SupervisorService<'a> {
         })
     }
 
-    #[cfg(unix)]
     pub(crate) fn runtime_child_pid(&self, name: &str) -> Result<Option<u32>, String> {
         Ok(self.read_runtime_state()?.and_then(|runtime| {
             runtime
