@@ -734,10 +734,12 @@ fn wait_for_action_summary(
 ) -> Result<(ServiceSummary, Vec<String>), String> {
     let should_wait_for_stop = matches!(action, "stop" | "uninstall");
     if !should_wait_for_stop {
-        return Ok((
-            super::inspect::service_status_fast(name, env, cwd)?,
-            Vec::new(),
-        ));
+        let summary = if matches!(action, "start" | "restart") {
+            super::inspect::service_status_for_readiness(name, env, cwd)?
+        } else {
+            super::inspect::service_status_fast(name, env, cwd)?
+        };
+        return Ok((summary, Vec::new()));
     }
 
     let deadline = Instant::now() + Duration::from_secs(3);

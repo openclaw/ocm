@@ -2426,6 +2426,116 @@ fn daemon_publishes_dynamic_pending_ownership_before_starting_the_child() {
     assert!(wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5)).is_some());
 }
 
+// Darwin can start the real executable suspended before its first instruction.
+// This delays publication without changing runtime bytes or holding OCM locks.
+#[cfg(target_os = "macos")]
+struct SuspendedDaemon(libc::pid_t);
+
+#[cfg(target_os = "macos")]
+impl SuspendedDaemon {
+    fn spawn(env: &BTreeMap<String, String>) -> Self {
+        use std::ffi::CString;
+        let binary = CString::new(ocm_test_binary_path().to_str().unwrap()).unwrap();
+        let args = [
+            binary.clone(),
+            CString::new("__daemon").unwrap(),
+            CString::new("run").unwrap(),
+        ];
+        let env: Vec<_> = env
+            .iter()
+            .map(|(key, value)| CString::new(format!("{key}={value}")).unwrap())
+            .collect();
+        let mut argv: Vec<_> = args
+            .iter()
+            .map(|arg| arg.as_ptr() as *mut libc::c_char)
+            .collect();
+        argv.push(std::ptr::null_mut());
+        let mut envp: Vec<_> = env
+            .iter()
+            .map(|entry| entry.as_ptr() as *mut libc::c_char)
+            .collect();
+        envp.push(std::ptr::null_mut());
+        unsafe {
+            let mut attr = std::mem::zeroed();
+            assert_eq!(libc::posix_spawnattr_init(&mut attr), 0);
+            // POSIX_SPAWN_START_SUSPENDED from Darwin's sys/spawn.h.
+            assert_eq!(libc::posix_spawnattr_setflags(&mut attr, 0x0080), 0);
+            let mut pid = 0;
+            let result = libc::posix_spawn(
+                &mut pid,
+                binary.as_ptr(),
+                std::ptr::null(),
+                &attr,
+                argv.as_ptr(),
+                envp.as_ptr(),
+            );
+            assert_eq!(libc::posix_spawnattr_destroy(&mut attr), 0);
+            assert_eq!(result, 0);
+            Self(pid)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SuspendedDaemon {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.0, libc::SIGCONT);
+            libc::kill(self.0, libc::SIGINT);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if libc::waitpid(self.0, std::ptr::null_mut(), libc::WNOHANG) == self.0 {
+                    return;
+                }
+                sleep(Duration::from_millis(25));
+            }
+            libc::kill(self.0, libc::SIGKILL);
+            libc::waitpid(self.0, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn service_start_waits_for_the_current_daemons_first_publication() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-readiness-first-publication");
+    let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
+    let daemon = SuspendedDaemon::spawn(&env);
+    fs::write(
+        &env["OCM_TEST_NATIVE_DAEMON_PID_FILE"],
+        daemon.0.to_string(),
+    )
+    .unwrap();
+    let start_cwd = cwd.clone();
+    let start_env = env.clone();
+    let start = std::thread::spawn(move || {
+        run_ocm(
+            &start_cwd,
+            &start_env,
+            &["service", "start", "demo", "--json"],
+        )
+    });
+    sleep(Duration::from_millis(300));
+    let waited = !start.is_finished();
+    let unpublished = !root.child("ocm-home/supervisor/runtime.json").exists();
+    let resumed = unsafe { libc::kill(daemon.0, libc::SIGCONT) };
+    let result = start.join().unwrap();
+    assert_eq!(resumed, 0);
+    assert!(unpublished);
+    assert!(waited, "Start ended before the first current publication");
+    assert!(
+        result.status.success(),
+        "{} {}",
+        stdout(&result),
+        stderr(&result)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&result.stdout).unwrap()["gatewayReady"],
+        true
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn replacement_retains_claims_until_exact_operator_recovery() {
@@ -2462,6 +2572,11 @@ fn replacement_retains_claims_until_exact_operator_recovery() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(root);
+    env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
+    env.insert(
+        "OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS".into(),
+        "500".into(),
+    );
     env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
     install_fake_launchctl(root, &mut env);
     let gateway = root.child("bin/ownership-gateway");
@@ -2552,8 +2667,71 @@ NODE
         .iter()
         .map(|child| child["pid"].as_u64().unwrap() as u32)
         .collect();
+    fs::write(
+        root.child("launchctl-print.txt"),
+        format!(
+            "state = running\npid = {}\npath = {}\n",
+            fixture.daemons[0].id(),
+            path_string(&support::managed_service_definition_path(
+                &env, &cwd, "source"
+            ))
+        ),
+    )
+    .unwrap();
+    let current = run_ocm(&cwd, &env, &["service", "start", "source", "--json"]);
+    assert!(current.status.success(), "{}", stdout(&current));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&current.stdout).unwrap()["gatewayReady"],
+        true
+    );
     fixture.daemons[0].kill().unwrap();
     fixture.daemons[0].wait().unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let original_runtime = fs::read(&runtime_path).unwrap();
+        let replacement = SuspendedDaemon::spawn(&env);
+        let observed = Command::new("/bin/ps")
+            .args(["-o", "stat=,comm=", "-p", &replacement.0.to_string()])
+            .output()
+            .unwrap();
+        assert!(observed.status.success());
+        let observed = stdout(&observed);
+        assert!(
+            observed.split_whitespace().next().unwrap().contains('T'),
+            "{observed}"
+        );
+        assert!(
+            observed.contains(ocm_test_binary_path().to_str().unwrap()),
+            "{observed}"
+        );
+        fs::write(
+            root.child("launchctl-print.txt"),
+            format!(
+                "state = running\npid = {}\npath = {}\n",
+                replacement.0,
+                path_string(&support::managed_service_definition_path(
+                    &env, &cwd, "source"
+                ))
+            ),
+        )
+        .unwrap();
+        let beats = fs::metadata(root.child("beats-sibling")).unwrap().len();
+        let started = run_ocm(&cwd, &env, &["service", "start", "source", "--json"]);
+        assert!(!started.status.success(), "{}", stdout(&started));
+        let started: Value = serde_json::from_slice(&started.stdout).unwrap();
+        assert_eq!(started["gatewayReady"], false);
+        assert_eq!(started["gatewayState"], "pending");
+        assert_eq!(started["running"], false);
+        assert!(
+            started["issue"]
+                .as_str()
+                .unwrap()
+                .contains("current supervisor runtime observation")
+        );
+        assert_eq!(fs::read(&runtime_path).unwrap(), original_runtime);
+        assert!(fs::metadata(root.child("beats-sibling")).unwrap().len() > beats);
+        assert_eq!(runtime_child_pid(&initial, "source"), Some(original_pid));
+    }
     fs::remove_file(root.child("launchctl-print.txt")).unwrap();
     let stopped = run_ocm(&cwd, &env, &["service", "stop", "source"]);
     assert!(stopped.status.success(), "{}", stderr(&stopped));

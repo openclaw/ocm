@@ -607,13 +607,31 @@ impl<'a> SupervisorService<'a> {
 
     pub fn inspect(&self) -> Result<SupervisorInspection, String> {
         self.inspect_with_checked_daemon(false)
+            .map(|(inspection, _)| inspection)
     }
 
     pub(crate) fn inspect_for_recovery(&self) -> Result<SupervisorInspection, String> {
-        self.inspect_with_checked_daemon(true)
+        let (inspection, issue) = self.inspect_with_checked_daemon(true)?;
+        if let Some(issue) = issue {
+            return Err(issue);
+        }
+        Ok(inspection)
     }
 
-    fn inspect_with_checked_daemon(&self, checked: bool) -> Result<SupervisorInspection, String> {
+    pub(crate) fn inspect_for_readiness(
+        &self,
+    ) -> Result<(SupervisorInspection, Option<String>), String> {
+        let (inspection, issue) = self.inspect_with_checked_daemon(true)?;
+        let issue = issue.or_else(|| {
+            (!inspection.daemon.running).then(|| "supervisor is not running".to_string())
+        });
+        Ok((inspection, issue))
+    }
+
+    fn inspect_with_checked_daemon(
+        &self,
+        checked: bool,
+    ) -> Result<(SupervisorInspection, Option<String>), String> {
         let state = self.build_state()?;
         let daemon = if checked {
             self.daemon_summary_with_inspector("status", inspect_job_for_recovery)?
@@ -638,37 +656,47 @@ impl<'a> SupervisorService<'a> {
             }
         }
 
-        if checked && daemon.running {
-            runtime
-                .as_ref()
-                .ok_or("running supervisor has no runtime observation")?
-                .gateway_admission
-                .as_ref()
-                .ok_or("running supervisor has no process identity in its runtime observation")?
-                .verify_process(
-                    daemon
-                        .pid
-                        .ok_or("running supervisor has no observed process ID")?,
-                )?;
-        }
+        // Readiness may wait for a replacement's first publication. Recovery
+        // instead rejects this same observation until it identifies the daemon.
+        let observation_issue = if checked && daemon.running {
+            (|| {
+                runtime
+                    .as_ref()
+                    .ok_or("running supervisor has no runtime observation")?
+                    .gateway_admission
+                    .as_ref()
+                    .ok_or("running supervisor has no process identity in its runtime observation")?
+                    .verify_process(
+                        daemon
+                            .pid
+                            .ok_or("running supervisor has no observed process ID")?,
+                    )
+            })()
+            .err()
+        } else {
+            None
+        };
 
-        Ok(SupervisorInspection {
-            retained_envs: runtime
-                .as_ref()
-                .map(|r| r.retained_envs())
-                .unwrap_or_default(),
-            daemon,
-            daemon_version: runtime
-                .as_ref()
-                .and_then(|runtime| runtime.daemon_version.clone()),
-            planned_children: state.children,
-            skipped_envs: state.skipped_envs,
-            runtime_children: runtime
-                .as_ref()
-                .map(|runtime| runtime.children.clone())
-                .unwrap_or_default(),
-            runtime_services: runtime.map(|runtime| runtime.services).unwrap_or_default(),
-        })
+        Ok((
+            SupervisorInspection {
+                retained_envs: runtime
+                    .as_ref()
+                    .map(|r| r.retained_envs())
+                    .unwrap_or_default(),
+                daemon,
+                daemon_version: runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.daemon_version.clone()),
+                planned_children: state.children,
+                skipped_envs: state.skipped_envs,
+                runtime_children: runtime
+                    .as_ref()
+                    .map(|runtime| runtime.children.clone())
+                    .unwrap_or_default(),
+                runtime_services: runtime.map(|runtime| runtime.services).unwrap_or_default(),
+            },
+            observation_issue,
+        ))
     }
 
     pub fn run(&self, once: bool) -> Result<SupervisorRunSummary, String> {

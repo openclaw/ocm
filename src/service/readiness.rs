@@ -5,7 +5,7 @@ use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use super::inspect::{ServiceSummary, service_status_fast};
+use super::inspect::{ServiceSummary, service_status_for_readiness};
 
 const DEFAULT_GATEWAY_READINESS_TIMEOUT: Duration = Duration::from_secs(90);
 const GATEWAY_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -45,7 +45,7 @@ fn wait_for_gateway_readiness_with_timeout(
     let mut permitted_retry_count = None;
     let mut process_observed_after_ms = None;
     loop {
-        let status = service_status_fast(name, env, cwd)?;
+        let status = service_status_for_readiness(name, env, cwd)?;
         if process_observed_after_ms.is_none() && status.child_pid.is_some() {
             process_observed_after_ms = Some(duration_ms(started.elapsed()));
         }

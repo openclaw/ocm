@@ -109,6 +109,7 @@ pub struct ServiceSummaryList {
 }
 
 struct ServiceSnapshot {
+    observation_issue: Option<String>,
     daemon: SupervisorDaemonSummary,
     daemon_version: Option<String>,
     planned_children: BTreeMap<String, SupervisorChildSpec>,
@@ -126,7 +127,7 @@ pub fn list_services(
     let mut envs = list_environments(env, cwd)?;
     envs.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let snapshot = load_service_snapshot(env, cwd)?;
+    let snapshot = load_service_snapshot(env, cwd, false)?;
     let version =
         ocm_service_version_contract(&snapshot.daemon, snapshot.daemon_version.as_deref());
 
@@ -163,16 +164,33 @@ pub fn service_status_fast(
 ) -> Result<ServiceSummary, String> {
     let env_service = EnvironmentService::new(env, cwd);
     let meta = env_service.get(name)?;
-    let snapshot = load_service_snapshot(env, cwd)?;
+    let snapshot = load_service_snapshot(env, cwd, false)?;
 
+    build_service_summary(&env_service, &meta, env, cwd, &snapshot)
+}
+
+pub(crate) fn service_status_for_readiness(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<ServiceSummary, String> {
+    let env_service = EnvironmentService::new(env, cwd);
+    let meta = env_service.get(name)?;
+    let snapshot = load_service_snapshot(env, cwd, true)?;
     build_service_summary(&env_service, &meta, env, cwd, &snapshot)
 }
 
 fn load_service_snapshot(
     env: &BTreeMap<String, String>,
     cwd: &Path,
+    current_publisher: bool,
 ) -> Result<ServiceSnapshot, String> {
     let supervisor = SupervisorService::new(env, cwd);
+    let (inspection, observation_issue) = if current_publisher {
+        supervisor.inspect_for_readiness()?
+    } else {
+        (supervisor.inspect()?, None)
+    };
     let SupervisorInspection {
         daemon,
         daemon_version,
@@ -181,9 +199,10 @@ fn load_service_snapshot(
         runtime_children,
         runtime_services,
         retained_envs,
-    } = supervisor.inspect()?;
+    } = inspection;
 
     Ok(ServiceSnapshot {
+        observation_issue,
         retained_envs,
         daemon,
         daemon_version,
@@ -215,8 +234,14 @@ fn build_service_summary(
 ) -> Result<ServiceSummary, String> {
     let planned_child = snapshot.planned_children.get(&meta.name);
     let skipped_reason = snapshot.skipped_envs.get(&meta.name);
-    let runtime_child = snapshot.runtime_children.get(&meta.name);
-    let runtime_service = snapshot.runtime_services.get(&meta.name);
+    let runtime_child = snapshot
+        .runtime_children
+        .get(&meta.name)
+        .filter(|_| snapshot.observation_issue.is_none());
+    let runtime_service = snapshot
+        .runtime_services
+        .get(&meta.name)
+        .filter(|_| snapshot.observation_issue.is_none());
     let daemon = &snapshot.daemon;
     let version = ocm_service_version_contract(daemon, snapshot.daemon_version.as_deref());
     let (gateway_port, _) = env_service.resolve_effective_gateway_port(meta)?;
@@ -235,14 +260,20 @@ fn build_service_summary(
     let retained = snapshot.retained_envs.contains(&meta.name);
     let running = runtime_child.is_some() && !retained;
     let foreign_listener = !running && tcp_port_reachable(gateway_port);
-    let gateway_state = if retained {
+    let gateway_state = if snapshot.observation_issue.is_some() {
+        "pending".to_string()
+    } else if retained {
         "unknown".to_string()
     } else {
         runtime_service
             .map(reported_gateway_state)
             .unwrap_or_else(|| service_state_label(installed, desired_running, running))
     };
-    let issue = if retained {
+    let issue = if let Some(issue) = &snapshot.observation_issue {
+        Some(format!(
+            "waiting for current supervisor runtime observation: {issue}"
+        ))
+    } else if retained {
         Some(format!(
             "env {} has unresolved retained service ownership; inspect it with `ocm service recover {}`",
             meta.name, meta.name
