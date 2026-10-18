@@ -1677,6 +1677,26 @@ fn env_clone_retains_configured_agent_directories() {
             &state.join("extensions/demo/node_modules/stale.txt"),
             "runtime debris",
         );
+        let session = serde_json::json!({
+            "sessionRoot": state.join("workspace"),
+            "spawnedCwd": state.join("workspace/nested"),
+            "opaque": {"sessionRoot": state.join("workspace")}
+        });
+        let mut databases = Vec::new();
+        for filename in ["openclaw-agent.sqlite", "authored.sqlite"] {
+            let path = state.join(relative).join(filename);
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, entry_json TEXT NOT NULL);",
+            ).unwrap();
+            db.execute(
+                "INSERT INTO session_nodes VALUES ('fixture', ?1)",
+                [session.to_string()],
+            )
+            .unwrap();
+            drop(db);
+            databases.push((filename, fs::read(path).unwrap()));
+        }
         let config_before = fs::read(state.join("openclaw.json")).unwrap();
         let cloned = run_ocm(cwd, &env, &["env", "clone", &source_name, &target_name]);
         assert!(cloned.status.success(), "{relative}: {}", stderr(&cloned));
@@ -1712,6 +1732,26 @@ fn env_clone_retains_configured_agent_directories() {
             fs::read(state.join(relative).join("models.json")).unwrap(),
             b"{\"providers\":{}}"
         );
+        for (filename, before) in databases {
+            assert_eq!(
+                fs::read(state.join(relative).join(filename)).unwrap(),
+                before
+            );
+            let copied = target.join(relative).join(filename);
+            if filename == "authored.sqlite" {
+                assert_eq!(fs::read(copied).unwrap(), before);
+                continue;
+            }
+            let db = Connection::open(copied).unwrap();
+            let raw: String = db
+                .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+                .unwrap();
+            let actual: Value = serde_json::from_str(&raw).unwrap();
+            let mut expected = session.clone();
+            expected["sessionRoot"] = serde_json::json!(target.join("workspace"));
+            expected["spawnedCwd"] = serde_json::json!(target.join("workspace/nested"));
+            assert_eq!(actual, expected, "{relative}");
+        }
         assert!(state.join("agents/main/sessions/stale.jsonl").exists());
     }
 }

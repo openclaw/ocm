@@ -760,6 +760,7 @@ Retained managed Git worktree bindings stay consistent with the copied repositor
 Required copied Git configuration survives cleanup, and registry paths, structural Git links and selected configuration must agree before migration succeeds.
 A required database or Git relocation failure rolls back the new environment without acquiring additional external Git data or changing source registrations.
 Clone and upgrade simulation also rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
+This includes `openclaw-agent.sqlite` in configured agent directories, even when an ordinary archive import omitted the global database registry.
 This includes legacy live session entries that OpenClaw migrates into its current session store.
 External paths and integrity-protected history keep their existing values, while clone continues to clear copied runtime residue and database leases.
 Retained managed Git worktrees whose repository and required Git data are inside the copied environment keep their checkout content, including the default `.openclaw/worktrees` layout.
@@ -771,7 +772,7 @@ Clone refuses an active database that resolves to protected history, including t
 The same active-state ownership check applies to migration and its existing import rollback.
 
 OCM does not classify a package or project asset as operational merely because it has a SQLite header or filename.
-Unregistered custom database locations and opaque package, project, import, audit, and Workshop payloads retain their existing copy behavior.
+Other unregistered custom database locations and opaque package, project, import, audit, and Workshop payloads retain their existing copy behavior.
 Symlinks keep their existing handling.
 A selected database that cannot be snapshotted makes the command fail and invokes its existing target cleanup; raw source WAL or journal files are never attached to its snapshot.
 

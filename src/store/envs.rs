@@ -925,13 +925,18 @@ fn clone_environment_with_policy(
         };
 
         super::openclaw_state::relocate_cloned_plugin_index_paths(&source_paths, &target_paths)?;
+        let copied_paths = super::openclaw_workspaces::resolve_env_openclaw_copy_paths(
+            &target_paths,
+            env,
+            target_runtime,
+        )?;
         // Sessions may store canonical paths even when the environment root
         // was registered through an alias (for example /var on macOS).
         super::openclaw_state::relocate_copied_databases(
             &target_paths,
             &[&source_paths.root, &canonical_source_root],
             super::openclaw_state::DatabasePathRelocation::ClonedSessions,
-            None,
+            Some(&copied_paths),
         )?;
         super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
         copied_worktrees.finish(&target_paths)?;

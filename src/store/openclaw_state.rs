@@ -519,7 +519,8 @@ pub(super) fn relocate_copied_databases(
         }
     }
     // Default archives omit the global registry but retain configured agent
-    // directories. Select their actual agent database, not arbitrary SQLite
+    // directories, including when the imported environment is later cloned.
+    // Select their actual agent database, not arbitrary SQLite
     // payloads in the directory, and keep the usual history/containment checks.
     let mut configured_databases = Vec::new();
     if let Some(configured_paths) = configured_paths {

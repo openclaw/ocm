@@ -764,3 +764,159 @@ fn state_import_preserves_history_reached_through_database_aliases() {
         }
     }
 }
+
+#[test]
+fn ordinary_import_then_clone_relocates_configured_agent_sessions() {
+    use support::{run_ocm, stderr, write_text};
+
+    let root = TestDir::new("import-clone-configured-sessions");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    let state = source.join(".openclaw");
+    let workspace = state.join("workspace");
+    write_text(
+        &state.join("openclaw.json"),
+        &serde_json::json!({"agents": {
+            "defaults": {"workspace": workspace},
+            "list": [{"id":"main", "agentDir":state.join("custom-agent")}, {"id":"control"}]
+        }})
+        .to_string(),
+    );
+    let entry = serde_json::json!({
+        "sessionId": "fixture-session",
+        "sessionRoot": workspace,
+        "spawnedCwd": workspace.join("nested"),
+        "opaque": {"sessionRoot": workspace},
+        "external": root.child("external")
+    });
+    let databases = [
+        "custom-agent/openclaw-agent.sqlite",
+        "agents/control/agent/openclaw-agent.sqlite",
+        "custom-agent/authored.sqlite",
+    ];
+    let mut originals = Vec::new();
+    for relative in databases {
+        let path = state.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, entry_json TEXT NOT NULL);
+             CREATE TABLE authored (value TEXT NOT NULL);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO session_nodes VALUES ('fixture', ?1)",
+            [entry.to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO authored VALUES (?1)",
+            [workspace.to_str().unwrap()],
+        )
+        .unwrap();
+        drop(db);
+        originals.push((relative, fs::read(path).unwrap()));
+    }
+    let registry = state.join("state/openclaw.sqlite");
+    fs::create_dir_all(registry.parent().unwrap()).unwrap();
+    let db = Connection::open(&registry).unwrap();
+    db.execute_batch(
+        "CREATE TABLE agent_databases (agent_id TEXT PRIMARY KEY, path TEXT NOT NULL);",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO agent_databases VALUES ('main', ?1)",
+        [state.join(databases[0]).to_str().unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let registry_before = fs::read(&registry).unwrap();
+    let archive = root.child("default.tar");
+    for args in [
+        vec!["env", "clone", "source", "registered"],
+        vec![
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+        vec![
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "imported",
+        ],
+    ] {
+        let output = run_ocm(root.path(), &env, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+    let imported = root.child("ocm-home/envs/imported/.openclaw");
+    assert!(!imported.join("state/openclaw.sqlite").exists());
+    let imported_before: Vec<_> = databases
+        .iter()
+        .map(|relative| fs::read(imported.join(relative)).unwrap())
+        .collect();
+    let archive_before = fs::read(&archive).unwrap();
+    let clone = run_ocm(root.path(), &env, &["env", "clone", "imported", "copied"]);
+    assert!(clone.status.success(), "{}", stderr(&clone));
+    for name in ["registered", "imported", "copied"] {
+        let target = root.child(&format!("ocm-home/envs/{name}/.openclaw"));
+        for relative in &databases[..2] {
+            let db = Connection::open(target.join(relative)).unwrap();
+            let raw: String = db
+                .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+                .unwrap();
+            let actual: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let mut expected = entry.clone();
+            expected["sessionRoot"] = serde_json::json!(target.join("workspace"));
+            expected["spawnedCwd"] = serde_json::json!(target.join("workspace/nested"));
+            assert_eq!(actual, expected, "{name}: {relative}");
+            let authored: String = db
+                .query_row("SELECT value FROM authored", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(authored, workspace.to_str().unwrap());
+            let integrity: String = db
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+        }
+        let opaque_path = target.join(databases[2]);
+        let opaque = Connection::open(&opaque_path).unwrap();
+        let raw: String = opaque
+            .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&raw).unwrap(),
+            entry
+        );
+        let authored: String = opaque
+            .query_row("SELECT value FROM authored", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(authored, workspace.to_str().unwrap());
+        // Export snapshots may change SQLite header counters. Clone must leave
+        // the unselected database's imported snapshot bytes unchanged.
+        if name == "copied" {
+            assert_eq!(fs::read(opaque_path).unwrap(), imported_before[2]);
+        }
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(target.join("openclaw.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["agents"]["defaults"]["workspace"],
+            serde_json::json!(target.join("workspace"))
+        );
+        assert_eq!(
+            config["agents"]["list"][0]["agentDir"],
+            serde_json::json!(target.join("custom-agent"))
+        );
+    }
+    for ((relative, before), imported_bytes) in originals.iter().zip(imported_before) {
+        assert_eq!(fs::read(state.join(relative)).unwrap(), *before);
+        assert_eq!(fs::read(imported.join(relative)).unwrap(), imported_bytes);
+    }
+    assert_eq!(fs::read(registry).unwrap(), registry_before);
+    assert_eq!(fs::read(archive).unwrap(), archive_before);
+}
