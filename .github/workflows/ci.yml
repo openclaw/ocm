@@ -80,6 +80,9 @@ jobs:
       - name: Prove Windows migration admission under root spellings
         timeout-minutes: 5
         run: cargo test --locked --test migrate_command_tests migration_preserves_internal_redirect_refusal_under_root_spellings -- --exact --nocapture
+      - name: Prove Windows migration session projections
+        timeout-minutes: 5
+        run: cargo test --locked --test migrate_command_tests migration_rebases_ -- --nocapture
       - name: Prove Windows clone admission under root spellings
         timeout-minutes: 5
         run: cargo test --locked --test env_clone_tests env_clone_rejects_internal_workspace_links_under_root_spellings -- --exact --nocapture
