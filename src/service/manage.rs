@@ -545,7 +545,12 @@ fn update_service_with_observation(
         supervisor.require_durable_daemon_executable()?;
     }
     let previous_restart_pid = if matches!(update, ServiceUpdate::Restart) {
-        super::inspect::service_status_fast(name, env, cwd)?.child_pid
+        let before = supervisor.inspect()?;
+        before
+            .runtime_children
+            .iter()
+            .find(|child| child.env_name == name && !before.retained_envs.contains(name))
+            .map(|child| child.pid)
     } else {
         None
     };

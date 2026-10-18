@@ -61,13 +61,9 @@ impl ShutdownFixture {
                 ),
             );
             let launcher = format!("exec /bin/sh '{}'", leader.display());
-            // Do not depend on a shared default port staying unused during retries.
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port().to_string();
-            drop(listener);
             for args in [
                 vec!["launcher", "add", name, "--command", launcher.as_str()],
-                vec!["env", "create", name, "--launcher", name, "--port", &port],
+                vec!["env", "create", name, "--launcher", name],
                 vec!["service", "start", name],
             ] {
                 let output = run_ocm(&cwd, &env, &args);

@@ -1415,6 +1415,75 @@ fn service_restart_restores_running_policy() {
 }
 
 #[test]
+fn stopped_target_restart_preserves_an_unresolvable_sibling_plan() {
+    let root = TestDir::new("restart-unresolvable-sibling");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = launchd_env(&root);
+    setup_launcher_env(&cwd, &env);
+    for args in [
+        vec!["service", "install", "demo"],
+        vec!["launcher", "add", "sibling", "--command", "openclaw"],
+        vec!["env", "create", "sibling", "--launcher", "sibling"],
+        vec!["service", "start", "sibling"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let supervisor = ocm::supervisor::SupervisorService::new(&env, &cwd);
+    let sibling_request = supervisor.request_child_restart("sibling").unwrap();
+    let state_path = supervisor_state_path(&env, &cwd).unwrap();
+    let before: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let sibling = before["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "sibling")
+        .unwrap();
+    // Simulate unrelated binding disappearance while its saved child still exists.
+    fs::remove_file(root.child("ocm-home/launchers/sibling.json")).unwrap();
+    let plan = supervisor.plan().unwrap();
+    assert!(
+        plan.children
+            .iter()
+            .all(|child| child.env_name != "sibling")
+    );
+    let output = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let after: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        after["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["envName"] == "sibling"),
+        Some(sibling)
+    );
+    assert!(
+        after["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|child| child["envName"] == "demo")
+    );
+    assert!(
+        after["restartRequests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|request| request["envName"] == "sibling"
+                && request["requestId"] == sibling_request)
+    );
+    assert!(
+        after["restartRequests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|request| request["envName"] == "demo")
+    );
+}
+
+#[test]
 fn service_restart_requests_immediate_recovery_handoff_without_self_deadlock() {
     let root = TestDir::new("service-restart-gateway-aware");
     let (cwd, env, invocation_log) = setup_gateway_aware_restart_fixture(&root, "protocol-v1");
