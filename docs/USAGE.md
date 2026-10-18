@@ -915,16 +915,17 @@ not add crash recovery for an uncatchable process or machine failure.
 
 This policy belongs to the environment registration. Clone and import start with
 an empty list. A separately requested full snapshot, export, or clone still
-includes independent content. Full snapshot restore still rewinds unregistered
-independent content and the selected environment's OCM-owned worktree when those
-paths were captured inside the environment root.
+includes independent content. Full snapshot restore still rewinds independent
+content without a registered or active temporary source owner, and the selected
+environment's OCM-owned worktree, when captured inside the environment root.
 
 Restores and required rollbacks refuse checkpoints whose recorded scope would
-replace another named environment's registered dev source or required Git
-metadata, before service quiescence or restore staging. Explicit rollback checks
-both the selected checkpoint and its failure-recovery checkpoint. `--no-rollback`
-keeps its existing behavior. The check reads only known registered source paths
-and Git identity metadata, including surviving history for a missing worktree.
+replace another named environment's registered dev source, active temporary dev
+source, or required Git metadata, before service quiescence or restore staging.
+Explicit rollback checks both the selected checkpoint and its failure-recovery
+checkpoint. `--no-rollback` keeps its existing behavior. The check reads known registered and active temporary
+source paths and Git identity metadata, including surviving history for a missing
+worktree.
 Checkpoint traversal still leaves independent content opaque; post-copy updates
 and residue cleanup leave directory links untouched. Excluding only a worktree
 is insufficient when its required Git metadata remains in scope.
@@ -932,7 +933,11 @@ Borrowed source and its known Git metadata also remain protected from a restore
 of the borrowing environment itself. Missing borrowed paths stay reserved until
 the binding is removed; an unrelated excluded sibling does not preserve that
 reservation. Select a checkpoint whose saved exclusions cover the source and
-all affected Git metadata.
+all affected Git metadata. A temporary takeover keeps its source protected even
+when the watching environment retains a runtime or launcher binding. Stop that
+session with `ocm dev stop <watching-env>` before retrying a restore that would
+replace its source. Once the session completes, its temporary protection ends;
+a disjoint source does not block the restore.
 
 ### Snapshots
 

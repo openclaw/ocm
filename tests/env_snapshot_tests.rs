@@ -509,6 +509,158 @@ fn env_snapshot_restore_preserves_the_current_complete_dev_binding() {
 }
 
 #[test]
+fn env_snapshot_restore_preserves_peer_temporary_source_footprints() {
+    for layout in [
+        "nested",
+        "git-dir",
+        "disjoint",
+        "excluded",
+        "partial-exclusion",
+    ] {
+        let root = TestDir::new(&format!("snapshot-temporary-source-{layout}"));
+        let cwd = root.path();
+        let env = ocm_env(&root);
+        for name in ["source", "watcher"] {
+            let created = run_ocm(cwd, &env, &["env", "create", name]);
+            assert!(created.status.success(), "{}", stderr(&created));
+        }
+        let target = get_environment("source", &env, cwd).unwrap();
+        let target_root = Path::new(&target.root);
+        let checkout = if matches!(layout, "git-dir" | "disjoint") {
+            root.child("checkout")
+        } else {
+            target_root.join("project/checkout")
+        };
+        fs::create_dir_all(checkout.join("extensions")).unwrap();
+        write_text(&checkout.join("openclaw.mjs"), "fixture\n");
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&checkout)
+            .output()
+            .unwrap();
+        assert!(initialized.status.success(), "{}", stderr(&initialized));
+        let git_dir = if matches!(layout, "git-dir" | "partial-exclusion") {
+            let git_dir = target_root.join("source.git");
+            fs::rename(checkout.join(".git"), &git_dir).unwrap();
+            write_text(
+                &checkout.join(".git"),
+                &format!("gitdir: {}\n", git_dir.display()),
+            );
+            git_dir
+        } else {
+            checkout.join(".git")
+        };
+        let source_marker = checkout.join("authored");
+        let state_marker = target_root.join("surrounding-state");
+        write_text(&source_marker, "captured source\n");
+        write_text(&state_marker, "captured state\n");
+        let saved = run_ocm(
+            cwd,
+            &env,
+            &["env", "snapshot", "create", "source", "--json"],
+        );
+        assert!(saved.status.success(), "{}", stderr(&saved));
+        let saved: Value = serde_json::from_slice(&saved.stdout).unwrap();
+        let id = saved["id"].as_str().unwrap();
+        if matches!(layout, "excluded" | "partial-exclusion") {
+            // A scoped checkpoint omits its recorded independent directories.
+            let metadata_path = ocm::store::snapshot_meta_path("source", id, &env, cwd).unwrap();
+            let mut metadata: Value =
+                serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+            metadata["kind"] = "ocm-env-upgrade-checkpoint-v1".into();
+            metadata["upgradeScope"] = serde_json::json!({"independentPaths": ["project"]});
+            fs::remove_dir_all(Path::new(saved["archivePath"].as_str().unwrap()).join("project"))
+                .unwrap();
+            write_json_replacing_path(&metadata_path, &metadata);
+        }
+        write_text(&source_marker, "active source\n");
+        write_text(&state_marker, "current state\n");
+        let git_before = fs::read(git_dir.join("HEAD")).unwrap();
+        let watcher = get_environment("watcher", &env, cwd).unwrap();
+        assert!(watcher.dev.is_none());
+        let override_path = source_watch_override_path("watcher", &env, cwd).unwrap();
+        fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        let mut lease = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(override_path.with_extension("lock"))
+            .unwrap();
+        lease.lock_exclusive().unwrap();
+        writeln!(lease, "snapshot-peer").unwrap();
+        let mut session = serde_json::json!({
+            "kind": "ocm-source-watch-session", "envName": "watcher", "leaseId": "snapshot-peer",
+            "envRoot": watcher.root, "envCreatedAt": serde_json::to_value(&watcher).unwrap()["createdAt"],
+            "processScope": null, "controller": {"pid": std::process::id(), "startedAt": "fixture"},
+            "child": null, "childSpawnPending": false, "restoreService": false, "closed": false
+        });
+        write_json_replacing_path(&override_path.with_extension("session"), &session);
+        write_json_replacing_path(
+            &override_path,
+            &serde_json::json!({
+                "kind": "ocm-source-watch-override", "envName": "watcher", "repoRoot": checkout,
+                "watchPid": std::process::id(), "token": "lease:snapshot-peer:fixture",
+                "startedAt": "2026-10-18T00:00:00Z"
+            }),
+        );
+        let ownership_before = fs::read(&override_path).unwrap();
+        let refused = !matches!(layout, "disjoint" | "excluded");
+        if refused {
+            // Early CLI admission must preserve running intent before quiescence.
+            let mut target = target.clone();
+            target.service_enabled = true;
+            target.service_running = true;
+            save_environment(target, &env, cwd).unwrap();
+        }
+        let registry_path = env_registry_path(&env, cwd).unwrap();
+        let registry_before = fs::read(&registry_path).unwrap();
+        let restored = run_ocm(cwd, &env, &["env", "snapshot", "restore", "source", id]);
+        if refused {
+            assert!(!restored.status.success(), "accepted {layout}");
+            assert!(
+                stderr(&restored)
+                    .contains("active temporary dev source or Git metadata for env watcher"),
+                "{layout}: {}",
+                stderr(&restored)
+            );
+            assert!(stderr(&restored).contains("ocm dev stop watcher"));
+            let direct = ocm::store::restore_env_snapshot(
+                ocm::env::RestoreEnvSnapshotOptions {
+                    env_name: "source".into(),
+                    snapshot_id: id.into(),
+                },
+                &env,
+                cwd,
+            )
+            .unwrap_err();
+            assert!(direct.contains("active temporary dev source"), "{direct}");
+            assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+            assert_eq!(fs::read(&state_marker).unwrap(), b"current state\n");
+        } else {
+            assert!(restored.status.success(), "{layout}: {}", stderr(&restored));
+            assert_eq!(fs::read(&state_marker).unwrap(), b"captured state\n");
+        }
+        assert_eq!(fs::read(&source_marker).unwrap(), b"active source\n");
+        assert_eq!(fs::read(git_dir.join("HEAD")).unwrap(), git_before);
+        assert_eq!(fs::read(&override_path).unwrap(), ownership_before);
+        fs::remove_file(&override_path).unwrap();
+        session["closed"] = true.into();
+        write_json_replacing_path(&override_path.with_extension("session"), &session);
+        drop(lease);
+        if refused {
+            let mut target = get_environment("source", &env, cwd).unwrap();
+            target.service_enabled = false;
+            target.service_running = false;
+            save_environment(target, &env, cwd).unwrap();
+            let restored = run_ocm(cwd, &env, &["env", "snapshot", "restore", "source", id]);
+            assert!(restored.status.success(), "{layout}: {}", stderr(&restored));
+            assert_eq!(fs::read(&state_marker).unwrap(), b"captured state\n");
+        }
+    }
+}
+
+#[test]
 fn env_snapshot_restore_refuses_active_transitional_and_unknown_dev_ownership() {
     let root = TestDir::new("env-snapshot-watch-ownership");
     let cwd = root.child("workspace");

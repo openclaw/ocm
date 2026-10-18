@@ -21,7 +21,7 @@ use super::checkpoints::{
 use super::common::{copy_path_recursive, load_json_files, path_exists, read_json, write_json};
 use super::dev_sources::{
     contains_existing, path_identity, projected_path_contains, projected_path_relative,
-    registered_dev_source_footprint,
+    protected_dev_source_footprints,
 };
 use super::layout::{
     derive_env_paths, display_path, snapshot_archive_path, snapshot_checkpoint_path,
@@ -512,12 +512,9 @@ pub(crate) fn ensure_restore_preserves_dev_sources(
     cwd: &Path,
 ) -> Result<(), String> {
     super::with_locked_environments(env, cwd, |envs| {
-        let protected = |meta: &EnvMeta| {
-            meta.dev
-                .as_ref()
-                .is_some_and(|dev| meta.name != target.name || dev.borrowed_source_root().is_some())
-        };
-        if !envs.iter().any(protected) {
+        let service = crate::env::EnvironmentService::new(env, cwd);
+        let footprints = protected_dev_source_footprints(target, envs, &service)?;
+        if footprints.is_empty() {
             return Ok(());
         }
         let target_root = Path::new(&target.root);
@@ -549,14 +546,17 @@ pub(crate) fn ensure_restore_preserves_dev_sources(
             }
             Ok(None)
         };
-        for meta in envs.iter().filter(|meta| protected(meta)) {
-            let Some(footprint) = registered_dev_source_footprint(meta, envs).map_err(|error| {
-                format!("cannot protect dev source for env {}: {error}", meta.name)
-            })?
-            else {
-                continue;
-            };
+        for (meta, footprint) in footprints {
             let replacement_error = |path: &Path| {
+                if meta.dev.is_none() {
+                    return format!(
+                        "restoring env {} would replace active temporary dev source or Git metadata for env {} at {}; run `ocm dev stop {}` first or choose a checkpoint that preserves the complete source and Git metadata",
+                        target.name,
+                        meta.name,
+                        display_path(path),
+                        meta.name
+                    );
+                }
                 format!(
                     "restoring env {} would replace registered dev source or Git metadata for env {} at {}; choose a checkpoint that preserves the complete source and Git metadata",
                     target.name,
