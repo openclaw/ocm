@@ -483,6 +483,7 @@ If the daemon reports `cleanup is unverified`, it retains the affected child in 
 A failed signal, process inspection, or bounded wait is not evidence that the old process group stopped.
 Other environments can continue to run or stop.
 Resolve the reported operating-system error before requesting another restart; do not delete the runtime record or signal a saved PID without verifying its current identity.
+The first explicit `service restart <env>` (including `--force`) retries cleanup even after Stop saved stopped intent. It succeeds only after observing a replacement; if cleanup still cannot finish, Restart reports an error and retains the cleanup evidence for another retry.
 A daemon shutdown with unresolved cleanup returns an error.
 
 Starting a service requires a successful manager observation or confirmed absence of the OCM daemon.

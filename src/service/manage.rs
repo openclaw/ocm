@@ -289,51 +289,62 @@ fn restart_running_service_directly(
     restart_warning: &str,
 ) -> Result<ServiceActionSummary, String> {
     let supervisor = SupervisorService::new(env, cwd);
-    let mut request_id = supervisor.request_child_restart(name)?;
-    let restart_result = wait_for_restart_action_summary(name, before.child_pid, env, cwd);
-    match restart_result {
-        Ok(mut status) => {
-            if !status.observed_restart {
-                let (_, recovery_request_id) = supervisor
-                    .recover_child_restart_with_request_id(name)
-                    .map_err(|error| {
-                        format!(
-                            "gateway restart was not observed and targeted supervisor recovery failed: {error}"
-                        )
-                    })?;
-                request_id = recovery_request_id;
-                status = wait_for_restart_action_summary_with_timeout(
-                    name,
-                    before.child_pid,
-                    Duration::from_secs(5),
-                    env,
-                    cwd,
-                    None,
-                )?;
-                if !status.observed_restart {
-                    return Err(
-                        "gateway restart was not observed after targeted supervisor recovery"
-                            .to_string(),
-                    );
-                }
-                status
-                    .warnings
-                    .push("gateway restart required targeted supervisor recovery".to_string());
-            }
-            if let Err(clear_error) = supervisor.clear_child_restart_request(name, &request_id) {
-                status.warnings.push(format!(
-                    "restart completed, but failed to clear restart request: {clear_error}"
-                ));
-            }
-            status.warnings.push(restart_warning.to_string());
-            Ok(service_action_summary(
-                "restart",
-                status.summary,
-                status.warnings,
-            ))
+    let request_id = supervisor.request_child_restart(name)?;
+    let mut status = complete_direct_restart(name, before.child_pid, request_id, env, cwd)?;
+    status.warnings.push(restart_warning.to_string());
+    Ok(service_action_summary(
+        "restart",
+        status.summary,
+        status.warnings,
+    ))
+}
+
+fn complete_direct_restart(
+    name: &str,
+    previous_pid: Option<u32>,
+    mut request_id: String,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<RestartActionStatus, String> {
+    let supervisor = SupervisorService::new(env, cwd);
+    let mut status = wait_for_restart_action_summary(name, previous_pid, env, cwd)?;
+    if !status.observed_restart {
+        let (_, recovery_request_id) = supervisor
+            .recover_child_restart_with_request_id(name)
+            .map_err(|error| {
+                format!(
+                    "gateway restart was not observed and targeted supervisor recovery failed: {error}"
+                )
+            })?;
+        request_id = recovery_request_id;
+        status = wait_for_restart_action_summary_with_timeout(
+            name,
+            previous_pid,
+            Duration::from_secs(5),
+            env,
+            cwd,
+            None,
+        )?;
+        if !status.observed_restart {
+            let detail = status
+                .summary
+                .last_error
+                .as_deref()
+                .unwrap_or("no replacement child observed");
+            return Err(format!(
+                "gateway restart was not observed after targeted supervisor recovery: {detail}"
+            ));
         }
-        Err(restart_error) => Err(restart_error),
+        status
+            .warnings
+            .push("gateway restart required targeted supervisor recovery".to_string());
     }
+    if let Err(clear_error) = supervisor.clear_child_restart_request(name, &request_id) {
+        status.warnings.push(format!(
+            "restart completed, but failed to clear restart request: {clear_error}"
+        ));
+    }
+    Ok(status)
 }
 
 fn spawn_recovery_aware_restart(
@@ -533,14 +544,29 @@ fn update_service_with_observation(
     {
         supervisor.require_durable_daemon_executable()?;
     }
+    let previous_restart_pid = if matches!(update, ServiceUpdate::Restart) {
+        super::inspect::service_status_fast(name, env, cwd)?.child_pid
+    } else {
+        None
+    };
     let change = set_environment_service_policy(name, service_enabled, service_running, env, cwd)?;
     let mut daemon_mutation_attempted = false;
+    let mut restart_request_id = None;
     let update_result = match supervisor_policy {
-        ServiceSupervisorPolicy::EnsureRunning => sync_supervisor_env_if_present(env, cwd, name)
-            .map(|_| ())
-            .and_then(|()| {
+        ServiceSupervisorPolicy::EnsureRunning => {
+            // Publish the restored desired child and its explicit restart together.
+            // A failed Stop can retain the same child even with stopped intent.
+            let sync_result = if matches!(update, ServiceUpdate::Restart) {
+                supervisor.request_child_restart(name).map(|id| {
+                    restart_request_id = Some(id);
+                })
+            } else {
+                sync_supervisor_env_if_present(env, cwd, name).map(|_| ())
+            };
+            sync_result.and_then(|()| {
                 ensure_supervisor_running_locked(&supervisor, env, &mut daemon_mutation_attempted)
-            }),
+            })
+        }
         ServiceSupervisorPolicy::LeaveAsIs => {
             sync_supervisor_env_if_present(env, cwd, name).map(|_| ())
         }
@@ -631,6 +657,12 @@ fn update_service_with_observation(
     // Readiness can wait for a Gateway; it must not block independent service
     // operations on the shared daemon lifecycle lock.
     drop(_lifecycle_lock);
+    if let (Some(previous_pid), Some(request_id)) = (previous_restart_pid, restart_request_id) {
+        // Readiness of the retained old child cannot certify this action. Keep
+        // accepted running intent and the request/error evidence on failure.
+        let status = complete_direct_restart(name, Some(previous_pid), request_id, env, cwd)?;
+        summary = service_action_summary(action, status.summary, status.warnings);
+    }
     if let Some(observe) = observe
         && let Err(error) = observe(&mut summary)
     {

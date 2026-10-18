@@ -61,9 +61,13 @@ impl ShutdownFixture {
                 ),
             );
             let launcher = format!("exec /bin/sh '{}'", leader.display());
+            // Do not depend on a shared default port staying unused during retries.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port().to_string();
+            drop(listener);
             for args in [
                 vec!["launcher", "add", name, "--command", launcher.as_str()],
-                vec!["env", "create", name, "--launcher", name],
+                vec!["env", "create", name, "--launcher", name, "--port", &port],
                 vec!["service", "start", name],
             ] {
                 let output = run_ocm(&cwd, &env, &args);
@@ -348,6 +352,107 @@ fn failed_target_stop_blocks_replacement_without_stalling_siblings() {
             fixture.stop().success(),
             "cleanup retry at shutdown failed: {trigger}"
         );
+        assert!(fixture.runtime()["children"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn first_public_restart_retries_cleanup_after_failed_stop() {
+    for force in [false, true] {
+        let mut fixture = ShutdownFixture::new();
+        let before = fixture.start();
+        let target = child_pid(&before, "target");
+        let sibling = child_pid(&before, "sibling");
+        let state_path = supervisor_state_path(&fixture.env, &fixture.cwd).unwrap();
+        let state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let spec = state["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["envName"] == "target")
+            .unwrap()
+            .clone();
+        fs::write(fixture.root.child("fail-group"), format!("-{target}")).unwrap();
+        let stopped = run_ocm(
+            &fixture.cwd,
+            &fixture.env,
+            &["service", "stop", "target", "--json"],
+        );
+        assert!(stopped.status.success(), "{}", stderr(&stopped));
+        let stopped: Value = serde_json::from_slice(&stopped.stdout).unwrap();
+        assert_eq!(stopped["desiredRunning"], false);
+        fixture.wait_for_cleanup_error(target);
+        let signals = fs::read(fixture.root.child("signals.log")).unwrap();
+        fs::remove_file(fixture.root.child("fail-group")).unwrap();
+        let mut args = vec!["service", "restart", "target", "--json"];
+        if force {
+            args.push("--force");
+        }
+        let restarted = run_ocm(&fixture.cwd, &fixture.env, &args);
+        assert!(restarted.status.success(), "{}", stderr(&restarted));
+        let after = fixture.runtime();
+        let replacement = child_pid(&after, "target");
+        assert_ne!(
+            replacement, target,
+            "first Restart must replace the retained child"
+        );
+        assert_eq!(child_pid(&after, "sibling"), sibling);
+        fixture.assert_heartbeat_advances("sibling");
+        assert!(fs::read(fixture.root.child("signals.log")).unwrap().len() > signals.len());
+        assert!(
+            after["services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|service| service["envName"] == "target")
+                .unwrap()["lastError"]
+                .is_null()
+        );
+        let state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            state["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|child| child["envName"] == "target")
+                .unwrap(),
+            &spec
+        );
+        assert!(
+            state["restartRequests"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+
+        if force {
+            // A still-failing retry must not certify the healthy old process.
+            fs::write(fixture.root.child("fail-group"), format!("-{replacement}")).unwrap();
+            let stopped = run_ocm(&fixture.cwd, &fixture.env, &["service", "stop", "target"]);
+            assert!(stopped.status.success(), "{}", stderr(&stopped));
+            fixture.wait_for_cleanup_error(replacement);
+            let failed = run_ocm(&fixture.cwd, &fixture.env, &args);
+            assert!(!failed.status.success());
+            assert!(
+                stderr(&failed).contains("cleanup is unverified"),
+                "{}",
+                stderr(&failed)
+            );
+            assert_eq!(child_pid(&fixture.runtime(), "target"), replacement);
+            assert_eq!(child_pid(&fixture.runtime(), "sibling"), sibling);
+            fixture.assert_heartbeat_advances("sibling");
+            let failures = fs::read(fixture.root.child("failed-kill.log")).unwrap();
+            sleep(Duration::from_millis(450));
+            assert_eq!(
+                fs::read(fixture.root.child("failed-kill.log")).unwrap(),
+                failures
+            );
+            fs::remove_file(fixture.root.child("fail-group")).unwrap();
+            let retried = run_ocm(&fixture.cwd, &fixture.env, &args);
+            assert!(retried.status.success(), "{}", stderr(&retried));
+            assert_ne!(child_pid(&fixture.runtime(), "target"), replacement);
+            assert_eq!(child_pid(&fixture.runtime(), "sibling"), sibling);
+        }
+        assert!(fixture.stop().success());
         assert!(fixture.runtime()["children"].as_array().unwrap().is_empty());
     }
 }

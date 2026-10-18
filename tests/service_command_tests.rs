@@ -1406,6 +1406,12 @@ fn service_restart_restores_running_policy() {
     let body = json_output(&output);
     assert_eq!(body["installed"], true);
     assert_eq!(body["desiredRunning"], true);
+    let state: Value = serde_json::from_slice(
+        &fs::read(ocm::store::supervisor_state_path(&env, &cwd).unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["restartRequests"].as_array().unwrap().len(), 1);
+    assert_eq!(state["restartRequests"][0]["envName"], "demo");
 }
 
 #[test]
