@@ -372,14 +372,17 @@ fn seed_plain_openclaw_home(source_home: &std::path::Path) {
     fs::write(
         source_home.join("openclaw.json"),
         format!(
-            "{{\"agents\":{{\"defaults\":{{\"workspace\":\"{}\"}},\"list\":[{{\"id\":\"main\",\"default\":true}},{{\"id\":\"ops\",\"workspace\":\"{}\"}}]}},\"externalProject\":\"{}\"}}\n",
-            source_home.join("workspace").display(),
-            source_home.join("team/ops").display(),
-            source_home
-                .parent()
-                .unwrap()
-                .join("projects/unrelated")
-                .display()
+            "{}\n",
+            serde_json::json!({
+                "agents": {
+                    "defaults": {"workspace": source_home.join("workspace")},
+                    "list": [
+                        {"id": "main", "default": true},
+                        {"id": "ops", "workspace": source_home.join("team").join("ops")}
+                    ]
+                },
+                "externalProject": source_home.parent().unwrap().join("projects").join("unrelated")
+            })
         ),
     )
     .unwrap();
@@ -402,9 +405,11 @@ fn seed_plain_openclaw_home(source_home: &std::path::Path) {
     fs::write(
         source_home.join("agents/main/sessions/main.jsonl"),
         format!(
-            "{{\"cwd\":\"{}\",\"log\":\"{}\"}}\n",
-            source_home.join("workspace").display(),
-            source_home.join("logs/app.log").display()
+            "{}\n",
+            serde_json::json!({
+                "cwd": source_home.join("workspace"),
+                "log": source_home.join("logs").join("app.log")
+            })
         ),
     )
     .unwrap();
@@ -477,31 +482,42 @@ fn assert_imported_plain_openclaw_home(
     assert!(!imported_state.join("run/live.sock").exists());
 
     let config_text = fs::read_to_string(imported_state.join("openclaw.json")).unwrap();
-    assert!(config_text.contains(&imported_state.join("workspace").display().to_string()));
-    assert!(
-        config_text.contains(
-            &source_home
+    let config: serde_json::Value = serde_json::from_str(&config_text).unwrap();
+    assert_eq!(
+        config["agents"]["defaults"]["workspace"],
+        serde_json::json!(imported_state.join("workspace"))
+    );
+    assert_eq!(
+        config["externalProject"],
+        serde_json::json!(
+            source_home
                 .parent()
                 .unwrap()
-                .join("projects/unrelated")
-                .display()
-                .to_string()
+                .join("projects")
+                .join("unrelated")
         )
     );
-    assert!(!config_text.contains(&source_home.display().to_string()));
+    let source_json = serde_json::to_string(source_home).unwrap();
+    let source_json_path = &source_json[1..source_json.len() - 1];
+    assert!(!config_text.contains(source_json_path));
 
     let session_text =
         fs::read_to_string(imported_state.join("agents/main/sessions/main.jsonl")).unwrap();
     let log_text = fs::read_to_string(imported_state.join("logs/app.log")).unwrap();
     let backup_text = fs::read_to_string(imported_state.join("openclaw.json.bak")).unwrap();
-    assert!(session_text.contains(&imported_state.join("workspace").display().to_string()));
-    assert!(
-        session_text.contains(&imported_state.join("logs/app.log").display().to_string()),
+    let session: serde_json::Value = serde_json::from_str(&session_text).unwrap();
+    assert_eq!(
+        session["cwd"],
+        serde_json::json!(imported_state.join("workspace"))
+    );
+    assert_eq!(
+        session["log"],
+        serde_json::json!(imported_state.join("logs").join("app.log")),
         "source={}; target={}; session={session_text}",
         source_home.display(),
         imported_state.display()
     );
-    assert!(!session_text.contains(&source_home.display().to_string()));
+    assert!(!session_text.contains(source_json_path));
     assert!(log_text.contains(&imported_state.join("workspace").display().to_string()));
     assert!(!log_text.contains(&source_home.display().to_string()));
     assert!(backup_text.contains(&imported_state.display().to_string()));
@@ -2683,7 +2699,7 @@ fn migration_rebases_retained_sqlite_sessions_to_the_copied_state_root() {
             continue;
         }
         let root = TestDir::new("migration-sqlite-session-paths");
-        let source = root.child("legacy/.openclaw");
+        let source = root.child("legacy").join(".openclaw");
         seed_plain_openclaw_home(&source);
         let alias = root.child("legacy-alias");
         #[cfg(unix)]
@@ -2797,7 +2813,7 @@ fn migration_rebases_retained_sqlite_sessions_to_the_copied_state_root() {
         // relocate literal legacy references that are not typed path fields.
         for registered in [
             stored_workspace.join("custom-agent.db"),
-            source.join("workspace/custom-agent.db"),
+            source.join("workspace").join("custom-agent.db"),
         ] {
             registry
                 .execute(
@@ -2812,7 +2828,7 @@ fn migration_rebases_retained_sqlite_sessions_to_the_copied_state_root() {
             .chain(["state/openclaw.sqlite"].iter())
             .map(|relative| (*relative, fs::read(source.join(relative)).unwrap()))
             .collect();
-        let mut target_root = root.child("ocm-home/envs/target");
+        let mut target_root = root.child("ocm-home").join("envs").join("target");
         #[cfg(unix)]
         if matches!(source_form, "target-spelling" | "embedded-target") {
             let outside = root.child("outside");
@@ -2888,7 +2904,7 @@ fn migration_rebases_retained_sqlite_sessions_to_the_copied_state_root() {
         }
         let mut expected = entry;
         expected["sessionRoot"] = serde_json::json!(target.join("workspace"));
-        expected["spawnedCwd"] = serde_json::json!(target.join("workspace/project"));
+        expected["spawnedCwd"] = serde_json::json!(target.join("workspace").join("project"));
         for relative in &databases[..2] {
             let db = Connection::open(target.join(relative)).unwrap();
             let actual: String = db
@@ -2931,7 +2947,14 @@ fn migration_rebases_retained_sqlite_sessions_to_the_copied_state_root() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(registered, target.join(databases[1]).to_str().unwrap());
+        assert_eq!(
+            registered,
+            target
+                .join("workspace")
+                .join("custom-agent.db")
+                .to_str()
+                .unwrap()
+        );
         assert_eq!(
             fs::read(target.join(databases[2])).unwrap(),
             fs::read(source.join(databases[2])).unwrap()
@@ -2981,7 +3004,11 @@ fn migration_rebases_sessions_through_shared_workspace_projections() {
             .to_string(),
         )
         .unwrap();
-        let agent_path = source.join("agents/main/agent/openclaw-agent.sqlite");
+        let agent_path = source
+            .join("agents")
+            .join("main")
+            .join("agent")
+            .join("openclaw-agent.sqlite");
         let db = Connection::open(&agent_path).unwrap();
         db.execute_batch("CREATE TABLE schema_meta(meta_key TEXT PRIMARY KEY, role TEXT, agent_id TEXT);
             INSERT INTO schema_meta VALUES ('primary', 'agent', 'main');
@@ -3069,6 +3096,12 @@ fn migration_rebases_sessions_through_shared_workspace_projections() {
         let output = run_ocm(root.path(), &ocm_env(&root), &args);
         assert!(output.status.success(), "{}", stderr(&output));
         let target = target_root.join(".openclaw");
+        let copied_workspace = target.join("workspaces").join("default");
+        let copied_workspace = if home_parent {
+            copied_workspace.join("plain-home").join("workspace")
+        } else {
+            copied_workspace.join("project")
+        };
         let legacy =
             fs::read_to_string(target.join("agents/main/sessions/retained.jsonl")).unwrap();
         let events = legacy
@@ -3078,8 +3111,7 @@ fn migration_rebases_sessions_through_shared_workspace_projections() {
         let mut expected_header = legacy_header;
         let mut expected_other = legacy_other;
         if home_parent {
-            expected_header["cwd"] =
-                serde_json::json!(target.join("workspaces/default/plain-home/workspace"));
+            expected_header["cwd"] = serde_json::json!(&copied_workspace);
             // Only the recognized top-level header location changes projection.
             expected_header["metadata"]["cwd"] = serde_json::json!(target.join("workspace"));
             expected_other["cwd"] = serde_json::json!(target.join("workspace"));
@@ -3094,18 +3126,13 @@ fn migration_rebases_sessions_through_shared_workspace_projections() {
         );
         let copied =
             Connection::open(target.join("agents/main/agent/openclaw-agent.sqlite")).unwrap();
-        for (key, relative) in [
-            ("agent:main:retained", "workspaces/default/project"),
-            ("agent:twin:retained", "workspaces/default/project"),
-            ("agent:nested:retained", "workspaces/default/project"),
-            ("agent:other:retained", "workspaces/default/project"),
-            ("legacy", "workspaces/default/project"),
+        for key in [
+            "agent:main:retained",
+            "agent:twin:retained",
+            "agent:nested:retained",
+            "agent:other:retained",
+            "legacy",
         ] {
-            let relative = if home_parent {
-                "workspaces/default/plain-home/workspace"
-            } else {
-                relative
-            };
             for table in ["session_nodes", "session_entries"] {
                 let raw: String = copied
                     .query_row(
@@ -3115,16 +3142,15 @@ fn migration_rebases_sessions_through_shared_workspace_projections() {
                     )
                     .unwrap();
                 let mut expected: serde_json::Value = serde_json::from_str(&entry).unwrap();
-                expected["sessionRoot"] = serde_json::json!(target.join(relative));
-                expected["spawnedCwd"] =
-                    serde_json::json!(target.join(relative).join("missing-child"));
+                expected["sessionRoot"] = serde_json::json!(&copied_workspace);
+                expected["spawnedCwd"] = serde_json::json!(copied_workspace.join("missing-child"));
                 expected["spawnedWorkspaceDir"] = serde_json::json!(
-                    url::Url::from_directory_path(target.join(relative))
+                    url::Url::from_directory_path(&copied_workspace)
                         .unwrap()
                         .as_str()
                 );
                 expected["worktree"]["canonicalWorkspaceDir"] =
-                    serde_json::json!(target.join(relative));
+                    serde_json::json!(&copied_workspace);
                 assert_eq!(
                     serde_json::from_str::<serde_json::Value>(&raw).unwrap(),
                     expected,
@@ -3142,12 +3168,13 @@ fn migration_rebases_sessions_through_shared_workspace_projections() {
             .unwrap();
         assert_eq!(
             Path::new(&internal_database),
-            target.join("agents/main/agent/openclaw-agent.sqlite")
+            target
+                .join("agents")
+                .join("main")
+                .join("agent")
+                .join("openclaw-agent.sqlite")
         );
-        for (agent, relative) in [
-            ("main", "workspaces/default/retained.db"),
-            ("twin", "workspaces/default/retained.db"),
-        ] {
+        for agent in ["main", "twin"] {
             let path: String = registry
                 .query_row(
                     "SELECT path FROM agent_databases WHERE agent_id=?1",
@@ -3155,7 +3182,13 @@ fn migration_rebases_sessions_through_shared_workspace_projections() {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(Path::new(&path), target.join(relative));
+            assert_eq!(
+                Path::new(&path),
+                target
+                    .join("workspaces")
+                    .join("default")
+                    .join("retained.db")
+            );
             let copied = Connection::open(path).unwrap();
             assert_eq!(
                 copied
