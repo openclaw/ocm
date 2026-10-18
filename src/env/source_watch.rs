@@ -795,6 +795,14 @@ impl<'a> EnvironmentService<'a> {
         // An upgrade keeps its environment operation lock through activation,
         // after releasing registry exclusion so service policy can be restored.
         // Try, never wait for, peer locks while holding the registry lock.
+        let envs = self.list()?;
+        let mut source_operations = crate::store::DevSourceRegistration::lock_temporary_source(
+            &env_name,
+            source_root,
+            &envs,
+            self.env,
+            self.cwd,
+        )?;
         let source_root = fs::canonicalize(source_root).map_err(|error| error.to_string())?;
         let meta = self.get(&env_name)?;
         if let Some(dev) = meta.dev.as_ref() {
@@ -810,8 +818,7 @@ impl<'a> EnvironmentService<'a> {
             }
         }
         let launchers = crate::launcher::LauncherService::new(self.env, self.cwd);
-        let mut peer_operations = Vec::new();
-        for peer in self.list()? {
+        for peer in envs {
             if peer.name == env_name {
                 continue;
             }
@@ -825,8 +832,7 @@ impl<'a> EnvironmentService<'a> {
             if crate::store::dev_sources::contains_existing(&root, &source_root)?
                 || crate::store::dev_sources::contains_existing(&source_root, &root)?
             {
-                peer_operations.push(crate::store::try_lock_environment_operation(&peer.name, self.env, self.cwd)?
-                    .ok_or_else(|| format!("cannot prepare source while environment {:?} has an operation in progress; retry after it finishes", peer.name))?);
+                source_operations.lock_peer_operation(&peer.name, self.env, self.cwd)?;
             }
         }
         let service_policy_revision = Some(crate::store::environment_service_policy_revision(

@@ -288,6 +288,57 @@ impl DevSourceRegistration {
         Ok(registration)
     }
 
+    // The caller holds registry exclusion and its own environment operation lock.
+    // Temporary leases need the same footprint admission as permanent sources,
+    // without publishing a binding or reacquiring the daemon lifecycle lock.
+    pub(crate) fn lock_temporary_source(
+        name: &str,
+        source: &Path,
+        envs: &[EnvMeta],
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> Result<Self, String> {
+        let dev = EnvDevMeta::Borrowed {
+            source_root: display_path(source),
+        };
+        let identity = source_identity(&dev)?;
+        let mut registration = Self {
+            source: Some((dev.clone(), identity)),
+            held_files: BTreeSet::from([path_identity(&environment_operation_lock_path(
+                name, env, cwd,
+            )?)?]),
+            ..Self::default()
+        };
+        registration.lock_owners(envs, env, cwd)?;
+        // A containing operation may have finished between inspection and lock
+        // acquisition. Refuse a replaced footprint instead of admitting stale geometry.
+        if registration.source.as_ref().map(|(_, identity)| identity)
+            != Some(&source_identity(&dev)?)
+        {
+            return Err(Self::changed());
+        }
+        Ok(registration)
+    }
+
+    pub(crate) fn lock_peer_operation(
+        &mut self,
+        owner: &str,
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> Result<(), String> {
+        let path = environment_operation_lock_path(owner, env, cwd)?;
+        // Distinct registered names can share a lock on case-insensitive filesystems.
+        if !path_identity(&path).is_ok_and(|identity| self.held_files.contains(&identity)) {
+            let lock = try_lock_environment_operation(owner, env, cwd)?.ok_or_else(|| format!(
+                "cannot register dev source while environment {owner} has an operation in progress; retry after it finishes"
+            ))?;
+            self.held_files.insert(path_identity(&path)?);
+            self._locks.push(lock);
+        }
+        self.owners.insert(owner.to_string());
+        Ok(())
+    }
+
     fn lock_owners(
         &mut self,
         envs: &[EnvMeta],
@@ -299,16 +350,7 @@ impl DevSourceRegistration {
         };
         let owners = containing_environments(identity, envs)?;
         for owner in owners.difference(&self.owners).cloned().collect::<Vec<_>>() {
-            let path = environment_operation_lock_path(&owner, env, cwd)?;
-            // Distinct registered names can share a lock on case-insensitive filesystems.
-            if !path_identity(&path).is_ok_and(|identity| self.held_files.contains(&identity)) {
-                let lock = try_lock_environment_operation(&owner, env, cwd)?.ok_or_else(|| format!(
-                    "cannot register dev source while environment {owner} has an operation in progress; retry after it finishes"
-                ))?;
-                self.held_files.insert(path_identity(&path)?);
-                self._locks.push(lock);
-            }
-            self.owners.insert(owner);
+            self.lock_peer_operation(&owner, env, cwd)?;
         }
         Ok(())
     }

@@ -1228,6 +1228,10 @@ endpoint and effective backend watching/UI choices reuses the session; changing
 those choices requires stopping it first. `dev status --json` reports active
 ownership separately from `sourceWatch.watching`.
 `--force` temporarily takes over a running background service while backend watching is enabled and restores it on exit only if no later service policy request supersedes the takeover; it rejects `--no-watch` or `--service`.
+Temporary source sessions also refuse to start while an environment operation
+can replace their checkout or Git metadata. Retry after the containing operation
+finishes; refusal leaves the temporary session and service policy unchanged.
+Operations on disjoint sources do not block admission.
 A successful `service stop` or `service uninstall` during preparation or the foreground session remains authoritative after cleanup, including a Stop that repeats the temporarily stopped state.
 In that case, `dev stop --json` reports `serviceRestored: false`; an unchanged takeover still restores the running service, and an initially stopped environment remains stopped.
 

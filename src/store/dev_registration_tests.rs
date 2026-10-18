@@ -254,3 +254,93 @@ fn rebind_publication_rechecks_environment_and_target_identity() {
         before
     );
 }
+
+#[test]
+fn temporary_admission_covers_external_checkout_git_and_caller_held_operation() {
+    let (temp, env, dev) = fixture();
+    let cwd = temp.path();
+    create_environment(options("child", None), &env, cwd).unwrap();
+    let child = lock_environment_operation("child", &env, cwd).unwrap();
+    let external = cwd.join("external-checkout");
+    let moved = Command::new("git")
+        .args(["-C", dev.repo_root(), "worktree", "move", dev.source_root()])
+        .arg(&external)
+        .output()
+        .unwrap();
+    assert!(
+        moved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    let parent = lock_environment_operation("parent", &env, cwd).unwrap();
+    let envs = list_environments(&env, cwd).unwrap();
+    let registry = super::super::lock_env_registry(&env, cwd).unwrap();
+    let error = DevSourceRegistration::lock_temporary_source("child", &external, &envs, &env, cwd)
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("parent has an operation in progress"),
+        "{error}"
+    );
+    drop(parent);
+    let mut admission =
+        DevSourceRegistration::lock_temporary_source("child", &external, &envs, &env, cwd).unwrap();
+    // A containing owner can also be a source-launcher peer. Do not relock it.
+    admission.lock_peer_operation("parent", &env, cwd).unwrap();
+    admission.lock_peer_operation("child", &env, cwd).unwrap();
+    assert!(
+        try_lock_environment_operation("parent", &env, cwd)
+            .unwrap()
+            .is_none()
+    );
+    drop(admission);
+    assert!(
+        try_lock_environment_operation("parent", &env, cwd)
+            .unwrap()
+            .is_some()
+    );
+    drop(registry);
+    drop(child);
+}
+
+#[cfg(unix)]
+#[test]
+fn temporary_admission_preserves_source_alias_entries_and_own_root() {
+    let (temp, env, dev) = fixture();
+    let cwd = temp.path();
+    let parent = get_environment("parent", &env, cwd).unwrap();
+    let independent = owned_source(&cwd.join("independent"));
+    let alias = Path::new(&parent.root).join("source-alias");
+    std::os::unix::fs::symlink(independent.source_root(), &alias).unwrap();
+    create_environment(options("child", None), &env, cwd).unwrap();
+    let _child = lock_environment_operation("child", &env, cwd).unwrap();
+    let parent_lock = lock_environment_operation("parent", &env, cwd).unwrap();
+    let envs = list_environments(&env, cwd).unwrap();
+    let _registry = super::super::lock_env_registry(&env, cwd).unwrap();
+    let error = DevSourceRegistration::lock_temporary_source("child", &alias, &envs, &env, cwd)
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("parent has an operation in progress"),
+        "{error}"
+    );
+    DevSourceRegistration::lock_temporary_source(
+        "child",
+        Path::new(independent.source_root()),
+        &envs,
+        &env,
+        cwd,
+    )
+    .unwrap();
+    // The target's own operation is already held by lease admission.
+    DevSourceRegistration::lock_temporary_source(
+        "parent",
+        Path::new(dev.source_root()),
+        &envs,
+        &env,
+        cwd,
+    )
+    .unwrap();
+    drop(parent_lock);
+    DevSourceRegistration::lock_temporary_source("child", &alias, &envs, &env, cwd).unwrap();
+}

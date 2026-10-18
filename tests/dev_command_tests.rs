@@ -4823,6 +4823,84 @@ fn create_runtime_backed_env(cwd: &Path, env: &std::collections::BTreeMap<String
     assert!(created.status.success(), "{}", stderr(&created));
 }
 
+#[cfg(unix)]
+#[test]
+fn temporary_source_refuses_containing_operation_before_preparation() {
+    let root = TestDir::new("temporary-source-operation");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+    create_runtime_backed_env(&cwd, &env);
+    let parent = run_ocm(&cwd, &env, &["env", "create", "parent"]);
+    assert!(parent.status.success(), "{}", stderr(&parent));
+    let parent = get_environment("parent", &env, &cwd).unwrap();
+    let source = Path::new(&parent.root).join("checkout");
+    fs::rename(init_openclaw_repo(&root), &source).unwrap();
+    let owner = hold_environment_operation(&root, "parent");
+    let registry = ocm::store::env_registry_path(&env, &cwd).unwrap();
+    let before = fs::read(&registry).unwrap();
+    let mut child = DevWatchFixture::spawn(
+        &root,
+        &cwd,
+        &env,
+        &dev_watch(&[
+            "demo",
+            "--repo",
+            &path_string(&source),
+            "--force",
+            "--watch",
+        ]),
+    );
+    let rejected = child.wait_without_release();
+    assert!(!rejected.status.success());
+    assert!(
+        stderr(&rejected).contains("parent has an operation in progress"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(fs::read(&registry).unwrap(), before);
+    assert!(!root.child("pnpm.log").exists());
+    assert!(!root.child("node.log").exists());
+    assert!(
+        !Path::new(&env["OCM_HOME"])
+            .join("source-watch/demo.session")
+            .exists()
+    );
+    assert!(!source_watch_override_path(&root, "demo").exists());
+
+    let independent = init_openclaw_repo(&root);
+    let allowed = run_ocm(
+        &cwd,
+        &env,
+        &dev_watch(&[
+            "demo",
+            "--repo",
+            &path_string(&independent),
+            "--force",
+            "--watch",
+        ]),
+    );
+    assert!(allowed.status.success(), "{}", stderr(&allowed));
+    drop(owner);
+    let retried = run_ocm(
+        &cwd,
+        &env,
+        &dev_watch(&[
+            "demo",
+            "--repo",
+            &path_string(&source),
+            "--force",
+            "--watch",
+        ]),
+    );
+    assert!(retried.status.success(), "{}", stderr(&retried));
+    let demo = get_environment("demo", &env, &cwd).unwrap();
+    assert!(demo.dev.is_none());
+    assert_eq!(demo.default_runtime.as_deref(), Some("stable"));
+    assert!(!demo.service_running);
+}
+
 #[test]
 fn dev_watch_force_takes_over_runtime_env_without_rebinding() {
     let root = TestDir::new("dev-command-runtime-watch-force");
