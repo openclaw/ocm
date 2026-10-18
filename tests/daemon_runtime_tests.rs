@@ -2715,6 +2715,15 @@ NODE
             ),
         )
         .unwrap();
+        fs::write(
+            &env["OCM_TEST_NATIVE_DAEMON_PID_FILE"],
+            replacement.0.to_string(),
+        )
+        .unwrap();
+        let status = run_ocm(&cwd, &env, &["service", "status", "source", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["ocmServicePid"], replacement.0);
         let beats = fs::metadata(root.child("beats-sibling")).unwrap().len();
         let started = run_ocm(&cwd, &env, &["service", "start", "source", "--json"]);
         assert!(!started.status.success(), "{}", stdout(&started));
@@ -2726,7 +2735,7 @@ NODE
             started["issue"]
                 .as_str()
                 .unwrap()
-                .contains("current supervisor runtime observation")
+                .contains("does not identify the current managed process")
         );
         assert_eq!(fs::read(&runtime_path).unwrap(), original_runtime);
         assert!(fs::metadata(root.child("beats-sibling")).unwrap().len() > beats);
