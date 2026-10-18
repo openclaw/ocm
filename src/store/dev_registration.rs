@@ -437,7 +437,12 @@ pub(crate) fn with_prepared_dev_source<T>(
                 .and_then(|()| {
                     with_locked_environments(env, cwd, |envs| {
                         registration.recheck_source(&dev, envs)?;
-                        ensure_dev_worktree_removal_preserves_dev_sources(&name, &dev, envs)?;
+                        ensure_dev_worktree_removal_preserves_dev_sources(
+                            &name,
+                            &dev,
+                            envs,
+                            &crate::env::EnvironmentService::new(env, cwd),
+                        )?;
                         remove_openclaw_worktree(repo, &worktree.root)
                     })
                 });

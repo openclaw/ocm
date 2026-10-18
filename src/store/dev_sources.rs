@@ -489,6 +489,22 @@ fn borrowed_source_footprint(source: &Path) -> Result<SourceFootprint, String> {
     Ok(footprint)
 }
 
+fn protected_dev_source_footprint(
+    meta: &EnvMeta,
+    envs: &[EnvMeta],
+    service: &crate::env::EnvironmentService<'_>,
+) -> Result<Option<SourceFootprint>, String> {
+    if meta.dev.is_some() {
+        registered_dev_source_footprint(meta, envs)
+    } else if let Some(source) = service.temporary_source_watch_source_root(meta)? {
+        let mut footprint = inspect_source_footprint(&source)?;
+        footprint.content_roots.insert(source);
+        Ok(Some(footprint))
+    } else {
+        Ok(None)
+    }
+}
+
 // The caller holds registry exclusion through its destructive operation. This
 // fences new source generations and dev rebinding while their footprints are
 // selected. Temporary ownership expires with the foreground generation.
@@ -505,16 +521,7 @@ pub(crate) fn protected_dev_source_footprints<'a>(
                 .as_ref()
                 .is_some_and(|dev| dev.borrowed_source_root().is_some())
     }) {
-        let footprint = if meta.dev.is_some() {
-            registered_dev_source_footprint(meta, envs)?
-        } else if let Some(source) = service.temporary_source_watch_source_root(meta)? {
-            let mut footprint = inspect_source_footprint(&source)?;
-            footprint.content_roots.insert(source);
-            Some(footprint)
-        } else {
-            None
-        };
-        if let Some(footprint) = footprint {
+        if let Some(footprint) = protected_dev_source_footprint(meta, envs, service)? {
             footprints.push((meta, footprint));
         }
     }
@@ -533,16 +540,7 @@ pub(crate) fn ensure_environment_removal_preserves_dev_sources(
     let removal = DevSourceRemoval::environment(target)?;
     for (owner, footprint) in footprints {
         if let Some(path) = removal.affected_path(&footprint)? {
-            if owner.dev.is_none() {
-                return Err(format!(
-                    "cleanup for env {} would affect active temporary dev source for env {} at {}; run `ocm dev stop {}` first",
-                    target.name,
-                    owner.name,
-                    display_path(path),
-                    owner.name
-                ));
-            }
-            return Err(source_removal_error(&target.name, &owner.name, path));
+            return Err(source_removal_error(&target.name, owner, path));
         }
     }
     Ok(())
@@ -552,19 +550,29 @@ pub(crate) fn ensure_dev_worktree_removal_preserves_dev_sources(
     name: &str,
     dev: &EnvDevMeta,
     envs: &[EnvMeta],
+    service: &crate::env::EnvironmentService<'_>,
 ) -> Result<(), String> {
     let removal = DevSourceRemoval::worktree(dev)?;
     for meta in envs {
-        if let Some(footprint) = registered_dev_source_footprint(meta, envs)?
+        if let Some(footprint) = protected_dev_source_footprint(meta, envs, service)?
             && let Some(path) = removal.affected_path(&footprint)?
         {
-            return Err(source_removal_error(name, &meta.name, path));
+            return Err(source_removal_error(name, meta, path));
         }
     }
     Ok(())
 }
 
-fn source_removal_error(name: &str, owner: &str, path: &Path) -> String {
+fn source_removal_error(name: &str, owner: &EnvMeta, path: &Path) -> String {
+    if owner.dev.is_none() {
+        return format!(
+            "cleanup for env {name} would affect active temporary dev source for env {} at {}; run `ocm dev stop {}` first",
+            owner.name,
+            display_path(path),
+            owner.name
+        );
+    }
+    let owner = &owner.name;
     format!(
         "cleanup for env {name} would affect registered dev source for env {owner} at {}; remove the dependent dev env first",
         display_path(path)

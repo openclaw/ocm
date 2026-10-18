@@ -308,13 +308,36 @@ fn dev_rebind_refuses_active_and_unfinished_foreground_ownership() {
 }
 
 #[cfg(unix)]
+struct RegistryWriteFailure {
+    path: PathBuf,
+    permissions: fs::Permissions,
+}
+
+#[cfg(unix)]
+impl RegistryWriteFailure {
+    fn new(registry: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let path = registry.parent().unwrap().to_path_buf();
+        let permissions = fs::metadata(&path).unwrap().permissions();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+        Self { path, permissions }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RegistryWriteFailure {
+    fn drop(&mut self) {
+        fs::set_permissions(&self.path, self.permissions.clone()).unwrap();
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn dev_rebind_failed_registry_publication_preserves_previous_binding() {
     #[cfg(unix)]
     let _serial = INITIAL_UI_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    use std::os::unix::fs::PermissionsExt;
     let root = TestDir::new("dev-rebind-write-failure");
     let repo = init_openclaw_repo(&root);
     let mut env = service_env(&root);
@@ -329,11 +352,9 @@ fn dev_rebind_failed_registry_publication_preserves_previous_binding() {
     init_nested_openclaw_repo(&target);
     let registry = ocm::store::env_registry_path(&env, root.path()).unwrap();
     let bytes = fs::read(&registry).unwrap();
-    let parent = registry.parent().unwrap();
-    let permissions = fs::metadata(parent).unwrap().permissions();
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o500)).unwrap();
+    let fault = RegistryWriteFailure::new(&registry);
     let result = rebind(root.path(), &env, &target);
-    fs::set_permissions(parent, permissions).unwrap();
+    drop(fault);
     assert!(
         !result.status.success(),
         "publication unexpectedly succeeded"
@@ -608,4 +629,232 @@ fn dev_rebind_waits_for_stopped_history_retirement() {
         fs::read(ocm::store::env_registry_path(&env, root.path()).unwrap()).unwrap(),
         bytes
     );
+}
+
+#[cfg(unix)]
+struct ReleasePreparation(PathBuf);
+
+#[cfg(unix)]
+impl Drop for ReleasePreparation {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, "release\n");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn preparation_rollback_preserves_source_owners_and_cleans_only_unused_worktrees() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for mode in [
+        "active",
+        "none",
+        "disjoint",
+        "completed",
+        "permanent",
+        "unknown",
+        "dirty",
+    ] {
+        let root = TestDir::new(&format!("preparation-rollback-{mode}"));
+        let repo = fs::canonicalize(init_openclaw_repo(&root)).unwrap();
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env(&root);
+        let (started, release, _) = install_blocking_fake_dev_runners(&root, &mut env);
+        create_runtime_backed_env(&cwd, &env);
+        let created = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "source", "--runtime", "stable"],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+
+        let real_git = Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        assert!(real_git.status.success());
+        let gate = root.child("worktree-added");
+        let gate_release = root.child("release-preparation");
+        let tools = root.child("git-gate");
+        fs::create_dir_all(&tools).unwrap();
+        write_executable_script(
+            &tools.join("git"),
+            r#"#!/bin/sh
+"$OCM_TEST_REAL_GIT" "$@"
+status=$?
+if [ "$status" = 0 ] && [ "$3" = worktree ] && [ "$4" = add ]; then
+  printf '%s/%s\n' "$2" "$6" > "$OCM_TEST_GIT_GATE.tmp"
+  mv "$OCM_TEST_GIT_GATE.tmp" "$OCM_TEST_GIT_GATE"
+  attempts=0
+  while [ ! -f "$OCM_TEST_GIT_RELEASE" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 600 ] || exit 92
+    /bin/sleep 0.05
+  done
+fi
+exit "$status"
+"#,
+        );
+        let mut creator_env = env.clone();
+        prepend_fake_bin(&mut creator_env, &tools);
+        creator_env.insert("OCM_TEST_REAL_GIT".into(), stdout(&real_git).trim().into());
+        creator_env.insert("OCM_TEST_GIT_GATE".into(), path_string(&gate));
+        creator_env.insert("OCM_TEST_GIT_RELEASE".into(), path_string(&gate_release));
+        let mut creator = DevWatchFixture::spawn_caller(
+            &root,
+            &cwd,
+            &creator_env,
+            &[
+                "upgrade",
+                "simulate",
+                "source",
+                "--to",
+                &path_string(&repo),
+                "--scenario",
+                "current",
+                "--keep-simulation",
+                "--json",
+            ],
+        );
+        // Release before the caller fixture reaps the command on assertion failure.
+        let _gate_cleanup = ReleasePreparation(gate_release.clone());
+        assert!(
+            wait_for_path(&gate, Duration::from_secs(30)),
+            "{mode}: worktree not prepared"
+        );
+        let worktree = fs::canonicalize(fs::read_to_string(&gate).unwrap().trim()).unwrap();
+        assert_eq!(worktree.parent().unwrap(), repo.join(".worktrees"));
+        let simulation = worktree.file_name().unwrap().to_str().unwrap();
+        assert!(
+            get_environment(simulation, &env, &cwd)
+                .unwrap()
+                .dev
+                .is_none()
+        );
+        let sentinel = worktree.join("openclaw.mjs");
+        let source_bytes = fs::read(&sentinel).unwrap();
+        let mut watch = None;
+        let owner = if mode == "permanent" {
+            "borrower"
+        } else {
+            "demo"
+        };
+        let selected = if mode == "disjoint" { &repo } else { &worktree };
+        if matches!(
+            mode,
+            "active" | "disjoint" | "completed" | "permanent" | "unknown"
+        ) {
+            let mut args = vec![
+                "dev",
+                owner,
+                "--repo",
+                selected.to_str().unwrap(),
+                "--watch",
+                "--no-ui",
+            ];
+            if mode != "permanent" {
+                args.push("--force");
+            }
+            watch = Some(DevWatchFixture::spawn(&root, &cwd, &env, &args));
+            assert!(
+                wait_for_path(&started, Duration::from_secs(30)),
+                "{mode}: watch not started"
+            );
+        }
+        let override_path = source_watch_override_path(&root, owner);
+        let ownership = watch.as_ref().map(|_| fs::read(&override_path).unwrap());
+        if matches!(mode, "completed" | "permanent") {
+            fs::write(&release, "release\n").unwrap();
+            let completed = watch.as_mut().unwrap().wait_without_release();
+            assert!(completed.status.success(), "{}", stderr(&completed));
+            let session: Value =
+                serde_json::from_slice(&fs::read(override_path.with_extension("session")).unwrap())
+                    .unwrap();
+            assert_eq!(session["closed"], true);
+            watch = None;
+        }
+        if mode == "dirty" {
+            fs::write(&sentinel, "uncommitted source\n").unwrap();
+        }
+        let registry = ocm::store::env_registry_path(&env, &cwd).unwrap();
+        let registry_bytes = fs::read(&registry).unwrap();
+        if mode == "unknown" {
+            // A valid unfinished owner without its source publication must
+            // retain the checkout too; release only after restoring the record.
+            fs::remove_file(&override_path).unwrap();
+        }
+        let fault = RegistryWriteFailure::new(&registry);
+        fs::write(&gate_release, "release\n").unwrap();
+        let output = creator.wait_without_release();
+        drop(fault);
+        if mode == "unknown" {
+            fs::write(&override_path, ownership.as_ref().unwrap()).unwrap();
+        }
+        let detail = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(
+            !output.status.success(),
+            "{mode}: publication unexpectedly succeeded"
+        );
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let preparation = summary["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stage| stage["name"] == "prepare target")
+            .unwrap();
+        assert_eq!(preparation["status"], "failed", "{mode}: {detail}");
+        let failure = preparation["note"].as_str().unwrap();
+        assert!(
+            failure.starts_with("Permission denied")
+                || failure.starts_with("Operation not permitted"),
+            "{mode}: {detail}"
+        );
+        assert_eq!(fs::read(&registry).unwrap(), registry_bytes);
+        let retained = matches!(mode, "active" | "permanent" | "unknown" | "dirty");
+        assert_eq!(worktree.exists(), retained, "{mode}: {detail}");
+        assert_eq!(
+            git_worktree_paths(&repo).contains(&worktree),
+            retained,
+            "{mode}: Git registration"
+        );
+        if retained {
+            assert!(
+                detail.contains(&format!(
+                    "prepared worktree retained at {}",
+                    worktree.display()
+                )),
+                "{detail}"
+            );
+            if mode == "dirty" {
+                assert!(detail.contains("modified or untracked files"), "{detail}");
+                assert_eq!(
+                    fs::read_to_string(&sentinel).unwrap(),
+                    "uncommitted source\n"
+                );
+            } else {
+                assert_eq!(fs::read(&sentinel).unwrap(), source_bytes);
+                let reason = match mode {
+                    "active" => "active temporary dev source for env demo",
+                    "permanent" => "registered dev source for env borrower",
+                    _ => "cannot establish temporary dev source ownership for env demo",
+                };
+                assert!(detail.contains(reason), "{mode}: {detail}");
+            }
+        } else {
+            assert!(
+                !detail.contains("prepared worktree retained"),
+                "{mode}: {detail}"
+            );
+        }
+        if let Some(mut watch) = watch {
+            assert!(watch.child.as_mut().unwrap().try_wait().unwrap().is_none());
+            assert_eq!(fs::read(&override_path).unwrap(), ownership.unwrap());
+            assert!(selected.join("openclaw.mjs").exists());
+            fs::write(&release, "release\n").unwrap();
+            let completed = watch.wait_without_release();
+            assert!(completed.status.success(), "{}", stderr(&completed));
+        }
+    }
 }
