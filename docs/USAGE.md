@@ -1304,6 +1304,26 @@ ocm self update --version 0.2.1
 
 If you installed `ocm` long ago and the `self` command is not available yet, rerun the install script once with `--force`, then use `ocm self update` from then on.
 
+## Shell activation
+
+Initialize the helper for the shell evaluating the output, then select an
+existing environment:
+
+```bash
+eval "$(ocm init bash)"
+ocm_use mira
+```
+
+Use `ocm init zsh` or `ocm init sh` for those shells. In Fish, use
+`ocm init fish | source`. With no shell argument, `ocm init` uses the `SHELL`
+hint to select Fish, otherwise Zsh. Specify the current shell explicitly when
+it differs from the login shell recorded in `SHELL`.
+
+The generated `ocm_use` helper keeps that selection for later activations,
+even when the inherited `SHELL` names a different shell. An explicit
+`ocm_use mira --shell bash` still overrides the activation format. Direct
+`ocm env use mira --shell bash` prints the script without evaluating it.
+
 ## Output modes
 
 By default, `ocm` formats output for people in a terminal.
