@@ -508,6 +508,9 @@ fn env_snapshot_restore_preserves_the_current_complete_dev_binding() {
     }
 }
 
+// This fixture uses a Unix whole-file lease; Windows leases keep the generation
+// readable with a separate lock byte, covered by the native source-watch tests.
+#[cfg(unix)]
 #[test]
 fn env_snapshot_restore_preserves_peer_temporary_source_footprints() {
     for layout in [
