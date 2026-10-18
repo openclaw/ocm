@@ -5010,7 +5010,20 @@ fn service_start_waits_for_slow_gateway_health() {
 #[test]
 fn service_start_preserves_builtin_and_plain_executable_launchers() {
     let _guard = daemon_runtime_test_lock();
-    for mode in ["exec-quoted", "exec", "eval-quoted", "eval", "plain"] {
+    let modes = [
+        "exec-quoted",
+        "exec",
+        "eval-quoted",
+        "eval",
+        "plain",
+        "plain-wrapper",
+    ];
+    // macOS /bin/sh forwards dot arguments to the sourced script. Linux sh may
+    // not (for example, dash), so its portable controls exercise the executable
+    // wrapper and the resolver tests independently protect Unix dot selection.
+    #[cfg(target_os = "macos")]
+    let modes = modes.into_iter().chain(["dot", "dot-quoted"]);
+    for mode in modes {
         let root = TestDir::new("service-readiness-builtins");
         let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
         let script = root.child("bin/readiness-openclaw.mjs");
@@ -5031,10 +5044,18 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
         .unwrap();
         let entry = root.child("Entrypoint With Spaces.mjs");
         std::os::unix::fs::symlink(&script, &entry).unwrap();
+        let wrapper = root.child("bin/wrapper.sh");
+        write_executable_script(
+            &wrapper,
+            &format!("#!/bin/sh\nexec node '{}' \"$@\"\n", path_string(&script)),
+        );
         let recipe = match mode {
             "exec-quoted" => format!("exec \"node\" '{}'", path_string(&entry)),
             "exec" | "eval" => format!("{mode} {}", path_string(&script)),
             "eval-quoted" => format!("eval '{}'", path_string(&script)),
+            "dot" => format!(". {}", path_string(&wrapper)),
+            "dot-quoted" => format!(". '{}'", path_string(&wrapper)),
+            "plain-wrapper" => path_string(&wrapper),
             _ => path_string(&script),
         };
         let launcher = run_ocm(
@@ -5114,6 +5135,8 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
         );
         if mode == "plain" {
             assert_eq!(child["binaryPath"], path_string(&script));
+        } else if mode == "plain-wrapper" {
+            assert_eq!(child["binaryPath"], path_string(&wrapper));
         } else {
             assert!(child["binaryPath"].is_null(), "{mode}");
         }

@@ -56,9 +56,9 @@ pub(crate) fn resolve_direct_launcher_command(
         return None;
     }
     let tokens = parse_literal_launcher_command(&launcher.command)?;
-    // Unix exec and eval need the shell even when every word is literal. Keep this
-    // execution constraint separate from parsing words for source inspection.
-    if cfg!(unix) && matches!(tokens.first()?.as_str(), "exec" | "eval") {
+    // Unix exec, eval and dot-source recipes need the shell even when every word
+    // is literal. Keep execution separate from parsing for source inspection.
+    if cfg!(unix) && matches!(tokens.first()?.as_str(), "exec" | "eval" | ".") {
         return None;
     }
 
@@ -249,6 +249,7 @@ mod tests {
         for recipe in [
             "exec \"node\" 'openclaw.mjs'",
             "node '/source tree/openclaw.mjs'",
+            ". '/source/wrapper.sh'",
         ] {
             assert!(
                 resolve_direct_launcher_command(
@@ -263,7 +264,7 @@ mod tests {
 
     #[test]
     fn resolve_direct_launcher_command_keeps_builtin_shell_semantics_on_unix() {
-        for builtin in ["exec", "eval"] {
+        for builtin in ["exec", "eval", "."] {
             let recipe = format!("{builtin} openclaw --profile dev");
             assert_eq!(
                 parse_literal_launcher_command(&recipe).unwrap(),
@@ -284,14 +285,16 @@ mod tests {
                     vec!["openclaw", "--profile", "dev", "gateway"]
                 );
             }
+        }
 
+        for program in ["./exec", "./eval", "./wrapper.sh", "/bin/sh"] {
             let command = resolve_direct_launcher_command(
-                &sample_launcher(&format!("./{builtin} openclaw"), None),
+                &sample_launcher(&format!("{program} openclaw"), None),
                 &[],
                 Path::new("/tmp"),
             )
             .unwrap();
-            assert_eq!(command.program, format!("./{builtin}"));
+            assert_eq!(command.program, program);
             assert_eq!(command.args, vec!["openclaw"]);
         }
     }
