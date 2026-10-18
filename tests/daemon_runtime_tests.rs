@@ -4729,17 +4729,33 @@ fn service_start_waits_for_slow_gateway_health() {
 
 #[cfg(unix)]
 #[test]
-fn service_start_preserves_exec_and_plain_executable_launchers() {
+fn service_start_preserves_builtin_and_plain_executable_launchers() {
     let _guard = daemon_runtime_test_lock();
-    for mode in ["quoted", "unquoted", "plain"] {
-        let root = TestDir::new("service-readiness-exec");
+    for mode in ["exec-quoted", "exec", "eval-quoted", "eval", "plain"] {
+        let root = TestDir::new("service-readiness-builtins");
         let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
         let script = root.child("bin/readiness-openclaw.mjs");
+        let invocations = root.child("invocations.jsonl");
+        let script_body = fs::read_to_string(&script).unwrap();
+        fs::write(
+            &script,
+            script_body.replace(
+                "import http from 'node:http';",
+                &format!(
+                    "import http from 'node:http';\nimport fs from 'node:fs';\n\
+                     fs.appendFileSync({}, JSON.stringify({{argv: process.argv.slice(2), cwd: process.cwd()}}) + '\\n');\n\
+                     if (process.argv[2] === '--version') process.exit(0);",
+                    serde_json::to_string(&path_string(&invocations)).unwrap()
+                ),
+            ),
+        )
+        .unwrap();
         let entry = root.child("Entrypoint With Spaces.mjs");
         std::os::unix::fs::symlink(&script, &entry).unwrap();
         let recipe = match mode {
-            "quoted" => format!("exec \"node\" '{}'", path_string(&entry)),
-            "unquoted" => format!("exec {}", path_string(&script)),
+            "exec-quoted" => format!("exec \"node\" '{}'", path_string(&entry)),
+            "exec" | "eval" => format!("{mode} {}", path_string(&script)),
+            "eval-quoted" => format!("eval '{}'", path_string(&script)),
             _ => path_string(&script),
         };
         let launcher = run_ocm(
@@ -4759,6 +4775,12 @@ fn service_start_preserves_exec_and_plain_executable_launchers() {
         let bound = run_ocm(&cwd, &env, &["env", "set-launcher", "demo", "candidate"]);
         assert!(bound.status.success(), "{}", stderr(&bound));
 
+        let foreground = run_ocm(&cwd, &env, &["env", "run", "demo", "--", "--version"]);
+        assert!(
+            foreground.status.success(),
+            "{mode}: {}",
+            stderr(&foreground)
+        );
         let mut daemon = spawn_daemon_process(&cwd, &env);
         let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
         let runtime: Value = serde_json::from_slice(
@@ -4786,10 +4808,30 @@ fn service_start_preserves_exec_and_plain_executable_launchers() {
 
         let child = persisted_child(&root.child("ocm-home/supervisor/state.json"), "demo");
         assert_eq!(child["runDir"], path_string(&cwd));
+        let calls: Vec<Value> = fs::read_to_string(&invocations)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(calls[0]["argv"], serde_json::json!(["--version"]), "{mode}");
+        let gateway = calls
+            .iter()
+            .find(|call| call["argv"][0] == "gateway" && call["argv"][1] == "run")
+            .unwrap();
+        assert_eq!(
+            gateway["argv"],
+            serde_json::json!(["gateway", "run", "--port", child["childPort"].to_string()]),
+            "{mode}"
+        );
+        assert_eq!(
+            gateway["cwd"],
+            path_string(&fs::canonicalize(&cwd).unwrap()),
+            "{mode}"
+        );
         assert!(
             std::env::split_paths(child["processEnv"]["PATH"].as_str().unwrap())
-                .all(|path| !path.join("exec").is_file()),
-            "fixture must not provide an external exec command"
+                .all(|path| !path.join("exec").is_file() && !path.join("eval").is_file()),
+            "fixture must not provide external exec or eval commands"
         );
         if mode == "plain" {
             assert_eq!(child["binaryPath"], path_string(&script));

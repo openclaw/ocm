@@ -355,7 +355,7 @@ Use a launcher when you want:
 - a custom command line
 - something that is not just a published OpenClaw release
 
-On Unix, recipes beginning with the `exec` shell builtin use the shell for managed services as well as `env run`, with or without quotes around the executable path.
+On Unix, recipes beginning with the `exec` or `eval` shell builtin use the shell for managed services as well as `env run`, with or without quotes in the recipe. In particular, `eval` retains its shell evaluation semantics instead of being treated as an external executable.
 Plain executable recipes still run directly under the supervisor.
 
 ### The simple rule
