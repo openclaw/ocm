@@ -216,50 +216,18 @@ pub(in crate::store) fn copied_destination_git_contexts(
         if !metadata.is_dir() || metadata_roots.contains(&path) || !seen.insert(path.clone()) {
             continue;
         }
-        // Reuse the existing decoder, but only consume Git directories already
-        // contained in the copy. Relocating source-selecting storage pointers
-        // remains the storage owner's responsibility.
-        // Native Git validates both ordinary .git entries and bare roots.
-        // The cheap marker check avoids running Git in every copied directory.
-        let entry = path.join(".git");
-        let has_entry = fs::symlink_metadata(&entry).is_ok();
-        let bare_candidate =
-            !has_entry && path.join("HEAD").is_file() && path.join("objects").is_dir();
-        if (has_entry || bare_candidate)
-            && git_command()
-                .args(["rev-parse", "--resolve-git-dir"])
-                .arg(git_path(if has_entry { &entry } else { &path }))
-                .output()
-                .map_err(|e| e.to_string())?
-                .status
-                .success()
-            && let Some(identity) = if bare_candidate {
-                Some(git_registration_paths(&path)?)
-            } else {
-                git_identity_paths(&path)?
+        if let Some(context) = copied_destination_git_context(&canonical_target, &path)? {
+            for directory in [&context.private_dir, &context.common_dir] {
+                let owned = owned(&canonical_target, directory)?;
+                metadata_roots.insert(
+                    target
+                        .root
+                        .join(owned.strip_prefix(&canonical_target).unwrap()),
+                );
             }
-            && let (Ok(private), Ok(common)) = (
-                owned(&canonical_target, &identity.private_dir),
-                owned(&canonical_target, &identity.common_dir),
-            )
-        {
-            metadata_roots.insert(
-                target
-                    .root
-                    .join(private.strip_prefix(&canonical_target).unwrap()),
-            );
-            metadata_roots.insert(
-                target
-                    .root
-                    .join(common.strip_prefix(&canonical_target).unwrap()),
-            );
-            contexts.push(CopiedGitConfigContext {
-                checkout: path.clone(),
-                private_dir: identity.private_dir,
-                common_dir: identity.common_dir,
-            });
-            if bare_candidate {
-                continue; // The repository itself is administrative storage.
+            contexts.push(context);
+            if !path.join(".git").exists() {
+                continue; // A native bare repository is administrative storage.
             }
         }
         for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
@@ -271,6 +239,42 @@ pub(in crate::store) fn copied_destination_git_contexts(
         }
     }
     Ok(contexts)
+}
+
+/// Discover one repository without traversing its administrative storage.
+/// Source-selecting storage pointers remain the storage owner's responsibility.
+pub(super) fn copied_destination_git_context(
+    canonical_target: &Path,
+    path: &Path,
+) -> Result<Option<CopiedGitConfigContext>, String> {
+    // Native Git validates ordinary .git entries and native bare roots. The
+    // cheap marker check avoids running Git in every copied directory.
+    let entry = path.join(".git");
+    let has_entry = fs::symlink_metadata(&entry).is_ok();
+    let bare_candidate = !has_entry && path.join("HEAD").is_file() && path.join("objects").is_dir();
+    if (has_entry || bare_candidate)
+        && git_command()
+            .args(["rev-parse", "--resolve-git-dir"])
+            .arg(git_path(if has_entry { &entry } else { path }))
+            .output()
+            .map_err(|e| e.to_string())?
+            .status
+            .success()
+        && let Some(identity) = if bare_candidate {
+            Some(git_registration_paths(path)?)
+        } else {
+            git_identity_paths(path)?
+        }
+        && owned(canonical_target, &identity.private_dir).is_ok()
+        && owned(canonical_target, &identity.common_dir).is_ok()
+    {
+        return Ok(Some(CopiedGitConfigContext {
+            checkout: path.to_path_buf(),
+            private_dir: identity.private_dir,
+            common_dir: identity.common_dir,
+        }));
+    }
+    Ok(None)
 }
 
 fn owned(root: &Path, path: &Path) -> Result<PathBuf, String> {

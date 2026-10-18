@@ -1094,3 +1094,121 @@ fn env_import_preserves_selected_bare_repository() {
         "true"
     );
 }
+
+#[test]
+fn env_import_relocates_native_bare_and_ordinary_git_includes() {
+    for include_state in [false, true] {
+        let fixture = TestDir::new("import-native-bare-git-config");
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let env = ocm_env(&fixture);
+        let source = root.join("source");
+        let target = root.join("target");
+        let created = run_ocm(
+            &root,
+            &env,
+            &[
+                "env",
+                "create",
+                "source",
+                "--root",
+                source.to_str().unwrap(),
+            ],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        let workspace = source.join(".openclaw/workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let settings = workspace.join("settings.ini");
+        fs::write(&settings, "[fixture]\n value = retained\n").unwrap();
+        let mut original_files = Vec::new();
+        for (name, native_bare) in [("bare.git", true), ("ordinary", false)] {
+            let repository = workspace.join(name);
+            fs::create_dir(&repository).unwrap();
+            let args = if native_bare {
+                vec!["init", "--bare", "-q"]
+            } else {
+                vec!["init", "-q"]
+            };
+            import_git(&repository, &env, &args);
+            import_git(
+                &repository,
+                &env,
+                &["config", "include.path", settings.to_str().unwrap()],
+            );
+            let metadata = if native_bare {
+                repository
+            } else {
+                repository.join(".git")
+            };
+            for name in ["config", "HEAD"] {
+                let path = metadata.join(name);
+                original_files.push((
+                    path.strip_prefix(&source).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                ));
+            }
+        }
+        original_files.push((
+            settings.strip_prefix(&source).unwrap().to_path_buf(),
+            fs::read(&settings).unwrap(),
+        ));
+        let archive = root.join("source.tar");
+        let mut args = vec![
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ];
+        if include_state {
+            args.push("--include-state");
+        }
+        let exported = run_ocm(&root, &env, &args);
+        assert!(exported.status.success(), "{}", stderr(&exported));
+        let archive_before = fs::read(&archive).unwrap();
+        let offline = root.join("offline");
+        fs::rename(&source, &offline).unwrap();
+        let imported = run_ocm(
+            &root,
+            &env,
+            &[
+                "env",
+                "import",
+                archive.to_str().unwrap(),
+                "--name",
+                "target",
+                "--root",
+                target.to_str().unwrap(),
+            ],
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+        assert_eq!(fs::read(&archive).unwrap(), archive_before);
+        for (path, bytes) in original_files {
+            assert_eq!(fs::read(offline.join(&path)).unwrap(), bytes);
+            if path.file_name().unwrap() != "config" {
+                assert_eq!(fs::read(target.join(path)).unwrap(), bytes);
+            }
+        }
+        let copied_workspace = target.join(".openclaw/workspace");
+        for (name, bare) in [("bare.git", "true"), ("ordinary", "false")] {
+            let repository = copied_workspace.join(name);
+            assert_eq!(
+                import_git(&repository, &env, &["rev-parse", "--is-bare-repository"]),
+                bare
+            );
+            assert_eq!(
+                import_git(&repository, &env, &["config", "fixture.value"]),
+                "retained"
+            );
+            assert_eq!(
+                Path::new(&import_git(
+                    &repository,
+                    &env,
+                    &["config", "--get", "include.path"]
+                )),
+                Path::new(&import_git_argument(
+                    copied_workspace.join("settings.ini").to_str().unwrap()
+                ))
+            );
+        }
+    }
+}

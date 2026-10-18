@@ -1084,6 +1084,7 @@ links are retained.
 Owned file and directory links use relative targets in the archive; external
 and dangling links retain their targets without copying external contents.
 Import relocates selected Git repositories and linked worktrees to the destination before registering the environment.
+This includes native bare repositories (`git init --bare`): source-local configuration includes resolve to their retained destination files in both archive modes.
 Their required Git storage must be present inside the copied archive; an incomplete graph or unresolved copied lock fails import and removes the incomplete target without modifying the archive or source.
 Git indexes, branches, snapshot refs, authored files, and protected history retain their contents.
 Ordinary-import cleanup retains the selected configuration files and links required by those Git repositories.

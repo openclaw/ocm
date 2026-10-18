@@ -362,7 +362,16 @@ pub(super) fn prepare_archived_worktrees(
 ) -> Result<CopiedWorktrees, String> {
     let mut directories = vec![paths.root.clone()];
     let mut git_roots = BTreeSet::new();
+    let mut bare_contexts = Vec::new();
+    let canonical_root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
     while let Some(directory) = directories.pop() {
+        if fs::symlink_metadata(directory.join(".git")).is_err()
+            && let Some(context) =
+                git_config::copied_destination_git_context(&canonical_root, &directory)?
+        {
+            bare_contexts.push(context);
+            continue; // Do not scan a native bare repository's administrative storage.
+        }
         for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
             let path = entry.path();
@@ -392,7 +401,12 @@ pub(super) fn prepare_archived_worktrees(
         .map(|source| (*source, paths.root.as_path()))
         .collect();
     let git_roots = git_roots.into_iter().collect::<Vec<_>>();
-    let mut copied = relocate_copied_worktrees(paths, &mappings, Vec::new(), &git_roots)?;
+    let bare_roots = bare_contexts
+        .iter()
+        .map(|context| context.checkout.clone())
+        .collect::<Vec<_>>();
+    let mut copied = relocate_copied_worktrees(paths, &mappings, bare_contexts, &git_roots)?;
+    copied.preserved_roots.extend(bare_roots);
     // The archive may itself be a checkout. Keep that selected root too, even
     // though the shared retention result omits the environment root.
     copied.preserved_roots.extend(git_roots);
