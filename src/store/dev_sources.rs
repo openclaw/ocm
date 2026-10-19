@@ -732,7 +732,7 @@ impl DevSourceRemoval {
     }
 
     // Runtime reset unlinks a final symlink, without deleting its referent.
-    fn entry(path: &Path) -> Result<Self, String> {
+    pub(crate) fn entry(path: &Path) -> Result<Self, String> {
         if !fs::symlink_metadata(path)
             .map_err(|error| error.to_string())?
             .is_symlink()
@@ -818,10 +818,7 @@ impl DevSourceRemoval {
     pub(crate) fn contains_registered_path(&self, path: &Path) -> Result<bool, String> {
         // Root removal unlinks a final symlink without deleting its referent.
         // A missing root is skipped, but Git may still remove a worktree or slot.
-        let root = self
-            .root
-            .as_ref()
-            .map(|root| self.root_link.as_ref().unwrap_or(root));
+        let root = self.root_link.as_ref().or(self.root.as_ref());
         for boundary in root
             .into_iter()
             .chain(self.worktree.iter())

@@ -1198,6 +1198,10 @@ External configured agent directories remain untouched and do not prevent this c
 Cleanup preview and apply refuse a runtime reset that would delete a registered or active temporary dev source, or Git metadata it needs, before changing that environment's configuration, bindings or files.
 The diagnostic identifies the dependent environment. Remove that dev environment, or stop an active temporary session with `ocm dev stop <env>`, before retrying.
 Sources outside the reset plan, including sources fully retained by workspace preservation, do not block cleanup. Cleanup without a runtime reset keeps its existing behavior.
+For legacy layouts created before overlapping roots were rejected, cleanup also refuses a reset that would delete another registered environment's root or a link needed to reach it.
+This applies before any config, binding or file repair, even when the dependent environment is unprotected. Preserve any needed child data and remove that environment separately before retrying the containing environment's cleanup.
+Registered roots outside the selected deletion entries, including roots retained inside a workspace, do not block the reset.
+`--all` uses the same check for each environment; it does not roll back repairs already completed for earlier environments.
 Run `ocm env cleanup mira --json` to preview the actions before applying them with `--yes`.
 
 ### Remove or destroy

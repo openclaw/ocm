@@ -22,7 +22,7 @@ use super::common::{
     copy_dir_recursive, copy_dir_with_sqlite_snapshots, copy_path, ensure_dir, path_exists,
     read_json, write_json,
 };
-use super::dev_sources::ensure_root_outside_dev_sources;
+use super::dev_sources::{DevSourceRemoval, ensure_root_outside_dev_sources};
 use super::gateway_ports::{
     DEFAULT_GATEWAY_PORT, choose_available_gateway_port, resolve_effective_gateway_ports,
     resolve_env_gateway_port,
@@ -1581,21 +1581,55 @@ pub(crate) fn ensure_environment_removal_preserves_registered_roots(
     target: &EnvMeta,
     envs: &[EnvMeta],
 ) -> Result<(), String> {
-    let removal = super::dev_sources::DevSourceRemoval::environment(target)?;
+    let removal = DevSourceRemoval::environment(target)?;
+    if let Some(other) = affected_registered_environment(target, envs, &[removal])? {
+        return Err(format!(
+            "cannot remove environment {}: its cleanup contains registered environment {} root {} or a link needed to reach it; remove that environment separately first",
+            target.name, other.name, other.root
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_runtime_cleanup_preserves_registered_roots(
+    target: &EnvMeta,
+    envs: &[EnvMeta],
+    paths: &BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let removals = paths
+        .iter()
+        .map(|path| DevSourceRemoval::entry(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(other) = affected_registered_environment(target, envs, &removals)? {
+        return Err(format!(
+            "cannot clean up environment {}: its runtime reset contains registered environment {} root {} or a link needed to reach it; preserve any needed data and remove that environment separately before retrying",
+            target.name, other.name, other.root
+        ));
+    }
+    Ok(())
+}
+
+fn affected_registered_environment<'a>(
+    target: &EnvMeta,
+    envs: &'a [EnvMeta],
+    removals: &[DevSourceRemoval],
+) -> Result<Option<&'a EnvMeta>, String> {
     for other in envs.iter().filter(|meta| meta.name != target.name) {
         let (registered, mut entries) =
             super::dev_registration::registration_path(Path::new(&other.root))?;
         entries.insert(registered);
         for entry in entries {
-            if removal.contains_registered_path(&entry)? {
-                return Err(format!(
-                    "cannot remove environment {}: its cleanup contains registered environment {} root {} or a link needed to reach it; remove that environment separately first",
-                    target.name, other.name, other.root
-                ));
+            for removal in removals {
+                if removal.contains_registered_path(&entry)? {
+                    return Ok(Some(other));
+                }
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 pub(crate) fn remove_environment_locked(

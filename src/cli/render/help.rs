@@ -1461,6 +1461,8 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 "Only a narrow set of safe repairs is applied.",
                 "Preview and apply refuse a runtime reset that would affect a registered or active temporary dev source or its required Git metadata, before changing this environment.",
                 "Remove the dependent dev environment or stop the identified temporary dev session before retrying. Sources outside the reset plan do not block cleanup.",
+                "For legacy overlapping roots, preview and apply also refuse a reset that would delete another registered environment root or a link needed to reach it. Preserve needed data and remove that environment separately before retrying. Roots outside the reset plan do not block cleanup.",
+                "--all checks each environment before its repairs; repairs already completed for earlier environments are not rolled back.",
             ],
         ),
         "use" => render_leaf(

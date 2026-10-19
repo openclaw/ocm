@@ -875,3 +875,198 @@ fn env_cleanup_unlinks_unregistered_alias_without_deleting_borrowed_source() {
     cleanup_git(&source, &env, &["cat-file", "-t", "HEAD"]);
     cleanup_git(&source, &env, &["fsck", "--full"]);
 }
+
+fn cleanup_legacy_child_fixture(
+    root: &TestDir,
+    location: Option<&str>,
+) -> std::collections::BTreeMap<String, String> {
+    use crate::support::{path_string, write_text};
+    use ocm::store::{get_environment, save_environment};
+
+    let env = ocm_env(root);
+    for name in ["a-parent", "child", "donor"] {
+        let created = run_ocm(root.path(), &env, &["env", "create", name]);
+        assert!(created.status.success(), "{}", stderr(&created));
+    }
+    let mut child = get_environment("child", &env, root.path()).unwrap();
+    if let Some(location) = location {
+        let nested = root
+            .child("ocm-home/envs/a-parent/.openclaw")
+            .join(location);
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        // Reconstruct a persisted 0.2.44 layout; new root admission stays refused.
+        fs::rename(&child.root, &nested).unwrap();
+        child.root = path_string(&nested);
+    }
+    child.protected = true;
+    let child = save_environment(child, &env, root.path()).unwrap();
+    let state = std::path::Path::new(&child.root).join(".openclaw");
+    write_text(&state.join("workspace/keep.txt"), "protected child data\n");
+    write_text(
+        &state.join("openclaw.json"),
+        &serde_json::json!({"gateway":{"port":child.gateway_port}}).to_string(),
+    );
+    env
+}
+
+#[test]
+fn env_cleanup_refuses_legacy_child_before_config_binding_or_file_repairs() {
+    use crate::support::write_text;
+    use ocm::store::{env_registry_path, get_environment, save_environment};
+
+    let root = TestDir::new("cleanup-legacy-child");
+    let env = cleanup_legacy_child_fixture(&root, Some("logs/child"));
+    let state = root.child("ocm-home/envs/a-parent/.openclaw");
+    let config = state.join("openclaw.json");
+    write_text(&config, r#"{"gateway":{"port":1}}"#);
+    let mut parent = get_environment("a-parent", &env, root.path()).unwrap();
+    parent.default_runtime = Some("missing-runtime".into());
+    save_environment(parent, &env, root.path()).unwrap();
+    let stale = state.join("agents/main/sessions/stale.jsonl");
+    write_text(
+        &stale,
+        &serde_json::json!({"cwd":root.child("ocm-home/envs/donor/.openclaw/workspace")})
+            .to_string(),
+    );
+    let debris = state.join("tmp/keep-until-admitted");
+    write_text(&debris, "runtime residue");
+    let registry = env_registry_path(&env, root.path()).unwrap();
+    let preserved = [
+        registry,
+        config,
+        stale,
+        debris,
+        state.join("logs/child/.openclaw/openclaw.json"),
+        state.join("logs/child/.openclaw/workspace/keep.txt"),
+    ];
+    let before: Vec<_> = preserved
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect();
+    for args in [
+        vec!["env", "cleanup", "a-parent", "--json"],
+        vec!["env", "cleanup", "a-parent", "--yes", "--json"],
+        vec!["env", "cleanup", "--all", "--json"],
+        vec!["env", "cleanup", "--all", "--yes", "--json"],
+        vec!["env", "remove", "a-parent", "--force"],
+    ] {
+        let refused = run_ocm(root.path(), &env, &args);
+        assert!(!refused.status.success(), "{}", stdout(&refused));
+        assert!(
+            stderr(&refused).contains("registered environment child"),
+            "{}",
+            stderr(&refused)
+        );
+        // a-parent is first in --all: this proves its preflight, not batch rollback.
+        for (path, bytes) in preserved.iter().zip(&before) {
+            assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
+        }
+    }
+}
+
+#[test]
+fn env_cleanup_allows_legacy_roots_outside_selected_deletions() {
+    use crate::support::write_text;
+    use ocm::store::{env_registry_path, get_environment};
+
+    for (location, reset) in [
+        (Some("logs/child"), false),
+        (Some("workspace/child"), true),
+        (None, true),
+    ] {
+        let root = TestDir::new("cleanup-legacy-child-control");
+        let env = cleanup_legacy_child_fixture(&root, location);
+        let child = get_environment("child", &env, root.path()).unwrap();
+        let child_state = std::path::Path::new(&child.root).join(".openclaw");
+        let config = fs::read(child_state.join("openclaw.json")).unwrap();
+        let registry = env_registry_path(&env, root.path()).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let stale = root.child("ocm-home/envs/a-parent/.openclaw/agents/main/sessions/stale.jsonl");
+        if reset {
+            write_text(
+                &stale,
+                &serde_json::json!({"cwd":root.child("ocm-home/envs/donor/.openclaw/workspace")})
+                    .to_string(),
+            );
+        }
+        for args in [
+            vec!["env", "cleanup", "a-parent", "--json"],
+            vec!["env", "cleanup", "a-parent", "--yes", "--json"],
+        ] {
+            let output = run_ocm(root.path(), &env, &args);
+            assert!(output.status.success(), "{}", stderr(&output));
+            let result: Value = serde_json::from_str(&stdout(&output)).unwrap();
+            assert_eq!(
+                result["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| { action["kind"] == "reset-openclaw-runtime-state" }),
+                reset
+            );
+            assert_eq!(fs::read(&registry).unwrap(), registry_before);
+            assert_eq!(fs::read(child_state.join("openclaw.json")).unwrap(), config);
+            assert_eq!(
+                fs::read_to_string(child_state.join("workspace/keep.txt")).unwrap(),
+                "protected child data\n"
+            );
+        }
+        assert!(!stale.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_cleanup_preserves_registered_access_links_but_unlinks_unused_aliases() {
+    use crate::support::{path_string, write_text};
+    use ocm::store::{env_registry_path, get_environment, save_environment};
+    use std::os::unix::fs::symlink;
+
+    for registered_link in [false, true] {
+        let root = TestDir::new("cleanup-legacy-child-link");
+        let env = cleanup_legacy_child_fixture(&root, None);
+        let mut child = get_environment("child", &env, root.path()).unwrap();
+        let physical = std::path::PathBuf::from(&child.root);
+        let state = root.child("ocm-home/envs/a-parent/.openclaw");
+        let link = state.join("child-link");
+        symlink(&physical, &link).unwrap();
+        if registered_link {
+            child.root = path_string(&link);
+            save_environment(child, &env, root.path()).unwrap();
+        }
+        let registry = env_registry_path(&env, root.path()).unwrap();
+        let before = fs::read(&registry).unwrap();
+        let stale = state.join("agents/main/sessions/stale.jsonl");
+        write_text(
+            &stale,
+            &serde_json::json!({"cwd":root.child("ocm-home/envs/donor/.openclaw/workspace")})
+                .to_string(),
+        );
+        for args in [
+            vec!["env", "cleanup", "a-parent", "--json"],
+            vec!["env", "cleanup", "a-parent", "--yes", "--json"],
+        ] {
+            let result = run_ocm(root.path(), &env, &args);
+            assert_eq!(
+                result.status.success(),
+                !registered_link,
+                "{}",
+                stderr(&result)
+            );
+            if registered_link {
+                assert!(stderr(&result).contains("registered environment child"));
+                assert_eq!(fs::read_link(&link).unwrap(), physical);
+                assert!(stale.exists());
+            }
+            assert_eq!(fs::read(&registry).unwrap(), before);
+            assert_eq!(
+                fs::read_to_string(physical.join(".openclaw/workspace/keep.txt")).unwrap(),
+                "protected child data\n"
+            );
+        }
+        if !registered_link {
+            assert!(fs::symlink_metadata(&link).is_err());
+            assert!(!stale.exists());
+        }
+    }
+}

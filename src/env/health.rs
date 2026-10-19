@@ -166,6 +166,11 @@ impl<'a> EnvironmentService<'a> {
                 self.env,
                 config_repair.as_ref().map(|repair| &repair.value),
             )?;
+            crate::store::ensure_runtime_cleanup_preserves_registered_roots(
+                env,
+                &known_envs,
+                cleanup.removals(),
+            )?;
             crate::store::dev_sources::ensure_runtime_cleanup_preserves_dev_sources(
                 env,
                 &known_envs,
