@@ -672,7 +672,14 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
 
 #[test]
 fn removal_preserves_initialized_submodule_object_dependencies() {
-    for mode in ["shared", "nested", "old-form", "copied"] {
+    for mode in [
+        "shared",
+        "nested",
+        "old-form",
+        "copied",
+        "index-fallback",
+        "head-fallback",
+    ] {
         let fixture = TestDir::new(&format!("submodule-object-dependency-{mode}"));
         let cwd = fixture.path();
         let env = ocm_env(&fixture);
@@ -698,6 +705,25 @@ fn removal_preserves_initialized_submodule_object_dependencies() {
             source.clone()
         };
         let module = add(&parent, &donor, mode != "copied");
+        if mode.ends_with("fallback") {
+            git(
+                &source,
+                &[
+                    "-c",
+                    "user.name=OCM Tests",
+                    "-c",
+                    "user.email=tests@example.com",
+                    "commit",
+                    "-m",
+                    "submodule",
+                ],
+            );
+            fs::remove_file(source.join(".gitmodules")).unwrap();
+            if mode == "head-fallback" {
+                git(&source, &["rm", "--cached", ".gitmodules"]);
+            }
+            assert!(git(&source, &["submodule", "status"]).contains("dependency"));
+        }
         let private = PathBuf::from(git(&module, &["rev-parse", "--absolute-git-dir"]));
         assert_eq!(
             private.join("objects/info/alternates").is_file(),

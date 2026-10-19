@@ -426,6 +426,8 @@ fn inspect_source_footprint_paths(
             continue;
         }
         if let Some(git) = crate::openclaw_repo::git_identity_paths(&root)? {
+            let metadata_present = existing_cleanup_path(&git.private_dir)?.is_some()
+                && existing_cleanup_path(&git.common_dir)?.is_some();
             let registrations = if reserve_missing
                 && existing_cleanup_path(&git.common_dir)?.is_none()
             {
@@ -458,14 +460,13 @@ fn inspect_source_footprint_paths(
             }
             let modules = root.join(".gitmodules");
             match fs::symlink_metadata(&modules) {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(_) => {
+                    record_git_path(&modules, &mut footprint, reserve_missing, &mut links)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.to_string()),
             }
-            if record_git_path(&modules, &mut footprint, reserve_missing, &mut links)?.is_none() {
-                continue;
-            }
-            for relative in crate::openclaw_repo::git_submodule_paths(&modules)? {
+            for relative in crate::openclaw_repo::git_submodule_paths(&root, metadata_present)? {
                 let child = root.join(relative);
                 // An uninitialized submodule has no checkout identity. Require
                 // its own .git entry instead of discovering the parent's again.

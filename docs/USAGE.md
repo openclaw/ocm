@@ -725,6 +725,7 @@ before writing the destination. Check the recorded source with `ocm env show
 Registered sources retain their required Git object stores, including relative and
 transitive `objects/info/alternates` references from shared clones and path aliases,
 as well as those of initialized submodules declared in `.gitmodules`, recursively.
+When the working `.gitmodules` file is absent, OCM uses Git’s index or HEAD copy.
 Removing an environment that contains this storage is refused before deletion; an
 independent clone with its own objects does not keep its former donor reserved.
 Missing borrowed object paths stay reserved, while unreadable or excessive Git

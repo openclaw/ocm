@@ -1091,19 +1091,76 @@ pub(crate) fn read_git_alternates(path: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
-// Git owns .gitmodules syntax. Query only the selected bounded file, without
-// includes, so submodule discovery never scans a checkout or executes hooks.
-pub(crate) fn git_submodule_paths(file: &Path) -> Result<Vec<PathBuf>, String> {
-    let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
-    if !metadata.is_file() || metadata.len() > 65536 {
-        return Err(format!(
-            "invalid Git submodule metadata: {}",
-            display_path(file)
-        ));
+// Git owns .gitmodules syntax and falls back to the index, then HEAD, when
+// its working file is absent. Inspect only this bounded metadata, without includes.
+pub(crate) fn git_submodule_paths(
+    root: &Path,
+    metadata_present: bool,
+) -> Result<Vec<PathBuf>, String> {
+    let file = root.join(".gitmodules");
+    let invalid = || format!("invalid Git submodule metadata: {}", display_path(&file));
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--no-includes", "--null"]);
+    match fs::metadata(&file) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.len() > 65536 {
+                return Err(invalid());
+            }
+            command.args(["--file", ".gitmodules"]);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Missing borrowed Git directories stay reserved for recovery. They
+            // cannot supply an index/HEAD fallback until restored.
+            if !metadata_present {
+                return Ok(Vec::new());
+            }
+            let mut selected = None;
+            for revision in [":.gitmodules", "HEAD:.gitmodules"] {
+                let object = git_command()
+                    .arg("-C")
+                    .arg(root)
+                    .args(["rev-parse", "--verify", "--quiet", revision])
+                    .output()
+                    .map_err(|error| error.to_string())?;
+                if object.status.code() == Some(1) {
+                    continue;
+                }
+                if !object.status.success() {
+                    return Err(invalid());
+                }
+                selected = Some(
+                    String::from_utf8(object.stdout)
+                        .map_err(|_| invalid())?
+                        .trim()
+                        .to_string(),
+                );
+                break;
+            }
+            let Some(object) = selected else {
+                return Ok(Vec::new());
+            };
+            let size = git_command()
+                .arg("-C")
+                .arg(root)
+                .args(["cat-file", "-s", &object])
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !size.status.success()
+                || !String::from_utf8_lossy(&size.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .is_ok_and(|size| size <= 65536)
+            {
+                return Err(invalid());
+            }
+            command.args(["--blob", &object]);
+        }
+        Err(error) => return Err(error.to_string()),
     }
-    let output = git_command()
-        .args(["config", "--no-includes", "--null", "--file"])
-        .arg(file)
+    let output = command
         .args(["--get-regexp", "^submodule\\..*\\.path$"])
         .stdin(Stdio::null())
         .output()
@@ -1114,7 +1171,7 @@ pub(crate) fn git_submodule_paths(file: &Path) -> Result<Vec<PathBuf>, String> {
     if !output.status.success() {
         return Err(format!(
             "cannot read Git submodule metadata: {}",
-            display_path(file)
+            display_path(&file)
         ));
     }
     output
