@@ -5204,6 +5204,9 @@ fn dev_watch_force_warns_for_installed_plugins_missing_from_source() {
 fn dev_watch_force_restores_runtime_service_when_source_watch_cannot_spawn() {
     let root = TestDir::new("dev-command-runtime-watch-spawn-fails");
     let repo = init_openclaw_repo(&root);
+    // Use unpacked source so the empty PATH reaches the missing Node launch,
+    // instead of failing earlier because Git metadata cannot be inspected.
+    fs::remove_dir_all(repo.join(".git")).unwrap();
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let env = service_env_with_gateway_admission(&root);
