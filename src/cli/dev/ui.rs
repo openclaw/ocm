@@ -683,6 +683,10 @@ function resolveUiPackage(name) {
     }
     // pnpm's UI links traverse the root alias into its isolated package tree.
     packageRoot = path.join(deferredModules, relative);
+    if (!fs.existsSync(packageRoot)) {
+      // Node skips a broken UI link and continues at the root modules tree.
+      packageRoot = path.join(deferredModules, name);
+    }
   } else {
     return uiRequire.resolve(name);
   }
@@ -941,12 +945,26 @@ for (const name of ['vite', 'dompurify']) {
                 // The UI consumes the root alias that native source bootstrap
                 // creates. Keep its owned startup gate closed until then.
                 let deadline = std::time::Instant::now() + DASHBOARD_TIMEOUT;
+                #[cfg(unix)]
+                let mut deadline = deadline;
                 while !modules.exists() {
                     if source_watch_cancelled(lease, stop)? {
                         return Ok(130);
                     }
                     if children[0].poll()?.is_some() {
                         return Err("OpenClaw source exited before preparing its node_modules link for the Control UI".to_string().into());
+                    }
+                    #[cfg(unix)]
+                    if observe_process(children[0].identity.pid)?
+                        .is_some_and(|process| process.stopped)
+                    {
+                        let suspended = std::time::Instant::now();
+                        children[0].guard.suspend_with_child(
+                            children[0].identity.pid,
+                            lease,
+                            stop,
+                        )?;
+                        deadline += suspended.elapsed();
                     }
                     if std::time::Instant::now() >= deadline {
                         return Err("OpenClaw source did not prepare its node_modules link for the Control UI within 30 seconds".to_string().into());

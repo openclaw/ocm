@@ -1132,6 +1132,7 @@ fn dev_ui_checks_configured_modules_before_native_linking() {
     for variant in [
         "hoisted",
         "isolated",
+        "stale-ui-link",
         "missing-package",
         "foreign-package",
         "foreign-ui-links",
@@ -1139,6 +1140,7 @@ fn dev_ui_checks_configured_modules_before_native_linking() {
         "missing-override",
         "source-exit",
         "cancel-before-link",
+        "suspend-before-link",
     ] {
         let root = TestDir::new(&format!("dev-ui-configured-{variant}"));
         let mut env = ocm_env(&root);
@@ -1155,6 +1157,7 @@ const configured = process.env.PNPM_CONFIG_MODULES_DIR;
 if (!fs.existsSync(modules) && configured) {{
   fs.writeFileSync(path.join(process.env.OCM_TEST_DEV_UI_DIR, 'native-link-started'), 'absent');
   if ('{variant}' === 'source-exit') process.exit(0);
+  if ('{variant}' === 'suspend-before-link') process.kill(process.pid, 'SIGSTOP');
   if ('{variant}' === 'cancel-before-link') {{
     process.once('SIGTERM', () => process.exit(0));
     await new Promise(() => setInterval(() => {{}}, 100));
@@ -1216,6 +1219,15 @@ await import('./dev-ui-fixture.cjs');
             "dompurify"
         });
         match variant {
+            "stale-ui-link" => {
+                let ui_modules = repo.join("ui/node_modules");
+                fs::create_dir_all(&ui_modules).unwrap();
+                std::os::unix::fs::symlink(
+                    "../../node_modules/.pnpm/stale-vite/node_modules/vite",
+                    ui_modules.join("vite"),
+                )
+                .unwrap();
+            }
             "missing-package" => fs::remove_file(dompurify.join("index.js")).unwrap(),
             "foreign-package" => {
                 let foreign = root.child("foreign-package");
@@ -1272,6 +1284,16 @@ await import('./dev-ui-fixture.cjs');
             assert!(!root.child("ui.json").exists(), "{variant}");
         } else {
             let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &["dev", "demo"]);
+            if variant == "suspend-before-link" {
+                let pid = controller.child.as_ref().unwrap().id();
+                assert!(
+                    wait_for_process_stop(pid, Duration::from_secs(10)),
+                    "OCM did not suspend while waiting for native linking"
+                );
+                assert!(!root.child("ui.json").exists());
+                assert!(!repo.join("node_modules").exists());
+                assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
+            }
             let gateway = initial_ui_process(&root, "gateway", &mut controller);
             let ui = initial_ui_process(&root, "ui", &mut controller);
             assert_eq!(gateway["cwd"], path_string(&repo), "{variant}");
@@ -1280,7 +1302,10 @@ await import('./dev-ui-fixture.cjs');
             assert!(stopped.status.success(), "{variant}: {}", stderr(&stopped));
             assert_eq!(controller.wait_without_release().status.code(), Some(130));
         }
-        if matches!(variant, "hoisted" | "isolated") {
+        if matches!(
+            variant,
+            "hoisted" | "isolated" | "stale-ui-link" | "suspend-before-link"
+        ) {
             assert_eq!(
                 fs::read_to_string(root.child("native-link-started")).unwrap(),
                 "absent",

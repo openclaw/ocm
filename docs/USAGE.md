@@ -159,6 +159,8 @@ link, including pnpm UI package links through that root. OCM checks these
 dependencies without creating the link or accepting packages from another
 checkout. When the link is absent, the UI waits for native source startup to
 create it; cancellation, source exit, or a 30-second timeout ends that wait.
+Suspending the foreground source also suspends OCM and pauses that startup
+timeout until resume.
 `--service` uses the background
 workflow without foreground watching or UI and rejects explicit `--watch` or
 `--ui`. Existing authentication settings remain in effect.
