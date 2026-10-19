@@ -1144,7 +1144,9 @@ fn dev_ui_checks_configured_modules_before_native_linking() {
     ] {
         let root = TestDir::new(&format!("dev-ui-configured-{variant}"));
         let mut env = ocm_env(&root);
-        let repo = prepare_initial_ui_repo(&root, &mut env);
+        let repo = prepare_initial_ui_repo(&root, &mut env)
+            .canonicalize()
+            .unwrap();
         for entry in ["watch-node.mjs", "run-node.mjs"] {
             fs::write(
                 repo.join("scripts").join(entry),
