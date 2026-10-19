@@ -32,6 +32,7 @@ All notable changes to OCM are documented here.
 
 ### Changed
 
+- Update zip to 9.0.4 and refresh the pinned Rust toolchain installer action while retaining Rust 1.88 support.
 - Refresh eleven compatible Rust dependencies, including rustls 0.23.46, serde_json 1.0.154, and zip 9.0.3, while retaining Rust 1.88 support.
 - Refresh seven compatible Rust dependencies, including cc 1.7.0 and smallvec 1.16.3, while retaining Rust 1.88 support.
 - Update `libc` to 0.2.190 and the pinned Rust installer action to retry transient official-server checksum failures, retaining Rust 1.88 support.
