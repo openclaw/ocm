@@ -1,3 +1,5 @@
+#[path = "support/config_includes.rs"]
+mod config_includes;
 mod support;
 
 use std::{fs, path::Path};
@@ -1513,5 +1515,38 @@ fn env_import_relocates_native_bare_and_ordinary_git_includes() {
                 ))
             );
         }
+    }
+}
+
+#[test]
+fn env_import_relocates_config_includes_after_source_removal() {
+    for include_state in [false, true] {
+        let root = TestDir::new("import-config-includes");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source");
+        let fixture = config_includes::IncludedPluginConfig::seed(
+            &source.join(".openclaw"),
+            &root.child("external"),
+        );
+        let mut args = vec!["env", "export", "source", "--output", "copy.tar"];
+        if include_state {
+            args.push("--include-state");
+        }
+        let export = run_ocm(root.path(), &env, &args);
+        assert!(export.status.success(), "{}", stderr(&export));
+        let original = root.child("original");
+        fs::rename(&source, &original).unwrap();
+
+        let import = run_ocm(
+            root.path(),
+            &env,
+            &["env", "import", "copy.tar", "--name", "copied"],
+        );
+        assert!(import.status.success(), "{}", stderr(&import));
+        fixture.assert_relocated(&root.child("ocm-home/envs/copied/.openclaw"));
+        fixture.assert_source_unchanged(&original.join(".openclaw"));
+        assert!(!source.exists());
     }
 }

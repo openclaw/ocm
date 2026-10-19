@@ -396,11 +396,23 @@ fn rewrite_openclaw_config_with_path_rewriter(
         changed |= apply_simulation_identity_overlay(&mut value, target_paths, gateway_port)?;
     }
 
-    if !changed && !config_is_symlink {
-        return Ok(outcome);
+    if changed || config_is_symlink {
+        write_config_value(&target_paths.config_path, &value)?;
     }
 
-    write_config_value(&target_paths.config_path, &value)?;
+    if matches!(
+        sandbox_origin_policy,
+        SandboxOriginPolicy::NewEnvironment(_)
+    ) && !source_roots.is_empty()
+    {
+        rewrite_openclaw_config_includes_with_root_mappings(
+            &target_paths.config_path,
+            &target_paths.state_dir,
+            source_roots,
+            canonical_source_root,
+            target_root,
+        )?;
+    }
     Ok(outcome)
 }
 
@@ -542,6 +554,22 @@ pub(crate) fn rewrite_openclaw_config_includes_for_target(
     source_root: &Path,
     target_root: &Path,
 ) -> Result<bool, String> {
+    rewrite_openclaw_config_includes_with_root_mappings(
+        config_path,
+        state_dir,
+        &[source_root],
+        None,
+        target_root,
+    )
+}
+
+fn rewrite_openclaw_config_includes_with_root_mappings(
+    config_path: &Path,
+    state_dir: &Path,
+    source_roots: &[&Path],
+    canonical_source_root: Option<&Path>,
+    target_root: &Path,
+) -> Result<bool, String> {
     let include_paths = openclaw_config_include_paths(config_path, state_dir)?;
     let mut changed = false;
     for include_path in include_paths {
@@ -557,7 +585,12 @@ pub(crate) fn rewrite_openclaw_config_includes_for_target(
                 display_path(&include_path)
             )
         })?;
-        if rewrite_env_root_paths(&mut value, source_root, target_root) {
+        if rewrite_env_root_paths_from_roots(
+            &mut value,
+            source_roots,
+            canonical_source_root,
+            target_root,
+        ) {
             write_config_value(&include_path, &value)?;
             changed = true;
         }

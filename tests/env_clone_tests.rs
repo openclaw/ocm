@@ -1,3 +1,5 @@
+#[path = "support/config_includes.rs"]
+mod config_includes;
 mod support;
 
 use std::fs;
@@ -3720,4 +3722,19 @@ fn env_clone_copied_git_config_relocates_native_bare_repository_includes() {
         "copied"
     );
     assert_eq!(fs::read(target.join("HEAD")).unwrap(), head);
+}
+
+#[test]
+fn env_clone_relocates_nested_and_shared_config_includes() {
+    let root = TestDir::new("clone-config-includes");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    let fixture = config_includes::IncludedPluginConfig::seed(&source, &root.child("external"));
+
+    let clone = run_ocm(root.path(), &env, &["env", "clone", "source", "copied"]);
+    assert!(clone.status.success(), "{}", stderr(&clone));
+    fixture.assert_relocated(&root.child("ocm-home/envs/copied/.openclaw"));
+    fixture.assert_source_unchanged(&source);
 }
