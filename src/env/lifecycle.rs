@@ -521,7 +521,11 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn prune_candidates(&self, older_than_days: i64) -> Result<Vec<EnvMeta>, String> {
         let envs = list_environments(self.env, self.cwd)?;
-        Ok(select_prune_candidates(&envs, older_than_days))
+        let candidates = select_prune_candidates(&envs, older_than_days);
+        for candidate in &candidates {
+            crate::store::ensure_environment_removal_preserves_registered_roots(candidate, &envs)?;
+        }
+        Ok(candidates)
     }
 
     pub fn prune(&self, older_than_days: i64) -> Result<Vec<EnvMeta>, String> {

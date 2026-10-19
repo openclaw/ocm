@@ -1645,10 +1645,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             )],
             &[
                 ("--yes", "Apply destruction instead of showing a preview"),
-                (
-                    "--force",
-                    "Override protection checks and destroy the env anyway",
-                ),
+                ("--force", "Override protection for the target environment"),
                 (
                     "--if-state-token <token>",
                     "Apply only if state still matches a JSON preview",
@@ -1667,6 +1664,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 "An ordinary --yes apply first stops and verifies the recorded source-watch generation. Unverifiable ownership blocks removal.",
                 "Guarded --if-state-token apply requires a stopped watch: run dev stop, then request a fresh destroy preview.",
                 "Destroy does not remove shared runtimes or launchers.",
+                "Legacy roots containing another registered environment or its required links block destruction, even with --force.",
                 "Registered and active temporary dev sources and their required Git metadata block containing cleanup, even with --force.",
                 "If the separate machine-wide OpenClaw service is using the env, destroy refuses to apply.",
                 "TTY output uses cards by default. Piped output stays plain.",
@@ -1692,6 +1690,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Protected environments require `--force`.",
+                "Legacy roots containing another registered environment or its required links cannot be removed, even with --force. Remove that environment separately first.",
                 "Cleanup preserves registered and active temporary dev sources and their required Git metadata.",
                 "Active or unfinished source watches must be stopped with dev stop before remove or prune can delete their state.",
             ],
@@ -1719,6 +1718,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} env prune --older-than 30 --yes"),
             ],
             &[
+                "Legacy roots containing another registered environment or its required links block preview and apply. Remove that environment separately first.",
                 "Active or unfinished source watches block removal; run dev stop for those envs first.",
                 "Cleanup preserves registered and active temporary dev sources and their required Git metadata.",
             ],

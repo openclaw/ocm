@@ -31,8 +31,9 @@ pub(crate) use dev_registration::{DevSourceRegistration, with_prepared_dev_sourc
 pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
 pub(crate) use dev_ui_ports::reserve as reserve_dev_ui_port;
 pub(crate) use envs::{
-    EnvironmentOperationLock, lock_env_registry, lock_environment_operation,
-    rebind_environment_dev, remove_environment_locked, validate_gateway_port,
+    EnvironmentOperationLock, ensure_environment_removal_preserves_registered_roots,
+    lock_env_registry, lock_environment_operation, rebind_environment_dev,
+    remove_environment_locked, validate_gateway_port,
 };
 pub(crate) use envs::{
     EnvironmentServicePolicyChange, environment_service_policy_revision,

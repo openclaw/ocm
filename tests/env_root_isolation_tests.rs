@@ -5,9 +5,117 @@ use std::fs;
 use std::path::Path;
 use std::process::Output;
 
-use ocm::store::{env_registry_path, get_environment};
+use ocm::store::{env_registry_path, get_environment, remove_environment, save_environment};
 
 use support::{TestDir, ocm_env, path_string, run_ocm, stderr, write_text};
+
+fn legacy_child(
+    fixture: &TestDir,
+    env: &BTreeMap<String, String>,
+    root: &Path,
+    protected: bool,
+) -> ocm::env::EnvMeta {
+    let created = run_ocm(fixture.path(), env, &["env", "create", "child"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let mut child = get_environment("child", env, fixture.path()).unwrap();
+    // Persist the layout admitted by OCM 0.2.44 without weakening new admission.
+    fs::rename(&child.root, root).unwrap();
+    child.root = path_string(root);
+    child.protected = protected;
+    save_environment(child, env, fixture.path()).unwrap()
+}
+
+#[test]
+fn legacy_child_roots_block_parent_removal_even_with_force() {
+    for protected in [false, true] {
+        for missing in [false, true] {
+            let fixture = TestDir::new("legacy-child-root-removal");
+            let env = ocm_env(&fixture);
+            for name in ["parent", "parent-sibling"] {
+                let created = run_ocm(fixture.path(), &env, &["env", "create", name]);
+                assert!(created.status.success(), "{}", stderr(&created));
+            }
+            let parent = get_environment("parent", &env, fixture.path()).unwrap();
+            let child = legacy_child(
+                &fixture,
+                &env,
+                &Path::new(&parent.root).join("nested"),
+                protected,
+            );
+            let marker = Path::new(&child.root).join(".openclaw/workspace/keep.txt");
+            write_text(&marker, "child data\n");
+            let retained = fixture.child("retained-child");
+            if missing {
+                fs::rename(&child.root, &retained).unwrap();
+            }
+            let registry = env_registry_path(&env, fixture.path()).unwrap();
+            let before = fs::read(&registry).unwrap();
+            for force in [false, true] {
+                let error = remove_environment("parent", force, &env, fixture.path()).unwrap_err();
+                assert!(error.contains("registered environment child"), "{error}");
+                let mut args = vec!["env", "remove", "parent"];
+                if force {
+                    args.push("--force");
+                }
+                let refused = run_ocm(fixture.path(), &env, &args);
+                assert!(!refused.status.success());
+                assert!(stderr(&refused).contains("registered environment child"));
+                assert_eq!(fs::read(&registry).unwrap(), before);
+                let preserved = if missing {
+                    retained.join(".openclaw/workspace/keep.txt")
+                } else {
+                    marker.clone()
+                };
+                assert_eq!(fs::read_to_string(preserved).unwrap(), "child data\n");
+            }
+            // A selected child remains individually removable; force applies to it only.
+            if protected {
+                let error = remove_environment("child", false, &env, fixture.path()).unwrap_err();
+                assert!(error.contains("is protected"), "{error}");
+            }
+            remove_environment("child", protected, &env, fixture.path()).unwrap();
+            remove_environment("parent", false, &env, fixture.path()).unwrap();
+            let sibling = get_environment("parent-sibling", &env, fixture.path()).unwrap();
+            assert!(Path::new(&sibling.root).is_dir());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_child_root_links_are_preserved_without_following_a_removed_root_link() {
+    use std::os::unix::fs::symlink;
+    for child_uses_link in [false, true] {
+        let fixture = TestDir::new("legacy-child-root-link-removal");
+        let env = ocm_env(&fixture);
+        let created = run_ocm(fixture.path(), &env, &["env", "create", "parent"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let parent = get_environment("parent", &env, fixture.path()).unwrap();
+        let actual_parent = fixture.child("actual-parent");
+        fs::rename(&parent.root, &actual_parent).unwrap();
+        symlink(&actual_parent, &parent.root).unwrap();
+        let child = legacy_child(&fixture, &env, &actual_parent.join("nested"), true);
+        let marker = actual_parent.join("nested/.openclaw/workspace/keep.txt");
+        write_text(&marker, "child data\n");
+        if child_uses_link {
+            let mut aliased = child;
+            aliased.root = path_string(&Path::new(&parent.root).join("nested"));
+            save_environment(aliased, &env, fixture.path()).unwrap();
+            let registry = env_registry_path(&env, fixture.path()).unwrap();
+            let before = fs::read(&registry).unwrap();
+            let error = remove_environment("parent", true, &env, fixture.path()).unwrap_err();
+            assert!(error.contains("registered environment child"), "{error}");
+            assert_eq!(fs::read(&registry).unwrap(), before);
+            assert!(fs::symlink_metadata(&parent.root).unwrap().is_symlink());
+        } else {
+            // The other registration uses the actual directory, so unlinking this
+            // separate alias does not remove its root or its access path.
+            remove_environment("parent", false, &env, fixture.path()).unwrap();
+            assert!(fs::symlink_metadata(&parent.root).is_err());
+        }
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "child data\n");
+    }
+}
 
 fn admit(
     fixture: &TestDir,

@@ -1267,8 +1267,11 @@ impl Cli {
         let mut snapshots = self.environment_service().list_snapshots(Some(name))?;
         snapshots.sort_by(|left, right| left.id.cmp(&right.id));
         let mut blockers = Vec::new();
-        let source_blocked = if let Err(error) =
+        let removal_blocked = if let Err(error) =
             crate::store::with_locked_environments(&self.env, &self.cwd, |envs| {
+                crate::store::ensure_environment_removal_preserves_registered_roots(
+                    &env_meta, envs,
+                )?;
                 crate::store::ensure_environment_removal_preserves_dev_sources(
                     &env_meta,
                     envs,
@@ -1295,7 +1298,7 @@ impl Cli {
         // its generation-bound protocol before taking the ordinary stable
         // process snapshot; a token-guarded apply refuses unfinished sessions.
         let process_inspection_deferred = source_watch_session.is_some() || source_watch_active;
-        let process_candidates = if process_inspection_deferred || source_blocked {
+        let process_candidates = if process_inspection_deferred || removal_blocked {
             Vec::new()
         } else {
             self.destroy_process_candidates(&env_meta)?

@@ -1567,6 +1567,42 @@ pub fn remove_environment(
     remove_environment_locked(name, force, env, cwd, |_| Ok(()))
 }
 
+pub(crate) fn ensure_environment_removal_preserves_registered_roots(
+    target: &EnvMeta,
+    envs: &[EnvMeta],
+) -> Result<(), String> {
+    let root = Path::new(&target.root);
+    if !path_exists(root) {
+        return Ok(());
+    }
+    // remove_dir_all unlinks a final symlink instead of traversing its target.
+    // Resolve ancestors while retaining that entry's actual deletion boundary.
+    let removal_root = if fs::symlink_metadata(root)
+        .map_err(|error| error.to_string())?
+        .is_symlink()
+    {
+        fs::canonicalize(root.parent().ok_or("environment root has no parent")?)
+            .map_err(|error| error.to_string())?
+            .join(root.file_name().ok_or("environment root has no name")?)
+    } else {
+        fs::canonicalize(root).map_err(|error| error.to_string())?
+    };
+    for other in envs.iter().filter(|meta| meta.name != target.name) {
+        let (registered, mut entries) =
+            super::dev_registration::registration_path(Path::new(&other.root))?;
+        entries.insert(registered);
+        for entry in entries {
+            if super::dev_sources::projected_path_contains(&removal_root, &entry)? {
+                return Err(format!(
+                    "cannot remove environment {}: its root contains registered environment {} root {} or a link needed to reach it; remove that environment separately first",
+                    target.name, other.name, other.root
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn remove_environment_locked(
     name: &str,
     force: bool,
@@ -1591,6 +1627,7 @@ pub(crate) fn remove_environment_locked(
 
     let paths = derive_env_paths(Path::new(&meta.root));
 
+    ensure_environment_removal_preserves_registered_roots(&meta, &registry.envs)?;
     super::dev_sources::ensure_environment_removal_preserves_dev_sources(
         &meta,
         &registry.envs,

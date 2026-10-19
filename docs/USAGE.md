@@ -1193,6 +1193,13 @@ ocm env destroy mira
 ocm env destroy mira --yes
 ```
 
+For legacy layouts created before overlapping roots were rejected, removal refuses
+to delete another registered environment's root or a link needed to reach it.
+This applies to `env remove`, destroy preview and apply, and prune preview and apply.
+Remove the child environment separately before removing its containing parent.
+`--force` overrides only the selected environment's protection; it does not select
+registered children for deletion. Disjoint environments remain independently removable.
+
 `environment service uninstalled: <env>` confirms that the environment was
 removed from OCM service supervision. It does not report deletion of the shared
 daemon: a running sibling keeps that daemon, and it may already be absent after
