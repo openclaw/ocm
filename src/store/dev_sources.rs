@@ -328,10 +328,62 @@ fn append_git_footprint(
     if include_worktree_entry && let Some(path) = git.worktree_entry {
         record_git_path(&path, footprint, reserve_missing, links)?;
     }
+    let objects = git.common_dir.join("objects");
     for path in [git.private_dir, git.common_dir] {
         if let Some(resolved) = record_git_path(&path, footprint, reserve_missing, links)? {
             footprint.content_roots.insert(resolved);
         }
+    }
+    append_git_object_footprint(footprint, objects, reserve_missing, links)
+}
+
+fn append_git_object_footprint(
+    footprint: &mut SourceFootprint,
+    objects: PathBuf,
+    reserve_missing: bool,
+    links: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    let mut pending = vec![objects];
+    let mut visited = BTreeSet::new();
+    // Bound the metadata graph, including repeated edges, without walking a
+    // checkout or its object files. Uninspectable graphs refuse the operation.
+    let mut paths_left = 1024usize;
+    while let Some(objects) = pending.pop() {
+        if paths_left == 0 {
+            return Err(
+                "cannot inspect Git object dependencies: too many alternate paths".to_string(),
+            );
+        }
+        paths_left -= 1;
+        if existing_cleanup_path(&objects)?.is_none() {
+            if reserve_missing {
+                reserve_path(&objects, footprint)?;
+            }
+            continue;
+        }
+        let resolved = record_path_entries(&objects, &mut footprint.entries, links)?;
+        footprint.content_roots.insert(resolved.clone());
+        if !visited.insert(resolved.clone()) {
+            continue;
+        }
+        let file = resolved.join("info/alternates");
+        match fs::symlink_metadata(&file) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+        if record_git_path(&file, footprint, reserve_missing, links)?.is_none() {
+            continue;
+        }
+        let alternates = crate::openclaw_repo::read_git_alternates(&file)?;
+        if alternates.len() + pending.len() > paths_left {
+            return Err(
+                "cannot inspect Git object dependencies: too many alternate paths".to_string(),
+            );
+        }
+        // Git resolves relative alternates against this object directory, not
+        // info/ or the checkout. Keep '..' until symlinks have been resolved.
+        pending.extend(alternates.into_iter().map(|path| resolved.join(path)));
     }
     Ok(())
 }

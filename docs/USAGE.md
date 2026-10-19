@@ -722,6 +722,13 @@ When OCM reports that it cannot resolve or inspect a registered source, it stops
 before writing the destination. Check the recorded source with `ocm env show
 <env>`, restore that checkout's path or access permissions, then retry.
 
+Registered sources retain their required Git object stores, including relative and
+transitive `objects/info/alternates` references from shared clones and path aliases.
+Removing an environment that contains this storage is refused before deletion; an
+independent clone with its own objects does not keep its former donor reserved.
+Missing borrowed object paths stay reserved, while unreadable or excessive Git
+dependency metadata requires restoring that metadata before cleanup can proceed.
+
 Removal, pruning, destroy, and simulation cleanup also protect checkouts and Git
 metadata used by another environment's active temporary source session, including
 `ocm dev <env> --repo <checkout> --watch --force`. A containing cleanup refuses

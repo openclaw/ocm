@@ -446,3 +446,226 @@ fn borrowed_state_roots_cannot_overlap_the_source_or_its_git_metadata() {
     assert!(!repo.join(".git/new-state").exists());
     create("main-source", None, Some(borrowed(&repo)), &env, cwd).unwrap();
 }
+
+#[test]
+fn removal_preserves_shared_git_objects_but_allows_independent_clones() {
+    for mode in ["shared", "copied", "linked"] {
+        let fixture = TestDir::new(&format!("git-objects-{mode}"));
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        let donor_root = fixture.child("donor-env");
+        create("donor", Some(&donor_root), None, &env, cwd).unwrap();
+        let donor = init_checkout(&donor_root.join("checkout"));
+        let source = fixture.child("borrowed-source");
+        if mode == "linked" {
+            git(
+                &donor,
+                &["worktree", "add", "--detach", &path_string(&source)],
+            );
+        } else {
+            git(
+                cwd,
+                &[
+                    "clone",
+                    if mode == "shared" {
+                        "--shared"
+                    } else {
+                        "--no-hardlinks"
+                    },
+                    &path_string(&donor),
+                    &path_string(&source),
+                ],
+            );
+        }
+        create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let before = fs::read(&registry).unwrap();
+        assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
+        git(&source, &["fsck", "--no-dangling"]);
+        let removed = run_ocm(cwd, &env, &["env", "remove", "donor", "--force"]);
+        if mode == "copied" {
+            assert!(removed.status.success(), "{}", stderr(&removed));
+            assert!(!donor_root.exists());
+        } else {
+            assert!(!removed.status.success());
+            assert!(
+                stderr(&removed).contains("registered dev source"),
+                "{}",
+                stderr(&removed)
+            );
+            assert!(donor_root.exists());
+            assert_eq!(fs::read(&registry).unwrap(), before);
+        }
+        assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
+        git(&source, &["fsck", "--no-dangling"]);
+    }
+}
+
+#[test]
+fn removal_follows_relative_quoted_transitive_alternates_and_stops_cycles() {
+    let fixture = TestDir::new("transitive-git-objects");
+    let cwd = fixture.path();
+    let env = ocm_env(&fixture);
+    let donor_root = fixture.child("donor-env");
+    create("donor", Some(&donor_root), None, &env, cwd).unwrap();
+    let donor = init_checkout(&donor_root.join("checkout"));
+    let middle = fixture.child("middle checkout");
+    let source = fixture.child("borrowed-source");
+    git(
+        cwd,
+        &[
+            "clone",
+            "--shared",
+            &path_string(&donor),
+            &path_string(&middle),
+        ],
+    );
+    git(
+        cwd,
+        &[
+            "clone",
+            "--shared",
+            &path_string(&middle),
+            &path_string(&source),
+        ],
+    );
+    write_text(
+        &source.join(".git/objects/info/alternates"),
+        "# Git object dependencies\n\n\"../../../middle\\040checkout/.git/objects\"\n",
+    );
+    // The donor owns the objects. Its backlink forms a cycle without changing
+    // the borrower's need for the donor's object database.
+    write_text(
+        &donor.join(".git/objects/info/alternates"),
+        &format!("{}\n", path_string(&source.join(".git/objects"))),
+    );
+    create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
+    git(&source, &["fsck", "--no-dangling"]);
+    let removed = run_ocm(cwd, &env, &["env", "remove", "donor"]);
+    assert!(!removed.status.success());
+    assert!(
+        stderr(&removed).contains("registered dev source"),
+        "{}",
+        stderr(&removed)
+    );
+    assert!(donor_root.exists());
+    assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
+    git(&source, &["fsck", "--no-dangling"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn removal_preserves_git_object_and_alternates_path_aliases() {
+    use std::os::unix::fs::symlink;
+    for mode in ["alternate-path", "alternate-file", "primary-objects"] {
+        let fixture = TestDir::new(&format!("git-object-alias-{mode}"));
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        let donor_root = fixture.child("donor-env");
+        create("donor", Some(&donor_root), None, &env, cwd).unwrap();
+        let donor = init_checkout(&fixture.child("outside-donor"));
+        let source = fixture.child("borrowed-source");
+        git(
+            cwd,
+            &[
+                "clone",
+                "--shared",
+                &path_string(&donor),
+                &path_string(&source),
+            ],
+        );
+        let objects = source.join(".git/objects");
+        let alternates = objects.join("info/alternates");
+        let alias = donor_root.join("dependency");
+        match mode {
+            "alternate-path" => {
+                symlink(donor.join(".git/objects"), &alias).unwrap();
+                write_text(&alternates, &format!("{}\n", path_string(&alias)));
+            }
+            "alternate-file" => {
+                fs::rename(&alternates, &alias).unwrap();
+                symlink(&alias, &alternates).unwrap();
+            }
+            _ => {
+                fs::rename(&objects, &alias).unwrap();
+                symlink(&alias, &objects).unwrap();
+            }
+        }
+        create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
+        git(&source, &["fsck", "--no-dangling"]);
+        let removed = run_ocm(cwd, &env, &["env", "remove", "donor"]);
+        assert!(!removed.status.success(), "{mode}");
+        assert!(
+            stderr(&removed).contains("registered dev source"),
+            "{mode}: {}",
+            stderr(&removed)
+        );
+        assert!(donor_root.exists());
+        assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
+        git(&source, &["fsck", "--no-dangling"]);
+    }
+}
+
+#[test]
+fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
+    for mode in ["missing", "directory", "oversized", "too-many"] {
+        let fixture = TestDir::new(&format!("git-alternate-metadata-{mode}"));
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        let donor_root = fixture.child("donor-env");
+        create("donor", Some(&donor_root), None, &env, cwd).unwrap();
+        let donor = init_checkout(&donor_root.join("checkout"));
+        let source = fixture.child("borrowed-source");
+        git(
+            cwd,
+            &[
+                "clone",
+                "--shared",
+                &path_string(&donor),
+                &path_string(&source),
+            ],
+        );
+        create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
+        create("unrelated", None, None, &env, cwd).unwrap();
+        let alternates = source.join(".git/objects/info/alternates");
+        let original = fs::read_to_string(&alternates).unwrap();
+        match mode {
+            "missing" => write_text(
+                &alternates,
+                &format!(
+                    "{}\n{original}",
+                    path_string(&fixture.child("absent-objects"))
+                ),
+            ),
+            "directory" => {
+                fs::remove_file(&alternates).unwrap();
+                fs::create_dir(&alternates).unwrap();
+            }
+            "oversized" => write_text(&alternates, &"#".repeat(65537)),
+            _ => write_text(&alternates, &".\n".repeat(1024)),
+        }
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let before = fs::read(&registry).unwrap();
+        let removed = run_ocm(cwd, &env, &["env", "remove", "donor"]);
+        assert!(!removed.status.success(), "{mode}");
+        let expected = match mode {
+            "missing" => "registered dev source",
+            "too-many" => "too many alternate paths",
+            _ => "invalid Git alternates file",
+        };
+        assert!(
+            stderr(&removed).contains(expected),
+            "{mode}: {}",
+            stderr(&removed)
+        );
+        assert!(donor_root.exists());
+        assert_eq!(fs::read(&registry).unwrap(), before);
+        if mode == "missing" {
+            // Missing unrelated storage remains reserved but does not block a
+            // disjoint removal or hide the surviving donor dependency.
+            let removed = run_ocm(cwd, &env, &["env", "remove", "unrelated"]);
+            assert!(removed.status.success(), "{}", stderr(&removed));
+            assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
+        }
+    }
+}

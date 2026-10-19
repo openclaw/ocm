@@ -485,48 +485,6 @@ fn git_value(path: &Path, args: &[&str]) -> Result<String, String> {
         .to_string())
 }
 
-// Git paths use C quoting, including three-digit octal byte escapes.
-// A malformed quoted alternate is a literal path, matching Git's fallback.
-fn unquote_git_path(input: &[u8]) -> Option<(Vec<u8>, usize)> {
-    if input.first() != Some(&b'"') {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    let mut cursor = 1;
-    loop {
-        let byte = *input.get(cursor)?;
-        cursor += 1;
-        match byte {
-            b'"' => return Some((bytes, cursor)),
-            b'\\' => {
-                let escaped = *input.get(cursor)?;
-                cursor += 1;
-                bytes.push(match escaped {
-                    b'a' => 7,
-                    b'b' => 8,
-                    b't' => b'\t',
-                    b'n' => b'\n',
-                    b'v' => 11,
-                    b'f' => 12,
-                    b'r' => b'\r',
-                    b'\\' | b'"' => escaped,
-                    b'0'..=b'3' => {
-                        let digits = input.get(cursor..cursor + 2)?;
-                        if !digits.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
-                            return None;
-                        }
-                        cursor += 2;
-                        ((escaped - b'0') << 6) | ((digits[0] - b'0') << 3) | (digits[1] - b'0')
-                    }
-                    _ => return None,
-                });
-            }
-            0 => return None,
-            _ => bytes.push(byte),
-        }
-    }
-}
-
 impl CopyGraph<'_> {
     fn project(&self, path: &Path) -> Option<PathBuf> {
         let path = native_path(path);
@@ -852,8 +810,8 @@ impl CopyGraph<'_> {
                 remaining = &remaining[consumed..];
                 continue;
             }
-            let (mut raw, consumed) =
-                unquote_git_path(remaining).unwrap_or_else(|| (remaining[..end].to_vec(), end));
+            let (mut raw, consumed) = crate::openclaw_repo::unquote_git_path(remaining)
+                .unwrap_or_else(|| (remaining[..end].to_vec(), end));
             remaining = &remaining[(consumed + 1).min(remaining.len())..];
             if let Some(end) = raw.iter().position(|byte| *byte == 0) {
                 raw.truncate(end);
