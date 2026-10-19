@@ -288,6 +288,7 @@ fn start_reuses_launcher_with_equivalent_cwd_and_preserves_conflicts() {
     let root = TestDir::new("start-command-cwd-reuse");
     let cwd = root.child("workspace");
     fs::create_dir_all(cwd.join("other")).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
     let env = ocm_env(&root);
     let start = |command: &str, directory: Option<&str>| {
         let mut args = vec![
@@ -332,6 +333,34 @@ fn start_reuses_launcher_with_equivalent_cwd_and_preserves_conflicts() {
         assert_eq!(refused.status.code(), Some(1));
         assert!(stderr(&refused).contains("already exists with different settings"));
         assert_eq!(fs::read(&launcher_path).unwrap(), original);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn start_preserves_relative_cwd_when_directory_name_ends_in_space() {
+    let root = TestDir::new("start-command-cwd-space");
+    let cwd = root.child("workspace ");
+    fs::create_dir_all(&cwd).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+    let env = ocm_env(&root);
+    let args = [
+        "start",
+        "demo",
+        "--command",
+        "openclaw",
+        "--cwd",
+        ".",
+        "--no-service",
+    ];
+    for _ in 0..2 {
+        let started = run_ocm(&cwd, &env, &args);
+        assert!(started.status.success(), "{}", stderr(&started));
+        let launcher: Value = serde_json::from_slice(
+            &fs::read(root.child("ocm-home/launchers/demo.local.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(launcher["cwd"], path_string(&cwd));
     }
 }
 

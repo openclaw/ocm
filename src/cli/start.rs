@@ -467,7 +467,7 @@ impl Cli {
                 self.launcher_service().add(AddLauncherOptions {
                     name: launcher_name.clone(),
                     command: command.to_string(),
-                    cwd: desired_cwd,
+                    cwd: cwd.map(str::to_string),
                     description: Some(format!("Local command for env {env_name}")),
                 })?;
                 Ok(launcher_name)
