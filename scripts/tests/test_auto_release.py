@@ -134,7 +134,7 @@ class CIGateTests(unittest.TestCase):
                    "head_repository": {"full_name": release.REPO}, "status": "completed",
                    "conclusion": "success", "html_url": "https://github.com/openclaw/ocm/actions/runs/42"}
         names = ("Format", "Rust 1.88 minimum", "Windows compile",
-                 "Test (ubuntu-latest)", "Test (xcode-27)",
+                 "Test (ubuntu-latest)", "Test (macos-latest)",
                  "npm (ubuntu-latest, Node 22.15.0)", "npm (ubuntu-latest, Node 24)",
                  "npm (xcode-27-x86_64, Node 24)", "npm (xcode-27-arm64, Node 24)")
         self.jobs = {"total_count": len(names), "jobs": [
@@ -169,10 +169,8 @@ class CIGateTests(unittest.TestCase):
             self.check([self.ci], {"total_count": self.jobs["total_count"],
                                    "jobs": self.jobs["jobs"][:-1]})
 
-    def test_missing_failed_or_replaced_npm_jobs_stop_release(self):
+    def test_missing_failed_or_replaced_required_jobs_stop_release(self):
         for index, job in enumerate(self.jobs["jobs"]):
-            if not job["name"].startswith("npm ("):
-                continue
             for outcome in ["missing", "failure", "skipped", None, "renamed", "duplicate"]:
                 with self.subTest(job=job["name"], outcome=outcome):
                     jobs = copy.deepcopy(self.jobs)
@@ -180,9 +178,9 @@ class CIGateTests(unittest.TestCase):
                         jobs["jobs"].pop(index)
                         jobs["total_count"] -= 1
                     elif outcome == "renamed":
-                        jobs["jobs"][index]["name"] = "unexpected npm job"
+                        jobs["jobs"][index]["name"] = "unexpected job"
                     elif outcome == "duplicate":
-                        jobs["jobs"][index]["name"] = "Format"
+                        jobs["jobs"][index]["name"] = self.jobs["jobs"][index - 1]["name"]
                     else:
                         jobs["jobs"][index]["conclusion"] = outcome
                     with self.assertRaisesRegex(release.ReleaseError, "every required release job"):
