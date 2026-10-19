@@ -3260,7 +3260,7 @@ fn migrate_and_adopt_relocate_config_includes() {
     for adopt in [false, true] {
         let root = TestDir::new("migrate-config-includes");
         let env = ocm_env(&root);
-        let source = root.child("plain-home");
+        let source = root.child("source/plain-home");
         let fixture = config_includes::IncludedPluginConfig::seed(&source, &root.child("external"));
         let args = if adopt {
             vec![

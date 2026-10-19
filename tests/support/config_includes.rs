@@ -9,11 +9,29 @@ pub struct IncludedPluginConfig {
     files: Vec<(PathBuf, String)>,
     external: PathBuf,
     external_traversal: PathBuf,
+    #[cfg(unix)]
+    external_symlink_parent: PathBuf,
 }
 
 impl IncludedPluginConfig {
     pub fn seed(state: &Path, external: &Path) -> Self {
         let external_traversal = state.join("../../external/demo");
+        let mut paths = vec![
+            state.join("extensions/demo"),
+            external.to_path_buf(),
+            external_traversal.clone(),
+        ];
+        #[cfg(unix)]
+        let external_symlink_parent = {
+            let path = state.join("extensions/redirect/../demo");
+            paths.extend([
+                path.clone(),
+                state.join("extensions/local-redirect/../demo"),
+            ]);
+            path
+        };
+        #[cfg(not(unix))]
+        let _ = &mut paths;
         let files = vec![
             (
                 PathBuf::from("openclaw.json"),
@@ -31,8 +49,7 @@ impl IncludedPluginConfig {
             ),
             (
                 PathBuf::from("config/load.json5"),
-                json!({"paths": [state.join("extensions/demo"), external, external_traversal]})
-                    .to_string(),
+                json!({"paths": paths}).to_string(),
             ),
             (
                 PathBuf::from("unchanged.json5"),
@@ -57,6 +74,12 @@ impl IncludedPluginConfig {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            fs::create_dir_all(external.join("deep")).unwrap();
+            fs::create_dir_all(external.join("demo")).unwrap();
+            fs::create_dir_all(state.join("extensions/deep")).unwrap();
+            std::os::unix::fs::symlink(external.join("deep"), state.join("extensions/redirect"))
+                .unwrap();
+            std::os::unix::fs::symlink("deep", state.join("extensions/local-redirect")).unwrap();
             fs::set_permissions(
                 state.join("config/load.json5"),
                 fs::Permissions::from_mode(0o640),
@@ -67,6 +90,8 @@ impl IncludedPluginConfig {
             files,
             external: external.to_path_buf(),
             external_traversal,
+            #[cfg(unix)]
+            external_symlink_parent,
         }
     }
 
@@ -83,13 +108,21 @@ impl IncludedPluginConfig {
         };
         let included = read("config/load.json5");
         let paths = included["paths"].as_array().unwrap();
-        assert_eq!(paths.len(), 3);
+        assert_eq!(paths.len(), if cfg!(unix) { 5 } else { 3 });
         assert_eq!(
             Path::new(paths[0].as_str().unwrap()),
             state.join("extensions/demo")
         );
         assert_eq!(paths[1], json!(self.external));
         assert_eq!(paths[2], json!(self.external_traversal));
+        #[cfg(unix)]
+        {
+            assert_eq!(paths[3], json!(self.external_symlink_parent));
+            assert_eq!(
+                Path::new(paths[4].as_str().unwrap()),
+                state.join("extensions/demo")
+            );
+        }
         self.assert_include_mode(state);
         assert_eq!(
             read("openclaw.json")["plugins"]["$include"],

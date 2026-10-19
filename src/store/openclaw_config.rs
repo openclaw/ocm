@@ -1467,10 +1467,9 @@ fn rewrite_env_root_paths_from_roots(
             // Never run a second pass over a rewritten destination value.
             for source in source_roots {
                 if let Ok(suffix) = Path::new(raw).strip_prefix(source) {
-                    let target = clean_path(&target_root.join(suffix));
-                    if !target.starts_with(clean_path(target_root)) {
+                    let Some(target) = map_env_root_suffix(suffix, target_root) else {
                         return false;
-                    }
+                    };
                     *raw = display_path(&target);
                     return true;
                 }
@@ -1528,12 +1527,27 @@ fn rewrite_env_root_string(raw: &mut String, source_root: &Path, target_root: &P
         suffix.to_path_buf()
     };
 
-    let target = clean_path(&target_root.join(suffix));
-    if !target.starts_with(clean_path(target_root)) {
+    let Some(target) = map_env_root_suffix(&suffix, target_root) else {
         return false;
-    }
+    };
     *raw = display_path(&target);
     true
+}
+
+fn map_env_root_suffix(suffix: &Path, target_root: &Path) -> Option<PathBuf> {
+    let target = target_root.join(suffix);
+    if suffix
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        // A symlink followed by .. has filesystem, not lexical, semantics.
+        // Inspect the copied graph so recorded archive roots still work when
+        // their original source has disappeared or an alias was retargeted.
+        let resolved = normalize_path_allow_missing(&target)?;
+        let root = normalize_path_allow_missing(target_root)?;
+        return resolved.starts_with(root).then_some(resolved);
+    }
+    Some(clean_path(&target))
 }
 
 pub(super) fn normalize_path_allow_missing(path: &Path) -> Option<PathBuf> {
