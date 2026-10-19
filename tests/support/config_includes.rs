@@ -27,6 +27,7 @@ impl IncludedPluginConfig {
             paths.extend([
                 path.clone(),
                 state.join("extensions/local-redirect/../demo"),
+                state.join("extensions/absolute-redirect/../demo"),
             ]);
             path
         };
@@ -80,6 +81,11 @@ impl IncludedPluginConfig {
             std::os::unix::fs::symlink(external.join("deep"), state.join("extensions/redirect"))
                 .unwrap();
             std::os::unix::fs::symlink("deep", state.join("extensions/local-redirect")).unwrap();
+            std::os::unix::fs::symlink(
+                state.join("extensions/deep"),
+                state.join("extensions/absolute-redirect"),
+            )
+            .unwrap();
             fs::set_permissions(
                 state.join("config/load.json5"),
                 fs::Permissions::from_mode(0o640),
@@ -108,7 +114,7 @@ impl IncludedPluginConfig {
         };
         let included = read("config/load.json5");
         let paths = included["paths"].as_array().unwrap();
-        assert_eq!(paths.len(), if cfg!(unix) { 5 } else { 3 });
+        assert_eq!(paths.len(), if cfg!(unix) { 6 } else { 3 });
         assert_eq!(
             Path::new(paths[0].as_str().unwrap()),
             state.join("extensions/demo")
@@ -118,10 +124,12 @@ impl IncludedPluginConfig {
         #[cfg(unix)]
         {
             assert_eq!(paths[3], json!(self.external_symlink_parent));
-            assert_eq!(
-                Path::new(paths[4].as_str().unwrap()),
-                state.join("extensions/demo")
-            );
+            for path in &paths[4..] {
+                assert_eq!(
+                    Path::new(path.as_str().unwrap()),
+                    state.join("extensions/demo")
+                );
+            }
         }
         self.assert_include_mode(state);
         assert_eq!(

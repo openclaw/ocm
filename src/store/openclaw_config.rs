@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 #[cfg(any(unix, windows))]
@@ -1467,7 +1467,9 @@ fn rewrite_env_root_paths_from_roots(
             // Never run a second pass over a rewritten destination value.
             for source in source_roots {
                 if let Ok(suffix) = Path::new(raw).strip_prefix(source) {
-                    let Some(target) = map_env_root_suffix(suffix, target_root) else {
+                    let Some(target) =
+                        map_env_root_suffix(suffix, source, source_roots, target_root)
+                    else {
                         return false;
                     };
                     *raw = display_path(&target);
@@ -1527,27 +1529,108 @@ fn rewrite_env_root_string(raw: &mut String, source_root: &Path, target_root: &P
         suffix.to_path_buf()
     };
 
-    let Some(target) = map_env_root_suffix(&suffix, target_root) else {
+    let canonical_source = suffix
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+        .then(|| normalize_path_allow_missing(source_root))
+        .flatten();
+    let source_roots = [
+        source_root,
+        canonical_source.as_deref().unwrap_or(source_root),
+    ];
+    let Some(target) = map_env_root_suffix(&suffix, source_root, &source_roots, target_root) else {
         return false;
     };
     *raw = display_path(&target);
     true
 }
 
-fn map_env_root_suffix(suffix: &Path, target_root: &Path) -> Option<PathBuf> {
-    let target = target_root.join(suffix);
-    if suffix
+fn map_env_root_suffix(
+    suffix: &Path,
+    source_root: &Path,
+    source_roots: &[&Path],
+    target_root: &Path,
+) -> Option<PathBuf> {
+    if !suffix
         .components()
         .any(|component| component == std::path::Component::ParentDir)
     {
-        // A symlink followed by .. has filesystem, not lexical, semantics.
-        // Inspect the copied graph so recorded archive roots still work when
-        // their original source has disappeared or an alias was retargeted.
-        let resolved = normalize_path_allow_missing(&target)?;
-        let root = normalize_path_allow_missing(target_root)?;
-        return resolved.starts_with(root).then_some(resolved);
+        return Some(clean_path(&target_root.join(suffix)));
     }
-    Some(clean_path(&target))
+
+    // Resolve parent traversal in the recorded source namespace, reading owned
+    // entries from the copied tree. Absolute internal links can still name a
+    // removed source; neither that source nor a retargeted root alias is read.
+    let mut resolved = source_root.to_path_buf();
+    let mut pending: VecDeque<OsString> = suffix
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect();
+    let mut links = 0;
+    while let Some(component) = pending.pop_front() {
+        if component == ".." {
+            resolved.pop();
+            continue;
+        }
+        if component == "." {
+            continue;
+        }
+        resolved.push(component);
+        let copied = source_roots.iter().find_map(|root| {
+            resolved
+                .strip_prefix(root)
+                .ok()
+                .map(|relative| target_root.join(relative))
+        });
+        let entry = copied.as_deref().unwrap_or(&resolved);
+        match fs::symlink_metadata(entry) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                links += 1;
+                if links > 40 {
+                    return None;
+                }
+                let link = fs::read_link(entry).ok()?;
+                resolved.pop();
+                let remainder = if link.is_absolute() {
+                    if let Some((root, relative)) = source_roots
+                        .iter()
+                        .find_map(|root| link.strip_prefix(root).ok().map(|path| (*root, path)))
+                    {
+                        resolved = root.to_path_buf();
+                        relative
+                    } else if let Ok(relative) = link.strip_prefix(target_root) {
+                        resolved = source_root.to_path_buf();
+                        relative
+                    } else {
+                        // External links retain normal filesystem semantics.
+                        // A final external destination must not be relocated.
+                        let rest: PathBuf = pending.iter().collect();
+                        let external = normalize_path_allow_missing(&link.join(rest))?;
+                        return source_roots.iter().find_map(|root| {
+                            external
+                                .strip_prefix(root)
+                                .ok()
+                                .map(|relative| target_root.join(relative))
+                        });
+                    }
+                } else {
+                    &link
+                };
+                for component in remainder.components().rev() {
+                    pending.push_front(component.as_os_str().to_owned());
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    source_roots.iter().find_map(|root| {
+        resolved
+            .strip_prefix(root)
+            .ok()
+            .map(|relative| target_root.join(relative))
+    })
 }
 
 pub(super) fn normalize_path_allow_missing(path: &Path) -> Option<PathBuf> {
