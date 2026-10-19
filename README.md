@@ -340,7 +340,9 @@ migration/finalization status, service state, and rollback outcome. History is
 stored as atomic JSON metadata under `OCM_HOME`; it does not copy config
 contents, command output, or credentials. A successful in-place update of a
 managed runtime retains the previous runtime files beside its transaction
-record. Removing or pruning the corresponding pre-upgrade snapshot removes
+record. Runtime backup and restoration preserve Unix directory modes, so recovery
+continues to match its recorded integrity digest when the command's umask changes.
+Removing or pruning the corresponding pre-upgrade snapshot removes
 those retained files; switching to a different runtime does not duplicate the
 source runtime.
 During an active upgrade or rollback, OCM also retains the previous runtime's lock until recovery or successful completion settles.

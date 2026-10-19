@@ -6130,6 +6130,192 @@ fn upgrade_rollback_restores_retained_in_place_runtime_bytes() {
     assert_eq!(stdout(&version).trim(), "2026.6.33");
 }
 
+#[cfg(unix)]
+#[test]
+fn upgrade_runtime_recovery_preserves_directory_modes_across_umasks() {
+    for (install, upgrade, rollback) in [
+        (0o022, 0o077, 0o077),
+        (0o077, 0o022, 0o022),
+        (0o022, 0o022, 0o077),
+        (0o077, 0o077, 0o022),
+        (0o022, 0o022, 0o022),
+        (0o077, 0o077, 0o077),
+    ] {
+        assert_runtime_recovery_modes(install, upgrade, rollback, false);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_upgrade_restores_runtime_directory_modes_across_umasks() {
+    for (install, upgrade) in [(0o022, 0o077), (0o077, 0o022)] {
+        assert_runtime_recovery_modes(install, upgrade, upgrade, true);
+    }
+}
+
+#[cfg(unix)]
+fn assert_runtime_recovery_modes(
+    install_mask: u32,
+    upgrade_mask: u32,
+    rollback_mask: u32,
+    fail_finalize: bool,
+) {
+    let root = TestDir::new("runtime-recovery-modes");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let old = "2026.3.24";
+    let new = "2026.3.25";
+    let old_package = openclaw_package_tarball(&recording_openclaw_script(old), old);
+    let new_package = openclaw_package_tarball(&recording_openclaw_script(new), new);
+    let old_server =
+        TestHttpServer::serve_bytes_times("/old.tgz", "application/octet-stream", &old_package, 4);
+    let new_server =
+        TestHttpServer::serve_bytes_times("/new.tgz", "application/octet-stream", &new_package, 4);
+    let packument = |latest: &str| {
+        serde_json::json!({
+        "dist-tags": { "latest": latest },
+        "versions": {
+            (old): { "version": old, "dist": { "tarball": old_server.url(), "integrity": sha512_integrity(&old_package) } },
+            (new): { "version": new, "dist": { "tarball": new_server.url(), "integrity": sha512_integrity(&new_package) } }
+        },
+        "time": { (old): "2026-03-24T00:00:00.000Z", (new): "2026-03-25T00:00:00.000Z" }
+    }).to_string().into_bytes()
+    };
+    let registry = TestHttpServer::serve_bytes_sequence(
+        "/openclaw",
+        "application/json",
+        vec![packument(old), packument(new), packument(new)],
+    );
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    env.insert("OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(), registry.url());
+
+    // Change only the child shell's umask; other tests share this test process.
+    let run = |args: &[&str], mask: u32, env: &BTreeMap<String, String>| {
+        Command::new("/bin/sh")
+            .args(["-c", &format!("umask {mask:03o}; exec \"$@\""), "ocm-umask"])
+            .arg(support::ocm_test_binary_path())
+            .args(args)
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(env)
+            .output()
+            .unwrap()
+    };
+    let start = run(
+        &["start", "demo", "--no-service", "--json"],
+        install_mask,
+        &env,
+    );
+    assert!(start.status.success(), "{}", stderr(&start));
+    let original = run(&["runtime", "show", "stable", "--json"], install_mask, &env);
+    assert!(original.status.success(), "{}", stderr(&original));
+    let original: Value = serde_json::from_str(&stdout(&original)).unwrap();
+    assert!(original["runtimeSha256"].is_string());
+    let install_root = Path::new(original["installRoot"].as_str().unwrap());
+    let directory_modes = |path: &Path| {
+        [
+            "",
+            "files",
+            "files/node_modules",
+            "files/node_modules/openclaw",
+        ]
+        .map(|relative| {
+            fs::metadata(path.join(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        })
+    };
+    let original_modes = directory_modes(install_root);
+    let verify = run(
+        &["runtime", "verify", "stable", "--json"],
+        install_mask,
+        &env,
+    );
+    assert!(
+        verify.status.success(),
+        "{} {}",
+        stdout(&verify),
+        stderr(&verify)
+    );
+
+    if fail_finalize {
+        env.insert("OCM_TEST_FAIL_UPDATE_FINALIZE".into(), "1".into());
+    }
+    let upgrade = run(&["upgrade", "demo", "--json"], upgrade_mask, &env);
+    let upgrade_json: Value = serde_json::from_str(&stdout(&upgrade)).unwrap();
+    if fail_finalize {
+        assert!(!upgrade.status.success());
+        assert_eq!(upgrade_json["outcome"], "rolled-back", "{upgrade_json}");
+        assert_eq!(upgrade_json["rollback"], "restored", "{upgrade_json}");
+    } else {
+        assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+        assert_eq!(upgrade_json["outcome"], "updated");
+        let verify = run(
+            &["runtime", "verify", "stable", "--json"],
+            upgrade_mask,
+            &env,
+        );
+        assert!(
+            verify.status.success(),
+            "{} {}",
+            stdout(&verify),
+            stderr(&verify)
+        );
+        let history = run(
+            &["upgrade", "history", "demo", "--json"],
+            upgrade_mask,
+            &env,
+        );
+        assert!(history.status.success(), "{}", stderr(&history));
+        let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
+        let recovery = root.child("ocm-home/upgrade-history/demo").join(format!(
+            "{}.recovery/stable/install-root",
+            history[0]["id"].as_str().unwrap(),
+        ));
+        assert_eq!(directory_modes(&recovery), original_modes);
+        let preview = run(
+            &["upgrade", "rollback", "demo", "--dry-run", "--json"],
+            rollback_mask,
+            &env,
+        );
+        assert!(preview.status.success(), "{}", stderr(&preview));
+        let rollback = run(
+            &["upgrade", "rollback", "demo", "--json"],
+            rollback_mask,
+            &env,
+        );
+        assert!(rollback.status.success(), "{}", stderr(&rollback));
+        let rollback: Value = serde_json::from_str(&stdout(&rollback)).unwrap();
+        assert_eq!(rollback["outcome"], "rolled-back");
+    }
+
+    assert_eq!(directory_modes(install_root), original_modes);
+    let restored = run(
+        &["runtime", "show", "stable", "--json"],
+        rollback_mask,
+        &env,
+    );
+    assert!(restored.status.success(), "{}", stderr(&restored));
+    let restored: Value = serde_json::from_str(&stdout(&restored)).unwrap();
+    assert_eq!(restored["releaseVersion"], old);
+    assert_eq!(restored["runtimeSha256"], original["runtimeSha256"]);
+    // This checks every recorded file byte and mode as well as directory modes.
+    let verify = run(
+        &["runtime", "verify", "stable", "--json"],
+        rollback_mask,
+        &env,
+    );
+    assert!(
+        verify.status.success(),
+        "{} {}",
+        stdout(&verify),
+        stderr(&verify)
+    );
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn rollback_refuses_runtime_mutation_when_quiescence_observation_is_lost() {

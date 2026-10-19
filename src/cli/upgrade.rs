@@ -42,7 +42,7 @@ use crate::store::{
     EnvironmentOperationLock, InstallContext, RuntimeBindingGuard, RuntimeMutationGuard,
     RuntimeReleaseDetails, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming, UpgradeHistoryRecord,
     UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState, UpgradeHistoryStage,
-    UpgradeRuntimeRecovery, clean_path, copy_dir_recursive, derive_env_paths, display_path,
+    UpgradeRuntimeRecovery, clean_path, copy_dir_preserving_modes, derive_env_paths, display_path,
     ensure_minimum_local_openclaw_config, ensure_store, get_runtime, get_upgrade_history_record,
     get_upgrade_runtime_recovery, install_runtime_from_selected_official_openclaw_release,
     list_upgrade_history, lock_env_registry, lock_upgrade_batch, lock_upgrade_participant,
@@ -1714,7 +1714,7 @@ impl Cli {
                 )
             })?;
         }
-        copy_dir_recursive(&recovery.install_root, &install_root)?;
+        copy_dir_preserving_modes(&recovery.install_root, &install_root)?;
         let meta_path = runtime_meta_path(&recovery.meta.name, &self.env, &self.cwd)?;
         write_json(&meta_path, &recovery.meta)
     }
@@ -5350,7 +5350,7 @@ impl Cli {
                 std::process::id(),
                 time::OffsetDateTime::now_utc().unix_timestamp_nanos()
             ));
-            copy_dir_recursive(&install_root, &backup_root)?;
+            copy_dir_preserving_modes(&install_root, &backup_root)?;
             Some(backup_root)
         } else {
             None
@@ -5763,7 +5763,7 @@ impl Cli {
                     )
                 })?;
             }
-            copy_dir_recursive(backup_root, &install_root)?;
+            copy_dir_preserving_modes(backup_root, &install_root)?;
         }
         write_json(&meta_path, &backup.meta)
     }

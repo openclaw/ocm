@@ -208,14 +208,19 @@ pub(crate) fn try_lock_file_shared(
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, None)
+    copy_dir_recursive_inner(source, destination, None, None, false)
+}
+
+/// Copy a runtime tree without changing the directory modes in its integrity digest.
+pub(crate) fn copy_dir_preserving_modes(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_dir_recursive_inner(source, destination, None, None, true)
 }
 
 pub(crate) fn copy_dir_preserving_permissions(
     source: &Path,
     destination: &Path,
 ) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, Some(destination))
+    copy_dir_recursive_inner(source, destination, None, Some(destination), false)
 }
 
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), String> {
@@ -317,7 +322,7 @@ impl<'a> OpenClawDirectoryCopy<'a> {
     }
 
     pub(crate) fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), String> {
-        copy_dir_recursive_inner(source, destination, Some(self), None)
+        copy_dir_recursive_inner(source, destination, Some(self), None, false)
     }
 
     pub(crate) fn databases(&self) -> &HashSet<PathBuf> {
@@ -330,6 +335,7 @@ fn copy_dir_recursive_inner(
     destination: &Path,
     mut copying: Option<&mut OpenClawDirectoryCopy<'_>>,
     private_root: Option<&Path>,
+    preserve_directory_modes: bool,
 ) -> Result<(), String> {
     if private_root.is_some() {
         ensure_private_dir(destination)?;
@@ -423,12 +429,13 @@ fn copy_dir_recursive_inner(
                 &destination_path,
                 copying.as_deref_mut(),
                 private_root,
+                preserve_directory_modes,
             )?;
         }
     }
 
-    if private_root.is_some_and(|root| root != destination) {
-        // Restore nested modes before exposing the containing directory.
+    if preserve_directory_modes || private_root.is_some_and(|root| root != destination) {
+        // Populate children before restoring modes, including read-only directories.
         let permissions = fs::metadata(source)
             .map_err(|error| error.to_string())?
             .permissions();
@@ -450,7 +457,7 @@ pub(crate) fn copy_path_recursive(source: &Path, destination: &Path) -> Result<(
 }
 
 pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_path_inner(source, destination, None, None)
+    copy_path_inner(source, destination, None, None, false)
 }
 
 fn copy_path_inner(
@@ -458,6 +465,7 @@ fn copy_path_inner(
     destination: &Path,
     copying: Option<&mut OpenClawDirectoryCopy<'_>>,
     private_root: Option<&Path>,
+    preserve_directory_modes: bool,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     let file_type = metadata.file_type();
@@ -473,7 +481,13 @@ fn copy_path_inner(
         return copy_symlink(source, destination, directory_hint);
     }
     if file_type.is_dir() {
-        return copy_dir_recursive_inner(source, destination, copying, private_root);
+        return copy_dir_recursive_inner(
+            source,
+            destination,
+            copying,
+            private_root,
+            preserve_directory_modes,
+        );
     }
     #[cfg(unix)]
     if file_type.is_socket() {
@@ -722,6 +736,65 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_copy_preserves_read_only_directory_modes_and_archive_privacy() {
+        use crate::infra::tree_digest::inventory_tree;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let nested = source.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("data"), "runtime bytes").unwrap();
+        std::os::unix::fs::symlink("missing", nested.join("link")).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o550)).unwrap();
+
+        let destination = root.path().join("runtime");
+        super::copy_dir_preserving_modes(&source, &destination).unwrap();
+        assert_eq!(
+            inventory_tree(&source).unwrap(),
+            inventory_tree(&destination).unwrap()
+        );
+
+        let private = root.path().join("private");
+        super::copy_dir_preserving_permissions(&source, &private).unwrap();
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            inventory_tree(&nested).unwrap(),
+            inventory_tree(&private.join("nested")).unwrap()
+        );
+
+        for path in [&source, &destination, &private] {
+            super::remove_owned_tree(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn runtime_copy_propagates_child_copy_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/data"), "runtime bytes").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("nested"), "occupied").unwrap();
+
+        assert!(super::copy_dir_preserving_modes(&source, &destination).is_err());
+        assert_eq!(
+            fs::read_to_string(source.join("nested/data")).unwrap(),
+            "runtime bytes"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("nested")).unwrap(),
+            "occupied"
+        );
     }
 
     #[cfg(unix)]
