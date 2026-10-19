@@ -1070,3 +1070,60 @@ fn env_cleanup_preserves_registered_access_links_but_unlinks_unused_aliases() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn env_cleanup_only_refuses_registered_cycles_inside_selected_deletions() {
+    use crate::support::write_text;
+    use ocm::store::{env_registry_path, get_environment};
+    use std::os::unix::fs::symlink;
+
+    for location in [None, Some("logs/child")] {
+        let root = TestDir::new("cleanup-registered-root-cycle");
+        let env = cleanup_legacy_child_fixture(&root, location);
+        let child = get_environment("child", &env, root.path()).unwrap();
+        let child_root = std::path::Path::new(&child.root);
+        let retained = root.child("retained-child");
+        fs::rename(child_root, &retained).unwrap();
+        symlink(child_root.file_name().unwrap(), child_root).unwrap();
+        let registry = env_registry_path(&env, root.path()).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let stale = root.child("ocm-home/envs/a-parent/.openclaw/agents/main/sessions/stale.jsonl");
+        write_text(
+            &stale,
+            &serde_json::json!({"cwd":root.child("ocm-home/envs/donor/.openclaw/workspace")})
+                .to_string(),
+        );
+        for apply in [false, true] {
+            let mut args = vec!["env", "cleanup", "a-parent", "--json"];
+            if apply {
+                args.push("--yes");
+            }
+            let result = run_ocm(root.path(), &env, &args);
+            assert_eq!(
+                result.status.success(),
+                location.is_none(),
+                "{}",
+                stderr(&result)
+            );
+            if location.is_some() {
+                assert!(stderr(&result).contains("registered environment child"));
+            } else {
+                let result: Value = serde_json::from_str(&stdout(&result)).unwrap();
+                assert!(result["actions"].as_array().unwrap().iter().any(|action| {
+                    action["kind"] == "reset-openclaw-runtime-state" && action["applied"] == apply
+                }));
+            }
+            assert_eq!(stale.exists(), location.is_some() || !apply);
+            assert_eq!(fs::read(&registry).unwrap(), registry_before);
+            assert_eq!(
+                fs::read_link(child_root).unwrap(),
+                child_root.file_name().unwrap()
+            );
+            assert_eq!(
+                fs::read_to_string(retained.join(".openclaw/workspace/keep.txt")).unwrap(),
+                "protected child data\n"
+            );
+        }
+    }
+}
