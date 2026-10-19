@@ -381,7 +381,12 @@ mod tests {
             .join("logs");
         fs::create_dir_all(&logs).unwrap();
         fs::write(logs.join("gateway.log"), "old runtime output\n").unwrap();
-        assert!(crate::store::repair_openclaw_runtime_state(&original, &env).unwrap());
+        assert!(
+            crate::store::prepare_openclaw_runtime_state_repair(&original, &env, None)
+                .unwrap()
+                .apply()
+                .unwrap()
+        );
         assert!(!logs.exists());
         assert_eq!(
             get_environment("original", &env, root.path())

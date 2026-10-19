@@ -434,8 +434,27 @@ pub(crate) fn resolve_env_openclaw_cleanup_paths(
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
 ) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
-    let mut inventory =
-        resolve_env_openclaw_paths(paths, env, runtime, OpenClawPathSelection::Cleanup)?;
+    resolve_env_openclaw_cleanup_paths_with_config(paths, env, runtime, None)
+}
+
+pub(super) fn resolve_env_openclaw_cleanup_paths_with_config(
+    paths: &EnvPaths,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    config: Option<&Value>,
+) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
+    let mut inventory = resolve_openclaw_workspaces_with_config(
+        &paths.config_path,
+        &paths.state_dir,
+        &paths.openclaw_home,
+        env,
+        runtime,
+        OpenClawPathSelection::Cleanup,
+        config,
+    )?;
+    inventory
+        .workspace_roots
+        .insert(paths.workspace_dir.clone());
     let root = clean_path(&paths.root);
     let canonical_root = canonicalize_path_allow_missing(&root)?;
     inventory.agent_directory_roots.retain(|_, directory| {
@@ -513,6 +532,13 @@ pub(crate) fn load_effective_openclaw_config(
 
     let raw = read_regular_text_file(config_path, "OpenClaw config", None)?;
     let value = parse_json5(&raw, config_path, "OpenClaw config")?;
+    resolve_effective_openclaw_config(config_path, value).map(Some)
+}
+
+fn resolve_effective_openclaw_config(
+    config_path: &Path,
+    value: Value,
+) -> Result<EffectiveOpenClawConfig, String> {
     let config_root = config_path.parent().ok_or_else(|| {
         format!(
             "OpenClaw config path has no parent: {}",
@@ -528,11 +554,11 @@ pub(crate) fn load_effective_openclaw_config(
         &[],
     )?;
 
-    Ok(Some(EffectiveOpenClawConfig {
+    Ok(EffectiveOpenClawConfig {
         value,
         include_paths: processor.include_paths,
         include_scopes: processor.include_scopes,
-    }))
+    })
 }
 
 fn resolve_openclaw_workspaces(
@@ -543,7 +569,33 @@ fn resolve_openclaw_workspaces(
     runtime: OpenClawWorkspaceRuntime<'_>,
     selection: OpenClawPathSelection,
 ) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
-    let resolved = load_effective_openclaw_config(config_path)?;
+    resolve_openclaw_workspaces_with_config(
+        config_path,
+        state_dir,
+        openclaw_home,
+        env,
+        runtime,
+        selection,
+        None,
+    )
+}
+
+fn resolve_openclaw_workspaces_with_config(
+    config_path: &Path,
+    state_dir: &Path,
+    openclaw_home: &Path,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    selection: OpenClawPathSelection,
+    config: Option<&Value>,
+) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
+    let resolved = match config {
+        Some(config) => Some(resolve_effective_openclaw_config(
+            config_path,
+            config.clone(),
+        )?),
+        None => load_effective_openclaw_config(config_path)?,
+    };
     let config = resolved
         .as_ref()
         .map(|resolved| resolved.value.clone())

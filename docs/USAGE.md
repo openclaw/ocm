@@ -1185,6 +1185,9 @@ Configuring an agent directory above `agents/<id>/sessions` preserves agent payl
 If an agent directory is exactly `agents/<id>/sessions`, cleanup preview and apply refuse the conflicting ownership before changing any configuration or data.
 Use a separate agent directory before retrying cleanup; `env doctor` reports the conflict.
 External configured agent directories remain untouched and do not prevent this cleanup.
+Cleanup preview and apply refuse a runtime reset that would delete a registered or active temporary dev source, or Git metadata it needs, before changing that environment's configuration, bindings or files.
+The diagnostic identifies the dependent environment. Remove that dev environment, or stop an active temporary session with `ocm dev stop <env>`, before retrying.
+Sources outside the reset plan, including sources fully retained by workspace preservation, do not block cleanup. Cleanup without a runtime reset keeps its existing behavior.
 Run `ocm env cleanup mira --json` to preview the actions before applying them with `--yes`.
 
 ### Remove or destroy

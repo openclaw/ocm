@@ -67,20 +67,20 @@ pub use layout::{
     upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir, validate_name,
 };
 pub(crate) use openclaw_config::{
-    OpenClawConfigAudit, audit_openclaw_config, clear_skip_bootstrap_for_openclaw_onboarding,
-    dev_ui_gateway_base_path, dev_ui_gateway_url, ensure_minimum_local_openclaw_config,
-    normalize_new_environment_sandbox_origin, openclaw_config_include_paths,
-    openclaw_config_uses_includes, reject_include_owned_agent_workspaces,
-    reject_include_owned_sandbox_origin, repair_openclaw_config,
+    OpenClawConfigAudit, OpenClawConfigRepair, audit_openclaw_config,
+    clear_skip_bootstrap_for_openclaw_onboarding, dev_ui_gateway_base_path, dev_ui_gateway_url,
+    ensure_minimum_local_openclaw_config, normalize_new_environment_sandbox_origin,
+    openclaw_config_include_paths, openclaw_config_uses_includes, prepare_openclaw_config_repair,
+    reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
     rewrite_external_workspace_paths_for_migration,
     rewrite_identity_bound_workspace_paths_for_target, rewrite_openclaw_config_for_migration,
     rewrite_openclaw_config_for_new_environment, rewrite_openclaw_config_for_simulation,
     rewrite_openclaw_config_for_target, rewrite_openclaw_config_includes_for_target,
 };
 pub(crate) use openclaw_state::{
-    MigrationWorkspaceCopy, OpenClawStateAudit, audit_openclaw_state,
+    MigrationWorkspaceCopy, OpenClawRuntimeStateCleanup, OpenClawStateAudit, audit_openclaw_state,
     clear_nonportable_runtime_state, openclaw_env_archive_options, prepare_migrated_runtime_state,
-    repair_openclaw_runtime_state,
+    prepare_openclaw_runtime_state_repair,
 };
 pub(crate) use openclaw_workspaces::{
     OpenClawWorkspaceRuntime, resolve_env_openclaw_workspaces, resolve_plain_openclaw_workspaces,

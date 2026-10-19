@@ -85,18 +85,29 @@ pub(crate) fn audit_openclaw_config(meta: &EnvMeta, known_envs: &[EnvMeta]) -> O
     audit_openclaw_config_value(meta, known_envs, &paths, &value)
 }
 
-pub(crate) fn repair_openclaw_config(
+pub(crate) struct OpenClawConfigRepair {
+    config_path: PathBuf,
+    pub(crate) value: Value,
+}
+
+impl OpenClawConfigRepair {
+    pub(crate) fn apply(&self) -> Result<(), String> {
+        write_config_value(&self.config_path, &self.value)
+    }
+}
+
+pub(crate) fn prepare_openclaw_config_repair(
     meta: &EnvMeta,
     known_envs: &[EnvMeta],
-) -> Result<bool, String> {
+) -> Result<Option<OpenClawConfigRepair>, String> {
     let paths = derive_env_paths(Path::new(&meta.root));
     let Some(mut value) = read_config_value(&paths.config_path)? else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let audit = audit_openclaw_config_value(meta, known_envs, &paths, &value);
     if audit.status != "drifted" {
-        return Ok(false);
+        return Ok(None);
     }
 
     let mut changed = false;
@@ -111,11 +122,13 @@ pub(crate) fn repair_openclaw_config(
     }
 
     if !changed {
-        return Ok(false);
+        return Ok(None);
     }
 
-    write_config_value(&paths.config_path, &value)?;
-    Ok(true)
+    Ok(Some(OpenClawConfigRepair {
+        config_path: paths.config_path,
+        value,
+    }))
 }
 
 pub(crate) fn rewrite_openclaw_config_for_target(

@@ -492,7 +492,7 @@ bindings before registration. Older OCM readers refuse these records. Refresh an
 incompatible daemon with the command above; unchanged bindings and confirmed
 stopped or unloaded managers remain usable.
 
-Removal, pruning, destroy, and simulation cleanup preserve other registered and active temporary dev sources and the Git metadata they need, even with `--force`. Remove dependent dev environments, or stop temporary sessions with `ocm dev stop <env>`, before deleting their containing environment or worktree. Preparation rollback also preserves these sources when publishing a newly created worktree's binding fails. The error reports the original failure and the retained worktree path; stop the dependent temporary session before removing that worktree.
+Health cleanup, removal, pruning, destroy, and simulation cleanup preserve other registered and active temporary dev sources and the Git metadata they need, even with `--force`. Remove dependent dev environments, or stop temporary sessions with `ocm dev stop <env>`, before deleting their containing environment or worktree. Preparation rollback also preserves these sources when publishing a newly created worktree's binding fails. The error reports the original failure and the retained worktree path; stop the dependent temporary session before removing that worktree.
 
 ### Try beta or pin a specific release
 

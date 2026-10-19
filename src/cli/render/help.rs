@@ -1457,7 +1457,11 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} env cleanup mira --yes"),
                 format!("{cmd} env cleanup --all --yes"),
             ],
-            &["Only a narrow set of safe repairs is applied."],
+            &[
+                "Only a narrow set of safe repairs is applied.",
+                "Preview and apply refuse a runtime reset that would affect a registered or active temporary dev source or its required Git metadata, before changing this environment.",
+                "Remove the dependent dev environment or stop the identified temporary dev session before retrying. Sources outside the reset plan do not block cleanup.",
+            ],
         ),
         "use" => render_leaf(
             "Activate an environment in your shell",

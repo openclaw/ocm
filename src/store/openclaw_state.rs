@@ -23,7 +23,8 @@ use super::openclaw_config::normalize_path_allow_missing;
 use super::openclaw_workspaces::{
     OpenClawCleanupPathError, OpenClawWorkspaceInventory, OpenClawWorkspaceRuntime,
     canonicalize_path_allow_missing, resolve_env_openclaw_cleanup_paths,
-    resolve_env_openclaw_copy_paths, resolve_env_openclaw_workspaces,
+    resolve_env_openclaw_cleanup_paths_with_config, resolve_env_openclaw_copy_paths,
+    resolve_env_openclaw_workspaces,
 };
 
 #[derive(Clone, Debug)]
@@ -122,16 +123,38 @@ pub(crate) fn audit_openclaw_state(
     }
 }
 
-pub(crate) fn repair_openclaw_runtime_state(
+pub(crate) struct OpenClawRuntimeStateCleanup {
+    removals: BTreeSet<PathBuf>,
+}
+
+impl OpenClawRuntimeStateCleanup {
+    pub(crate) fn removals(&self) -> &BTreeSet<PathBuf> {
+        &self.removals
+    }
+
+    pub(crate) fn apply(&self) -> Result<bool, String> {
+        for path in &self.removals {
+            remove_path(path)?;
+        }
+        Ok(!self.removals.is_empty())
+    }
+}
+
+pub(crate) fn prepare_openclaw_runtime_state_repair(
     meta: &EnvMeta,
     env: &BTreeMap<String, String>,
-) -> Result<bool, String> {
+    config: Option<&Value>,
+) -> Result<OpenClawRuntimeStateCleanup, String> {
     let paths = derive_env_paths(Path::new(&meta.root));
-    clear_nonportable_runtime_state(
+    validate_nonportable_runtime_state_paths(&paths)?;
+    let workspaces = resolve_env_openclaw_cleanup_paths_with_config(
         &paths,
         env,
         OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port),
+        config,
     )
+    .map_err(OpenClawCleanupPathError::into_message)?;
+    plan_runtime_state_cleanup(&paths, &workspaces, &BTreeSet::new(), &BTreeSet::new())
 }
 
 pub(crate) fn openclaw_env_archive_options(
@@ -1108,7 +1131,19 @@ fn clear_runtime_state_preserving_paths(
     workspaces.preserve_copied_roots(preserved_roots);
     workspaces.preserve_copied_config_paths(preserved_files);
 
-    let mut changed = false;
+    plan_runtime_state_cleanup(paths, &workspaces, preserved_roots, preserved_files)?.apply()
+}
+
+fn plan_runtime_state_cleanup(
+    paths: &EnvPaths,
+    workspaces: &OpenClawWorkspaceInventory,
+    preserved_roots: &BTreeSet<PathBuf>,
+    preserved_files: &BTreeSet<PathBuf>,
+) -> Result<OpenClawRuntimeStateCleanup, String> {
+    let mut removals = BTreeSet::new();
+    if !path_exists(&paths.state_dir) {
+        return Ok(OpenClawRuntimeStateCleanup { removals });
+    }
     for relative_path in runtime_debris_outside_preserved_paths(
         &paths.state_dir,
         &workspaces,
@@ -1122,13 +1157,14 @@ fn clear_runtime_state_preserving_paths(
             continue;
         }
         if preserved_files.iter().any(|leaf| leaf.starts_with(&path)) {
-            changed |=
-                clear_parent_preserving(&path, &|path| preserved_files.contains(path), &|path| {
-                    preserved_files.iter().any(|leaf| leaf.starts_with(path))
-                })?;
+            collect_parent_cleanup(
+                &path,
+                &|path| preserved_files.contains(path),
+                &|path| preserved_files.iter().any(|leaf| leaf.starts_with(path)),
+                &mut removals,
+            )?;
         } else {
-            remove_path(&path)?;
-            changed = true;
+            removals.insert(path);
         }
     }
     let entries = fs::read_dir(&paths.state_dir).map_err(|error| error.to_string())?;
@@ -1144,21 +1180,34 @@ fn clear_runtime_state_preserving_paths(
             continue;
         }
         if name == OsStr::new("agents") {
-            if prune_agent_runtime_state(&path, &workspaces)? {
-                changed = true;
-            }
+            collect_agent_runtime_cleanup(&path, workspaces, &mut removals)?;
             continue;
         }
         if workspaces.has_descendant(&path) {
-            changed |= clear_parent_preserving_workspaces(&path, &workspaces)?;
+            collect_parent_cleanup(
+                &path,
+                &|path| workspaces.contains(path),
+                &|path| workspaces.has_descendant(path),
+                &mut removals,
+            )?;
             continue;
         }
 
-        remove_path(&path)?;
-        changed = true;
+        removals.insert(path);
     }
 
-    Ok(changed)
+    // A removed parent subsumes its children; keep each actual deletion once.
+    let removals = removals
+        .iter()
+        .filter(|path| {
+            !path
+                .ancestors()
+                .skip(1)
+                .any(|parent| removals.contains(parent))
+        })
+        .cloned()
+        .collect();
+    Ok(OpenClawRuntimeStateCleanup { removals })
 }
 
 fn is_durable_openclaw_state_root(name: &OsStr) -> bool {
@@ -2786,11 +2835,20 @@ fn clear_parent_preserving(
     contains: &impl Fn(&Path) -> bool,
     has_descendant: &impl Fn(&Path) -> bool,
 ) -> Result<bool, String> {
-    if contains(root) {
-        return Ok(false);
-    }
+    let mut removals = BTreeSet::new();
+    collect_parent_cleanup(root, contains, has_descendant, &mut removals)?;
+    OpenClawRuntimeStateCleanup { removals }.apply()
+}
 
-    let mut changed = false;
+fn collect_parent_cleanup(
+    root: &Path,
+    contains: &impl Fn(&Path) -> bool,
+    has_descendant: &impl Fn(&Path) -> bool,
+    removals: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    if contains(root) {
+        return Ok(());
+    }
     let entries = fs::read_dir(root).map_err(|error| error.to_string())?;
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
@@ -2800,67 +2858,68 @@ fn clear_parent_preserving(
         }
         let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
         if metadata.is_dir() && has_descendant(&path) {
-            changed |= clear_parent_preserving(&path, contains, has_descendant)?;
-            continue;
+            collect_parent_cleanup(&path, contains, has_descendant, removals)?;
+        } else {
+            removals.insert(path);
         }
-        remove_path(&path)?;
-        changed = true;
     }
-    Ok(changed)
+    Ok(())
 }
 
-fn prune_agent_runtime_state(
+fn collect_agent_runtime_cleanup(
     agents_root: &Path,
     workspaces: &OpenClawWorkspaceInventory,
-) -> Result<bool, String> {
+    removals: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
     if !path_exists(agents_root) {
-        return Ok(false);
+        return Ok(());
     }
-
-    let mut changed = false;
+    let mut retain_agents = false;
     let agent_entries = fs::read_dir(agents_root).map_err(|error| error.to_string())?;
     for entry in agent_entries {
         let entry = entry.map_err(|error| error.to_string())?;
         let agent_root = entry.path();
         if workspaces.contains(&agent_root) {
+            retain_agents = true;
             continue;
         }
         let metadata = fs::symlink_metadata(&agent_root).map_err(|error| error.to_string())?;
         if !metadata.is_dir() {
-            remove_path(&agent_root)?;
-            changed = true;
+            removals.insert(agent_root);
             continue;
         }
 
+        let mut retain_agent = false;
         let child_entries = fs::read_dir(&agent_root).map_err(|error| error.to_string())?;
         for child in child_entries {
             let child = child.map_err(|error| error.to_string())?;
             let child_path = child.path();
             if child.file_name() == OsStr::new("agent") || workspaces.contains(&child_path) {
+                retain_agent = true;
                 continue;
             }
             if workspaces.has_descendant(&child_path) {
-                changed |= clear_parent_preserving_workspaces(&child_path, workspaces)?;
+                collect_parent_cleanup(
+                    &child_path,
+                    &|path| workspaces.contains(path),
+                    &|path| workspaces.has_descendant(path),
+                    removals,
+                )?;
+                retain_agent = true;
                 continue;
             }
-            remove_path(&child_path)?;
-            changed = true;
+            removals.insert(child_path);
         }
-
-        let mut remaining = fs::read_dir(&agent_root).map_err(|error| error.to_string())?;
-        if remaining.next().is_none() {
-            remove_path(&agent_root)?;
-            changed = true;
+        if retain_agent {
+            retain_agents = true;
+        } else {
+            removals.insert(agent_root);
         }
     }
-
-    let mut remaining = fs::read_dir(agents_root).map_err(|error| error.to_string())?;
-    if remaining.next().is_none() {
-        remove_path(agents_root)?;
-        changed = true;
+    if !retain_agents {
+        removals.insert(agents_root.to_path_buf());
     }
-
-    Ok(changed)
+    Ok(())
 }
 
 fn resolve_archivable_workspaces(
