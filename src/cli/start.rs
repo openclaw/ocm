@@ -198,7 +198,7 @@ impl Cli {
                     root: request.root.clone(),
                     gateway_port: request.gateway_port,
                     service_enabled: request.service_requested,
-                    service_running: request.service_requested,
+                    service_running: request.service_requested && !onboarding_planned,
                     default_runtime: match desired_binding.as_ref() {
                         Some(StartBinding::Runtime(runtime_name)) => Some(runtime_name.clone()),
                         _ => None,
@@ -230,24 +230,13 @@ impl Cli {
             )?;
         }
 
-        let mut service_started = false;
-        if request.service_requested {
-            self.with_progress(format!("Installing service for {}", request.name), || {
-                self.service_service().install(&request.name)
-            })?;
-            self.with_progress(format!("Starting service for {}", request.name), || {
-                self.service_service().start(&request.name)
-            })?;
-            service_started = true;
-        }
-
         let detected_plain_home = if created {
             let source = inspect_migration_source(None, &self.env);
             source.exists.then_some(source.source_home)
         } else {
             None
         };
-        let summary = StartSummary {
+        let mut summary = StartSummary {
             env_name: request.name.clone(),
             created,
             root: meta.root.clone(),
@@ -263,14 +252,22 @@ impl Cli {
             protected: meta.protected,
             onboarding_planned,
             service_requested: request.service_requested,
-            service_started,
+            service_started: false,
             migrate_command: detected_plain_home
                 .as_ref()
                 .map(|_| format!("{} migrate <env>", self.command_example())),
             detected_plain_home,
             open_command: format!("{} @{} -- tui", self.command_example(), request.name),
             run_command: format!("{} @{} -- status", self.command_example(), request.name),
-            onboard_command: format!("{} @{} -- onboard", self.command_example(), request.name),
+            onboard_command: if onboarding_planned && request.service_requested {
+                format!(
+                    "{} start {} --onboard",
+                    self.command_example(),
+                    request.name
+                )
+            } else {
+                format!("{} @{} -- onboard", self.command_example(), request.name)
+            },
             service_command: format!(
                 "{} service install {}",
                 self.command_example(),
@@ -278,30 +275,43 @@ impl Cli {
             ),
         };
 
-        if json_flag {
-            self.print_json(&summary)?;
-            return Ok(0);
-        }
-
-        self.stdout_lines(self.start_summary_lines(&summary));
         if onboarding_planned {
+            self.stdout_lines(self.start_summary_lines(&summary));
             self.stdout_lines(self.onboarding_handoff_lines(&summary));
-        }
-
-        if onboarding_planned {
-            let onboarding =
-                self.handle_env_run(vec![request.name, "--".to_string(), "onboard".to_string()]);
-            return match onboarding {
-                Ok(0) => Ok(0),
+            let onboarding = self.handle_env_run(vec![
+                request.name.clone(),
+                "--".to_string(),
+                "onboard".to_string(),
+            ]);
+            match onboarding {
+                Ok(0) => {}
                 Ok(code) => {
                     self.print_onboarding_follow_up(&summary, None, Some(code));
-                    Ok(code)
+                    return Ok(code);
                 }
                 Err(error) => {
                     self.print_onboarding_follow_up(&summary, Some(&error), None);
-                    Ok(1)
+                    return Ok(1);
                 }
-            };
+            }
+        }
+
+        if request.service_requested {
+            self.with_progress(format!("Installing service for {}", request.name), || {
+                self.service_service().install(&request.name)
+            })?;
+            self.with_progress(format!("Starting service for {}", request.name), || {
+                self.service_service().start(&request.name)
+            })?;
+            summary.service_started = true;
+        }
+
+        if json_flag {
+            self.print_json(&summary)?;
+        } else if !onboarding_planned {
+            self.stdout_lines(self.start_summary_lines(&summary));
+        } else if summary.service_started {
+            self.stdout_line(format!("Service running for env {}", request.name));
         }
 
         Ok(0)

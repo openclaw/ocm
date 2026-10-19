@@ -11,7 +11,7 @@ use tar::{Builder, Header};
 use crate::support::{
     TestDir, TestHttpServer, install_fake_git_package_manager, install_fake_launchctl,
     install_fake_managed_node_archive, install_fake_node_and_npm, ocm_env, run_ocm,
-    run_ocm_with_stdin, stderr, stdout,
+    run_ocm_with_stdin, stderr, stdout, write_executable_script,
 };
 
 fn append_tar_file(
@@ -120,6 +120,34 @@ fn setup_can_prepare_a_local_command_launcher() {
     assert!(show.status.success(), "{}", stderr(&show));
     let show_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
     assert_eq!(show_json["defaultLauncher"], "hacking.local");
+}
+
+#[test]
+fn setup_onboards_before_starting_the_requested_background_service() {
+    let root = TestDir::new("setup-onboarding-order");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+    install_fake_launchctl(&root, &mut env);
+    let peer = root.child("bin/openclaw");
+    write_executable_script(
+        &peer,
+        "#!/bin/sh\nset -eu\n[ \"$1\" = onboard ]\ncp \"$OCM_HOME/envs.json\" \"$OCM_HOME/during-onboarding.json\"\nprintf '{\"gateway\":{\"mode\":\"local\"}}\\n' > \"$OPENCLAW_CONFIG_PATH\"\n",
+    );
+    let input = format!("4\nfresh\n{}\n{}\ny\ny\n", peer.display(), cwd.display());
+    let setup = run_ocm_with_stdin(&cwd, &env, &["setup"], &input);
+    assert!(setup.status.success(), "{}", stderr(&setup));
+    assert!(stdout(&setup).contains("Service running for env fresh"));
+    let during: Value = serde_json::from_str(
+        &fs::read_to_string(root.child("ocm-home/during-onboarding.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(during["envs"][0]["serviceRunning"], false);
+    let show = run_ocm(&cwd, &env, &["env", "show", "fresh", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let after: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert_eq!(after["serviceRunning"], true);
 }
 
 #[test]

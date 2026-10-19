@@ -113,7 +113,7 @@ If you already know what you want:
 ocm start
 ```
 
-`setup` walks you through the choices. `start` creates or reuses an environment, installs the latest stable OpenClaw release by default, writes the minimum local config needed to boot, and keeps it running in the background. Use `--onboard` when you want the interactive OpenClaw setup flow instead. If you do not pass a name, `ocm` generates one for you.
+`setup` walks you through the choices. `start` creates or reuses an environment, installs the latest stable OpenClaw release by default, writes the minimum local config needed to boot, and keeps it running in the background. Use `--onboard` when you want the interactive OpenClaw setup flow instead: onboarding runs before OCM installs and starts the service. If onboarding fails or is cancelled, OCM leaves a new environment stopped; retry with `ocm start <name> --onboard`. If you do not pass a name, `ocm` generates one for you.
 
 If you are developing OpenClaw itself, use the dev path:
 

@@ -601,6 +601,7 @@ pub fn start_help(cmd: &str) -> String {
             "Start writes the minimum local config by default so the env can boot immediately. Use `--onboard` for the interactive setup flow.",
             "A new root must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap.",
             "Start installs and starts the env service by default. Use `--no-service` when you do not want a background process.",
+            "With `--onboard`, onboarding must succeed before OCM installs and starts the service. Failed or cancelled onboarding leaves a new env stopped; retry with `start <name> --onboard`.",
             "Managed services currently support launchd on macOS and systemd --user on Linux.",
             "Official release selectors prefer host Node.js and npm when compatible with the selected package; OCM can manage a compatible private copy on supported platforms.",
             "When start creates a new official-release env interactively, it can offer to install git for repo-aware coding workflows.",
