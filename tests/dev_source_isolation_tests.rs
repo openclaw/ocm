@@ -477,6 +477,7 @@ fn removal_preserves_shared_git_objects_but_allows_independent_clones() {
                 ],
             );
         }
+        let source = fs::canonicalize(source).unwrap();
         create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
         let registry = env_registry_path(&env, cwd).unwrap();
         let before = fs::read(&registry).unwrap();
@@ -539,6 +540,7 @@ fn removal_follows_relative_quoted_transitive_alternates_and_stops_cycles() {
         &donor.join(".git/objects/info/alternates"),
         &format!("{}\n", path_string(&source.join(".git/objects"))),
     );
+    let source = fs::canonicalize(source).unwrap();
     create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
     git(&source, &["fsck", "--no-dangling"]);
     let removed = run_ocm(cwd, &env, &["env", "remove", "donor"]);
@@ -591,6 +593,7 @@ fn removal_preserves_git_object_and_alternates_path_aliases() {
                 symlink(&alias, &objects).unwrap();
             }
         }
+        let source = fs::canonicalize(source).unwrap();
         create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
         git(&source, &["fsck", "--no-dangling"]);
         let removed = run_ocm(cwd, &env, &["env", "remove", "donor"]);
@@ -625,6 +628,7 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
                 &path_string(&source),
             ],
         );
+        let source = fs::canonicalize(source).unwrap();
         create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
         create("unrelated", None, None, &env, cwd).unwrap();
         let alternates = source.join(".git/objects/info/alternates");
