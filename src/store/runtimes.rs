@@ -39,6 +39,7 @@ use super::layout::{
     runtime_meta_path, validate_name,
 };
 use super::now_utc;
+use super::openclaw_state::installed_plugin_index_ids;
 use super::openclaw_workspaces::load_effective_openclaw_config;
 
 const OPENCLAW_OCM_RUNTIME_BUILD_PROFILE_ENV: &str = "OPENCLAW_OCM_RUNTIME_BUILD_PROFILE";
@@ -745,6 +746,9 @@ fn installed_target_plugin_ids(
     let installs_path = paths.state_dir.join("plugins/installs.json");
     if let Ok(value) = read_json::<serde_json::Value>(&installs_path) {
         collect_plugin_ids_from_records(&value, &mut ids);
+    }
+    if let Ok(installed) = installed_plugin_index_ids(&paths.state_dir) {
+        ids.extend(installed.iter().filter_map(|id| normalized_plugin_id(id)));
     }
     ids
 }

@@ -1448,9 +1448,9 @@ fn runtime_build_local_derives_source_plugins_from_target_env_before_pack() {
     );
 }
 
-#[test]
-fn runtime_build_local_rejects_missing_target_plugin_before_pack() {
-    let root = TestDir::new("runtime-build-local-missing-target-plugin");
+fn target_plugin_build_fixture(
+    root: &TestDir,
+) -> (PathBuf, BTreeMap<String, String>, PathBuf, PathBuf) {
     let cwd = root.child("workspace");
     let repo = cwd.join("openclaw");
     fs::create_dir_all(repo.join("extensions/codex")).unwrap();
@@ -1476,8 +1476,8 @@ fn runtime_build_local_rejects_missing_target_plugin_before_pack() {
         openclaw_package_tarball("#!/usr/bin/env node\n"),
     )
     .unwrap();
-    let mut env = ocm_env(&root);
-    let npm_log = install_fake_node_and_packing_npm(&root, &mut env, &archive_path);
+    let mut env = ocm_env(root);
+    let npm_log = install_fake_node_and_packing_npm(root, &mut env, &archive_path);
     let old_runtime = cwd.join("old-openclaw");
     write_executable_script(&old_runtime, "#!/bin/sh\nexit 0\n");
     let add = run_ocm(
@@ -1498,8 +1498,16 @@ fn runtime_build_local_rejects_missing_target_plugin_before_pack() {
         &["env", "create", "primary", "--runtime", "old-local"],
     );
     assert!(create.status.success(), "{}", stderr(&create));
+    let state = root.child("ocm-home/envs/primary/.openclaw");
+    (cwd, env, state, npm_log)
+}
+
+#[test]
+fn runtime_build_local_rejects_missing_target_plugin_before_pack() {
+    let root = TestDir::new("runtime-build-local-missing-target-plugin");
+    let (cwd, env, state, npm_log) = target_plugin_build_fixture(&root);
     fs::write(
-        root.child("ocm-home/envs/primary/.openclaw/openclaw.json"),
+        state.join("openclaw.json"),
         br#"{"plugins":{"entries":{"missing-plugin":{"enabled":true}}}}"#,
     )
     .unwrap();
@@ -1528,6 +1536,224 @@ fn runtime_build_local_rejects_missing_target_plugin_before_pack() {
         !npm_log.exists(),
         "npm pack must not run after preflight failure"
     );
+}
+
+fn write_target_plugin_index(state: &Path, dedicated: bool, raw: &str) {
+    let database = state.join("state/openclaw.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let db = rusqlite::Connection::open(database).unwrap();
+    if dedicated {
+        db.execute_batch("CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT NOT NULL)").unwrap();
+        db.execute(
+            "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', ?1)",
+            [raw],
+        )
+        .unwrap();
+    } else {
+        db.execute_batch("CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT NOT NULL)").unwrap();
+        db.execute(
+            "INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?1)",
+            [raw],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn runtime_build_local_accepts_installed_target_plugin_record_formats() {
+    for format in [
+        "inline",
+        "legacy-json",
+        "legacy-array",
+        "canonical",
+        "dedicated",
+    ] {
+        let root = TestDir::new("runtime-build-local-installed-target-plugin");
+        let (cwd, env, state, _) = target_plugin_build_fixture(&root);
+        // codex is in the checkout but unselected. Its install record must not cause it
+        // to be packed, and external must remain outside the bundled extension set.
+        let records = serde_json::json!({"external": {"source":"path"}, "codex": {"source":"npm"}});
+        let mut config = serde_json::json!({"plugins":{"entries":{"external":{"enabled":true}}}});
+        match format {
+            "inline" => config["plugins"]["installs"] = records,
+            "legacy-json" | "legacy-array" => {
+                fs::create_dir_all(state.join("plugins")).unwrap();
+                let value = if format == "legacy-json" {
+                    serde_json::json!({"installRecords":records})
+                } else {
+                    serde_json::json!({"plugins":[{"pluginId":"external"},{"pluginId":"codex"}]})
+                };
+                fs::write(state.join("plugins/installs.json"), value.to_string()).unwrap();
+            }
+            "canonical" => write_target_plugin_index(
+                &state,
+                false,
+                &serde_json::json!({"revision":42,"index":{"installRecords":records}}).to_string(),
+            ),
+            "dedicated" => write_target_plugin_index(&state, true, &records.to_string()),
+            _ => unreachable!(),
+        }
+        let config_bytes = config.to_string();
+        fs::write(state.join("openclaw.json"), &config_bytes).unwrap();
+        let database = state.join("state/openclaw.sqlite");
+        let database_before = fs::read(&database).ok();
+        let build = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "build-local",
+                "target",
+                "--repo",
+                "./openclaw",
+                "--for-env",
+                "primary",
+                "--raw",
+            ],
+        );
+        assert!(build.status.success(), "{format}: {}", stderr(&build));
+        let runtime_root = runtime_install_root("target", &env, &cwd)
+            .unwrap()
+            .join("files/node_modules/openclaw");
+        assert!(
+            !runtime_root.join("dist/extensions/external").exists(),
+            "{format}"
+        );
+        assert!(
+            !runtime_root.join("dist/extensions/codex").exists(),
+            "{format}"
+        );
+        assert_eq!(
+            fs::read_to_string(state.join("openclaw.json")).unwrap(),
+            config_bytes
+        );
+        assert_eq!(fs::read(database).ok(), database_before, "{format}");
+    }
+}
+
+#[test]
+fn runtime_build_local_preserves_target_plugin_selection_and_index_fallback() {
+    let selected = serde_json::json!({"plugins":{"entries":{"external":{"enabled":true}}}});
+    for (scenario, config, admitted) in [
+        ("missing", selected.clone(), false),
+        ("invalid-json", selected.clone(), false),
+        ("invalid-records", selected.clone(), false),
+        ("dedicated-precedence", selected.clone(), false),
+        (
+            "inline-fallback",
+            serde_json::json!({"plugins":{"entries":{"external":{}},"installs":{"external":{}}}}),
+            true,
+        ),
+        ("legacy-fallback", selected.clone(), true),
+        (
+            "disabled",
+            serde_json::json!({"plugins":{"entries":{"external":{"enabled":false}}}}),
+            true,
+        ),
+        (
+            "denied",
+            serde_json::json!({"plugins":{"entries":{"external":{}},"allow":["external"],"slots":{"memory":"external"},"deny":["external"]}}),
+            true,
+        ),
+        (
+            "globally-disabled",
+            serde_json::json!({"plugins":{"enabled":false,"entries":{"external":{}}}}),
+            true,
+        ),
+        (
+            "unselected",
+            serde_json::json!({"plugins":{"slots":{"memory":"none"}}}),
+            true,
+        ),
+        (
+            "allow",
+            serde_json::json!({"plugins":{"allow":["external"]}}),
+            true,
+        ),
+        (
+            "slot",
+            serde_json::json!({"plugins":{"slots":{"memory":"external"}}}),
+            true,
+        ),
+    ] {
+        let root = TestDir::new("runtime-build-local-target-plugin-policy");
+        let (cwd, env, state, npm_log) = target_plugin_build_fixture(&root);
+        let records = serde_json::json!({"revision":42,"index":{"installRecords":{"external":{"source":"path"},"codex":{"source":"npm"}}}});
+        match scenario {
+            "missing" => {}
+            "invalid-json" => write_target_plugin_index(&state, false, "{"),
+            "invalid-records" => {
+                write_target_plugin_index(&state, false, r#"{"index":{"installRecords":[]}}"#)
+            }
+            "dedicated-precedence" => {
+                write_target_plugin_index(&state, false, &records.to_string());
+                write_target_plugin_index(&state, true, "{}");
+            }
+            "allow" | "slot" | "unselected" => {
+                write_target_plugin_index(&state, false, &records.to_string())
+            }
+            _ => {
+                fs::create_dir_all(state.join("state")).unwrap();
+                fs::write(state.join("state/openclaw.sqlite"), "broken database").unwrap();
+            }
+        }
+        if scenario == "legacy-fallback" {
+            fs::create_dir_all(state.join("plugins")).unwrap();
+            fs::write(
+                state.join("plugins/installs.json"),
+                r#"{"installRecords":{"external":{}}}"#,
+            )
+            .unwrap();
+        }
+        let config_bytes = config.to_string();
+        fs::write(state.join("openclaw.json"), &config_bytes).unwrap();
+        let database = state.join("state/openclaw.sqlite");
+        let database_before = fs::read(&database).ok();
+        let build = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "build-local",
+                "target",
+                "--repo",
+                "./openclaw",
+                "--for-env",
+                "primary",
+                "--raw",
+            ],
+        );
+        assert_eq!(
+            build.status.success(),
+            admitted,
+            "{scenario}: {}",
+            stderr(&build)
+        );
+        if admitted {
+            let runtime_root = runtime_install_root("target", &env, &cwd)
+                .unwrap()
+                .join("files/node_modules/openclaw");
+            assert!(
+                !runtime_root.join("dist/extensions/codex").exists(),
+                "{scenario}"
+            );
+        } else {
+            assert!(
+                stderr(&build).contains("records: external. Repair"),
+                "{scenario}: {}",
+                stderr(&build)
+            );
+            assert!(
+                !npm_log.exists(),
+                "{scenario}: pack admitted missing plugin"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(state.join("openclaw.json")).unwrap(),
+            config_bytes
+        );
+        assert_eq!(fs::read(database).ok(), database_before, "{scenario}");
+    }
 }
 
 #[test]

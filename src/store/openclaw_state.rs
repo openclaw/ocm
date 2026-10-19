@@ -2280,6 +2280,72 @@ pub(super) fn clear_cloned_agent_database_leases(target: &EnvPaths) -> Result<()
     Ok(())
 }
 
+struct InstalledPluginIndexRow {
+    document: String,
+    dedicated_table: bool,
+}
+
+fn read_installed_plugin_index(
+    connection: &Connection,
+) -> Result<Option<InstalledPluginIndexRow>, String> {
+    let table_exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'installed_plugin_index'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .is_some();
+    let select_sql = if table_exists {
+        "SELECT install_records_json FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'"
+    } else {
+        let exists = connection.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_machine_state'",
+            [], |_| Ok(()),
+        ).optional().map_err(|error| error.to_string())?.is_some();
+        if !exists {
+            return Ok(None);
+        }
+        "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'"
+    };
+    connection
+        .query_row(select_sql, [], |row| row.get::<_, String>(0))
+        .optional()
+        .map(|raw| {
+            raw.map(|document| InstalledPluginIndexRow {
+                document,
+                dedicated_table: table_exists,
+            })
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(super) fn installed_plugin_index_ids(state_root: &Path) -> Result<Vec<String>, String> {
+    let database_path = state_root.join("state/openclaw.sqlite");
+    if !is_sqlite_database(&database_path)? {
+        return Ok(Vec::new());
+    }
+    // Targeted builds only inspect installed state. Never create a missing database or
+    // migrate it while deciding which source plugins need packaging.
+    let connection = Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    let Some(row) = read_installed_plugin_index(&connection)? else {
+        return Ok(Vec::new());
+    };
+    let document: Value = serde_json::from_str(&row.document).map_err(|error| error.to_string())?;
+    let records = if row.dedicated_table {
+        document.as_object()
+    } else {
+        document
+            .pointer("/index/installRecords")
+            .and_then(Value::as_object)
+    };
+    Ok(records
+        .map(|records| records.keys().cloned().collect())
+        .unwrap_or_default())
+}
+
 fn relocate_installed_plugin_index_paths(
     database_path: &Path,
     source_state_root: &Path,
@@ -2299,52 +2365,24 @@ fn relocate_installed_plugin_index_paths(
         return Ok(MigratedRuntimeStateResult::default());
     }
     let connection = Connection::open(&database_path).map_err(|error| error.to_string())?;
-    let table_exists = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'installed_plugin_index'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .is_some();
-    let (select_sql, update_sql) = if table_exists {
-        (
-            "SELECT install_records_json FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'",
-            "UPDATE installed_plugin_index SET install_records_json = ?1 WHERE index_key = 'installed-plugin-index'",
-        )
-    } else {
-        let exists = connection.query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_machine_state'",
-            [], |_| Ok(()),
-        ).optional().map_err(|error| error.to_string())?.is_some();
-        if !exists {
-            return Ok(MigratedRuntimeStateResult::default());
-        }
-        (
-            "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'",
-            "UPDATE config_machine_state SET value_json = ?1 WHERE state_key = 'plugins.installedIndex'",
-        )
+    let Some(row) = read_installed_plugin_index(&connection)? else {
+        return Ok(MigratedRuntimeStateResult::default());
     };
-    let raw = connection
-        .query_row(select_sql, [], |row| row.get::<_, String>(0))
-        .optional()
-        .map_err(|error| error.to_string())?;
-    let rewritten = raw
-        .map(|raw| {
-            rewrite_plugin_install_records(
-                &raw,
-                &database_path,
-                table_exists,
-                source_state_root,
-                target_state_root,
-                relocation,
-            )
-        })
-        .transpose()?
-        .flatten();
+    let rewritten = rewrite_plugin_install_records(
+        &row.document,
+        &database_path,
+        row.dedicated_table,
+        source_state_root,
+        target_state_root,
+        relocation,
+    )?;
     let changed = rewritten.is_some();
     if let Some(rewritten) = rewritten {
+        let update_sql = if row.dedicated_table {
+            "UPDATE installed_plugin_index SET install_records_json = ?1 WHERE index_key = 'installed-plugin-index'"
+        } else {
+            "UPDATE config_machine_state SET value_json = ?1 WHERE state_key = 'plugins.installedIndex'"
+        };
         connection
             .execute(update_sql, [rewritten])
             .map_err(|error| error.to_string())?;
