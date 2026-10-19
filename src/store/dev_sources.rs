@@ -338,6 +338,13 @@ fn append_git_footprint(
     append_git_object_footprint(footprint, objects, reserve_missing, links, paths_left)
 }
 
+fn git_dependency_limit_error(path: &Path, kind: &str) -> String {
+    format!(
+        "cannot inspect Git dependencies at '{}': too many {kind} paths; repair or consolidate these dependencies while preserving all required Git objects, then retry",
+        path.display()
+    )
+}
+
 fn append_git_object_footprint(
     footprint: &mut SourceFootprint,
     objects: PathBuf,
@@ -351,9 +358,7 @@ fn append_git_object_footprint(
     // checkout or its object files. Uninspectable graphs refuse the operation.
     while let Some(objects) = pending.pop() {
         if *paths_left == 0 {
-            return Err(
-                "cannot inspect Git object dependencies: too many alternate paths".to_string(),
-            );
+            return Err(git_dependency_limit_error(&objects, "alternate"));
         }
         *paths_left -= 1;
         if existing_cleanup_path(&objects)?.is_none() {
@@ -378,9 +383,7 @@ fn append_git_object_footprint(
         }
         let alternates = crate::openclaw_repo::read_git_alternates(&file)?;
         if alternates.len() + pending.len() > *paths_left {
-            return Err(
-                "cannot inspect Git object dependencies: too many alternate paths".to_string(),
-            );
+            return Err(git_dependency_limit_error(&file, "alternate"));
         }
         // Git resolves relative alternates against this object directory, not
         // info/ or the checkout. Keep '..' until symlinks have been resolved.
@@ -406,7 +409,7 @@ fn inspect_source_footprint_paths(
     let mut paths_left = 1024usize;
     while let Some(root) = pending.pop() {
         if paths_left == 0 {
-            return Err("cannot inspect Git dependencies: too many submodule paths".to_string());
+            return Err(git_dependency_limit_error(&root, "submodule"));
         }
         paths_left -= 1;
         let Some(resolved) = existing_cleanup_path(&root)? else {
@@ -476,9 +479,7 @@ fn inspect_source_footprint_paths(
                     Err(error) => return Err(error.to_string()),
                 }
                 if pending.len() > paths_left {
-                    return Err(
-                        "cannot inspect Git dependencies: too many submodule paths".to_string()
-                    );
+                    return Err(git_dependency_limit_error(&modules, "submodule"));
                 }
             }
         }

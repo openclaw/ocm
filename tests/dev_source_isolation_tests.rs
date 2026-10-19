@@ -662,6 +662,10 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
             "{mode}: {}",
             stderr(&removed)
         );
+        if mode == "too-many" {
+            assert!(stderr(&removed).contains(&path_string(&alternates)));
+            assert!(stderr(&removed).contains("preserving all required Git objects, then retry"));
+        }
         assert!(donor_root.exists());
         assert_eq!(fs::read(&registry).unwrap(), before);
         if mode == "missing" {
@@ -779,6 +783,9 @@ fn removal_refuses_uninspectable_submodule_metadata() {
         "[invalid".to_string(),
         "#".repeat(65537),
         "[submodule \"unsafe\"]\npath = ../outside\n".to_string(),
+        (0..1024)
+            .map(|index| format!("[submodule \"{index}\"]\npath = module\n"))
+            .collect::<String>(),
     ] {
         let fixture = TestDir::new("invalid-submodule-metadata");
         let cwd = fixture.path();
@@ -787,16 +794,27 @@ fn removal_refuses_uninspectable_submodule_metadata() {
         create("donor", Some(&donor_root), None, &env, cwd).unwrap();
         let source = init_checkout(&fixture.child("source"));
         create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
-        write_text(&source.join(".gitmodules"), &contents);
+        let excessive = contents.contains("path = module");
+        if excessive {
+            init_checkout(&source.join("module"));
+        }
+        let modules = source.join(".gitmodules");
+        write_text(&modules, &contents);
         let registry = env_registry_path(&env, cwd).unwrap();
         let before = fs::read(&registry).unwrap();
         let removed = run_ocm(cwd, &env, &["env", "remove", "donor", "--force"]);
         assert!(!removed.status.success());
-        assert!(
-            stderr(&removed).contains("Git submodule"),
-            "{}",
-            stderr(&removed)
-        );
+        if excessive {
+            assert!(stderr(&removed).contains("too many submodule paths"));
+            assert!(stderr(&removed).contains(&path_string(&modules)));
+            assert!(stderr(&removed).contains("preserving all required Git objects, then retry"));
+        } else {
+            assert!(
+                stderr(&removed).contains("Git submodule"),
+                "{}",
+                stderr(&removed)
+            );
+        }
         assert!(donor_root.exists());
         assert_eq!(fs::read(&registry).unwrap(), before);
     }
