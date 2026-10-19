@@ -3677,7 +3677,7 @@ fn dev_command_does_not_recreate_a_missing_saved_worktree() {
     let remove = run_ocm(&cwd, &env, &["env", "remove", "demo", "--force"]);
     assert!(!remove.status.success());
     assert!(
-        stderr(&remove).contains("checkout identity does not match"),
+        stderr(&remove).contains("registered environment replacement"),
         "{}",
         stderr(&remove)
     );
