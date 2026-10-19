@@ -763,6 +763,7 @@ source-owned paths inside accepted OpenClaw config includes, including nested
 and shared fragments. Plugin load paths point at the copied payload; explicitly
 external values and source files remain unchanged. Relative `$include`
 directives and fragments needing no rewrite retain their authored contents.
+Rewritten fragments retain their copied Unix file modes.
 The existing restrictions on include-owned agent workspaces and sandbox origins
 still apply.
 

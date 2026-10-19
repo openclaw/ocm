@@ -591,7 +591,7 @@ fn rewrite_openclaw_config_includes_with_root_mappings(
             canonical_source_root,
             target_root,
         ) {
-            write_config_value(&include_path, &value)?;
+            write_copied_config_value(&include_path, &value)?;
             changed = true;
         }
     }
@@ -1140,6 +1140,26 @@ fn ensure_object_field<'a>(
         .expect("object field must exist after reset")
 }
 
+fn write_copied_config_value(config_path: &Path, value: &Value) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        // The copy already carries the authored mode, including group access or
+        // read-only permissions. Stage privately before restoring that mode so
+        // the process umask cannot expose a rewritten include more broadly.
+        let permissions = fs::metadata(config_path)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        let staged = stage_private_config(config_path, value)?;
+        staged
+            .as_file()
+            .set_permissions(permissions)
+            .map_err(|error| error.to_string())?;
+        replace_private_config(staged, config_path)
+    }
+    #[cfg(not(unix))]
+    write_config_value(config_path, value)
+}
+
 fn write_config_value(config_path: &Path, value: &Value) -> Result<(), String> {
     // Preserve private access when replacing the file. Other authored
     // files retain the existing writer's access and replacement behavior.
@@ -1447,7 +1467,11 @@ fn rewrite_env_root_paths_from_roots(
             // Never run a second pass over a rewritten destination value.
             for source in source_roots {
                 if let Ok(suffix) = Path::new(raw).strip_prefix(source) {
-                    *raw = display_path(&clean_path(&target_root.join(suffix)));
+                    let target = clean_path(&target_root.join(suffix));
+                    if !target.starts_with(clean_path(target_root)) {
+                        return false;
+                    }
+                    *raw = display_path(&target);
                     return true;
                 }
             }
@@ -1504,7 +1528,11 @@ fn rewrite_env_root_string(raw: &mut String, source_root: &Path, target_root: &P
         suffix.to_path_buf()
     };
 
-    *raw = display_path(&clean_path(&target_root.join(suffix)));
+    let target = clean_path(&target_root.join(suffix));
+    if !target.starts_with(clean_path(target_root)) {
+        return false;
+    }
+    *raw = display_path(&target);
     true
 }
 
