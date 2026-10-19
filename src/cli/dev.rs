@@ -1033,13 +1033,9 @@ impl Cli {
                 "dev takeover of an existing non-dev env requires --repo <path>".to_string(),
             );
         };
-        let repo_root = resolve_absolute_path(&repo_root, &self.env, &self.cwd)?;
-        let repo_root = detect_openclaw_checkout(&repo_root).ok_or_else(|| {
-            format!(
-                "OpenClaw checkout not found at {}",
-                display_path(&repo_root)
-            )
-        })?;
+        // Capture the checkout before admission so preparation, the worker and
+        // routed commands retain the same source if a selected alias changes.
+        let repo_root = self.resolve_dev_repo_root(Some(repo_root))?;
         let meta = existing;
         let watch_stop = install_source_watch_signal_handler()?;
         let mut source_watch_lease = Some(

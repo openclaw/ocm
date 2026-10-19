@@ -1,3 +1,5 @@
+#[path = "support/config_includes.rs"]
+mod config_includes;
 mod support;
 
 use std::{fs, path::Path};
@@ -79,6 +81,309 @@ fn env_import_rejects_linked_archive_structure_before_reading_external_files() {
             fs::read_to_string(external.join("sentinel.txt")).unwrap(),
             "external fixture contents"
         );
+    }
+}
+
+#[test]
+fn env_import_relocates_absolute_includes_without_the_original_source() {
+    for include_state in [false, true] {
+        for spelling in ["relative", "absolute", "normalized", "overlapping"] {
+            let absolute = spelling != "relative";
+            let root = TestDir::new("env-import-config-includes");
+            let cwd = root.child("cwd");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = ocm_env(&root);
+            let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source");
+            let state = source.join(".openclaw");
+            let include_root = if spelling == "normalized" {
+                source.join("../source/.openclaw")
+            } else {
+                state.clone()
+            };
+            let include = |relative: &str| {
+                if absolute {
+                    include_root.join(relative).to_string_lossy().into_owned()
+                } else {
+                    format!("./{relative}")
+                }
+            };
+            let config = serde_json::json!({
+                "plugins": {"$include": [include("config/plugins.json5"), include("config/shared.json")]}
+            }).to_string();
+            let nested = serde_json::json!({
+                "$include": if absolute { include("config/shared.json") } else { "./shared.json".into() }
+            }).to_string();
+            write_text(&state.join("openclaw.json"), &config);
+            write_text(&state.join("config/plugins.json5"), &nested);
+            write_text(&state.join("config/shared.json"), "{\"enabled\": false}\n");
+            #[cfg(unix)]
+            if include_state && absolute {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    state.join("config/plugins.json5"),
+                    fs::Permissions::from_mode(0o400),
+                )
+                .unwrap();
+                fs::set_permissions(state.join("config"), fs::Permissions::from_mode(0o500))
+                    .unwrap();
+            }
+            let mut args = vec!["env", "export", "source", "--output", "archive.tar"];
+            if include_state {
+                args.push("--include-state");
+            }
+            let export = run_ocm(&cwd, &env, &args);
+            assert!(export.status.success(), "{}", stderr(&export));
+            let archive_before = fs::read(cwd.join("archive.tar")).unwrap();
+            let offline = root.child("source-offline");
+            fs::rename(&source, &offline).unwrap();
+            let target_root = if spelling == "overlapping" {
+                source.join("target")
+            } else {
+                root.child("ocm-home/envs/target")
+            };
+            let mut import_env = env.clone();
+            if spelling == "overlapping" {
+                import_env.insert(
+                    "OCM_HOME".into(),
+                    root.child("import-store").display().to_string(),
+                );
+            }
+            let import = run_ocm(
+                &cwd,
+                &import_env,
+                &[
+                    "env",
+                    "import",
+                    "archive.tar",
+                    "--name",
+                    "target",
+                    "--root",
+                    target_root.to_str().unwrap(),
+                ],
+            );
+            assert!(import.status.success(), "{}", stderr(&import));
+            let target = target_root.join(".openclaw");
+            let imported: Value =
+                serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
+                    .unwrap();
+            let imported_nested: Value = serde_json::from_str(
+                &fs::read_to_string(target.join("config/plugins.json5")).unwrap(),
+            )
+            .unwrap();
+            if absolute {
+                assert_eq!(
+                    Path::new(imported["plugins"]["$include"][0].as_str().unwrap()),
+                    target.join("config/plugins.json5")
+                );
+                assert_eq!(
+                    Path::new(imported["plugins"]["$include"][1].as_str().unwrap()),
+                    target.join("config/shared.json")
+                );
+                assert_eq!(
+                    Path::new(imported_nested["$include"].as_str().unwrap()),
+                    target.join("config/shared.json")
+                );
+            } else {
+                assert_eq!(imported["plugins"]["$include"][0], "./config/plugins.json5");
+                assert_eq!(imported["plugins"]["$include"][1], "./config/shared.json");
+                assert_eq!(imported_nested["$include"], "./shared.json");
+            }
+            assert_eq!(
+                fs::read_to_string(target.join("config/shared.json")).unwrap(),
+                "{\"enabled\": false}\n"
+            );
+            assert_eq!(
+                fs::read_to_string(offline.join(".openclaw/openclaw.json")).unwrap(),
+                config
+            );
+            assert_eq!(
+                fs::read_to_string(offline.join(".openclaw/config/plugins.json5")).unwrap(),
+                nested
+            );
+            assert_eq!(fs::read(cwd.join("archive.tar")).unwrap(), archive_before);
+            assert!(!source.join(".openclaw").exists());
+            #[cfg(unix)]
+            if include_state && absolute {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(target.join("config/plugins.json5"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o400
+                );
+                for parent in [target.join("config"), offline.join(".openclaw/config")] {
+                    assert_eq!(
+                        fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+                        0o500
+                    );
+                    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_import_preserves_readonly_include_symlink_referents() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = TestDir::new("env-import-include-symlink-mode");
+    let cwd = root.child("cwd");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    let state = source.join(".openclaw");
+    write_text(
+        &state.join("openclaw.json"),
+        r#"{"plugins":{"$include":"./config/alias.json"}}"#,
+    );
+    let fragment = serde_json::json!({"$include": state.join("shared.json")}).to_string();
+    write_text(&state.join("config/fragment.json"), &fragment);
+    write_text(&state.join("shared.json"), "{\"enabled\":false}");
+    symlink("fragment.json", state.join("config/alias.json")).unwrap();
+    fs::set_permissions(
+        state.join("config/fragment.json"),
+        fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
+    fs::set_permissions(state.join("config"), fs::Permissions::from_mode(0o500)).unwrap();
+    let export = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "archive.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    let archive_before = fs::read(cwd.join("archive.tar")).unwrap();
+    let offline = root.child("source-offline");
+    fs::rename(&source, &offline).unwrap();
+    let import = run_ocm(
+        &cwd,
+        &env,
+        &["env", "import", "archive.tar", "--name", "target"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    let target = root.child("ocm-home/envs/target/.openclaw");
+    let alias = target.join("config/alias.json");
+    assert!(fs::symlink_metadata(&alias).unwrap().is_file());
+    let imported: Value = serde_json::from_str(&fs::read_to_string(&alias).unwrap()).unwrap();
+    assert_eq!(
+        Path::new(imported["$include"].as_str().unwrap()),
+        target.join("shared.json")
+    );
+    assert_eq!(
+        fs::metadata(alias).unwrap().permissions().mode() & 0o777,
+        0o400
+    );
+    let copied_fragment: Value =
+        serde_json::from_str(&fs::read_to_string(target.join("config/fragment.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        Path::new(copied_fragment["$include"].as_str().unwrap()),
+        target.join("shared.json")
+    );
+    assert_eq!(
+        fs::read_to_string(offline.join(".openclaw/config/fragment.json")).unwrap(),
+        fragment
+    );
+    for parent in [target.join("config"), offline.join(".openclaw/config")] {
+        let referent = parent.join("fragment.json");
+        assert_eq!(
+            fs::metadata(&referent).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert_eq!(fs::read(cwd.join("archive.tar")).unwrap(), archive_before);
+    assert!(!source.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn env_import_keeps_archived_include_resolution_inside_the_config_directory() {
+    for include_state in [false, true] {
+        for case in ["external", "parent", "symlink"] {
+            let root = TestDir::new("env-import-include-containment");
+            let cwd = root.child("cwd");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = ocm_env(&root);
+            let original = root.child("original");
+            let external = root.child("external");
+            write_text(&external.join("settings.json"), "{\"enabled\":false}");
+            let archived = root.child("archived");
+            let config_dir = archived.join("root/.openclaw");
+            fs::create_dir_all(&config_dir).unwrap();
+            let directive = match case {
+                "external" => external.join("settings.json"),
+                "parent" => original.join(".openclaw/../settings.json"),
+                "symlink" => {
+                    std::os::unix::fs::symlink(&external, config_dir.join("linked")).unwrap();
+                    original.join(".openclaw/linked/settings.json")
+                }
+                _ => unreachable!(),
+            };
+            write_text(
+                &config_dir.join("openclaw.json"),
+                &serde_json::json!({
+                    "plugins": {"$include": directive}
+                })
+                .to_string(),
+            );
+            write_text(
+                &archived.join("meta/env.json"),
+                &serde_json::json!({
+                    "kind": "ocm-env-archive", "formatVersion": 1,
+                    "includeState": include_state, "exportedAt": "2026-10-19T00:00:00Z",
+                    "env": {"name": "source", "sourceRoot": original,
+                        "canonicalSourceRoot": original, "protected": false,
+                        "createdAt": "2026-10-19T00:00:00Z", "updatedAt": "2026-10-19T00:00:00Z"}
+                })
+                .to_string(),
+            );
+            let mut archive = tar::Builder::new(fs::File::create(cwd.join("archive.tar")).unwrap());
+            archive.follow_symlinks(false);
+            archive
+                .append_dir_all("meta", archived.join("meta"))
+                .unwrap();
+            archive
+                .append_dir_all("root", archived.join("root"))
+                .unwrap();
+            archive.finish().unwrap();
+            drop(archive);
+            let imported = run_ocm(
+                &cwd,
+                &env,
+                &["env", "import", "archive.tar", "--name", "target"],
+            );
+            assert!(!imported.status.success(), "accepted {case}");
+            assert!(
+                stderr(&imported).contains("config directory"),
+                "{}",
+                stderr(&imported)
+            );
+            assert!(!root.child("ocm-home/envs/target").exists());
+            assert_eq!(
+                fs::read_to_string(external.join("settings.json")).unwrap(),
+                "{\"enabled\":false}"
+            );
+        }
     }
 }
 
@@ -1211,4 +1516,84 @@ fn env_import_relocates_native_bare_and_ordinary_git_includes() {
             );
         }
     }
+}
+
+#[test]
+fn env_import_relocates_config_includes_after_source_removal() {
+    for include_state in [false, true] {
+        let root = TestDir::new("import-config-includes");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source");
+        let fixture = config_includes::IncludedPluginConfig::seed(
+            &source.join(".openclaw"),
+            &root.child("external"),
+        );
+        let mut args = vec!["env", "export", "source", "--output", "copy.tar"];
+        if include_state {
+            args.push("--include-state");
+        }
+        let export = run_ocm(root.path(), &env, &args);
+        assert!(export.status.success(), "{}", stderr(&export));
+        let original = root.child("original");
+        fs::rename(&source, &original).unwrap();
+
+        let import = run_ocm(
+            root.path(),
+            &env,
+            &["env", "import", "copy.tar", "--name", "copied"],
+        );
+        assert!(import.status.success(), "{}", stderr(&import));
+        fixture.assert_relocated(&root.child("ocm-home/envs/copied/.openclaw"));
+        fixture.assert_source_unchanged(&original.join(".openclaw"));
+        assert!(!source.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_import_relocates_values_beneath_readonly_include_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("import-readonly-include-values");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    let fixture = config_includes::IncludedPluginConfig::seed(&source, &root.child("external"));
+    let source_directory = source.join("config");
+    fs::set_permissions(&source_directory, fs::Permissions::from_mode(0o500)).unwrap();
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "copy.tar",
+        ],
+    );
+    fs::set_permissions(&source_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(export.status.success(), "{}", stderr(&export));
+    let original = root.child("original");
+    fs::rename(source.parent().unwrap(), &original).unwrap();
+    let imported = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "copy.tar", "--name", "copied"],
+    );
+    let target = root.child("ocm-home/envs/copied/.openclaw");
+    let mode = fs::metadata(target.join("config"))
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o777);
+    if mode.is_some() {
+        fs::set_permissions(target.join("config"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert_eq!(mode, Some(0o500));
+    fixture.assert_relocated(&target);
+    fixture.assert_source_unchanged(&original.join(".openclaw"));
 }

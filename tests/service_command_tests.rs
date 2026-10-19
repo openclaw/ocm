@@ -1552,6 +1552,77 @@ fn service_restart_requests_immediate_recovery_handoff_without_self_deadlock() {
 }
 
 #[test]
+fn service_restart_rejects_stale_inactive_protocol_observation() {
+    let root = TestDir::new("service-restart-stale-inactive");
+    let (cwd, env, invocation_log) = setup_gateway_aware_restart_fixture(&root, "protocol-v1");
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    let mut runtime: Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+    let mut publisher = serde_json::to_value(support::fake_daemon_gateway_admission()).unwrap();
+    publisher["process"]["startedAt"] = json!("stale-publisher");
+    runtime["gatewayAdmission"] = publisher;
+    runtime["children"] = json!([]);
+    runtime["services"][0]["gatewayState"] = json!("stopped");
+    runtime["services"][0]["pid"] = Value::Null;
+    fs::write(
+        &env["OCM_TEST_NATIVE_DAEMON_PID_FILE"],
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    support::write_json_replacing_path(&runtime_path, &runtime);
+    let state_path = supervisor_state_path(&env, &cwd).unwrap();
+    let state_before = fs::read(&state_path).unwrap();
+
+    let output = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("does not identify the current managed process"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fs::read(state_path).unwrap(), state_before);
+    assert!(!invocation_log.exists());
+}
+
+#[test]
+fn service_restart_keeps_handoff_for_unsettled_protocol_rows() {
+    for (state, pid, retry) in [
+        ("stopped", Some(4242), None),
+        ("stopped", None, Some("2026-10-19T20:00:00Z")),
+        ("backoff", None, Some("2026-10-19T20:00:00Z")),
+    ] {
+        let root = TestDir::new("service-restart-unsettled");
+        let (cwd, env, invocation_log) = setup_gateway_aware_restart_fixture(&root, "protocol-v1");
+        let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+        let mut runtime: Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+        runtime["gatewayAdmission"] =
+            serde_json::to_value(support::fake_daemon_gateway_admission()).unwrap();
+        runtime["children"] = json!([]);
+        runtime["services"][0]["gatewayState"] = json!(state);
+        runtime["services"][0]["pid"] = json!(pid);
+        runtime["services"][0]["nextRetryAt"] = serde_json::to_value(retry).unwrap();
+        fs::write(
+            &env["OCM_TEST_NATIVE_DAEMON_PID_FILE"],
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        support::write_json_replacing_path(&runtime_path, &runtime);
+        let state_path = supervisor_state_path(&env, &cwd).unwrap();
+        let state_before = fs::read(&state_path).unwrap();
+
+        let output = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(fs::read(state_path).unwrap(), state_before);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::read_to_string(&invocation_log).unwrap_or_default()
+            != "gateway restart --force --json\n"
+        {
+            assert!(Instant::now() < deadline, "native handoff was not invoked");
+            sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[test]
 fn service_uninstall_disables_the_env_service() {
     let root = TestDir::new("service-uninstall");
     let cwd = root.child("workspace");

@@ -621,3 +621,257 @@ fn env_cleanup_retains_external_agent_directory_policy() {
     assert!(!stale.exists());
     assert_eq!(fs::read(external).unwrap(), b"external payload");
 }
+
+fn cleanup_source_fixture(
+    root: &TestDir,
+    location: &str,
+    internal_origin: bool,
+    separate_git: bool,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::path::PathBuf,
+) {
+    use crate::support::{path_string, write_text};
+    let env = ocm_env(root);
+    for name in ["donor", "container"] {
+        let created = run_ocm(root.path(), &env, &["env", "create", name]);
+        assert!(created.status.success(), "{}", stderr(&created));
+    }
+    let donor = root.child(if internal_origin {
+        "ocm-home/envs/donor/openclaw"
+    } else {
+        "external-origin"
+    });
+    write_text(
+        &donor.join("package.json"),
+        r#"{"name":"openclaw","version":"1.0.0"}"#,
+    );
+    for path in [
+        "scripts/run-node.mjs",
+        "scripts/watch-node.mjs",
+        "openclaw.mjs",
+    ] {
+        write_text(&donor.join(path), "console.log('finite source fixture');\n");
+    }
+    write_text(&donor.join("extensions/.keep"), "fixture\n");
+    cleanup_git(&donor, &env, &["init"]);
+    cleanup_git(&donor, &env, &["add", "."]);
+    cleanup_git(
+        &donor,
+        &env,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    let source = root.child(location);
+    let metadata = root.child("ocm-home/envs/container/.openclaw/logs/source.git");
+    let mut clone = vec!["clone", "--no-hardlinks"];
+    let metadata_string = path_string(&metadata);
+    if separate_git {
+        fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        clone.extend(["--separate-git-dir", &metadata_string]);
+    }
+    let source_string = path_string(&source);
+    let donor_string = path_string(&donor);
+    clone.extend([donor_string.as_str(), source_string.as_str()]);
+    cleanup_git(root.path(), &env, &clone);
+    #[cfg(unix)]
+    let selected = {
+        let alias = root.child("source-alias");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        alias
+    };
+    #[cfg(not(unix))]
+    let selected = source.clone();
+    let registered = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "dev",
+            "borrower",
+            "--repo",
+            &path_string(&selected),
+            "--no-watch",
+            "--no-ui",
+        ],
+    );
+    assert!(registered.status.success(), "{}", stderr(&registered));
+    (env, source)
+}
+
+fn cleanup_git(
+    repo: &std::path::Path,
+    env: &std::collections::BTreeMap<String, String>,
+    args: &[&str],
+) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env_clear()
+        .envs(env)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn env_cleanup_refuses_registered_source_deletions_before_any_repair() {
+    use crate::support::write_text;
+    for (location, separate_git) in [
+        ("ocm-home/envs/container/.openclaw/logs/source", false),
+        (
+            "ocm-home/envs/container/.openclaw/agents/main/sessions/source",
+            false,
+        ),
+        (
+            "ocm-home/envs/container/.openclaw/extensions/demo/node_modules/source",
+            false,
+        ),
+        ("external-source", true),
+    ] {
+        let root = TestDir::new("cleanup-registered-source");
+        let (env, source) = cleanup_source_fixture(&root, location, true, separate_git);
+        let state = root.child("ocm-home/envs/container/.openclaw");
+        let config_path = state.join("openclaw.json");
+        // Config repair would execute before runtime reset without a whole-plan guard.
+        let config = r#"{"gateway":{"port":1}}"#;
+        write_text(&config_path, config);
+        let stale = state.join("agents/main/sessions/stale.jsonl");
+        write_text(
+            &stale,
+            &serde_json::json!({"cwd":root.child("ocm-home/envs/donor/.openclaw/workspace")})
+                .to_string(),
+        );
+        let debris = state.join("extensions/demo/.openclaw-runtime-deps.json");
+        write_text(&debris, "{}");
+        write_text(&state.join("tmp/keep-until-admitted"), "residue");
+        write_text(&source.join("uncommitted.txt"), "authored work");
+        let registry = ocm::store::env_registry_path(&env, root.path()).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let source_config = fs::read(if separate_git {
+            state.join("logs/source.git/config")
+        } else {
+            source.join(".git/config")
+        })
+        .unwrap();
+        for args in [
+            vec!["env", "cleanup", "container", "--json"],
+            vec!["env", "cleanup", "container", "--yes", "--json"],
+            vec!["env", "cleanup", "--all", "--yes", "--json"],
+            vec!["env", "remove", "container"],
+        ] {
+            let rejected = run_ocm(root.path(), &env, &args);
+            assert!(!rejected.status.success(), "{}", stdout(&rejected));
+            assert!(
+                stderr(&rejected).contains("registered dev source for env borrower"),
+                "{}",
+                stderr(&rejected)
+            );
+            assert_eq!(fs::read(&registry).unwrap(), registry_before);
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+            assert_eq!(
+                fs::read_to_string(source.join("uncommitted.txt")).unwrap(),
+                "authored work"
+            );
+            assert!(
+                stale.exists() && debris.exists() && state.join("tmp/keep-until-admitted").exists()
+            );
+        }
+        assert_eq!(
+            fs::read(if separate_git {
+                state.join("logs/source.git/config")
+            } else {
+                source.join(".git/config")
+            })
+            .unwrap(),
+            source_config
+        );
+        cleanup_git(&source, &env, &["cat-file", "-t", "HEAD"]);
+        cleanup_git(&source, &env, &["fsck", "--full"]);
+    }
+}
+
+#[test]
+fn env_cleanup_allows_sources_outside_the_prepared_reset_plan() {
+    use crate::support::write_text;
+    for mode in ["no-reset", "workspace", "repaired-agent"] {
+        let root = TestDir::new("cleanup-source-preservation-control");
+        let location = match mode {
+            "workspace" => "ocm-home/envs/container/.openclaw/workspace/source",
+            "repaired-agent" => "ocm-home/envs/container/.openclaw/custom/agent/source",
+            _ => "ocm-home/envs/container/.openclaw/logs/source",
+        };
+        let (env, source) = cleanup_source_fixture(&root, location, mode != "no-reset", false);
+        let state = root.child("ocm-home/envs/container/.openclaw");
+        let stale = state.join("agents/main/sessions/stale.jsonl");
+        if mode != "no-reset" {
+            write_text(
+                &stale,
+                &serde_json::json!({"cwd":root.child("ocm-home/envs/donor/.openclaw/workspace")})
+                    .to_string(),
+            );
+        }
+        if mode == "repaired-agent" {
+            write_text(&state.join("openclaw.json"), &serde_json::json!({
+                "agents":{"entries":{"main":{"agentDir":root.child("ocm-home/envs/donor/.openclaw/custom/agent")}}}
+            }).to_string());
+        }
+        for args in [
+            vec!["env", "cleanup", "container", "--json"],
+            vec!["env", "cleanup", "container", "--yes", "--json"],
+        ] {
+            let result = run_ocm(root.path(), &env, &args);
+            assert!(result.status.success(), "{mode}: {}", stderr(&result));
+            let result: Value = serde_json::from_str(&stdout(&result)).unwrap();
+            assert_eq!(
+                result["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action["kind"] == "reset-openclaw-runtime-state"),
+                mode != "no-reset"
+            );
+        }
+        assert!(!stale.exists());
+        assert!(source.join("package.json").exists());
+        cleanup_git(&source, &env, &["cat-file", "-t", "HEAD"]);
+        cleanup_git(&source, &env, &["fsck", "--full"]);
+        let rejected = run_ocm(root.path(), &env, &["env", "remove", "container"]);
+        assert!(!rejected.status.success());
+        assert!(
+            stderr(&rejected).contains("registered dev source for env borrower"),
+            "{}",
+            stderr(&rejected)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_cleanup_unlinks_unregistered_alias_without_deleting_borrowed_source() {
+    use crate::support::write_text;
+    let root = TestDir::new("cleanup-unregistered-source-alias");
+    let (env, source) = cleanup_source_fixture(&root, "external-source", true, false);
+    let state = root.child("ocm-home/envs/container/.openclaw");
+    let alias = state.join("source-link");
+    std::os::unix::fs::symlink(&source, &alias).unwrap();
+    write_text(
+        &state.join("agents/main/sessions/stale.jsonl"),
+        &serde_json::json!({"cwd":root.child("ocm-home/envs/donor/.openclaw/workspace")})
+            .to_string(),
+    );
+    let cleanup = run_ocm(root.path(), &env, &["env", "cleanup", "container", "--yes"]);
+    assert!(cleanup.status.success(), "{}", stderr(&cleanup));
+    assert!(!alias.exists());
+    cleanup_git(&source, &env, &["cat-file", "-t", "HEAD"]);
+    cleanup_git(&source, &env, &["fsck", "--full"]);
+}

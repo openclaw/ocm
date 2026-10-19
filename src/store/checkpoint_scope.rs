@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use super::common::path_exists;
 use super::layout::display_path;
 
 /// The declared paths are opaque to checkpoints. In particular, checking their
@@ -46,7 +45,7 @@ pub(crate) fn validate_ancestors(root: &Path, paths: &[PathBuf]) -> Result<(), S
 pub(crate) fn validate_scoped_artifact(root: &Path, paths: &[PathBuf]) -> Result<(), String> {
     validate_ancestors(root, paths)?;
     for relative in paths {
-        if path_exists(&root.join(relative)) {
+        if entry_exists(&root.join(relative))? {
             return Err(format!(
                 "upgrade checkpoint unexpectedly contains independent path: {}",
                 display_path(relative)
@@ -54,6 +53,16 @@ pub(crate) fn validate_scoped_artifact(root: &Path, paths: &[PathBuf]) -> Result
         }
     }
     Ok(())
+}
+
+// Scoped publication moves directory entries, irrespective of their targets.
+// In particular, an earlier move can make a staged relative link dangling.
+fn entry_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("failed to inspect {}: {error}", display_path(path))),
+    }
 }
 
 fn require_directory(path: &Path) -> Result<(), String> {
@@ -141,7 +150,7 @@ pub(crate) fn replace_owned_entries(
             .map_err(SnapshotRestoreError::unchanged)?;
     }
     for relative in &entries {
-        if path_exists(&displaced.join(relative)) {
+        if entry_exists(&displaced.join(relative)).map_err(SnapshotRestoreError::unchanged)? {
             return Err(SnapshotRestoreError::unchanged(format!(
                 "scoped restore destination already exists: {}",
                 display_path(&displaced.join(relative))
@@ -157,12 +166,12 @@ pub(crate) fn replace_owned_entries(
             });
             let replacement = completed.last_mut().expect("replacement just inserted");
             let live = current.join(&relative);
-            if path_exists(&live) {
+            if entry_exists(&live)? {
                 fs::rename(&live, displaced.join(&relative)).map_err(|error| error.to_string())?;
                 replacement.displaced = true;
             }
             let staged = candidate.join(&relative);
-            if path_exists(&staged) {
+            if entry_exists(&staged)? {
                 fs::rename(&staged, &live).map_err(|error| error.to_string())?;
                 replacement.installed = true;
             }
@@ -199,7 +208,7 @@ pub(crate) fn replace_owned_entries(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     #[test]
     fn partial_publication_failure_reinstates_owned_entries_and_leaves_project_in_place() {
@@ -220,6 +229,8 @@ mod tests {
             .unwrap();
             fs::write(root.join("z-parent/owned"), "runtime").unwrap();
         }
+        symlink("missing-live", current.join("b-link")).unwrap();
+        symlink("missing-staged", candidate.join("b-link")).unwrap();
         fs::create_dir(current.join("z-parent/project")).unwrap();
         fs::write(current.join("z-parent/project/file"), "developer").unwrap();
         let before = fs::metadata(current.join("z-parent/project/file")).unwrap();
@@ -231,7 +242,15 @@ mod tests {
             &[PathBuf::from("z-parent/project")],
         );
         fs::set_permissions(current.join("z-parent"), fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(result.is_err());
+        assert!(result.unwrap_err().prior_state_restored);
+        assert_eq!(
+            fs::read_link(current.join("b-link")).unwrap(),
+            Path::new("missing-live")
+        );
+        assert_eq!(
+            fs::read_link(candidate.join("b-link")).unwrap(),
+            Path::new("missing-staged")
+        );
         assert_eq!(fs::read(current.join("a-first")).unwrap(), b"current");
         assert_eq!(fs::read(candidate.join("a-first")).unwrap(), b"candidate");
         assert_eq!(
@@ -259,10 +278,13 @@ mod tests {
         fs::create_dir(current.join("workspace/project")).unwrap();
         fs::write(current.join("owned"), "original").unwrap();
         fs::write(candidate.join("owned"), "restored").unwrap();
+        symlink("missing-original", current.join("link")).unwrap();
+        symlink("missing-restored", candidate.join("link")).unwrap();
         let paths = [PathBuf::from("workspace/project")];
         replace_owned_entries(&current, &candidate, &backup, &paths).unwrap();
         fs::write(current.join("workspace/project/new"), "new work").unwrap();
         fs::write(current.join("new-runtime-state"), "new runtime").unwrap();
+        symlink("missing-new", current.join("new-link")).unwrap();
         replace_owned_entries(&current, &backup, &rejected, &paths).unwrap();
         assert_eq!(fs::read(current.join("owned")).unwrap(), b"original");
         assert_eq!(
@@ -270,5 +292,38 @@ mod tests {
             b"new work"
         );
         assert!(!current.join("new-runtime-state").exists());
+        assert_eq!(
+            fs::read_link(current.join("link")).unwrap(),
+            Path::new("missing-original")
+        );
+        assert!(fs::symlink_metadata(current.join("new-link")).is_err());
+    }
+    #[test]
+    fn dangling_entries_do_not_bypass_scope_or_displacement_guards() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("current");
+        let candidate = temp.path().join("candidate");
+        let backup = temp.path().join("backup");
+        for root in [&current, &candidate, &backup] {
+            fs::create_dir(root).unwrap();
+        }
+        let paths = [PathBuf::from("project")];
+        symlink("missing-project", candidate.join("project")).unwrap();
+        assert!(validate_scoped_artifact(&candidate, &paths).is_err());
+        fs::remove_file(candidate.join("project")).unwrap();
+        validate_scoped_artifact(&candidate, &paths).unwrap();
+
+        fs::write(current.join("owned"), "live").unwrap();
+        fs::write(candidate.join("owned"), "saved").unwrap();
+        symlink("missing-backup", backup.join("owned")).unwrap();
+        let error = replace_owned_entries(&current, &candidate, &backup, &paths).unwrap_err();
+        assert!(error.prior_state_restored);
+        assert!(error.message.contains("destination already exists"));
+        assert_eq!(fs::read(current.join("owned")).unwrap(), b"live");
+        assert_eq!(fs::read(candidate.join("owned")).unwrap(), b"saved");
+        assert_eq!(
+            fs::read_link(backup.join("owned")).unwrap(),
+            Path::new("missing-backup")
+        );
     }
 }

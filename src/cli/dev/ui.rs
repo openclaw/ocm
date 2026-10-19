@@ -654,15 +654,61 @@ impl Cli {
 const path = require('node:path');
 const {createRequire} = require('node:module');
 const root = fs.realpathSync(process.cwd());
+const localModules = path.join(root, 'node_modules');
+const configuredModules = process.argv[1];
+// Native TSX bootstrap links this tree only when the root modules are absent.
+const deferredModules = !fs.existsSync(localModules) && configuredModules &&
+  fs.existsSync(path.join(configuredModules, 'tsx', 'package.json'))
+  ? configuredModules : undefined;
 const uiRequire = createRequire(path.join(root, 'ui', 'package.json'));
-for (const name of ['vite', 'dompurify']) {
-  const entry = fs.realpathSync(uiRequire.resolve(name));
+function insideRoot(entry) {
   const relative = path.relative(root, entry);
   if (path.isAbsolute(relative) || relative === '..' || relative.startsWith('..' + path.sep)) {
-    throw new Error(name + ' resolves outside the selected OpenClaw checkout');
+    throw new Error('UI dependency resolves outside the selected OpenClaw checkout');
   }
+}
+function resolveUiPackage(name) {
+  if (!deferredModules) return uiRequire.resolve(name);
+  const uiPackage = path.join(root, 'ui', 'node_modules', name);
+  const uiMetadata = fs.lstatSync(uiPackage, {throwIfNoEntry: false});
+  let packageRoot;
+  if (!uiMetadata) {
+    // Hoisted dependencies will be visible through the native root alias.
+    packageRoot = path.join(deferredModules, name);
+  } else if (uiMetadata.isSymbolicLink()) {
+    const target = path.resolve(fs.realpathSync(path.dirname(uiPackage)), fs.readlinkSync(uiPackage));
+    const relative = path.relative(localModules, target);
+    if (path.isAbsolute(relative) || relative === '..' || relative.startsWith('..' + path.sep)) {
+      return uiRequire.resolve(name);
+    }
+    // pnpm's UI links traverse the root alias into its isolated package tree.
+    packageRoot = path.join(deferredModules, relative);
+    if (!fs.existsSync(packageRoot)) {
+      // Node skips a broken UI link and continues at the root modules tree.
+      packageRoot = path.join(deferredModules, name);
+    }
+  } else {
+    return uiRequire.resolve(name);
+  }
+  packageRoot = fs.realpathSync(packageRoot);
+  insideRoot(packageRoot);
+  const manifest = path.join(packageRoot, 'package.json');
+  const metadata = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+  const packageRequire = createRequire(manifest);
+  return metadata.exports != null
+    ? packageRequire.resolve(metadata.name || name)
+    : packageRequire.resolve('./');
+}
+for (const name of ['vite', 'dompurify']) {
+  const entry = resolveUiPackage(name);
+  if (!path.isAbsolute(entry)) throw new Error(name + ' did not resolve to an installed file');
+  insideRoot(fs.realpathSync(entry));
 }"#;
         let mut env = build_openclaw_dev_source_env(meta, &self.env, source);
+        let modules_override = crate::openclaw_repo::source_modules_override(source, &env)?
+            .as_deref()
+            .map(display_path)
+            .unwrap_or_default();
         for key in ["NODE_OPTIONS", "NODE_PATH", "NODE_COMPILE_CACHE"] {
             env.remove(key);
         }
@@ -672,6 +718,8 @@ for (const name of ['vite', 'dompurify']) {
                 "--input-type=commonjs".to_string(),
                 "--eval".to_string(),
                 PROBE.to_string(),
+                "--".to_string(),
+                modules_override,
             ],
         );
         probe
@@ -834,6 +882,11 @@ for (const name of ['vite', 'dompurify']) {
         let mut children: Vec<OwnedUiChild> = Vec::new();
         let mut override_token = None;
         let result = (|| {
+            let source_env = build_openclaw_dev_source_env(meta, &self.env, source);
+            let modules = source.join("node_modules");
+            let native_link_pending = !modules.exists()
+                && crate::openclaw_repo::source_modules_override(source, &source_env)?
+                    .is_some_and(|configured| configured.join("tsx/package.json").is_file());
             let args = vec![
                 "gateway".to_string(),
                 "run".to_string(),
@@ -851,7 +904,7 @@ for (const name of ['vite', 'dompurify']) {
             gateway
                 .stdin(Stdio::inherit())
                 .env_clear()
-                .envs(build_openclaw_dev_source_env(meta, &self.env, source))
+                .envs(source_env)
                 .current_dir(source);
             let spawn_admission = self.lock_source_watch_gateway_spawn(&meta.name)?;
             children.push(spawn_ui_child(
@@ -884,12 +937,46 @@ for (const name of ['vite', 'dompurify']) {
                 )?;
             override_token = Some(active.token.clone());
             drop(spawn_admission);
-            for child in &mut children {
-                if source_watch_cancelled(lease, stop)? {
-                    return Ok(130);
-                }
-                child.start()?;
+            if source_watch_cancelled(lease, stop)? {
+                return Ok(130);
             }
+            children[0].start()?;
+            if native_link_pending {
+                // The UI consumes the root alias that native source bootstrap
+                // creates. Keep its owned startup gate closed until then.
+                let deadline = std::time::Instant::now() + DASHBOARD_TIMEOUT;
+                #[cfg(unix)]
+                let mut deadline = deadline;
+                while !modules.exists() {
+                    if source_watch_cancelled(lease, stop)? {
+                        return Ok(130);
+                    }
+                    if children[0].poll()?.is_some() {
+                        return Err("OpenClaw source exited before preparing its node_modules link for the Control UI; inspect the source startup output and retry, or use --no-ui to diagnose Gateway-only startup".to_string().into());
+                    }
+                    #[cfg(unix)]
+                    if observe_process(children[0].identity.pid)?
+                        .is_some_and(|process| process.stopped)
+                    {
+                        let suspended = std::time::Instant::now();
+                        children[0].guard.suspend_with_child(
+                            children[0].identity.pid,
+                            lease,
+                            stop,
+                        )?;
+                        deadline += suspended.elapsed();
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err("OpenClaw source did not prepare its node_modules link for the Control UI within 30 seconds; inspect the source startup output and retry, or use --no-ui to diagnose Gateway-only startup".to_string().into());
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                crate::openclaw_repo::ensure_checkout_owned_dependencies(source)?;
+            }
+            if source_watch_cancelled(lease, stop)? {
+                return Ok(130);
+            }
+            children[1].start()?;
             self.stdout_line(format!("UI address: http://127.0.0.1:{}/", target.port));
             let began = std::time::Instant::now();
             let mut last_probe = began - Duration::from_secs(1);

@@ -48,6 +48,23 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Restore scoped checkpoint symlinks, including dangling links and links into independently preserved directories. Thanks @shakkernerd (#488, #502).
+- Preserve SQLite symlinks in ordinary environment exports without copying external database contents. Thanks @shakkernerd (#493, #503).
+- Run requested onboarding before activating a fresh background service. Thanks @shakkernerd (#489, #504).
+- Preserve Unix `command` builtin semantics for supervised launchers. Thanks @shakkernerd (#491, #505).
+- Preserve shared-clone and initialized-submodule Git objects when removing another environment. Thanks @shakkernerd (#501, #506).
+- Relocate paths in copied config includes for clone, import, migration, and adoption. Thanks @shakkernerd (#486, #507).
+- Refuse parent environment removal when it would delete separately registered legacy children. Thanks @shakkernerd (#494, #508).
+- Retain the admitted development checkout when a source alias changes during a temporary takeover. Thanks @shakkernerd (#496, #509).
+- Refuse health cleanup that would delete registered development sources before making repairs. Thanks @shakkernerd (#487, #510).
+- Reuse existing start launchers with equivalent relative working directories. Thanks @shakkernerd (#499, #511).
+- Recognize native SQLite plugin installation records during targeted local builds. Thanks @shakkernerd (#495, #513).
+- Preserve runtime directory modes across changed umasks during upgrade, rollback, and failed-upgrade recovery. Thanks @shakkernerd (#490, #514).
+- Import archives with nested absolute internal config includes after the original source has been removed. Thanks @shakkernerd (#492, #516).
+- Resolve Gateway ports from effective JSON5 and included configuration. Thanks @shakkernerd (#498, #517).
+- Admit configured development dependency directories and wait for native linking before starting the UI. Thanks @shakkernerd (#497, #518).
+- Revive cleanly stopped protocol-capable Gateways with ordinary service restart. Thanks @shakkernerd (#500, #519).
+- Relocate nested absolute internal include directives before validating a cloned environment. Thanks @shakkernerd (#520).
 - Relocate session, recorded file, worktree, and other text references across registered OpenClaw databases during state-inclusive import, with per-database counts and unchanged binary payloads.
 
 - Relocate installed plugin receipts and runtime state references when importing a state-inclusive archive, preserving other state and references outside the source environment. Share path-component and file-URL matching with plain-home migration so sibling path prefixes are preserved.

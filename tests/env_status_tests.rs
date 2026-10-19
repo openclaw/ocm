@@ -392,7 +392,7 @@ fn env_status_keeps_official_runtime_healthy_when_managed_fallback_is_available(
 }
 
 #[test]
-fn env_status_reports_the_config_derived_gateway_port_after_onboarding_writes_it() {
+fn env_status_and_execution_resolve_the_effective_config_gateway_port() {
     let root = TestDir::new("env-status-config-port");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -404,9 +404,9 @@ fn env_status_reports_the_config_derived_gateway_port_after_onboarding_writes_it
         &[
             "launcher",
             "add",
-            "fallback",
+            "inspect",
             "--command",
-            "printf launcher",
+            "printf '%s' \"$OPENCLAW_GATEWAY_PORT\"",
         ],
     );
     assert!(add.status.success(), "{}", stderr(&add));
@@ -414,17 +414,124 @@ fn env_status_reports_the_config_derived_gateway_port_after_onboarding_writes_it
     let create = run_ocm(
         &cwd,
         &env,
-        &["env", "create", "demo", "--launcher", "fallback"],
+        &["env", "create", "demo", "--launcher", "inspect", "--json"],
     );
     assert!(create.status.success(), "{}", stderr(&create));
+    let created: Value = serde_json::from_str(&stdout(&create)).unwrap();
+    let automatic_port = created["gatewayPort"].as_u64().unwrap();
+    let configured_port = if automatic_port <= 64_535 {
+        automatic_port + 1000
+    } else {
+        automatic_port - 1000
+    };
 
-    let env_root = root.child("ocm-home/envs/demo");
-    let config_path = env_root.join(".openclaw/openclaw.json");
-    fs::write(&config_path, "{\"gateway\":{\"port\":18888}}").unwrap();
+    let state_dir = root.child("ocm-home/envs/demo/.openclaw");
+    let config_path = state_dir.join("openclaw.json");
+    let strict = format!(r#"{{"gateway":{{"port":{configured_port}}}}}"#);
+    fs::write(state_dir.join("gateway.json5"), &strict).unwrap();
+    fs::write(
+        state_dir.join("port.json5"),
+        format!("{{port: {configured_port}}}"),
+    )
+    .unwrap();
+    fs::write(state_dir.join("first.json5"), "{gateway: {port: 1}}").unwrap();
+    fs::write(state_dir.parent().unwrap().join("outside.json5"), &strict).unwrap();
 
-    let status = run_ocm(&cwd, &env, &["env", "status", "demo"]);
-    assert!(status.status.success(), "{}", stderr(&status));
-    let output = stdout(&status);
-    assert!(output.contains("gatewayPort: 18888"));
-    assert!(output.contains("gatewayPortSource: config"));
+    let assert_port = |name: &str, port: u64, source: &str| {
+        let status = run_ocm(&cwd, &env, &["env", "status", name, "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let value: Value = serde_json::from_str(&stdout(&status)).unwrap();
+        assert_eq!(value["gatewayPort"], port);
+        assert_eq!(value["gatewayPortSource"], source);
+
+        let show = run_ocm(&cwd, &env, &["env", "show", name, "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        let value: Value = serde_json::from_str(&stdout(&show)).unwrap();
+        assert_eq!(value["gatewayPort"], port);
+
+        #[cfg(unix)]
+        for args in [
+            vec!["env", "run", name, "--"],
+            vec![
+                "env",
+                "exec",
+                name,
+                "--",
+                "sh",
+                "-c",
+                "printf '%s' \"$OPENCLAW_GATEWAY_PORT\"",
+            ],
+        ] {
+            let output = run_ocm(&cwd, &env, &args);
+            assert!(output.status.success(), "{}", stderr(&output));
+            assert_eq!(stdout(&output), port.to_string());
+        }
+    };
+
+    for content in [
+        strict.clone(),
+        format!("{{ // JSON5 comment\n gateway: {{port: {configured_port},}},}}"),
+        r#"{"$include":"./gateway.json5"}"#.to_string(),
+        r#"{gateway: {$include: './port.json5'}}"#.to_string(),
+        r#"{$include: ['./first.json5', './gateway.json5']}"#.to_string(),
+        format!("{{$include: './first.json5', gateway: {{port: {configured_port}}}}}"),
+    ] {
+        fs::write(&config_path, &content).unwrap();
+        let doctor = run_ocm(&cwd, &env, &["env", "doctor", "demo", "--json"]);
+        assert!(doctor.status.success(), "{}", stderr(&doctor));
+        let value: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+        assert_eq!(value["configStatus"], "ok", "{content}");
+        assert_eq!(value["healthy"], true, "{content}");
+        assert_port("demo", configured_port, "config");
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), content);
+    }
+
+    for content in [
+        "{gateway: [",
+        "{gateway: {port: 65536}}",
+        "{gateway: {port: '18888'}}",
+        "{$include: 42}",
+        "{$include: './missing.json5'}",
+        "{$include: '../outside.json5'}",
+    ] {
+        fs::write(&config_path, content).unwrap();
+        assert_port("demo", automatic_port, "computed");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../outside.json5", state_dir.join("linked.json5")).unwrap();
+        fs::write(&config_path, "{$include: './linked.json5'}").unwrap();
+        assert_port("demo", automatic_port, "computed");
+    }
+    fs::remove_file(&config_path).unwrap();
+    assert_port("demo", automatic_port, "computed");
+
+    let explicit_port = if configured_port == 30_000 {
+        31_000
+    } else {
+        30_000
+    };
+    let explicit_port_arg = explicit_port.to_string();
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "explicit",
+            "--launcher",
+            "inspect",
+            "--port",
+            &explicit_port_arg,
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let explicit_state = root.child("ocm-home/envs/explicit/.openclaw");
+    fs::write(explicit_state.join("gateway.json5"), strict).unwrap();
+    fs::write(
+        explicit_state.join("openclaw.json"),
+        "{$include: './gateway.json5'}",
+    )
+    .unwrap();
+    assert_port("explicit", explicit_port, "metadata");
 }

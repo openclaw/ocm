@@ -248,6 +248,43 @@ pub fn restart_service(
         );
     }
 
+    if !before.running && before.gateway_state == "stopped" {
+        // Retained capability describes the exited process, not a live owner to
+        // receive a handoff. Verify absence against the current daemon before
+        // publishing a restart; informational status may contain stale rows.
+        let supervisor = SupervisorService::new(env, cwd);
+        let request_id = {
+            let _lifecycle_lock = supervisor.lock_daemon_lifecycle()?;
+            supervisor.validate_daemon_owner_locked()?;
+            let observed = supervisor.inspect_for_recovery()?;
+            let settled = observed.daemon.running
+                && !observed.retained_envs.contains(name)
+                && !observed
+                    .runtime_children
+                    .iter()
+                    .any(|child| child.env_name == name)
+                && observed.runtime_services.iter().any(|service| {
+                    service.env_name == name
+                        && service.gateway_state == "stopped"
+                        && service.pid.is_none()
+                        && service.next_retry_at.is_none()
+                });
+            if settled {
+                Some(supervisor.request_child_restart(name)?)
+            } else {
+                None
+            }
+        };
+        if let Some(request_id) = request_id {
+            let status = complete_direct_restart(name, None, request_id, env, cwd)?;
+            return Ok(service_action_summary(
+                "restart",
+                status.summary,
+                status.warnings,
+            ));
+        }
+    }
+
     let mut helper = spawn_recovery_aware_restart(name, env, cwd)?;
 
     if restart_originates_inside_gateway(name, env) {

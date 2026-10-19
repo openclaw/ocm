@@ -1,3 +1,5 @@
+#[path = "support/config_includes.rs"]
+mod config_includes;
 mod support;
 
 use std::fs;
@@ -3251,4 +3253,29 @@ fn migration_rolls_back_a_database_relocation_conflict() {
         serde_json::json!([])
     );
     assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn migrate_and_adopt_relocate_config_includes() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-config-includes");
+        let env = ocm_env(&root);
+        let source = root.child("source/plain-home");
+        let fixture = config_includes::IncludedPluginConfig::seed(&source, &root.child("external"));
+        let args = if adopt {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "copied",
+                source.to_str().unwrap(),
+            ]
+        } else {
+            vec!["migrate", "copied", source.to_str().unwrap()]
+        };
+        let migrate = run_ocm(root.path(), &env, &args);
+        assert!(migrate.status.success(), "{}", stderr(&migrate));
+        fixture.assert_relocated(&root.child("ocm-home/envs/copied/.openclaw"));
+        fixture.assert_source_unchanged(&source);
+    }
 }

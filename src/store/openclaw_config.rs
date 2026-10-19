@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 #[cfg(any(unix, windows))]
@@ -85,18 +85,29 @@ pub(crate) fn audit_openclaw_config(meta: &EnvMeta, known_envs: &[EnvMeta]) -> O
     audit_openclaw_config_value(meta, known_envs, &paths, &value)
 }
 
-pub(crate) fn repair_openclaw_config(
+pub(crate) struct OpenClawConfigRepair {
+    config_path: PathBuf,
+    pub(crate) value: Value,
+}
+
+impl OpenClawConfigRepair {
+    pub(crate) fn apply(&self) -> Result<(), String> {
+        write_config_value(&self.config_path, &self.value)
+    }
+}
+
+pub(crate) fn prepare_openclaw_config_repair(
     meta: &EnvMeta,
     known_envs: &[EnvMeta],
-) -> Result<bool, String> {
+) -> Result<Option<OpenClawConfigRepair>, String> {
     let paths = derive_env_paths(Path::new(&meta.root));
     let Some(mut value) = read_config_value(&paths.config_path)? else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let audit = audit_openclaw_config_value(meta, known_envs, &paths, &value);
     if audit.status != "drifted" {
-        return Ok(false);
+        return Ok(None);
     }
 
     let mut changed = false;
@@ -111,11 +122,13 @@ pub(crate) fn repair_openclaw_config(
     }
 
     if !changed {
-        return Ok(false);
+        return Ok(None);
     }
 
-    write_config_value(&paths.config_path, &value)?;
-    Ok(true)
+    Ok(Some(OpenClawConfigRepair {
+        config_path: paths.config_path,
+        value,
+    }))
 }
 
 pub(crate) fn rewrite_openclaw_config_for_target(
@@ -295,14 +308,38 @@ pub(super) fn rewrite_archived_openclaw_config(
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
-    rewrite_openclaw_config_with_root_mappings(
+    let source_config_roots = source_roots
+        .iter()
+        .map(|root| derive_env_paths(root).state_dir)
+        .collect::<Vec<_>>();
+    let outcome = rewrite_openclaw_config_with_path_rewriter(
         target_paths,
+        gateway_port,
+        SandboxOriginPolicy::NewEnvironment(sandbox_origin),
+        |value| {
+            rewrite_config_paths_with_archive_includes(
+                value,
+                &source_config_roots,
+                &target_paths.state_dir,
+                &|value| {
+                    rewrite_env_root_paths_from_roots(
+                        value,
+                        source_roots,
+                        canonical_source_root,
+                        &target_paths.root,
+                    )
+                },
+            )
+        },
+    )?;
+    rewrite_openclaw_config_includes_with_root_mappings(
+        &target_paths.config_path,
+        &target_paths.state_dir,
         source_roots,
         canonical_source_root,
         &target_paths.root,
-        gateway_port,
-        SandboxOriginPolicy::NewEnvironment(sandbox_origin),
-    )
+    )?;
+    Ok(outcome)
 }
 
 fn rewrite_openclaw_config_with_root_mapping(
@@ -315,23 +352,33 @@ fn rewrite_openclaw_config_with_root_mapping(
     let target_root = root_mapping
         .map(|(_, target)| target)
         .unwrap_or(&target_paths.root);
-    rewrite_openclaw_config_with_root_mappings(
+    let outcome = rewrite_openclaw_config_with_path_rewriter(
         target_paths,
-        &source_roots,
-        None,
-        target_root,
         gateway_port,
         sandbox_origin_policy,
-    )
+        |value| rewrite_env_root_paths_from_roots(value, &source_roots, None, target_root),
+    )?;
+    if matches!(
+        sandbox_origin_policy,
+        SandboxOriginPolicy::NewEnvironment(_)
+    ) && !source_roots.is_empty()
+    {
+        rewrite_openclaw_config_includes_with_root_mappings(
+            &target_paths.config_path,
+            &target_paths.state_dir,
+            &source_roots,
+            None,
+            target_root,
+        )?;
+    }
+    Ok(outcome)
 }
 
-fn rewrite_openclaw_config_with_root_mappings(
+fn rewrite_openclaw_config_with_path_rewriter(
     target_paths: &EnvPaths,
-    source_roots: &[&Path],
-    canonical_source_root: Option<&Path>,
-    target_root: &Path,
     gateway_port: Option<u32>,
     sandbox_origin_policy: SandboxOriginPolicy<'_>,
+    rewrite_paths: impl FnOnce(&mut Value) -> bool,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
     let config_is_symlink = fs::symlink_metadata(&target_paths.config_path)
         .map(|metadata| metadata.file_type().is_symlink())
@@ -350,12 +397,7 @@ fn rewrite_openclaw_config_with_root_mappings(
 
     let mut changed = false;
     let mut outcome = OpenClawConfigRewriteOutcome::default();
-    changed |= rewrite_env_root_paths_from_roots(
-        &mut value,
-        source_roots,
-        canonical_source_root,
-        target_root,
-    );
+    changed |= rewrite_paths(&mut value);
     changed |= rewrite_workspace_field_if_env_scoped(
         &mut value,
         &target_paths.root,
@@ -376,11 +418,10 @@ fn rewrite_openclaw_config_with_root_mappings(
         changed |= apply_simulation_identity_overlay(&mut value, target_paths, gateway_port)?;
     }
 
-    if !changed && !config_is_symlink {
-        return Ok(outcome);
+    if changed || config_is_symlink {
+        write_config_value(&target_paths.config_path, &value)?;
     }
 
-    write_config_value(&target_paths.config_path, &value)?;
     Ok(outcome)
 }
 
@@ -398,10 +439,144 @@ pub(crate) fn rewrite_openclaw_config_for_simulation(
     .map(|_| ())
 }
 
+pub(super) fn rewrite_copied_include_directives(
+    include_paths: &[PathBuf],
+    source_roots: &[&Path],
+    target_root: &Path,
+) -> Result<(), String> {
+    let source_config_roots = source_roots
+        .iter()
+        .map(|root| derive_env_paths(root).state_dir)
+        .collect::<Vec<_>>();
+    let target_config_root = derive_env_paths(target_root).state_dir;
+    for path in include_paths {
+        let mut value = read_config_value(path)?
+            .ok_or_else(|| format!("copied OpenClaw include is missing: {}", display_path(path)))?;
+        if rewrite_config_paths_with_archive_includes(
+            &mut value,
+            &source_config_roots,
+            &target_config_root,
+            &|_| false,
+        ) {
+            let permissions = fs::metadata(path)
+                .map_err(|error| error.to_string())?
+                .permissions();
+            let parent = path
+                .parent()
+                .ok_or_else(|| "copied include has no parent".to_string())?;
+            super::openclaw_state::with_owner_write_permission(parent, || {
+                #[cfg(unix)]
+                {
+                    // Replace the copied pathname without making a symlink's
+                    // referent writable. Protect bytes before publishing them.
+                    let staged = stage_private_config(path, &value)?;
+                    staged
+                        .as_file()
+                        .set_permissions(permissions.clone())
+                        .map_err(|error| error.to_string())?;
+                    replace_private_config(staged, path)
+                }
+                #[cfg(not(unix))]
+                {
+                    let write = || write_config_value(path, &value);
+                    if fs::symlink_metadata(path)
+                        .map_err(|error| error.to_string())?
+                        .file_type()
+                        .is_symlink()
+                    {
+                        write()
+                    } else {
+                        super::openclaw_state::with_owner_write_permission(path, write)
+                    }
+                }
+            })?;
+            #[cfg(not(unix))]
+            fs::set_permissions(path, permissions).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_config_paths_with_archive_includes(
+    value: &mut Value,
+    source_config_roots: &[PathBuf],
+    target_config_root: &Path,
+    rewrite_other: &impl Fn(&mut Value) -> bool,
+) -> bool {
+    match value {
+        Value::Object(object) => object.iter_mut().fold(false, |changed, (key, value)| {
+            let rewritten = if key == "$include" {
+                rewrite_include_path(value, source_config_roots, target_config_root)
+            } else {
+                rewrite_config_paths_with_archive_includes(
+                    value,
+                    source_config_roots,
+                    target_config_root,
+                    rewrite_other,
+                )
+            };
+            changed || rewritten
+        }),
+        Value::Array(values) => values.iter_mut().fold(false, |changed, value| {
+            rewrite_config_paths_with_archive_includes(
+                value,
+                source_config_roots,
+                target_config_root,
+                rewrite_other,
+            ) || changed
+        }),
+        _ => rewrite_other(value),
+    }
+}
+
+fn rewrite_include_path(
+    value: &mut Value,
+    source_config_roots: &[PathBuf],
+    target_config_root: &Path,
+) -> bool {
+    match value {
+        Value::String(raw) => {
+            let Some(mapped) = super::openclaw_workspaces::map_archived_config_include(
+                Path::new(raw),
+                source_config_roots,
+                target_config_root,
+            ) else {
+                return false;
+            };
+            let mapped = display_path(&mapped);
+            if *raw == mapped {
+                return false;
+            }
+            *raw = mapped;
+            true
+        }
+        Value::Array(values) => values.iter_mut().fold(false, |changed, value| {
+            rewrite_include_path(value, source_config_roots, target_config_root) || changed
+        }),
+        _ => false,
+    }
+}
+
 pub(crate) fn rewrite_openclaw_config_includes_for_target(
     config_path: &Path,
     state_dir: &Path,
     source_root: &Path,
+    target_root: &Path,
+) -> Result<bool, String> {
+    rewrite_openclaw_config_includes_with_root_mappings(
+        config_path,
+        state_dir,
+        &[source_root],
+        None,
+        target_root,
+    )
+}
+
+fn rewrite_openclaw_config_includes_with_root_mappings(
+    config_path: &Path,
+    state_dir: &Path,
+    source_roots: &[&Path],
+    canonical_source_root: Option<&Path>,
     target_root: &Path,
 ) -> Result<bool, String> {
     let include_paths = openclaw_config_include_paths(config_path, state_dir)?;
@@ -419,8 +594,17 @@ pub(crate) fn rewrite_openclaw_config_includes_for_target(
                 display_path(&include_path)
             )
         })?;
-        if rewrite_env_root_paths(&mut value, source_root, target_root) {
-            write_config_value(&include_path, &value)?;
+        // Include directives already select copied files. Only relocate their
+        // values here, so a destination beneath a former source is not remapped.
+        if rewrite_config_paths_with_archive_includes(&mut value, &[], state_dir, &|value| {
+            rewrite_env_root_paths_from_roots(
+                value,
+                source_roots,
+                canonical_source_root,
+                target_root,
+            )
+        }) {
+            write_copied_config_value(&include_path, &value)?;
             changed = true;
         }
     }
@@ -969,6 +1153,29 @@ fn ensure_object_field<'a>(
         .expect("object field must exist after reset")
 }
 
+fn write_copied_config_value(config_path: &Path, value: &Value) -> Result<(), String> {
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| "copied include has no parent".to_string())?;
+    super::openclaw_state::with_owner_write_permission(parent, || {
+        #[cfg(unix)]
+        {
+            // Stage privately, then restore authored file and parent modes.
+            let permissions = fs::metadata(config_path)
+                .map_err(|error| error.to_string())?
+                .permissions();
+            let staged = stage_private_config(config_path, value)?;
+            staged
+                .as_file()
+                .set_permissions(permissions)
+                .map_err(|error| error.to_string())?;
+            replace_private_config(staged, config_path)
+        }
+        #[cfg(not(unix))]
+        write_config_value(config_path, value)
+    })
+}
+
 fn write_config_value(config_path: &Path, value: &Value) -> Result<(), String> {
     // Preserve private access when replacing the file. Other authored
     // files retain the existing writer's access and replacement behavior.
@@ -1276,7 +1483,12 @@ fn rewrite_env_root_paths_from_roots(
             // Never run a second pass over a rewritten destination value.
             for source in source_roots {
                 if let Ok(suffix) = Path::new(raw).strip_prefix(source) {
-                    *raw = display_path(&clean_path(&target_root.join(suffix)));
+                    let Some(target) =
+                        map_env_root_suffix(suffix, source, source_roots, target_root)
+                    else {
+                        return false;
+                    };
+                    *raw = display_path(&target);
                     return true;
                 }
             }
@@ -1333,8 +1545,108 @@ fn rewrite_env_root_string(raw: &mut String, source_root: &Path, target_root: &P
         suffix.to_path_buf()
     };
 
-    *raw = display_path(&clean_path(&target_root.join(suffix)));
+    let canonical_source = suffix
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+        .then(|| normalize_path_allow_missing(source_root))
+        .flatten();
+    let source_roots = [
+        source_root,
+        canonical_source.as_deref().unwrap_or(source_root),
+    ];
+    let Some(target) = map_env_root_suffix(&suffix, source_root, &source_roots, target_root) else {
+        return false;
+    };
+    *raw = display_path(&target);
     true
+}
+
+fn map_env_root_suffix(
+    suffix: &Path,
+    source_root: &Path,
+    source_roots: &[&Path],
+    target_root: &Path,
+) -> Option<PathBuf> {
+    if !suffix
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Some(clean_path(&target_root.join(suffix)));
+    }
+
+    // Resolve parent traversal in the recorded source namespace, reading owned
+    // entries from the copied tree. Absolute internal links can still name a
+    // removed source; neither that source nor a retargeted root alias is read.
+    let mut resolved = source_root.to_path_buf();
+    let mut pending: VecDeque<OsString> = suffix
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect();
+    let mut links = 0;
+    while let Some(component) = pending.pop_front() {
+        if component == ".." {
+            resolved.pop();
+            continue;
+        }
+        if component == "." {
+            continue;
+        }
+        resolved.push(component);
+        let copied = source_roots.iter().find_map(|root| {
+            resolved
+                .strip_prefix(root)
+                .ok()
+                .map(|relative| target_root.join(relative))
+        });
+        let entry = copied.as_deref().unwrap_or(&resolved);
+        match fs::symlink_metadata(entry) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                links += 1;
+                if links > 40 {
+                    return None;
+                }
+                let link = fs::read_link(entry).ok()?;
+                resolved.pop();
+                let remainder = if link.is_absolute() {
+                    if let Some((root, relative)) = source_roots
+                        .iter()
+                        .find_map(|root| link.strip_prefix(root).ok().map(|path| (*root, path)))
+                    {
+                        resolved = root.to_path_buf();
+                        relative
+                    } else if let Ok(relative) = link.strip_prefix(target_root) {
+                        resolved = source_root.to_path_buf();
+                        relative
+                    } else {
+                        // External links retain normal filesystem semantics.
+                        // A final external destination must not be relocated.
+                        let rest: PathBuf = pending.iter().collect();
+                        let external = normalize_path_allow_missing(&link.join(rest))?;
+                        return source_roots.iter().find_map(|root| {
+                            external
+                                .strip_prefix(root)
+                                .ok()
+                                .map(|relative| target_root.join(relative))
+                        });
+                    }
+                } else {
+                    &link
+                };
+                for component in remainder.components().rev() {
+                    pending.push_front(component.as_os_str().to_owned());
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    source_roots.iter().find_map(|root| {
+        resolved
+            .strip_prefix(root)
+            .ok()
+            .map(|relative| target_root.join(relative))
+    })
 }
 
 pub(super) fn normalize_path_allow_missing(path: &Path) -> Option<PathBuf> {

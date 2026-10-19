@@ -650,6 +650,37 @@ pub(crate) fn ensure_environment_removal_preserves_dev_sources(
     Ok(())
 }
 
+pub(crate) fn ensure_runtime_cleanup_preserves_dev_sources(
+    target: &EnvMeta,
+    envs: &[EnvMeta],
+    service: &crate::env::EnvironmentService<'_>,
+    paths: &BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // Health cleanup retains its own source too; unlike removal, it does not
+    // retire the target's binding or finish an active temporary generation.
+    let mut footprints = Vec::new();
+    for meta in envs {
+        if let Some(footprint) = protected_dev_source_footprint(meta, envs, service)? {
+            footprints.push((meta, footprint));
+        }
+    }
+    if footprints.is_empty() {
+        return Ok(());
+    }
+    for path in paths {
+        let removal = DevSourceRemoval::entry(path)?;
+        for (owner, footprint) in &footprints {
+            if let Some(path) = removal.affected_path(footprint)? {
+                return Err(source_removal_error(&target.name, owner, path));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_dev_worktree_removal_preserves_dev_sources(
     name: &str,
     dev: &EnvDevMeta,
@@ -698,6 +729,22 @@ pub(crate) struct DevSourceRemoval {
 impl DevSourceRemoval {
     pub(crate) fn environment(target: &EnvMeta) -> Result<Self, String> {
         Self::new(Some(Path::new(&target.root)), target.dev.as_ref())
+    }
+
+    // Runtime reset unlinks a final symlink, without deleting its referent.
+    fn entry(path: &Path) -> Result<Self, String> {
+        if !fs::symlink_metadata(path)
+            .map_err(|error| error.to_string())?
+            .is_symlink()
+        {
+            return Self::new(Some(path), None);
+        }
+        let mut removal = Self::new(None, None)?;
+        let parent = fs::canonicalize(path.parent().ok_or("cleanup path has no parent")?)
+            .map_err(|error| error.to_string())?;
+        removal.root_link = Some(parent.join(path.file_name().ok_or("cleanup path has no name")?));
+        removal.entry_parent = Some(parent);
+        Ok(removal)
     }
 
     fn worktree(dev: &EnvDevMeta) -> Result<Self, String> {

@@ -4662,6 +4662,74 @@ fn sibling_restart_preserves_inactive_target_until_explicit_restart() {
 }
 
 #[test]
+fn ordinary_restart_revives_inactive_protocol_target_without_reviving_sibling() {
+    let _guard = daemon_runtime_test_lock();
+    let fixture = InactiveGatewayFixture::running(true);
+    fs::write(fixture.root.child("release-consume"), "release").unwrap();
+    // The native command has no live owner after exit; invoking it is the bug.
+    let script = fixture.root.child("bin/target/openclaw.mjs");
+    let raw = fs::read_to_string(&script).unwrap();
+    write_executable_script(
+        &script,
+        &raw.replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\nif [ \"$1\" = gateway ] && [ \"${2:-}\" = restart ]; then exit 23; fi\n",
+            1,
+        ),
+    );
+    fixture.exit_target();
+    let sibling_pid = fixture.sibling["pid"].as_u64().unwrap();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &sibling_pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let sibling_state = wait_for_runtime_service_state(
+        &fixture.runtime_path,
+        "sibling",
+        "stopped",
+        Duration::from_secs(5),
+    )
+    .expect("sibling did not settle inactive");
+    let target_state = wait_for_runtime_service_state(
+        &fixture.runtime_path,
+        "target",
+        "stopped",
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(target_state["restartHandoff"], "protocol-v1");
+    assert_eq!(target_state["pid"], Value::Null);
+
+    let restart = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["service", "restart", "target", "--json"],
+    );
+    assert!(restart.status.success(), "{}", stderr(&restart));
+    let body: Value = serde_json::from_slice(&restart.stdout).unwrap();
+    assert_eq!(body["gatewayReady"], true);
+    assert!(body["warnings"].as_array().unwrap().is_empty());
+    let runtime = read_persisted_service_state(&fixture.runtime_path);
+    assert!(runtime_child_pid(&runtime, "target").is_some());
+    assert!(runtime_child_pid(&runtime, "sibling").is_none());
+    assert_eq!(
+        runtime["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["envName"] == "sibling"),
+        Some(&sibling_state)
+    );
+    assert_eq!(
+        runtime["gatewayAdmission"]["process"]["pid"],
+        fixture.daemon.id()
+    );
+}
+
+#[test]
 fn snapshot_retires_inactive_target_and_preserves_running_sibling() {
     let _guard = daemon_runtime_test_lock();
     let fixture = InactiveGatewayFixture::new();
@@ -5015,6 +5083,8 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
         "exec",
         "eval-quoted",
         "eval",
+        "command-quoted",
+        "command",
         "plain",
         "plain-wrapper",
     ];
@@ -5043,7 +5113,7 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
                 "import http from 'node:http';",
                 &format!(
                     "import http from 'node:http';\nimport fs from 'node:fs';\n\
-                     fs.appendFileSync({}, JSON.stringify({{argv: process.argv.slice(2), cwd: process.cwd()}}) + '\\n');\n\
+                     fs.appendFileSync({}, JSON.stringify({{pid: process.pid, argv: process.argv.slice(2), cwd: process.cwd()}}) + '\\n');\n\
                      if (process.argv[2] === '--version') process.exit(0);",
                     serde_json::to_string(&path_string(&invocations)).unwrap()
                 ),
@@ -5059,8 +5129,9 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
         );
         let recipe = match mode {
             "exec-quoted" => format!("exec \"node\" '{}'", path_string(&entry)),
-            "exec" | "eval" => format!("{mode} {}", path_string(&script)),
+            "exec" | "eval" | "command" => format!("{mode} {}", path_string(&script)),
             "eval-quoted" => format!("eval '{}'", path_string(&script)),
+            "command-quoted" => format!("command '{}'", path_string(&entry)),
             "dot" => format!(". {}", path_string(&wrapper)),
             "dot-quoted" => format!(". '{}'", path_string(&wrapper)),
             "source" => format!("source {}", path_string(&wrapper)),
@@ -5130,6 +5201,10 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
             .iter()
             .find(|call| call["argv"][0] == "gateway" && call["argv"][1] == "run")
             .unwrap();
+        assert!(
+            !process_exists(gateway["pid"].as_u64().unwrap() as u32),
+            "{mode}: Gateway peer survived stop"
+        );
         assert_eq!(
             gateway["argv"],
             serde_json::json!(["gateway", "run", "--port", child["childPort"].to_string()]),
@@ -5147,6 +5222,14 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
             .iter()
             .all(|program| !path.join(program).is_file())),
             "fixture must not provide external shell builtin commands"
+        );
+        // macOS supplies an external command; Linux proves the builtin works
+        // without one, so direct spawning cannot accidentally pass this case.
+        #[cfg(target_os = "linux")]
+        assert!(
+            std::env::split_paths(child["processEnv"]["PATH"].as_str().unwrap())
+                .all(|path| !path.join("command").is_file()),
+            "fixture must not provide an external command executable"
         );
         if mode == "plain" {
             assert_eq!(child["binaryPath"], path_string(&script));

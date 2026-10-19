@@ -1778,7 +1778,15 @@ fn state_archive_relocates_both_root_identities_after_the_source_disappears() {
             config["agents"]["entries"]["main"]["agentDir"],
             target.join(".openclaw/private-agent").to_str().unwrap()
         );
-        for (path, bytes) in protected[1..6].iter().zip(&before[1..6]) {
+        // Active include values follow the root config's import relocation;
+        // export and unrelated authored provenance remain byte-preserving.
+        let included: Value =
+            serde_json::from_slice(&fs::read(imported_state.join("extra.json")).unwrap()).unwrap();
+        assert_eq!(
+            included["plugin"]["note"],
+            target.join("included-provenance").to_str().unwrap()
+        );
+        for (path, bytes) in protected[2..6].iter().zip(&before[2..6]) {
             assert_eq!(
                 fs::read(imported_state.join(path)).unwrap(),
                 *bytes,

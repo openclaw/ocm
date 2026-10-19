@@ -61,7 +61,7 @@ pub(crate) fn resolve_direct_launcher_command(
     if cfg!(unix)
         && matches!(
             tokens.first()?.as_str(),
-            "exec" | "eval" | "." | "source" | "builtin"
+            "exec" | "eval" | "." | "source" | "builtin" | "command"
         )
     {
         return None;
@@ -257,6 +257,7 @@ mod tests {
             ". '/source/wrapper.sh'",
             "source '/source/wrapper.sh'",
             "builtin source '/source/wrapper.sh'",
+            "command '/source/openclaw'",
         ] {
             assert!(
                 resolve_direct_launcher_command(
@@ -271,7 +272,7 @@ mod tests {
 
     #[test]
     fn resolve_direct_launcher_command_keeps_builtin_shell_semantics_on_unix() {
-        for builtin in ["exec", "eval", ".", "source", "builtin"] {
+        for builtin in ["exec", "eval", ".", "source", "builtin", "command"] {
             let recipe = format!("{builtin} openclaw --profile dev");
             assert_eq!(
                 parse_literal_launcher_command(&recipe).unwrap(),
@@ -315,9 +316,12 @@ mod tests {
             "./eval",
             "./source",
             "./builtin",
+            "./command",
             "source-tool",
             "builtin-tool",
+            "command-tool",
             "/usr/local/bin/builtin",
+            "/usr/local/bin/command",
             "./wrapper.sh",
             "/bin/sh",
         ] {

@@ -55,6 +55,16 @@ ocm start luna --command 'pnpm openclaw' --cwd /path/to/openclaw
 
 `start` creates or reuses the environment, prepares the chosen OpenClaw source, and can run onboarding for you.
 By default, it also installs and starts the environment service so OpenClaw keeps running in the background.
+With `--onboard`, onboarding runs first, and OCM installs and starts the service only
+after onboarding succeeds. This also applies when you choose both onboarding and
+background running in `setup`. Failed or cancelled onboarding leaves a new
+environment stopped and preserves an existing environment's service state. Retry
+with `ocm start <name> --onboard`; use `--no-service` to finish onboarding without
+starting a background service. Gateway readiness is still checked when OCM starts
+the service after onboarding.
+Repeating `ocm start luna --command ... --cwd .` from the same directory reuses the local
+launcher, as does the equivalent absolute directory. A different command or
+directory is refused without changing the existing launcher.
 
 ## Common scenarios
 
@@ -146,7 +156,15 @@ unavailable until that dev session is restarted.
 same deadline; late or disconnected callers' grant bytes are discarded.
 An unfinished or interrupted cleanup keeps its recorded ownership.
 UI requires HTTP, enabled Control UI and installed source UI dependencies; use
-`--no-ui` for TLS or disabled-UI environments. `--service` uses the background
+`--no-ui` for TLS or disabled-UI environments. A configured in-checkout modules
+directory is accepted before native startup creates its root `node_modules`
+link, including pnpm UI package links through that root. OCM checks these
+dependencies without creating the link or accepting packages from another
+checkout. When the link is absent, the UI waits for native source startup to
+create it; cancellation, source exit, or a 30-second timeout ends that wait.
+Suspending the foreground source also suspends OCM and pauses that startup
+timeout until resume.
+`--service` uses the background
 workflow without foreground watching or UI and rejects explicit `--watch` or
 `--ui`. Existing authentication settings remain in effect.
 
@@ -211,7 +229,11 @@ ocm runtime build-local primary-test \
 
 OCM reads the target environment's effective config before `npm pack`, validates
 explicit plugin references against the checkout and installed-plugin records,
-and follows transitive local plugin package dependencies. The resulting runtime
+including the native SQLite index, inline config and legacy JSON records,
+and follows transitive local plugin package dependencies. Installed external
+plugins satisfy that validation without being bundled into the new runtime;
+installed records do not select additional plugins. Disabled entries and denied
+plugins remain excluded from the explicit selection. The resulting runtime
 adds only required source plugins omitted from the core package. `--for-env` and
 `--include-source-extensions` are mutually exclusive. A build without either
 option remains release-shaped.
@@ -355,7 +377,7 @@ Use a launcher when you want:
 - a custom command line
 - something that is not just a published OpenClaw release
 
-On Unix, recipes beginning with the `exec`, `eval`, or `.` (dot-source) shell builtin use the shell for managed services as well as `env run`, with or without quotes in the recipe. In particular, `eval` retains its shell evaluation semantics, and `. /path/to/wrapper.sh` sources the wrapper instead of trying to execute `.` as a program.
+On Unix, recipes beginning with the `exec`, `eval`, `command`, or `.` (dot-source) shell builtin use the shell for managed services as well as `env run`, with or without quotes in the recipe. In particular, `command /path/to/openclaw` does not require an external executable named `command`, `eval` retains its shell evaluation semantics, and `. /path/to/wrapper.sh` sources the wrapper instead of trying to execute `.` as a program.
 Recipes beginning with `source` or `builtin` (including `builtin source`) also retain shell execution, including when the wrapper path is unquoted. These forms require a shell that supports them; OCM does not select a different shell to make them available. Foreground `env run` uses `sh` from PATH, while managed services use `/bin/sh`.
 Sourcing support and argument forwarding depend on those shells. For example, macOS `/bin/sh` supports `source` and `builtin source` and forwards arguments into the sourced script, while other `sh` implementations may not. For portable argument forwarding, use an executable wrapper that invokes OpenClaw with `"$@"` and register the wrapper path directly.
 Plain executable recipes still run directly under the supervisor.
@@ -495,8 +517,9 @@ Retry after restoring manager access; `ocm service status` remains available for
 Saved dev service plans must still match the env's current binding and recorded
 worktree. If OCM refuses a stale plan, use `ocm service restart <env>` to refresh it.
 
-Normal restart is gateway-aware when `ocm service status mira` reports restart
-handoff `protocol v1`: OpenClaw records eligible active sessions and subagents,
+Normal restart is gateway-aware while the Gateway is running and
+`ocm service status mira` reports restart handoff `protocol v1`: OpenClaw records
+eligible active sessions and subagents,
 hands the fresh-process restart back to OCM immediately, and resumes recoverable
 work after the replacement gateway starts. The old gateway process does not wait
 for an in-flight turn to finish.
@@ -529,9 +552,12 @@ The target request remains pending, so the existing daemon can still process it.
 A Gateway that exits cleanly without an accepted restart handoff stays stopped
 while its saved launch definition remains unchanged. Starting or restarting a
 sibling environment does not revive it. An explicit restart of that environment,
-a changed launch definition, or a new daemon run can start it again. Stopping the
-service removes its inactive runtime record so snapshot maintenance can verify
-that the environment is quiescent.
+a changed launch definition, or a new daemon run can start it again. Ordinary
+restart starts a settled inactive Gateway without requiring `--force`, even when
+its runtime record retains restart-handoff capability. OCM verifies the current
+daemon observation before starting it; stale or unresolved ownership does not
+qualify as a stopped Gateway. Stopping the service removes its inactive runtime
+record so snapshot maintenance can verify that the environment is quiescent.
 
 Snapshot and upgrade maintenance check the target's supervisor ownership before capturing or replacing its state.
 A failed service-manager read, a running daemon without a current runtime observation, or a runtime identity mismatch fails maintenance before mutation; stored stopped intent alone is insufficient.
@@ -698,6 +724,14 @@ ocm self update --check
 `env create`, `start`, and `dev` accept explicit Gateway ports from 1 through 65535 with `--port`.
 An empty, zero, or out-of-range value is rejected before creating an environment or changing its configuration.
 
+An explicit OCM `--port` takes precedence over `gateway.port` in the OpenClaw
+configuration. Otherwise, a valid configured port overrides the automatically
+assigned port. OCM reads the effective JSON/JSON5 configuration, including
+`$include` files within the config directory, for both inspection and command
+execution. Missing or invalid configuration falls back to the saved automatic
+port. An active foreground dev session continues to use its captured endpoint
+until stopped, even if the configuration changes.
+
 New environment roots must be separate. A root cannot equal, contain, or sit
 inside another registered environment root, including through path aliases.
 OCM rejects overlap before creating or copying environment state or registering
@@ -757,6 +791,18 @@ Git continues to select conditional includes, and authored predicates, repeated-
 Relative values keep Git's containing-file or Git-directory context; external references and inactive missing or invalid includes remain unchanged unless their path maps to copied content.
 Config files retain their copied permissions; unsafe ownership, active invalid configuration, required writes into protected history, or configuration locks fail the clone before registration and roll back its target.
 Linked-worktree registrations and other Git storage pointers retain their separate copy handling.
+
+Clone, both archive import modes, `migrate`, and `adopt import` also relocate
+source-owned paths inside accepted OpenClaw config includes, including nested
+and shared fragments. Plugin load paths point at the copied payload; explicitly
+external values and source files remain unchanged. Relative `$include`
+directives and fragments needing no rewrite retain their authored contents.
+Rewritten fragments retain their copied Unix file modes.
+Clone also relocates nested absolute internal `$include` directives before
+resolving the copied graph; relative directives keep their spelling, and external
+includes remain rejected.
+The existing restrictions on include-owned agent workspaces and sandbox origins
+still apply.
 
 Clone does not copy dev source bindings. The usual next step is:
 
@@ -910,7 +956,9 @@ sandbox runtime writes. Unclassified state remains covered, including credential
 unknown runtime directories, and migration inputs outside the declared directories.
 
 Preparation, stopped capture, and rollback validation do not traverse independent
-directories. Restore replaces owned entries around them; it leaves current
+directories. Restore replaces owned entries around them, including captured symlinks
+whose targets are missing or independently preserved, and removes owned entries
+added after capture. It leaves current
 independent bytes, modes, timestamps, extended attributes, symlinks, additions,
 and deletions in place. Shared ancestor directories stay in place, but their
 metadata can change when owned siblings are replaced. Existing service-log and
@@ -1064,8 +1112,14 @@ Equivalent spellings select the same owned content and omit each workspace's `.o
 Other root spellings retain the default export refusal, even when another alias resolves inside the environment.
 External workspaces, the environment root itself and workspace paths redirected by internal symlinks remain refused.
 
+Within the selected content, ordinary export preserves symlinks, including links
+named `*.sqlite`, without copying their targets. Regular `*.sqlite` files still
+use coherent committed snapshots, including uncheckpointed WAL writes, and omit
+raw database sidecars.
+
 New archives, with or without `--include-state`, retain the accepted source root and its captured canonical path in optional `env.canonicalSourceRoot` metadata.
 Configuration relocation uses both recorded roots without requiring the original source or alias to exist; state-inclusive runtime-reference relocation uses the same identities.
+Absolute internal config includes use those identities to select the archived files before import inventories configuration, including nested includes. Imported directives select the destination copies; relative directives remain relative. Includes outside the config directory, including symlink escapes, are still refused.
 Older archives retain their existing source-root matching rules.
 The archive format remains version 1, and older readers ignore the optional field.
 Source identities may use POSIX, Windows drive, or UNC syntax; the extension preserves acceptance of portable foreign-platform contents without adding translation of platform-specific payload paths.
@@ -1185,6 +1239,9 @@ Configuring an agent directory above `agents/<id>/sessions` preserves agent payl
 If an agent directory is exactly `agents/<id>/sessions`, cleanup preview and apply refuse the conflicting ownership before changing any configuration or data.
 Use a separate agent directory before retrying cleanup; `env doctor` reports the conflict.
 External configured agent directories remain untouched and do not prevent this cleanup.
+Cleanup preview and apply refuse a runtime reset that would delete a registered or active temporary dev source, or Git metadata it needs, before changing that environment's configuration, bindings or files.
+The diagnostic identifies the dependent environment. Remove that dev environment, or stop an active temporary session with `ocm dev stop <env>`, before retrying.
+Sources outside the reset plan, including sources fully retained by workspace preservation, do not block cleanup. Cleanup without a runtime reset keeps its existing behavior.
 Run `ocm env cleanup mira --json` to preview the actions before applying them with `--yes`.
 
 ### Remove or destroy
@@ -1253,6 +1310,11 @@ endpoint and effective backend watching/UI choices reuses the session; changing
 those choices requires stopping it first. `dev status --json` reports active
 ownership separately from `sourceWatch.watching`.
 `--force` temporarily takes over a running background service while backend watching is enabled and restores it on exit only if no later service policy request supersedes the takeover; it rejects `--no-watch` or `--service`.
+Temporary takeovers resolve `--repo` to its canonical checkout before preparation.
+Changing a selected path alias while the session runs does not redirect the
+worker or environment commands. A repeat request through that alias is refused
+if it now selects another checkout; stop the session before switching sources.
+Equivalent aliases that still select the active checkout can reuse it.
 Temporary source sessions also refuse to start while an environment operation
 can replace their checkout or Git metadata. Retry after the containing operation
 finishes; refusal leaves the temporary session and service policy unchanged.

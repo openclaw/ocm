@@ -42,15 +42,15 @@ use crate::store::{
     EnvironmentOperationLock, InstallContext, RuntimeBindingGuard, RuntimeMutationGuard,
     RuntimeReleaseDetails, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming, UpgradeHistoryRecord,
     UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState, UpgradeHistoryStage,
-    UpgradeRuntimeRecovery, clean_path, copy_dir_recursive, derive_env_paths, display_path,
+    UpgradeRuntimeRecovery, clean_path, copy_dir_preserving_modes, derive_env_paths, display_path,
     ensure_minimum_local_openclaw_config, ensure_store, get_runtime, get_upgrade_history_record,
     get_upgrade_runtime_recovery, install_runtime_from_selected_official_openclaw_release,
     list_upgrade_history, lock_env_registry, lock_upgrade_batch, lock_upgrade_participant,
-    lock_upgrade_transaction, remove_runtime, remove_runtime_with_guard, remove_upgrade_recovery,
-    resolve_absolute_path, runtime_install_root, runtime_integrity_issue, runtime_meta_path,
-    save_environment_with_dev_registration, save_upgrade_history_record, try_lock_runtime_binding,
-    try_lock_runtime_mutation, upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir,
-    with_prepared_dev_source, write_json,
+    lock_upgrade_transaction, remove_owned_tree, remove_runtime, remove_runtime_with_guard,
+    remove_upgrade_recovery, resolve_absolute_path, runtime_install_root, runtime_integrity_issue,
+    runtime_meta_path, save_environment_with_dev_registration, save_upgrade_history_record,
+    try_lock_runtime_binding, try_lock_runtime_mutation, upgrade_history_recovery_dir,
+    upgrade_history_runtime_recovery_dir, with_prepared_dev_source, write_json,
 };
 
 pub(super) const UPGRADE_DRY_RUN_NOTES: [&str; 4] = [
@@ -1707,14 +1707,14 @@ impl Cli {
         guard.check(&recovery.meta.name, &self.env, &self.cwd)?;
         let install_root = runtime_install_root(&recovery.meta.name, &self.env, &self.cwd)?;
         if install_root.exists() {
-            fs::remove_dir_all(&install_root).map_err(|error| {
+            remove_owned_tree(&install_root).map_err(|error| {
                 format!(
                     "failed to remove current runtime root {}: {error}",
                     display_path(&install_root)
                 )
             })?;
         }
-        copy_dir_recursive(&recovery.install_root, &install_root)?;
+        copy_dir_preserving_modes(&recovery.install_root, &install_root)?;
         let meta_path = runtime_meta_path(&recovery.meta.name, &self.env, &self.cwd)?;
         write_json(&meta_path, &recovery.meta)
     }
@@ -5350,7 +5350,7 @@ impl Cli {
                 std::process::id(),
                 time::OffsetDateTime::now_utc().unix_timestamp_nanos()
             ));
-            copy_dir_recursive(&install_root, &backup_root)?;
+            copy_dir_preserving_modes(&install_root, &backup_root)?;
             Some(backup_root)
         } else {
             None
@@ -5756,14 +5756,14 @@ impl Cli {
         if let Some(backup_root) = backup.backup_root.as_ref() {
             let install_root = runtime_install_root(&backup.meta.name, &self.env, &self.cwd)?;
             if install_root.exists() {
-                fs::remove_dir_all(&install_root).map_err(|error| {
+                remove_owned_tree(&install_root).map_err(|error| {
                     format!(
                         "failed to remove upgraded runtime root {}: {error}",
                         display_path(&install_root)
                     )
                 })?;
             }
-            copy_dir_recursive(backup_root, &install_root)?;
+            copy_dir_preserving_modes(backup_root, &install_root)?;
         }
         write_json(&meta_path, &backup.meta)
     }
@@ -6176,9 +6176,9 @@ impl RuntimeRollbackBackup {
     fn cleanup(mut self) {
         if let Some(retained_root) = self.retained_root.take() {
             self.backup_root.take();
-            let _ = fs::remove_dir_all(retained_root);
+            let _ = remove_owned_tree(&retained_root);
         } else if let Some(backup_root) = self.backup_root.take() {
-            let _ = fs::remove_dir_all(backup_root);
+            let _ = remove_owned_tree(&backup_root);
         }
     }
 
@@ -6196,9 +6196,9 @@ impl Drop for RuntimeRollbackBackup {
     fn drop(&mut self) {
         if let Some(retained_root) = self.retained_root.take() {
             self.backup_root.take();
-            let _ = fs::remove_dir_all(retained_root);
+            let _ = remove_owned_tree(&retained_root);
         } else if let Some(backup_root) = self.backup_root.take() {
-            let _ = fs::remove_dir_all(backup_root);
+            let _ = remove_owned_tree(&backup_root);
         }
     }
 }
@@ -6783,6 +6783,73 @@ mod tests {
         simulation_requires_attention, summarize_command_failure_text, verify_gateway_build_id,
         verify_gateway_status_readiness, version_output_matches_expected,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_backup_disposes_read_only_trees_and_keeps_committed_recovery() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        for retained in [false, true] {
+            for action in ["cleanup", "drop", "commit"] {
+                let root = tempfile::tempdir().unwrap();
+                let container = root.path().join("backup");
+                let install = if retained {
+                    container.join("stable/install-root")
+                } else {
+                    container.clone()
+                };
+                let nested = install.join("files/readonly");
+                fs::create_dir_all(&nested).unwrap();
+                fs::write(nested.join("payload"), "runtime bytes").unwrap();
+                let outside = root.path().join("outside");
+                fs::create_dir(&outside).unwrap();
+                fs::write(outside.join("keep"), "unrelated").unwrap();
+                fs::set_permissions(&outside, fs::Permissions::from_mode(0o555)).unwrap();
+                std::os::unix::fs::symlink(&outside, install.join("link")).unwrap();
+                fs::set_permissions(&nested, fs::Permissions::from_mode(0o555)).unwrap();
+                let meta = serde_json::from_value(serde_json::json!({
+                    "kind": "ocm-runtime", "name": "stable", "binaryPath": "unused",
+                    "createdAt": "2026-03-24T00:00:00Z", "updatedAt": "2026-03-24T00:00:00Z"
+                }))
+                .unwrap();
+                let backup = super::RuntimeRollbackBackup {
+                    meta,
+                    backup_root: Some(install),
+                    retained_root: retained.then_some(container.clone()),
+                    backup_id: retained.then(|| "stable".to_string()),
+                };
+                match action {
+                    "cleanup" => backup.cleanup(),
+                    "drop" => drop(backup),
+                    "commit" => backup.commit(),
+                    _ => unreachable!(),
+                }
+                if retained && action == "commit" {
+                    assert_eq!(
+                        fs::read_to_string(nested.join("payload")).unwrap(),
+                        "runtime bytes"
+                    );
+                    assert_eq!(
+                        fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+                        0o555
+                    );
+                    super::remove_owned_tree(&container).unwrap();
+                } else {
+                    assert!(!container.exists(), "{action}, retained={retained}");
+                }
+                assert_eq!(
+                    fs::read_to_string(outside.join("keep")).unwrap(),
+                    "unrelated"
+                );
+                assert_eq!(
+                    fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+                    0o555
+                );
+                super::remove_owned_tree(&outside).unwrap();
+            }
+        }
+    }
 
     fn simulation_summary(outcome: &str, cleanup: &str) -> UpgradeSimulationSummary {
         UpgradeSimulationSummary {

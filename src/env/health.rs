@@ -3,11 +3,12 @@ use std::path::Path;
 use serde::Serialize;
 
 use super::{EnvMeta, EnvironmentService, ExecutionBinding, resolve_execution_binding};
-use crate::store::{OpenClawStateAudit, audit_openclaw_state, derive_env_paths, display_path};
 use crate::store::{
-    audit_openclaw_config, get_launcher, get_runtime, repair_openclaw_config,
-    repair_openclaw_runtime_state, runtime_integrity_issue, save_environment,
+    OpenClawConfigRepair, OpenClawRuntimeStateCleanup, audit_openclaw_config, get_launcher,
+    get_runtime, prepare_openclaw_config_repair, prepare_openclaw_runtime_state_repair,
+    runtime_integrity_issue, save_environment,
 };
+use crate::store::{OpenClawStateAudit, audit_openclaw_state, derive_env_paths, display_path};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +78,7 @@ impl<'a> EnvironmentService<'a> {
         }
         let doctor = self.doctor(name)?;
         let actions = cleanup_actions(&env, &doctor, &config_audit, &state_audit);
+        self.prepare_cleanup(&env, &actions)?;
         Ok(build_cleanup_summary(&env, doctor, false, actions, None))
     }
 
@@ -90,6 +92,7 @@ impl<'a> EnvironmentService<'a> {
         }
         let doctor_before = self.doctor(name)?;
         let actions = cleanup_actions(&env, &doctor_before, &config_audit, &state_audit);
+        let (config_repair, runtime_cleanup) = self.prepare_cleanup(&env, &actions)?;
 
         for action in &actions {
             match action.kind {
@@ -100,11 +103,14 @@ impl<'a> EnvironmentService<'a> {
                     env.default_launcher = None;
                 }
                 "repair-openclaw-config" => {
-                    let known_envs = self.list()?;
-                    repair_openclaw_config(&env, &known_envs)?;
+                    if let Some(repair) = &config_repair {
+                        repair.apply()?;
+                    }
                 }
                 "reset-openclaw-runtime-state" => {
-                    repair_openclaw_runtime_state(&env, self.env)?;
+                    if let Some(cleanup) = &runtime_cleanup {
+                        cleanup.apply()?;
+                    }
                 }
                 _ => {}
             }
@@ -129,6 +135,48 @@ impl<'a> EnvironmentService<'a> {
             actions,
             Some(doctor_after),
         ))
+    }
+
+    fn prepare_cleanup(
+        &self,
+        env: &EnvMeta,
+        actions: &[PlannedCleanupAction],
+    ) -> Result<
+        (
+            Option<OpenClawConfigRepair>,
+            Option<OpenClawRuntimeStateCleanup>,
+        ),
+        String,
+    > {
+        let known_envs = self.list()?;
+        let config_repair = if actions
+            .iter()
+            .any(|action| action.kind == "repair-openclaw-config")
+        {
+            prepare_openclaw_config_repair(env, &known_envs)?
+        } else {
+            None
+        };
+        let runtime_cleanup = if actions
+            .iter()
+            .any(|action| action.kind == "reset-openclaw-runtime-state")
+        {
+            let cleanup = prepare_openclaw_runtime_state_repair(
+                env,
+                self.env,
+                config_repair.as_ref().map(|repair| &repair.value),
+            )?;
+            crate::store::dev_sources::ensure_runtime_cleanup_preserves_dev_sources(
+                env,
+                &known_envs,
+                self,
+                cleanup.removals(),
+            )?;
+            Some(cleanup)
+        } else {
+            None
+        };
+        Ok((config_repair, runtime_cleanup))
     }
 
     pub fn cleanup_all_preview(&self) -> Result<EnvCleanupBatchSummary, String> {

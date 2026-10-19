@@ -284,6 +284,87 @@ fn start_can_create_a_local_command_launcher() {
 }
 
 #[test]
+fn start_reuses_launcher_with_equivalent_cwd_and_preserves_conflicts() {
+    let root = TestDir::new("start-command-cwd-reuse");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(cwd.join("other")).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+    let env = ocm_env(&root);
+    let start = |command: &str, directory: Option<&str>| {
+        let mut args = vec![
+            "start",
+            "demo",
+            "--command",
+            command,
+            "--no-service",
+            "--json",
+        ];
+        if let Some(directory) = directory {
+            args.extend(["--cwd", directory]);
+        }
+        run_ocm(&cwd, &env, &args)
+    };
+
+    let created = start("openclaw", Some("."));
+    assert!(created.status.success(), "{}", stderr(&created));
+    let launcher_path = root.child("ocm-home/launchers/demo.local.json");
+    let original = fs::read(&launcher_path).unwrap();
+    let launcher: Value = serde_json::from_slice(&original).unwrap();
+    let absolute_cwd = path_string(&cwd);
+    assert_eq!(launcher["cwd"], absolute_cwd);
+
+    for equivalent in [".", "./other/..", absolute_cwd.as_str()] {
+        let repeated = start("openclaw", Some(equivalent));
+        assert!(repeated.status.success(), "{}", stderr(&repeated));
+        let summary: Value = serde_json::from_str(&stdout(&repeated)).unwrap();
+        assert_eq!(summary["created"], false);
+        assert_eq!(summary["defaultLauncher"], "demo.local");
+        assert_eq!(fs::read(&launcher_path).unwrap(), original);
+    }
+
+    let other_cwd = path_string(&cwd.join("other"));
+    for (command, directory) in [
+        ("openclaw", Some("./other")),
+        ("openclaw", Some(other_cwd.as_str())),
+        ("openclaw", None),
+        ("different-command", Some(".")),
+    ] {
+        let refused = start(command, directory);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(stderr(&refused).contains("already exists with different settings"));
+        assert_eq!(fs::read(&launcher_path).unwrap(), original);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn start_preserves_relative_cwd_when_directory_name_ends_in_space() {
+    let root = TestDir::new("start-command-cwd-space");
+    let cwd = root.child("workspace ");
+    fs::create_dir_all(&cwd).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+    let env = ocm_env(&root);
+    let args = [
+        "start",
+        "demo",
+        "--command",
+        "openclaw",
+        "--cwd",
+        ".",
+        "--no-service",
+    ];
+    for _ in 0..2 {
+        let started = run_ocm(&cwd, &env, &args);
+        assert!(started.status.success(), "{}", stderr(&started));
+        let launcher: Value = serde_json::from_slice(
+            &fs::read(root.child("ocm-home/launchers/demo.local.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(launcher["cwd"], path_string(&cwd));
+    }
+}
+
+#[test]
 fn start_points_existing_plain_openclaw_users_at_migrate_when_creating_fresh_envs() {
     let root = TestDir::new("start-detect-plain-home");
     let cwd = root.child("workspace");
@@ -436,4 +517,120 @@ fn start_reports_recovery_steps_when_onboarding_fails() {
     assert!(error.contains("run: ocm @demo -- status"));
     assert!(error.contains("keep running: ocm service install demo"));
     assert!(!error.contains("Run \"ocm help\" for usage."));
+}
+
+#[test]
+fn start_onboards_before_activating_a_new_service() {
+    for service_requested in [true, false] {
+        let root = TestDir::new("start-onboarding-order");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+        install_fake_launchctl(&root, &mut env);
+        let peer = root.child("bin/openclaw");
+        write_executable_script(
+            &peer,
+            "#!/bin/sh\nset -eu\n[ \"$1\" = onboard ]\n[ \"$2\" = --no-install-daemon ]\ncp \"$OCM_HOME/envs.json\" \"$OCM_HOME/during-onboarding.json\"\nprintf '{\"gateway\":{\"mode\":\"local\"}}\\n' > \"$OPENCLAW_CONFIG_PATH\"\n",
+        );
+        let peer_path = path_string(&peer);
+        let mut args = vec!["start", "demo", "--command", &peer_path, "--onboard"];
+        if !service_requested {
+            args.push("--no-service");
+        }
+        let start = run_ocm(&cwd, &env, &args);
+        assert!(start.status.success(), "{}", stderr(&start));
+        let during: Value = serde_json::from_str(
+            &fs::read_to_string(root.child("ocm-home/during-onboarding.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(during["envs"][0]["serviceRunning"], false);
+        let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        let after: Value = serde_json::from_str(&stdout(&show)).unwrap();
+        assert_eq!(after["serviceRunning"], service_requested);
+        assert_eq!(
+            stdout(&start).contains("Service running for env demo"),
+            service_requested
+        );
+
+        // Reusing a configured env still reaches onboarding and keeps the
+        // existing service policy while the command runs.
+        let repeated = run_ocm(&cwd, &env, &args);
+        assert!(repeated.status.success(), "{}", stderr(&repeated));
+        let during: Value = serde_json::from_str(
+            &fs::read_to_string(root.child("ocm-home/during-onboarding.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(during["envs"][0]["serviceRunning"], service_requested);
+    }
+}
+
+#[test]
+fn failed_or_cancelled_onboarding_does_not_activate_a_new_service() {
+    for exit_code in [1, 130] {
+        let root = TestDir::new("start-onboarding-stays-stopped");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+        install_fake_launchctl(&root, &mut env);
+        let peer = root.child("bin/openclaw");
+        write_executable_script(&peer, &format!("#!/bin/sh\nexit {exit_code}\n"));
+
+        let start = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "start",
+                "demo",
+                "--command",
+                &path_string(&peer),
+                "--onboard",
+            ],
+        );
+        assert_eq!(start.status.code(), Some(exit_code), "{}", stderr(&start));
+        assert!(stderr(&start).contains("retry: ocm start demo --onboard"));
+        assert!(!stdout(&start).contains("Service running"));
+        let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        let after: Value = serde_json::from_str(&stdout(&show)).unwrap();
+        assert_eq!(after["serviceRunning"], false);
+        assert!(
+            !root
+                .child("ocm-home/envs/demo/.openclaw/openclaw.json")
+                .exists()
+        );
+        let log = fs::read_to_string(root.child("launchctl.log")).unwrap_or_default();
+        assert!(!log.contains("bootstrap gui/"), "{log}");
+    }
+}
+
+#[test]
+fn failed_onboarding_preserves_an_existing_service() {
+    let root = TestDir::new("start-onboarding-existing-service");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+    install_fake_launchctl(&root, &mut env);
+    let peer = root.child("bin/openclaw");
+    write_executable_script(&peer, "#!/bin/sh\nexit 1\n");
+    let start = run_ocm(
+        &cwd,
+        &env,
+        &["start", "demo", "--command", &path_string(&peer)],
+    );
+    assert!(start.status.success(), "{}", stderr(&start));
+    fs::write(root.child("launchctl.log"), "").unwrap();
+
+    let onboard = run_ocm(&cwd, &env, &["start", "demo", "--onboard"]);
+    assert_eq!(onboard.status.code(), Some(1));
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let after: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert_eq!(after["serviceRunning"], true);
+    let log = fs::read_to_string(root.child("launchctl.log")).unwrap();
+    assert!(!log.contains("bootout"), "{log}");
+    assert!(!log.contains("bootstrap"), "{log}");
 }

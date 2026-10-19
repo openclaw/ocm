@@ -113,7 +113,7 @@ If you already know what you want:
 ocm start
 ```
 
-`setup` walks you through the choices. `start` creates or reuses an environment, installs the latest stable OpenClaw release by default, writes the minimum local config needed to boot, and keeps it running in the background. Use `--onboard` when you want the interactive OpenClaw setup flow instead. If you do not pass a name, `ocm` generates one for you.
+`setup` walks you through the choices. `start` creates or reuses an environment, installs the latest stable OpenClaw release by default, writes the minimum local config needed to boot, and keeps it running in the background. Use `--onboard` when you want the interactive OpenClaw setup flow instead: onboarding runs before OCM installs and starts the service. If onboarding fails or is cancelled, OCM leaves a new environment stopped; retry with `ocm start <name> --onboard`. If you do not pass a name, `ocm` generates one for you.
 
 If you are developing OpenClaw itself, use the dev path:
 
@@ -340,7 +340,9 @@ migration/finalization status, service state, and rollback outcome. History is
 stored as atomic JSON metadata under `OCM_HOME`; it does not copy config
 contents, command output, or credentials. A successful in-place update of a
 managed runtime retains the previous runtime files beside its transaction
-record. Removing or pruning the corresponding pre-upgrade snapshot removes
+record. Runtime backup and restoration preserve Unix directory modes, so recovery
+continues to match its recorded integrity digest when the command's umask changes.
+Removing or pruning the corresponding pre-upgrade snapshot removes
 those retained files; switching to a different runtime does not duplicate the
 source runtime.
 During an active upgrade or rollback, OCM also retains the previous runtime's lock until recovery or successful completion settles.
@@ -440,7 +442,7 @@ plans also validate the recorded checkout before starting it. Restore the
 recorded checkout before retrying. Explicit runtime or launcher overrides and
 status inspection remain available. A worktree validation failure leaves config unchanged.
 
-Before starting source, `dev` checks the installed entry points for the tooling declared by that checkout. It reuses hoisted or isolated installs whose tooling resolves. New borrowed environments and OCM-owned dev worktrees can prepare missing tooling with `pnpm install --frozen-lockfile` and check it again. A resumed borrowed environment reports missing tooling so you can prepare its checkout explicitly; it does not reinstall dependencies. Source takeover of a runtime or launcher env only validates the borrowed checkout and fails before stopping its service if preparation is needed. OCM does not reinstall through linked dependency directories. A modules-directory environment override may select dependencies inside that checkout, including before OpenClaw creates its `node_modules` link. OCM inspects the configured tree without creating that link and rejects overrides that resolve outside the checkout. These are startup checks; OpenClaw still owns builds and validation of the running application.
+Before starting source, `dev` checks the installed entry points for the tooling declared by that checkout. It reuses hoisted or isolated installs whose tooling resolves. New borrowed environments and OCM-owned dev worktrees can prepare missing tooling with `pnpm install --frozen-lockfile` and check it again. A resumed borrowed environment reports missing tooling so you can prepare its checkout explicitly; it does not reinstall dependencies. Source takeover of a runtime or launcher env only validates the borrowed checkout and fails before stopping its service if preparation is needed. OCM does not reinstall through linked dependency directories. A modules-directory environment override may select dependencies inside that checkout, including before OpenClaw creates its `node_modules` link. This also applies to default UI startup: its prerequisite checks accept hoisted packages and pnpm UI package links through the deferred root link. OCM inspects the configured tree without creating that link and rejects overrides or UI packages that resolve outside the checkout. When the link is absent, OCM starts the native source first and holds the UI until the link is ready, failing on cancellation, source exit, or a 30-second timeout. Suspending the foreground source also suspends OCM and pauses that startup timeout until resume. These are startup checks; OpenClaw still owns builds and validation of the running application.
 
 Direct dev-source commands run with `NODE_DISABLE_COMPILE_CACHE=1` and without
 `NODE_COMPILE_CACHE` before Node starts. This avoids OpenClaw's compile-cache
@@ -451,6 +453,11 @@ continue to own rebuilds and auto-doctor.
 Foreground dependency installation keeps build output and pnpm diagnostics readable while using lifecycle reports to check script completion. When run from a terminal, installation keeps interactive stdin while streaming that output. On Unix, interrupted or unfinished build scripts retain foreground ownership even if pnpm returns an ordinary error or an optional build lets it succeed. Completed installation errors remain retryable.
 
 Repeating `ocm dev <env>` with the same effective backend watching/UI choices and source returns its status and existing gateway link without preparing dependencies, onboarding, or restarting processes. Mode/source/root/port mismatches and onboarding during a foreground session are errors. Startup and service restoration are reported as progress; an invocation during startup does not claim a source identity that has not yet been published. Temporary runtime or launcher takeovers retain the `--repo <path> --watch --force` form. Active status and routed source commands use the captured launch root and port even if config is edited; an explicit different port is refused. Watch sessions started by an older OCM without endpoint metadata need to be stopped from their original terminal and started again before they can be reused. Only the foreground invocation that acquires the lease prepares configuration.
+
+Temporary source takeovers capture the canonical checkout before preparation.
+Retargeting a selected path alias leaves the active worker and routed commands
+on that checkout; stop the session before selecting the new alias target.
+Aliases that still identify the active checkout can reuse the session.
 
 Use `ocm dev status [env]` to inspect dev environments and temporary source watches on runtime or launcher environments. It reports the source path, gateway URL, and session ownership (`starting`, `active`, `restoring`, `inactive`, or `unknown`). Active foreground ownership can outlive the wrapper process and does not imply that the Gateway is ready. JSON reports backend watching as `sourceWatch.watching`, keeps `serviceRunning` separate from the saved `serviceDesiredRunning` policy and includes the watch PID, start time, and any inspection issue. `gatewayPortReachable` uses a 100 ms loopback TCP check; an open port does not establish Gateway identity or readiness. Status leaves watch metadata unchanged and omits lease tokens.
 
@@ -492,7 +499,7 @@ bindings before registration. Older OCM readers refuse these records. Refresh an
 incompatible daemon with the command above; unchanged bindings and confirmed
 stopped or unloaded managers remain usable.
 
-Removal, pruning, destroy, and simulation cleanup preserve other registered and active temporary dev sources and the Git metadata they need, even with `--force`. Remove dependent dev environments, or stop temporary sessions with `ocm dev stop <env>`, before deleting their containing environment or worktree. Preparation rollback also preserves these sources when publishing a newly created worktree's binding fails. The error reports the original failure and the retained worktree path; stop the dependent temporary session before removing that worktree.
+Health cleanup, removal, pruning, destroy, and simulation cleanup preserve other registered and active temporary dev sources and the Git metadata they need, even with `--force`. Remove dependent dev environments, or stop temporary sessions with `ocm dev stop <env>`, before deleting their containing environment or worktree. Preparation rollback also preserves these sources when publishing a newly created worktree's binding fails. The error reports the original failure and the retained worktree path; stop the dependent temporary session before removing that worktree.
 
 ### Try beta or pin a specific release
 
