@@ -316,6 +316,7 @@ pub(super) fn rewrite_archived_openclaw_config(
         target_paths,
         gateway_port,
         SandboxOriginPolicy::NewEnvironment(sandbox_origin),
+        !source_roots.is_empty(),
         |value| {
             rewrite_config_paths_with_archive_includes(
                 value,
@@ -348,6 +349,10 @@ fn rewrite_openclaw_config_with_root_mapping(
         target_paths,
         gateway_port,
         sandbox_origin_policy,
+        matches!(
+            sandbox_origin_policy,
+            SandboxOriginPolicy::NewEnvironment(_)
+        ) && root_mapping.is_some(),
         |value| rewrite_env_root_paths_from_roots(value, &source_roots, None, target_root),
     )
 }
@@ -356,7 +361,8 @@ fn rewrite_openclaw_config_with_path_rewriter(
     target_paths: &EnvPaths,
     gateway_port: Option<u32>,
     sandbox_origin_policy: SandboxOriginPolicy<'_>,
-    rewrite_paths: impl FnOnce(&mut Value) -> bool,
+    rewrite_includes: bool,
+    rewrite_paths: impl Fn(&mut Value) -> bool,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
     let config_is_symlink = fs::symlink_metadata(&target_paths.config_path)
         .map(|metadata| metadata.file_type().is_symlink())
@@ -400,17 +406,11 @@ fn rewrite_openclaw_config_with_path_rewriter(
         write_config_value(&target_paths.config_path, &value)?;
     }
 
-    if matches!(
-        sandbox_origin_policy,
-        SandboxOriginPolicy::NewEnvironment(_)
-    ) && !source_roots.is_empty()
-    {
-        rewrite_openclaw_config_includes_with_root_mappings(
+    if rewrite_includes {
+        rewrite_openclaw_config_includes_with_path_rewriter(
             &target_paths.config_path,
             &target_paths.state_dir,
-            source_roots,
-            canonical_source_root,
-            target_root,
+            rewrite_paths,
         )?;
     }
     Ok(outcome)
@@ -449,40 +449,7 @@ pub(super) fn rewrite_archived_include_directives(
             &target_config_root,
             &|_| false,
         ) {
-            let permissions = fs::metadata(path)
-                .map_err(|error| error.to_string())?
-                .permissions();
-            let parent = path
-                .parent()
-                .ok_or_else(|| "copied include has no parent".to_string())?;
-            super::openclaw_state::with_owner_write_permission(parent, || {
-                #[cfg(unix)]
-                {
-                    // Replace the copied pathname without making a symlink's
-                    // referent writable. Protect bytes before publishing them.
-                    let staged = stage_private_config(path, &value)?;
-                    staged
-                        .as_file()
-                        .set_permissions(permissions.clone())
-                        .map_err(|error| error.to_string())?;
-                    replace_private_config(staged, path)
-                }
-                #[cfg(not(unix))]
-                {
-                    let write = || write_config_value(path, &value);
-                    if fs::symlink_metadata(path)
-                        .map_err(|error| error.to_string())?
-                        .file_type()
-                        .is_symlink()
-                    {
-                        write()
-                    } else {
-                        super::openclaw_state::with_owner_write_permission(path, write)
-                    }
-                }
-            })?;
-            #[cfg(not(unix))]
-            fs::set_permissions(path, permissions).map_err(|error| error.to_string())?;
+            write_copied_config_value(path, &value)?;
         }
     }
     Ok(())
@@ -554,21 +521,15 @@ pub(crate) fn rewrite_openclaw_config_includes_for_target(
     source_root: &Path,
     target_root: &Path,
 ) -> Result<bool, String> {
-    rewrite_openclaw_config_includes_with_root_mappings(
-        config_path,
-        state_dir,
-        &[source_root],
-        None,
-        target_root,
-    )
+    rewrite_openclaw_config_includes_with_path_rewriter(config_path, state_dir, |value| {
+        rewrite_env_root_paths_from_roots(value, &[source_root], None, target_root)
+    })
 }
 
-fn rewrite_openclaw_config_includes_with_root_mappings(
+fn rewrite_openclaw_config_includes_with_path_rewriter(
     config_path: &Path,
     state_dir: &Path,
-    source_roots: &[&Path],
-    canonical_source_root: Option<&Path>,
-    target_root: &Path,
+    rewrite_paths: impl Fn(&mut Value) -> bool,
 ) -> Result<bool, String> {
     let include_paths = openclaw_config_include_paths(config_path, state_dir)?;
     let mut changed = false;
@@ -585,12 +546,7 @@ fn rewrite_openclaw_config_includes_with_root_mappings(
                 display_path(&include_path)
             )
         })?;
-        if rewrite_env_root_paths_from_roots(
-            &mut value,
-            source_roots,
-            canonical_source_root,
-            target_root,
-        ) {
+        if rewrite_paths(&mut value) {
             write_copied_config_value(&include_path, &value)?;
             changed = true;
         }
@@ -1140,27 +1096,42 @@ fn ensure_object_field<'a>(
         .expect("object field must exist after reset")
 }
 
-fn write_copied_config_value(config_path: &Path, value: &Value) -> Result<(), String> {
-    let parent = config_path.parent().ok_or("copied include has no parent")?;
+fn write_copied_config_value(path: &Path, value: &Value) -> Result<(), String> {
+    let permissions = fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "copied include has no parent".to_string())?;
     super::openclaw_state::with_owner_write_permission(parent, || {
         #[cfg(unix)]
         {
-            // The copy already carries the authored mode, including group access or
-            // read-only permissions. Stage privately before restoring that mode so
-            // the process umask cannot expose a rewritten include more broadly.
-            let permissions = fs::metadata(config_path)
-                .map_err(|error| error.to_string())?
-                .permissions();
-            let staged = stage_private_config(config_path, value)?;
+            // Replace the copied pathname without making a symlink's
+            // referent writable. Protect bytes before publishing them.
+            let staged = stage_private_config(path, value)?;
             staged
                 .as_file()
-                .set_permissions(permissions)
+                .set_permissions(permissions.clone())
                 .map_err(|error| error.to_string())?;
-            replace_private_config(staged, config_path)
+            replace_private_config(staged, path)
         }
         #[cfg(not(unix))]
-        write_config_value(config_path, value)
-    })
+        {
+            let write = || write_config_value(path, value);
+            if fs::symlink_metadata(path)
+                .map_err(|error| error.to_string())?
+                .file_type()
+                .is_symlink()
+            {
+                write()
+            } else {
+                super::openclaw_state::with_owner_write_permission(path, write)
+            }
+        }
+    })?;
+    #[cfg(not(unix))]
+    fs::set_permissions(path, permissions).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn write_config_value(config_path: &Path, value: &Value) -> Result<(), String> {

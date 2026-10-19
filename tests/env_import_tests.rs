@@ -112,9 +112,18 @@ fn env_import_relocates_absolute_includes_without_the_original_source() {
             let config = serde_json::json!({
                 "plugins": {"$include": [include("config/plugins.json5"), include("config/shared.json")]}
             }).to_string();
+            let external = root.child("external/demo");
+            fs::create_dir_all(&external).unwrap();
             let nested = serde_json::json!({
-                "$include": if absolute { include("config/shared.json") } else { "./shared.json".into() }
+                "$include": if absolute { include("config/shared.json") } else { "./shared.json".into() },
+                "load": {"paths": [state.join("extensions/demo"), external]}
             }).to_string();
+            let payload = "export default { id: 'demo', register() {} };\n";
+            write_text(&state.join("extensions/demo/index.js"), payload);
+            write_text(
+                &state.join("extensions/demo/openclaw.plugin.json"),
+                r#"{"id":"demo","configSchema":{"type":"object"}}"#,
+            );
             write_text(&state.join("openclaw.json"), &config);
             write_text(&state.join("config/plugins.json5"), &nested);
             write_text(&state.join("config/shared.json"), "{\"enabled\": false}\n");
@@ -191,6 +200,18 @@ fn env_import_relocates_absolute_includes_without_the_original_source() {
                 assert_eq!(imported_nested["$include"], "./shared.json");
             }
             assert_eq!(
+                Path::new(imported_nested["load"]["paths"][0].as_str().unwrap()),
+                target.join("extensions/demo")
+            );
+            assert_eq!(
+                imported_nested["load"]["paths"][1],
+                serde_json::json!(external)
+            );
+            assert_eq!(
+                fs::read_to_string(target.join("extensions/demo/index.js")).unwrap(),
+                payload
+            );
+            assert_eq!(
                 fs::read_to_string(target.join("config/shared.json")).unwrap(),
                 "{\"enabled\": false}\n"
             );
@@ -244,7 +265,19 @@ fn env_import_preserves_readonly_include_symlink_referents() {
         &state.join("openclaw.json"),
         r#"{"plugins":{"$include":"./config/alias.json"}}"#,
     );
-    let fragment = serde_json::json!({"$include": state.join("shared.json")}).to_string();
+    let fragment = serde_json::json!({
+        "$include": state.join("shared.json"),
+        "load": {"paths": [state.join("extensions/demo")]}
+    })
+    .to_string();
+    write_text(
+        &state.join("extensions/demo/index.js"),
+        "export default { id: 'demo', register() {} };\n",
+    );
+    write_text(
+        &state.join("extensions/demo/openclaw.plugin.json"),
+        r#"{"id":"demo","configSchema":{"type":"object"}}"#,
+    );
     write_text(&state.join("config/fragment.json"), &fragment);
     write_text(&state.join("shared.json"), "{\"enabled\":false}");
     symlink("fragment.json", state.join("config/alias.json")).unwrap();
@@ -284,6 +317,11 @@ fn env_import_preserves_readonly_include_symlink_referents() {
         Path::new(imported["$include"].as_str().unwrap()),
         target.join("shared.json")
     );
+    assert_eq!(
+        Path::new(imported["load"]["paths"][0].as_str().unwrap()),
+        target.join("extensions/demo")
+    );
+    assert!(target.join("extensions/demo/index.js").is_file());
     assert_eq!(
         fs::metadata(alias).unwrap().permissions().mode() & 0o777,
         0o400
