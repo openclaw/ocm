@@ -3856,15 +3856,12 @@ mod tests {
     #[test]
     fn dynamic_child_publication_failure_prevents_spawn_and_allows_retry() {
         let root = tempfile::tempdir().unwrap();
-        // Parallel port tests can occupy the default family before publication.
-        let gateway_port = (0..32)
-            .find_map(|_| {
-                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                let port = u32::from(listener.local_addr().unwrap().port());
-                drop(listener);
-                openclaw_port_family_available(port).then_some(port)
-            })
-            .expect("an available ephemeral Gateway port family");
+        // Avoid both the shared default and ephemeral ports reused by outgoing
+        // connections between the publication failure and retry.
+        let gateway_port = (12000..16000)
+            .step_by(111)
+            .find(|port| openclaw_port_family_available(*port))
+            .expect("an available non-ephemeral Gateway port family");
         let env = BTreeMap::from([
             ("HOME".to_string(), display_path(&root.path().join("home"))),
             (
