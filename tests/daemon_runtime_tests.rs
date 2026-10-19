@@ -4662,6 +4662,74 @@ fn sibling_restart_preserves_inactive_target_until_explicit_restart() {
 }
 
 #[test]
+fn ordinary_restart_revives_inactive_protocol_target_without_reviving_sibling() {
+    let _guard = daemon_runtime_test_lock();
+    let fixture = InactiveGatewayFixture::running(true);
+    fs::write(fixture.root.child("release-consume"), "release").unwrap();
+    // The native command has no live owner after exit; invoking it is the bug.
+    let script = fixture.root.child("bin/target/openclaw.mjs");
+    let raw = fs::read_to_string(&script).unwrap();
+    write_executable_script(
+        &script,
+        &raw.replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\nif [ \"$1\" = gateway ] && [ \"${2:-}\" = restart ]; then exit 23; fi\n",
+            1,
+        ),
+    );
+    fixture.exit_target();
+    let sibling_pid = fixture.sibling["pid"].as_u64().unwrap();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &sibling_pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let sibling_state = wait_for_runtime_service_state(
+        &fixture.runtime_path,
+        "sibling",
+        "stopped",
+        Duration::from_secs(5),
+    )
+    .expect("sibling did not settle inactive");
+    let target_state = wait_for_runtime_service_state(
+        &fixture.runtime_path,
+        "target",
+        "stopped",
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(target_state["restartHandoff"], "protocol-v1");
+    assert_eq!(target_state["pid"], Value::Null);
+
+    let restart = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["service", "restart", "target", "--json"],
+    );
+    assert!(restart.status.success(), "{}", stderr(&restart));
+    let body: Value = serde_json::from_slice(&restart.stdout).unwrap();
+    assert_eq!(body["gatewayReady"], true);
+    assert!(body["warnings"].as_array().unwrap().is_empty());
+    let runtime = read_persisted_service_state(&fixture.runtime_path);
+    assert!(runtime_child_pid(&runtime, "target").is_some());
+    assert!(runtime_child_pid(&runtime, "sibling").is_none());
+    assert_eq!(
+        runtime["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["envName"] == "sibling"),
+        Some(&sibling_state)
+    );
+    assert_eq!(
+        runtime["gatewayAdmission"]["process"]["pid"],
+        fixture.daemon.id()
+    );
+}
+
+#[test]
 fn snapshot_retires_inactive_target_and_preserves_running_sibling() {
     let _guard = daemon_runtime_test_lock();
     let fixture = InactiveGatewayFixture::new();

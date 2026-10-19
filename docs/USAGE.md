@@ -517,8 +517,9 @@ Retry after restoring manager access; `ocm service status` remains available for
 Saved dev service plans must still match the env's current binding and recorded
 worktree. If OCM refuses a stale plan, use `ocm service restart <env>` to refresh it.
 
-Normal restart is gateway-aware when `ocm service status mira` reports restart
-handoff `protocol v1`: OpenClaw records eligible active sessions and subagents,
+Normal restart is gateway-aware while the Gateway is running and
+`ocm service status mira` reports restart handoff `protocol v1`: OpenClaw records
+eligible active sessions and subagents,
 hands the fresh-process restart back to OCM immediately, and resumes recoverable
 work after the replacement gateway starts. The old gateway process does not wait
 for an in-flight turn to finish.
@@ -551,9 +552,12 @@ The target request remains pending, so the existing daemon can still process it.
 A Gateway that exits cleanly without an accepted restart handoff stays stopped
 while its saved launch definition remains unchanged. Starting or restarting a
 sibling environment does not revive it. An explicit restart of that environment,
-a changed launch definition, or a new daemon run can start it again. Stopping the
-service removes its inactive runtime record so snapshot maintenance can verify
-that the environment is quiescent.
+a changed launch definition, or a new daemon run can start it again. Ordinary
+restart starts a settled inactive Gateway without requiring `--force`, even when
+its runtime record retains restart-handoff capability. OCM verifies the current
+daemon observation before starting it; stale or unresolved ownership does not
+qualify as a stopped Gateway. Stopping the service removes its inactive runtime
+record so snapshot maintenance can verify that the environment is quiescent.
 
 Snapshot and upgrade maintenance check the target's supervisor ownership before capturing or replacing its state.
 A failed service-manager read, a running daemon without a current runtime observation, or a runtime identity mismatch fails maintenance before mutation; stored stopped intent alone is insufficient.
