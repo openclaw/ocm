@@ -952,7 +952,7 @@ for (const name of ['vite', 'dompurify']) {
                         return Ok(130);
                     }
                     if children[0].poll()?.is_some() {
-                        return Err("OpenClaw source exited before preparing its node_modules link for the Control UI".to_string().into());
+                        return Err("OpenClaw source exited before preparing its node_modules link for the Control UI; inspect the source startup output and retry, or use --no-ui to diagnose Gateway-only startup".to_string().into());
                     }
                     #[cfg(unix)]
                     if observe_process(children[0].identity.pid)?
@@ -967,7 +967,7 @@ for (const name of ['vite', 'dompurify']) {
                         deadline += suspended.elapsed();
                     }
                     if std::time::Instant::now() >= deadline {
-                        return Err("OpenClaw source did not prepare its node_modules link for the Control UI within 30 seconds".to_string().into());
+                        return Err("OpenClaw source did not prepare its node_modules link for the Control UI within 30 seconds; inspect the source startup output and retry, or use --no-ui to diagnose Gateway-only startup".to_string().into());
                     }
                     thread::sleep(Duration::from_millis(50));
                 }
