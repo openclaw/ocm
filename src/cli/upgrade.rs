@@ -1707,7 +1707,7 @@ impl Cli {
         guard.check(&recovery.meta.name, &self.env, &self.cwd)?;
         let install_root = runtime_install_root(&recovery.meta.name, &self.env, &self.cwd)?;
         if install_root.exists() {
-            fs::remove_dir_all(&install_root).map_err(|error| {
+            remove_owned_tree(&install_root).map_err(|error| {
                 format!(
                     "failed to remove current runtime root {}: {error}",
                     display_path(&install_root)
@@ -5756,7 +5756,7 @@ impl Cli {
         if let Some(backup_root) = backup.backup_root.as_ref() {
             let install_root = runtime_install_root(&backup.meta.name, &self.env, &self.cwd)?;
             if install_root.exists() {
-                fs::remove_dir_all(&install_root).map_err(|error| {
+                remove_owned_tree(&install_root).map_err(|error| {
                     format!(
                         "failed to remove upgraded runtime root {}: {error}",
                         display_path(&install_root)

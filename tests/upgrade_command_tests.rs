@@ -569,6 +569,17 @@ struct SeededInPlaceRollback {
     original_recovery_root: PathBuf,
 }
 
+#[cfg(unix)]
+fn add_read_only_recovery_directory(fixture: &SeededInPlaceRollback) -> PathBuf {
+    let directory = fixture
+        .original_recovery_root
+        .join("stable/install-root/files/readonly");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("payload"), "retained runtime bytes").unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+    directory
+}
+
 fn seed_in_place_rollback(root: &TestDir, recovery_binary_version: &str) -> SeededInPlaceRollback {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -6062,6 +6073,8 @@ fn upgrade_refuses_a_live_watch_before_state_or_runtime_mutation() {
 fn upgrade_rollback_restores_retained_in_place_runtime_bytes() {
     let root = TestDir::new("upgrade-explicit-rollback-in-place");
     let fixture = seed_in_place_rollback(&root, "2026.6.11");
+    #[cfg(unix)]
+    add_read_only_recovery_directory(&fixture);
 
     let rollback = run_ocm(
         &fixture.cwd,
@@ -6079,6 +6092,18 @@ fn upgrade_rollback_restores_retained_in_place_runtime_bytes() {
         "before-upgrade"
     );
     assert!(!fixture.original_recovery_root.exists());
+    #[cfg(unix)]
+    {
+        let restored = root.child("ocm-home/runtimes/stable/files/readonly");
+        assert_eq!(
+            fs::read_to_string(restored.join("payload")).unwrap(),
+            "retained runtime bytes"
+        );
+        assert_eq!(
+            fs::metadata(restored).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+    }
 
     let version = run_ocm(&fixture.cwd, &fixture.env, &["@demo", "--", "--version"]);
     assert!(version.status.success(), "{}", stderr(&version));
@@ -6116,7 +6141,12 @@ fn upgrade_rollback_restores_retained_in_place_runtime_bytes() {
         &fixture.env,
         &["upgrade", "rollback", "demo", "--json"],
     );
-    assert!(reverse.status.success(), "{}", stderr(&reverse));
+    assert!(
+        reverse.status.success(),
+        "{} {}",
+        stdout(&reverse),
+        stderr(&reverse)
+    );
     let reverse_json: Value = serde_json::from_str(&stdout(&reverse)).unwrap();
     assert_eq!(reverse_json["outcome"], "rolled-back");
     assert_eq!(reverse_json["runtimeReleaseVersion"], "2026.6.33");
@@ -6128,6 +6158,28 @@ fn upgrade_rollback_restores_retained_in_place_runtime_bytes() {
     let version = run_ocm(&fixture.cwd, &fixture.env, &["@demo", "--", "--version"]);
     assert!(version.status.success(), "{}", stderr(&version));
     assert_eq!(stdout(&version).trim(), "2026.6.33");
+    #[cfg(unix)]
+    {
+        assert!(
+            !root
+                .child("ocm-home/runtimes/stable/files/readonly")
+                .exists()
+        );
+        let retained = root.child(format!(
+            "ocm-home/upgrade-history/demo/{}.recovery/stable/install-root/files/readonly",
+            reverse_json["rollbackTransactionId"].as_str().unwrap()
+        ));
+        assert_eq!(
+            fs::read_to_string(retained.join("payload")).unwrap(),
+            "retained runtime bytes"
+        );
+        assert_eq!(
+            fs::metadata(&retained).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        // Restore fixture access only after checking the retained backup's mode.
+        fs::set_permissions(retained, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 #[cfg(unix)]
@@ -6412,6 +6464,8 @@ fn rollback_refuses_runtime_mutation_when_quiescence_observation_is_lost() {
 fn upgrade_rollback_failure_restores_the_pre_rollback_state() {
     let root = TestDir::new("upgrade-explicit-rollback-failure");
     let fixture = seed_in_place_rollback(&root, "broken-recovery");
+    #[cfg(unix)]
+    let read_only_recovery = add_read_only_recovery_directory(&fixture);
 
     let rollback = run_ocm(
         &fixture.cwd,
@@ -6421,7 +6475,7 @@ fn upgrade_rollback_failure_restores_the_pre_rollback_state() {
     assert!(!rollback.status.success());
     let rollback_json: Value = serde_json::from_str(&stdout(&rollback)).unwrap();
     assert_eq!(rollback_json["transactionId"], fixture.transaction_id);
-    assert_eq!(rollback_json["outcome"], "failed");
+    assert_eq!(rollback_json["outcome"], "failed", "{rollback_json}");
     assert!(rollback_json["safetySnapshotId"].is_string());
     assert!(
         rollback_json["note"]
@@ -6434,6 +6488,24 @@ fn upgrade_rollback_failure_restores_the_pre_rollback_state() {
         "after-upgrade"
     );
     assert!(fixture.original_recovery_root.exists());
+    #[cfg(unix)]
+    {
+        assert!(
+            !root
+                .child("ocm-home/runtimes/stable/files/readonly")
+                .exists()
+        );
+        assert_eq!(
+            fs::metadata(&read_only_recovery)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+        // The failed rollback retains its original recovery; allow fixture cleanup.
+        fs::set_permissions(read_only_recovery, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     let version = run_ocm(&fixture.cwd, &fixture.env, &["@demo", "--", "--version"]);
     assert!(version.status.success(), "{}", stderr(&version));
@@ -6485,10 +6557,11 @@ fn assert_failed_rollback_retains_runtime(block_history: bool) {
         .original_recovery_root
         .join("stable/install-root/files/bin/openclaw");
     let mut script = recording_openclaw_script("broken-recovery");
+    // Block deletion at the parent; owned-tree cleanup repairs the tree itself.
     script = script.replace(
         "printf 'broken-recovery\\n'",
         &format!(
-            "chmod 500 \"$OCM_HOME/runtimes/stable\"\n{}printf 'broken-recovery\\n'",
+            "chmod 500 \"$OCM_HOME/runtimes\"\n{}printf 'broken-recovery\\n'",
             if block_history {
                 "chmod 500 \"$OCM_HOME/upgrade-history/demo\"\n"
             } else {
@@ -6504,7 +6577,11 @@ fn assert_failed_rollback_retains_runtime(block_history: bool) {
         &["upgrade", "rollback", "demo", "--json"],
     );
     // Restore only fixture permissions before assertions or TestDir cleanup.
-    fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(
+        runtime_root.parent().unwrap(),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
     fs::set_permissions(&history_root, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(!rollback.status.success());
     let result: Value = serde_json::from_str(&stdout(&rollback)).unwrap();
