@@ -1286,6 +1286,11 @@ endpoint and effective backend watching/UI choices reuses the session; changing
 those choices requires stopping it first. `dev status --json` reports active
 ownership separately from `sourceWatch.watching`.
 `--force` temporarily takes over a running background service while backend watching is enabled and restores it on exit only if no later service policy request supersedes the takeover; it rejects `--no-watch` or `--service`.
+Temporary takeovers resolve `--repo` to its canonical checkout before preparation.
+Changing a selected path alias while the session runs does not redirect the
+worker or environment commands. A repeat request through that alias is refused
+if it now selects another checkout; stop the session before switching sources.
+Equivalent aliases that still select the active checkout can reuse it.
 Temporary source sessions also refuse to start while an environment operation
 can replace their checkout or Git metadata. Retry after the containing operation
 finishes; refusal leaves the temporary session and service policy unchanged.

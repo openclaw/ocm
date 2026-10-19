@@ -5074,6 +5074,105 @@ fn dev_watch_force_takes_over_runtime_env_without_rebinding() {
 
 #[cfg(unix)]
 #[test]
+fn dev_takeover_retains_its_source_when_the_selected_alias_is_retargeted() {
+    let root = TestDir::new("dev-takeover-source-alias");
+    let other = TestDir::new("dev-takeover-other-source");
+    let repo = fs::canonicalize(init_openclaw_repo(&root)).unwrap();
+    let other_repo = fs::canonicalize(init_openclaw_repo(&other)).unwrap();
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = service_env(&root);
+    let (started, release, watch_log) = install_blocking_fake_dev_runners(&root, &mut env);
+    create_runtime_backed_env(&cwd, &env);
+    let binding = get_environment("demo", &env, &cwd).unwrap();
+    let alias = root.child("selected-source");
+    std::os::unix::fs::symlink(&repo, &alias).unwrap();
+    let alias_string = path_string(&alias);
+    let args = dev_watch(&["demo", "--repo", &alias_string, "--watch", "--force"]);
+    let mut watch = DevWatchFixture::spawn(&root, &cwd, &env, &args);
+    assert!(wait_for_path(&started, Duration::from_secs(30)));
+    let override_path = source_watch_override_path(&root, "demo");
+    let before = fs::read(&override_path).unwrap();
+    let same = run_ocm(&cwd, &env, &args);
+    assert!(same.status.success(), "{}", stderr(&same));
+    assert!(stderr(&same).contains("keeping the existing session"));
+
+    std::os::unix::fs::symlink(&repo, root.child("equivalent-source")).unwrap();
+    let equivalent = run_ocm(
+        &cwd,
+        &env,
+        &dev_watch(&[
+            "demo",
+            "--repo",
+            &path_string(&root.child("equivalent-source")),
+            "--watch",
+            "--force",
+        ]),
+    );
+    assert!(equivalent.status.success(), "{}", stderr(&equivalent));
+    fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&other_repo, &alias).unwrap();
+
+    // Route an actual command through the published generation after the alias
+    // changes, checking its cwd and entrypoint independently of the watcher.
+    let route_bin = root.child("route-bin");
+    write_executable_script(
+        &route_bin.join("node"),
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$1\"\n",
+    );
+    let mut route_env = env.clone();
+    prepend_fake_bin(&mut route_env, &route_bin);
+    let routed = run_ocm(&cwd, &route_env, &["env", "run", "demo", "--", "--probe"]);
+    assert!(routed.status.success(), "{}", stderr(&routed));
+    assert_eq!(
+        stdout(&routed),
+        format!(
+            "{}\n{}\n",
+            repo.display(),
+            repo.join("openclaw.mjs").display()
+        )
+    );
+    let gateway = ocm::env::EnvironmentService::new(&env, &cwd)
+        .resolve_gateway_process("demo", false)
+        .unwrap();
+    assert_eq!(gateway.run_dir, repo);
+    assert_eq!(gateway.args[0], path_string(&repo.join("openclaw.mjs")));
+    let mismatch = run_ocm(&cwd, &env, &args);
+    assert!(!mismatch.status.success());
+    assert!(stderr(&mismatch).contains("stop that session before selecting"));
+    assert_eq!(fs::read(&override_path).unwrap(), before);
+    assert_eq!(fs::read_to_string(&watch_log).unwrap().lines().count(), 1);
+    let current = get_environment("demo", &env, &cwd).unwrap();
+    assert_eq!(current.root, binding.root);
+    assert_eq!(current.dev, binding.dev);
+    assert_eq!(current.default_runtime, binding.default_runtime);
+    assert_eq!(current.default_launcher, binding.default_launcher);
+    let stopped = run_dev_stop(&cwd, &env);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let finished = watch.wait_without_release();
+    assert_eq!(finished.status.code(), Some(130), "{}", stderr(&finished));
+    assert!(!override_path.exists());
+    assert_eq!(read_source_watch_session(&root)["closed"], true);
+    drop(watch);
+
+    // Ending the generation releases only its source selection. A new takeover
+    // can use the alias's new target without changing the environment binding.
+    fs::remove_file(&release).unwrap();
+    fs::remove_file(&started).unwrap();
+    let mut next = DevWatchFixture::spawn(&root, &cwd, &env, &args);
+    assert!(wait_for_path(&started, Duration::from_secs(30)));
+    let current: Value = serde_json::from_slice(&fs::read(&override_path).unwrap()).unwrap();
+    assert_eq!(current["repoRoot"], path_string(&other_repo));
+    let stopped = run_dev_stop(&cwd, &env);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let finished = next.wait_without_release();
+    assert_eq!(finished.status.code(), Some(130), "{}", stderr(&finished));
+    assert!(!override_path.exists());
+    assert_eq!(read_source_watch_session(&root)["closed"], true);
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_watch_force_rejects_dependencies_from_another_checkout_before_takeover() {
     let root = TestDir::new("dev-command-runtime-watch-external-dependencies");
     let repo = init_openclaw_repo(&root);
