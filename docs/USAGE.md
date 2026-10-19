@@ -920,7 +920,9 @@ sandbox runtime writes. Unclassified state remains covered, including credential
 unknown runtime directories, and migration inputs outside the declared directories.
 
 Preparation, stopped capture, and rollback validation do not traverse independent
-directories. Restore replaces owned entries around them; it leaves current
+directories. Restore replaces owned entries around them, including captured symlinks
+whose targets are missing or independently preserved, and removes owned entries
+added after capture. It leaves current
 independent bytes, modes, timestamps, extended attributes, symlinks, additions,
 and deletions in place. Shared ancestor directories stay in place, but their
 metadata can change when owned siblings are replaced. Existing service-log and

@@ -1021,6 +1021,8 @@ fn env_snapshot_restores_socket_named_data_and_discards_process_residue() {
     assert!(!checkpoint.join(".openclaw/endpoint").exists());
     assert!(!checkpoint.join(".openclaw/stale.socket").exists());
     drop(listener);
+    let new_dangling = env_root.join(".openclaw/new-dangling");
+    symlink("missing-new-target", &new_dangling).unwrap();
 
     let restore = run_ocm(
         &cwd,
@@ -1028,6 +1030,7 @@ fn env_snapshot_restores_socket_named_data_and_discards_process_residue() {
         &["env", "snapshot", "restore", "source", snapshot_id],
     );
     assert!(restore.status.success(), "{}", stderr(&restore));
+    assert!(fs::symlink_metadata(new_dangling).is_err());
     for saved_root in [&env_root, &checkpoint.to_path_buf()] {
         for relative in files {
             assert_eq!(

@@ -339,6 +339,80 @@ fn independent_project_survives_success_failure_interrupt_and_explicit_rollback(
 }
 
 #[test]
+fn scoped_manual_restore_and_rollback_restore_owned_symlink_entries() {
+    for manual in [true, false] {
+        let mut fixture = Fixture::new();
+        let workspace = fixture.state.join("workspace");
+        write_text(&workspace.join("a-target"), "saved owned target");
+        write_text(&workspace.join("z-target"), "saved later target");
+        fs::create_dir(workspace.join("subtree")).unwrap();
+        let external = fixture.root.child("external");
+        write_text(&external, "external control");
+        let links = [
+            ("z-link", PathBuf::from("a-target")),
+            ("b-link", PathBuf::from("z-target")),
+            ("project-link", PathBuf::from("projects/example/code")),
+            ("dangling", PathBuf::from("missing-target")),
+            ("subtree/nested-dangling", PathBuf::from("missing-nested")),
+            ("external-link", external.clone()),
+        ];
+        for (relative, target) in &links {
+            symlink(target, workspace.join(relative)).unwrap();
+        }
+        let ready = fixture.root.child("ready");
+        let release = fixture.root.child("release");
+        write_text(&release, "continue");
+        fixture
+            .env
+            .insert("OCM_PROOF_READY".into(), ready.to_str().unwrap().into());
+        fixture
+            .env
+            .insert("OCM_PROOF_RELEASE".into(), release.to_str().unwrap().into());
+        let upgraded = fixture.run_ok(&["upgrade", "demo", "--runtime", "new", "--json"]);
+        let receipt: Value = serde_json::from_slice(&upgraded.stdout).unwrap();
+        let id = receipt["snapshotId"].as_str().unwrap();
+        let show = fixture.run_ok(&["env", "snapshot", "show", "demo", id, "--json"]);
+        let snapshot: Value = serde_json::from_slice(&show.stdout).unwrap();
+        let captured =
+            PathBuf::from(snapshot["archivePath"].as_str().unwrap()).join(".openclaw/workspace");
+        for (relative, target) in &links {
+            assert_eq!(fs::read_link(captured.join(relative)).unwrap(), *target);
+            // Manual restore must replace changed entry types. Rollback must
+            // also preserve saved links that remain valid immediately before it.
+            if manual {
+                fs::remove_file(workspace.join(relative)).unwrap();
+                write_text(&workspace.join(relative), "current regular file");
+            }
+        }
+        write_text(&workspace.join("a-target"), "current owned target");
+        let expected_project = fixture.edit_project();
+        let new_link = workspace.join("new-dangling");
+        symlink("missing-new", &new_link).unwrap();
+        if manual {
+            fixture.run_ok(&["env", "snapshot", "restore", "demo", id]);
+        } else {
+            let rollback = fixture.run_ok(&["upgrade", "rollback", "demo", "--json"]);
+            let receipt: Value = serde_json::from_slice(&rollback.stdout).unwrap();
+            assert_eq!(receipt["outcome"], "rolled-back");
+        }
+        for (relative, target) in &links {
+            assert_eq!(fs::read_link(workspace.join(relative)).unwrap(), *target);
+            assert_eq!(fs::read_link(captured.join(relative)).unwrap(), *target);
+        }
+        assert!(fs::symlink_metadata(new_link).is_err());
+        assert_eq!(
+            fs::read(workspace.join("a-target")).unwrap(),
+            b"saved owned target"
+        );
+        assert_eq!(fs::read(external).unwrap(), b"external control");
+        fixture.assert_project(&expected_project);
+        let current =
+            ocm::store::get_environment("demo", &fixture.env, fixture.root.path()).unwrap();
+        assert_eq!(current.default_runtime.as_deref(), Some("old"));
+    }
+}
+
+#[test]
 fn configured_workspace_policy_ignores_unrelated_dangling_home_alias() {
     for redeclare in [false, true] {
         let mut fixture = Fixture::with_independent_root("development/projects");
