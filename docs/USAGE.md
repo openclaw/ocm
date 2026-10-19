@@ -62,6 +62,9 @@ environment stopped and preserves an existing environment's service state. Retry
 with `ocm start <name> --onboard`; use `--no-service` to finish onboarding without
 starting a background service. Gateway readiness is still checked when OCM starts
 the service after onboarding.
+Repeating `ocm start luna --command ... --cwd .` from the same directory reuses the local
+launcher, as does the equivalent absolute directory. A different command or
+directory is refused without changing the existing launcher.
 
 ## Common scenarios
 

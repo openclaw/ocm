@@ -284,6 +284,58 @@ fn start_can_create_a_local_command_launcher() {
 }
 
 #[test]
+fn start_reuses_launcher_with_equivalent_cwd_and_preserves_conflicts() {
+    let root = TestDir::new("start-command-cwd-reuse");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(cwd.join("other")).unwrap();
+    let env = ocm_env(&root);
+    let start = |command: &str, directory: Option<&str>| {
+        let mut args = vec![
+            "start",
+            "demo",
+            "--command",
+            command,
+            "--no-service",
+            "--json",
+        ];
+        if let Some(directory) = directory {
+            args.extend(["--cwd", directory]);
+        }
+        run_ocm(&cwd, &env, &args)
+    };
+
+    let created = start("openclaw", Some("."));
+    assert!(created.status.success(), "{}", stderr(&created));
+    let launcher_path = root.child("ocm-home/launchers/demo.local.json");
+    let original = fs::read(&launcher_path).unwrap();
+    let launcher: Value = serde_json::from_slice(&original).unwrap();
+    let absolute_cwd = path_string(&cwd);
+    assert_eq!(launcher["cwd"], absolute_cwd);
+
+    for equivalent in [".", "./other/..", absolute_cwd.as_str()] {
+        let repeated = start("openclaw", Some(equivalent));
+        assert!(repeated.status.success(), "{}", stderr(&repeated));
+        let summary: Value = serde_json::from_str(&stdout(&repeated)).unwrap();
+        assert_eq!(summary["created"], false);
+        assert_eq!(summary["defaultLauncher"], "demo.local");
+        assert_eq!(fs::read(&launcher_path).unwrap(), original);
+    }
+
+    let other_cwd = path_string(&cwd.join("other"));
+    for (command, directory) in [
+        ("openclaw", Some("./other")),
+        ("openclaw", Some(other_cwd.as_str())),
+        ("openclaw", None),
+        ("different-command", Some(".")),
+    ] {
+        let refused = start(command, directory);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(stderr(&refused).contains("already exists with different settings"));
+        assert_eq!(fs::read(&launcher_path).unwrap(), original);
+    }
+}
+
+#[test]
 fn start_points_existing_plain_openclaw_users_at_migrate_when_creating_fresh_envs() {
     let root = TestDir::new("start-detect-plain-home");
     let cwd = root.child("workspace");

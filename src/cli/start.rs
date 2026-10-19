@@ -8,7 +8,10 @@ use crate::infra::terminal::{KeyValueRow, Tone, paint, render_key_value_card};
 use crate::launcher::AddLauncherOptions;
 use crate::migrate::inspect_migration_source;
 use crate::service::service_backend_support_error;
-use crate::store::{derive_env_paths, ensure_minimum_local_openclaw_config, validate_name};
+use crate::store::{
+    derive_env_paths, display_path, ensure_minimum_local_openclaw_config, resolve_absolute_path,
+    validate_name,
+};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -444,7 +447,11 @@ impl Cli {
         cwd: Option<&str>,
     ) -> Result<String, String> {
         let launcher_name = format!("{env_name}.local");
-        let desired_cwd = cwd.map(str::to_string);
+        let desired_cwd = cwd
+            .map(|raw| {
+                resolve_absolute_path(raw, &self.env, &self.cwd).map(|path| display_path(&path))
+            })
+            .transpose()?;
         match self.launcher_service().show(&launcher_name) {
             Ok(existing) => {
                 if existing.command == command && existing.cwd == desired_cwd {
