@@ -444,10 +444,32 @@ pub(super) fn rewrite_archived_include_directives(
                 .parent()
                 .ok_or_else(|| "copied include has no parent".to_string())?;
             super::openclaw_state::with_owner_write_permission(parent, || {
-                super::openclaw_state::with_owner_write_permission(path, || {
-                    write_config_value(path, &value)
-                })
+                #[cfg(unix)]
+                {
+                    // Replace the copied pathname without making a symlink's
+                    // referent writable. Protect bytes before publishing them.
+                    let staged = stage_private_config(path, &value)?;
+                    staged
+                        .as_file()
+                        .set_permissions(permissions.clone())
+                        .map_err(|error| error.to_string())?;
+                    replace_private_config(staged, path)
+                }
+                #[cfg(not(unix))]
+                {
+                    let write = || write_config_value(path, &value);
+                    if fs::symlink_metadata(path)
+                        .map_err(|error| error.to_string())?
+                        .file_type()
+                        .is_symlink()
+                    {
+                        write()
+                    } else {
+                        super::openclaw_state::with_owner_write_permission(path, write)
+                    }
+                }
             })?;
+            #[cfg(not(unix))]
             fs::set_permissions(path, permissions).map_err(|error| error.to_string())?;
         }
     }
