@@ -1066,6 +1066,7 @@ External workspaces, the environment root itself and workspace paths redirected 
 
 New archives, with or without `--include-state`, retain the accepted source root and its captured canonical path in optional `env.canonicalSourceRoot` metadata.
 Configuration relocation uses both recorded roots without requiring the original source or alias to exist; state-inclusive runtime-reference relocation uses the same identities.
+Absolute internal config includes use those identities to select the archived files before import inventories configuration, including nested includes. Imported directives select the destination copies; relative directives remain relative. Includes outside the config directory, including symlink escapes, are still refused.
 Older archives retain their existing source-root matching rules.
 The archive format remains version 1, and older readers ignore the optional field.
 Source identities may use POSIX, Windows drive, or UNC syntax; the extension preserves acceptance of portable foreign-platform contents without adding translation of platform-specific payload paths.

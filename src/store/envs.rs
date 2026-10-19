@@ -1377,15 +1377,12 @@ pub(crate) fn import_environment_with_sandbox_origin(
         };
         reject_include_owned_sandbox_origin(&extracted_paths.config_path)?;
         reject_include_owned_agent_workspaces(&extracted_paths.config_path)?;
-        let resolve_copy_paths = if extracted.metadata.include_state {
-            resolve_env_openclaw_workspaces
-        } else {
-            super::openclaw_workspaces::resolve_env_openclaw_copy_paths
-        };
-        let extracted_workspaces = resolve_copy_paths(
+        let extracted_workspaces = super::openclaw_workspaces::resolve_archived_openclaw_paths(
             &extracted_paths,
+            &source_roots,
             env,
             OpenClawWorkspaceRuntime::for_env(&source_name, extracted.metadata.env.gateway_port),
+            extracted.metadata.include_state,
         )?;
         let preferred_gateway_port = extracted
             .metadata
@@ -1414,6 +1411,19 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 validate_nonportable_runtime_state_paths(&target_paths)?;
             }
             reject_include_owned_sandbox_origin(&target_paths.config_path)?;
+            let copied_includes = extracted_workspaces
+                .config_include_paths()
+                .map(|path| {
+                    path.strip_prefix(&extracted.root_dir)
+                        .map(|relative| target_paths.root.join(relative))
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            super::openclaw_config::rewrite_archived_include_directives(
+                &copied_includes,
+                &source_roots,
+                &target_paths.root,
+            )?;
             let config_rewrite = super::openclaw_config::rewrite_archived_openclaw_config(
                 &target_paths,
                 &source_roots,

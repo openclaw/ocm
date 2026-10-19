@@ -2048,7 +2048,7 @@ fn quoted_value_ranges(raw: &str) -> Vec<std::ops::Range<usize>> {
     ranges
 }
 
-fn with_owner_write_permission<T>(
+pub(super) fn with_owner_write_permission<T>(
     path: &Path,
     action: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {

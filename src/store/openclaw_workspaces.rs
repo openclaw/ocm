@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use super::common::path_exists;
-use super::layout::{EnvPaths, clean_path, display_path};
+use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 
 const DEFAULT_AGENT_ID: &str = "main";
 const MAX_INCLUDE_DEPTH: usize = 10;
@@ -92,6 +92,10 @@ enum OpenClawPathSelection {
 }
 
 impl OpenClawWorkspaceInventory {
+    pub(super) fn config_include_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.config_include_paths.iter()
+    }
+
     pub(super) fn preserve_copied_config_paths(&mut self, paths: &BTreeSet<PathBuf>) {
         self.config_include_paths.extend(paths.iter().cloned());
     }
@@ -427,6 +431,38 @@ pub(crate) fn resolve_env_openclaw_copy_paths(
         .map_err(OpenClawCleanupPathError::into_message)
 }
 
+/// Archive includes select extracted files using the identities captured at export,
+/// without consulting the original source tree.
+pub(super) fn resolve_archived_openclaw_paths(
+    paths: &EnvPaths,
+    source_roots: &[&Path],
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    include_state: bool,
+) -> Result<OpenClawWorkspaceInventory, String> {
+    let selection = if include_state {
+        OpenClawPathSelection::Workspaces
+    } else {
+        OpenClawPathSelection::Copy
+    };
+    let resolved =
+        load_effective_openclaw_config_with_source_roots(&paths.config_path, source_roots)?;
+    let mut inventory = resolve_openclaw_workspaces_from_config(
+        &paths.config_path,
+        &paths.state_dir,
+        &paths.openclaw_home,
+        env,
+        runtime,
+        selection,
+        resolved,
+    )
+    .map_err(OpenClawCleanupPathError::into_message)?;
+    inventory
+        .workspace_roots
+        .insert(paths.workspace_dir.clone());
+    Ok(inventory)
+}
+
 /// Cleanup preserves configured payload inside this environment, but neither
 /// acquires external agent directories nor requires them to be archivable.
 pub(crate) fn resolve_env_openclaw_cleanup_paths(
@@ -526,18 +562,26 @@ pub(crate) fn resolve_plain_openclaw_workspaces(
 pub(crate) fn load_effective_openclaw_config(
     config_path: &Path,
 ) -> Result<Option<EffectiveOpenClawConfig>, String> {
+    load_effective_openclaw_config_with_source_roots(config_path, &[])
+}
+
+fn load_effective_openclaw_config_with_source_roots(
+    config_path: &Path,
+    source_roots: &[&Path],
+) -> Result<Option<EffectiveOpenClawConfig>, String> {
     if !path_exists(config_path) {
         return Ok(None);
     }
 
     let raw = read_regular_text_file(config_path, "OpenClaw config", None)?;
     let value = parse_json5(&raw, config_path, "OpenClaw config")?;
-    resolve_effective_openclaw_config(config_path, value).map(Some)
+    resolve_effective_openclaw_config(config_path, value, source_roots).map(Some)
 }
 
 fn resolve_effective_openclaw_config(
     config_path: &Path,
     value: Value,
+    source_roots: &[&Path],
 ) -> Result<EffectiveOpenClawConfig, String> {
     let config_root = config_path.parent().ok_or_else(|| {
         format!(
@@ -546,6 +590,10 @@ fn resolve_effective_openclaw_config(
         )
     })?;
     let mut processor = IncludeProcessor::new(config_root)?;
+    processor.archived_config_roots = source_roots
+        .iter()
+        .map(|root| derive_env_paths(root).state_dir)
+        .collect();
     let value = processor.process(
         value,
         config_path,
@@ -593,9 +641,30 @@ fn resolve_openclaw_workspaces_with_config(
         Some(config) => Some(resolve_effective_openclaw_config(
             config_path,
             config.clone(),
+            &[],
         )?),
         None => load_effective_openclaw_config(config_path)?,
     };
+    resolve_openclaw_workspaces_from_config(
+        config_path,
+        state_dir,
+        openclaw_home,
+        env,
+        runtime,
+        selection,
+        resolved,
+    )
+}
+
+fn resolve_openclaw_workspaces_from_config(
+    config_path: &Path,
+    state_dir: &Path,
+    openclaw_home: &Path,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+    selection: OpenClawPathSelection,
+    resolved: Option<EffectiveOpenClawConfig>,
+) -> Result<OpenClawWorkspaceInventory, OpenClawCleanupPathError> {
     let config = resolved
         .as_ref()
         .map(|resolved| resolved.value.clone())
@@ -1201,6 +1270,7 @@ fn resolve_configured_path(
 
 struct IncludeProcessor {
     root_dir: PathBuf,
+    archived_config_roots: Vec<PathBuf>,
     canonical_root_dir: PathBuf,
     include_paths: BTreeSet<PathBuf>,
     include_scopes: BTreeMap<PathBuf, BTreeSet<Vec<String>>>,
@@ -1212,6 +1282,7 @@ impl IncludeProcessor {
         let canonical_root_dir = canonicalize_path_allow_missing(&root_dir)?;
         Ok(Self {
             root_dir,
+            archived_config_roots: Vec::new(),
             canonical_root_dir,
             include_paths: BTreeSet::new(),
             include_scopes: BTreeMap::new(),
@@ -1358,7 +1429,12 @@ impl IncludeProcessor {
         }
         let include_path = Path::new(include_path);
         let resolved = if include_path.is_absolute() {
-            clean_path(include_path)
+            let authored = clean_path(include_path);
+            self.archived_config_roots
+                .iter()
+                .find_map(|root| strip_archive_root_prefix(&authored, root))
+                .map(|relative| clean_path(&self.root_dir.join(relative)))
+                .unwrap_or(authored)
         } else {
             clean_path(
                 &containing_file

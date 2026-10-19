@@ -411,6 +411,53 @@ pub(crate) fn rewrite_openclaw_config_for_simulation(
     .map(|_| ())
 }
 
+pub(super) fn rewrite_archived_include_directives(
+    include_paths: &[PathBuf],
+    source_roots: &[&Path],
+    target_root: &Path,
+) -> Result<(), String> {
+    for path in include_paths {
+        let mut value = read_config_value(path)?
+            .ok_or_else(|| format!("copied OpenClaw include is missing: {}", display_path(path)))?;
+        if rewrite_include_directives(&mut value, source_roots, target_root) {
+            let permissions = fs::metadata(path)
+                .map_err(|error| error.to_string())?
+                .permissions();
+            let parent = path
+                .parent()
+                .ok_or_else(|| "copied include has no parent".to_string())?;
+            super::openclaw_state::with_owner_write_permission(parent, || {
+                super::openclaw_state::with_owner_write_permission(path, || {
+                    write_config_value(path, &value)
+                })
+            })?;
+            fs::set_permissions(path, permissions).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_include_directives(
+    value: &mut Value,
+    source_roots: &[&Path],
+    target_root: &Path,
+) -> bool {
+    match value {
+        Value::Object(object) => object.iter_mut().fold(false, |changed, (key, value)| {
+            let rewritten = if key == "$include" {
+                rewrite_env_root_paths_from_roots(value, source_roots, None, target_root)
+            } else {
+                rewrite_include_directives(value, source_roots, target_root)
+            };
+            changed || rewritten
+        }),
+        Value::Array(values) => values.iter_mut().fold(false, |changed, value| {
+            rewrite_include_directives(value, source_roots, target_root) || changed
+        }),
+        _ => false,
+    }
+}
+
 pub(crate) fn rewrite_openclaw_config_includes_for_target(
     config_path: &Path,
     state_dir: &Path,
