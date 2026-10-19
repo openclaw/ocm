@@ -821,28 +821,30 @@ fn clone_environment_with_policy(
         )?;
         let created_at = now_utc();
         let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
+        if matches!(policy, CloneEnvironmentPolicy::Standard) {
+            reject_include_owned_sandbox_origin(&target_paths.config_path)?;
+        }
+        let mut copied_configs = source_workspaces
+            .config_include_paths()
+            .map(|path| {
+                path.strip_prefix(&source_paths.root)
+                    .map(|relative| target_paths.root.join(relative))
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !copied_configs.is_empty() {
+            // Use the admitted source graph before any target traversal.
+            // Include the root so normalized absolute directives use the
+            // same mapping as directives inside copied fragments.
+            copied_configs.push(target_paths.config_path.clone());
+            super::openclaw_config::rewrite_copied_include_directives(
+                &copied_configs,
+                &[&source_paths.root, &canonical_source_root],
+                &target_paths.root,
+            )?;
+        }
         let config_rewrite = match policy {
             CloneEnvironmentPolicy::Standard => {
-                reject_include_owned_sandbox_origin(&target_paths.config_path)?;
-                let mut copied_configs = source_workspaces
-                    .config_include_paths()
-                    .map(|path| {
-                        path.strip_prefix(&source_paths.root)
-                            .map(|relative| target_paths.root.join(relative))
-                            .map_err(|error| error.to_string())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if !copied_configs.is_empty() {
-                    // Use the admitted source graph before any target traversal.
-                    // Include the root so normalized absolute directives use the
-                    // same mapping as directives inside copied fragments.
-                    copied_configs.push(target_paths.config_path.clone());
-                    super::openclaw_config::rewrite_copied_include_directives(
-                        &copied_configs,
-                        &[&source_paths.root, &canonical_source_root],
-                        &target_paths.root,
-                    )?;
-                }
                 let outcome = rewrite_openclaw_config_for_new_environment(
                     &target_paths,
                     Some(&source_paths.root),
@@ -1922,12 +1924,13 @@ mod tests {
                     sandboxPort: 19790,
                     sandboxOrigin: "https://source.example.test",
                   }} }},
-                  nested: {{ $include: "./nested.json5" }},
+                  nested: {{ $include: {} }},
                   plugin: {{ agentDir: "${{OPENCLAW_STATE_DIR}}/workspace/${{OCM_ACTIVE_ENV}}" }},
                 }}
 "#,
                 source_paths.workspace_dir.display(),
-                source_paths.workspace_dir.display()
+                source_paths.workspace_dir.display(),
+                serde_json::to_string(&include_dir.join("nested.json5")).unwrap()
             ),
         )
         .unwrap();
@@ -1936,6 +1939,8 @@ mod tests {
             "{\n  // Nested JSON5 includes must be preserved.\n  enabled: true,\n}\n",
         )
         .unwrap();
+        let source_base_before = fs::read(include_dir.join("base.json")).unwrap();
+        let source_nested_before = fs::read(include_dir.join("nested.json5")).unwrap();
         let agent_template = "${OPENCLAW_STATE_DIR}/workspace/${OCM_ACTIVE_ENV}";
         let agent_include = serde_json::to_string(agent_template).unwrap();
         fs::write(include_dir.join("agent-dir.json"), &agent_include).unwrap();
@@ -2153,6 +2158,22 @@ mod tests {
         assert_eq!(
             included["agents"]["list"][0]["workspace"],
             target_paths.workspace_dir.display().to_string()
+        );
+        assert_eq!(
+            included["nested"]["$include"],
+            target_paths
+                .state_dir
+                .join("config/nested.json5")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            fs::read(include_dir.join("base.json")).unwrap(),
+            source_base_before
+        );
+        assert_eq!(
+            fs::read(include_dir.join("nested.json5")).unwrap(),
+            source_nested_before
         );
         let target_inventory = super::super::openclaw_workspaces::resolve_env_openclaw_copy_paths(
             &target_paths,

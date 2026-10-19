@@ -3088,12 +3088,13 @@ fn upgrade_simulate_tests_a_published_version_without_changing_the_source_env() 
     let source_state = root.child("ocm-home/envs/demo/.openclaw");
     let source_config = source_state.join("openclaw.json");
     let included_config = source_state.join("config/base.json");
+    let nested_config = source_state.join("config/leaf.json");
     fs::create_dir_all(included_config.parent().unwrap()).unwrap();
-    fs::write(
-        &included_config,
-        fs::read_to_string(&source_config).unwrap(),
-    )
-    .unwrap();
+    let source_leaf_before = fs::read(&source_config).unwrap();
+    fs::write(&nested_config, &source_leaf_before).unwrap();
+    let source_base_before =
+        serde_json::to_vec_pretty(&serde_json::json!({"$include": nested_config})).unwrap();
+    fs::write(&included_config, &source_base_before).unwrap();
     fs::write(
         &source_config,
         "{\n  \"$include\": \"./config/base.json\"\n}\n",
@@ -3132,7 +3133,8 @@ fn upgrade_simulate_tests_a_published_version_without_changing_the_source_env() 
         fs::read_to_string(&source_config).unwrap(),
         "{\n  \"$include\": \"./config/base.json\"\n}\n"
     );
-    assert!(included_config.exists());
+    assert_eq!(fs::read(&included_config).unwrap(), source_base_before);
+    assert_eq!(fs::read(&nested_config).unwrap(), source_leaf_before);
 
     let simulation = run_ocm(&cwd, &env, &["env", "show", sim_name, "--json"]);
     assert!(!simulation.status.success(), "{}", stdout(&simulation));
