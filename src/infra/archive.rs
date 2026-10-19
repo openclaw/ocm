@@ -446,6 +446,7 @@ fn append_env_root(
         if state_database
             || (!discover_sqlite
                 && options.snapshot_sqlite_files
+                && metadata.is_file()
                 && is_sqlite_database_path(relative_path))
         {
             let source_metadata = captured

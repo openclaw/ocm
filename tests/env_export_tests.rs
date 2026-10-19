@@ -400,6 +400,136 @@ fn env_export_json_reports_the_custom_archive_path() {
     assert!(cwd.join("archives/source-backup.tar").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn env_export_preserves_sqlite_links_and_snapshots_regular_databases() {
+    use std::collections::BTreeSet;
+    use std::io::Read;
+    use std::os::unix::fs::symlink;
+
+    use rusqlite::{Connection, OpenFlags};
+
+    let root = TestDir::new("export-sqlite-links");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let workspace = root.child("ocm-home/envs/source/.openclaw/workspace");
+    let external = root.child("external.sqlite");
+    let external_db = Connection::open(&external).unwrap();
+    external_db
+        .execute_batch(
+            "CREATE TABLE evidence(value TEXT); INSERT INTO evidence VALUES ('external marker');",
+        )
+        .unwrap();
+    drop(external_db);
+    let external_before = fs::read(&external).unwrap();
+
+    let owned = workspace.join("owned.sqlite");
+    let writer = Connection::open(&owned).unwrap();
+    writer
+        .execute_batch("CREATE TABLE evidence(value TEXT); INSERT INTO evidence VALUES ('baseline'); PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; INSERT INTO evidence VALUES ('wal-only');")
+        .unwrap();
+    let owned_before = fs::read(&owned).unwrap();
+    let wal = workspace.join("owned.sqlite-wal");
+    let wal_before = fs::read(&wal).unwrap();
+    assert!(!wal_before.is_empty());
+    let primary_only = root.child("primary-only.sqlite");
+    fs::write(&primary_only, &owned_before).unwrap();
+    let primary =
+        Connection::open_with_flags(&primary_only, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(
+        primary
+            .query_row("SELECT count(*) FROM evidence", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(primary);
+
+    let links = [
+        ("external.sqlite", external.clone()),
+        ("external.db", external.clone()),
+        ("internal.sqlite", "owned.sqlite".into()),
+    ];
+    for (name, target) in &links {
+        symlink(target, workspace.join(name)).unwrap();
+    }
+    for include_state in [false, true] {
+        let output = root.child(&format!("export-{include_state}.tar"));
+        let mut args = vec![
+            "env",
+            "export",
+            "source",
+            "--output",
+            output.to_str().unwrap(),
+        ];
+        if include_state {
+            args.push("--include-state");
+        }
+        let export = run_ocm(root.path(), &env, &args);
+        assert!(export.status.success(), "{}", stderr(&export));
+        let mut archive = tar::Archive::new(fs::File::open(&output).unwrap());
+        let mut seen = BTreeSet::new();
+        let mut snapshot = None;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            let Ok(relative) = path.strip_prefix("root/.openclaw/workspace") else {
+                continue;
+            };
+            for (name, target) in &links {
+                if relative == std::path::Path::new(name) {
+                    assert!(
+                        entry.header().entry_type().is_symlink(),
+                        "{name}, include_state={include_state}"
+                    );
+                    assert_eq!(entry.link_name().unwrap().unwrap().as_ref(), target);
+                    assert_eq!(entry.size(), 0);
+                    seen.insert(*name);
+                }
+            }
+            if relative == std::path::Path::new("owned.sqlite") {
+                assert!(entry.header().entry_type().is_file());
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                snapshot = Some(bytes);
+            }
+            for suffix in ["-wal", "-shm", "-journal"] {
+                assert!(!relative.to_string_lossy().ends_with(suffix));
+            }
+        }
+        assert_eq!(seen.len(), links.len());
+        let readback = root.child(&format!("snapshot-{include_state}.sqlite"));
+        fs::write(&readback, snapshot.unwrap()).unwrap();
+        let db = Connection::open_with_flags(readback, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let values: Vec<String> = db
+            .prepare("SELECT value FROM evidence ORDER BY value")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(values, ["baseline", "wal-only"]);
+        assert_eq!(
+            db.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert!(
+            !fs::read(output)
+                .unwrap()
+                .windows(b"external marker".len())
+                .any(|bytes| bytes == b"external marker")
+        );
+        assert_eq!(fs::read(&external).unwrap(), external_before);
+        assert_eq!(fs::read(&owned).unwrap(), owned_before);
+        assert_eq!(fs::read(&wal).unwrap(), wal_before);
+        for (name, target) in &links {
+            assert_eq!(fs::read_link(workspace.join(name)).unwrap(), *target);
+        }
+    }
+}
+
 #[test]
 fn env_export_include_state_round_trips_committed_sqlite_state() {
     use rusqlite::{Connection, OpenFlags};
