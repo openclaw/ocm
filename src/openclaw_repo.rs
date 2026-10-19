@@ -1091,6 +1091,57 @@ pub(crate) fn read_git_alternates(path: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
+// Git owns .gitmodules syntax. Query only the selected bounded file, without
+// includes, so submodule discovery never scans a checkout or executes hooks.
+pub(crate) fn git_submodule_paths(file: &Path) -> Result<Vec<PathBuf>, String> {
+    let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > 65536 {
+        return Err(format!(
+            "invalid Git submodule metadata: {}",
+            display_path(file)
+        ));
+    }
+    let output = git_command()
+        .args(["config", "--no-includes", "--null", "--file"])
+        .arg(file)
+        .args(["--get-regexp", "^submodule\\..*\\.path$"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "cannot read Git submodule metadata: {}",
+            display_path(file)
+        ));
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let separator = entry
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .ok_or("invalid Git submodule path output")?;
+            let path = PathBuf::from(git_path_from_bytes(&entry[separator + 1..])?);
+            if path.as_os_str().is_empty()
+                || path.components().any(|part| {
+                    !matches!(
+                        part,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                })
+            {
+                return Err("invalid Git submodule path".to_string());
+            }
+            Ok(path)
+        })
+        .collect()
+}
+
 fn git_top_level(path: &Path) -> Option<PathBuf> {
     git_rev_parse_path(path, "--show-toplevel")
 }

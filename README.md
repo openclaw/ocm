@@ -145,7 +145,8 @@ ownership.
 Creating or changing a dev binding is refused while an environment containing or
 owning its source, worktree path, or required Git metadata is busy with another operation.
 Required Git metadata includes object stores referenced by `objects/info/alternates`,
-including shared clones and transitive references. Removing a containing environment
+including shared clones, transitive references, and initialized submodules declared
+in `.gitmodules` (including nested submodules). Removing a containing environment
 refuses while another registered source depends on that storage. Independent clones
 with their own objects remain removable.
 This also applies to local upgrade simulations; retry after that operation finishes.

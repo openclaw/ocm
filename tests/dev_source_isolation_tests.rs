@@ -669,3 +669,105 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
         }
     }
 }
+
+#[test]
+fn removal_preserves_initialized_submodule_object_dependencies() {
+    for mode in ["shared", "nested", "old-form", "copied"] {
+        let fixture = TestDir::new(&format!("submodule-object-dependency-{mode}"));
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        let donor_root = fixture.child("donor-env");
+        create("donor", Some(&donor_root), None, &env, cwd).unwrap();
+        let donor = init_checkout(&donor_root.join("checkout"));
+        let source = init_checkout(&fixture.child("source"));
+        let add = |parent: &Path, repository: &Path, reference: bool| {
+            let url = url::Url::from_file_path(repository).unwrap().to_string();
+            let repository = path_string(repository);
+            let mut command = vec!["-c", "protocol.file.allow=always", "submodule", "add"];
+            if reference {
+                command.extend(["--reference", &repository]);
+            }
+            command.extend([&url, "dependency"]);
+            git(parent, &command);
+            parent.join("dependency")
+        };
+        let parent = if mode == "nested" {
+            let middle = init_checkout(&fixture.child("middle"));
+            add(&source, &middle, false)
+        } else {
+            source.clone()
+        };
+        let module = add(&parent, &donor, mode != "copied");
+        let private = PathBuf::from(git(&module, &["rev-parse", "--absolute-git-dir"]));
+        assert_eq!(
+            private.join("objects/info/alternates").is_file(),
+            mode != "copied"
+        );
+        if mode == "old-form" {
+            // Git also supports a submodule with its own .git directory.
+            git(
+                &source,
+                &[
+                    "config",
+                    "--file",
+                    &path_string(&private.join("config")),
+                    "--unset",
+                    "core.worktree",
+                ],
+            );
+            fs::remove_file(module.join(".git")).unwrap();
+            fs::rename(&private, module.join(".git")).unwrap();
+        }
+        create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let before = fs::read(&registry).unwrap();
+        assert_eq!(git(&module, &["cat-file", "-t", "HEAD"]), "commit");
+        let removed = run_ocm(cwd, &env, &["env", "remove", "donor", "--force"]);
+        assert_eq!(
+            removed.status.success(),
+            mode == "copied",
+            "{mode}: {}",
+            stderr(&removed)
+        );
+        assert_eq!(donor_root.exists(), mode != "copied");
+        if mode != "copied" {
+            assert!(
+                stderr(&removed).contains("registered dev source"),
+                "{}",
+                stderr(&removed)
+            );
+            assert_eq!(fs::read(&registry).unwrap(), before);
+        }
+        assert_eq!(git(&module, &["cat-file", "-t", "HEAD"]), "commit");
+        git(&module, &["fsck", "--no-dangling"]);
+    }
+}
+
+#[test]
+fn removal_refuses_uninspectable_submodule_metadata() {
+    for contents in [
+        "[invalid".to_string(),
+        "#".repeat(65537),
+        "[submodule \"unsafe\"]\npath = ../outside\n".to_string(),
+    ] {
+        let fixture = TestDir::new("invalid-submodule-metadata");
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        let donor_root = fixture.child("donor-env");
+        create("donor", Some(&donor_root), None, &env, cwd).unwrap();
+        let source = init_checkout(&fixture.child("source"));
+        create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
+        write_text(&source.join(".gitmodules"), &contents);
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let before = fs::read(&registry).unwrap();
+        let removed = run_ocm(cwd, &env, &["env", "remove", "donor", "--force"]);
+        assert!(!removed.status.success());
+        assert!(
+            stderr(&removed).contains("Git submodule"),
+            "{}",
+            stderr(&removed)
+        );
+        assert!(donor_root.exists());
+        assert_eq!(fs::read(&registry).unwrap(), before);
+    }
+}
