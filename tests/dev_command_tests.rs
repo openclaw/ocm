@@ -1125,6 +1125,188 @@ fn dev_defaults_start_live_components_and_opt_outs_select_the_owned_mode() {
 
 #[cfg(unix)]
 #[test]
+fn dev_ui_checks_configured_modules_before_native_linking() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for variant in [
+        "hoisted",
+        "isolated",
+        "missing-package",
+        "foreign-package",
+        "foreign-ui-links",
+        "existing-root",
+        "missing-override",
+        "source-exit",
+        "cancel-before-link",
+    ] {
+        let root = TestDir::new(&format!("dev-ui-configured-{variant}"));
+        let mut env = ocm_env(&root);
+        let repo = prepare_initial_ui_repo(&root, &mut env);
+        for entry in ["watch-node.mjs", "run-node.mjs"] {
+            fs::write(
+                repo.join("scripts").join(entry),
+                format!(
+                    r#"import fs from 'node:fs';
+import path from 'node:path';
+const root = process.cwd();
+const modules = path.join(root, 'node_modules');
+const configured = process.env.PNPM_CONFIG_MODULES_DIR;
+if (!fs.existsSync(modules) && configured) {{
+  fs.writeFileSync(path.join(process.env.OCM_TEST_DEV_UI_DIR, 'native-link-started'), 'absent');
+  if ('{variant}' === 'source-exit') process.exit(0);
+  if ('{variant}' === 'cancel-before-link') {{
+    process.once('SIGTERM', () => process.exit(0));
+    await new Promise(() => setInterval(() => {{}}, 100));
+  }}
+  // Model delayed native bootstrap; the real helper is exercised separately.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  fs.symlinkSync(path.resolve(root, configured), modules, 'dir');
+}}
+await import('./dev-ui-fixture.cjs');
+"#
+                ),
+            )
+            .unwrap();
+        }
+        fs::write(
+            repo.join("scripts/ui.js"),
+            "if (!require('node:fs').existsSync('node_modules')) throw new Error('UI started before native linking');\nrequire('./dev-ui-fixture.cjs');\n",
+        )
+        .unwrap();
+        write_resolvable_source_tool(&repo, "tsx");
+        let modules = repo.join("installed-modules");
+        let isolated = matches!(
+            variant,
+            "isolated" | "missing-package" | "foreign-package" | "foreign-ui-links"
+        );
+        for name in ["vite", "dompurify"] {
+            let package = repo.join("node_modules").join(name);
+            if name == "vite" {
+                // Exercise package exports as well as DOMPurify's legacy main.
+                fs::write(
+                    package.join("package.json"),
+                    r#"{"name":"vite","exports":{".":"./index.js"}}"#,
+                )
+                .unwrap();
+            }
+            if isolated {
+                let target = format!(".pnpm/{name}/node_modules/{name}");
+                let installed = repo.join("node_modules").join(&target);
+                fs::create_dir_all(installed.parent().unwrap()).unwrap();
+                fs::rename(&package, &installed).unwrap();
+                // DOMPurify has only a UI link in an isolated pnpm install.
+                if name == "vite" {
+                    std::os::unix::fs::symlink(&target, &package).unwrap();
+                }
+                let ui_link = repo.join("ui/node_modules").join(name);
+                fs::create_dir_all(ui_link.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(format!("../../node_modules/{target}"), ui_link)
+                    .unwrap();
+            }
+        }
+        fs::rename(repo.join("node_modules"), &modules).unwrap();
+        env.insert(
+            "PNPM_CONFIG_MODULES_DIR".to_string(),
+            "installed-modules".to_string(),
+        );
+        let dompurify = modules.join(if isolated {
+            ".pnpm/dompurify/node_modules/dompurify"
+        } else {
+            "dompurify"
+        });
+        match variant {
+            "missing-package" => fs::remove_file(dompurify.join("index.js")).unwrap(),
+            "foreign-package" => {
+                let foreign = root.child("foreign-package");
+                fs::rename(&dompurify, &foreign).unwrap();
+                std::os::unix::fs::symlink(&foreign, &dompurify).unwrap();
+            }
+            "foreign-ui-links" => {
+                // Resolve relative package links from their real parent, even
+                // when ui/node_modules itself redirects outside the checkout.
+                let foreign = root.child("foreign-ui-links");
+                fs::rename(repo.join("ui/node_modules"), &foreign).unwrap();
+                std::os::unix::fs::symlink(&foreign, repo.join("ui/node_modules")).unwrap();
+            }
+            "existing-root" => {
+                // A configured tree must not hide an incomplete existing root.
+                fs::create_dir(repo.join("node_modules")).unwrap();
+                fs::rename(modules.join("vite"), repo.join("node_modules/vite")).unwrap();
+            }
+            "missing-override" => fs::rename(&modules, repo.join("node_modules")).unwrap(),
+            _ => {}
+        }
+        let has_root = repo.join("node_modules").exists();
+        if variant == "source-exit" {
+            let rejected = run_ocm(&repo, &env, &["dev", "demo"]);
+            assert!(!rejected.status.success());
+            assert!(
+                stderr(&rejected).contains("source exited before preparing its node_modules link"),
+                "{}",
+                stderr(&rejected)
+            );
+            assert!(!root.child("ui.json").exists());
+        } else if variant == "cancel-before-link" {
+            let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &["dev", "demo"]);
+            assert!(wait_for_path(
+                &root.child("native-link-started"),
+                Duration::from_secs(10)
+            ));
+            assert!(!root.child("ui.json").exists());
+            let stopped = run_dev_stop(&repo, &env);
+            assert!(stopped.status.success(), "{}", stderr(&stopped));
+            assert_eq!(controller.wait_without_release().status.code(), Some(130));
+        } else if matches!(
+            variant,
+            "missing-package" | "foreign-package" | "foreign-ui-links" | "existing-root"
+        ) {
+            let rejected = run_ocm(&repo, &env, &["dev", "demo"]);
+            assert!(!rejected.status.success(), "{variant}");
+            assert!(
+                stderr(&rejected).contains("Control UI dependencies are not ready"),
+                "{variant}: {}",
+                stderr(&rejected)
+            );
+            assert!(!root.child("gateway.json").exists(), "{variant}");
+            assert!(!root.child("ui.json").exists(), "{variant}");
+        } else {
+            let mut controller = DevWatchFixture::spawn(&root, &repo, &env, &["dev", "demo"]);
+            let gateway = initial_ui_process(&root, "gateway", &mut controller);
+            let ui = initial_ui_process(&root, "ui", &mut controller);
+            assert_eq!(gateway["cwd"], path_string(&repo), "{variant}");
+            assert_eq!(ui["cwd"], path_string(&repo), "{variant}");
+            let stopped = run_dev_stop(&repo, &env);
+            assert!(stopped.status.success(), "{variant}: {}", stderr(&stopped));
+            assert_eq!(controller.wait_without_release().status.code(), Some(130));
+        }
+        if matches!(variant, "hoisted" | "isolated") {
+            assert_eq!(
+                fs::read_to_string(root.child("native-link-started")).unwrap(),
+                "absent",
+                "{variant}"
+            );
+            assert_eq!(fs::read_link(repo.join("node_modules")).unwrap(), modules);
+        } else {
+            assert_eq!(repo.join("node_modules").exists(), has_root, "{variant}");
+            assert!(!repo.join("node_modules").is_symlink(), "{variant}");
+        }
+        assert_eq!(
+            read_source_watch_session(&root)["closed"],
+            true,
+            "{variant}"
+        );
+        if variant == "foreign-package" {
+            assert_eq!(
+                fs::read_to_string(root.child("foreign-package/index.js")).unwrap(),
+                "throw new Error('UI inspection must not execute package code');\n"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_defaults_preserve_incompatible_existing_envs_and_allow_ui_opt_out() {
     let _serial = INITIAL_UI_TEST_LOCK
         .lock()

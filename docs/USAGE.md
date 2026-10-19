@@ -153,7 +153,13 @@ unavailable until that dev session is restarted.
 same deadline; late or disconnected callers' grant bytes are discarded.
 An unfinished or interrupted cleanup keeps its recorded ownership.
 UI requires HTTP, enabled Control UI and installed source UI dependencies; use
-`--no-ui` for TLS or disabled-UI environments. `--service` uses the background
+`--no-ui` for TLS or disabled-UI environments. A configured in-checkout modules
+directory is accepted before native startup creates its root `node_modules`
+link, including pnpm UI package links through that root. OCM checks these
+dependencies without creating the link or accepting packages from another
+checkout. When the link is absent, the UI waits for native source startup to
+create it; cancellation, source exit, or a 30-second timeout ends that wait.
+`--service` uses the background
 workflow without foreground watching or UI and rejects explicit `--watch` or
 `--ui`. Existing authentication settings remain in effect.
 

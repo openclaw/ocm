@@ -328,7 +328,7 @@ pub(crate) fn inspect_source_dependencies_with_runner<E: From<String>>(
     Ok((!issues.is_empty()).then(|| issues.join("; ")))
 }
 
-fn source_modules_override(
+pub(crate) fn source_modules_override(
     repo_root: &Path,
     env: &BTreeMap<String, String>,
 ) -> Result<Option<PathBuf>, String> {
