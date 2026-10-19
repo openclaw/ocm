@@ -1194,7 +1194,8 @@ ocm env destroy mira --yes
 ```
 
 For legacy layouts created before overlapping roots were rejected, removal refuses
-to delete another registered environment's root or a link needed to reach it.
+to delete another registered environment's root or a link needed to reach it,
+including through an owned development worktree or its Git registration directory.
 This applies to `env remove`, destroy preview and apply, and prune preview and apply.
 Remove the child environment separately before removing its containing parent.
 `--force` overrides only the selected environment's protection; it does not select

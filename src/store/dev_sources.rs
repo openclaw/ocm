@@ -664,6 +664,26 @@ impl DevSourceRemoval {
         })
     }
 
+    pub(crate) fn contains_registered_path(&self, path: &Path) -> Result<bool, String> {
+        // Root removal unlinks a final symlink without deleting its referent.
+        // A missing root is skipped, but Git may still remove a worktree or slot.
+        let root = self
+            .root
+            .as_ref()
+            .map(|root| self.root_link.as_ref().unwrap_or(root));
+        for boundary in root
+            .into_iter()
+            .chain(self.worktree.iter())
+            .chain(self.registrations.iter())
+            .chain(self.registration_links.iter())
+        {
+            if projected_path_contains(boundary, path)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn affected_path<'a>(
         &self,
         footprint: &'a SourceFootprint,

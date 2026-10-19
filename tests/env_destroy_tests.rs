@@ -823,6 +823,83 @@ fn legacy_child_blocks_destroy_and_prune_before_teardown() {
 }
 
 #[test]
+fn legacy_child_blocks_owned_worktree_and_registration_cleanup() {
+    for location in ["worktree", "registration", "missing-worktree-registration"] {
+        let root = TestDir::new("legacy-child-owned-cleanup");
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.path();
+        let env = ocm_env(&root);
+        // Keep the fixture child disposable to Git so the OCM guard is decisive.
+        fs::write(
+            repo.join(".git/info/exclude"),
+            "node_modules/\n.worktrees/\n",
+        )
+        .unwrap();
+        let worktree = create_owned_dev_env(&repo, "parent", &env, cwd);
+        let created = run_ocm(cwd, &env, &["env", "create", "child", "--protect"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let mut child = get_environment("child", &env, cwd).unwrap();
+        let git_file = fs::read_to_string(worktree.join(".git")).unwrap();
+        let registration = Path::new(git_file.trim().strip_prefix("gitdir: ").unwrap());
+        let nested = if location == "worktree" {
+            worktree.join("node_modules/child")
+        } else {
+            registration.join("child")
+        };
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::rename(&child.root, &nested).unwrap();
+        child.root = path_string(&nested);
+        save_environment(child, &env, cwd).unwrap();
+        let marker = nested.join(".openclaw/workspace/keep.txt");
+        fs::write(&marker, "protected child data\n").unwrap();
+        let mut parent = get_environment("parent", &env, cwd).unwrap();
+        parent.created_at -= time::Duration::days(30);
+        save_environment(parent.clone(), &env, cwd).unwrap();
+        if location == "missing-worktree-registration" {
+            fs::remove_dir_all(&worktree).unwrap();
+            fs::remove_dir_all(&parent.root).unwrap();
+        }
+        let registry = ocm::store::env_registry_path(&env, cwd).unwrap();
+        let before = fs::read(&registry).unwrap();
+        let preview = run_ocm(cwd, &env, &["env", "destroy", "parent", "--json"]);
+        assert!(preview.status.success(), "{}", stderr(&preview));
+        let summary: serde_json::Value = serde_json::from_str(&stdout(&preview)).unwrap();
+        assert!(
+            summary["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|blocker| {
+                    blocker
+                        .as_str()
+                        .unwrap()
+                        .contains("registered environment child")
+                })
+        );
+        for args in [
+            vec!["env", "remove", "parent"],
+            vec!["env", "remove", "parent", "--force"],
+            vec!["env", "destroy", "parent", "--yes", "--force", "--json"],
+            vec!["env", "prune", "--older-than", "14", "--json"],
+            vec!["env", "prune", "--older-than", "14", "--yes", "--json"],
+        ] {
+            let result = run_ocm(cwd, &env, &args);
+            assert!(!result.status.success(), "{location}: {}", stdout(&result));
+            assert!(
+                format!("{}{}", stdout(&result), stderr(&result))
+                    .contains("registered environment child")
+            );
+            assert_eq!(fs::read(&registry).unwrap(), before);
+            assert_eq!(
+                fs::read_to_string(&marker).unwrap(),
+                "protected child data\n"
+            );
+            assert!(registration.is_dir());
+        }
+    }
+}
+
+#[test]
 fn env_destroy_yes_removes_dev_worktree() {
     let root = TestDir::new("env-destroy-dev-worktree");
     let repo = init_openclaw_repo(&root);
