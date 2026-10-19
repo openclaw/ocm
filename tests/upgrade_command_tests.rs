@@ -335,7 +335,10 @@ fn converging_health_server_rejects_incomplete_requests() {
     stop_converging_health_server(port, &stop, handle);
 
     result.unwrap();
-    assert!(response.is_empty(), "incomplete request received {response:?}");
+    assert!(
+        response.is_empty(),
+        "incomplete request received {response:?}"
+    );
     assert_eq!(requests.load(Ordering::SeqCst), 0);
 }
 
