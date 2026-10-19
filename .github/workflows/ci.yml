@@ -118,7 +118,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - macos-latest
+          - xcode-27
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -144,34 +144,41 @@ jobs:
           "$RUNNER_TEMP/ocm-install/bin/ocm" --version
 
   npm:
-    name: npm (${{ matrix.os }}, Node ${{ matrix.node }})
+    name: npm (${{ matrix.name }}, Node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, node: '22.15.0' }
-          - { os: ubuntu-latest, node: '24' }
-          - { os: macos-15-intel, node: '24' }
-          - { os: macos-15, node: '24' }
+          - { os: ubuntu-latest, name: ubuntu-latest, arch: x64, node: '22.15.0', prefix: '' }
+          - { os: ubuntu-latest, name: ubuntu-latest, arch: x64, node: '24', prefix: '' }
+          - { os: xcode-27, name: xcode-27-x86_64, arch: x64, node: '24', prefix: 'arch -x86_64' }
+          - { os: xcode-27, name: xcode-27-arm64, arch: arm64, node: '24', prefix: '' }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Ensure Rosetta for Intel validation
+        if: runner.os == 'macOS' && matrix.arch == 'x64'
+        run: |
+          arch -x86_64 /usr/bin/true || sudo softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /usr/bin/true
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.arch }}
           package-manager-cache: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
-      - run: npm install --global --ignore-scripts npm@11.19.1
+          architecture: ${{ matrix.arch }}
+      - run: ${{ matrix.prefix }} npm install --global --ignore-scripts npm@11.19.1
       - name: Test npm packaging, recovery, launcher, and isolated installation lifecycle
-        run: python3 -B -m unittest discover -s scripts/tests -p 'test_npm_*.py'
+        run: ${{ matrix.prefix }} python3 -B -m unittest discover -s scripts/tests -p 'test_npm_*.py'
       # Temporary workaround for actions/runner-images#14924 on disposable macOS VMs.
       # Remove after the runner fix is qualified with the unchanged strict fixture.
       - name: Use TCP fallback for macOS notarization lookups
-        if: matrix.os == 'macos-15-intel' || matrix.os == 'macos-15'
+        if: runner.os == 'macOS'
         run: |
           echo "block return out quick proto udp from any to any port 443" | sudo pfctl -f -
           sudo pfctl -E
@@ -180,4 +187,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
-        run: python3 -B scripts/tests/test_npm_install.py --published-binary-fixture
+        run: ${{ matrix.prefix }} python3 -B scripts/tests/test_npm_install.py --published-binary-fixture

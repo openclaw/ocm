@@ -1,5 +1,5 @@
 name: Release
-run-name: Release ${{ inputs.tag }}
+run-name: ${{ inputs.dry_run && 'Dry run' || 'Release' }} ${{ inputs.tag }}
 
 # macOS signing and notarization prerequisites: docs/RELEASING.md
 
@@ -10,6 +10,10 @@ on:
         description: Signed release tag
         required: true
         type: string
+      dry_run:
+        description: Build and verify merged main without publishing
+        type: boolean
+        default: false
 
 permissions:
   actions: read
@@ -29,9 +33,8 @@ jobs:
     if: github.repository == 'openclaw/ocm' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
-      # Build and publish consume only the signed tag target validated below.
-      # Dispatch inputs never select executable release source.
-      source: ${{ steps.verify.outputs.source }}
+      # Publication consumes only the signed tag; dry runs use verified main.
+      source: ${{ steps.verify.outputs.source || steps.dry-run.outputs.source }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,6 +42,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Verify signed tag and package version
+        if: ${{ !inputs.dry_run }}
         id: verify
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,6 +58,15 @@ jobs:
             --repo "$RELEASE_REPO" \
             --commit "$verified_commit"
           printf 'source=%s\n' "$verified_commit" >>"$GITHUB_OUTPUT"
+      - name: Verify merged main for dry run
+        if: ${{ inputs.dry_run }}
+        id: dry-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          ./scripts/verify-release-ci.sh --repo "$RELEASE_REPO" --commit "$GITHUB_SHA"
+          printf 'source=%s\n' "$GITHUB_SHA" >>"$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.target }}
@@ -66,12 +79,16 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             macos: false
-          - os: macos-15-intel
+          - os: xcode-27
             target: x86_64-apple-darwin
             macos: true
-          - os: macos-14
+            deployment-target: '10.12'
+          - os: xcode-27
             target: aarch64-apple-darwin
             macos: true
+            deployment-target: '11.0'
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment-target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -83,6 +100,21 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Verify macOS deployment target and executable
+        if: ${{ matrix.macos }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary="target/$TARGET/release/ocm"
+          minimum=$(otool -l "$binary" | awk '/LC_VERSION_MIN_MACOSX/ { legacy=1 } legacy && /version/ { print $2; exit } /minos/ { print $2; exit }')
+          test "$minimum" = "$MACOSX_DEPLOYMENT_TARGET"
+          if [ "$TARGET" = x86_64-apple-darwin ]; then
+            arch -x86_64 /usr/bin/true || sudo softwareupdate --install-rosetta --agree-to-license
+            arch -x86_64 /usr/bin/true
+            arch -x86_64 "$binary" --version
+          else
+            "$binary" --version
+          fi
       - name: Import Developer ID certificate
         if: ${{ matrix.macos }}
         uses: Apple-Actions/import-codesign-certs@77ba2a2a8f5cfc8c405ebf3159f767c323e238f9 # v7.1.0
@@ -247,6 +279,7 @@ jobs:
 
   publish:
     name: Publish complete release
+    if: ${{ !inputs.dry_run }}
     needs:
       - verify
       - build

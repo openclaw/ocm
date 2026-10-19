@@ -6,6 +6,17 @@ asset checks below apply to both automatic and manual releases.
 
 The canonical `.github/workflows/release.yml` workflow publishes OCM releases from signed tags on `main`. Linux packaging needs no repository credentials. Each macOS matrix job imports one Developer ID Application certificate, signs `ocm` with the identifier `com.openclaw.ocm`, submits a temporary ZIP to Apple's notary service, checks the executable's notarization ticket, and verifies the executable again after extracting the final tarball.
 
+macOS jobs use the Apple Silicon `xcode-27` runner. Intel npm validation runs with x64 Node and Python under Rosetta, and Intel release builds are cross-compiled and smoke-tested under Rosetta. Release binaries retain macOS 10.12 for Intel and macOS 11.0 for Apple Silicon; the build checks those deployment targets explicitly.
+
+After the exact merged-main CI run passes, validate the release build and signing pipeline without creating a tag or publishing:
+
+```sh
+gh workflow run release.yml --repo openclaw/ocm --ref main -f tag=v0.3.4 -F dry_run=true
+gh workflow run publish-npm.yml --repo openclaw/ocm --ref main -f tag=v0.3.4 -F dry_run=true
+```
+
+Use the current version for `tag`. The release dry run builds the dispatched main commit, signs and verifies its artifacts, and skips publication. The npm dry run prepares packages from the existing signed release and runs the native installation matrix without publishing. Ordinary release dispatches continue to require a verified signed tag.
+
 Configure these GitHub Actions repository secrets:
 
 - `APPSTORE_CERTIFICATES_FILE_BASE64`: a base64-encoded PKCS#12 file containing the Developer ID Application certificate and private key.

@@ -22,9 +22,9 @@ ROOT = Path(__file__).resolve().parents[2]
 REPO = "openclaw/ocm"
 MARKER = "<!-- ocm-auto-release:v1 -->"
 JOBS = ("Format", "Rust 1.88 minimum", "Windows compile",
-        "Test (ubuntu-latest)", "Test (macos-latest)",
+        "Test (ubuntu-latest)", "Test (xcode-27)",
         "npm (ubuntu-latest, Node 22.15.0)", "npm (ubuntu-latest, Node 24)",
-        "npm (macos-15-intel, Node 24)", "npm (macos-15, Node 24)")
+        "npm (xcode-27-x86_64, Node 24)", "npm (xcode-27-arm64, Node 24)")
 
 
 class ReleaseBoundaryTests(unittest.TestCase):

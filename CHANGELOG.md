@@ -4,6 +4,7 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+- Move macOS CI and release builds to Xcode 27, preserve Intel validation with Rosetta and existing deployment targets, and add a nonpublishing release dry run.
 - Use the canonical `openclaw/ocm` repository for installation and self-update
   requests. Thanks @shakkernerd.
 - Require exact complete release archives and keep failed release settlement

@@ -1410,7 +1410,11 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
     assert!(release.contains("github.repository == 'openclaw/ocm'"));
     assert!(release.contains("github.ref == 'refs/heads/main'"));
     assert!(release.contains("RELEASE_TAG: ${{ inputs.tag }}"));
-    assert!(release.contains("source: ${{ steps.verify.outputs.source }}"));
+    assert!(
+        release
+            .contains("source: ${{ steps.verify.outputs.source || steps.dry-run.outputs.source }}")
+    );
+    assert!(release.contains("    if: ${{ !inputs.dry_run }}"));
     assert!(release.contains("ref: ${{ github.sha }}"));
     assert!(release.contains("ref: ${{ needs.verify.outputs.source }}"));
     assert!(release.contains("path: trusted"));
@@ -1424,7 +1428,11 @@ fn workflows_pin_actions_lock_dependencies_and_gate_the_msrv() {
     assert!(!release.contains("push:\n    tags:"));
     assert!(!release.contains("repository_dispatch:"));
     assert!(!release.contains("github.event.client_payload.tag"));
-    assert!(release.contains("os: macos-15-intel"));
+    assert!(release.contains("os: xcode-27"));
+    assert!(release.contains("arch -x86_64 /usr/bin/true"));
+    assert!(release.contains("deployment-target: '10.12'"));
+    assert!(release.contains("deployment-target: '11.0'"));
+    assert!(!release.contains("os: macos-15-intel"));
     assert!(!release.contains("os: macos-13"));
 
     let workflow_targets = release
