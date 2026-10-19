@@ -5015,6 +5015,8 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
         "exec",
         "eval-quoted",
         "eval",
+        "command-quoted",
+        "command",
         "plain",
         "plain-wrapper",
     ];
@@ -5043,7 +5045,7 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
                 "import http from 'node:http';",
                 &format!(
                     "import http from 'node:http';\nimport fs from 'node:fs';\n\
-                     fs.appendFileSync({}, JSON.stringify({{argv: process.argv.slice(2), cwd: process.cwd()}}) + '\\n');\n\
+                     fs.appendFileSync({}, JSON.stringify({{pid: process.pid, argv: process.argv.slice(2), cwd: process.cwd()}}) + '\\n');\n\
                      if (process.argv[2] === '--version') process.exit(0);",
                     serde_json::to_string(&path_string(&invocations)).unwrap()
                 ),
@@ -5059,8 +5061,9 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
         );
         let recipe = match mode {
             "exec-quoted" => format!("exec \"node\" '{}'", path_string(&entry)),
-            "exec" | "eval" => format!("{mode} {}", path_string(&script)),
+            "exec" | "eval" | "command" => format!("{mode} {}", path_string(&script)),
             "eval-quoted" => format!("eval '{}'", path_string(&script)),
+            "command-quoted" => format!("command '{}'", path_string(&entry)),
             "dot" => format!(". {}", path_string(&wrapper)),
             "dot-quoted" => format!(". '{}'", path_string(&wrapper)),
             "source" => format!("source {}", path_string(&wrapper)),
@@ -5130,6 +5133,10 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
             .iter()
             .find(|call| call["argv"][0] == "gateway" && call["argv"][1] == "run")
             .unwrap();
+        assert!(
+            !process_exists(gateway["pid"].as_u64().unwrap() as u32),
+            "{mode}: Gateway peer survived stop"
+        );
         assert_eq!(
             gateway["argv"],
             serde_json::json!(["gateway", "run", "--port", child["childPort"].to_string()]),
@@ -5147,6 +5154,14 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
             .iter()
             .all(|program| !path.join(program).is_file())),
             "fixture must not provide external shell builtin commands"
+        );
+        // macOS supplies an external command; Linux proves the builtin works
+        // without one, so direct spawning cannot accidentally pass this case.
+        #[cfg(target_os = "linux")]
+        assert!(
+            std::env::split_paths(child["processEnv"]["PATH"].as_str().unwrap())
+                .all(|path| !path.join("command").is_file()),
+            "fixture must not provide an external command executable"
         );
         if mode == "plain" {
             assert_eq!(child["binaryPath"], path_string(&script));
