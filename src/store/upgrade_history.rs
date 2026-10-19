@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 
 use super::common::{
     ExclusiveFileLock, SharedFileLock, load_json_files, lock_file, lock_file_shared, path_exists,
-    read_json, write_json,
+    read_json, remove_owned_tree, write_json,
 };
 use super::layout::{
     display_path, runtime_install_root, upgrade_history_env_dir, upgrade_history_meta_path,
@@ -295,7 +295,7 @@ pub(crate) fn remove_upgrade_recovery(
     if !path_exists(&path) {
         return Ok(());
     }
-    std::fs::remove_dir_all(&path).map_err(|error| {
+    remove_owned_tree(&path).map_err(|error| {
         format!(
             "failed to remove upgrade recovery at {}: {error}",
             display_path(&path)
@@ -325,7 +325,7 @@ pub(crate) fn remove_upgrade_recovery_for_snapshot(
             continue;
         };
         if recovery_snapshot_id.trim() == snapshot_id {
-            std::fs::remove_dir_all(&path).map_err(|error| {
+            remove_owned_tree(&path).map_err(|error| {
                 format!(
                     "failed to remove upgrade recovery at {}: {error}",
                     path.display()
@@ -712,6 +712,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_recovery_removal_disposes_read_only_trees_without_touching_other_snapshots() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        for by_snapshot in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let env = BTreeMap::from([(
+                "OCM_HOME".to_string(),
+                root.path().join("ocm").to_string_lossy().into_owned(),
+            )]);
+            let recovery =
+                super::upgrade_history_recovery_dir("demo", "transaction-1", &env, root.path())
+                    .unwrap();
+            let sibling =
+                super::upgrade_history_recovery_dir("demo", "transaction-2", &env, root.path())
+                    .unwrap();
+            for (path, snapshot) in [(&recovery, "snapshot-1"), (&sibling, "snapshot-2")] {
+                let nested = path.join("stable/install-root/files/readonly");
+                fs::create_dir_all(&nested).unwrap();
+                fs::write(nested.join("payload"), "runtime bytes").unwrap();
+                fs::write(path.join("snapshot-id"), snapshot).unwrap();
+                fs::set_permissions(nested, fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            std::os::unix::fs::symlink(&sibling, recovery.join("link")).unwrap();
+            if by_snapshot {
+                super::remove_upgrade_recovery_for_snapshot(
+                    "demo",
+                    "snapshot-1",
+                    &env,
+                    root.path(),
+                )
+                .unwrap();
+            } else {
+                super::remove_upgrade_recovery("demo", "transaction-1", &env, root.path()).unwrap();
+            }
+            assert!(!recovery.exists());
+            let untouched = sibling.join("stable/install-root/files/readonly");
+            assert_eq!(
+                fs::read_to_string(untouched.join("payload")).unwrap(),
+                "runtime bytes"
+            );
+            assert_eq!(
+                fs::metadata(untouched).unwrap().permissions().mode() & 0o777,
+                0o555
+            );
+            super::remove_owned_tree(&sibling).unwrap();
+        }
     }
 
     #[test]

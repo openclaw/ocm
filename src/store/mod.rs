@@ -25,7 +25,7 @@ use crate::env::EnvSummary;
 pub(crate) use checkpoints::CheckpointCleanup;
 pub(crate) use common::{
     ExclusiveFileLock, OpenClawDirectoryCopy, copy_dir_preserving_modes, ensure_dir, lock_file,
-    read_json, try_lock_file, write_json,
+    read_json, remove_owned_tree, try_lock_file, write_json,
 };
 pub(crate) use dev_registration::{DevSourceRegistration, with_prepared_dev_source};
 pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
