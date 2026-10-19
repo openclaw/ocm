@@ -272,9 +272,25 @@ fn spawn_converging_health_server() -> (
                 }
                 Err(error) => panic!("health listener failed: {error}"),
             };
-            let mut request = [0_u8; 1024];
-            let read = stream.read(&mut request).unwrap_or(0);
-            if !request[..read].starts_with(b"GET /health ") {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            // Closing with unread request headers can reset the client's response read.
+            while request.len() < 8192 && !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let available = chunk.len().min(8192 - request.len());
+                let read = match stream.read(&mut chunk[..available]) {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                request.extend_from_slice(&chunk[..read]);
+            }
+            if !request.windows(4).any(|part| part == b"\r\n\r\n")
+                || !request.starts_with(b"GET /health ")
+            {
                 continue;
             }
             let request_number = requests_thread.fetch_add(1, Ordering::SeqCst);
@@ -303,6 +319,24 @@ fn stop_converging_health_server(port: u32, stop: &AtomicBool, handle: thread::J
     stop.store(true, Ordering::Relaxed);
     let _ = TcpStream::connect(("127.0.0.1", port as u16));
     handle.join().unwrap();
+}
+
+#[test]
+fn converging_health_server_rejects_incomplete_requests() {
+    let (port, requests, stop, handle) = spawn_converging_health_server();
+    let mut stream = TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(b"GET /health HTTP/1.1\r\n").unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut response = String::new();
+    let result = stream.read_to_string(&mut response);
+    stop_converging_health_server(port, &stop, handle);
+
+    result.unwrap();
+    assert!(response.is_empty(), "incomplete request received {response:?}");
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
 }
 
 fn health_status(port: u32) -> String {
