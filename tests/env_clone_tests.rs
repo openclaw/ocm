@@ -436,6 +436,215 @@ fn check_clone_plugin_registry(folded: bool) {
 }
 
 #[test]
+fn env_clone_relocates_nested_include_directives_before_reading_the_copy() {
+    for case in [
+        "absolute",
+        "relative-root",
+        "relative-leaf",
+        "relative",
+        "normalized",
+        "external",
+    ] {
+        let root = TestDir::new("clone-nested-includes");
+        let cwd = root.child("cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source/.openclaw");
+        let target = root.child("ocm-home/envs/target/.openclaw");
+        let include_root = if case == "normalized" {
+            source.join("../../source/.openclaw")
+        } else {
+            source.clone()
+        };
+        let first = if matches!(case, "relative-root" | "relative" | "external") {
+            "./config/plugins.json".into()
+        } else {
+            include_root
+                .join("config/plugins.json")
+                .display()
+                .to_string()
+        };
+        let leaf = if case == "external" {
+            root.child("external.json")
+        } else {
+            source.join("config/leaf.json")
+        };
+        let second = if matches!(case, "relative-leaf" | "relative") {
+            "./leaf.json".into()
+        } else if case == "external" {
+            leaf.display().to_string()
+        } else {
+            include_root.join("config/leaf.json").display().to_string()
+        };
+        let config = serde_json::json!({"plugins": {"$include": first}}).to_string();
+        // Keep an authored relative directive beside the relocated absolute one.
+        let parent = serde_json::json!({"$include": [second, "./local.json"]}).to_string();
+        write_text(&source.join("openclaw.json"), &config);
+        write_text(&source.join("config/plugins.json"), &parent);
+        write_text(&source.join("config/local.json"), "{\"enabled\":false}");
+        write_text(&leaf, "{\"enabled\":false}");
+        let registry = fs::read(root.child("ocm-home/envs.json")).unwrap();
+        let export = run_ocm(
+            &cwd,
+            &env,
+            &["env", "export", "source", "--output", "source.tar"],
+        );
+        let cloned = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+        if case == "external" {
+            for output in [&export, &cloned] {
+                assert!(!output.status.success());
+                assert!(
+                    stderr(output).contains("OpenClaw $include path escapes the config directory"),
+                    "{}",
+                    stderr(output)
+                );
+            }
+            assert!(!cwd.join("source.tar").exists());
+            assert!(!target.parent().unwrap().exists());
+            assert_eq!(
+                fs::read(root.child("ocm-home/envs.json")).unwrap(),
+                registry
+            );
+        } else {
+            assert!(export.status.success(), "case={case}: {}", stderr(&export));
+            assert!(cloned.status.success(), "case={case}: {}", stderr(&cloned));
+            let copied: Value =
+                serde_json::from_slice(&fs::read(target.join("openclaw.json")).unwrap()).unwrap();
+            let copied_parent: Value =
+                serde_json::from_slice(&fs::read(target.join("config/plugins.json")).unwrap())
+                    .unwrap();
+            if matches!(case, "relative-root" | "relative") {
+                assert_eq!(copied["plugins"]["$include"], first);
+            } else {
+                assert_eq!(
+                    Path::new(copied["plugins"]["$include"].as_str().unwrap()),
+                    target.join("config/plugins.json")
+                );
+            }
+            if matches!(case, "relative-leaf" | "relative") {
+                assert_eq!(
+                    fs::read_to_string(target.join("config/plugins.json")).unwrap(),
+                    parent
+                );
+            } else {
+                assert_eq!(
+                    Path::new(copied_parent["$include"][0].as_str().unwrap()),
+                    target.join("config/leaf.json")
+                );
+            }
+            assert_eq!(copied_parent["$include"][1], "./local.json");
+            assert_eq!(
+                fs::read(target.join("config/leaf.json")).unwrap(),
+                fs::read(&leaf).unwrap()
+            );
+            let reexport = run_ocm(
+                &cwd,
+                &env,
+                &["env", "export", "target", "--output", "target.tar"],
+            );
+            assert!(
+                reexport.status.success(),
+                "case={case}: {}",
+                stderr(&reexport)
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(source.join("openclaw.json")).unwrap(),
+            config
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("config/plugins.json")).unwrap(),
+            parent
+        );
+        assert_eq!(fs::read_to_string(leaf).unwrap(), "{\"enabled\":false}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_preserves_aliased_readonly_include_graphs() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = TestDir::new("clone-aliased-includes");
+    let cwd = root.child("cwd");
+    fs::create_dir_all(&cwd).unwrap();
+    let physical = root.child("physical");
+    fs::create_dir_all(&physical).unwrap();
+    symlink(&physical, root.child("alias")).unwrap();
+    let source_root = root.child("alias/source");
+    let env = ocm_env(&root);
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source_root.to_str().unwrap(),
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = source_root.join(".openclaw");
+    let target = root.child("ocm-home/envs/target/.openclaw");
+    let config =
+        serde_json::json!({"plugins":{"$include":["./config/fragment.json", "./leaf.json"]}})
+            .to_string();
+    let fragment = serde_json::json!({"$include":source.join("leaf.json")}).to_string();
+    write_text(&source.join("openclaw.json"), &config);
+    write_text(&source.join("config/fragment.json"), &fragment);
+    write_text(&source.join("leaf.json"), "{\"enabled\":false}");
+    fs::set_permissions(
+        source.join("config/fragment.json"),
+        fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
+    fs::set_permissions(source.join("config"), fs::Permissions::from_mode(0o500)).unwrap();
+    let cloned = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+    assert!(cloned.status.success(), "{}", stderr(&cloned));
+    let copied: Value =
+        serde_json::from_slice(&fs::read(target.join("config/fragment.json")).unwrap()).unwrap();
+    assert_eq!(
+        Path::new(copied["$include"].as_str().unwrap()),
+        target.join("leaf.json")
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("openclaw.json")).unwrap(),
+        config
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("config/fragment.json")).unwrap(),
+        fragment
+    );
+    for file in [
+        source.join("config/fragment.json"),
+        target.join("config/fragment.json"),
+    ] {
+        assert_eq!(
+            fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+    }
+    let reexport = run_ocm(
+        &cwd,
+        &env,
+        &["env", "export", "target", "--output", "target.tar"],
+    );
+    assert!(reexport.status.success(), "{}", stderr(&reexport));
+    assert_eq!(
+        fs::metadata(source.join("config"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o500
+    );
+    fs::set_permissions(source.join("config"), fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
 fn env_clone_rejects_unowned_plugin_paths_without_changing_source() {
     for folded in [false, true] {
         for case in [
@@ -474,6 +683,18 @@ fn env_clone_rejects_unowned_plugin_paths_without_changing_source() {
                 folded,
                 serde_json::json!({"demo":{"source":kind,(field):path}}),
             );
+            let config =
+                serde_json::json!({"plugins":{"$include":"./config/plugins.json"}}).to_string();
+            let included =
+                serde_json::json!({"$include":source.join("config/leaf.json")}).to_string();
+            // The existing post-copy isolation failure must still roll back after
+            // successfully relocating a nested include graph.
+            if !folded && case == "external" {
+                write_text(&source.join("openclaw.json"), &config);
+                write_text(&source.join("config/plugins.json"), &included);
+                write_text(&source.join("config/leaf.json"), "{\"enabled\":false}");
+            }
+            let registry_before = fs::read(root.child("ocm-home/envs.json")).unwrap();
             let before = fs::read(&db).unwrap();
             let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
             assert!(
@@ -487,6 +708,24 @@ fn env_clone_rejects_unowned_plugin_paths_without_changing_source() {
                 stderr(&clone)
             );
             assert_eq!(fs::read(&db).unwrap(), before);
+            assert_eq!(
+                fs::read(root.child("ocm-home/envs.json")).unwrap(),
+                registry_before
+            );
+            if !folded && case == "external" {
+                assert_eq!(
+                    fs::read_to_string(source.join("openclaw.json")).unwrap(),
+                    config
+                );
+                assert_eq!(
+                    fs::read_to_string(source.join("config/plugins.json")).unwrap(),
+                    included
+                );
+                assert_eq!(
+                    fs::read_to_string(source.join("config/leaf.json")).unwrap(),
+                    "{\"enabled\":false}"
+                );
+            }
             assert_eq!(
                 fs::read_to_string(external.join("index.js")).unwrap(),
                 "external original"

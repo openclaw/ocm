@@ -824,6 +824,25 @@ fn clone_environment_with_policy(
         let config_rewrite = match policy {
             CloneEnvironmentPolicy::Standard => {
                 reject_include_owned_sandbox_origin(&target_paths.config_path)?;
+                let mut copied_configs = source_workspaces
+                    .config_include_paths()
+                    .map(|path| {
+                        path.strip_prefix(&source_paths.root)
+                            .map(|relative| target_paths.root.join(relative))
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !copied_configs.is_empty() {
+                    // Use the admitted source graph before any target traversal.
+                    // Include the root so normalized absolute directives use the
+                    // same mapping as directives inside copied fragments.
+                    copied_configs.push(target_paths.config_path.clone());
+                    super::openclaw_config::rewrite_copied_include_directives(
+                        &copied_configs,
+                        &[&source_paths.root, &canonical_source_root],
+                        &target_paths.root,
+                    )?;
+                }
                 let outcome = rewrite_openclaw_config_for_new_environment(
                     &target_paths,
                     Some(&source_paths.root),
@@ -1419,7 +1438,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                         .map_err(|error| error.to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            super::openclaw_config::rewrite_archived_include_directives(
+            super::openclaw_config::rewrite_copied_include_directives(
                 &copied_includes,
                 &source_roots,
                 &target_paths.root,

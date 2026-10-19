@@ -430,7 +430,7 @@ pub(crate) fn rewrite_openclaw_config_for_simulation(
     .map(|_| ())
 }
 
-pub(super) fn rewrite_archived_include_directives(
+pub(super) fn rewrite_copied_include_directives(
     include_paths: &[PathBuf],
     source_roots: &[&Path],
     target_root: &Path,
