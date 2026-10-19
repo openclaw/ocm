@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
 
@@ -8,6 +7,7 @@ use serde_json::Value;
 use crate::env::EnvMeta;
 
 use super::layout::{derive_env_paths, resolve_user_home};
+use super::openclaw_workspaces::load_effective_openclaw_config;
 
 pub(crate) const DEFAULT_GATEWAY_PORT: u32 = 18_789;
 const OPENCLAW_PORT_FAMILY_END_OFFSET: u32 = 110;
@@ -190,9 +190,8 @@ fn openclaw_port_family(base_port: u32) -> Vec<u32> {
 }
 
 fn read_gateway_port_from_config(path: &Path) -> Option<u32> {
-    let raw = fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    read_port_number(value.get("gateway")?.get("port")?)
+    let config = load_effective_openclaw_config(path).ok()??;
+    read_port_number(config.value.get("gateway")?.get("port")?)
 }
 
 pub(super) fn read_port_number(value: &Value) -> Option<u32> {

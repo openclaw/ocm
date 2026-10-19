@@ -698,6 +698,14 @@ ocm self update --check
 `env create`, `start`, and `dev` accept explicit Gateway ports from 1 through 65535 with `--port`.
 An empty, zero, or out-of-range value is rejected before creating an environment or changing its configuration.
 
+An explicit OCM `--port` takes precedence over `gateway.port` in the OpenClaw
+configuration. Otherwise, a valid configured port overrides the automatically
+assigned port. OCM reads the effective JSON/JSON5 configuration, including
+`$include` files within the config directory, for both inspection and command
+execution. Missing or invalid configuration falls back to the saved automatic
+port. An active foreground dev session continues to use its captured endpoint
+until stopped, even if the configuration changes.
+
 New environment roots must be separate. A root cannot equal, contain, or sit
 inside another registered environment root, including through path aliases.
 OCM rejects overlap before creating or copying environment state or registering
