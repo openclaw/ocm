@@ -85,7 +85,8 @@ fn env_import_rejects_linked_archive_structure_before_reading_external_files() {
 #[test]
 fn env_import_relocates_absolute_includes_without_the_original_source() {
     for include_state in [false, true] {
-        for absolute in [false, true] {
+        for spelling in ["relative", "absolute", "normalized", "overlapping"] {
+            let absolute = spelling != "relative";
             let root = TestDir::new("env-import-config-includes");
             let cwd = root.child("cwd");
             fs::create_dir_all(&cwd).unwrap();
@@ -94,9 +95,14 @@ fn env_import_relocates_absolute_includes_without_the_original_source() {
             assert!(create.status.success(), "{}", stderr(&create));
             let source = root.child("ocm-home/envs/source");
             let state = source.join(".openclaw");
+            let include_root = if spelling == "normalized" {
+                source.join("../source/.openclaw")
+            } else {
+                state.clone()
+            };
             let include = |relative: &str| {
                 if absolute {
-                    state.join(relative).to_string_lossy().into_owned()
+                    include_root.join(relative).to_string_lossy().into_owned()
                 } else {
                     format!("./{relative}")
                 }
@@ -130,13 +136,33 @@ fn env_import_relocates_absolute_includes_without_the_original_source() {
             let archive_before = fs::read(cwd.join("archive.tar")).unwrap();
             let offline = root.child("source-offline");
             fs::rename(&source, &offline).unwrap();
+            let target_root = if spelling == "overlapping" {
+                source.join("target")
+            } else {
+                root.child("ocm-home/envs/target")
+            };
+            let mut import_env = env.clone();
+            if spelling == "overlapping" {
+                import_env.insert(
+                    "OCM_HOME".into(),
+                    root.child("import-store").display().to_string(),
+                );
+            }
             let import = run_ocm(
                 &cwd,
-                &env,
-                &["env", "import", "archive.tar", "--name", "target"],
+                &import_env,
+                &[
+                    "env",
+                    "import",
+                    "archive.tar",
+                    "--name",
+                    "target",
+                    "--root",
+                    target_root.to_str().unwrap(),
+                ],
             );
             assert!(import.status.success(), "{}", stderr(&import));
-            let target = root.child("ocm-home/envs/target/.openclaw");
+            let target = target_root.join(".openclaw");
             let imported: Value =
                 serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
                     .unwrap();
@@ -146,16 +172,16 @@ fn env_import_relocates_absolute_includes_without_the_original_source() {
             .unwrap();
             if absolute {
                 assert_eq!(
-                    imported["plugins"]["$include"][0],
-                    target.join("config/plugins.json5").to_str().unwrap()
+                    Path::new(imported["plugins"]["$include"][0].as_str().unwrap()),
+                    target.join("config/plugins.json5")
                 );
                 assert_eq!(
-                    imported["plugins"]["$include"][1],
-                    target.join("config/shared.json").to_str().unwrap()
+                    Path::new(imported["plugins"]["$include"][1].as_str().unwrap()),
+                    target.join("config/shared.json")
                 );
                 assert_eq!(
-                    imported_nested["$include"],
-                    target.join("config/shared.json").to_str().unwrap()
+                    Path::new(imported_nested["$include"].as_str().unwrap()),
+                    target.join("config/shared.json")
                 );
             } else {
                 assert_eq!(imported["plugins"]["$include"][0], "./config/plugins.json5");
@@ -175,7 +201,7 @@ fn env_import_relocates_absolute_includes_without_the_original_source() {
                 nested
             );
             assert_eq!(fs::read(cwd.join("archive.tar")).unwrap(), archive_before);
-            assert!(!source.exists());
+            assert!(!source.join(".openclaw").exists());
             #[cfg(unix)]
             if include_state && absolute {
                 use std::os::unix::fs::PermissionsExt;

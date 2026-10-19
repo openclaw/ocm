@@ -338,6 +338,21 @@ fn strip_archive_root_prefix<'a>(path: &'a Path, root: &Path) -> Option<&'a Path
     path.strip_prefix(root).ok()
 }
 
+pub(super) fn map_archived_config_include(
+    path: &Path,
+    source_config_roots: &[PathBuf],
+    target_config_root: &Path,
+) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let path = clean_path(path);
+    source_config_roots
+        .iter()
+        .find_map(|root| strip_archive_root_prefix(&path, root))
+        .map(|relative| clean_path(&target_config_root.join(relative)))
+}
+
 fn validate_internal_migration_path(
     path: &Path,
     source_root: &Path,
@@ -1429,12 +1444,8 @@ impl IncludeProcessor {
         }
         let include_path = Path::new(include_path);
         let resolved = if include_path.is_absolute() {
-            let authored = clean_path(include_path);
-            self.archived_config_roots
-                .iter()
-                .find_map(|root| strip_archive_root_prefix(&authored, root))
-                .map(|relative| clean_path(&self.root_dir.join(relative)))
-                .unwrap_or(authored)
+            map_archived_config_include(include_path, &self.archived_config_roots, &self.root_dir)
+                .unwrap_or_else(|| clean_path(include_path))
         } else {
             clean_path(
                 &containing_file

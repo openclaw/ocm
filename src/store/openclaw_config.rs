@@ -308,13 +308,29 @@ pub(super) fn rewrite_archived_openclaw_config(
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
-    rewrite_openclaw_config_with_root_mappings(
+    let source_config_roots = source_roots
+        .iter()
+        .map(|root| derive_env_paths(root).state_dir)
+        .collect::<Vec<_>>();
+    rewrite_openclaw_config_with_path_rewriter(
         target_paths,
-        source_roots,
-        canonical_source_root,
-        &target_paths.root,
         gateway_port,
         SandboxOriginPolicy::NewEnvironment(sandbox_origin),
+        |value| {
+            rewrite_config_paths_with_archive_includes(
+                value,
+                &source_config_roots,
+                &target_paths.state_dir,
+                &|value| {
+                    rewrite_env_root_paths_from_roots(
+                        value,
+                        source_roots,
+                        canonical_source_root,
+                        &target_paths.root,
+                    )
+                },
+            )
+        },
     )
 }
 
@@ -328,23 +344,19 @@ fn rewrite_openclaw_config_with_root_mapping(
     let target_root = root_mapping
         .map(|(_, target)| target)
         .unwrap_or(&target_paths.root);
-    rewrite_openclaw_config_with_root_mappings(
+    rewrite_openclaw_config_with_path_rewriter(
         target_paths,
-        &source_roots,
-        None,
-        target_root,
         gateway_port,
         sandbox_origin_policy,
+        |value| rewrite_env_root_paths_from_roots(value, &source_roots, None, target_root),
     )
 }
 
-fn rewrite_openclaw_config_with_root_mappings(
+fn rewrite_openclaw_config_with_path_rewriter(
     target_paths: &EnvPaths,
-    source_roots: &[&Path],
-    canonical_source_root: Option<&Path>,
-    target_root: &Path,
     gateway_port: Option<u32>,
     sandbox_origin_policy: SandboxOriginPolicy<'_>,
+    rewrite_paths: impl FnOnce(&mut Value) -> bool,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
     let config_is_symlink = fs::symlink_metadata(&target_paths.config_path)
         .map(|metadata| metadata.file_type().is_symlink())
@@ -363,12 +375,7 @@ fn rewrite_openclaw_config_with_root_mappings(
 
     let mut changed = false;
     let mut outcome = OpenClawConfigRewriteOutcome::default();
-    changed |= rewrite_env_root_paths_from_roots(
-        &mut value,
-        source_roots,
-        canonical_source_root,
-        target_root,
-    );
+    changed |= rewrite_paths(&mut value);
     changed |= rewrite_workspace_field_if_env_scoped(
         &mut value,
         &target_paths.root,
@@ -416,10 +423,20 @@ pub(super) fn rewrite_archived_include_directives(
     source_roots: &[&Path],
     target_root: &Path,
 ) -> Result<(), String> {
+    let source_config_roots = source_roots
+        .iter()
+        .map(|root| derive_env_paths(root).state_dir)
+        .collect::<Vec<_>>();
+    let target_config_root = derive_env_paths(target_root).state_dir;
     for path in include_paths {
         let mut value = read_config_value(path)?
             .ok_or_else(|| format!("copied OpenClaw include is missing: {}", display_path(path)))?;
-        if rewrite_include_directives(&mut value, source_roots, target_root) {
+        if rewrite_config_paths_with_archive_includes(
+            &mut value,
+            &source_config_roots,
+            &target_config_root,
+            &|_| false,
+        ) {
             let permissions = fs::metadata(path)
                 .map_err(|error| error.to_string())?
                 .permissions();
@@ -437,22 +454,61 @@ pub(super) fn rewrite_archived_include_directives(
     Ok(())
 }
 
-fn rewrite_include_directives(
+fn rewrite_config_paths_with_archive_includes(
     value: &mut Value,
-    source_roots: &[&Path],
-    target_root: &Path,
+    source_config_roots: &[PathBuf],
+    target_config_root: &Path,
+    rewrite_other: &impl Fn(&mut Value) -> bool,
 ) -> bool {
     match value {
         Value::Object(object) => object.iter_mut().fold(false, |changed, (key, value)| {
             let rewritten = if key == "$include" {
-                rewrite_env_root_paths_from_roots(value, source_roots, None, target_root)
+                rewrite_include_path(value, source_config_roots, target_config_root)
             } else {
-                rewrite_include_directives(value, source_roots, target_root)
+                rewrite_config_paths_with_archive_includes(
+                    value,
+                    source_config_roots,
+                    target_config_root,
+                    rewrite_other,
+                )
             };
             changed || rewritten
         }),
         Value::Array(values) => values.iter_mut().fold(false, |changed, value| {
-            rewrite_include_directives(value, source_roots, target_root) || changed
+            rewrite_config_paths_with_archive_includes(
+                value,
+                source_config_roots,
+                target_config_root,
+                rewrite_other,
+            ) || changed
+        }),
+        _ => rewrite_other(value),
+    }
+}
+
+fn rewrite_include_path(
+    value: &mut Value,
+    source_config_roots: &[PathBuf],
+    target_config_root: &Path,
+) -> bool {
+    match value {
+        Value::String(raw) => {
+            let Some(mapped) = super::openclaw_workspaces::map_archived_config_include(
+                Path::new(raw),
+                source_config_roots,
+                target_config_root,
+            ) else {
+                return false;
+            };
+            let mapped = display_path(&mapped);
+            if *raw == mapped {
+                return false;
+            }
+            *raw = mapped;
+            true
+        }
+        Value::Array(values) => values.iter_mut().fold(false, |changed, value| {
+            rewrite_include_path(value, source_config_roots, target_config_root) || changed
         }),
         _ => false,
     }
