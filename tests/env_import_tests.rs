@@ -1533,6 +1533,15 @@ fn env_import_relocates_config_includes_after_source_removal() {
         let mut args = vec!["env", "export", "source", "--output", "copy.tar"];
         if include_state {
             args.push("--include-state");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    source.join(".openclaw/config"),
+                    fs::Permissions::from_mode(0o500),
+                )
+                .unwrap();
+            }
         }
         let export = run_ocm(root.path(), &env, &args);
         assert!(export.status.success(), "{}", stderr(&export));
@@ -1548,5 +1557,19 @@ fn env_import_relocates_config_includes_after_source_removal() {
         fixture.assert_relocated(&root.child("ocm-home/envs/copied/.openclaw"));
         fixture.assert_source_unchanged(&original.join(".openclaw"));
         assert!(!source.exists());
+        #[cfg(unix)]
+        if include_state {
+            use std::os::unix::fs::PermissionsExt;
+            for config in [
+                original.join(".openclaw/config"),
+                root.child("ocm-home/envs/copied/.openclaw/config"),
+            ] {
+                assert_eq!(
+                    fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+                    0o500
+                );
+                fs::set_permissions(config, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
     }
 }

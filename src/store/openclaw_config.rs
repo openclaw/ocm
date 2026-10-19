@@ -1141,23 +1141,26 @@ fn ensure_object_field<'a>(
 }
 
 fn write_copied_config_value(config_path: &Path, value: &Value) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        // The copy already carries the authored mode, including group access or
-        // read-only permissions. Stage privately before restoring that mode so
-        // the process umask cannot expose a rewritten include more broadly.
-        let permissions = fs::metadata(config_path)
-            .map_err(|error| error.to_string())?
-            .permissions();
-        let staged = stage_private_config(config_path, value)?;
-        staged
-            .as_file()
-            .set_permissions(permissions)
-            .map_err(|error| error.to_string())?;
-        replace_private_config(staged, config_path)
-    }
-    #[cfg(not(unix))]
-    write_config_value(config_path, value)
+    let parent = config_path.parent().ok_or("copied include has no parent")?;
+    super::openclaw_state::with_owner_write_permission(parent, || {
+        #[cfg(unix)]
+        {
+            // The copy already carries the authored mode, including group access or
+            // read-only permissions. Stage privately before restoring that mode so
+            // the process umask cannot expose a rewritten include more broadly.
+            let permissions = fs::metadata(config_path)
+                .map_err(|error| error.to_string())?
+                .permissions();
+            let staged = stage_private_config(config_path, value)?;
+            staged
+                .as_file()
+                .set_permissions(permissions)
+                .map_err(|error| error.to_string())?;
+            replace_private_config(staged, config_path)
+        }
+        #[cfg(not(unix))]
+        write_config_value(config_path, value)
+    })
 }
 
 fn write_config_value(config_path: &Path, value: &Value) -> Result<(), String> {
