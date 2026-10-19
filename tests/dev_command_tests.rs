@@ -4996,6 +4996,7 @@ fn temporary_source_refuses_containing_operation_before_preparation() {
 fn dev_watch_force_takes_over_runtime_env_without_rebinding() {
     let root = TestDir::new("dev-command-runtime-watch-force");
     let repo = init_openclaw_repo(&root);
+    let canonical_repo = fs::canonicalize(&repo).unwrap();
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = service_env_with_gateway_admission(&root);
@@ -5041,15 +5042,15 @@ fn dev_watch_force_takes_over_runtime_env_without_rebinding() {
     assert!(!source_watch_override_path(&root, "demo").exists());
 
     let node_log = fs::read_to_string(root.child("node.log")).unwrap();
-    assert!(node_log.contains(&path_string(&repo)));
+    assert!(node_log.contains(&path_string(&canonical_repo)));
     assert!(node_log.contains(show_json["configPath"].as_str().unwrap()));
     assert!(node_log.contains("21901|--input-type=module"));
     assert!(node_log.contains("gateway run --port 21901"));
     assert!(node_log.contains(&format!(
         "|bundled={}",
-        path_string(&repo.join("extensions"))
+        path_string(&canonical_repo.join("extensions"))
     )));
-    assert!(node_log.contains(&format!("|devroot={}", path_string(&repo))));
+    assert!(node_log.contains(&format!("|devroot={}", path_string(&canonical_repo))));
     assert!(stdout(&watch).contains("source watch stdout"));
     assert!(stderr(&watch).contains("source watch stderr"));
 
