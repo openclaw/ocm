@@ -20,11 +20,11 @@ All notable changes to OCM are documented here.
 
 - Retain uncertain service ownership after daemon replacement or failed cleanup, preserve newer restart requests, and keep sibling gateways unchanged during targeted operations. Thanks @shakkernerd.
 
-- Restore ordinary restart for settled inactive gateways and collect delayed native restart rejection before reporting readiness. Thanks @shakkernerd.
+- Restore ordinary restart for settled inactive gateways. Thanks @shakkernerd.
 
 - Preserve shell builtin semantics for source, dot, eval, and command launchers, keep activated shells alive, and reuse launchers with equivalent relative working directories. Thanks @shakkernerd.
 
-- Reach onboarding before background service startup for fresh environments, honor JSON5 and included Gateway ports, and reject invalid ports or ambiguous batch targets without hanging. Thanks @shakkernerd.
+- Reach onboarding before background service startup for fresh environments, honor JSON5 and included Gateway ports, reject invalid ports, and prevent upgrade hangs for environments named `batch`. Thanks @shakkernerd.
 
 - Select a compatible Node.js version for each OpenClaw package, respect configured dev UI dependency directories, and retain captured checkout identity when source aliases change. Thanks @shakkernerd.
 
