@@ -49,6 +49,8 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Refuse snapshot restores and upgrade rollbacks that would replace another registered environment's complete root or access links, including legacy nested and temporarily missing roots. Thanks @shakkernerd (#526, #527).
+
 - Relocate session, recorded file, worktree, and other text references across registered OpenClaw databases during state-inclusive import, with per-database counts and unchanged binary payloads.
 
 - Relocate installed plugin receipts and runtime state references when importing a state-inclusive archive, preserving other state and references outside the source environment. Share path-component and file-URL matching with plain-home migration so sibling path prefixes are preserved.
