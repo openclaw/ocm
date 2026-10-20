@@ -3868,11 +3868,16 @@ mod tests {
             ),
         ]);
         let service = EnvironmentService::new(&env, root.path());
+        // Other fixtures probe the automatic allocation range while this one
+        // retries admission. Keep its family below that range.
+        let gateway_port = (10_000..18_000)
+            .find(|port| openclaw_port_family_available(*port))
+            .expect("available isolated test port family");
         let meta = service
             .create(crate::env::CreateEnvironmentOptions {
                 name: "demo".to_string(),
                 root: None,
-                gateway_port: None,
+                gateway_port: Some(gateway_port),
                 service_enabled: false,
                 service_running: false,
                 default_runtime: None,
