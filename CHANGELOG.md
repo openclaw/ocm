@@ -4,7 +4,48 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+## 0.3.5 - 2026-10-20
+
+**Highlights:** Prevent cross-environment data loss during restore and cleanup, preserve imported state, and refresh compatible dependencies.
+
+### Fixed
+
+- Refuse snapshot restores and upgrade rollbacks that would replace another registered environment's complete root or access links, including legacy nested and temporarily missing roots. Thanks @shakkernerd (#526, #527).
+
+- Preserve registered child environments and borrowed or temporary dev sources during removal and health cleanup, including shared-clone Git object storage. Thanks @shakkernerd.
+
+- Preserve configured agent data, workspace folders, session references, and Git ownership when importing, cloning, or migrating environments. Thanks @shakkernerd.
+
+- Preserve nested and absolute configuration includes and SQLite symlinks in state imports and ordinary exports. Thanks @shakkernerd.
+
+- Retain uncertain service ownership after daemon replacement or failed cleanup, preserve newer restart requests, and keep sibling gateways unchanged during targeted operations. Thanks @shakkernerd.
+
+- Restore ordinary restart for settled inactive gateways and collect delayed native restart rejection before reporting readiness. Thanks @shakkernerd.
+
+- Preserve shell builtin semantics for source, dot, eval, and command launchers, keep activated shells alive, and reuse launchers with equivalent relative working directories. Thanks @shakkernerd.
+
+- Reach onboarding before background service startup for fresh environments, honor JSON5 and included Gateway ports, and reject invalid ports or ambiguous batch targets without hanging. Thanks @shakkernerd.
+
+- Select a compatible Node.js version for each OpenClaw package, respect configured dev UI dependency directories, and retain captured checkout identity when source aliases change. Thanks @shakkernerd.
+
+### Changed
+
 - Move macOS CI and release builds to Xcode 27, preserve Intel validation with Rosetta and existing deployment targets, and add a nonpublishing release dry run.
+
+- Refresh twelve compatible Rust dependencies, including zip 9.0.5, json5 1.3.3, and libc 0.2.191, while retaining Rust 1.88 support.
+
+- Update zip to 9.0.4 and refresh the pinned Rust toolchain installer action while retaining Rust 1.88 support.
+
+- Refresh eleven compatible Rust dependencies, including rustls 0.23.46, serde_json 1.0.154, and zip 9.0.3, while retaining Rust 1.88 support.
+
+- Keep strict native notarization verification on disposable macOS runners while using the provider-recommended TCP fallback for ticket lookups. Thanks @shakkernerd.
+
+- Isolate the supervisor publication-retry regression from listening sockets retained by parallel pre-exec fixtures.
+
+## 0.3.4 - 2026-10-15
+
+These cumulative notes shipped by v0.3.4 and were previously left under Unreleased; they are preserved here as a historical rollup.
+
 - Use the canonical `openclaw/ocm` repository for installation and self-update
   requests. Thanks @shakkernerd.
 - Require exact complete release archives and keep failed release settlement
@@ -32,9 +73,6 @@ All notable changes to OCM are documented here.
 
 ### Changed
 
-- Refresh twelve compatible Rust dependencies, including zip 9.0.5, json5 1.3.3, and libc 0.2.191, while retaining Rust 1.88 support.
-- Update zip to 9.0.4 and refresh the pinned Rust toolchain installer action while retaining Rust 1.88 support.
-- Refresh eleven compatible Rust dependencies, including rustls 0.23.46, serde_json 1.0.154, and zip 9.0.3, while retaining Rust 1.88 support.
 - Refresh seven compatible Rust dependencies, including cc 1.7.0 and smallvec 1.16.3, while retaining Rust 1.88 support.
 - Update `libc` to 0.2.190 and the pinned Rust installer action to retry transient official-server checksum failures, retaining Rust 1.88 support.
 - Update `cc` to 1.5.1, `find-msvc-tools` to 0.1.14, and `smallvec` to 1.16.2 while retaining Rust 1.88 support.
@@ -49,8 +87,6 @@ All notable changes to OCM are documented here.
 - Resolve and package the complete transitive closure of private OpenClaw `workspace:*` dependencies during `runtime build-local`, rewriting nested workspace specs only inside scratch archives so current source graphs install without mutating the checkout.
 
 ### Fixed
-
-- Refuse snapshot restores and upgrade rollbacks that would replace another registered environment's complete root or access links, including legacy nested and temporarily missing roots. Thanks @shakkernerd (#526, #527).
 
 - Relocate session, recorded file, worktree, and other text references across registered OpenClaw databases during state-inclusive import, with per-database counts and unchanged binary payloads.
 
