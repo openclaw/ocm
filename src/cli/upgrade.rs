@@ -1055,7 +1055,7 @@ impl Cli {
         let interrupt_fence = UpgradeInterruptFence::enter()?;
         if rollback_enabled {
             self.environment_service()
-                .ensure_upgrade_rollback_preserves_dev_sources_locked(
+                .ensure_upgrade_rollback_preserves_ownership_locked(
                     &self.environment_service().get(env_name)?,
                 )?;
         }
@@ -1318,9 +1318,9 @@ impl Cli {
                 )
             })?;
         self.environment_service()
-            .ensure_snapshot_restore_preserves_dev_sources_locked(&snapshot)?;
+            .ensure_snapshot_restore_preserves_ownership_locked(&snapshot)?;
         self.environment_service()
-            .ensure_upgrade_rollback_preserves_dev_sources_locked(&current)?;
+            .ensure_upgrade_rollback_preserves_ownership_locked(&current)?;
         self.verify_rollback_target_version(env_name, &record, operation_lock)?;
         let recovery = self.verify_rollback_source(env_name, &record, operation_lock)?;
         Ok(UpgradeRollbackPlan { record, recovery })
@@ -4928,7 +4928,7 @@ impl Cli {
         let env_meta = self.environment_service().get(env_name)?;
         if rollback_enabled {
             self.environment_service()
-                .ensure_upgrade_rollback_preserves_dev_sources_locked(&env_meta)?;
+                .ensure_upgrade_rollback_preserves_ownership_locked(&env_meta)?;
         }
         let prepared = self
             .environment_service()

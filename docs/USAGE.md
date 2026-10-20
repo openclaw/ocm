@@ -977,8 +977,13 @@ content without a registered or active temporary source owner, and the selected
 environment's OCM-owned worktree, when captured inside the environment root.
 
 Restores and required rollbacks refuse checkpoints whose recorded scope would
-replace another named environment's registered dev source, active temporary dev
-source, or required Git metadata, before service quiescence or restore staging.
+replace another registered environment's root or links needed to reach it,
+registered dev source, active temporary dev source, or required Git metadata,
+before service quiescence or restore staging. Legacy nested environment roots
+remain protected regardless of their protection flag, including missing roots.
+A saved exclusion must preserve the entire other root and its access paths;
+excluding only a directory beneath that root is insufficient. Disjoint registered
+roots do not block restoration.
 Explicit rollback checks both the selected checkpoint and its failure-recovery
 checkpoint. `--no-rollback` keeps its existing behavior. The check reads known registered and active temporary
 source paths and Git identity metadata, including surviving history for a missing

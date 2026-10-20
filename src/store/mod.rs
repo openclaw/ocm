@@ -107,10 +107,9 @@ pub use runtimes::{
 pub(crate) use snapshots::{
     EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, SnapshotRestoreError,
     commit_env_snapshot_restore, create_env_snapshot_from_preparation,
-    ensure_restore_preserves_dev_sources, prepare_env_snapshot_capture,
-    prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
-    prepare_upgrade_snapshot_restore, rollback_env_snapshot_restore,
-    validate_upgrade_independent_paths,
+    ensure_restore_preserves_ownership, prepare_env_snapshot_capture, prepare_env_snapshot_restore,
+    prepare_upgrade_checkpoint_capture, prepare_upgrade_snapshot_restore,
+    rollback_env_snapshot_restore, validate_upgrade_independent_paths,
 };
 pub use snapshots::{
     create_env_snapshot, get_env_snapshot, list_all_env_snapshots, list_env_snapshots,

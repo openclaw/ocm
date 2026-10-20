@@ -508,6 +508,175 @@ fn env_snapshot_restore_preserves_the_current_complete_dev_binding() {
     }
 }
 
+fn register_legacy_snapshot_child(
+    root: &TestDir,
+    env: &std::collections::BTreeMap<String, String>,
+    path: &Path,
+    protected: bool,
+) -> ocm::env::EnvMeta {
+    let created = run_ocm(root.path(), env, &["env", "create", "child"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let mut child = get_environment("child", env, root.path()).unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Reconstruct the registered layout admitted by OCM 0.2.44.
+    fs::rename(&child.root, path).unwrap();
+    child.root = path_string(path);
+    child.protected = protected;
+    save_environment(child, env, root.path()).unwrap()
+}
+
+#[test]
+fn env_snapshot_restore_preserves_registered_environment_roots() {
+    for layout in ["captured", "new", "missing", "disjoint"] {
+        let root = TestDir::new(&format!("snapshot-registered-child-{layout}"));
+        let cwd = root.path();
+        let env = ocm_env(&root);
+        let created = run_ocm(cwd, &env, &["env", "create", "parent"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let mut parent = get_environment("parent", &env, cwd).unwrap();
+        let parent_marker = Path::new(&parent.root).join(".openclaw/workspace/parent.txt");
+        write_text(&parent_marker, "captured parent\n");
+        let child_root = if layout == "disjoint" {
+            root.child("disjoint-child")
+        } else {
+            Path::new(&parent.root).join("projects/child")
+        };
+        let child_marker = child_root.join(".openclaw/workspace/keep.txt");
+        if layout != "new" {
+            register_legacy_snapshot_child(&root, &env, &child_root, true);
+            write_text(&child_marker, "captured child\n");
+        }
+        let captured = run_ocm(
+            cwd,
+            &env,
+            &["env", "snapshot", "create", "parent", "--json"],
+        );
+        assert!(captured.status.success(), "{}", stderr(&captured));
+        let snapshot: Value = serde_json::from_slice(&captured.stdout).unwrap();
+        let id = snapshot["id"].as_str().unwrap();
+        if layout == "new" {
+            register_legacy_snapshot_child(&root, &env, &child_root, false);
+        }
+        write_text(&child_marker, "current child\n");
+        write_text(&parent_marker, "current parent\n");
+        let retained_child = root.child("retained-child");
+        if layout == "missing" {
+            fs::rename(&child_root, &retained_child).unwrap();
+        }
+        let refused = layout != "disjoint";
+        if refused {
+            // Refusal must precede service quiescence, not just tree replacement.
+            parent.service_enabled = true;
+            parent.service_running = true;
+            save_environment(parent, &env, cwd).unwrap();
+        }
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let child_before =
+            serde_json::to_value(get_environment("child", &env, cwd).unwrap()).unwrap();
+        let restored = run_ocm(cwd, &env, &["env", "snapshot", "restore", "parent", id]);
+        assert_eq!(
+            restored.status.success(),
+            !refused,
+            "{layout}: {}",
+            stderr(&restored)
+        );
+        if refused {
+            assert!(
+                stderr(&restored).contains("registered environment child"),
+                "{}",
+                stderr(&restored)
+            );
+            let direct = ocm::store::restore_env_snapshot(
+                ocm::env::RestoreEnvSnapshotOptions {
+                    env_name: "parent".into(),
+                    snapshot_id: id.into(),
+                },
+                &env,
+                cwd,
+            )
+            .unwrap_err();
+            assert!(direct.contains("registered environment child"), "{direct}");
+            assert_eq!(fs::read(&registry).unwrap(), registry_before);
+            assert_eq!(fs::read(&parent_marker).unwrap(), b"current parent\n");
+        } else {
+            assert_eq!(fs::read(&parent_marker).unwrap(), b"captured parent\n");
+        }
+        let preserved = if layout == "missing" {
+            assert!(
+                !child_root.exists(),
+                "restore recreated the missing registered root"
+            );
+            retained_child.join(".openclaw/workspace/keep.txt")
+        } else {
+            child_marker
+        };
+        assert_eq!(fs::read(preserved).unwrap(), b"current child\n");
+        assert_eq!(
+            serde_json::to_value(get_environment("child", &env, cwd).unwrap()).unwrap(),
+            child_before
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_snapshot_restore_preserves_registered_root_access_links() {
+    for through_alias in [false, true] {
+        let root = TestDir::new("snapshot-registered-child-alias");
+        let cwd = root.path();
+        let env = ocm_env(&root);
+        let created = run_ocm(cwd, &env, &["env", "create", "parent"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let parent = get_environment("parent", &env, cwd).unwrap();
+        let captured = run_ocm(
+            cwd,
+            &env,
+            &["env", "snapshot", "create", "parent", "--json"],
+        );
+        assert!(captured.status.success(), "{}", stderr(&captured));
+        let snapshot: Value = serde_json::from_slice(&captured.stdout).unwrap();
+        let actual_parent = root.child("actual-parent");
+        fs::rename(&parent.root, &actual_parent).unwrap();
+        std::os::unix::fs::symlink(&actual_parent, &parent.root).unwrap();
+        let child_root = if through_alias {
+            Path::new(&parent.root).join("child")
+        } else {
+            actual_parent.join("child")
+        };
+        register_legacy_snapshot_child(&root, &env, &child_root, true);
+        let marker = actual_parent.join("child/.openclaw/workspace/keep.txt");
+        write_text(&marker, "current child\n");
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let before = fs::read(&registry).unwrap();
+        let restored = run_ocm(
+            cwd,
+            &env,
+            &[
+                "env",
+                "snapshot",
+                "restore",
+                "parent",
+                snapshot["id"].as_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            restored.status.success(),
+            !through_alias,
+            "{}",
+            stderr(&restored)
+        );
+        if through_alias {
+            assert!(stderr(&restored).contains("registered environment child"));
+            assert_eq!(fs::read(&registry).unwrap(), before);
+            assert!(fs::symlink_metadata(&parent.root).unwrap().is_symlink());
+        } else {
+            assert!(!fs::symlink_metadata(&parent.root).unwrap().is_symlink());
+        }
+        assert_eq!(fs::read(&marker).unwrap(), b"current child\n");
+    }
+}
+
 // This fixture uses a Unix whole-file lease; Windows leases keep the generation
 // readable with a separate lock byte, covered by the native source-watch tests.
 #[cfg(unix)]

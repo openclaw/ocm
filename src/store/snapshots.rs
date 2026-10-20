@@ -505,7 +505,7 @@ pub fn summarize_snapshot(meta: &EnvSnapshotMeta) -> EnvSnapshotSummary {
     }
 }
 
-pub(crate) fn ensure_restore_preserves_dev_sources(
+pub(crate) fn ensure_restore_preserves_ownership(
     target: &EnvMeta,
     independent: &[PathBuf],
     env: &BTreeMap<String, String>,
@@ -514,9 +514,6 @@ pub(crate) fn ensure_restore_preserves_dev_sources(
     super::with_locked_environments(env, cwd, |envs| {
         let service = crate::env::EnvironmentService::new(env, cwd);
         let footprints = protected_dev_source_footprints(target, envs, &service)?;
-        if footprints.is_empty() {
-            return Ok(());
-        }
         let target_root = Path::new(&target.root);
         if !independent.is_empty() {
             super::checkpoint_scope::validate_ancestors(target_root, independent)?;
@@ -546,6 +543,31 @@ pub(crate) fn ensure_restore_preserves_dev_sources(
             }
             Ok(None)
         };
+        for other in envs.iter().filter(|meta| meta.name != target.name) {
+            let registered =
+                super::dev_registration::inspect_registration_path(Path::new(&other.root))?;
+            // Preserve the complete registered root, including missing locations,
+            // and every link needed to reach it. Scoped restore keeps ancestor
+            // directories in place, but preserving only part of a root is unsafe.
+            for (path, contents) in registered
+                .entries
+                .iter()
+                .map(|path| (path, false))
+                .chain(registered.location.iter().map(|path| (path, true)))
+            {
+                if let Some(relative) = projected_path_relative(&root, path)?
+                    && !independent.iter().any(|excluded| {
+                        relative.starts_with(excluded)
+                            || (!contents && excluded.starts_with(&relative))
+                    })
+                {
+                    return Err(format!(
+                        "restoring env {} would replace registered environment {} root {} or a link needed to reach it; choose a checkpoint that preserves the complete environment root and its access paths",
+                        target.name, other.name, other.root
+                    ));
+                }
+            }
+        }
         for (meta, footprint) in footprints {
             let replacement_error = |path: &Path| {
                 if meta.dev.is_none() {
@@ -658,7 +680,7 @@ fn prepare_env_snapshot_restore_with_binding(
         .as_ref()
         .map(|scope| scope.independent_paths.clone())
         .unwrap_or_default();
-    ensure_restore_preserves_dev_sources(&current, &independent, env, cwd)
+    ensure_restore_preserves_ownership(&current, &independent, env, cwd)
         .map_err(SnapshotRestoreError::unchanged)?;
     if !independent.is_empty() {
         super::checkpoint_scope::validate_ancestors(&current_paths.root, &independent)

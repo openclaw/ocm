@@ -493,6 +493,10 @@ preserves its source, dependencies, generated output, and unrelated source worke
 Restore and rollback also preserve borrowed source and known Git metadata;
 checkpoint exclusions must cover the affected paths, including missing source
 reservations.
+Restore and rollback also refuse to replace another registered environment's
+root or the links needed to reach it, including legacy nested registrations.
+A scoped checkpoint is safe only when its saved exclusions preserve the entire
+other environment and its access paths; excluding just part of it is insufficient.
 
 When a managed daemon is running, it must support new or changed borrowed
 bindings before registration. Older OCM readers refuse these records. Refresh an

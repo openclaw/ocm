@@ -7,7 +7,7 @@ use super::{EnvMeta, EnvironmentService};
 use crate::store::{
     EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, SnapshotRestoreError,
     commit_env_snapshot_restore, create_env_snapshot, create_env_snapshot_from_preparation,
-    ensure_restore_preserves_dev_sources, get_env_snapshot, list_all_env_snapshots,
+    ensure_restore_preserves_ownership, get_env_snapshot, list_all_env_snapshots,
     list_env_snapshots, now_utc, prepare_env_snapshot_capture, prepare_env_snapshot_restore,
     prepare_upgrade_checkpoint_capture, prepare_upgrade_snapshot_restore, remove_env_snapshot,
     rollback_env_snapshot_restore, summarize_snapshot,
@@ -200,11 +200,11 @@ impl<'a> EnvironmentService<'a> {
         Ok(summarize_snapshot(&snapshot))
     }
 
-    pub(crate) fn ensure_snapshot_restore_preserves_dev_sources_locked(
+    pub(crate) fn ensure_snapshot_restore_preserves_ownership_locked(
         &self,
         snapshot: &EnvSnapshotSummary,
     ) -> Result<(), String> {
-        ensure_restore_preserves_dev_sources(
+        ensure_restore_preserves_ownership(
             &self.get(&snapshot.env_name)?,
             snapshot
                 .upgrade_scope
@@ -216,11 +216,11 @@ impl<'a> EnvironmentService<'a> {
         )
     }
 
-    pub(crate) fn ensure_upgrade_rollback_preserves_dev_sources_locked(
+    pub(crate) fn ensure_upgrade_rollback_preserves_ownership_locked(
         &self,
         meta: &EnvMeta,
     ) -> Result<(), String> {
-        ensure_restore_preserves_dev_sources(
+        ensure_restore_preserves_ownership(
             meta,
             &meta.upgrade_independent_paths,
             self.env,

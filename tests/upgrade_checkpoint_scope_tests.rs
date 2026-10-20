@@ -1088,6 +1088,110 @@ fn restore_keeps_a_missing_borrowed_checkout_reserved() {
 }
 
 #[test]
+fn registered_child_roots_require_complete_saved_and_rollback_scopes() {
+    for (action, captured_scope, current_scope, allowed) in [
+        ("restore", "none", "complete", false),
+        ("restore", "partial", "complete", false),
+        ("restore", "complete", "none", true),
+        ("rollback", "none", "complete", false),
+        ("rollback", "complete", "none", false),
+        ("rollback", "complete", "complete", true),
+        ("upgrade", "complete", "none", false),
+        ("upgrade", "complete", "partial", false),
+    ] {
+        let mut fixture = Fixture::new();
+        for (name, path) in [
+            ("OCM_PROOF_READY", "ready"),
+            ("OCM_PROOF_RELEASE", "release"),
+        ] {
+            fixture
+                .env
+                .insert(name.into(), fixture.root.child(path).display().to_string());
+        }
+        write_text(&fixture.root.child("release"), "continue");
+        let scope_path = |scope| match scope {
+            "complete" => ".openclaw/workspace/projects",
+            "partial" => ".openclaw/workspace/projects/example/child/.openclaw/workspace",
+            _ => "none",
+        };
+        if captured_scope == "partial" {
+            fs::create_dir_all(fixture.project.join("child/.openclaw")).unwrap();
+        }
+        let scope = fixture.run(&[
+            "env",
+            "set-independent-paths",
+            "demo",
+            scope_path(captured_scope),
+        ]);
+        assert!(scope.status.success(), "{}", stderr(&scope));
+        let captured = fixture.run(&["upgrade", "demo", "--runtime", "new", "--json"]);
+        assert!(captured.status.success(), "{}", stderr(&captured));
+        let captured: Value = serde_json::from_slice(&captured.stdout).unwrap();
+        let id = captured["snapshotId"].as_str().unwrap();
+        let created = fixture.run(&["env", "create", "child", "--protect"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let mut child =
+            ocm::store::get_environment("child", &fixture.env, fixture.root.path()).unwrap();
+        let child_root = fixture.project.join("child");
+        if captured_scope == "partial" {
+            fs::remove_dir_all(&child_root).unwrap();
+        }
+        // Persist an inherited registration; new nested admission remains refused.
+        fs::rename(&child.root, &child_root).unwrap();
+        child.root = child_root.display().to_string();
+        ocm::store::save_environment(child, &fixture.env, fixture.root.path()).unwrap();
+        let marker = child_root.join(".openclaw/workspace/keep.txt");
+        write_text(&marker, "current child\n");
+        let inode = fs::metadata(&marker).unwrap().ino();
+        let scope = fixture.run(&[
+            "env",
+            "set-independent-paths",
+            "demo",
+            scope_path(current_scope),
+        ]);
+        assert!(scope.status.success(), "{}", stderr(&scope));
+        let registry = ocm::store::env_registry_path(&fixture.env, fixture.root.path()).unwrap();
+        let before = fs::read(&registry).unwrap();
+        let snapshots = ["env", "snapshot", "list", "demo", "--json"];
+        let snapshots_before = stdout(&fixture.run(&snapshots));
+        if action == "upgrade" {
+            let next = fixture.root.child("next");
+            write_executable_script(
+                &next,
+                &fs::read_to_string(fixture.root.child("new"))
+                    .unwrap()
+                    .replace("2026.9.2", "2026.9.3"),
+            );
+            let added = fixture.run(&["runtime", "add", "next", "--path", next.to_str().unwrap()]);
+            assert!(added.status.success(), "{}", stderr(&added));
+        }
+        let result = match action {
+            "rollback" => fixture.run(&["upgrade", "rollback", "demo", "--json"]),
+            "upgrade" => fixture.run(&["upgrade", "demo", "--runtime", "next", "--json"]),
+            _ => fixture.run(&["env", "snapshot", "restore", "demo", id]),
+        };
+        assert_eq!(
+            result.status.success(),
+            allowed,
+            "{action}, captured {captured_scope}, current {current_scope}: {} {}",
+            stdout(&result),
+            stderr(&result)
+        );
+        if !allowed {
+            assert!(
+                stderr(&result).contains("registered environment child"),
+                "{}",
+                stderr(&result)
+            );
+            assert_eq!(fs::read(&registry).unwrap(), before);
+            assert_eq!(stdout(&fixture.run(&snapshots)), snapshots_before);
+        }
+        assert_eq!(fs::read(&marker).unwrap(), b"current child\n");
+        assert_eq!(fs::metadata(&marker).unwrap().ino(), inode);
+    }
+}
+
+#[test]
 fn restore_protects_its_own_borrowed_git_metadata() {
     let fixture = Fixture::with_dev_repo();
     fixture.register_child(true);
