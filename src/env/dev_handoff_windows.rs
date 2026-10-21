@@ -76,9 +76,12 @@ impl Listener {
             }
             Some(ERROR_PIPE_CONNECTED) => {}
             _ => {
-                return Err(
-                    format!("failed accepting a dev UI browser-link request: {error}").into(),
-                );
+                let os_error = error.raw_os_error();
+                return Err(HandoffPollError {
+                    message: format!("failed accepting a dev UI browser-link request: {error}"),
+                    operation: Some(HandoffPollOperation::PipeAccept),
+                    os_error,
+                });
             }
         }
         if verify_peer(pipe, &self.user, None).is_err() {
@@ -91,9 +94,14 @@ impl Listener {
         // One instance refuses busy callers instead of queuing a later helper.
         // Retaining the original handle also keeps the name reserved between
         // requests. The non-inheritable duplicate refers to the same instance.
-        let accepted = pipe
-            .try_clone()
-            .map_err(|error| format!("failed opening the dev UI request stream: {error}"))?;
+        let accepted = pipe.try_clone().map_err(|error| {
+            let os_error = error.raw_os_error();
+            HandoffPollError {
+                message: format!("failed opening the dev UI request stream: {error}"),
+                operation: Some(HandoffPollOperation::PipeDuplicate),
+                os_error,
+            }
+        })?;
         let slot = Arc::new(());
         self.active = Arc::downgrade(&slot);
         Ok(Some(Stream {

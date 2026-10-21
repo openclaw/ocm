@@ -77,7 +77,8 @@ impl SourceWatchError {
             cleanup_verified: self.cleanup_verified,
             stop_observed,
         };
-        let mut bytes = b"OCM dev failure: ".to_vec();
+        // Source tee output can finish without a newline. Own the separator.
+        let mut bytes = b"\nOCM dev failure: ".to_vec();
         serde_json::to_writer(&mut bytes, &diagnostic).ok()?;
         bytes.push(b'\n');
         Some(bytes)
@@ -504,7 +505,8 @@ impl OwnedUiChild {
         if self.completion.is_some() {
             return Ok(None);
         }
-        let result = poll_source_watch_child(&mut self.child, &self.guard)?;
+        let result = poll_source_watch_child(&mut self.child, &self.guard)
+            .map_err(|error| error.at(ControllerStage::ChildPoll, Some(self.role)))?;
         if let Some(status) = result {
             self.completion = Some(self.guard.classify_completion(Ok(status), true, false));
         }
@@ -1175,10 +1177,7 @@ for (const name of ['vite', 'dompurify']) {
                 let mut index = 0;
                 while index < children.len() {
                     let role = children[index].role;
-                    let Some(status) = children[index]
-                        .poll()
-                        .map_err(|error| error.at(ControllerStage::ChildPoll, Some(role)))?
-                    else {
+                    let Some(status) = children[index].poll()? else {
                         index += 1;
                         continue;
                     };
@@ -1470,7 +1469,7 @@ mod tests {
         let text = String::from_utf8(record).unwrap();
         assert!(!text.contains(secret));
         let value: Value =
-            serde_json::from_str(text.strip_prefix("OCM dev failure: ").unwrap()).unwrap();
+            serde_json::from_str(text.strip_prefix("\nOCM dev failure: ").unwrap()).unwrap();
         assert_eq!(
             value,
             json!({
@@ -1485,12 +1484,46 @@ mod tests {
             .combine(combined)
             .at(ControllerStage::ChildFinish, Some(DevUiChildRole::Ui));
         let record = earlier.controller_diagnostic(false).unwrap();
-        let value: Value = serde_json::from_slice(&record[b"OCM dev failure: ".len()..]).unwrap();
+        let value: Value = serde_json::from_slice(&record[b"\nOCM dev failure: ".len()..]).unwrap();
         assert_eq!(value["stage"], "child-finish");
         assert_eq!(value["operation"], Value::Null);
         assert_eq!(value["os_error"], Value::Null);
         assert_eq!(value["role"], "ui");
         assert_eq!(value["stop_observed"], false);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn windows_source_watch_pipe_context_excludes_error_text() {
+        use crate::env::dev_handoff::{HandoffPollError, HandoffPollOperation};
+        for (operation, expected) in [
+            (HandoffPollOperation::PipeAccept, "pipe-accept"),
+            (HandoffPollOperation::PipeDuplicate, "pipe-duplicate"),
+            (
+                HandoffPollOperation::PipeDisconnectStale,
+                "pipe-disconnect-stale",
+            ),
+            (
+                HandoffPollOperation::PipeDisconnectRejected,
+                "pipe-disconnect-rejected",
+            ),
+        ] {
+            let message = "synthetic-owner-grant-private-path";
+            let error = SourceWatchError::from(HandoffPollError {
+                message: message.to_string(),
+                operation: Some(operation),
+                os_error: Some(5),
+            });
+            assert_eq!(error.message, message);
+            let bytes = error.controller_diagnostic(false).unwrap();
+            let value: Value =
+                serde_json::from_slice(&bytes[b"\nOCM dev failure: ".len()..]).unwrap();
+            assert_eq!(value["stage"], "ui-loop");
+            assert_eq!(value["operation"], expected);
+            assert_eq!(value["os_error"], 5);
+            assert_eq!(value["role"], Value::Null);
+            assert!(!String::from_utf8(bytes).unwrap().contains(message));
+        }
     }
 
     fn handoff(target: &DevUiTarget) -> Value {

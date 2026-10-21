@@ -35,6 +35,8 @@ fn scope(session: &SourceWatchSession) -> String {
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum HandoffPollOperation {
+    PipeAccept,
+    PipeDuplicate,
     PipeDisconnectStale,
     PipeDisconnectRejected,
 }

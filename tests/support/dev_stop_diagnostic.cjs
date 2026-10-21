@@ -3,7 +3,7 @@
 const prefix = 'OCM dev failure: ';
 const keys = ['diagnostic', 'stage', 'operation', 'role', 'os_error', 'cleanup_verified', 'stop_observed'];
 const stages = ['ui-loop', 'child-poll', 'child-stop', 'child-finish', 'role-clear', 'server-close', 'override-clear'];
-const operations = ['parent-create', 'temp-open', 'temp-write', 'replace', 'pipe-disconnect-stale', 'pipe-disconnect-rejected'];
+const operations = ['parent-create', 'temp-open', 'temp-write', 'replace', 'pipe-accept', 'pipe-duplicate', 'pipe-disconnect-stale', 'pipe-disconnect-rejected'];
 
 // The controller capture may also contain owner grants, errors and paths. Never
 // forward a line from it, even one with our marker: reconstruct closed values.
@@ -38,7 +38,9 @@ if (require.main === module) {
   const secret = 'synthetic-owner-grant-C:\\private\\session-error';
   const safe = {diagnostic:'windows-dev-stop', stage:'role-clear', operation:'replace', role:'command', os_error:5, cleanup_verified:true, stop_observed:true};
   const line = value => prefix + JSON.stringify(value) + '\n';
-  assert.deepEqual(controllerFailure(secret + '\n' + line(safe) + secret), {status:'present', ...safe});
+  // Match the producer's own leading separator after unterminated source bytes.
+  const framed = value => '\n' + line(value);
+  assert.deepEqual(controllerFailure(secret + framed(safe) + secret), {status:'present', ...safe});
   for (const key of keys) {
     const missing = {...safe}; delete missing[key];
     assert.deepEqual(controllerFailure(line(missing)), {status:'invalid'});
