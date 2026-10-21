@@ -27,6 +27,7 @@ use crate::runtime::{
     InstallRuntimeFromReleaseOptions, InstallRuntimeFromUrlOptions, InstallRuntimeOptions,
     RuntimeCompanionMeta, RuntimeMeta, RuntimeReleaseSelectorKind, RuntimeSourceKind,
     is_official_openclaw_package_runtime, is_openclaw_package_runtime,
+    patch_workspace_package_archive,
 };
 
 use super::common::{
@@ -808,6 +809,7 @@ fn resolve_target_source_plugin_closure(
 
 fn local_workspace_dependency_plan(
     repo_path: &Path,
+    extensions: &[LocalSourceExtensionArchive],
 ) -> Result<Option<LocalWorkspaceDependencyPlan>, String> {
     let package_json_path = repo_path.join("package.json");
     let raw = fs::read_to_string(&package_json_path).map_err(|error| {
@@ -824,6 +826,17 @@ fn local_workspace_dependency_plan(
     })?;
 
     let mut pending = workspace_dependency_names(&root_package, true);
+    let extension_packages = extensions
+        .iter()
+        .map(|extension| {
+            let path = extension.extension.source_dir.join("package.json");
+            read_json::<serde_json::Value>(&path)
+                .map(|package| (&extension.extension.package_name, package))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (_, package) in &extension_packages {
+        pending.extend(workspace_dependency_names(package, true));
+    }
     if pending.is_empty() {
         return Ok(None);
     }
@@ -841,8 +854,26 @@ fn local_workspace_dependency_plan(
         .to_string();
     let mut visited = BTreeSet::from([root_name.clone()]);
 
+    let mut versions = BTreeMap::from([(root_name, root_version)]);
+    // Selected extensions are already packed from the built payload. Seed their dependency
+    // closure without repacking their source directories or rewriting the source manifests.
+    for (name, package) in extension_packages {
+        let version = package
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("selected source extension \"{name}\" is missing a version"))?;
+        visited.insert(name.clone());
+        versions.insert(name.clone(), version.to_string());
+    }
     let mut packages = BTreeMap::new();
-    for package_dir in local_workspace_package_dirs(repo_path)? {
+    let package_dirs = if pending.iter().any(|name| !visited.contains(name)) {
+        local_workspace_package_dirs(repo_path)?
+    } else {
+        Vec::new()
+    };
+    for package_dir in package_dirs {
         let package_json_path = package_dir.join("package.json");
         let Ok(package_raw) = fs::read_to_string(&package_json_path) else {
             continue;
@@ -875,7 +906,6 @@ fn local_workspace_dependency_plan(
     }
 
     let mut selected = BTreeMap::new();
-    let mut versions = BTreeMap::from([(root_name, root_version)]);
     while let Some(name) = pending.pop_first() {
         if !visited.insert(name.clone()) {
             continue;
@@ -922,7 +952,7 @@ fn local_build_npm_adapter(
         return Ok(None);
     };
 
-    let workspace_dependencies = local_workspace_dependency_plan(repo_path)?;
+    let workspace_dependencies = local_workspace_dependency_plan(repo_path, &[])?;
     let npm_proxy = std::env::current_exe()
         .map_err(|error| format!("failed to resolve OCM npm proxy executable: {error}"))?;
     Ok(Some(LocalBuildNpmAdapter {
@@ -2958,7 +2988,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
     let _ = fs::remove_dir_all(&pack_dir);
 
     let result = (|| {
-        let local_adapter = local_build_npm_adapter(&repo_path, context.env)?;
+        let mut local_adapter = local_build_npm_adapter(&repo_path, context.env)?;
         let archive_path =
             pack_local_openclaw_repo(&repo_path, &pack_dir, context.env, local_adapter.as_ref())?;
         let needs_source_extensions = options.include_source_extensions
@@ -3002,6 +3032,21 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
         } else {
             Vec::new()
         };
+        if let Some(adapter) = local_adapter.as_mut()
+            && !source_extensions.is_empty()
+            && let Some(plan) = local_workspace_dependency_plan(&repo_path, &source_extensions)?
+        {
+            let versions = serde_json::from_str(&plan.versions_json)
+                .map_err(|error| format!("failed to parse workspace versions: {error}"))?;
+            // The native adapter only knows packages it packs itself. The root may also
+            // reference an extension supplied separately, so rewrite it with the full plan.
+            patch_workspace_package_archive(&archive_path, &versions)?;
+            for extension in &source_extensions {
+                patch_workspace_package_archive(&extension.archive_path, &versions)?;
+            }
+            adapter.workspace_dependency_dirs = Some(plan.dirs);
+            adapter.workspace_dependency_versions = Some(plan.versions_json);
+        }
         let packed_companions = companion_specs
             .into_values()
             .map(|spec| pack_local_openclaw_companion(&repo_path, &pack_dir, spec, context.env))

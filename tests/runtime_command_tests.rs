@@ -169,15 +169,14 @@ fn openclaw_package_tarball_with_bundled_extension(script_body: &str, version: &
 }
 
 fn source_extension_package_tarball() -> Vec<u8> {
+    source_extension_package_tarball_with_manifest(br#"{"name":"@openclaw/codex","version":"2026.4.25","dependencies":{"codex-runtime":"1.0.0"},"peerDependencies":{"openclaw":"*"}}"#)
+}
+
+fn source_extension_package_tarball_with_manifest(manifest: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     {
         let mut builder = Builder::new(&mut encoder);
-        append_tar_file(
-            &mut builder,
-            "package/package.json",
-            br#"{"name":"@openclaw/codex","version":"2026.4.25","dependencies":{"codex-runtime":"1.0.0"},"peerDependencies":{"openclaw":"*"}}"#,
-            0o644,
-        );
+        append_tar_file(&mut builder, "package/package.json", manifest, 0o644);
         append_tar_file(
             &mut builder,
             "package/openclaw.plugin.json",
@@ -1302,13 +1301,10 @@ fn runtime_build_local_derives_source_plugins_from_target_env_before_pack() {
     let repo = cwd.join("openclaw");
     let source_codex_dir = repo.join("extensions/codex");
     let built_codex_dir = repo.join("dist/extensions/codex");
+    let manifest = br#"{"name":"@openclaw/codex","version":"2026.4.25","dependencies":{"codex-runtime":"workspace:*"},"peerDependencies":{"openclaw":"workspace:*"}}"#;
     for dir in [&source_codex_dir, &built_codex_dir] {
         fs::create_dir_all(dir).unwrap();
-        fs::write(
-            dir.join("package.json"),
-            br#"{"name":"@openclaw/codex","version":"2026.4.25","dependencies":{"codex-runtime":"1.0.0"}}"#,
-        )
-        .unwrap();
+        fs::write(dir.join("package.json"), manifest).unwrap();
         fs::write(
             dir.join("openclaw.plugin.json"),
             br#"{"id":"codex","configSchema":{"type":"object"}}"#,
@@ -1345,10 +1341,37 @@ fn runtime_build_local_derives_source_plugins_from_target_env_before_pack() {
     let source_extension_archive = root.child("openclaw-codex-2026.4.25.tgz");
     fs::write(
         &source_extension_archive,
-        source_extension_package_tarball(),
+        source_extension_package_tarball_with_manifest(manifest),
     )
     .unwrap();
 
+    fs::write(
+        repo.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n  - extensions/*\n",
+    )
+    .unwrap();
+    for (name, package) in [
+        (
+            "codex-runtime",
+            r#"{"name":"codex-runtime","version":"1.0.0","dependencies":{"private-leaf":"workspace:*"}}"#,
+        ),
+        (
+            "private-leaf",
+            r#"{"name":"private-leaf","version":"2.0.0","peerDependencies":{"@openclaw/codex":"workspace:*"}}"#,
+        ),
+    ] {
+        let dir = repo.join("packages").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("package.json"), package).unwrap();
+    }
+    let adapter_log = root.child("extension-adapter.log");
+    write_executable_script(
+        &repo.join("scripts/ocm-npm-workspace-deps.mjs"),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = install ]; then printf '%s\\n' \"$OPENCLAW_OCM_WORKSPACE_DEPENDENCY_DIRS\" > \"{}\"; fi\nexec \"$OPENCLAW_OCM_REAL_NPM_BIN\" \"$@\"\n",
+            path_string(&adapter_log)
+        ),
+    );
     let mut env = ocm_env(&root);
     env.insert(
         "FAKE_SOURCE_EXTENSION_ARCHIVE".to_string(),
@@ -1415,6 +1438,67 @@ fn runtime_build_local_derives_source_plugins_from_target_env_before_pack() {
     assert_eq!(
         fs::read_to_string(runtime_root.join("dist/extensions/codex/index.js")).unwrap(),
         "export const build = 'source';\n"
+    );
+
+    let installed: Value = serde_json::from_slice(
+        &fs::read(runtime_root.join("dist/extensions/codex/package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(installed["dependencies"]["codex-runtime"], "1.0.0");
+    assert_eq!(installed["peerDependencies"]["openclaw"], "2026.4.25");
+    let dirs = fs::read_to_string(&adapter_log).unwrap();
+    assert_eq!(
+        std::env::split_paths(dirs.trim()).collect::<BTreeSet<_>>(),
+        [
+            repo.join("packages/codex-runtime"),
+            repo.join("packages/private-leaf")
+        ]
+        .map(|p| fs::canonicalize(p).unwrap())
+        .into_iter()
+        .collect()
+    );
+    for dir in [&source_codex_dir, &built_codex_dir] {
+        assert_eq!(fs::read(dir.join("package.json")).unwrap(), manifest);
+    }
+    fs::remove_file(repo.join("packages/private-leaf/package.json")).unwrap();
+    let failed = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "missing-leaf",
+            "--repo",
+            "./openclaw",
+            "--for-env",
+            "primary",
+            "--raw",
+        ],
+    );
+    assert!(!failed.status.success());
+    assert!(
+        stderr(&failed).contains("workspace dependency \"private-leaf\" is not declared"),
+        "{}",
+        stderr(&failed)
+    );
+    assert!(
+        !runtime_meta_path("missing-leaf", &env, &cwd)
+            .unwrap()
+            .exists()
+    );
+    assert!(
+        !runtime_install_root("missing-leaf", &env, &cwd)
+            .unwrap()
+            .exists()
+    );
+    assert!(
+        !fs::read_dir(root.child("ocm-home/runtimes"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".missing-leaf.pack-"))
     );
 
     let host_peer = runtime_root.join("dist/extensions/codex/node_modules/openclaw");

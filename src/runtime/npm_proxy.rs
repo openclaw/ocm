@@ -107,7 +107,7 @@ fn rewrite_workspace_dependency_versions(
     Ok(rewritten)
 }
 
-fn patch_workspace_package_archive(
+pub(crate) fn patch_workspace_package_archive(
     archive_path: &Path,
     versions: &BTreeMap<String, String>,
 ) -> Result<(), String> {

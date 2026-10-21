@@ -17,7 +17,7 @@ pub(crate) use launch::{
 };
 pub(crate) use npm_proxy::{
     INTERNAL_NPM_PROXY_REAL_BIN_ENV, INTERNAL_NPM_PROXY_WORKSPACE_DIRS_ENV,
-    INTERNAL_NPM_PROXY_WORKSPACE_VERSIONS_ENV,
+    INTERNAL_NPM_PROXY_WORKSPACE_VERSIONS_ENV, patch_workspace_package_archive,
 };
 #[doc(hidden)]
 pub use npm_proxy::{is_internal_npm_proxy, run_internal_npm_proxy};
