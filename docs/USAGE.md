@@ -1098,6 +1098,11 @@ Import:
 ocm env import ./mira-with-state.ocm-env.tar --name rowan
 ```
 
+Export writes `<env>.ocm-env.tar` in the current directory unless `--output` is
+specified. The archive can be inside the environment, including through a
+directory alias: its own output is excluded from the archived contents. An
+existing output path is refused.
+
 Export omits `.openclaw/state` by default. `--include-state` means "export this
 environment as the same installation": it includes every file under the
 environment root, including plugin payloads and dependencies, SQLite-backed and

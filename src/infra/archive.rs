@@ -171,19 +171,10 @@ pub fn write_env_archive_with_options<T: Serialize>(
     options: EnvArchiveOptions,
 ) -> Result<(), String> {
     // Resolve aliases once. A retry must not retarget the selected environment.
-    let resolved_root = if options.private_output
-        || !options.sqlite_content_roots.is_empty()
-        || options.relocate_internal_symlinks
-    {
-        Some(
-            source_root
-                .canonicalize()
-                .map_err(|error| error.to_string())?,
-        )
-    } else {
-        None
-    };
-    let source_root = resolved_root.as_deref().unwrap_or(source_root);
+    let resolved_root = source_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let source_root = resolved_root.as_path();
     let capture = if options.sqlite_content_roots.is_empty() && !options.relocate_internal_symlinks
     {
         None
@@ -243,15 +234,6 @@ fn write_env_archive_with_capture<T: Serialize>(
         #[cfg(not(any(windows, target_os = "macos")))]
         let file = builder.tempfile_in(parent);
         let file = file.map_err(|error| error.to_string())?;
-        // An output requested inside the environment must not capture its own staging file.
-        if let Ok(relative) = file
-            .path()
-            .canonicalize()
-            .map_err(|error| error.to_string())?
-            .strip_prefix(source_root)
-        {
-            options.excluded_path_roots.insert(relative.to_path_buf());
-        }
         Some(file)
     } else {
         None
@@ -269,6 +251,16 @@ fn write_env_archive_with_capture<T: Serialize>(
         } else {
             File::create(output_path).map_err(|error| error.to_string())?
         };
+        // Both ordinary output and private staging can be inside the source,
+        // including through an aliased parent. Exclude the actual file before
+        // traversal so the archive never reads bytes it is concurrently writing.
+        let archive_path = staged.as_ref().map_or(output_path, |file| file.path());
+        let canonical_output = archive_path
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        if let Ok(relative) = canonical_output.strip_prefix(source_root) {
+            options.excluded_path_roots.insert(relative.to_path_buf());
+        }
         match write_env_archive_attempt(metadata, source_root, file, options.clone(), capture) {
             Ok(()) => {
                 if let Some(staged) = staged {
@@ -2022,6 +2014,42 @@ mod tests {
             source.link(Path::new("data/link"), &expected).unwrap(),
             fs::read_link(&link).unwrap()
         );
+    }
+
+    #[test]
+    fn ordinary_archive_excludes_output_before_selecting_source_entries() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("data"), b"fixture").unwrap();
+        let output = root.path().join("archive.tar");
+        write_env_archive_with_options(
+            &serde_json::json!({}),
+            &root.path().join("."),
+            &output,
+            EnvArchiveOptions {
+                should_skip_path: |path, _| {
+                    // Fail before reading the growing output if exclusion regresses.
+                    assert_ne!(path, Path::new("archive.tar"));
+                    false
+                },
+                ..EnvArchiveOptions::default()
+            },
+        )
+        .unwrap();
+        let mut archive = tar::Archive::new(fs::File::open(output).unwrap());
+        let paths: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("meta/env.json"),
+                PathBuf::from("root"),
+                PathBuf::from("root/data")
+            ]
+        );
+        assert_eq!(fs::read(root.path().join("data")).unwrap(), b"fixture");
     }
 
     #[test]

@@ -43,6 +43,97 @@ fn env_export_writes_the_default_archive_path() {
     );
 }
 
+#[test]
+fn env_export_excludes_its_output_inside_the_source() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    for include_state in [false, true] {
+        let mut locations = vec!["outside", "inside"];
+        #[cfg(unix)]
+        locations.push("alias");
+        for location in locations {
+            let root = TestDir::new("export-output-exclusion");
+            let env = ocm_env(&root);
+            let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source");
+            let note = source.join(".openclaw/workspace/notes.txt");
+            write_text(&note, "source bytes must survive");
+            let cwd = if location == "inside" {
+                source.as_path()
+            } else {
+                root.path()
+            };
+            let mut args = vec!["env", "export", "source"];
+            if include_state {
+                args.push("--include-state");
+            }
+            let output = if location == "alias" {
+                let alias = root.child("alias");
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&source, &alias).unwrap();
+                alias.join("source.ocm-env.tar")
+            } else {
+                cwd.join("source.ocm-env.tar")
+            };
+            let output_arg = output.to_string_lossy();
+            if location == "alias" {
+                args.extend(["--output", &output_arg]);
+            }
+            let mut child = Command::new(crate::support::ocm_test_binary_path())
+                .current_dir(cwd)
+                .env_clear()
+                .envs(&env)
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            // A recurrence must fail the test without hanging or filling the disk.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline
+                    || fs::metadata(&output).is_ok_and(|meta| meta.len() > 1024 * 1024)
+                {
+                    let _ = child.kill();
+                    let result = child.wait_with_output().unwrap();
+                    panic!(
+                        "unbounded export ({location}, state={include_state}): {}",
+                        stderr(&result)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let exported = child.wait_with_output().unwrap();
+            assert!(exported.status.success(), "{}", stderr(&exported));
+            let original = fs::read(&output).unwrap();
+            assert!(original.len() < 1024 * 1024);
+            let extracted =
+                extract_env_archive::<EnvArchiveMetadata>(&output, &root.child("extracted"))
+                    .unwrap();
+            assert_eq!(extracted.metadata.include_state, include_state);
+            assert!(!extracted.root_dir.join("source.ocm-env.tar").exists());
+            assert!(fs::read_dir(&extracted.root_dir).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ocm-export-")
+            }));
+            assert_eq!(fs::read(&note).unwrap(), b"source bytes must survive");
+            assert_eq!(
+                fs::read(extracted.root_dir.join(".openclaw/workspace/notes.txt")).unwrap(),
+                b"source bytes must survive"
+            );
+            let repeated = run_ocm(cwd, &env, &args);
+            assert!(!repeated.status.success());
+            assert!(stderr(&repeated).contains("export archive already exists"));
+            assert_eq!(fs::read(&output).unwrap(), original);
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn default_export_selects_equivalent_workspace_root_spellings() {
