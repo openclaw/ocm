@@ -3443,3 +3443,130 @@ fn migrate_and_adopt_relocate_config_includes() {
         fixture.assert_source_unchanged(&source);
     }
 }
+
+#[test]
+fn migrate_and_adopt_relocate_nested_absolute_includes_before_traversal() {
+    for adopt in [false, true] {
+        for absolute_root in [false, true] {
+            for absolute_nested in [false, true] {
+                let root = TestDir::new("migrate-nested-config-includes");
+                let env = ocm_env(&root);
+                let source = root.child("source/plain-home");
+                let fixture = config_includes::NestedConfigIncludes::seed(
+                    &source,
+                    absolute_root,
+                    absolute_nested,
+                );
+                let args = if adopt {
+                    vec![
+                        "adopt",
+                        "import",
+                        "--name",
+                        "copied",
+                        source.to_str().unwrap(),
+                    ]
+                } else {
+                    vec!["migrate", "copied", source.to_str().unwrap()]
+                };
+                let imported = run_ocm(root.path(), &env, &args);
+                assert!(imported.status.success(), "{}", stderr(&imported));
+                fixture.assert_source_unchanged(&source);
+                fixture.assert_relocated(&root.child("ocm-home/envs/copied/.openclaw"));
+                // A consumer must resolve the copied graph with the source absent.
+                fs::remove_dir_all(&source).unwrap();
+                let archive = root.child("copied.tar");
+                let exported = run_ocm(
+                    root.path(),
+                    &env,
+                    &[
+                        "env",
+                        "export",
+                        "copied",
+                        "--output",
+                        archive.to_str().unwrap(),
+                    ],
+                );
+                assert!(exported.status.success(), "{}", stderr(&exported));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_and_adopt_relocate_includes_through_a_source_home_alias() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-aliased-config-includes");
+        let env = ocm_env(&root);
+        let source = root.child("source/plain-home");
+        let alias = root.child("alias");
+        fs::create_dir_all(&source).unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let fixture = config_includes::NestedConfigIncludes::seed(&source, true, true);
+        let args = if adopt {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "copied",
+                alias.to_str().unwrap(),
+            ]
+        } else {
+            vec!["migrate", "copied", alias.to_str().unwrap()]
+        };
+        let imported = run_ocm(root.path(), &env, &args);
+        assert!(imported.status.success(), "{}", stderr(&imported));
+        fixture.assert_relocated(&root.child("ocm-home/envs/copied/.openclaw"));
+        fixture.assert_source_unchanged(&source);
+    }
+}
+
+#[test]
+fn migrate_and_adopt_reject_external_nested_config_includes() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-external-config-includes");
+        let env = ocm_env(&root);
+        let source = root.child("source/plain-home");
+        let external = root.child("external.json");
+        support::write_text(&external, "{\"enabled\":false}\n");
+        support::write_text(
+            &source.join("openclaw.json"),
+            "{\"plugins\":{\"$include\":\"./plugins.json\"}}",
+        );
+        let parent = serde_json::json!({"$include": external}).to_string();
+        support::write_text(&source.join("plugins.json"), &parent);
+        let args = if adopt {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "copied",
+                source.to_str().unwrap(),
+            ]
+        } else {
+            vec!["migrate", "copied", source.to_str().unwrap()]
+        };
+        let imported = run_ocm(root.path(), &env, &args);
+        assert!(!imported.status.success());
+        assert!(
+            stderr(&imported).contains("escapes the config directory"),
+            "{}",
+            stderr(&imported)
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("plugins.json")).unwrap(),
+            parent
+        );
+        assert_eq!(
+            fs::read_to_string(external).unwrap(),
+            "{\"enabled\":false}\n"
+        );
+        assert!(!root.child("ocm-home/envs/copied").exists());
+        let listing = run_ocm(root.path(), &env, &["env", "list", "--json"]);
+        assert!(listing.status.success(), "{}", stderr(&listing));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stdout(&listing)).unwrap(),
+            serde_json::json!([])
+        );
+    }
+}

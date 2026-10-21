@@ -851,6 +851,11 @@ and shared fragments. Plugin load paths point at the copied payload; explicitly
 external values and source files remain unchanged. Relative `$include`
 directives and fragments needing no rewrite retain their authored contents.
 Rewritten fragments retain their copied Unix file modes.
+Migration and adoption relocate absolute internal `$include` directives, including
+nested directives, before resolving the copied graph. Accepted directives select
+the corresponding target copies, including when the source home is supplied
+through a filesystem alias; relative directives stay relative. Includes outside
+the source home, including symlink escapes, remain rejected.
 The existing restrictions on include-owned agent workspaces and sandbox origins
 still apply.
 

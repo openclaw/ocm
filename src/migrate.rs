@@ -10,8 +10,9 @@ use crate::launcher::{AddLauncherOptions, LauncherService};
 use crate::store::{
     MigrationWorkspaceCopy, OpenClawDirectoryCopy, OpenClawWorkspaceRuntime, default_env_root,
     derive_env_paths, display_path, list_environments, normalize_new_environment_sandbox_origin,
-    prepare_migrated_runtime_state, reject_include_owned_agent_workspaces,
-    reject_include_owned_sandbox_origin, resolve_plain_openclaw_workspaces, resolve_user_home,
+    openclaw_config_include_paths, prepare_migrated_runtime_state,
+    reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
+    resolve_plain_openclaw_workspaces, resolve_user_home, rewrite_copied_config_include_directives,
     rewrite_external_workspace_paths_for_migration, rewrite_openclaw_config_for_migration,
     validate_name,
 };
@@ -536,8 +537,28 @@ fn complete_migration_import(
         std::path::absolute(source_home).map_err(|error| error.to_string())?;
     let source_home = absolute_source_home.as_path();
     let canonical_source_home = fs::canonicalize(source_home).map_err(|error| error.to_string())?;
+    let mut copied_configs = openclaw_config_include_paths(
+        &canonical_source_home.join("openclaw.json"),
+        &canonical_source_home,
+    )?
+    .iter()
+    .map(|path| {
+        path.strip_prefix(&canonical_source_home)
+            .map(|relative| target_paths.state_dir.join(relative))
+            .map_err(|error| error.to_string())
+    })
+    .collect::<Result<Vec<_>, _>>()?;
     let mut copying = OpenClawDirectoryCopy::new(source_home, source_home)?;
     copying.copy(source_home, &target_paths.state_dir)?;
+    if !copied_configs.is_empty() {
+        // Relocate the admitted graph before resolving any copied directives.
+        copied_configs.push(target_paths.config_path.clone());
+        rewrite_copied_config_include_directives(
+            &copied_configs,
+            &[source_home.to_path_buf(), canonical_source_home.clone()],
+            &target_paths.state_dir,
+        )?;
+    }
     external_workspace_plan.copy_and_rewrite_config(&target_paths.config_path, &mut copying)?;
     reject_include_owned_sandbox_origin(&target_paths.config_path)?;
     let config_rewrite = rewrite_openclaw_config_for_migration(

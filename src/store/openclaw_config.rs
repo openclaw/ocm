@@ -440,13 +440,25 @@ pub(super) fn rewrite_copied_include_directives(
         .map(|root| derive_env_paths(root).state_dir)
         .collect::<Vec<_>>();
     let target_config_root = derive_env_paths(target_root).state_dir;
+    rewrite_copied_config_include_directives(
+        include_paths,
+        &source_config_roots,
+        &target_config_root,
+    )
+}
+
+pub(crate) fn rewrite_copied_config_include_directives(
+    include_paths: &[PathBuf],
+    source_config_roots: &[PathBuf],
+    target_config_root: &Path,
+) -> Result<(), String> {
     for path in include_paths {
         let mut value = read_config_value(path)?
             .ok_or_else(|| format!("copied OpenClaw include is missing: {}", display_path(path)))?;
         if rewrite_config_paths_with_archive_includes(
             &mut value,
-            &source_config_roots,
-            &target_config_root,
+            source_config_roots,
+            target_config_root,
             &|_| false,
         ) {
             write_copied_config_value(path, &value)?;

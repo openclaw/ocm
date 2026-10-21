@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -170,5 +172,80 @@ impl IncludedPluginConfig {
         }
         #[cfg(not(unix))]
         let _ = state;
+    }
+}
+
+pub struct NestedConfigIncludes {
+    files: Vec<(PathBuf, String)>,
+    absolute_root: bool,
+    absolute_nested: bool,
+}
+
+impl NestedConfigIncludes {
+    pub fn seed(state: &Path, absolute_root: bool, absolute_nested: bool) -> Self {
+        let root_include = if absolute_root {
+            state.join("config/plugins.json5")
+        } else {
+            PathBuf::from("./config/plugins.json5")
+        };
+        let nested_include = if absolute_nested {
+            state.join("config/leaf.json5")
+        } else {
+            PathBuf::from("./leaf.json5")
+        };
+        let files = vec![
+            (
+                PathBuf::from("openclaw.json"),
+                json!({"plugins": {"$include": root_include}}).to_string(),
+            ),
+            (
+                PathBuf::from("config/plugins.json5"),
+                json!({"$include": nested_include}).to_string(),
+            ),
+            (
+                PathBuf::from("config/leaf.json5"),
+                "// Preserve an unchanged leaf.\n{ enabled: false }\n".to_string(),
+            ),
+        ];
+        for (path, contents) in &files {
+            write_text(&state.join(path), contents);
+        }
+        Self {
+            files,
+            absolute_root,
+            absolute_nested,
+        }
+    }
+
+    pub fn assert_source_unchanged(&self, state: &Path) {
+        for (path, contents) in &self.files {
+            assert_eq!(fs::read_to_string(state.join(path)).unwrap(), *contents);
+        }
+    }
+
+    pub fn assert_relocated(&self, state: &Path) {
+        let read = |path: &str| -> Value {
+            json5::from_str(&fs::read_to_string(state.join(path)).unwrap()).unwrap()
+        };
+        assert_eq!(
+            read("openclaw.json")["plugins"]["$include"],
+            json!(if self.absolute_root {
+                state.join("config/plugins.json5")
+            } else {
+                PathBuf::from("./config/plugins.json5")
+            })
+        );
+        assert_eq!(
+            read("config/plugins.json5")["$include"],
+            json!(if self.absolute_nested {
+                state.join("config/leaf.json5")
+            } else {
+                PathBuf::from("./leaf.json5")
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(state.join("config/leaf.json5")).unwrap(),
+            self.files[2].1
+        );
     }
 }
