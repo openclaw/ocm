@@ -57,6 +57,10 @@ def peer(case, name, args):
     generation = marker.read_text().strip()
     modefile = case / "mode"
     mode = modefile.read_text().strip() if modefile.exists() else "healthy"
+    if name == "target" and generation == "pre-restore" and mode != "healthy":
+        # Recovery can publish its child PID before this peer executes. Keep
+        # that startup gap observable even on otherwise idle test workers.
+        time.sleep(1)
     events = case / "events.jsonl"
     base = {"name": name, "pid": os.getpid(), "started_at": process_identity(os.getpid()),
             "generation": generation, "root_inode": root.stat().st_ino}
@@ -248,6 +252,20 @@ def scenario(ocm, case, mode):
 
         restored = run("env", "snapshot", "restore", "target", snapshot["id"], "--json",
                        expect=mode == "healthy", observe=observe_replacement)
+
+        def started_target():
+            observe_replacement()
+            current = child("target")
+            if current and any(row["event"] == "listening" and row["name"] == "target"
+                               and row["pid"] == current["pid"] for row in events()[offset:]):
+                return current
+            return None
+
+        # Supervisor admission can precede the peer's own startup observations.
+        # Keep observing replacement until that specific process is listening,
+        # then freeze the event snapshot used by the generation assertions.
+        after = None if mode == "stop-timeout" else wait_until(
+            started_target, "restored or recovered target startup")
         observe_replacement()
         observed = events()[offset:]
         starts = [row for row in observed if row["event"] == "start" and row["name"] == "target"]
@@ -274,7 +292,6 @@ def scenario(ocm, case, mode):
             assert not target["serviceRunning"], target
         else:
             assert not operations, operations
-            after = child("target")
             assert after and after["pid"] != before["pid"], runtime()
             expected = "snapshot" if mode == "healthy" else "pre-restore"
             assert marker.read_text() == expected
