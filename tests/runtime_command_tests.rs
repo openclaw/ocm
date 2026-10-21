@@ -1651,6 +1651,26 @@ fn runtime_build_local_preserves_target_plugin_selection_and_index_fallback() {
             true,
         ),
         (
+            "disabled-allow",
+            serde_json::json!({"plugins":{"entries":{"external":{"enabled":false}},"allow":["external"]}}),
+            true,
+        ),
+        (
+            "enabled-allow-missing",
+            serde_json::json!({"plugins":{"entries":{"external":{"enabled":true}},"allow":["external"]}}),
+            false,
+        ),
+        (
+            "allow-missing",
+            serde_json::json!({"plugins":{"allow":["external"]}}),
+            false,
+        ),
+        (
+            "disabled-slot-missing",
+            serde_json::json!({"plugins":{"entries":{"external":{"enabled":false}},"allow":["external"],"slots":{"memory":"external"}}}),
+            false,
+        ),
+        (
             "denied",
             serde_json::json!({"plugins":{"entries":{"external":{}},"allow":["external"],"slots":{"memory":"external"},"deny":["external"]}}),
             true,

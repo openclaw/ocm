@@ -699,19 +699,6 @@ fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<St
     let Some(plugins) = config.get("plugins").and_then(serde_json::Value::as_object) else {
         return ids;
     };
-    if let Some(entries) = plugins
-        .get("entries")
-        .and_then(serde_json::Value::as_object)
-    {
-        ids.extend(
-            entries
-                .iter()
-                .filter(|(_, entry)| {
-                    entry.get("enabled").and_then(serde_json::Value::as_bool) != Some(false)
-                })
-                .filter_map(|(id, _)| normalized_plugin_id(id)),
-        );
-    }
     if let Some(values) = plugins.get("allow").and_then(serde_json::Value::as_array) {
         ids.extend(
             values
@@ -719,6 +706,22 @@ fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<St
                 .filter_map(serde_json::Value::as_str)
                 .filter_map(normalized_plugin_id),
         );
+    }
+    if let Some(entries) = plugins
+        .get("entries")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (id, entry) in entries {
+            let Some(id) = normalized_plugin_id(id) else {
+                continue;
+            };
+            // Disabling a plugin can leave its identifier in the allowlist.
+            if entry.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+                ids.remove(&id);
+            } else {
+                ids.insert(id);
+            }
+        }
     }
     if let Some(slots) = plugins.get("slots").and_then(serde_json::Value::as_object) {
         ids.extend(
@@ -3800,7 +3803,7 @@ mod tests {
                     "disabled": { "enabled": false }
                 },
                 "deny": ["blocked"],
-                "allow": ["blocked", "allowed"],
+                "allow": ["blocked", "allowed", "disabled"],
                 "slots": { "memory": "memory-core" }
             }
         });

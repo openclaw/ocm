@@ -233,7 +233,9 @@ including the native SQLite index, inline config and legacy JSON records,
 and follows transitive local plugin package dependencies. Installed external
 plugins satisfy that validation without being bundled into the new runtime;
 installed records do not select additional plugins. Disabled entries and denied
-plugins remain excluded from the explicit selection. The resulting runtime
+plugins remain excluded from the explicit selection, even when their identifiers
+remain in `plugins.allow`. Explicit slot references still require the selected
+plugin to be available. The resulting runtime
 adds only required source plugins omitted from the core package. `--for-env` and
 `--include-source-extensions` are mutually exclusive. A build without either
 option remains release-shaped.
