@@ -962,15 +962,31 @@ fn service_readiness_keeps_tls_after_config_disappears_or_changes_during_wait() 
 
 #[test]
 fn service_readiness_requeries_native_config_for_scheduled_replacement_child() {
+    // The first child exits only after its native result; the supervisor's
+    // one-second backoff places the replacement beyond the short wait deadline.
+    // Retain the ordinary in-budget replacement as a control.
+    for timeout_ms in [6000, 1000] {
+        assert_native_config_for_scheduled_replacement_child(timeout_ms);
+    }
+}
+
+fn assert_native_config_for_scheduled_replacement_child(timeout_ms: u64) {
     let mut fixture = ReadinessFixture::with_native("tls", "explicit", Some("retry-generation"));
     fixture.env.insert(
         "OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS".into(),
-        "6000".into(),
+        timeout_ms.to_string(),
     );
     let dotenv = fixture.root.child("environment/.openclaw/.env");
     let before = fs::read_to_string(&dotenv).unwrap();
     assert!(before.contains("missing-first.pem"));
+    let began = Instant::now();
     let status = fixture.action(&["service", "start", "demo", "--json"], true);
+    if timeout_ms == 1000 {
+        assert!(
+            began.elapsed() >= Duration::from_millis(timeout_ms),
+            "replacement did not exercise the late-observation boundary"
+        );
+    }
     let read_records = |name| -> Vec<Value> {
         fs::read_to_string(fixture.root.child(name))
             .unwrap()

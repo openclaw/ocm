@@ -16,6 +16,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 
 const DEFAULT_GATEWAY_READINESS_TIMEOUT: Duration = Duration::from_secs(90);
 const GATEWAY_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const GATEWAY_READINESS_PROBE_BUDGET: Duration = Duration::from_millis(2100);
 
 pub(crate) struct GatewayReadiness {
     pub(crate) ready: bool,
@@ -65,6 +66,15 @@ fn wait_for_gateway_readiness_with_timeout(
         }
         let port = status.child_port.unwrap_or(status.gateway_port);
         let probe = if status.running {
+            // One scheduled replacement may be observed after the main wait
+            // deadline. Configuration and IO share that final finite budget;
+            // the network probe must not restart it after a slow native lookup.
+            let now = Instant::now();
+            let observation_deadline = if deadline > now {
+                deadline
+            } else {
+                now + GATEWAY_READINESS_PROBE_BUDGET
+            };
             child_spec
                 .as_ref()
                 .ok_or_else(|| "Gateway launch environment is unavailable".to_string())
@@ -122,14 +132,14 @@ fn wait_for_gateway_readiness_with_timeout(
                                         Path::new(&child.run_dir),
                                         &child.process_env,
                                         cwd,
-                                        deadline,
+                                        observation_deadline,
                                         interrupt_generation,
                                     )
                                 })
                                 .clone()
                         },
                     )
-                    .and_then(|certificate| gateway_health_ok(port, certificate, deadline))
+                    .and_then(|certificate| gateway_health_ok(port, certificate, observation_deadline))
                 })
         } else {
             Ok(false)
@@ -370,13 +380,9 @@ fn gateway_health_ok(
         return Ok(false);
     }
     let now = Instant::now();
-    // The wait loop permits one scheduled restart attempt even after its main
-    // deadline. Give that final observation the same finite probe budget.
-    let deadline = if readiness_deadline > now {
-        readiness_deadline.min(now + Duration::from_millis(2100))
-    } else {
-        now + Duration::from_millis(2100)
-    };
+    // The caller owns any late-observation grace. Bound IO within its remaining
+    // budget rather than renewing an already-expired configuration deadline.
+    let deadline = readiness_deadline.min(now + GATEWAY_READINESS_PROBE_BUDGET);
     let connect_timeout = deadline
         .saturating_duration_since(Instant::now())
         .min(Duration::from_millis(500));
