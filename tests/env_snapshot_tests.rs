@@ -66,6 +66,28 @@ fn assert_live_snapshot_compensation(mode: &str) {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn live_snapshot_fixture_selects_available_disjoint_port_families() {
+    let root = TestDir::new("snapshot-port-allocation");
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/snapshot_live_compensation.py"
+        ))
+        .arg("port-allocation")
+        .env_clear()
+        .envs(ocm_env(&root))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "port-family allocation failed:\nstdout={}\nstderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn snapshot_compensation_stops_a_live_rejected_gateway_before_replacing_its_root() {
     assert_live_snapshot_compensation("unhealthy-live");
 }
