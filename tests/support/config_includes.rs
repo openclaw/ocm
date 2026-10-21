@@ -183,13 +183,16 @@ pub struct NestedConfigIncludes {
 
 impl NestedConfigIncludes {
     pub fn seed(state: &Path, absolute_root: bool, absolute_nested: bool) -> Self {
+        fs::create_dir_all(state).unwrap();
+        // Source admission uses the canonical home, including Windows verbatim prefixes.
+        let canonical_state = fs::canonicalize(state).unwrap();
         let root_include = if absolute_root {
-            state.join("config/plugins.json5")
+            canonical_state.join("config/plugins.json5")
         } else {
             PathBuf::from("./config/plugins.json5")
         };
         let nested_include = if absolute_nested {
-            state.join("config/leaf.json5")
+            canonical_state.join("config/leaf.json5")
         } else {
             PathBuf::from("./leaf.json5")
         };
