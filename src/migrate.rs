@@ -435,6 +435,9 @@ fn migrate_plain_openclaw_home_inner(
         ExternalWorkspaceCopyPlan::for_migration(&source_home, &target_paths, env)?;
     let migrated_launcher = preflight_migrated_launcher(&env_name, env, cwd)?;
 
+    // Keep custody of the provisional target through import and rollback.
+    // Otherwise a failed copy could remove a replacement registered under its name.
+    let _operation = service.lock_operation(&env_name)?;
     let created = service.create(CreateEnvironmentOptions {
         name: env_name,
         root: Some(target_root_string),
@@ -461,7 +464,7 @@ fn migrate_plain_openclaw_home_inner(
     ) {
         Ok(result) => result,
         Err(error) => {
-            let rollback = service.remove(&created_name, true).map(|_| ());
+            let rollback = service.remove_locked(&created_name, true).map(|_| ());
             return Err(with_rollback_error(
                 error,
                 "removing the partially imported environment",
@@ -578,7 +581,7 @@ fn complete_migration_import(
         None
     };
 
-    match EnvironmentService::new(env, cwd).set_launcher(&created.name, &launcher.name) {
+    match EnvironmentService::new(env, cwd).set_launcher_locked(&created.name, &launcher.name) {
         Ok(meta) => Ok(CompletedMigrationImport {
             meta,
             cleared_sandbox_origin: config_rewrite.cleared_sandbox_origin,

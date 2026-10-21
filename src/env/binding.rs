@@ -83,6 +83,14 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn set_launcher(&self, name: &str, launcher_name: &str) -> Result<EnvMeta, String> {
         let _lock = self.lock_operation(name)?;
+        self.set_launcher_locked(name, launcher_name)
+    }
+
+    pub(crate) fn set_launcher_locked(
+        &self,
+        name: &str,
+        launcher_name: &str,
+    ) -> Result<EnvMeta, String> {
         let mut meta = get_environment(name, self.env, self.cwd)?;
         if launcher_name.eq_ignore_ascii_case("none") {
             meta.default_launcher = None;

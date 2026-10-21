@@ -3215,6 +3215,170 @@ fn migration_rebases_sessions_through_shared_workspace_projections() {
 }
 
 #[test]
+fn migration_retains_target_custody_through_copy_and_rollback() {
+    use std::process::{Child, Command, Output, Stdio};
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    struct PendingCommand(Option<Child>);
+    impl PendingCommand {
+        fn finish(mut self) -> Output {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while self.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "command did not finish");
+                sleep(Duration::from_millis(10));
+            }
+            self.0.take().unwrap().wait_with_output().unwrap()
+        }
+    }
+    impl Drop for PendingCommand {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    for (adopt, fail_copy) in [(false, false), (true, false), (false, true), (true, true)] {
+        let root = TestDir::new("migration-target-custody");
+        let source = root.child("plain");
+        seed_plain_openclaw_home(&source);
+        fs::create_dir_all(source.join("state")).unwrap();
+        let database = source.join("state/openclaw.sqlite");
+        let db = Connection::open(&database).unwrap();
+        db.execute_batch("CREATE TABLE payload(value TEXT); INSERT INTO payload VALUES ('keep');")
+            .unwrap();
+        let database_before = fs::read(&database).unwrap();
+        let config_before = fs::read(source.join("openclaw.json")).unwrap();
+        db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_openclaw_on_path(&root, &mut env);
+        let unrelated = run_ocm(
+            root.path(),
+            &env,
+            &["env", "create", "unrelated", "--protect"],
+        );
+        assert!(unrelated.status.success(), "{}", stderr(&unrelated));
+        let unrelated_before = ocm::store::get_environment("unrelated", &env, root.path()).unwrap();
+        let spawn = |args: &[&str]| {
+            PendingCommand(Some(
+                Command::new(crate::support::ocm_test_binary_path())
+                    .current_dir(root.path())
+                    .env_clear()
+                    .envs(&env)
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            ))
+        };
+        let args = if adopt {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "target",
+                source.to_str().unwrap(),
+            ]
+        } else {
+            vec!["migrate", "target", source.to_str().unwrap()]
+        };
+        let mut migration = spawn(&args);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while ocm::store::get_environment("target", &env, root.path()).is_err() {
+            assert!(migration.0.as_mut().unwrap().try_wait().unwrap().is_none());
+            assert!(
+                Instant::now() < deadline,
+                "provisional target was not published"
+            );
+            sleep(Duration::from_millis(10));
+        }
+        // The normal SQLite lock holds the copy open. Verify the published target
+        // cannot lose its operation custody before attempting concurrent removal.
+        let operation = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.child("ocm-home/locks/environments/target.lock"))
+            .unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&operation).is_err());
+        let removal = spawn(&["env", "rm", "target"]);
+        if !fail_copy {
+            db.execute_batch("ROLLBACK").unwrap();
+        }
+        let imported = migration.finish();
+        assert_eq!(
+            imported.status.success(),
+            !fail_copy,
+            "{}",
+            stderr(&imported)
+        );
+        if fail_copy {
+            assert!(
+                stderr(&imported).contains("database is locked"),
+                "{}",
+                stderr(&imported)
+            );
+            assert!(
+                !stderr(&imported).contains("rollback error"),
+                "{}",
+                stderr(&imported)
+            );
+            db.execute_batch("ROLLBACK").unwrap();
+        }
+        let removed = removal.finish();
+        assert_eq!(removed.status.success(), !fail_copy, "{}", stderr(&removed));
+        if fail_copy {
+            assert!(
+                stderr(&removed).contains("does not exist"),
+                "{}",
+                stderr(&removed)
+            );
+        }
+        assert!(!root.child("ocm-home/envs/target").exists());
+        assert!(ocm::store::get_environment("target", &env, root.path()).is_err());
+        // Once the transaction ends, the name can be reused. Its completed
+        // rollback and queued removal cannot delete the protected replacement.
+        let replacement = root.child("replacement");
+        let created = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "create",
+                "target",
+                "--root",
+                replacement.to_str().unwrap(),
+                "--protect",
+            ],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        fs::write(replacement.join("sentinel"), "keep replacement").unwrap();
+        let denied = run_ocm(root.path(), &env, &["env", "rm", "target"]);
+        assert!(!denied.status.success());
+        assert!(stderr(&denied).contains("protected"));
+        let current = ocm::store::get_environment("target", &env, root.path()).unwrap();
+        assert_eq!(Path::new(&current.root), replacement);
+        assert!(current.protected);
+        assert_eq!(
+            fs::read_to_string(replacement.join("sentinel")).unwrap(),
+            "keep replacement"
+        );
+        assert_eq!(fs::read(&database).unwrap(), database_before);
+        assert_eq!(
+            fs::read(source.join("openclaw.json")).unwrap(),
+            config_before
+        );
+        assert_eq!(
+            ocm::store::get_environment("unrelated", &env, root.path()).unwrap(),
+            unrelated_before
+        );
+    }
+}
+
+#[test]
 fn migration_rolls_back_a_database_relocation_conflict() {
     let root = TestDir::new("migration-sqlite-relocation-conflict");
     let source = root.child("legacy/.openclaw");
