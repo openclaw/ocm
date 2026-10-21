@@ -541,15 +541,84 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     serde_json::from_str(&raw).map_err(|error| error.to_string())
 }
 
+// Keep operation identity until the controller has consumed it. This envelope is
+// deliberately not serializable: its message can contain paths or other data.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum FileWriteOperation {
+    ParentCreate,
+    TempOpen,
+    TempWrite,
+    Replace,
+}
+
+#[derive(Debug)]
+pub(crate) struct FileWriteError {
+    pub(crate) message: String,
+    pub(crate) operation: Option<FileWriteOperation>,
+    pub(crate) os_error: Option<i32>,
+}
+
+impl FileWriteError {
+    fn io(operation: FileWriteOperation, error: std::io::Error) -> Self {
+        let os_error = error.raw_os_error();
+        Self {
+            message: error.to_string(),
+            operation: Some(operation),
+            os_error,
+        }
+    }
+}
+
+impl From<String> for FileWriteError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            operation: None,
+            os_error: None,
+        }
+    }
+}
+
+impl From<&str> for FileWriteError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl From<FileWriteError> for String {
+    fn from(error: FileWriteError) -> Self {
+        error.message
+    }
+}
+
+impl std::fmt::Display for FileWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    write_json_detailed(path, value).map_err(String::from)
+}
+
+pub(crate) fn write_json_detailed<T: Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<(), FileWriteError> {
     let mut raw = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
     raw.push('\n');
-    write_file_replacing_path(path, raw.as_bytes())
+    write_file_replacing_path_detailed(path, raw.as_bytes())
 }
 
 pub(crate) fn write_file_replacing_path(path: &Path, raw: &[u8]) -> Result<(), String> {
+    write_file_replacing_path_detailed(path, raw).map_err(String::from)
+}
+
+fn write_file_replacing_path_detailed(path: &Path, raw: &[u8]) -> Result<(), FileWriteError> {
     if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
+        fs::create_dir_all(parent)
+            .map_err(|error| FileWriteError::io(FileWriteOperation::ParentCreate, error))?;
     }
 
     let parent = path
@@ -569,11 +638,13 @@ pub(crate) fn write_file_replacing_path(path: &Path, raw: &[u8]) -> Result<(), S
         .create_new(true)
         .write(true)
         .open(&temp_path)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| FileWriteError::io(FileWriteOperation::TempOpen, error))?;
     let result = (|| {
-        file.write_all(raw).map_err(|error| error.to_string())?;
+        file.write_all(raw)
+            .map_err(|error| FileWriteError::io(FileWriteOperation::TempWrite, error))?;
         drop(file);
-        replace_path(&temp_path, path)
+        replace_path_io(&temp_path, path)
+            .map_err(|error| FileWriteError::io(FileWriteOperation::Replace, error))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
@@ -581,13 +652,17 @@ pub(crate) fn write_file_replacing_path(path: &Path, raw: &[u8]) -> Result<(), S
     result
 }
 
-#[cfg(not(windows))]
 pub(super) fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
-    fs::rename(source, destination).map_err(|error| error.to_string())
+    replace_path_io(source, destination).map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+fn replace_path_io(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
 }
 
 #[cfg(windows)]
-pub(super) fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
+fn replace_path_io(source: &Path, destination: &Path) -> std::io::Result<()> {
     let mut source_wide = source.as_os_str().encode_wide().collect::<Vec<_>>();
     source_wide.push(0);
     let mut destination_wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -595,7 +670,7 @@ pub(super) fn replace_path(source: &Path, destination: &Path) -> Result<(), Stri
     let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
     let moved = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), flags) };
     if moved == 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -641,6 +716,46 @@ mod tests {
         std::env::temp_dir()
             .join("ocm-copy-dir-tests")
             .join(format!("{label}-{}-{id}", std::process::id()))
+    }
+
+    #[test]
+    fn windows_source_watch_write_error_preserves_actual_operation_and_temp_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let parent_file = root.path().join("synthetic-private-parent");
+        fs::write(&parent_file, "kept").unwrap();
+        let error = super::write_file_replacing_path_detailed(&parent_file.join("session"), b"new")
+            .unwrap_err();
+        assert!(matches!(
+            error.operation,
+            Some(super::FileWriteOperation::ParentCreate)
+        ));
+        assert_eq!(
+            error.message,
+            std::io::Error::from_raw_os_error(error.os_error.unwrap()).to_string()
+        );
+        assert_eq!(fs::read_to_string(&parent_file).unwrap(), "kept");
+
+        let destination = root.path().join("synthetic-private-session");
+        fs::create_dir(&destination).unwrap();
+        let error = super::write_file_replacing_path_detailed(&destination, b"new").unwrap_err();
+        assert!(matches!(
+            error.operation,
+            Some(super::FileWriteOperation::Replace)
+        ));
+        assert_eq!(
+            error.message,
+            std::io::Error::from_raw_os_error(error.os_error.unwrap()).to_string()
+        );
+        assert!(destination.is_dir());
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            2,
+            "failed replacement retained a temporary file"
+        );
+        fs::remove_dir(&destination).unwrap();
+        super::write_file_replacing_path_detailed(&destination, b"first").unwrap();
+        write_file_replacing_path(&destination, b"second").unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"second");
     }
 
     #[cfg(unix)]

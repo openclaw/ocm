@@ -6,6 +6,152 @@ use super::*;
 use crate::env::dev_handoff::{self, HandoffOutcome, HandoffRequest, HandoffServer};
 use crate::env::{DevUiChildRole, SourceUiTarget};
 
+// This is internal fixture evidence, not a CLI or persisted session protocol.
+// Every serialized value is a closed enum or a primitive; error messages never
+// enter this type.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ControllerStage {
+    UiLoop,
+    ChildPoll,
+    ChildStop,
+    ChildFinish,
+    RoleClear,
+    ServerClose,
+    OverrideClear,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(untagged)]
+enum ControllerOperation {
+    Write(crate::store::FileWriteOperation),
+    #[cfg(any(unix, windows))]
+    Pipe(crate::env::dev_handoff::HandoffPollOperation),
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(super) struct ControllerFailure {
+    stage: ControllerStage,
+    operation: Option<ControllerOperation>,
+    role: Option<DevUiChildRole>,
+    os_error: Option<i32>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Serialize)]
+enum ControllerDiagnosticKind {
+    #[serde(rename = "windows-dev-stop")]
+    WindowsDevStop,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Serialize)]
+struct ControllerDiagnostic {
+    diagnostic: ControllerDiagnosticKind,
+    #[serde(flatten)]
+    failure: ControllerFailure,
+    cleanup_verified: bool,
+    stop_observed: bool,
+}
+
+impl SourceWatchError {
+    fn at(mut self, stage: ControllerStage, role: Option<DevUiChildRole>) -> Self {
+        let context = self.context.get_or_insert(ControllerFailure {
+            stage,
+            role,
+            operation: None,
+            os_error: None,
+        });
+        if context.role.is_none() {
+            context.role = role;
+        }
+        self
+    }
+
+    #[cfg(any(windows, test))]
+    fn controller_diagnostic(&self, stop_observed: bool) -> Option<Vec<u8>> {
+        let failure = self.context?;
+        let diagnostic = ControllerDiagnostic {
+            diagnostic: ControllerDiagnosticKind::WindowsDevStop,
+            failure,
+            cleanup_verified: self.cleanup_verified,
+            stop_observed,
+        };
+        let mut bytes = b"OCM dev failure: ".to_vec();
+        serde_json::to_writer(&mut bytes, &diagnostic).ok()?;
+        bytes.push(b'\n');
+        Some(bytes)
+    }
+
+    #[cfg(windows)]
+    fn report_controller_failure(&self, stop_observed: bool) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+
+        let Some(bytes) = self.controller_diagnostic(stop_observed) else {
+            return;
+        };
+        let handle = std::io::stderr().as_raw_handle() as usize;
+        // A diagnostic must neither take the CLI's stderr lock, change its
+        // output-error state, nor delay cleanup/return. One detached attempt
+        // owns only bounded safe bytes; process exit may discard it. The test
+        // capture reports absence/invalid output explicitly instead of guessing.
+        let _ = thread::Builder::new().spawn(move || {
+            let mut written = 0;
+            unsafe {
+                WriteFile(
+                    handle as _,
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                );
+            }
+        });
+    }
+}
+
+impl From<crate::store::FileWriteError> for SourceWatchError {
+    fn from(error: crate::store::FileWriteError) -> Self {
+        Self {
+            message: error.message,
+            cleanup_verified: true,
+            context: Some(ControllerFailure {
+                stage: ControllerStage::RoleClear,
+                operation: error.operation.map(ControllerOperation::Write),
+                role: None,
+                os_error: error.os_error,
+            }),
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl From<crate::env::dev_handoff::HandoffPollError> for SourceWatchError {
+    fn from(error: crate::env::dev_handoff::HandoffPollError) -> Self {
+        Self {
+            message: error.message,
+            cleanup_verified: true,
+            context: Some(ControllerFailure {
+                stage: ControllerStage::UiLoop,
+                operation: error.operation.map(ControllerOperation::Pipe),
+                role: None,
+                os_error: error.os_error,
+            }),
+        }
+    }
+}
+
+fn source_ui_cancelled(
+    lease: &SourceWatchLease,
+    stop: &AtomicBool,
+    observed: &mut bool,
+) -> Result<bool, String> {
+    let cancelled = source_watch_cancelled(lease, stop)?;
+    *observed |= cancelled;
+    Ok(cancelled)
+}
+
 #[derive(Clone, Debug)]
 struct DevUiTarget {
     port: u32,
@@ -300,7 +446,11 @@ fn spawn_ui_child(
                     .and_then(|session| session.ui.as_ref())
                     .and_then(|ui| ui.children.get(role))
                     .cloned();
-                lease.clear_ui_child(role, expected.as_ref())?;
+                lease
+                    .clear_ui_child(role, expected.as_ref())
+                    .map_err(|error| {
+                        SourceWatchError::from(error).at(ControllerStage::RoleClear, Some(role))
+                    })?;
             }
             return Err(stopped);
         }
@@ -427,9 +577,11 @@ impl OwnedUiChild {
         if source_watch_allows_service_restore(&result)
             && let Err(error) = lease.clear_ui_child(self.role, Some(&self.identity))
         {
+            let error =
+                SourceWatchError::from(error).at(ControllerStage::RoleClear, Some(self.role));
             result = Err(match result {
-                Ok(()) => error.into(),
-                Err(prior) => prior.combine(error.into()),
+                Ok(()) => error,
+                Err(prior) => prior.combine(error),
             });
         }
         match (result, terminal) {
@@ -858,7 +1010,26 @@ for (const name of ['vite', 'dompurify']) {
         lease: &mut SourceWatchLease,
         stop: &AtomicBool,
     ) -> SourceWatchResult<i32> {
-        if source_watch_cancelled(lease, stop)? {
+        let mut stop_observed = false;
+        let result = self
+            .run_source_gateway_ui_inner(meta, source, lease, stop, &mut stop_observed)
+            .map_err(|error| error.at(ControllerStage::UiLoop, None));
+        #[cfg(windows)]
+        if let Err(error) = &result {
+            error.report_controller_failure(stop_observed);
+        }
+        result
+    }
+
+    fn run_source_gateway_ui_inner(
+        &self,
+        meta: &EnvMeta,
+        source: &Path,
+        lease: &mut SourceWatchLease,
+        stop: &AtomicBool,
+        stop_observed: &mut bool,
+    ) -> SourceWatchResult<i32> {
+        if source_ui_cancelled(lease, stop, stop_observed)? {
             return Ok(130);
         }
         let captured = lease
@@ -937,7 +1108,7 @@ for (const name of ['vite', 'dompurify']) {
                 )?;
             override_token = Some(active.token.clone());
             drop(spawn_admission);
-            if source_watch_cancelled(lease, stop)? {
+            if source_ui_cancelled(lease, stop, stop_observed)? {
                 return Ok(130);
             }
             children[0].start()?;
@@ -948,7 +1119,7 @@ for (const name of ['vite', 'dompurify']) {
                 #[cfg(unix)]
                 let mut deadline = deadline;
                 while !modules.exists() {
-                    if source_watch_cancelled(lease, stop)? {
+                    if source_ui_cancelled(lease, stop, stop_observed)? {
                         return Ok(130);
                     }
                     if children[0].poll()?.is_some() {
@@ -973,7 +1144,7 @@ for (const name of ['vite', 'dompurify']) {
                 }
                 crate::openclaw_repo::ensure_checkout_owned_dependencies(source)?;
             }
-            if source_watch_cancelled(lease, stop)? {
+            if source_ui_cancelled(lease, stop, stop_observed)? {
                 return Ok(130);
             }
             children[1].start()?;
@@ -988,7 +1159,7 @@ for (const name of ['vite', 'dompurify']) {
             let mut pending_reported = false;
             let mut handoff_failure = None;
             loop {
-                if source_watch_cancelled(lease, stop)? {
+                if source_ui_cancelled(lease, stop, stop_observed)? {
                     return Ok(130);
                 }
                 #[cfg(any(unix, windows))]
@@ -1003,11 +1174,17 @@ for (const name of ['vite', 'dompurify']) {
                 }
                 let mut index = 0;
                 while index < children.len() {
-                    let Some(status) = children[index].poll()? else {
+                    let role = children[index].role;
+                    let Some(status) = children[index]
+                        .poll()
+                        .map_err(|error| error.at(ControllerStage::ChildPoll, Some(role)))?
+                    else {
                         index += 1;
                         continue;
                     };
-                    children[index].finish(lease)?;
+                    children[index]
+                        .finish(lease)
+                        .map_err(|error| error.at(ControllerStage::ChildFinish, Some(role)))?;
                     let mut child = children.remove(index);
                     if child.role != DevUiChildRole::Command {
                         self.stderr_line(format!(
@@ -1048,7 +1225,7 @@ for (const name of ['vite', 'dompurify']) {
                     };
                     match link {
                         Ok((_native, link)) => {
-                            if source_watch_cancelled(lease, stop)? {
+                            if source_ui_cancelled(lease, stop, stop_observed)? {
                                 return Ok(130);
                             }
                             #[cfg(any(unix, windows))]
@@ -1106,7 +1283,7 @@ for (const name of ['vite', 'dompurify']) {
                 {
                     last_probe = std::time::Instant::now();
                     if target.documents_ready() {
-                        if source_watch_cancelled(lease, stop)? {
+                        if source_ui_cancelled(lease, stop, stop_observed)? {
                             return Ok(130);
                         }
                         #[cfg(any(unix, windows))]
@@ -1193,6 +1370,9 @@ for (const name of ['vite', 'dompurify']) {
                 thread::sleep(Duration::from_millis(50));
             }
         })();
+        let result =
+            result.map_err(|error: SourceWatchError| error.at(ControllerStage::UiLoop, None));
+        let mut context = result.as_ref().err().and_then(|error| error.context);
         let mut verified = source_watch_allows_service_restore(&result);
         let mut errors = Vec::new();
         #[cfg(any(unix, windows))]
@@ -1201,13 +1381,29 @@ for (const name of ['vite', 'dompurify']) {
             // the owned helper. No caller can extend this session's shutdown.
             handoff_request.take();
             if let Err(error) = handoff_server.close() {
+                if result.is_ok() && errors.is_empty() {
+                    context = SourceWatchError::from(error.clone())
+                        .at(ControllerStage::ServerClose, None)
+                        .context;
+                }
                 errors.push(error);
             }
         }
         // Persistent components precede Command, whose stop grace is limited to
         // the remaining original request budget. Every error still stops siblings.
         for child in &mut children {
-            if let Err(error) = child.stop().and_then(|()| child.finish(lease)) {
+            let role = child.role;
+            let stopped = child
+                .stop()
+                .map_err(|error| error.at(ControllerStage::ChildStop, Some(role)));
+            if let Err(error) = stopped.and_then(|()| {
+                child
+                    .finish(lease)
+                    .map_err(|error| error.at(ControllerStage::ChildFinish, Some(role)))
+            }) {
+                if result.is_ok() && errors.is_empty() {
+                    context = error.context;
+                }
                 verified &= error.cleanup_verified;
                 errors.push(error.message);
             }
@@ -1218,6 +1414,11 @@ for (const name of ['vite', 'dompurify']) {
                 .environment_service()
                 .clear_source_watch_override(&meta.name, &token)
         {
+            if result.is_ok() && errors.is_empty() {
+                context = SourceWatchError::from(error.clone())
+                    .at(ControllerStage::OverrideClear, None)
+                    .context;
+            }
             errors.push(error);
         }
         match result {
@@ -1225,12 +1426,14 @@ for (const name of ['vite', 'dompurify']) {
             Ok(_) => Err(SourceWatchError {
                 message: errors.join("; "),
                 cleanup_verified: verified,
+                context,
             }),
             Err(error) => {
                 errors.insert(0, error.message);
                 Err(SourceWatchError {
                     message: errors.join("; "),
                     cleanup_verified: verified,
+                    context,
                 })
             }
         }
@@ -1247,6 +1450,48 @@ for (const name of ['vite', 'dompurify']) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn windows_source_watch_controller_failure_context_keeps_first_error_and_excludes_contents() {
+        let secret = "synthetic-owner-grant-C:\\private\\session-error";
+        let first = SourceWatchError::from(crate::store::FileWriteError {
+            message: secret.to_string(),
+            operation: Some(crate::store::FileWriteOperation::Replace),
+            os_error: Some(5),
+        })
+        .at(ControllerStage::RoleClear, Some(DevUiChildRole::Command));
+        let combined = first.combine(
+            SourceWatchError::unverified("second failure")
+                .at(ControllerStage::ChildStop, Some(DevUiChildRole::Gateway)),
+        );
+        assert_eq!(combined.message, format!("{secret}; second failure"));
+        assert!(!combined.cleanup_verified);
+        let record = combined.controller_diagnostic(true).unwrap();
+        let text = String::from_utf8(record).unwrap();
+        assert!(!text.contains(secret));
+        let value: Value =
+            serde_json::from_str(text.strip_prefix("OCM dev failure: ").unwrap()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "diagnostic":"windows-dev-stop", "stage":"role-clear", "operation":"replace",
+                "role":"command", "os_error":5, "cleanup_verified":false, "stop_observed":true,
+            })
+        );
+
+        // A later detailed error must not be mistaken for an earlier untagged
+        // failure. The enclosing boundary supplies only what it actually knows.
+        let earlier = SourceWatchError::from(secret.to_string())
+            .combine(combined)
+            .at(ControllerStage::ChildFinish, Some(DevUiChildRole::Ui));
+        let record = earlier.controller_diagnostic(false).unwrap();
+        let value: Value = serde_json::from_slice(&record[b"OCM dev failure: ".len()..]).unwrap();
+        assert_eq!(value["stage"], "child-finish");
+        assert_eq!(value["operation"], Value::Null);
+        assert_eq!(value["os_error"], Value::Null);
+        assert_eq!(value["role"], "ui");
+        assert_eq!(value["stop_observed"], false);
+    }
 
     fn handoff(target: &DevUiTarget) -> Value {
         let mut browser = Url::parse(&target.gateway_url).unwrap();

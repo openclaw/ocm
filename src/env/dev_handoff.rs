@@ -31,6 +31,44 @@ fn scope(session: &SourceWatchSession) -> String {
         .collect()
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum HandoffPollOperation {
+    PipeDisconnectStale,
+    PipeDisconnectRejected,
+}
+
+// Only the fixed operation and native code may enter the fixture diagnostic.
+#[derive(Debug)]
+pub(crate) struct HandoffPollError {
+    pub(crate) message: String,
+    pub(crate) operation: Option<HandoffPollOperation>,
+    pub(crate) os_error: Option<i32>,
+}
+
+impl From<String> for HandoffPollError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            operation: None,
+            os_error: None,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl HandoffPollError {
+    fn io(operation: HandoffPollOperation, error: io::Error) -> Self {
+        let os_error = error.raw_os_error();
+        Self {
+            message: error.to_string(),
+            operation: Some(operation),
+            os_error,
+        }
+    }
+}
+
 pub(crate) struct HandoffServer {
     listener: platform::Listener,
 }
@@ -48,9 +86,9 @@ impl HandoffServer {
         })
     }
 
-    pub(crate) fn poll(&mut self) -> Result<Option<HandoffRequest>, String> {
+    pub(crate) fn poll(&mut self) -> Result<Option<HandoffRequest>, HandoffPollError> {
         let began = Instant::now();
-        let Some(mut stream) = self.listener.accept()? else {
+        let Some(mut stream) = self.listener.accept().map_err(HandoffPollError::from)? else {
             return Ok(None);
         };
         // There is one fixed action. No command, source, destination, or credential

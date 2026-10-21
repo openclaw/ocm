@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const cp = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const {controllerFailure} = require('./dev_stop_diagnostic.cjs');
 
 if (process.platform !== 'win32') throw new Error('This proof requires native Windows');
 const binary = path.resolve(process.argv[2] || '');
@@ -100,6 +101,7 @@ function sessionPath(name) { return path.join(env.OCM_HOME, 'source-watch', name
 function session(name) { return JSON.parse(fs.readFileSync(sessionPath(name), 'utf8')); }
 function reportNamedStopFailure(record, controllerOutputClosed) {
   const context = {
+    failure: controllerFailure(record.output()),
     controller: {
       exitCode: record.controller.exitCode,
       signalCode: record.controller.signalCode,

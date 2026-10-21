@@ -22,6 +22,7 @@ use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
+use super::{HandoffPollError, HandoffPollOperation};
 use crate::infra::process_identity::ProcessIdentity;
 use crate::infra::windows_security::{UserSid, owned_handle, with_user_only_security_attributes};
 
@@ -52,7 +53,7 @@ impl Listener {
         })
     }
 
-    pub(super) fn accept(&mut self) -> Result<Option<Stream>, String> {
+    pub(super) fn accept(&mut self) -> Result<Option<Stream>, HandoffPollError> {
         if self.active.upgrade().is_some() {
             return Ok(None);
         }
@@ -68,19 +69,23 @@ impl Listener {
         match error.raw_os_error().map(|code| code as u32) {
             Some(ERROR_PIPE_LISTENING) => return Ok(None),
             Some(ERROR_NO_DATA | ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED) => {
-                disconnect(pipe).map_err(|error| error.to_string())?;
+                disconnect(pipe).map_err(|error| {
+                    HandoffPollError::io(HandoffPollOperation::PipeDisconnectStale, error)
+                })?;
                 return Ok(None);
             }
             Some(ERROR_PIPE_CONNECTED) => {}
             _ => {
-                return Err(format!(
-                    "failed accepting a dev UI browser-link request: {error}"
-                ));
+                return Err(
+                    format!("failed accepting a dev UI browser-link request: {error}").into(),
+                );
             }
         }
         if verify_peer(pipe, &self.user, None).is_err() {
             // A rejected or disappearing requester must not stop the dev session.
-            disconnect(pipe).map_err(|error| error.to_string())?;
+            disconnect(pipe).map_err(|error| {
+                HandoffPollError::io(HandoffPollOperation::PipeDisconnectRejected, error)
+            })?;
             return Ok(None);
         }
         // One instance refuses busy callers instead of queuing a later helper.

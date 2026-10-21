@@ -208,7 +208,9 @@ impl SourceWatchLease {
                 .and_then(|session| session.ui.as_ref())
                 .and_then(|ui| ui.children.get(DevUiChildRole::Command))
                 .cloned();
-            return self.clear_ui_child(DevUiChildRole::Command, expected.as_ref());
+            return self
+                .clear_ui_child(DevUiChildRole::Command, expected.as_ref())
+                .map_err(String::from);
         }
         if let Some(session) = &mut self.session {
             session.child = None;
@@ -287,7 +289,7 @@ impl SourceWatchLease {
         &mut self,
         role: DevUiChildRole,
         expected: Option<&ProcessIdentity>,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::store::FileWriteError> {
         let session = self.session.as_mut().ok_or("dev UI session is missing")?;
         let ui = session
             .ui
@@ -299,13 +301,13 @@ impl SourceWatchLease {
             .is_some_and(|child| Some(child) != expected)
             || (expected.is_some() && ui.pending == Some(role))
         {
-            return Err("dev UI child changed; refusing stale cleanup".to_string());
+            return Err("dev UI child changed; refusing stale cleanup".into());
         }
         *ui.children.get_mut(role) = None;
         if ui.pending == Some(role) {
             ui.pending = None;
         }
-        self.session_paths.save_session(session)
+        self.session_paths.save_session_detailed(session)
     }
 
     pub(crate) fn begin_service_takeover(&mut self, revision: u64) -> Result<(), String> {

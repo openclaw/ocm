@@ -120,6 +120,7 @@ enum SourcePreparationCommand {
 struct SourceWatchError {
     message: String,
     cleanup_verified: bool,
+    context: Option<ui::ControllerFailure>,
 }
 
 impl SourceWatchError {
@@ -127,6 +128,7 @@ impl SourceWatchError {
         Self {
             message: message.into(),
             cleanup_verified: false,
+            context: None,
         }
     }
 
@@ -134,6 +136,7 @@ impl SourceWatchError {
         Self {
             message: format!("{}; {}", self.message, other.message),
             cleanup_verified: self.cleanup_verified && other.cleanup_verified,
+            context: self.context,
         }
     }
 }
@@ -143,6 +146,7 @@ impl From<String> for SourceWatchError {
         Self {
             message,
             cleanup_verified: true,
+            context: None,
         }
     }
 }
@@ -1861,6 +1865,7 @@ impl Cli {
             (Err(error), Err(terminal_error)) => Err(SourceWatchError {
                 message: format!("{}; {terminal_error}", error.message),
                 cleanup_verified: error.cleanup_verified,
+                context: error.context,
             }),
         };
         // Restore the terminal and collect both pipes even if process cleanup or
@@ -2283,6 +2288,7 @@ impl Cli {
             (Err(error), Err(restore_error)) => Err(SourceWatchError {
                 message: format!("{}; {restore_error}", error.message),
                 cleanup_verified: error.cleanup_verified,
+                context: error.context,
             }),
         };
         let tee_result = wait_for_tee_threads(tee_threads);
@@ -2823,15 +2829,20 @@ fn combine_source_watch_cleanup_results(
 ) -> SourceWatchResult<std::process::ExitStatus> {
     let mut errors = Vec::new();
     let mut cleanup_verified = true;
+    let mut context = None;
     let status = match status_result {
         Ok(status) => Some(status),
         Err(error) => {
             cleanup_verified = error.cleanup_verified;
+            context = error.context;
             errors.push(error.message);
             None
         }
     };
     if let Err(error) = tee_result {
+        if errors.is_empty() {
+            context = error.context;
+        }
         cleanup_verified &= error.cleanup_verified;
         errors.push(error.message);
     }
@@ -2846,6 +2857,7 @@ fn combine_source_watch_cleanup_results(
         Err(SourceWatchError {
             message: errors.join("; "),
             cleanup_verified,
+            context,
         })
     }
 }
@@ -4345,6 +4357,7 @@ where
         tee_stream(input, terminal, log_file).map_err(|error| SourceWatchError {
             message: format!("source {stream} output failed: {}", error.message),
             cleanup_verified: error.cleanup_verified,
+            context: error.context,
         })
     })
 }
@@ -4682,6 +4695,7 @@ fs.writeFileSync('source-ran', JSON.stringify({
                 Err::<(), _>(SourceWatchError {
                     message: "stderr completion".to_string(),
                     cleanup_verified: second_verified,
+                    context: None,
                 })
             });
             let error = super::wait_for_tee_threads(vec![first, second]).unwrap_err();

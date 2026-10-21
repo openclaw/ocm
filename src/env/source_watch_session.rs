@@ -296,6 +296,13 @@ impl SourceWatchSessionPaths {
     }
 
     pub(super) fn save_session(&self, session: &SourceWatchSession) -> Result<(), String> {
+        self.save_session_detailed(session).map_err(String::from)
+    }
+
+    pub(super) fn save_session_detailed(
+        &self,
+        session: &SourceWatchSession,
+    ) -> Result<(), crate::store::FileWriteError> {
         let current = self.load_session(&session.env_name)?.ok_or_else(|| {
             format!(
                 "source watch session for env \"{}\" disappeared",
@@ -306,7 +313,7 @@ impl SourceWatchSessionPaths {
             return Err(format!(
                 "source watch session for env \"{}\" changed; refusing to replace its ownership metadata",
                 session.env_name
-            ));
+            ).into());
         }
         if current.kind != session.kind
             || current.watching != session.watching
@@ -320,9 +327,9 @@ impl SourceWatchSessionPaths {
                     session.ui.as_ref().and_then(|ui| ui.target.as_ref()) != Some(target)
                 })
         {
-            return Err("dev session mode or captured UI target changed".to_string());
+            return Err("dev session mode or captured UI target changed".into());
         }
-        write_json(&self.session, session)
+        crate::store::write_json_detailed(&self.session, session)
     }
 
     pub(super) fn request_stop(&self, session: &SourceWatchSession) -> Result<(), String> {
