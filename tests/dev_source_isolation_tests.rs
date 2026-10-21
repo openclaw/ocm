@@ -613,7 +613,13 @@ fn removal_preserves_git_object_and_alternates_path_aliases() {
 #[test]
 fn nested_pack_storage_is_protected_by_removal_and_registration() {
     use std::os::unix::fs::symlink;
-    for mode in ["primary", "alternate", "link-chain", "independent-copy"] {
+    for mode in [
+        "primary",
+        "alternate",
+        "link-chain",
+        "files",
+        "independent-copy",
+    ] {
         let fixture = TestDir::new(&format!("nested-pack-{mode}"));
         let cwd = fixture.path();
         let env = ocm_env(&fixture);
@@ -631,6 +637,15 @@ fn nested_pack_storage_is_protected_by_removal_and_registration() {
         }));
         let dependency = Path::new(&container.root).join("packed-objects");
         match mode {
+            "files" => {
+                fs::create_dir(&dependency).unwrap();
+                for entry in fs::read_dir(&packs).unwrap() {
+                    let entry = entry.unwrap();
+                    let target = dependency.join(entry.file_name());
+                    fs::rename(entry.path(), &target).unwrap();
+                    symlink(target, entry.path()).unwrap();
+                }
+            }
             "independent-copy" => {
                 fs::create_dir(&dependency).unwrap();
                 for entry in fs::read_dir(&packs).unwrap() {
@@ -710,7 +725,13 @@ fn nested_pack_storage_is_protected_by_removal_and_registration() {
 
 #[test]
 fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
-    for mode in ["missing", "directory", "oversized", "too-many"] {
+    for mode in [
+        "missing",
+        "directory",
+        "oversized",
+        "too-many",
+        "pack-limit",
+    ] {
         let fixture = TestDir::new(&format!("git-alternate-metadata-{mode}"));
         let cwd = fixture.path();
         let env = ocm_env(&fixture);
@@ -745,6 +766,11 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
                 fs::create_dir(&alternates).unwrap();
             }
             "oversized" => write_text(&alternates, &"#".repeat(65537)),
+            "pack-limit" => {
+                for index in 0..1024 {
+                    write_text(&source.join(format!(".git/objects/pack/entry-{index}")), "");
+                }
+            }
             _ => write_text(&alternates, &".\n".repeat(1024)),
         }
         let registry = env_registry_path(&env, cwd).unwrap();
@@ -754,6 +780,7 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
         let expected = match mode {
             "missing" => "registered dev source",
             "too-many" => "too many alternate paths",
+            "pack-limit" => "too many pack paths",
             _ => "invalid Git alternates file",
         };
         assert!(

@@ -355,7 +355,7 @@ fn append_git_object_footprint(
     let mut pending = vec![objects];
     let mut visited = BTreeSet::new();
     // Bound the metadata graph, including repeated edges, without walking a
-    // checkout or its object files. Uninspectable graphs refuse the operation.
+    // checkout or loose-object files. Uninspectable graphs refuse the operation.
     while let Some(objects) = pending.pop() {
         if *paths_left == 0 {
             return Err(git_dependency_limit_error(&objects, "alternate"));
@@ -372,14 +372,28 @@ fn append_git_object_footprint(
         if !visited.insert(resolved.clone()) {
             continue;
         }
-        // Packed objects can live outside the object root through a pack
-        // directory alias. Preserve both the link entries and its contents,
-        // including for alternate stores, without scanning individual objects.
+        // Packed objects can live outside the object root through aliases of
+        // the directory or its files, including in alternate stores. Inspect
+        // only pack entries, never object contents or loose-object fanouts.
         let packs = resolved.join("pack");
         match fs::symlink_metadata(&packs) {
             Ok(_) => {
                 if let Some(packs) = record_git_path(&packs, footprint, reserve_missing, links)? {
-                    footprint.content_roots.insert(packs);
+                    footprint.content_roots.insert(packs.clone());
+                    for entry in fs::read_dir(&packs).map_err(|error| error.to_string())? {
+                        if *paths_left == 0 {
+                            return Err(git_dependency_limit_error(&packs, "pack"));
+                        }
+                        *paths_left -= 1;
+                        let entry = entry.map_err(|error| error.to_string())?;
+                        if entry
+                            .file_type()
+                            .map_err(|error| error.to_string())?
+                            .is_symlink()
+                        {
+                            record_git_path(&entry.path(), footprint, reserve_missing, links)?;
+                        }
+                    }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
