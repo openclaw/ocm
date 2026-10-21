@@ -54,7 +54,7 @@ impl ShutdownFixture {
             write_executable_script(
                 &leader,
                 &format!(
-                    "#!/bin/sh\ntrap '' HUP\n/bin/sh '{}' '{}' &\ndescendant=$!\nprintf '%s %s' \"$$\" \"$descendant\" > '{}'\nwait \"$descendant\"\n",
+                    "#!/bin/sh\ntrap '' HUP\n/bin/sh '{}' '{}' &\ndescendant=$!\nprintf '%s %s\\n' \"$$\" \"$descendant\" > '{}'\nwait \"$descendant\"\n",
                     heartbeat.display(),
                     root.child(format!("{name}.heartbeat")).display(),
                     root.child(format!("{name}.pids")).display()
@@ -102,26 +102,28 @@ impl ShutdownFixture {
                 && runtime["children"]
                     .as_array()
                     .is_some_and(|children| children.len() == 2)
-                && ["target", "sibling"]
-                    .iter()
-                    .all(|name| self.root.child(format!("{name}.pids")).exists())
             {
-                for name in ["target", "sibling"] {
-                    let pids = fs::read_to_string(self.root.child(format!("{name}.pids"))).unwrap();
-                    let pids: Vec<i32> = pids
-                        .split_whitespace()
-                        .map(|pid| pid.parse().unwrap())
-                        .collect();
-                    assert_eq!(pids.len(), 2);
-                    assert_eq!(unsafe { libc::getpgid(pids[1]) }, pids[0]);
-                    self.groups.push((pids[0], pids[1]));
+                let groups: Option<Vec<_>> = ["target", "sibling"]
+                    .iter()
+                    .map(|name| {
+                        let pair = read_pid_pair(&self.root.child(format!("{name}.pids")))?;
+                        (find_child_pid(&runtime, name) == Some(pair.0 as u64)).then_some(pair)
+                    })
+                    .collect();
+                if let Some(groups) = groups {
+                    for (leader, descendant) in groups {
+                        assert_eq!(unsafe { libc::getpgid(descendant) }, leader);
+                        self.groups.push((leader, descendant));
+                    }
+                    return runtime;
                 }
-                return runtime;
             }
             sleep(Duration::from_millis(20));
         }
         panic!(
-            "daemon did not start: {}",
+            "daemon did not start with complete current PID records: target={:?}, sibling={:?}; {}",
+            fs::read_to_string(self.root.child("target.pids")),
+            fs::read_to_string(self.root.child("sibling.pids")),
             fs::read_to_string(self.root.child("daemon.log")).unwrap()
         );
     }
@@ -186,16 +188,27 @@ impl ShutdownFixture {
 
 impl Drop for ShutdownFixture {
     fn drop(&mut self) {
-        // Cover a setup assertion failing before start() records both groups.
-        for name in ["target", "sibling"] {
-            if let Ok(pids) = fs::read_to_string(self.root.child(format!("{name}.pids"))) {
-                let pids: Vec<i32> = pids
-                    .split_whitespace()
-                    .filter_map(|pid| pid.parse().ok())
-                    .collect();
-                if pids.len() == 2 && !self.groups.contains(&(pids[0], pids[1])) {
-                    self.groups.push((pids[0], pids[1]));
+        // Keep cleanup ownership even if startup timed out during PID publication.
+        if let Ok(bytes) = fs::read(&self.runtime)
+            && let Ok(runtime) = serde_json::from_slice::<Value>(&bytes)
+        {
+            for name in ["target", "sibling"] {
+                if let Some(leader) = find_child_pid(&runtime, name)
+                    .and_then(|pid| i32::try_from(pid).ok())
+                    .filter(|pid| *pid > 0)
+                    && unsafe { libc::getpgid(leader) } == leader
+                    && !self.groups.iter().any(|(group, _)| *group == leader)
+                {
+                    self.groups.push((leader, leader));
                 }
+            }
+        }
+        // A completed record also retains a descendant if its leader exited.
+        for name in ["target", "sibling"] {
+            if let Some(pair) = read_pid_pair(&self.root.child(format!("{name}.pids")))
+                && !self.groups.contains(&pair)
+            {
+                self.groups.push(pair);
             }
         }
         if let Some(daemon) = &mut self.daemon {
@@ -243,6 +256,18 @@ impl Drop for ShutdownFixture {
             sleep(Duration::from_millis(20));
         }
     }
+}
+
+fn read_pid_pair(path: &std::path::Path) -> Option<(i32, i32)> {
+    let text = fs::read_to_string(path).ok()?;
+    // The producer's final newline distinguishes a full second PID from a prefix.
+    if !text.ends_with('\n') {
+        return None;
+    }
+    let mut pids = text.split_whitespace();
+    let leader = pids.next()?.parse::<i32>().ok()?;
+    let descendant = pids.next()?.parse::<i32>().ok()?;
+    (leader > 0 && descendant > 0 && pids.next().is_none()).then_some((leader, descendant))
 }
 
 fn child_pid(runtime: &Value, name: &str) -> u64 {
@@ -561,4 +586,92 @@ fn post_reap_uncertainty_can_recover_after_group_disappears() {
         replacement.is_some_and(|pid| pid != target),
         "fresh restart cannot retire an already-reaped child after cleanup uncertainty resolves: {after}"
     );
+}
+
+#[test]
+fn startup_waits_for_complete_pid_publication() {
+    let fixture = ShutdownFixture::new();
+    let path = fixture.root.child("target.sh");
+    let release = fixture.root.child("publication-release");
+    let opened = fixture.root.child("publication-open");
+    let sibling_pids = fixture.root.child("sibling.pids");
+    let runtime_path = fixture.runtime.clone();
+    let original = format!(
+        "printf '%s %s\\n' \"$$\" \"$descendant\" > '{}'",
+        fixture.root.child("target.pids").display()
+    );
+    let script = fs::read_to_string(&path).unwrap();
+    assert!(script.contains(&original));
+    write_executable_script(
+        &path,
+        &script.replace(
+            &original,
+            &format!(
+                "{{\nprintf '%s ' \"$$\"\nprintf . > '{}'\nattempt=0\nwhile [ ! -e '{}' ] && [ \"$attempt\" -lt 250 ]; do /bin/sleep 0.02; attempt=$((attempt + 1)); done\nprintf '%s\\n' \"$descendant\"\n}} > '{}'",
+                opened.display(),
+                release.display(),
+                fixture.root.child("target.pids").display()
+            ),
+        ),
+    );
+    let (sent, received) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut fixture = fixture;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixture.start()));
+        sent.send(result.is_ok()).unwrap();
+        (fixture, result)
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let observable = || {
+        opened.exists()
+            && read_pid_pair(&sibling_pids).is_some()
+            && fs::read(&runtime_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|runtime| runtime["children"].as_array().is_some_and(|c| c.len() == 2))
+    };
+    while !observable() && Instant::now() < deadline {
+        sleep(Duration::from_millis(10));
+    }
+    let observed_partial = observable();
+    let pending = received.recv_timeout(Duration::from_millis(100));
+    fs::write(&release, b"release").unwrap();
+    let (mut fixture, result) = worker.join().unwrap();
+    assert!(
+        observed_partial,
+        "producer never reached partial publication"
+    );
+    assert!(matches!(
+        pending,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    let runtime = result.expect("startup failed after completing publication");
+    for name in ["target", "sibling"] {
+        let (leader, descendant) =
+            read_pid_pair(&fixture.root.child(format!("{name}.pids"))).unwrap();
+        assert_eq!(leader as u64, child_pid(&runtime, name));
+        assert_eq!(unsafe { libc::getpgid(descendant) }, leader);
+    }
+    assert!(fixture.stop().success());
+    assert!(fixture.runtime()["children"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn pid_publication_requires_two_complete_positive_pids() {
+    let root = TestDir::new("shutdown-pid-record");
+    let path = root.child("record");
+    for invalid in [
+        "",
+        "123 ",
+        "123 4",
+        "123 bad\n",
+        "0 4\n",
+        "-1 4\n",
+        "123 4 5\n",
+    ] {
+        fs::write(&path, invalid).unwrap();
+        assert_eq!(read_pid_pair(&path), None, "{invalid:?}");
+    }
+    fs::write(&path, "123 456\n").unwrap();
+    assert_eq!(read_pid_pair(&path), Some((123, 456)));
 }
