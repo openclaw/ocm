@@ -514,6 +514,94 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn full_restore_rollback_preserves_original_root_entries() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::path::Path;
+
+        for kind in ["directory", "missing", "reachable", "dangling"] {
+            for registry_failure in [false, true] {
+                let (root, env, options) = restore_fixture(false);
+                let service = super::EnvironmentService::new(&env, root.path());
+                let original = service.get("source").unwrap();
+                let live = Path::new(&original.root);
+                let backing = root.path().join("backing");
+                let offline = root.path().join("offline");
+                if kind != "directory" {
+                    fs::rename(live, &backing).unwrap();
+                }
+                if matches!(kind, "reachable" | "dangling") {
+                    symlink(&backing, live).unwrap();
+                }
+                if kind == "dangling" {
+                    fs::rename(&backing, &offline).unwrap();
+                }
+                let snapshot = crate::store::get_env_snapshot(
+                    "source",
+                    &options.snapshot_id,
+                    &env,
+                    root.path(),
+                )
+                .unwrap();
+                let checkpoint_marker = Path::new(&snapshot.archive_path).join("marker");
+                let transaction =
+                    crate::store::prepare_env_snapshot_restore(options, &env, root.path()).unwrap();
+                assert_eq!(fs::read_to_string(live.join("marker")).unwrap(), "snapshot");
+                let operation = fs::read_dir(live.parent().unwrap())
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .find(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
+                    .unwrap()
+                    .path();
+                if registry_failure {
+                    let registry = crate::store::env_registry_path(&env, root.path()).unwrap();
+                    fs::remove_file(&registry).unwrap();
+                    fs::create_dir(&registry).unwrap();
+                    let error = service
+                        .rollback_snapshot_restore_locked(transaction)
+                        .unwrap_err();
+                    assert!(!error.prior_state_restored, "{kind}");
+                    assert!(error.message.contains("restore operation retained at"));
+                    assert_eq!(fs::read_to_string(live.join("marker")).unwrap(), "snapshot");
+                } else {
+                    service
+                        .rollback_snapshot_restore_locked(transaction)
+                        .unwrap();
+                    assert!(!operation.exists());
+                    assert_eq!(service.get("source").unwrap().root, original.root);
+                }
+                let prior = if registry_failure {
+                    operation.join("displaced")
+                } else {
+                    live.to_path_buf()
+                };
+                match kind {
+                    "directory" => {
+                        assert_eq!(fs::read_to_string(prior.join("marker")).unwrap(), "current")
+                    }
+                    "missing" => assert!(fs::symlink_metadata(&prior).is_err()),
+                    _ => {
+                        assert_eq!(fs::read_link(&prior).unwrap(), backing);
+                        if kind == "dangling" {
+                            assert!(!prior.exists());
+                            fs::rename(&offline, &backing).unwrap();
+                        }
+                        assert_eq!(fs::read_to_string(prior.join("marker")).unwrap(), "current");
+                    }
+                }
+                assert_eq!(fs::read_to_string(checkpoint_marker).unwrap(), "snapshot");
+                if kind != "directory" {
+                    assert_eq!(
+                        fs::read_to_string(backing.join("marker")).unwrap(),
+                        "current"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn restore_rollback_failure_reports_retained_custody_and_actual_root() {
         for scoped in [false, true] {

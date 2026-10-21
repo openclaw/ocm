@@ -3738,3 +3738,78 @@ fn snapshots_refuse_retained_target_ownership_until_exact_recovery() {
     assert!(restored.status.success(), "{}", stderr(&restored));
     assert_eq!(fs::read(&marker).unwrap(), b"snapshot");
 }
+
+#[cfg(unix)]
+#[test]
+fn env_snapshot_restore_displaces_root_entries_without_following_links() {
+    for kind in ["directory", "missing", "reachable", "dangling"] {
+        let root = TestDir::new("snapshot-root-entry");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let original = get_environment("source", &env, &cwd).unwrap();
+        let live = Path::new(&original.root);
+        let marker = live.join(".openclaw/workspace/marker");
+        fs::write(&marker, "snapshot").unwrap();
+        let capture = run_ocm(
+            &cwd,
+            &env,
+            &["env", "snapshot", "create", "source", "--json"],
+        );
+        assert!(capture.status.success(), "{}", stderr(&capture));
+        let snapshot: Value = serde_json::from_str(&stdout(&capture)).unwrap();
+        fs::write(&marker, "current").unwrap();
+        let backing = root.child("backing");
+        let offline = root.child("offline");
+        if kind != "directory" {
+            fs::rename(live, &backing).unwrap();
+        }
+        if matches!(kind, "reachable" | "dangling") {
+            std::os::unix::fs::symlink(&backing, live).unwrap();
+        }
+        if kind == "dangling" {
+            fs::rename(&backing, &offline).unwrap();
+        }
+        let restore = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "snapshot",
+                "restore",
+                "source",
+                snapshot["id"].as_str().unwrap(),
+                "--json",
+            ],
+        );
+        assert!(restore.status.success(), "{kind}: {}", stderr(&restore));
+        assert!(fs::symlink_metadata(live).unwrap().is_dir());
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "snapshot");
+        assert_eq!(
+            get_environment("source", &env, &cwd).unwrap().root,
+            original.root
+        );
+        let checkpoint = Path::new(snapshot["archivePath"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(checkpoint.join(".openclaw/workspace/marker")).unwrap(),
+            "snapshot"
+        );
+        if kind == "dangling" {
+            fs::rename(&offline, &backing).unwrap();
+        }
+        if kind != "directory" {
+            assert_eq!(
+                fs::read_to_string(backing.join(".openclaw/workspace/marker")).unwrap(),
+                "current"
+            );
+        }
+        assert!(
+            !fs::read_dir(live.parent().unwrap())
+                .unwrap()
+                .map(Result::unwrap)
+                .any(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
+        );
+    }
+}

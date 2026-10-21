@@ -674,7 +674,8 @@ fn prepare_env_snapshot_restore_with_binding(
         .map_err(SnapshotRestoreError::unchanged)?;
     let current = get_environment(&env_name, env, cwd).map_err(SnapshotRestoreError::unchanged)?;
     let current_paths = derive_env_paths(Path::new(&current.root));
-    let root_exists = path_exists(&current_paths.root);
+    let root_exists =
+        restore_entry_exists(&current_paths.root).map_err(SnapshotRestoreError::unchanged)?;
     let independent = snapshot
         .upgrade_scope
         .as_ref()
@@ -878,7 +879,10 @@ fn prepare_env_snapshot_restore_with_binding(
         }
     })();
 
-    if result.is_err() && !rollback_attempted && !path_exists(&backup_root) {
+    if result.is_err()
+        && !rollback_attempted
+        && matches!(restore_entry_exists(&backup_root), Ok(false))
+    {
         let _ = remove_tree_if_present(&operation.root);
     }
     result
@@ -942,6 +946,15 @@ pub(crate) fn rollback_env_snapshot_restore(
                 )
             }),
     )
+}
+
+// Restore custody belongs to directory entries, even when a link target is offline.
+fn restore_entry_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("failed to inspect {}: {error}", display_path(path))),
+    }
 }
 
 fn reinstate_displaced_environment_root(
@@ -1020,7 +1033,7 @@ fn reinstate_displaced_environment_root(
                 display_path(displaced_root)
             ));
         }
-        if !path_exists(restored_root)
+        if !restore_entry_exists(restored_root)?
             && let Err(compensation_error) = fs::rename(rejected_root, restored_root)
         {
             compensation_errors.push(format!(
