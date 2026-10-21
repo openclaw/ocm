@@ -6,7 +6,7 @@ import {parseEnv} from 'node:util';
 import {pathToFileURL} from 'node:url';
 import {spawn} from 'node:child_process';
 
-// Deliberately finite fixture contract: JSON root plus at most one root include.
+// Deliberately finite fixture contract: JSON root plus at most two ordered root includes.
 // Authorized external roots come from native dotenv or the actual launcher env;
 // the OCM caller does not receive this fixture's ambient include authority.
 function fixtureGateway() {
@@ -17,15 +17,24 @@ function fixtureGateway() {
   const environment = {...values, ...process.env};
   let config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   if (config.$include) {
-    const included = fs.realpathSync(path.resolve(configDirectory, config.$include));
+    const includes = Array.isArray(config.$include) ? config.$include : [config.$include];
+    if (includes.length < 1 || includes.length > 2) throw new Error('fixture include count unsupported');
     const roots = [configDirectory, ...(environment.OPENCLAW_INCLUDE_ROOTS ?? '').split(path.delimiter).filter(Boolean)];
-    const permitted = roots.some(root => {
-      const relative = path.relative(fs.realpathSync(root), included);
-      return relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
-    });
-    if (!permitted || fs.statSync(included).size > 65536) throw new Error('fixture include denied');
-    config = JSON.parse(fs.readFileSync(included, 'utf8'));
-    if (config.$include) throw new Error('nested fixture include unsupported');
+    config = {};
+    for (const include of includes) {
+      const included = fs.realpathSync(path.resolve(configDirectory, include));
+      const permitted = roots.some(root => {
+        const relative = path.relative(fs.realpathSync(root), included);
+        return relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
+      });
+      if (!permitted || fs.statSync(included).size > 65536) throw new Error('fixture include denied');
+      const next = JSON.parse(fs.readFileSync(included, 'utf8'));
+      if (next.$include) throw new Error('nested fixture include unsupported');
+      // Only the object shapes needed by these finite Gateway fixtures. A later
+      // TLS setting overrides the earlier leaf without dropping its other fields.
+      config = {...config, ...next, gateway: {...config.gateway, ...next.gateway,
+        tls: {...config.gateway?.tls, ...next.gateway?.tls}}};
+    }
   }
   const gateway = structuredClone(config.gateway);
   if (typeof gateway.tls?.certPath === 'string') {
@@ -59,6 +68,11 @@ if (process.argv[2] === 'config') {
     }
   } else {
     const gateway = fixtureGateway();
+    if (behavior === 'invalid-settings') {
+      // Successful JSON parsing must not turn malformed native settings into an
+      // opaque fallback or expose a value from the private captured output.
+      gateway.tls = {enabled: true, certPath: {private: 'NATIVE_CONFIG_PRIVATE_SENTINEL_SETTINGS'}};
+    }
     process.stdout.write(JSON.stringify(gateway), () => {
       if (behavior === 'retry-generation') {
         fs.appendFileSync(queries + '.results', JSON.stringify({pid: process.pid,

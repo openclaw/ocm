@@ -1021,7 +1021,7 @@ pub(crate) fn gateway_readiness_certificate(
         read_openclaw_config_field(&paths.config_path, &["gateway", "tls", "enabled"], &context);
     // A fully resolved false may override an earlier true in an include array.
     // Partial resolution cannot discard that evidence and choose plaintext.
-    *known_tls |= enabled.value.is_err() && enabled.observed_true;
+    let partial_tls = enabled.value.is_err() && enabled.observed_true;
     let local = (|| -> Result<Value, OpenClawConfigReadError> {
         let enabled = match enabled.value? {
             None | Some(Value::Bool(false)) => false,
@@ -1064,11 +1064,23 @@ pub(crate) fn gateway_readiness_certificate(
     let native = if matches!(&local, Err(OpenClawConfigReadError::OutsideAuthority(_)))
         || templated_certificate
     {
-        resolve_native()?
+        match resolve_native() {
+            Ok(value) => value,
+            Err(error) => {
+                *known_tls |= partial_tls;
+                return Err(error);
+            }
+        }
     } else {
         None
     };
     let native_resolved = native.is_some();
+    // A successful native lookup completes this initial observation using the
+    // whole ordered include graph. Preserve partial evidence only while it is
+    // unresolved; never erase a transport chosen during an earlier observation.
+    if !native_resolved {
+        *known_tls |= partial_tls;
+    }
     let mut config = match native {
         Some(gateway) => json!({"gateway": gateway}),
         None => match local {

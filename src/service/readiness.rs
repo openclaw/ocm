@@ -267,6 +267,14 @@ fn resolve_native_gateway_config(
     if !gateway.is_object() {
         return Err("OpenClaw did not return a Gateway configuration object".to_string());
     }
+    if let Some(tls) = gateway.get("tls") {
+        if !tls.is_object()
+            || tls.get("enabled").is_some_and(|value| !value.is_boolean())
+            || tls.get("certPath").is_some_and(|value| !value.is_string())
+        {
+            return Err("OpenClaw returned invalid Gateway TLS settings".to_string());
+        }
+    }
     Ok(Some(gateway))
 }
 

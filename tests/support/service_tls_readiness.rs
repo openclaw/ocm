@@ -211,6 +211,26 @@ impl ReadinessFixture {
             config = json!({"$include": ["known-config.json", outside]});
             paths.extend([known, outside]);
         }
+        if certificate == "native-http-override" {
+            let known = environment.join(".openclaw/known-true.json");
+            config["gateway"]["tls"]["enabled"] = json!(true);
+            fs::write(&known, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+            let shared = root.child("shared");
+            fs::create_dir_all(&shared).unwrap();
+            let outside = shared.join("http.json");
+            fs::write(&outside, br#"{"gateway":{"tls":{"enabled":false}}}"#).unwrap();
+            config = json!({"$include": ["known-true.json", outside]});
+            paths.extend([known, outside]);
+            // Only the known-native reader receives this include authority from
+            // dotenv. Its later HTTP override completes the initial decision.
+            let dotenv = environment.join(".openclaw/.env");
+            let contents = fs::read_to_string(&dotenv).unwrap();
+            fs::write(
+                &dotenv,
+                format!("{contents}OPENCLAW_INCLUDE_ROOTS={}\n", json!(shared)),
+            )
+            .unwrap();
+        }
         if matches!(certificate, "native-root" | "opaque-root") {
             let shared = root.child("shared");
             fs::create_dir_all(&shared).unwrap();
@@ -523,6 +543,7 @@ fn service_readiness_native_dotenv_lookup_is_once_per_wait_and_keeps_output_priv
         ("unhealthy-tls", "success", false),
         ("tls", "failure", false),
         ("tls", "timeout", false),
+        ("tls", "invalid-settings", false),
         ("tls", "registered", false),
     ] {
         let mut fixture = ReadinessFixture::with_native(mode, "explicit", Some(behavior));
@@ -562,7 +583,7 @@ fn service_readiness_native_dotenv_lookup_is_once_per_wait_and_keeps_output_priv
                 -1,
                 "native config child was not settled"
             );
-            if behavior == "failure" || behavior == "timeout" {
+            if matches!(behavior, "failure" | "timeout" | "invalid-settings") {
                 assert!(
                     !fixture.root.child("requests.jsonl").exists(),
                     "failed native lookup was bypassed"
@@ -1010,4 +1031,37 @@ fn service_readiness_requeries_native_config_for_scheduled_replacement_child() {
         !lookup_process_live(second),
         "replacement Gateway remained live after stop"
     );
+}
+
+#[test]
+fn service_readiness_native_http_override_completes_initial_partial_tls_decision() {
+    let fixture = ReadinessFixture::with_native("http", "native-http-override", Some("success"));
+    fixture.action(&["service", "start", "demo", "--json"], true);
+    let queries = fs::read_to_string(fixture.root.child("queries.jsonl")).unwrap();
+    let queries: Vec<Value> = queries
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        queries.len(),
+        1,
+        "initial partial TLS evidence must use one authoritative lookup"
+    );
+    assert_eq!(
+        queries[0]["args"],
+        json!(["config", "get", "gateway", "--json"])
+    );
+    let requests = fs::read_to_string(fixture.root.child("requests.jsonl")).unwrap();
+    let requests: Vec<Value> = requests
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!requests.is_empty());
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["path"] == "/health" && request["tls"] == false),
+        "initial native HTTP decision did not reach the configured listener"
+    );
+    fixture.stop();
 }
