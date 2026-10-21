@@ -962,31 +962,17 @@ fn service_readiness_keeps_tls_after_config_disappears_or_changes_during_wait() 
 
 #[test]
 fn service_readiness_requeries_native_config_for_scheduled_replacement_child() {
-    // The first child exits only after its native result; the supervisor's
-    // one-second backoff places the replacement beyond the short wait deadline.
-    // Retain the ordinary in-budget replacement as a control.
-    for timeout_ms in [6000, 1000] {
-        assert_native_config_for_scheduled_replacement_child(timeout_ms);
-    }
-}
-
-fn assert_native_config_for_scheduled_replacement_child(timeout_ms: u64) {
     let mut fixture = ReadinessFixture::with_native("tls", "explicit", Some("retry-generation"));
+    // Establish the replacement and its child-specific config refresh without
+    // requiring initial Gateway/helper setup and exit observation within 1s.
     fixture.env.insert(
         "OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS".into(),
-        timeout_ms.to_string(),
+        "6000".into(),
     );
     let dotenv = fixture.root.child("environment/.openclaw/.env");
     let before = fs::read_to_string(&dotenv).unwrap();
     assert!(before.contains("missing-first.pem"));
-    let began = Instant::now();
     let status = fixture.action(&["service", "start", "demo", "--json"], true);
-    if timeout_ms == 1000 {
-        assert!(
-            began.elapsed() >= Duration::from_millis(timeout_ms),
-            "replacement did not exercise the late-observation boundary"
-        );
-    }
     let read_records = |name| -> Vec<Value> {
         fs::read_to_string(fixture.root.child(name))
             .unwrap()
@@ -1029,6 +1015,7 @@ fn assert_native_config_for_scheduled_replacement_child(timeout_ms: u64) {
             "native helper remained live"
         );
     }
+
     let requests = read_records("requests.jsonl");
     assert!(!requests.is_empty());
     assert!(
@@ -1046,6 +1033,84 @@ fn assert_native_config_for_scheduled_replacement_child(timeout_ms: u64) {
     assert!(
         !lookup_process_live(second),
         "replacement Gateway remained live after stop"
+    );
+}
+
+#[test]
+fn service_readiness_allows_native_lookup_after_main_deadline() {
+    let mut fixture = ReadinessFixture::with_native("tls", "explicit", Some("success"));
+    fixture.env.insert(
+        "OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS".into(),
+        "0".into(),
+    );
+    // Prepare a listening child through the real supervisor before measuring
+    // readiness. Use the same environment for preparation and the CLI start:
+    // changing even an internal OCM variable would republish a different spec.
+    EnvironmentService::new(&fixture.env, &fixture.cwd)
+        .set_service_policy("demo", Some(true), Some(true))
+        .unwrap();
+    let listening_path = fixture.root.child("requests.jsonl.listening");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let listening: Value = loop {
+        if let Ok(bytes) = fs::read(&listening_path)
+            && let Ok(listening) = serde_json::from_slice::<Value>(&bytes)
+        {
+            // Run the manager observation with the fixture's isolated process
+            // environment, just like the readiness command below.
+            let output = run_ocm(
+                &fixture.cwd,
+                &fixture.env,
+                &["service", "status", "demo", "--json"],
+            );
+            assert!(output.status.success(), "{}", stderr(&output));
+            let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+            if status["running"] == true && status["childPid"] == listening["pid"] {
+                break listening;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "TLS peer setup failed: listener={:?}; daemon={}",
+            fs::read_to_string(&listening_path),
+            fs::read_to_string(fixture.root.child("daemon.log")).unwrap()
+        );
+        sleep(Duration::from_millis(20));
+    };
+    assert_eq!(listening["tls"], true);
+    assert!(!fixture.root.child("queries.jsonl").exists());
+    assert!(!fixture.root.child("requests.jsonl").exists());
+
+    // The main deadline is already expired at the first observation. Native
+    // lookup and TLS IO must receive the shared late-observation budget; this
+    // boundary no longer depends on initial setup finishing within one second.
+    let status = fixture.action(&["service", "start", "demo", "--json"], true);
+    assert_eq!(status["childPid"], listening["pid"]);
+    assert_eq!(status["childRestartCount"], 0);
+    let queries = fs::read_to_string(fixture.root.child("queries.jsonl")).unwrap();
+    let queries: Vec<Value> = queries
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(queries.len(), 1, "late wait must query native config once");
+    assert_eq!(
+        queries[0]["args"],
+        json!(["config", "get", "gateway", "--json"])
+    );
+    assert!(
+        !lookup_process_live(queries[0]["pid"].as_i64().unwrap() as i32),
+        "late native helper remained live"
+    );
+    let requests = fs::read_to_string(fixture.root.child("requests.jsonl")).unwrap();
+    assert!(!requests.is_empty());
+    assert!(requests.lines().all(|line| {
+        let request: Value = serde_json::from_str(line).unwrap();
+        request["tls"] == true && request["path"] == "/health" && request["pid"] == listening["pid"]
+    }));
+    fixture.assert_sources_unchanged();
+    fixture.stop();
+    assert!(
+        !lookup_process_live(listening["pid"].as_i64().unwrap() as i32),
+        "prepared Gateway remained live after stop"
     );
 }
 
