@@ -636,6 +636,17 @@ impl<'a> SupervisorService<'a> {
         Ok((inspection, issue))
     }
 
+    pub(crate) fn persisted_child_spec(
+        &self,
+        name: &str,
+    ) -> Result<Option<SupervisorChildSpec>, String> {
+        let (_, state) = self.read_persisted_state()?;
+        Ok(state
+            .children
+            .into_iter()
+            .find(|child| child.env_name == name))
+    }
+
     fn inspect_with_checked_daemon(
         &self,
         checked: bool,

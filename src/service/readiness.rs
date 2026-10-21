@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use super::inspect::{ServiceSummary, service_readiness_observation};
 use crate::env::{EnvMeta, EnvironmentService, ExecutionBinding, resolve_execution_binding};
-use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::store::gateway_readiness_certificate;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -49,10 +48,14 @@ fn wait_for_gateway_readiness_with_timeout(
     cwd: &Path,
 ) -> Result<GatewayReadiness, String> {
     let interrupt_generation = crate::infra::interrupt::generation();
-    let meta = EnvironmentService::new(env, cwd).get(name)?;
+    let mut meta = EnvironmentService::new(env, cwd).get(name)?;
     let started = Instant::now();
     let deadline = Instant::now() + timeout;
-    let mut native_certificate_path = None;
+    let mut native_gateway_config: Option<Result<Option<serde_json::Value>, String>> = None;
+    let mut native_child_context = None;
+    // A later incomplete observation must never turn a known TLS wait into an
+    // unauthenticated HTTP probe, even if the config changes while starting.
+    let mut known_tls = false;
     let mut permitted_retry_count = None;
     let mut process_observed_after_ms = None;
     loop {
@@ -66,17 +69,56 @@ fn wait_for_gateway_readiness_with_timeout(
                 .as_ref()
                 .ok_or_else(|| "Gateway launch environment is unavailable".to_string())
                 .and_then(|child| {
+                    let same_child = native_child_context.as_ref().is_some_and(
+                        |(daemon, pid, restarts, spec)| {
+                            *daemon == status.ocm_service_pid
+                                && *pid == status.child_pid
+                                && *restarts == status.child_restart_count
+                                && spec == child
+                        },
+                    );
+                    if !same_child {
+                        // A scheduled retry can use a new desired spec. Resolve
+                        // at most once for that child/context, retaining TLS
+                        // evidence across the entire readiness wait.
+                        let current = EnvironmentService::new(env, cwd).get(name)?;
+                        let binding_matches = match resolve_execution_binding(&current, None, None)? {
+                            ExecutionBinding::Dev => child.binding_kind == "dev",
+                            ExecutionBinding::Runtime(binding) => {
+                                child.binding_kind == "runtime" && child.binding_name == binding
+                            }
+                            ExecutionBinding::Launcher(binding) => {
+                                child.binding_kind == "launcher" && child.binding_name == binding
+                            }
+                        };
+                        if !binding_matches {
+                            return Err("Gateway execution binding is changing; waiting for its supervised launch context".to_string());
+                        }
+                        meta = current;
+                        native_gateway_config = None;
+                        native_child_context = Some((
+                            status.ocm_service_pid,
+                            status.child_pid,
+                            status.child_restart_count,
+                            child.clone(),
+                        ));
+                    }
+                    // A failed native observation remains a failure for this
+                    // child even if a later local read no longer needs it.
+                    if let Some(Err(error)) = &native_gateway_config {
+                        return Err(error.clone());
+                    }
                     gateway_readiness_certificate(
                         &meta,
                         port,
                         Path::new(&child.run_dir),
                         &child.process_env,
+                        &mut known_tls,
                         || {
-                            native_certificate_path
+                            native_gateway_config
                                 .get_or_insert_with(|| {
-                                    resolve_native_certificate_path(
+                                    resolve_native_gateway_config(
                                         &meta,
-                                        port,
                                         Path::new(&child.run_dir),
                                         &child.process_env,
                                         cwd,
@@ -165,22 +207,18 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn resolve_native_certificate_path(
+fn resolve_native_gateway_config(
     meta: &EnvMeta,
-    port: u32,
     run_dir: &Path,
     env: &BTreeMap<String, String>,
     cwd: &Path,
     deadline: Instant,
     interrupt_generation: u64,
-) -> Result<Option<String>, String> {
-    let args = ["config", "get", "gateway.tls.certPath", "--json"].map(str::to_string);
-    let mut meta = meta.clone();
-    meta.gateway_port = Some(port);
-    let mut command = match resolve_execution_binding(&meta, None, None)? {
+) -> Result<Option<serde_json::Value>, String> {
+    let args = ["config", "get", "gateway", "--json"].map(str::to_string);
+    let mut command = match resolve_execution_binding(meta, None, None)? {
         ExecutionBinding::Dev => {
-            let source = meta
-                .dev
+            meta.dev
                 .as_ref()
                 .ok_or("missing dev binding")?
                 .execution_source_root()?;
@@ -190,7 +228,7 @@ fn resolve_native_certificate_path(
                 .arg("scripts/run-node.mjs")
                 .args(&args)
                 .env_clear()
-                .envs(build_openclaw_dev_source_env(&meta, env, source));
+                .envs(env);
             command
         }
         ExecutionBinding::Runtime(name) => {
@@ -199,7 +237,7 @@ fn resolve_native_certificate_path(
                 return Ok(None);
             }
             let launch = crate::runtime::resolve_runtime_launch(&runtime, &args, env, cwd, false)?;
-            let mut command_env = build_openclaw_env(&meta, env);
+            let mut command_env = env.clone();
             crate::managed_node::apply_path_prepend_to_environment(
                 &mut command_env,
                 launch.path_prepend.as_deref(),
@@ -224,9 +262,12 @@ fn resolve_native_certificate_path(
         remaining.min(Duration::from_secs(15)),
         interrupt_generation,
     )?;
-    let path: String = serde_json::from_slice(&output)
-        .map_err(|_| "OpenClaw did not return a string for gateway.tls.certPath".to_string())?;
-    Ok(Some(path))
+    let gateway: serde_json::Value = serde_json::from_slice(&output)
+        .map_err(|_| "OpenClaw did not return a Gateway configuration object".to_string())?;
+    if !gateway.is_object() {
+        return Err("OpenClaw did not return a Gateway configuration object".to_string());
+    }
+    Ok(Some(gateway))
 }
 
 /// The configured public leaf is the local endpoint identity, as in OpenClaw's

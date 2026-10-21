@@ -84,9 +84,41 @@ if (process.argv[2] === "--certificate") {
   setInterval(() => {
     try { process.kill(parent, 0); } catch { process.exit(0); }
   }, 100).unref();
+  let activeServer;
+  let switched = false;
+  const port = Number(process.env.OPENCLAW_GATEWAY_PORT);
+  const configureTimeouts = server => {
+    server.requestTimeout = 2000;
+    server.headersTimeout = 2000;
+    server.on("connection", socket => socket.setTimeout(2000, () => socket.destroy()));
+  };
   const handle = (request, response) => {
     fs.appendFileSync(log, JSON.stringify({pid: process.pid, path: request.url,
       tls: !!request.socket.encrypted}) + "\n");
+    if (!switched && request.socket.encrypted &&
+        (mode === "tls-then-missing" || mode === "tls-then-http-config")) {
+      switched = true;
+      // Stop accepting TLS while retaining this authenticated connection. Bind
+      // HTTP on the released listener before delivering its failing response, so
+      // the next readiness poll cannot miss the downgrade opportunity by racing.
+      activeServer.close();
+      activeServer = http.createServer(handle);
+      configureTimeouts(activeServer);
+      activeServer.listen(port, "127.0.0.1", () => {
+        const configPath = process.env.OPENCLAW_CONFIG_PATH;
+        if (mode === "tls-then-missing") {
+          fs.unlinkSync(configPath);
+        } else {
+          const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+          config.gateway.tls.enabled = false;
+          fs.writeFileSync(configPath, JSON.stringify(config));
+        }
+        fs.writeFileSync(log + ".switched", mode);
+        response.writeHead(503);
+        response.end("{\"ok\":false}");
+      });
+      return;
+    }
     response.writeHead(mode === "unhealthy-tls" ? 503 : 200);
     response.end("{\"ok\":true}");
   };
@@ -102,9 +134,10 @@ if (process.argv[2] === "--certificate") {
       minVersion: mode === "tls12" ? "TLSv1.2" : "TLSv1.3",
       maxVersion: mode === "tls12" ? "TLSv1.2" : "TLSv1.3",
     }, handle);
-    server.requestTimeout = 2000;
-    server.headersTimeout = 2000;
-    server.on("connection", socket => socket.setTimeout(2000, () => socket.destroy()));
-    server.listen(Number(process.env.OPENCLAW_GATEWAY_PORT), "127.0.0.1");
+    activeServer = server;
+    configureTimeouts(server);
+    server.listen(port, "127.0.0.1", () => {
+      fs.writeFileSync(log + ".listening", JSON.stringify({pid: process.pid, tls: !plain}));
+    });
   }
 }

@@ -272,7 +272,7 @@ pub(crate) fn read_private_config_command(
         Some(&interrupt),
     ) {
         Ok(output) if output.status.success() => Ok(output.stdout),
-        Ok(_) => Err("OpenClaw could not resolve gateway.tls.certPath".to_string()),
+        Ok(_) => Err("OpenClaw could not resolve Gateway readiness configuration".to_string()),
         Err(error) if error.cleanup_verified => {
             Err("OpenClaw TLS configuration lookup failed or timed out".to_string())
         }

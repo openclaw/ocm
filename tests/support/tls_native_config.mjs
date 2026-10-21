@@ -6,6 +6,35 @@ import {parseEnv} from 'node:util';
 import {pathToFileURL} from 'node:url';
 import {spawn} from 'node:child_process';
 
+// Deliberately finite fixture contract: JSON root plus at most one root include.
+// Authorized external roots come from native dotenv or the actual launcher env;
+// the OCM caller does not receive this fixture's ambient include authority.
+function fixtureGateway() {
+  const configPath = process.env.OPENCLAW_CONFIG_PATH;
+  const configDirectory = path.dirname(configPath);
+  const dotenv = path.join(configDirectory, '.env');
+  const values = fs.existsSync(dotenv) ? parseEnv(fs.readFileSync(dotenv, 'utf8')) : {};
+  const environment = {...values, ...process.env};
+  let config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  if (config.$include) {
+    const included = fs.realpathSync(path.resolve(configDirectory, config.$include));
+    const roots = [configDirectory, ...(environment.OPENCLAW_INCLUDE_ROOTS ?? '').split(path.delimiter).filter(Boolean)];
+    const permitted = roots.some(root => {
+      const relative = path.relative(fs.realpathSync(root), included);
+      return relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
+    });
+    if (!permitted || fs.statSync(included).size > 65536) throw new Error('fixture include denied');
+    config = JSON.parse(fs.readFileSync(included, 'utf8'));
+    if (config.$include) throw new Error('nested fixture include unsupported');
+  }
+  const gateway = structuredClone(config.gateway);
+  if (typeof gateway.tls?.certPath === 'string') {
+    gateway.tls.certPath = gateway.tls.certPath.replace(/\$\{([^}]+)\}/g,
+      (_, name) => environment[name] ?? '');
+  }
+  return gateway;
+}
+
 if (process.argv[2] === 'config') {
   const blocked = behavior === 'interrupt' && fs.existsSync(queries + '.block');
   let descendantPid;
@@ -29,13 +58,37 @@ if (process.argv[2] === 'config') {
       setTimeout(() => process.exit(0), 45000);
     }
   } else {
-    const values = parseEnv(fs.readFileSync(path.join(path.dirname(process.env.OPENCLAW_CONFIG_PATH), '.env'), 'utf8'));
-    const config = JSON.parse(fs.readFileSync(process.env.OPENCLAW_CONFIG_PATH, 'utf8'));
-    const certificate = config.gateway.tls.certPath.replace(/\$\{([^}]+)\}/g,
-      (_, name) => process.env[name] ?? values[name] ?? '');
-    process.stdout.write(JSON.stringify(certificate));
+    const gateway = fixtureGateway();
+    process.stdout.write(JSON.stringify(gateway), () => {
+      if (behavior === 'retry-generation') {
+        fs.appendFileSync(queries + '.results', JSON.stringify({pid: process.pid,
+          certificate: gateway.tls.certPath}) + '\n');
+        if (gateway.tls.certPath === 'missing-first.pem') {
+          // Publish only after the first result has been fixed and written. The
+          // Gateway must not change dotenv early enough to alter this lookup.
+          fs.writeFileSync(queries + '.first-result', String(process.pid));
+        }
+      }
+    });
   }
 } else if (process.argv[2] === 'gateway' && process.argv[3] === 'run') {
+  if (behavior === 'retry-generation') {
+    const generations = queries + '.generations';
+    const firstGeneration = !fs.existsSync(generations);
+    fs.appendFileSync(generations, JSON.stringify({pid: process.pid}) + '\n');
+    if (firstGeneration) {
+      const waitForFirstResult = setInterval(() => {
+        if (!fs.existsSync(queries + '.first-result')) return;
+        clearInterval(waitForFirstResult);
+        const dotenv = path.join(path.dirname(process.env.OPENCLAW_CONFIG_PATH), '.env');
+        const before = fs.readFileSync(dotenv, 'utf8');
+        fs.writeFileSync(dotenv, before.replace('missing-first.pem', 'fixture-cert.pem'));
+        process.exit(1);
+      }, 20);
+    }
+  }
+  const gateway = fixtureGateway();
+  if ((gateway.tls?.enabled === true) !== (mode !== 'http')) throw new Error('fixture transport mismatch');
   process.argv = [process.argv[0], peer, mode, requests];
   await import(pathToFileURL(peer).href);
 } else if (process.argv[2] === '--version') {

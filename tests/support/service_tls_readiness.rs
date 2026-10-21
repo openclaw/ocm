@@ -46,9 +46,8 @@ impl ReadinessFixture {
                 quote_posix(&path_string(&root.child("requests.jsonl")))
             ),
         );
-        let binding = if let Some(behavior) = native {
-            let binary = root.child("package/node_modules/openclaw/openclaw.mjs");
-            let script = format!(
+        let native_script = |behavior: &str| {
+            format!(
                 "#!/usr/bin/env node\nconst peer = {};\nconst mode = {};\nconst behavior = {};\nconst requests = {};\nconst queries = {};\n{}",
                 json!(peer),
                 json!(mode),
@@ -56,8 +55,11 @@ impl ReadinessFixture {
                 json!(root.child("requests.jsonl")),
                 json!(root.child("queries.jsonl")),
                 include_str!("tls_native_config.mjs"),
-            );
-            write_executable_script(&binary, &script);
+            )
+        };
+        let binding = if let Some(behavior) = native {
+            let binary = root.child("package/node_modules/openclaw/openclaw.mjs");
+            write_executable_script(&binary, &native_script(behavior));
             fs::write(
                 binary.with_file_name("package.json"),
                 r#"{"name":"openclaw","version":"0.0.0","engines":{"node":">=22"}}"#,
@@ -142,8 +144,15 @@ impl ReadinessFixture {
         if native.is_some() {
             config["gateway"]["tls"]["certPath"] = json!("${READINESS_DOTENV_CERT}");
             let dotenv = environment.join(".openclaw/.env");
-            fs::write(&dotenv, "# Native config owns dotenv parsing and interpolation.\nREADINESS_DOTENV_CERT=\"fixture-cert.pem\" # public fixture certificate\n").unwrap();
-            paths.push(dotenv);
+            let initial_certificate = if native == Some("retry-generation") {
+                "missing-first.pem"
+            } else {
+                "fixture-cert.pem"
+            };
+            fs::write(&dotenv, format!("# Native config owns dotenv parsing and interpolation.\nREADINESS_DOTENV_CERT=\"{initial_certificate}\" # public fixture certificate\n")).unwrap();
+            if native != Some("retry-generation") {
+                paths.push(dotenv);
+            }
         } else if certificate == "include" {
             config["env"] = json!({"vars": {"READINESS_CERT": "fixture-cert.pem"}});
             config["gateway"]["tls"] = json!({"$include": "tls.json5"});
@@ -153,9 +162,89 @@ impl ReadinessFixture {
         } else if certificate != "default" {
             config["gateway"]["tls"]["certPath"] = json!(cert);
         }
+        if certificate == "shared-unrelated" {
+            let shared = root.child("shared");
+            fs::create_dir_all(&shared).unwrap();
+            let agents = shared.join("agents.json5");
+            fs::write(&agents, "{ defaults: {} }\n").unwrap();
+            config["agents"] = json!({"$include": agents});
+            // Native launchers can explicitly allow shared configuration roots.
+            // Readiness needs only Gateway settings, not the unrelated graph.
+            let original = fs::read_to_string(&launcher).unwrap();
+            write_executable_script(
+                &launcher,
+                &original.replacen(
+                    "#!/bin/sh\n",
+                    &format!(
+                        "#!/bin/sh\nexport OPENCLAW_INCLUDE_ROOTS={}\n",
+                        quote_posix(&path_string(&shared))
+                    ),
+                    1,
+                ),
+            );
+            paths.push(agents);
+        }
+        if certificate == "blocked-tls-include" {
+            let shared = root.child("shared");
+            fs::create_dir_all(&shared).unwrap();
+            let included = shared.join("tls.json");
+            fs::write(
+                &included,
+                serde_json::to_vec_pretty(&json!({"certPath": cert})).unwrap(),
+            )
+            .unwrap();
+            // enabled=true is visible even though readiness cannot traverse the
+            // selected external include. It must never classify this as HTTP.
+            config["gateway"]["tls"] = json!({"enabled": true, "$include": included});
+            paths.push(included);
+        }
+        if certificate == "blocked-root-after-tls" {
+            let known = environment.join(".openclaw/known-config.json");
+            fs::write(&known, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+            let shared = root.child("shared");
+            fs::create_dir_all(&shared).unwrap();
+            let outside = shared.join("shared.json");
+            fs::write(&outside, b"{}\n").unwrap();
+            // The later include prevents a complete answer, but the earlier
+            // in-bound file already establishes observed TLS evidence. There is
+            // no determining enabled sibling that could mask this uncertainty.
+            config = json!({"$include": ["known-config.json", outside]});
+            paths.extend([known, outside]);
+        }
+        if matches!(certificate, "native-root" | "opaque-root") {
+            let shared = root.child("shared");
+            fs::create_dir_all(&shared).unwrap();
+            let included = shared.join("gateway.json");
+            fs::write(&included, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+            config = json!({"$include": included});
+            paths.push(included);
+            if certificate == "native-root" {
+                let dotenv = environment.join(".openclaw/.env");
+                let contents = fs::read_to_string(&dotenv).unwrap();
+                fs::write(
+                    &dotenv,
+                    format!("{contents}OPENCLAW_INCLUDE_ROOTS={}\n", json!(shared)),
+                )
+                .unwrap();
+            } else {
+                let entrypoint = root.child("opaque-gateway.mjs");
+                fs::write(&entrypoint, native_script("opaque")).unwrap();
+                write_executable_script(
+                    &launcher,
+                    &format!(
+                        "#!/bin/sh\nexport OPENCLAW_INCLUDE_ROOTS={}\nexec {} {} \"$@\"\n",
+                        quote_posix(&path_string(&shared)),
+                        quote_posix(&node),
+                        quote_posix(&path_string(&entrypoint)),
+                    ),
+                );
+            }
+        }
         let source = environment.join(".openclaw/openclaw.json");
         fs::write(&source, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-        paths.push(source);
+        if !matches!(mode, "tls-then-missing" | "tls-then-http-config") {
+            paths.push(source);
+        }
         let sources = paths
             .into_iter()
             .map(|path| {
@@ -465,7 +554,7 @@ fn service_readiness_native_dotenv_lookup_is_once_per_wait_and_keeps_output_priv
             );
             assert_eq!(
                 queries[0]["args"],
-                json!(["config", "get", "gateway.tls.certPath", "--json"])
+                json!(["config", "get", "gateway", "--json"])
             );
             let pid = queries[0]["pid"].as_i64().unwrap() as i32;
             assert_eq!(
@@ -726,4 +815,199 @@ fn service_readiness_interruption_settles_native_helper_and_pipe_holding_descend
         fixture.assert_sources_unchanged();
         fixture.stop();
     }
+}
+
+#[test]
+fn service_readiness_ignores_unrelated_shared_config_includes() {
+    for mode in ["http", "tls"] {
+        let fixture = ReadinessFixture::new(mode, "shared-unrelated");
+        fixture.action(&["service", "start", "demo", "--json"], true);
+        fixture.action(&["service", "restart", "demo", "--force", "--json"], true);
+        fixture.stop();
+    }
+}
+
+#[test]
+fn service_readiness_native_shared_root_config_resolves_http_and_tls() {
+    for mode in ["http", "tls"] {
+        let fixture = ReadinessFixture::with_native(mode, "native-root", Some("success"));
+        fixture.action(&["service", "start", "demo", "--json"], true);
+        let queries = fs::read_to_string(fixture.root.child("queries.jsonl")).unwrap();
+        let queries: Vec<Value> = queries
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(
+            queries[0]["args"],
+            json!(["config", "get", "gateway", "--json"])
+        );
+        let requests = fs::read_to_string(fixture.root.child("requests.jsonl")).unwrap();
+        assert!(requests.lines().any(|line| {
+            let request: Value = serde_json::from_str(line).unwrap();
+            request["path"] == "/health" && request["tls"] == (mode == "tls")
+        }));
+        fixture.stop();
+    }
+}
+
+#[test]
+fn service_readiness_opaque_shared_root_contract() {
+    for (mode, ready) in [("http", true), ("tls", false)] {
+        let fixture = ReadinessFixture::new(mode, "opaque-root");
+        fixture.action(&["service", "start", "demo", "--json"], ready);
+        let listening: Value = serde_json::from_slice(
+            &fs::read(fixture.root.child("requests.jsonl.listening")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            listening["tls"],
+            mode == "tls",
+            "peer did not establish its configured listener"
+        );
+        assert!(
+            !fixture.root.child("queries.jsonl").exists(),
+            "opaque launcher received a config command"
+        );
+        if mode == "tls" {
+            assert!(
+                !fixture.root.child("requests.jsonl").exists(),
+                "hidden TLS was claimed ready through an HTTP request"
+            );
+        }
+        fixture.stop();
+    }
+}
+
+#[test]
+fn service_readiness_visible_tls_does_not_downgrade_when_selected_include_is_inaccessible() {
+    for certificate in ["blocked-tls-include", "blocked-root-after-tls"] {
+        let fixture = ReadinessFixture::new("plaintext-only", certificate);
+        fixture.action(&["service", "start", "demo", "--json"], false);
+        assert!(
+            fixture.root.child("requests.jsonl.listening").exists(),
+            "plaintext peer never listened"
+        );
+        assert!(
+            !fixture.root.child("requests.jsonl").exists(),
+            "visible TLS was downgraded after include failure"
+        );
+        fixture.stop();
+    }
+}
+
+#[test]
+fn service_readiness_keeps_tls_after_config_disappears_or_changes_during_wait() {
+    for mode in ["tls-then-missing", "tls-then-http-config"] {
+        let fixture = ReadinessFixture::new(mode, "explicit");
+        let config = fixture.root.child("environment/.openclaw/openclaw.json");
+        let mut expected: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        expected["gateway"]["tls"]["enabled"] = json!(false);
+        fixture.action(&["service", "start", "demo", "--json"], false);
+        assert_eq!(
+            fs::read_to_string(fixture.root.child("requests.jsonl.switched")).unwrap(),
+            mode
+        );
+        // The peer switches the same listening port to HTTP200 and mutates its
+        // fixture config before delivering the first authenticated TLS503. This
+        // makes the next poll a deterministic opportunity for a bad downgrade.
+        if mode == "tls-then-missing" {
+            assert!(
+                !config.exists(),
+                "fixture config disappearance was not retained"
+            );
+        } else {
+            let actual: Value = serde_json::from_slice(&fs::read(config).unwrap()).unwrap();
+            assert_eq!(
+                actual, expected,
+                "only the fixture's intentional transport setting should change"
+            );
+        }
+        let requests = fs::read_to_string(fixture.root.child("requests.jsonl")).unwrap();
+        let requests: Vec<Value> = requests
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            requests.len(),
+            1,
+            "readiness sent an HTTP request after choosing TLS"
+        );
+        assert_eq!(requests[0]["path"], "/health");
+        assert_eq!(requests[0]["tls"], true);
+        fixture.stop();
+    }
+}
+
+#[test]
+fn service_readiness_requeries_native_config_for_scheduled_replacement_child() {
+    let mut fixture = ReadinessFixture::with_native("tls", "explicit", Some("retry-generation"));
+    fixture.env.insert(
+        "OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS".into(),
+        "6000".into(),
+    );
+    let dotenv = fixture.root.child("environment/.openclaw/.env");
+    let before = fs::read_to_string(&dotenv).unwrap();
+    assert!(before.contains("missing-first.pem"));
+    let status = fixture.action(&["service", "start", "demo", "--json"], true);
+    let read_records = |name| -> Vec<Value> {
+        fs::read_to_string(fixture.root.child(name))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let generations = read_records("queries.jsonl.generations");
+    assert_eq!(
+        generations.len(),
+        2,
+        "expected exactly one scheduled Gateway replacement"
+    );
+    let first = generations[0]["pid"].as_i64().unwrap() as i32;
+    let second = generations[1]["pid"].as_i64().unwrap() as i32;
+    assert_ne!(first, second);
+    assert_eq!(status["childPid"], second);
+    assert_eq!(status["childRestartCount"], 1);
+    assert!(
+        !lookup_process_live(first),
+        "first Gateway generation remained live"
+    );
+    assert!(lookup_process_live(second));
+
+    let queries = read_records("queries.jsonl");
+    let results = read_records("queries.jsonl.results");
+    assert_eq!(
+        queries.len(),
+        2,
+        "native query cache outlived its supervised child"
+    );
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["certificate"], "missing-first.pem");
+    assert_eq!(results[1]["certificate"], "fixture-cert.pem");
+    for (query, result) in queries.iter().zip(&results) {
+        assert_eq!(query["args"], json!(["config", "get", "gateway", "--json"]));
+        assert_eq!(query["pid"], result["pid"]);
+        assert!(
+            !lookup_process_live(query["pid"].as_i64().unwrap() as i32),
+            "native helper remained live"
+        );
+    }
+    let requests = read_records("requests.jsonl");
+    assert!(!requests.is_empty());
+    assert!(
+        requests.iter().all(|request| request["tls"] == true
+            && request["path"] == "/health"
+            && request["pid"] == second),
+        "readiness accepted a stale child or sent plaintext HTTP"
+    );
+    assert_eq!(
+        fs::read_to_string(dotenv).unwrap(),
+        before.replace("missing-first.pem", "fixture-cert.pem")
+    );
+    fixture.assert_sources_unchanged();
+    fixture.stop();
+    assert!(
+        !lookup_process_live(second),
+        "replacement Gateway remained live after stop"
+    );
 }
