@@ -832,10 +832,14 @@ pub(crate) fn ensure_minimum_local_openclaw_config(
 ) -> Result<(), String> {
     ensure_local_state_paths(target_paths)?;
     let original = read_config_value(&target_paths.config_path)?;
+    let effective = load_effective_openclaw_config(&target_paths.config_path)?
+        .map(|config| config.value)
+        .unwrap_or_else(|| json!({}));
     let value = minimum_local_config_value(
         target_paths,
         gateway_port,
         original.clone().unwrap_or_else(|| json!({})),
+        &effective,
     )?;
     if original.as_ref() == Some(&value) {
         return Ok(());
@@ -855,7 +859,8 @@ pub(super) fn initialize_new_dev_openclaw_config(
     #[cfg(any(unix, windows))]
     {
         ensure_local_state_paths(target_paths)?;
-        let mut value = minimum_local_config_value(target_paths, gateway_port, json!({}))?;
+        let mut value =
+            minimum_local_config_value(target_paths, gateway_port, json!({}), &json!({}))?;
         let mut bytes = [0_u8; 32];
         getrandom::fill(&mut bytes)
             .map_err(|error| format!("failed to generate dev Gateway authentication: {error}"))?;
@@ -886,6 +891,7 @@ fn minimum_local_config_value(
     target_paths: &EnvPaths,
     gateway_port: u32,
     mut value: Value,
+    effective: &Value,
 ) -> Result<Value, String> {
     let workspace = display_path(&target_paths.workspace_dir);
     if !value.is_object() {
@@ -897,22 +903,24 @@ fn minimum_local_config_value(
         .ok_or_else(|| "OpenClaw config root must be an object".to_string())?;
 
     let gateway = ensure_object_field(root, "gateway");
-    gateway
-        .entry("mode".to_string())
-        .or_insert_with(|| Value::String("local".to_string()));
-    gateway
-        .entry("bind".to_string())
-        .or_insert_with(|| Value::String("loopback".to_string()));
+    // Root siblings override includes. Add defaults only when the effective
+    // configuration lacks them, leaving authored include values at their source.
+    if effective.pointer("/gateway/mode").is_none() {
+        gateway.insert("mode".to_string(), Value::String("local".to_string()));
+    }
+    if effective.pointer("/gateway/bind").is_none() {
+        gateway.insert("bind".to_string(), Value::String("loopback".to_string()));
+    }
     gateway.insert(
         "port".to_string(),
         Value::Number(serde_json::Number::from(gateway_port)),
     );
 
-    let agents = ensure_object_field(root, "agents");
-    let defaults = ensure_object_field(agents, "defaults");
-    defaults
-        .entry("workspace".to_string())
-        .or_insert_with(|| Value::String(workspace));
+    if effective.pointer("/agents/defaults/workspace").is_none() {
+        let agents = ensure_object_field(root, "agents");
+        let defaults = ensure_object_field(agents, "defaults");
+        defaults.insert("workspace".to_string(), Value::String(workspace));
+    }
 
     Ok(value)
 }
@@ -2332,6 +2340,88 @@ mod tests {
             fs::metadata(&control).unwrap().permissions().mode()
         );
         assert!(!file_has_no_extended_acl(&fs::File::open(&paths.state_dir).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn minimum_config_preserves_nested_includes_and_fills_only_absent_defaults() {
+        for authored in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = derive_env_paths(root.path());
+            fs::create_dir_all(&paths.state_dir).unwrap();
+            let gateway = if authored {
+                json!({"mode": "remote", "bind": "lan", "port": 19800})
+            } else {
+                json!({"port": 19800})
+            };
+            let defaults = if authored {
+                json!({"workspace": display_path(&paths.state_dir.join("custom"))})
+            } else {
+                json!({"model": "authored-model"})
+            };
+            let gateway_path = paths.state_dir.join("gateway.json");
+            let defaults_path = paths.state_dir.join("defaults.json");
+            let gateway_bytes = serde_json::to_vec(&gateway).unwrap();
+            let defaults_bytes = serde_json::to_vec(&defaults).unwrap();
+            fs::write(&gateway_path, &gateway_bytes).unwrap();
+            fs::write(&defaults_path, &defaults_bytes).unwrap();
+            write_config_value(
+                &paths.config_path,
+                &json!({
+                    "gateway": {"$include": "./gateway.json"},
+                    "agents": {"defaults": {"$include": "./defaults.json"}}
+                }),
+            )
+            .unwrap();
+
+            ensure_minimum_local_openclaw_config(&paths, 19801).unwrap();
+            let effective = load_effective_openclaw_config(&paths.config_path)
+                .unwrap()
+                .unwrap()
+                .value;
+            assert_eq!(effective["gateway"]["port"], 19801);
+            assert_eq!(
+                effective["gateway"]["mode"],
+                if authored { "remote" } else { "local" }
+            );
+            assert_eq!(
+                effective["gateway"]["bind"],
+                if authored { "lan" } else { "loopback" }
+            );
+            assert_eq!(
+                effective["agents"]["defaults"]["workspace"],
+                if authored {
+                    display_path(&paths.state_dir.join("custom"))
+                } else {
+                    display_path(&paths.workspace_dir)
+                }
+            );
+            let raw = read_config_value(&paths.config_path).unwrap().unwrap();
+            assert_eq!(raw["gateway"]["$include"], "./gateway.json");
+            assert_eq!(raw["agents"]["defaults"]["$include"], "./defaults.json");
+            if authored {
+                assert!(raw["gateway"].get("mode").is_none());
+                assert!(raw["gateway"].get("bind").is_none());
+                assert!(raw["agents"]["defaults"].get("workspace").is_none());
+            } else {
+                assert_eq!(effective["agents"]["defaults"]["model"], "authored-model");
+            }
+            assert_eq!(fs::read(&gateway_path).unwrap(), gateway_bytes);
+            assert_eq!(fs::read(&defaults_path).unwrap(), defaults_bytes);
+            let once = fs::read(&paths.config_path).unwrap();
+            ensure_minimum_local_openclaw_config(&paths, 19801).unwrap();
+            assert_eq!(fs::read(&paths.config_path).unwrap(), once);
+        }
+    }
+
+    #[test]
+    fn minimum_config_does_not_write_when_include_resolution_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = derive_env_paths(root.path());
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        let original = b"{ $include: './missing.json' }\n";
+        fs::write(&paths.config_path, original).unwrap();
+        assert!(ensure_minimum_local_openclaw_config(&paths, 19800).is_err());
+        assert_eq!(fs::read(&paths.config_path).unwrap(), original);
     }
 
     #[test]

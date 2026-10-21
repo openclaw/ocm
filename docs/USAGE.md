@@ -55,6 +55,9 @@ ocm start luna --command 'pnpm openclaw' --cwd /path/to/openclaw
 
 `start` creates or reuses the environment, prepares the chosen OpenClaw source, and can run onboarding for you.
 By default, it also installs and starts the environment service so OpenClaw keeps running in the background.
+Minimum setup fills missing settings using the effective configuration, preserving
+authored values supplied through supported internal `$include` files. Included
+files remain unchanged, and the environment’s selected Gateway port still applies.
 With `--onboard`, onboarding runs first, and OCM installs and starts the service only
 after onboarding succeeds. This also applies when you choose both onboarding and
 background running in `setup`. Failed or cancelled onboarding leaves a new
