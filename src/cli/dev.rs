@@ -2425,8 +2425,11 @@ fn source_dependency_preparation_error(repo_root: &Path, issue: &str) -> String 
 fn install_source_watch_signal_handler() -> Result<Arc<AtomicBool>, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&stop);
-    ctrlc::set_handler(move || signal_flag.store(true, Ordering::SeqCst))
-        .map_err(|error| format!("failed to install dev watch signal handler: {error}"))?;
+    crate::infra::interrupt::set_handler(move || {
+        signal_flag.store(true, Ordering::SeqCst);
+        true
+    })
+    .map_err(|error| format!("failed to install dev watch signal handler: {error}"))?;
     Ok(stop)
 }
 

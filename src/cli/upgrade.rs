@@ -164,12 +164,8 @@ fn install_upgrade_interrupt_handler() -> Result<(), String> {
     UPGRADE_SIGNAL_HANDLER
         .get_or_init(|| {
             UPGRADE_INTERRUPT_STATE.store(0, Ordering::SeqCst);
-            ctrlc::set_handler(|| {
-                if !request_upgrade_interrupt() {
-                    std::process::exit(130);
-                }
-            })
-            .map_err(|error| format!("failed to install upgrade signal handler: {error}"))
+            crate::infra::interrupt::set_handler(request_upgrade_interrupt)
+                .map_err(|error| format!("failed to install upgrade signal handler: {error}"))
         })
         .clone()
 }

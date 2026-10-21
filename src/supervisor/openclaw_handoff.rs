@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use super::SupervisorChildSpec;
+use crate::infra::interrupt::CaptureInterrupt;
 #[cfg(test)]
 use crate::infra::shell::OPENCLAW_NATIVE_SERVICE_IDENTITY_KEYS;
 use crate::infra::shell::{
@@ -251,7 +252,7 @@ fn run_openclaw_machine_command_with_timeout(
         .env_clear()
         .envs(&spec.process_env)
         .current_dir(Path::new(&spec.run_dir));
-    run_captured_machine_command(command, timeout, &spec.env_name)
+    run_captured_machine_command(command, timeout, &spec.env_name, None)
 }
 
 /// Reuse bounded capture and process-group settlement without exposing private
@@ -259,8 +260,17 @@ fn run_openclaw_machine_command_with_timeout(
 pub(crate) fn read_private_config_command(
     command: Command,
     timeout: Duration,
+    operation_generation: u64,
 ) -> Result<Vec<u8>, String> {
-    match run_captured_machine_command(command, timeout, "Gateway TLS configuration") {
+    // This outer guard drops only after the capture function has destroyed its
+    // readers and completed child cleanup, including its early error paths.
+    let interrupt = CaptureInterrupt::enter(operation_generation)?;
+    match run_captured_machine_command(
+        command,
+        timeout,
+        "Gateway TLS configuration",
+        Some(&interrupt),
+    ) {
         Ok(output) if output.status.success() => Ok(output.stdout),
         Ok(_) => Err("OpenClaw could not resolve gateway.tls.certPath".to_string()),
         Err(error) if error.cleanup_verified => {
@@ -274,6 +284,7 @@ fn run_captured_machine_command(
     mut command: Command,
     timeout: Duration,
     env_name: &str,
+    interrupt: Option<&CaptureInterrupt>,
 ) -> Result<CommandOutput, MachineCommandError> {
     // Configure capture before spawning so every post-spawn failure settles the child.
     let (mut stdout, stdout_writer) = CommandCapture::new()
@@ -286,6 +297,13 @@ fn run_captured_machine_command(
         .stderr(stderr_writer);
     #[cfg(unix)]
     command.process_group(0);
+    if interrupt.is_some_and(CaptureInterrupt::interrupted) {
+        return Err(
+            "private configuration command was interrupted before startup"
+                .to_string()
+                .into(),
+        );
+    }
     let mut child = command.spawn().map_err(|error| {
         format!(
             "failed running restart-handoff command for env \"{}\": {error}",
@@ -295,7 +313,7 @@ fn run_captured_machine_command(
     // Command retains the parent-side writers even after spawn.
     drop(command);
     let deadline = Instant::now() + timeout;
-    let result = collect_command(&mut child, &mut stdout, &mut stderr, deadline);
+    let result = collect_command(&mut child, &mut stdout, &mut stderr, deadline, interrupt);
     match result {
         Ok(status) => Ok(CommandOutput {
             status,
@@ -411,8 +429,12 @@ fn collect_command(
     stdout: &mut CommandCapture,
     stderr: &mut CommandCapture,
     deadline: Instant,
+    interrupt: Option<&CaptureInterrupt>,
 ) -> Result<ExitStatus, String> {
     loop {
+        if interrupt.is_some_and(CaptureInterrupt::interrupted) {
+            return Err("private configuration command was interrupted".to_string());
+        }
         stdout
             .drain()
             .map_err(|error| format!("failed reading restart-handoff stdout: {error}"))?;

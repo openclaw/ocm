@@ -4,6 +4,7 @@ mod archive_path_guard;
 pub(crate) mod command_output;
 pub mod download;
 pub(crate) mod install_owner;
+pub(crate) mod interrupt;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_security;
 pub mod process;

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use super::inspect::{ServiceSummary, service_status_for_readiness};
+use super::inspect::{ServiceSummary, service_readiness_observation};
 use crate::env::{EnvMeta, EnvironmentService, ExecutionBinding, resolve_execution_binding};
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::store::gateway_readiness_certificate;
@@ -48,6 +48,7 @@ fn wait_for_gateway_readiness_with_timeout(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<GatewayReadiness, String> {
+    let interrupt_generation = crate::infra::interrupt::generation();
     let meta = EnvironmentService::new(env, cwd).get(name)?;
     let started = Instant::now();
     let deadline = Instant::now() + timeout;
@@ -55,30 +56,45 @@ fn wait_for_gateway_readiness_with_timeout(
     let mut permitted_retry_count = None;
     let mut process_observed_after_ms = None;
     loop {
-        let status = service_status_for_readiness(name, env, cwd)?;
+        let (status, child_spec) = service_readiness_observation(name, env, cwd)?;
         if process_observed_after_ms.is_none() && status.child_pid.is_some() {
             process_observed_after_ms = Some(duration_ms(started.elapsed()));
         }
         let port = status.child_port.unwrap_or(status.gateway_port);
         let probe = if status.running {
-            gateway_readiness_certificate(&meta, port, Path::new(&status.run_dir), env, || {
-                native_certificate_path
-                    .get_or_insert_with(|| {
-                        resolve_native_certificate_path(
-                            &meta,
-                            port,
-                            Path::new(&status.run_dir),
-                            env,
-                            cwd,
-                            deadline,
-                        )
-                    })
-                    .clone()
-            })
-            .and_then(|certificate| gateway_health_ok(port, certificate, deadline))
+            child_spec
+                .as_ref()
+                .ok_or_else(|| "Gateway launch environment is unavailable".to_string())
+                .and_then(|child| {
+                    gateway_readiness_certificate(
+                        &meta,
+                        port,
+                        Path::new(&child.run_dir),
+                        &child.process_env,
+                        || {
+                            native_certificate_path
+                                .get_or_insert_with(|| {
+                                    resolve_native_certificate_path(
+                                        &meta,
+                                        port,
+                                        Path::new(&child.run_dir),
+                                        &child.process_env,
+                                        cwd,
+                                        deadline,
+                                        interrupt_generation,
+                                    )
+                                })
+                                .clone()
+                        },
+                    )
+                    .and_then(|certificate| gateway_health_ok(port, certificate, deadline))
+                })
         } else {
             Ok(false)
         };
+        if crate::infra::interrupt::interrupted_since(interrupt_generation) {
+            return Err("Gateway readiness interrupted".to_string());
+        }
         if matches!(probe, Ok(true)) {
             return Ok(GatewayReadiness {
                 ready: true,
@@ -156,6 +172,7 @@ fn resolve_native_certificate_path(
     env: &BTreeMap<String, String>,
     cwd: &Path,
     deadline: Instant,
+    interrupt_generation: u64,
 ) -> Result<Option<String>, String> {
     let args = ["config", "get", "gateway.tls.certPath", "--json"].map(str::to_string);
     let mut meta = meta.clone();
@@ -205,6 +222,7 @@ fn resolve_native_certificate_path(
     let output = crate::supervisor::read_private_config_command(
         command,
         remaining.min(Duration::from_secs(15)),
+        interrupt_generation,
     )?;
     let path: String = serde_json::from_slice(&output)
         .map_err(|_| "OpenClaw did not return a string for gateway.tls.certPath".to_string())?;

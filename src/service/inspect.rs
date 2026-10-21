@@ -174,10 +174,19 @@ pub(crate) fn service_status_for_readiness(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<ServiceSummary, String> {
+    service_readiness_observation(name, env, cwd).map(|(status, _)| status)
+}
+
+pub(super) fn service_readiness_observation(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(ServiceSummary, Option<SupervisorChildSpec>), String> {
     let env_service = EnvironmentService::new(env, cwd);
     let meta = env_service.get(name)?;
     let snapshot = load_service_snapshot(env, cwd, true)?;
-    build_service_summary(&env_service, &meta, env, cwd, &snapshot)
+    let status = build_service_summary(&env_service, &meta, env, cwd, &snapshot)?;
+    Ok((status, snapshot.planned_children.get(name).cloned()))
 }
 
 fn load_service_snapshot(

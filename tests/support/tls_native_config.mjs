@@ -4,10 +4,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {parseEnv} from 'node:util';
 import {pathToFileURL} from 'node:url';
+import {spawn} from 'node:child_process';
 
 if (process.argv[2] === 'config') {
-  fs.appendFileSync(queries, JSON.stringify({pid: process.pid, args: process.argv.slice(2)}) + '\n');
-  if (behavior === 'failure' || behavior === 'timeout') {
+  const blocked = behavior === 'interrupt' && fs.existsSync(queries + '.block');
+  let descendantPid;
+  if (blocked) {
+    // Inherit both capture pipes, so killing just the direct helper is insufficient.
+    const descendant = spawn(process.execPath, ['-e',
+      `require('node:fs').writeFileSync(${JSON.stringify(queries + '.descendant-ready')}, String(process.pid));
+       process.stdout.write('NATIVE_CONFIG_PRIVATE_SENTINEL_DESCENDANT');
+       setTimeout(() => process.exit(0), 45000);`
+    ], {stdio: ['ignore', 'inherit', 'inherit']});
+    descendantPid = descendant.pid;
+  }
+  fs.appendFileSync(queries, JSON.stringify({pid: process.pid, descendantPid, args: process.argv.slice(2)}) + '\n');
+  if (behavior === 'failure' || behavior === 'timeout' || blocked) {
     process.stdout.write('NATIVE_CONFIG_PRIVATE_SENTINEL_STDOUT');
     process.stderr.write('NATIVE_CONFIG_PRIVATE_SENTINEL_STDERR');
     if (behavior === 'failure') {

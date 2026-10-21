@@ -248,14 +248,7 @@ impl ReadinessFixture {
                 "{summary}"
             );
         }
-        for (path, bytes) in &self.sources {
-            assert_eq!(
-                fs::read(path).unwrap(),
-                *bytes,
-                "readiness changed {}",
-                path.display()
-            );
-        }
+        self.assert_sources_unchanged();
         let status = run_ocm(
             &self.cwd,
             &self.env,
@@ -265,6 +258,17 @@ impl ReadinessFixture {
         let status: Value = serde_json::from_slice(&status.stdout).unwrap();
         assert!(status["childPid"].as_u64().is_some(), "{status}");
         status
+    }
+
+    fn assert_sources_unchanged(&self) {
+        for (path, bytes) in &self.sources {
+            assert_eq!(
+                fs::read(path).unwrap(),
+                *bytes,
+                "readiness changed {}",
+                path.display()
+            );
+        }
     }
 
     fn stop(&self) {
@@ -331,7 +335,11 @@ fn service_readiness_probes_http_and_tls_across_start_and_forced_restart() {
 
 #[test]
 fn service_readiness_resolves_included_tls_and_config_env_relative_certificate() {
-    let fixture = ReadinessFixture::new("tls", "include");
+    let mut fixture = ReadinessFixture::new("tls", "include");
+    // A caller shell must not override the supervised Gateway's config.env.vars.
+    fixture
+        .env
+        .insert("READINESS_CERT".into(), "caller-missing-cert.pem".into());
     fixture.action(&["service", "start", "demo", "--json"], true);
     fixture.stop();
 }
@@ -428,7 +436,15 @@ fn service_readiness_native_dotenv_lookup_is_once_per_wait_and_keeps_output_priv
         ("tls", "timeout", false),
         ("tls", "registered", false),
     ] {
-        let fixture = ReadinessFixture::with_native(mode, "explicit", Some(behavior));
+        let mut fixture = ReadinessFixture::with_native(mode, "explicit", Some(behavior));
+        if behavior == "success" {
+            // The daemon was started without this caller-only value; its .env
+            // remains the source used by the supervised Gateway and config getter.
+            fixture.env.insert(
+                "READINESS_DOTENV_CERT".into(),
+                "caller-missing-cert.pem".into(),
+            );
+        }
         fixture.action(&["service", "start", "demo", "--json"], ready);
         let queries_path = fixture.root.child("queries.jsonl");
         if behavior == "registered" {
@@ -471,6 +487,243 @@ fn service_readiness_native_dotenv_lookup_is_once_per_wait_and_keeps_output_priv
                 "negative peer did not exercise readiness retries"
             );
         }
+        fixture.stop();
+    }
+}
+
+struct InterruptedLookup {
+    cli: Child,
+    fixture_root: PathBuf,
+    queries: PathBuf,
+    owned: Vec<(i32, String)>,
+}
+
+impl InterruptedLookup {
+    fn start(fixture: &ReadinessFixture, args: &[&str], ignore_hup: bool) -> Self {
+        use std::os::unix::process::CommandExt;
+
+        let output = fs::File::create(fixture.root.child("interrupted.stdout")).unwrap();
+        let error = fs::File::create(fixture.root.child("interrupted.stderr")).unwrap();
+        let mut command = Command::new(support::ocm_test_binary_path());
+        command
+            .args(args)
+            .env_clear()
+            .envs(&fixture.env)
+            // Signal cleanup must finish well before the ordinary timeout.
+            .env("OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS", "15000")
+            .current_dir(&fixture.cwd)
+            .stdin(Stdio::null())
+            .stdout(output)
+            .stderr(error);
+        if ignore_hup {
+            // Detached workers inherit this policy across exec. Set it only in
+            // the fixture child, never in the test runner or supervisor.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let cli = command.spawn().unwrap();
+        Self {
+            cli,
+            fixture_root: fixture.root.path().to_path_buf(),
+            queries: fixture.root.child("queries.jsonl"),
+            owned: Vec::new(),
+        }
+    }
+
+    fn observe_helper(&mut self) -> Option<(i32, i32)> {
+        let queries = fs::read_to_string(&self.queries).ok()?;
+        let query = queries
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|query| query["descendantPid"].as_i64().is_some())?;
+        let helper = query["pid"].as_i64()? as i32;
+        let descendant = query["descendantPid"].as_i64()? as i32;
+        for pid in [helper, descendant] {
+            if !self.owned.iter().any(|(owned, _)| *owned == pid)
+                && let Some(identity) = lookup_process_identity(pid)
+                && identity.contains(&path_string(&self.fixture_root))
+            {
+                self.owned.push((pid, identity));
+            }
+        }
+        Some((helper, descendant))
+    }
+}
+
+impl Drop for InterruptedLookup {
+    fn drop(&mut self) {
+        // Preserve ownership before stopping the caller, also on a setup panic.
+        self.observe_helper();
+        if self.cli.try_wait().ok().flatten().is_none() {
+            let _ = self.cli.kill();
+        }
+        let _ = self.cli.wait();
+        for (pid, identity) in &self.owned {
+            // The unique fixture path and recorded birth/command protect against
+            // PID reuse. Never signal an unrecognized process from a stale log.
+            if lookup_process_identity(*pid).as_ref() == Some(identity) {
+                unsafe {
+                    libc::kill(*pid, libc::SIGKILL);
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self
+            .owned
+            .iter()
+            .any(|(pid, identity)| lookup_process_identity(*pid).as_ref() == Some(identity))
+        {
+            if Instant::now() >= deadline {
+                if std::thread::panicking() {
+                    eprintln!("fixture native lookup cleanup could not verify settlement");
+                } else {
+                    panic!("fixture native lookup cleanup could not verify settlement");
+                }
+                break;
+            }
+            sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+fn lookup_process_identity(pid: i32) -> Option<String> {
+    let output = Command::new("/bin/ps")
+        .args([
+            "-ww",
+            "-o",
+            "lstart=",
+            "-o",
+            "args=",
+            "-p",
+            &pid.to_string(),
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn lookup_process_live(pid: i32) -> bool {
+    // Same zombie treatment as the supervisor shutdown fixtures: an unreaped
+    // exited descendant cannot execute or retain capture pipes.
+    let output = Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    if output.status.success() {
+        return !String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .starts_with('Z');
+    }
+    assert!(
+        output.status.code() == Some(1) && output.stdout.is_empty(),
+        "cannot inspect fixture child"
+    );
+    false
+}
+
+#[test]
+fn service_readiness_interruption_settles_native_helper_and_pipe_holding_descendant() {
+    for (signal, restart, ignore_hup) in [
+        (libc::SIGINT, false, false),
+        (libc::SIGINT, true, false),
+        (libc::SIGTERM, false, false),
+        (libc::SIGTERM, true, false),
+        (libc::SIGTERM, false, true),
+    ] {
+        let fixture = ReadinessFixture::with_native("tls", "explicit", Some("interrupt"));
+        if restart {
+            fixture.action(&["service", "start", "demo", "--json"], true);
+        }
+        fs::write(
+            fixture.root.child("queries.jsonl.block"),
+            b"block native lookup",
+        )
+        .unwrap();
+        let args: &[&str] = if restart {
+            &["service", "restart", "demo", "--force", "--json"]
+        } else {
+            &["service", "start", "demo", "--json"]
+        };
+        let mut lookup = InterruptedLookup::start(&fixture, args, ignore_hup);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let (helper, descendant) = loop {
+            if let Some(pids) = lookup.observe_helper()
+                && fixture
+                    .root
+                    .child("queries.jsonl.descendant-ready")
+                    .exists()
+            {
+                break pids;
+            }
+            assert!(
+                lookup.cli.try_wait().unwrap().is_none(),
+                "CLI exited before blocked lookup"
+            );
+            assert!(Instant::now() < deadline, "native helper did not block");
+            sleep(Duration::from_millis(20));
+        };
+        assert!(lookup_process_live(helper) && lookup_process_live(descendant));
+        assert_eq!(
+            lookup.owned.len(),
+            2,
+            "fixture did not retain both process identities"
+        );
+        if ignore_hup {
+            assert_eq!(
+                unsafe { libc::kill(lookup.cli.id() as i32, libc::SIGHUP) },
+                0
+            );
+            let observe_until = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < observe_until {
+                assert!(
+                    lookup.cli.try_wait().unwrap().is_none(),
+                    "capture replaced inherited ignored SIGHUP"
+                );
+                sleep(Duration::from_millis(20));
+            }
+            assert!(
+                lookup_process_live(helper) && lookup_process_live(descendant),
+                "ignored SIGHUP cancelled the native lookup"
+            );
+        }
+        assert_eq!(unsafe { libc::kill(lookup.cli.id() as i32, signal) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = lookup.cli.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "interrupted CLI did not exit promptly"
+            );
+            sleep(Duration::from_millis(20));
+        };
+        assert!(!status.success(), "interrupted readiness reported success");
+        while lookup_process_live(helper) || lookup_process_live(descendant) {
+            assert!(
+                Instant::now() < deadline,
+                "interrupted native lookup left a live process"
+            );
+            sleep(Duration::from_millis(20));
+        }
+        for stream in ["interrupted.stdout", "interrupted.stderr"] {
+            assert!(
+                !fs::read_to_string(fixture.root.child(stream))
+                    .unwrap()
+                    .contains("NATIVE_CONFIG_PRIVATE_SENTINEL"),
+                "private lookup output leaked"
+            );
+        }
+        fixture.assert_sources_unchanged();
         fixture.stop();
     }
 }

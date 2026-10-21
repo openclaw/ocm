@@ -524,7 +524,7 @@ plaintext for a TLS environment. For templated certificate paths in dev and
 installed OpenClaw package bindings, it makes one private, bounded native
 `config get gateway.tls.certPath --json` call so OpenClaw owns `.env` resolution.
 Generic launchers and registered executables are not sent configuration commands;
-their certificate paths use literals, inherited variables, or `config.env` values.
+their certificate paths use literals, supervised-process variables, or `config.env` values.
 Missing or mismatched certificates keep the
 Gateway unready within the normal readiness timeout. HTTP environments retain
 the ordinary HTTP health check.

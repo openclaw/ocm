@@ -1492,8 +1492,9 @@ impl<'a> SupervisorService<'a> {
     ) -> Result<SupervisorRunSummary, String> {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let signal_flag = Arc::clone(&stop_requested);
-        ctrlc::set_handler(move || {
+        crate::infra::interrupt::set_handler(move || {
             signal_flag.store(true, Ordering::SeqCst);
+            true
         })
         .map_err(|error| format!("failed to install service signal handler: {error}"))?;
 
