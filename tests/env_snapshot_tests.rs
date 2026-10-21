@@ -40,6 +40,12 @@ fn install_fake_launchctl(root: &TestDir, env: &mut std::collections::BTreeMap<S
 
 #[cfg(target_os = "linux")]
 fn assert_live_snapshot_compensation(mode: &str) {
+    // Isolated registries otherwise select the same default families before
+    // their peers start. Keep each live scenario's ports through teardown.
+    static LIVE_SNAPSHOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LIVE_SNAPSHOT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let root = TestDir::new("snapshot-live-compensation");
     let mut env = ocm_env(&root);
     env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
@@ -59,28 +65,6 @@ fn assert_live_snapshot_compensation(mode: &str) {
         output.status.success(),
         "live snapshot compensation ({mode}) failed with {}:\nstdout={}\nstderr={}",
         output.status,
-        stdout(&output),
-        stderr(&output)
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn live_snapshot_fixture_selects_available_disjoint_port_families() {
-    let root = TestDir::new("snapshot-port-allocation");
-    let output = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/snapshot_live_compensation.py"
-        ))
-        .arg("port-allocation")
-        .env_clear()
-        .envs(ocm_env(&root))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "port-family allocation failed:\nstdout={}\nstderr={}",
         stdout(&output),
         stderr(&output)
     );

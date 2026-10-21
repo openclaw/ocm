@@ -2,13 +2,11 @@
 """Real CLI/supervisor coverage with finite synthetic Gateways and no native service."""
 
 import http.server
-from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
 import shlex
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -143,73 +141,6 @@ def wait_until(predicate, description, timeout=8):
     raise AssertionError("timed out waiting for " + description)
 
 
-def available_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def port_family(port):
-    # Match src/store/gateway_ports.rs, including the upper port boundary.
-    return range(port, min(port + 110, 65535) + 1)
-
-
-def available_port_family(claimed):
-    for _ in range(128):
-        port = available_port()
-        family = port_family(port)
-        if not claimed.isdisjoint(family):
-            continue
-        try:
-            with ExitStack() as probes:
-                for member in family:
-                    sock = probes.enter_context(socket.socket())
-                    sock.bind(("127.0.0.1", member))
-                return port
-        except OSError:
-            pass
-    raise AssertionError("no available disjoint Gateway port family after 128 candidates")
-
-
-def assert_port_allocation():
-    from unittest.mock import patch
-
-    first = available_port_family(set())
-    claimed = set(port_family(first))
-    second = available_port_family(claimed)
-    assert claimed.isdisjoint(port_family(second))
-
-    # Occupy a non-base member before candidate selection. All earlier probes
-    # must close both when selection succeeds elsewhere and when it exhausts.
-    with socket.socket() as blocker:
-        blocked_member = port_family(first)[-1]
-        assert blocked_member != first
-        blocker.bind(("127.0.0.1", blocked_member))
-        blocker.listen()
-        with patch(__name__ + ".available_port", side_effect=[first, second]):
-            assert available_port_family(set()) == second
-        with patch(__name__ + ".available_port", return_value=first):
-            try:
-                available_port_family(set())
-            except AssertionError as error:
-                assert "after 128 candidates" in str(error)
-            else:
-                raise AssertionError("occupied family was accepted")
-        with ExitStack() as probes:
-            for member in port_family(first):
-                if member != blocked_member:
-                    probes.enter_context(socket.socket()).bind(("127.0.0.1", member))
-
-    # Distinct bases can overlap on either side of a claimed family. The free
-    # candidate is accepted unchanged once those overlapping candidates fail.
-    with patch(__name__ + ".available_port", side_effect=[first - 1, first + 1, second]):
-        assert available_port_family(claimed) == second
-    with ExitStack() as probes:
-        for member in [*port_family(first), *port_family(second)]:
-            probes.enter_context(socket.socket()).bind(("127.0.0.1", member))
-    print("Gateway port-family allocation and socket cleanup passed")
-
-
 def scenario(ocm, case, mode):
     script = Path(__file__).resolve()
     cwd = case / "workspace"
@@ -265,15 +196,13 @@ def scenario(ocm, case, mode):
         return next((row for row in runtime().get("children", []) if row["envName"] == name), None)
 
     try:
-        ports = set()
         for name in ["sibling", "target"]:
             launcher_cwd = cwd / name
             launcher_cwd.mkdir()
             command = shlex.join(["exec", sys.executable, str(script), "peer", str(case), name])
             run("launcher", "add", name, "--command", command, "--cwd", str(launcher_cwd))
-            port = available_port_family(ports)
-            ports.update(port_family(port))
-            run("env", "create", name, "--launcher", name, "--port", str(port))
+            # Reuse the complete-family allocator and registered-peer exclusion.
+            run("env", "create", name, "--launcher", name)
             marker = home / "envs" / name / ".openclaw/workspace/generation.txt"
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("snapshot" if name == "target" else "sibling")
@@ -395,9 +324,6 @@ def scenario(ocm, case, mode):
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "port-allocation":
-        assert_port_allocation()
-        sys.exit(0)
     if sys.argv[1] == "manager":
         sys.exit(manager(Path(sys.argv[2]), sys.argv[3:]))
     if sys.argv[1] == "peer":
