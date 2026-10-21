@@ -743,12 +743,24 @@ fn collect_explicit_plugin_references(
         .get("entries")
         .and_then(serde_json::Value::as_object)
     {
+        let mut entry_enabled = BTreeMap::<String, Option<bool>>::new();
         for (id, entry) in entries {
             let Some(id) = target_plugin_id(id, source_ids, installed) else {
                 continue;
             };
+            // Native normalization merges alias/case-equivalent objects in authored order.
+            // An omitted boolean preserves earlier enablement; an explicit boolean replaces it.
+            let enabled = entry.as_object().and_then(|entry| {
+                entry
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .or_else(|| entry_enabled.get(&id).copied().flatten())
+            });
+            entry_enabled.insert(id, enabled);
+        }
+        for (id, enabled) in entry_enabled {
             // Disabling a plugin can leave its identifier in the allowlist.
-            if entry.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+            if enabled == Some(false) {
                 ids.remove(&id);
             } else {
                 ids.insert(id);

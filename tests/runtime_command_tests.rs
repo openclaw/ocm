@@ -1785,6 +1785,24 @@ fn runtime_build_local_combines_native_identity_and_disabled_policy() {
             None,
         ),
         (
+            "alias-entry-keeps-disable",
+            "google",
+            serde_json::json!({"plugins":{"allow":["google"],"entries":{"google":{"enabled":false},"google-gemini-cli":{"config":{}}}}}),
+            None,
+        ),
+        (
+            "case-entry-keeps-disable",
+            "Google",
+            serde_json::json!({"plugins":{"allow":["google"],"entries":{"GOOGLE":{"enabled":false},"google":{"config":{}}}}}),
+            None,
+        ),
+        (
+            "alias-entry-explicitly-reenables",
+            "google",
+            serde_json::json!({"plugins":{"entries":{"google":{"enabled":false},"google-gemini-cli":{"enabled":true}}}}),
+            Some("google"),
+        ),
+        (
             "legacy-source-disabled",
             "minimax-portal-auth",
             serde_json::json!({"plugins":{"allow":["MINIMAX-PORTAL-AUTH"],"entries":{"minimax-portal-auth":{"enabled":false}},"installs":{"minimax":{}}}}),

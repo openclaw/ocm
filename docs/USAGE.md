@@ -259,7 +259,9 @@ the new runtime; installed records do not select additional plugins. Disabled
 entries and denied plugins remain excluded even when their identifiers remain
 in `plugins.allow` under a supported alias or case variant, including when the
 plugin is no longer installed. Disable and deny references use the same
-selected-source identity rules. Explicit slot references still require the
+selected-source identity rules. Alias/case-equivalent entries share enablement:
+a later object without `enabled` preserves the previous value, while a later
+explicit boolean replaces it. Explicit slot references still require the
 selected plugin to be available. The resulting runtime adds only required
 source plugins omitted from the core package. `--for-env` and
 `--include-source-extensions` are mutually exclusive. A build without either
