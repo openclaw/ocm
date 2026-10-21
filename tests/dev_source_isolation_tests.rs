@@ -679,6 +679,7 @@ fn nested_pack_storage_is_protected_by_removal_and_registration() {
         } else {
             original
         };
+        let source = fs::canonicalize(source).unwrap();
         assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
         git(&source, &["fsck", "--full", "--no-dangling"]);
         let registry = env_registry_path(&env, cwd).unwrap();
