@@ -3715,6 +3715,218 @@ fi
 
 #[cfg(unix)]
 #[test]
+fn upgrade_simulate_cleanup_preserves_replacement_environments() {
+    use std::os::unix::process::CommandExt;
+
+    struct SimulationChild(std::process::Child);
+    impl Drop for SimulationChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+
+    // Reusing the root still creates a distinct generation; keeping simulations
+    // must continue to bypass cleanup altogether.
+    for (same_root, keep) in [(false, false), (true, false), (false, true)] {
+        let root = TestDir::new(&format!("upgrade-simulate-replacement-{same_root}-{keep}"));
+        let cwd = root.path();
+        let repo = init_openclaw_repo(&root);
+        let mut env = ocm_env(&root);
+        install_fake_node_and_npm(&root, &mut env, "22.22.3");
+        install_fake_simulation_pnpm(&root, &mut env);
+        env.insert("OCM_TEST_SIMULATION_DOCTOR_OK".to_string(), "1".to_string());
+        let ready = root.child("gateway.ready");
+        let release = root.child("gateway.release");
+        env.insert("OCM_TEST_GATEWAY_READY".to_string(), path_string(&ready));
+        env.insert(
+            "OCM_TEST_GATEWAY_RELEASE".to_string(),
+            path_string(&release),
+        );
+        let pnpm = root.child("fake-sim-bin/pnpm");
+        let original = fs::read_to_string(&pnpm).unwrap();
+        write_executable_script(
+            &pnpm,
+            &format!(
+                r#"#!/bin/sh
+# These fake checks need no build artifacts. Leave the worktree clean so
+# ordinary env rm can remove the simulation through its normal safety checks.
+case "$1" in
+  install|build|ui:build)
+    echo "$1 ok"
+    exit 0
+    ;;
+esac
+if [ "$1" = openclaw ] && [ "$2" = gateway ]; then
+  printf '%s\n' "$OCM_ACTIVE_ENV" > "$OCM_TEST_GATEWAY_READY"
+  attempts=0
+  while [ ! -f "$OCM_TEST_GATEWAY_RELEASE" ]; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 300 ]; then
+      echo 'timed out waiting for replacement registration' >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+fi
+{}"#,
+                original
+            ),
+        );
+
+        let started = run_ocm(
+            cwd,
+            &env,
+            &[
+                "start",
+                "demo",
+                "--command",
+                "pnpm openclaw",
+                "--cwd",
+                &path_string(&repo),
+                "--no-service",
+            ],
+        );
+        assert!(started.status.success(), "{}", stderr(&started));
+        let unrelated = run_ocm(cwd, &env, &["env", "create", "unrelated", "--protect"]);
+        assert!(unrelated.status.success(), "{}", stderr(&unrelated));
+        let mut preserved = Vec::new();
+        for name in ["demo", "unrelated"] {
+            let meta = ocm::store::get_environment(name, &env, cwd).unwrap();
+            let sentinel = Path::new(&meta.root).join("sentinel");
+            fs::write(&sentinel, name).unwrap();
+            let config = Path::new(&meta.root).join(".openclaw/openclaw.json");
+            let config_before = fs::read(&config).ok();
+            preserved.push((
+                name,
+                serde_json::to_value(meta).unwrap(),
+                sentinel,
+                config,
+                config_before,
+            ));
+        }
+
+        let output_path = root.child("simulation.out");
+        let error_path = root.child("simulation.err");
+        let mut command = Command::new(support::ocm_test_binary_path());
+        command
+            .args([
+                "upgrade",
+                "simulate",
+                "demo",
+                "--to",
+                &path_string(&repo),
+                "--json",
+            ])
+            .current_dir(cwd)
+            .env_clear()
+            .envs(&env)
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&output_path).unwrap())
+            .stderr(fs::File::create(&error_path).unwrap())
+            .process_group(0);
+        if keep {
+            command.arg("--keep-simulations");
+        }
+        let mut simulation = SimulationChild(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let simulation_name = loop {
+            if let Ok(name) = fs::read_to_string(&ready)
+                && !name.trim().is_empty()
+            {
+                break name.trim().to_string();
+            }
+            assert!(
+                simulation.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "simulation did not reach gateway check: {:?}; {:?}",
+                fs::read_to_string(&output_path),
+                fs::read_to_string(&error_path)
+            );
+            sleep(Duration::from_millis(25));
+        };
+        let original = ocm::store::get_environment(&simulation_name, &env, cwd).unwrap();
+        let removed = run_ocm(cwd, &env, &["env", "rm", &simulation_name]);
+        assert!(removed.status.success(), "{}", stderr(&removed));
+        let replacement_root = if same_root {
+            PathBuf::from(&original.root)
+        } else {
+            root.child("replacement")
+        };
+        let replacement = run_ocm(
+            cwd,
+            &env,
+            &[
+                "env",
+                "create",
+                &simulation_name,
+                "--root",
+                &path_string(&replacement_root),
+                "--protect",
+            ],
+        );
+        assert!(replacement.status.success(), "{}", stderr(&replacement));
+        let replacement = ocm::store::get_environment(&simulation_name, &env, cwd).unwrap();
+        assert_ne!(replacement.created_at, original.created_at);
+        assert_eq!(replacement.root == original.root, same_root);
+        assert!(replacement.protected);
+        let sentinel = replacement_root.join("sentinel");
+        fs::write(&sentinel, "replacement data\n").unwrap();
+        let refused = run_ocm(cwd, &env, &["env", "rm", &simulation_name]);
+        assert!(!refused.status.success(), "{}", stdout(&refused));
+        assert!(
+            stderr(&refused).contains("protected"),
+            "{}",
+            stderr(&refused)
+        );
+
+        fs::write(&release, "continue\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = simulation.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "simulation did not finish");
+            sleep(Duration::from_millis(25));
+        };
+        let output = fs::read_to_string(&output_path).unwrap();
+        let result: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["outcome"], "passed", "{result:#}");
+        assert_eq!(status.code(), Some(if keep { 0 } else { 1 }), "{result:#}");
+        assert_eq!(
+            result["cleanup"],
+            if keep { "kept" } else { "failed" },
+            "{result:#}"
+        );
+        if !keep {
+            assert!(
+                result["checks"].as_array().unwrap().iter().any(|check| {
+                    check["name"] == "cleanup simulation env"
+                        && check["status"] == "failed"
+                        && check["note"].as_str().unwrap().contains("replaced")
+                }),
+                "{result:#}"
+            );
+        }
+        let current = ocm::store::get_environment(&simulation_name, &env, cwd).unwrap();
+        assert_eq!(
+            serde_json::to_value(current).unwrap(),
+            serde_json::to_value(replacement).unwrap()
+        );
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "replacement data\n");
+        for (name, meta, sentinel, config, config_before) in preserved {
+            let current = ocm::store::get_environment(name, &env, cwd).unwrap();
+            assert_eq!(serde_json::to_value(current).unwrap(), meta);
+            assert_eq!(fs::read_to_string(sentinel).unwrap(), name);
+            assert_eq!(fs::read(config).ok(), config_before);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn upgrade_simulate_preserves_passed_outcome_when_cleanup_fails() {
     let root = TestDir::new("upgrade-simulate-cleanup-outcome");
     let cwd = root.child("workspace");

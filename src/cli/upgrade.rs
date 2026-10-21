@@ -1919,7 +1919,7 @@ impl Cli {
             self.environment_service()
                 .set_service_policy(&cloned.name, Some(false), Some(false))
         {
-            let _ = self.environment_service().remove(&cloned.name, true);
+            let _ = self.environment_service().remove_simulation(&cloned);
             return Err(error);
         }
         if cloned.protected
@@ -1927,7 +1927,7 @@ impl Cli {
                 .environment_service()
                 .set_protected(&cloned.name, false)
         {
-            let _ = self.environment_service().remove(&cloned.name, true);
+            let _ = self.environment_service().remove_simulation(&cloned);
             return Err(error);
         }
 
@@ -1953,7 +1953,7 @@ impl Cli {
                 target.display(),
                 checks,
             );
-            return self.finish_simulation_summary(summary, options);
+            return self.finish_simulation_summary(summary, &cloned, options);
         }
         checks.push(self.run_update_plan_check(&cloned.name, target));
 
@@ -1976,7 +1976,7 @@ impl Cli {
                     target.display(),
                     checks,
                 );
-                return self.finish_simulation_summary(summary, options);
+                return self.finish_simulation_summary(summary, &cloned, options);
             }
         }
 
@@ -2018,7 +2018,7 @@ impl Cli {
             target.display(),
             checks,
         );
-        self.finish_simulation_summary(summary, options)
+        self.finish_simulation_summary(summary, &cloned, options)
     }
 
     fn apply_simulation_scenario(
@@ -2491,6 +2491,7 @@ impl Cli {
     fn finish_simulation_summary(
         &self,
         mut summary: UpgradeSimulationSummary,
+        cloned: &crate::env::EnvMeta,
         options: UpgradeSimulationOptions,
     ) -> Result<UpgradeSimulationSummary, String> {
         if options.keep_envs {
@@ -2501,10 +2502,7 @@ impl Cli {
             return Ok(summary);
         }
 
-        match self
-            .environment_service()
-            .remove_simulation(&summary.simulation_env)
-        {
+        match self.environment_service().remove_simulation(cloned) {
             Ok(_) => {
                 summary.cleanup = "cleaned".to_string();
             }

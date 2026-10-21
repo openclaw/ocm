@@ -503,9 +503,17 @@ impl<'a> EnvironmentService<'a> {
         Ok(meta)
     }
 
-    pub(crate) fn remove_simulation(&self, name: &str) -> Result<EnvMeta, String> {
-        let _lock = self.lock_operation(name)?;
-        self.remove_with_cleanup_locked(name, true, |meta| {
+    pub(crate) fn remove_simulation(&self, expected: &EnvMeta) -> Result<EnvMeta, String> {
+        let _lock = self.lock_operation(&expected.name)?;
+        self.remove_with_cleanup_locked(&expected.name, true, |meta| {
+            // The checks run without holding the name lock. Compare the clone's
+            // generation under the registry lock before touching any files.
+            if meta.root != expected.root || meta.created_at != expected.created_at {
+                return Err(format!(
+                    "simulation environment \"{}\" was replaced; refusing to remove it",
+                    expected.name
+                ));
+            }
             if let Some((repo_root, worktree_root)) =
                 meta.dev.as_ref().and_then(EnvDevMeta::owned_worktree)
             {
