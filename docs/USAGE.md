@@ -808,7 +808,8 @@ before writing the destination. Check the recorded source with `ocm env show
 <env>`, restore that checkout's path or access permissions, then retry.
 
 Registered sources retain their required Git object stores, including relative and
-transitive `objects/info/alternates` references from shared clones and path aliases,
+transitive `objects/info/alternates` references from shared clones, linked
+`objects/pack` directories in those stores, and the aliases needed to reach them,
 as well as those of initialized submodules declared in `.gitmodules`, recursively.
 When the working `.gitmodules` file is absent, OCM uses Git’s index or HEAD copy.
 Removing an environment that contains this storage is refused before deletion; an

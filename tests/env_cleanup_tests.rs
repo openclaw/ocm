@@ -737,10 +737,23 @@ fn env_cleanup_refuses_registered_source_deletions_before_any_repair() {
             false,
         ),
         ("external-source", true),
+        #[cfg(unix)]
+        ("external-pack-source", false),
     ] {
         let root = TestDir::new("cleanup-registered-source");
         let (env, source) = cleanup_source_fixture(&root, location, true, separate_git);
         let state = root.child("ocm-home/envs/container/.openclaw");
+        #[cfg(unix)]
+        if location == "external-pack-source" {
+            cleanup_git(&source, &env, &["repack", "-ad"]);
+            cleanup_git(&source, &env, &["prune-packed"]);
+            let packs = source.join(".git/objects/pack");
+            let storage = state.join("logs/packed-objects");
+            fs::create_dir_all(storage.parent().unwrap()).unwrap();
+            fs::rename(&packs, &storage).unwrap();
+            std::os::unix::fs::symlink(&storage, &packs).unwrap();
+            cleanup_git(&source, &env, &["fsck", "--full"]);
+        }
         let config_path = state.join("openclaw.json");
         // Config repair would execute before runtime reset without a whole-plan guard.
         let config = r#"{"gateway":{"port":1}}"#;

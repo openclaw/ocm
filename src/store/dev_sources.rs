@@ -372,6 +372,19 @@ fn append_git_object_footprint(
         if !visited.insert(resolved.clone()) {
             continue;
         }
+        // Packed objects can live outside the object root through a pack
+        // directory alias. Preserve both the link entries and its contents,
+        // including for alternate stores, without scanning individual objects.
+        let packs = resolved.join("pack");
+        match fs::symlink_metadata(&packs) {
+            Ok(_) => {
+                if let Some(packs) = record_git_path(&packs, footprint, reserve_missing, links)? {
+                    footprint.content_roots.insert(packs);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
         let file = resolved.join("info/alternates");
         match fs::symlink_metadata(&file) {
             Ok(_) => {}
