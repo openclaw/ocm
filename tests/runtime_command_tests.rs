@@ -1631,16 +1631,33 @@ fn runtime_build_local_rejects_missing_target_plugin_before_pack() {
 
 #[test]
 fn runtime_build_local_resolves_native_plugin_identity_to_declared_source() {
-    for (id, configured, field) in [
-        ("google", "google", "entries"),
-        ("google", " google ", "entries"),
-        ("google", "google-gemini-cli", "entries"),
-        ("google", " GOOGLE-GEMINI-CLI ", "allow"),
-        ("Google", "GOOGLE", "entries"),
-        ("minimax", "minimax", "entries"),
-        ("minimax", "minimax-portal", "entries"),
-        ("minimax", "MINIMAX-PORTAL-AUTH", "allow"),
-        ("minimax-portal-auth", "minimax-portal-auth", "entries"),
+    for (id, configured, field, installed) in [
+        ("google", "google", "entries", None),
+        ("google", " google ", "entries", None),
+        ("google", "google-gemini-cli", "entries", None),
+        ("google", " GOOGLE-GEMINI-CLI ", "allow", None),
+        ("Google", "GOOGLE", "entries", None),
+        ("minimax", "minimax", "entries", None),
+        ("minimax", "minimax-portal", "entries", None),
+        ("minimax", "MINIMAX-PORTAL-AUTH", "allow", None),
+        (
+            "minimax-portal-auth",
+            "minimax-portal-auth",
+            "entries",
+            None,
+        ),
+        (
+            "minimax-portal-auth",
+            "minimax-portal-auth",
+            "entries",
+            Some("minimax"),
+        ),
+        (
+            "google",
+            "google-gemini-cli",
+            "entries",
+            Some("google-gemini-cli"),
+        ),
     ] {
         let root = TestDir::new("runtime-build-local-plugin-identity");
         let (cwd, mut env, state, _) = target_plugin_build_fixture(&root);
@@ -1682,12 +1699,15 @@ fn runtime_build_local_resolves_native_plugin_identity_to_declared_source() {
         ] {
             env.insert(key.to_string(), value);
         }
-        let config = if field == "entries" {
+        let mut config = if field == "entries" {
             serde_json::json!({"plugins":{"entries":{configured:{"enabled":true}}}})
         } else {
             serde_json::json!({"plugins":{"allow":[configured]}})
+        };
+        if let Some(installed) = installed {
+            config["plugins"]["installs"] = serde_json::json!({installed: {"source":"path"}});
         }
-        .to_string();
+        let config = config.to_string();
         fs::write(state.join("openclaw.json"), &config).unwrap();
         let build = run_ocm(
             &cwd,

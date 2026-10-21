@@ -695,13 +695,21 @@ fn normalized_plugin_id(id: &str) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
-fn target_plugin_id(id: &str, available: &BTreeSet<String>) -> Option<String> {
+fn target_plugin_id(
+    id: &str,
+    source_ids: &BTreeMap<String, String>,
+    installed: &BTreeSet<String>,
+) -> Option<String> {
     let id = normalized_plugin_id(id)?;
+    if source_ids.contains_key(&id) {
+        return Some(id);
+    }
     // Modern OpenClaw maps these legacy IDs to canonical plugins. Older checkouts can still
-    // declare the legacy ID itself, so only resolve an alias when its destination is available.
+    // declare the legacy ID itself; that source identity takes precedence over installed records.
+    let available = |id: &str| source_ids.contains_key(id) || installed.contains(id);
     match id.as_str() {
-        "google-gemini-cli" if available.contains("google") => Some("google".to_string()),
-        "minimax-portal" | "minimax-portal-auth" if available.contains("minimax") => {
+        "google-gemini-cli" if available("google") => Some("google".to_string()),
+        "minimax-portal" | "minimax-portal-auth" if available("minimax") => {
             Some("minimax".to_string())
         }
         _ => Some(id),
@@ -710,7 +718,8 @@ fn target_plugin_id(id: &str, available: &BTreeSet<String>) -> Option<String> {
 
 fn collect_explicit_plugin_references(
     config: &serde_json::Value,
-    available: &BTreeSet<String>,
+    source_ids: &BTreeMap<String, String>,
+    installed: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let Some(plugins) = config.get("plugins").and_then(serde_json::Value::as_object) else {
@@ -721,7 +730,7 @@ fn collect_explicit_plugin_references(
             values
                 .iter()
                 .filter_map(serde_json::Value::as_str)
-                .filter_map(|id| target_plugin_id(id, available)),
+                .filter_map(|id| target_plugin_id(id, source_ids, installed)),
         );
     }
     if let Some(entries) = plugins
@@ -729,7 +738,7 @@ fn collect_explicit_plugin_references(
         .and_then(serde_json::Value::as_object)
     {
         for (id, entry) in entries {
-            let Some(id) = target_plugin_id(id, available) else {
+            let Some(id) = target_plugin_id(id, source_ids, installed) else {
                 continue;
             };
             // Disabling a plugin can leave its identifier in the allowlist.
@@ -746,14 +755,14 @@ fn collect_explicit_plugin_references(
                 .values()
                 .filter_map(serde_json::Value::as_str)
                 .filter(|id| id.trim() != "none")
-                .filter_map(|id| target_plugin_id(id, available)),
+                .filter_map(|id| target_plugin_id(id, source_ids, installed)),
         );
     }
     if let Some(deny) = plugins.get("deny").and_then(serde_json::Value::as_array) {
         for id in deny
             .iter()
             .filter_map(serde_json::Value::as_str)
-            .filter_map(|id| target_plugin_id(id, available))
+            .filter_map(|id| target_plugin_id(id, source_ids, installed))
         {
             ids.remove(&id);
         }
@@ -804,19 +813,14 @@ fn resolve_target_source_plugin_closure(
     let mut source_ids = BTreeMap::new();
     for id in inventory.by_id.keys() {
         let policy_id = id.to_lowercase();
-        if let Some(previous) = source_ids.insert(policy_id.clone(), id) {
+        if let Some(previous) = source_ids.insert(policy_id.clone(), id.clone()) {
             return Err(format!(
                 "source plugin policy id \"{policy_id}\" is ambiguous between plugin ids \"{previous}\" and \"{id}\""
             ));
         }
     }
     let installed = installed_target_plugin_ids(&paths, &config);
-    let available = source_ids
-        .keys()
-        .chain(installed.iter())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let explicit = collect_explicit_plugin_references(&config, &available);
+    let explicit = collect_explicit_plugin_references(&config, &source_ids, &installed);
     let missing = explicit
         .iter()
         .filter(|id| !source_ids.contains_key(*id) && !installed.contains(*id))
@@ -831,7 +835,7 @@ fn resolve_target_source_plugin_closure(
 
     let mut direct = explicit
         .iter()
-        .filter_map(|id| source_ids.get(id).map(|id| (*id).clone()))
+        .filter_map(|id| source_ids.get(id).cloned())
         .collect::<BTreeSet<_>>();
     direct.retain(|id| {
         inventory
@@ -3878,7 +3882,7 @@ mod tests {
 
     #[test]
     fn target_plugin_identity_matches_native_aliases_and_case() {
-        let available = BTreeSet::from(["google".to_string(), "minimax".to_string()]);
+        let installed = BTreeSet::from(["google".to_string(), "minimax".to_string()]);
         for (raw, expected) in [
             ("google", Some("google")),
             (" GOOGLE-GEMINI-CLI ", Some("google")),
@@ -3890,14 +3894,14 @@ mod tests {
             ("  ", None),
         ] {
             assert_eq!(
-                super::target_plugin_id(raw, &available).as_deref(),
+                super::target_plugin_id(raw, &BTreeMap::new(), &installed).as_deref(),
                 expected
             );
         }
         for legacy in ["google-gemini-cli", "minimax-portal-auth"] {
-            let available = BTreeSet::from([legacy.to_string()]);
+            let source_ids = BTreeMap::from([(legacy.to_string(), legacy.to_string())]);
             assert_eq!(
-                super::target_plugin_id(legacy, &available).as_deref(),
+                super::target_plugin_id(legacy, &source_ids, &installed).as_deref(),
                 Some(legacy)
             );
         }
@@ -3907,10 +3911,7 @@ mod tests {
             "deny": ["GOOGLE", "minimax-portal-auth"]
         }});
         assert_eq!(
-            collect_explicit_plugin_references(
-                &config,
-                &BTreeSet::from(["google".to_string(), "minimax".to_string()])
-            ),
+            collect_explicit_plugin_references(&config, &BTreeMap::new(), &installed),
             BTreeSet::from(["external".to_string()])
         );
     }
@@ -3931,7 +3932,7 @@ mod tests {
         });
 
         assert_eq!(
-            collect_explicit_plugin_references(&config, &BTreeSet::new()),
+            collect_explicit_plugin_references(&config, &BTreeMap::new(), &BTreeSet::new()),
             BTreeSet::from([
                 "allowed".to_string(),
                 "memory-core".to_string(),
