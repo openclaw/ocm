@@ -46,7 +46,7 @@ use crate::store::{
     ensure_minimum_local_openclaw_config, ensure_store, get_runtime, get_upgrade_history_record,
     get_upgrade_runtime_recovery, install_runtime_from_selected_official_openclaw_release,
     list_upgrade_history, lock_env_registry, lock_upgrade_batch, lock_upgrade_participant,
-    lock_upgrade_transaction, remove_owned_tree, remove_runtime, remove_runtime_with_guard,
+    lock_upgrade_transaction, remove_owned_tree, remove_runtime_with_guard,
     remove_upgrade_recovery, resolve_absolute_path, runtime_install_root, runtime_integrity_issue,
     runtime_meta_path, save_environment_with_dev_registration, save_upgrade_history_record,
     try_lock_runtime_binding, try_lock_runtime_mutation, upgrade_history_recovery_dir,
@@ -2526,8 +2526,8 @@ impl Cli {
             return Ok(());
         }
 
-        match remove_runtime(&prepared_runtime.name, &self.env, &self.cwd).map(|_| ()) {
-            Ok(()) => Ok(()),
+        match self.runtime_service().remove(&prepared_runtime.name) {
+            Ok(_) => Ok(()),
             Err(error) => {
                 for summary in summaries
                     .iter_mut()

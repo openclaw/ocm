@@ -3201,6 +3201,183 @@ fn upgrade_simulate_tests_a_published_version_without_changing_the_source_env() 
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn upgrade_simulate_preserves_an_accepted_runtime_borrower() {
+    use std::os::unix::process::CommandExt;
+
+    // Keep the simulation and its finite fixture child in one owned process group,
+    // including when an assertion fails before the final check is released.
+    struct Simulation(std::process::Child);
+    impl Drop for Simulation {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+
+    for keep in [false, true] {
+        let root = TestDir::new("simulation-runtime-borrower");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_node_and_npm(&root, &mut env, "22.22.3");
+        let ready = root.child("gateway.ready");
+        let release = root.child("gateway.release");
+        env.insert("OCM_TEST_GATEWAY_READY".into(), path_string(&ready));
+        env.insert("OCM_TEST_GATEWAY_RELEASE".into(), path_string(&release));
+        let script = recording_openclaw_script("2026.3.25").replace(
+            "  gateway)\n",
+            r#"  gateway)
+    printf '%s\n' "$OCM_ACTIVE_ENV" > "$OCM_TEST_GATEWAY_READY"
+    attempts=0
+    while [ ! -f "$OCM_TEST_GATEWAY_RELEASE" ]; do
+      attempts=$((attempts + 1))
+      [ "$attempts" -lt 400 ] || exit 19
+      sleep 0.05
+    done
+"#,
+        );
+        let tarball = openclaw_package_tarball(&script, "2026.3.25");
+        let package_server = TestHttpServer::serve_bytes_times(
+            "/openclaw.tgz",
+            "application/octet-stream",
+            &tarball,
+            4,
+        );
+        let packument = serde_json::json!({
+            "dist-tags": {"latest": "2026.3.25"},
+            "versions": {"2026.3.25": {"version": "2026.3.25", "dist": {
+                "tarball": package_server.url(), "integrity": sha512_integrity(&tarball)
+            }}},
+            "time": {"2026.3.25": "2026-03-26T09:00:00.000Z"}
+        });
+        let registry = TestHttpServer::serve_bytes_times(
+            "/openclaw",
+            "application/json",
+            packument.to_string().as_bytes(),
+            8,
+        );
+        env.insert("OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(), registry.url());
+        let old = root.child("old-openclaw");
+        write_executable_script(&old, &recording_openclaw_script("2026.3.24"));
+        let run = |args: &[&str]| {
+            let output = run_ocm(&cwd, &env, args);
+            assert!(output.status.success(), "{}", stderr(&output));
+            output
+        };
+        run(&["runtime", "add", "old", "--path", &path_string(&old)]);
+        run(&["env", "create", "demo", "--runtime", "old"]);
+        let source = root.child("ocm-home/envs/demo");
+        let sentinel = source.join("source-sentinel");
+        fs::write(&sentinel, "source data").unwrap();
+        let config = source.join(".openclaw/openclaw.json");
+        fs::write(&config, "{}\n").unwrap();
+        let source_before = stdout(&run(&["env", "show", "demo", "--json"]));
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ocm"));
+        command
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .process_group(0)
+            .args(["upgrade", "simulate", "demo", "--to", "2026.3.25", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if keep {
+            command.arg("--keep-simulations");
+        }
+        let mut simulation = Simulation(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(
+                simulation.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "simulation did not reach its final gateway check"
+            );
+            sleep(Duration::from_millis(20));
+        }
+        let simulation_name = fs::read_to_string(&ready).unwrap();
+        let simulation_name = simulation_name.trim();
+        let meta: Value =
+            serde_json::from_str(&stdout(&run(&["env", "show", simulation_name, "--json"])))
+                .unwrap();
+        let runtime = meta["defaultRuntime"].as_str().unwrap();
+        assert!(runtime.starts_with("ocm-sim-runtime-"));
+        let runtime_before = stdout(&run(&["runtime", "show", runtime, "--json"]));
+        run(&["env", "create", "borrower", "--runtime", runtime]);
+        let borrower_sentinel = root.child("ocm-home/envs/borrower/borrower-sentinel");
+        fs::write(&borrower_sentinel, "borrower data").unwrap();
+        assert_eq!(
+            stdout(&run(&["@borrower", "--", "--version"])).trim(),
+            "2026.3.25"
+        );
+        let borrower_before = stdout(&run(&["env", "show", "borrower", "--json"]));
+        let removal = run_ocm(&cwd, &env, &["runtime", "remove", runtime]);
+        assert!(!removal.status.success());
+        assert!(stderr(&removal).contains("still used by environment(s)"));
+        assert!(stderr(&removal).contains("borrower"));
+        fs::write(&release, "finish").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = simulation.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "simulation cleanup did not settle"
+            );
+            sleep(Duration::from_millis(20));
+        };
+        let mut output = String::new();
+        simulation
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        let summary: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(status.success(), keep, "{summary}");
+        assert_eq!(summary["outcome"], "passed");
+        assert_eq!(summary["cleanup"], if keep { "kept" } else { "failed" });
+        if !keep {
+            assert!(
+                summary["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|check| check["name"] == "cleanup simulation runtime"
+                        && check["status"] == "failed"
+                        && check["note"].as_str().unwrap().contains("borrower"))
+            );
+        }
+        let remaining = run_ocm(&cwd, &env, &["env", "show", simulation_name, "--json"]);
+        assert_eq!(remaining.status.success(), keep);
+        assert_eq!(
+            stdout(&run(&["runtime", "show", runtime, "--json"])),
+            runtime_before
+        );
+        assert_eq!(
+            stdout(&run(&["env", "show", "borrower", "--json"])),
+            borrower_before
+        );
+        assert_eq!(
+            stdout(&run(&["@borrower", "--", "--version"])).trim(),
+            "2026.3.25"
+        );
+        assert_eq!(
+            stdout(&run(&["env", "show", "demo", "--json"])),
+            source_before
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), "{}\n");
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "source data");
+        assert_eq!(
+            fs::read_to_string(&borrower_sentinel).unwrap(),
+            "borrower data"
+        );
+    }
+}
+
 #[test]
 fn upgrade_simulate_errors_before_cloning_when_published_target_is_missing() {
     let root = TestDir::new("upgrade-simulate-missing-target");
