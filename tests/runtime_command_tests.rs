@@ -1745,6 +1745,146 @@ fn runtime_build_local_resolves_native_plugin_identity_to_declared_source() {
     }
 }
 
+#[test]
+fn runtime_build_local_combines_native_identity_and_disabled_policy() {
+    for (scenario, source_id, config, missing) in [
+        (
+            "alias-disabled",
+            "Google",
+            serde_json::json!({"plugins":{"allow":[" GOOGLE "],"entries":{"google-gemini-cli":{"enabled":false}}}}),
+            None,
+        ),
+        (
+            "canonical-disabled",
+            "minimax",
+            serde_json::json!({"plugins":{"allow":["MINIMAX-PORTAL-AUTH"],"entries":{"minimax":{"enabled":false}}}}),
+            None,
+        ),
+        (
+            "minimax-alias-disabled",
+            "minimax",
+            serde_json::json!({"plugins":{"allow":["minimax"],"entries":{"MINIMAX-PORTAL":{"enabled":false}}}}),
+            None,
+        ),
+        (
+            "alias-denied",
+            "google",
+            serde_json::json!({"plugins":{"allow":["google"],"entries":{"google-gemini-cli":{"enabled":true}},"deny":["GOOGLE-GEMINI-CLI"]}}),
+            None,
+        ),
+        (
+            "absent-alias-disabled",
+            "unrelated",
+            serde_json::json!({"plugins":{"allow":["GOOGLE"],"entries":{"google-gemini-cli":{"enabled":false}}}}),
+            None,
+        ),
+        (
+            "absent-alias-denied",
+            "unrelated",
+            serde_json::json!({"plugins":{"allow":["minimax"],"deny":["MINIMAX-PORTAL-AUTH"]}}),
+            None,
+        ),
+        (
+            "legacy-source-disabled",
+            "minimax-portal-auth",
+            serde_json::json!({"plugins":{"allow":["MINIMAX-PORTAL-AUTH"],"entries":{"minimax-portal-auth":{"enabled":false}},"installs":{"minimax":{}}}}),
+            None,
+        ),
+        (
+            "installed-disable-preserves-legacy-source",
+            "minimax-portal-auth",
+            serde_json::json!({"plugins":{"allow":["MINIMAX-PORTAL-AUTH"],"entries":{"minimax":{"enabled":false}},"installs":{"minimax":{}}}}),
+            Some("minimax-portal-auth"),
+        ),
+        (
+            "modern-source-with-legacy-record",
+            "google",
+            serde_json::json!({"plugins":{"allow":["GOOGLE"],"entries":{"google-gemini-cli":{"enabled":false}},"installs":{"google-gemini-cli":{}}}}),
+            None,
+        ),
+        (
+            "disabled-missing-slot",
+            "google",
+            serde_json::json!({"plugins":{"allow":["missing"],"entries":{" MISSING ":{"enabled":false}},"slots":{"memory":"MISSING"}}}),
+            Some("missing"),
+        ),
+    ] {
+        let root = TestDir::new("runtime-build-local-combined-plugin-policy");
+        let (cwd, env, state, npm_log) = target_plugin_build_fixture(&root);
+        let repo = cwd.join("openclaw");
+        let source = repo.join("extensions/identity-fixture");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("openclaw.plugin.json"),
+            serde_json::json!({"id":source_id}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            source.join("package.json"),
+            r#"{"name":"@openclaw/identity-fixture","version":"2026.4.25"}"#,
+        )
+        .unwrap();
+        // An empty build makes accidental source selection observable after root packing.
+        // The legacy-source control must retain the exact declared ID in the missing-build error.
+        fs::create_dir_all(repo.join("dist/extensions")).unwrap();
+        let config_bytes = config.to_string();
+        fs::write(state.join("openclaw.json"), &config_bytes).unwrap();
+        let build = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "build-local",
+                "target",
+                "--repo",
+                "./openclaw",
+                "--for-env",
+                "primary",
+                "--raw",
+            ],
+        );
+        match missing {
+            None => {
+                assert!(build.status.success(), "{scenario}: {}", stderr(&build));
+                let runtime_root = runtime_install_root("target", &env, &cwd)
+                    .unwrap()
+                    .join("files/node_modules/openclaw");
+                assert!(
+                    !runtime_root
+                        .join("dist/extensions/identity-fixture")
+                        .exists(),
+                    "{scenario}"
+                );
+            }
+            Some("missing") => {
+                assert!(!build.status.success(), "{scenario}");
+                assert!(
+                    stderr(&build).contains("records: missing. Repair"),
+                    "{scenario}: {}",
+                    stderr(&build)
+                );
+                assert!(
+                    !npm_log.exists(),
+                    "{scenario}: missing explicit slot must fail before pack"
+                );
+            }
+            Some(id) => {
+                assert!(!build.status.success(), "{scenario}");
+                assert!(stderr(&build).contains(&format!("did not produce required source plugins for target environment primary: {id}")), "{scenario}: {}", stderr(&build));
+                assert!(
+                    npm_log.exists(),
+                    "{scenario}: source selection should reach packing"
+                );
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(state.join("openclaw.json")).unwrap(),
+            config_bytes,
+            "{scenario}"
+        );
+    }
+}
+
 fn write_target_plugin_index(state: &Path, dedicated: bool, raw: &str) {
     let database = state.join("state/openclaw.sqlite");
     fs::create_dir_all(database.parent().unwrap()).unwrap();

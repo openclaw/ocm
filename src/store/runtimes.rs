@@ -706,14 +706,20 @@ fn target_plugin_id(
     }
     // Modern OpenClaw maps these legacy IDs to canonical plugins. Older checkouts can still
     // declare the legacy ID itself; that source identity takes precedence over installed records.
-    let available = |id: &str| source_ids.contains_key(id) || installed.contains(id);
-    match id.as_str() {
-        "google-gemini-cli" if available("google") => Some("google".to_string()),
-        "minimax-portal" | "minimax-portal-auth" if available("minimax") => {
-            Some("minimax".to_string())
-        }
-        _ => Some(id),
+    let canonical = match id.as_str() {
+        "google-gemini-cli" => "google",
+        "minimax-portal" | "minimax-portal-auth" => "minimax",
+        _ => return Some(id),
+    };
+    if installed.contains(&id)
+        && !source_ids.contains_key(canonical)
+        && !installed.contains(canonical)
+    {
+        return Some(id);
     }
+    // Disable and deny policy must still match aliases after a plugin has been removed.
+    // Availability is checked separately after the complete policy has been collected.
+    Some(canonical.to_string())
 }
 
 fn collect_explicit_plugin_references(
@@ -3902,6 +3908,15 @@ mod tests {
             let source_ids = BTreeMap::from([(legacy.to_string(), legacy.to_string())]);
             assert_eq!(
                 super::target_plugin_id(legacy, &source_ids, &installed).as_deref(),
+                Some(legacy)
+            );
+            assert_eq!(
+                super::target_plugin_id(
+                    legacy,
+                    &BTreeMap::new(),
+                    &BTreeSet::from([legacy.to_string()])
+                )
+                .as_deref(),
                 Some(legacy)
             );
         }
