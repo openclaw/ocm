@@ -11,7 +11,7 @@ use crate::store::{display_path, lock_file, resolve_store_paths};
 
 pub const OPENCLAW_MIN_NODE_VERSION: &str = "22.22.3";
 pub const OPENCLAW_NODE_VERSION_REQUIREMENT: &str = "Node.js 22.22.3+, 24.15.0+, or 25.9.0+";
-const MANAGED_NODE_VERSION: &str = "24.21.0";
+const MANAGED_NODE_VERSION: &str = "24.22.1";
 
 const INTERNAL_MANAGED_NODE_ARCHIVE_URL_ENV: &str = "OCM_INTERNAL_MANAGED_NODE_ARCHIVE_URL";
 const INTERNAL_MANAGED_NODE_ARCHIVE_SHA256_ENV: &str = "OCM_INTERNAL_MANAGED_NODE_ARCHIVE_SHA256";
@@ -203,21 +203,10 @@ pub(crate) fn load_existing_managed_node_toolchain(
         Err(_) => return Ok(None),
     };
     let root = managed_node_root(&distribution, env, cwd)?;
-    // Released OCM installations use this cache name. Keep their launches and
-    // installs working offline when the preferred private Node version changes.
-    let previous_root = root.with_file_name(distribution.root_dir_name.replacen(
-        MANAGED_NODE_VERSION,
-        "24.15.0",
-        1,
-    ));
-    for candidate in [root, previous_root] {
-        if let Some((node_bin, npm_cli)) =
-            verify_managed_node_toolchain(&candidate, &distribution, requirement)
-        {
-            return Ok(Some(ManagedNodeToolchain { node_bin, npm_cli }));
-        }
-    }
-    Ok(None)
+    Ok(
+        verify_managed_node_toolchain(&root, &distribution, requirement)
+            .map(|(node_bin, npm_cli)| ManagedNodeToolchain { node_bin, npm_cli }),
+    )
 }
 
 pub(crate) fn ensure_managed_node_toolchain(
@@ -445,23 +434,23 @@ fn managed_node_distribution_for(
     npm_cli_relative_path: &'static str,
 ) -> Result<ManagedNodeDistribution, String> {
     let archive_sha256 = match (version, suffix) {
-        ("24.21.0", "darwin-arm64") => {
-            "bed7eea5325e1108f32ce5228ddd6a5f0f08a499ee42aa7442aea583702f6057"
+        ("24.22.1", "darwin-arm64") => {
+            "89c682593d76cd44233fa53b1563264e7de9cbb189cad169135c5b4fadfbc0a7"
         }
-        ("24.21.0", "darwin-x64") => {
-            "1462cb3b3046b815cf8ea436d3da450ec1a9f11dac7e5a46b0ada5305d7e8097"
+        ("24.22.1", "darwin-x64") => {
+            "d132557e7ee2b85af08b0c8c34338e65c6430f2238d01f727728ef42dc83b035"
         }
-        ("24.21.0", "linux-arm64") => {
-            "724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5"
+        ("24.22.1", "linux-arm64") => {
+            "33c37be234ba8bee041961047b19160f4d7d0f164e8e246f78bdd10feff148b3"
         }
-        ("24.21.0", "linux-x64") => {
-            "6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff"
+        ("24.22.1", "linux-x64") => {
+            "eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c"
         }
-        ("24.21.0", "win-arm64") => {
-            "8779b1bde1d39f8d420e3b57aa657b39891af434d3de44a919044cec06785921"
+        ("24.22.1", "win-arm64") => {
+            "a0c807319fede24c4a0d8f84564c82a619bd313b16b10c007c383c2609e99171"
         }
-        ("24.21.0", "win-x64") => {
-            "158f7685b44de51f6c0df1d153526cbcd3e1bc739a8dfc607721cef75de9e541"
+        ("24.22.1", "win-x64") => {
+            "d2046d28c2c3dcd211ac5145c0bf30e2047ef9dfb306693c8c6e2eccd8b95fa5"
         }
         _ => {
             return Err(format!(
@@ -556,8 +545,11 @@ fn verify_managed_node_toolchain(
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    (version.status.success() && requirement.supports(&String::from_utf8_lossy(&version.stdout)))
-        .then_some((node_bin, npm_cli))
+    let actual = String::from_utf8_lossy(&version.stdout);
+    (version.status.success()
+        && actual.trim().trim_start_matches('v') == distribution.version
+        && requirement.supports(&actual))
+    .then_some((node_bin, npm_cli))
 }
 
 fn relocate_checked_path(path: &Path, from_root: &Path, to_root: &Path) -> Result<PathBuf, String> {

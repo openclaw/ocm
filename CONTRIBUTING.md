@@ -20,7 +20,7 @@ Node.js with npm on the remote worker. Use the project's approved tools and
 locked dependencies. The Rust minimum is declared in [Cargo.toml](Cargo.toml)
 (currently 1.88); CI checks it separately from stable Rust.
 
-For the complete Rust test suite, use CI's Node.js `24.21.0` when available. The
+For the complete Rust test suite, use CI's Node.js `24.22.1` when available. The
 npm launcher accepts `^22.15.0 || >=24.0.0`, while runtime-install tests require
 `22.22.3+`, `24.15.0+`, or `25.9.0+`. Their packages are local fixtures, so these
 tests do not require registry dependency downloads. A different supported
