@@ -264,7 +264,7 @@ fn spawn_converging_health_server() -> (
     let stop_thread = Arc::clone(&stop);
     let handle = thread::spawn(move || {
         while !stop_thread.load(Ordering::Relaxed) {
-            let (mut stream, _) = match listener.accept() {
+            let (stream, _) = match listener.accept() {
                 Ok(accepted) => accepted,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     sleep(Duration::from_millis(5));
@@ -272,47 +272,53 @@ fn spawn_converging_health_server() -> (
                 }
                 Err(error) => panic!("health listener failed: {error}"),
             };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 1024];
-            // Closing with unread request headers can reset the client's response read.
-            while request.len() < 8192 && !request.windows(4).any(|part| part == b"\r\n\r\n") {
-                let available = chunk.len().min(8192 - request.len());
-                let read = match stream.read(&mut chunk[..available]) {
-                    Ok(0) => break,
-                    Ok(read) => read,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                };
-                request.extend_from_slice(&chunk[..read]);
-            }
-            if !request.windows(4).any(|part| part == b"\r\n\r\n")
-                || !request.starts_with(b"GET /health ")
-            {
-                continue;
-            }
-            let request_number = requests_thread.fetch_add(1, Ordering::SeqCst);
-            let status = if request_number == 0 {
-                "503 Service Unavailable"
-            } else {
-                "200 OK"
-            };
-            let body = if request_number == 0 {
-                br#"{"ok":false}"#.as_slice()
-            } else {
-                br#"{"ok":true}"#.as_slice()
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.write_all(body);
+            serve_converging_health_request(stream, &requests_thread);
         }
     });
     (port, requests, stop, handle)
+}
+
+fn serve_converging_health_request(mut stream: TcpStream, requests: &AtomicUsize) {
+    // Accepted sockets can inherit the listener's nonblocking mode on macOS.
+    // Blocking reads let the existing timeout wait for the complete headers.
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    // Closing with unread request headers can reset the client's response read.
+    while request.len() < 8192 && !request.windows(4).any(|part| part == b"\r\n\r\n") {
+        let available = chunk.len().min(8192 - request.len());
+        let read = match stream.read(&mut chunk[..available]) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        request.extend_from_slice(&chunk[..read]);
+    }
+    if !request.windows(4).any(|part| part == b"\r\n\r\n") || !request.starts_with(b"GET /health ")
+    {
+        return;
+    }
+    let request_number = requests.fetch_add(1, Ordering::SeqCst);
+    let status = if request_number == 0 {
+        "503 Service Unavailable"
+    } else {
+        "200 OK"
+    };
+    let body = if request_number == 0 {
+        br#"{"ok":false}"#.as_slice()
+    } else {
+        br#"{"ok":true}"#.as_slice()
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.write_all(body);
 }
 
 fn stop_converging_health_server(port: u32, stop: &AtomicBool, handle: thread::JoinHandle<()>) {
@@ -340,6 +346,48 @@ fn converging_health_server_rejects_incomplete_requests() {
         "incomplete request received {response:?}"
     );
     assert_eq!(requests.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn converging_health_server_waits_for_delayed_headers_on_nonblocking_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    // Exercise inherited mode on every platform, including Linux where accept
+    // does not preserve the listener's nonblocking flag.
+    stream.set_nonblocking(true).unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_thread = Arc::clone(&requests);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        serve_converging_health_request(stream, &requests_thread);
+        finished_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let before_headers = finished_rx.recv_timeout(Duration::from_millis(50));
+    let write_result =
+        client.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let mut response = String::new();
+    let read_result = client.read_to_string(&mut response);
+    drop(client);
+    handle.join().unwrap();
+
+    assert_eq!(
+        before_headers,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    write_result.unwrap();
+    read_result.unwrap();
+    assert_eq!(
+        response.lines().next(),
+        Some("HTTP/1.1 503 Service Unavailable")
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
 }
 
 fn health_status(port: u32) -> String {
