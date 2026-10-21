@@ -1031,6 +1031,22 @@ impl Cli {
                                     .commit_snapshot_restore_locked(transaction))
                             }
                             Err(service_error) => {
+                                let mut error = format!(
+                                    "snapshot {} failed managed-service acceptance: {service_error}",
+                                    restored.snapshot_id
+                                );
+                                // Acceptance can fail while the restored Gateway is still
+                                // alive. Stop that generation before replacing its files;
+                                // the recovery pause never compensates back to running intent.
+                                if let Err(stop_error) = self
+                                    .service_service()
+                                    .quiesce_after_failed_restore_locked(name)
+                                {
+                                    return Err(format!(
+                                        "{error}; snapshot rollback and automatic service resumption withheld because quiescence could not be confirmed; quiescing the managed service also failed: {stop_error}; {}",
+                                        transaction.retained_operation_note()
+                                    ));
+                                }
                                 let rollback_result = self
                                     .environment_service()
                                     .rollback_snapshot_restore_locked(transaction);
@@ -1038,10 +1054,6 @@ impl Cli {
                                     .map_or_else(|error| error.prior_state_restored, |()| true);
                                 let service_restore_result = self
                                     .restore_service_after_snapshot_failure_locked(name, service_state, recovery_safe);
-                                let mut error = format!(
-                                    "snapshot {} failed managed-service acceptance: {service_error}",
-                                    restored.snapshot_id
-                                );
                                 if let Err(rollback_error) = rollback_result {
                                     error.push_str(&format!(
                                         "; snapshot rollback requires attention: {rollback_error}"

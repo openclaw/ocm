@@ -38,6 +38,56 @@ fn install_fake_launchctl(root: &TestDir, env: &mut std::collections::BTreeMap<S
     );
 }
 
+#[cfg(target_os = "linux")]
+fn assert_live_snapshot_compensation(mode: &str) {
+    let root = TestDir::new("snapshot-live-compensation");
+    let mut env = ocm_env(&root);
+    env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/snapshot_live_compensation.py"
+        ))
+        .arg(support::ocm_test_binary_path())
+        .arg(root.path())
+        .arg(mode)
+        .env_clear()
+        .envs(&env)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "live snapshot compensation ({mode}) failed with {}:\nstdout={}\nstderr={}",
+        output.status,
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn snapshot_compensation_stops_a_live_rejected_gateway_before_replacing_its_root() {
+    assert_live_snapshot_compensation("unhealthy-live");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn snapshot_compensation_retains_recovery_files_when_a_live_gateway_cannot_be_quiesced() {
+    assert_live_snapshot_compensation("stop-timeout");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn snapshot_compensation_recovers_after_the_restored_gateway_exits_before_readiness() {
+    assert_live_snapshot_compensation("exit-before-ready");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn snapshot_compensation_accepts_a_healthy_restored_gateway() {
+    assert_live_snapshot_compensation("healthy");
+}
+
 fn write_running_snapshot_service(
     root: &TestDir,
     cwd: &Path,
