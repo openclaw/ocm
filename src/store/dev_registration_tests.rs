@@ -352,8 +352,10 @@ fn loose_storage_observation_keeps_complete_outputs_and_fresh_barriers() {
     use std::os::unix::fs::symlink;
 
     let (temp, env, owned) = fixture();
-    let cwd = temp.path();
-    let repo = Path::new(owned.repo_root());
+    let canonical_root = fs::canonicalize(temp.path()).unwrap();
+    let cwd = canonical_root.as_path();
+    let canonical_repo = fs::canonicalize(owned.repo_root()).unwrap();
+    let repo = canonical_repo.as_path();
     let objects = repo.join(".git/objects");
     let fanout = fs::read_dir(&objects)
         .unwrap()
@@ -384,7 +386,10 @@ fn loose_storage_observation_keeps_complete_outputs_and_fresh_barriers() {
         },
     ] {
         let (observed_repo, observed_dev) = inspect_dev_source_identity_footprints(&dev).unwrap();
-        assert_eq!(observed_repo, inspect_source_footprint(repo).unwrap());
+        assert_eq!(
+            observed_repo,
+            inspect_source_footprint(Path::new(dev.repo_root())).unwrap()
+        );
         assert_eq!(observed_dev, inspect_dev_source_footprint(&dev).unwrap());
         for output in [&observed_repo, &observed_dev] {
             for path in [&fanout, &intermediate, &backing, &first, &second] {
@@ -429,12 +434,15 @@ fn loose_storage_missing_aliases_keep_reservations_separate_from_strict_identity
 
     for directory in [false, true] {
         let (temp, _env, owned) = fixture();
-        let repo = Path::new(owned.repo_root());
+        let canonical_repo = fs::canonicalize(owned.repo_root()).unwrap();
+        let repo = canonical_repo.as_path();
         let fanout = (0..=255u8)
             .map(|prefix| repo.join(format!(".git/objects/{prefix:02x}")))
             .find(|path| !path.exists())
             .unwrap();
-        let missing = temp.path().join("absent/storage");
+        let missing = fs::canonicalize(temp.path())
+            .unwrap()
+            .join("absent/storage");
         let alias = if directory {
             fanout
         } else {
@@ -455,7 +463,8 @@ fn loose_storage_missing_aliases_keep_reservations_separate_from_strict_identity
 #[test]
 fn ordinary_loose_object_writes_keep_registration_identity_and_budget() {
     let (temp, env, owned) = fixture();
-    let repo = Path::new(owned.repo_root());
+    let canonical_repo = fs::canonicalize(owned.repo_root()).unwrap();
+    let repo = canonical_repo.as_path();
     let dev = EnvDevMeta::Borrowed {
         source_root: display_path(repo),
     };
