@@ -15,8 +15,8 @@ use super::common::{ensure_dir, path_exists, write_file_replacing_path};
 use super::gateway_ports::read_port_number;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_workspaces::{
-    OpenClawWorkspaceInventory, load_effective_openclaw_config, normalize_agent_id,
-    read_regular_text_file,
+    OpenClawConfigReadContext, OpenClawWorkspaceInventory, load_effective_openclaw_config,
+    normalize_agent_id, read_openclaw_config_field, read_regular_text_file,
 };
 
 #[cfg(all(test, target_os = "macos"))]
@@ -830,21 +830,95 @@ pub(crate) fn ensure_minimum_local_openclaw_config(
     target_paths: &EnvPaths,
     gateway_port: u32,
 ) -> Result<(), String> {
-    ensure_local_state_paths(target_paths)?;
-    let original = read_config_value(&target_paths.config_path)?;
-    let effective = load_effective_openclaw_config(&target_paths.config_path)?
-        .map(|config| config.value)
-        .unwrap_or_else(|| json!({}));
+    prepare_minimum_local_openclaw_config(
+        target_paths,
+        gateway_port,
+        &OpenClawConfigReadContext::default(),
+    )?
+    .apply()
+}
+
+pub(crate) struct MinimumLocalConfig {
+    paths: EnvPaths,
+    value: Value,
+    changed: bool,
+    original: Option<String>,
+}
+
+impl MinimumLocalConfig {
+    pub(crate) fn apply(self) -> Result<(), String> {
+        if read_config_raw(&self.paths.config_path)? != self.original {
+            return Err(
+                "OpenClaw configuration changed during minimum setup; retry without overwriting it"
+                    .to_string(),
+            );
+        }
+        ensure_local_state_paths(&self.paths)?;
+        if self.changed {
+            write_config_value(&self.paths.config_path, &self.value)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn prepare_minimum_local_openclaw_config(
+    target_paths: &EnvPaths,
+    gateway_port: u32,
+    context: &OpenClawConfigReadContext,
+) -> Result<MinimumLocalConfig, String> {
+    let original_raw = read_config_raw(&target_paths.config_path)?;
+    let original: Option<Value> = original_raw
+        .as_deref()
+        .map(json5::from_str)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let missing_paths: Vec<&[&str]> = [
+        ("/gateway/mode", &["gateway", "mode"][..]),
+        ("/gateway/bind", &["gateway", "bind"][..]),
+        (
+            "/agents/defaults/workspace",
+            &["agents", "defaults", "workspace"][..],
+        ),
+    ]
+    .into_iter()
+    .filter(|(pointer, _)| {
+        original
+            .as_ref()
+            .and_then(|value| value.pointer(pointer))
+            .is_none()
+    })
+    .map(|(_, path)| path)
+    .collect();
+    let mut effective = json!({});
+    for path in missing_paths {
+        if let Some(value) = read_openclaw_config_field(&target_paths.config_path, path, context)
+            .value
+            .map_err(|error| {
+                format!("cannot prepare minimum setting {}: {error}", path.join("."))
+            })?
+        {
+            let mut parent = &mut effective;
+            for key in &path[..path.len() - 1] {
+                if parent.get(*key).is_none() {
+                    parent[*key] = json!({});
+                }
+                parent = &mut parent[*key];
+            }
+            parent[path[path.len() - 1]] = value;
+        }
+    }
     let value = minimum_local_config_value(
         target_paths,
         gateway_port,
         original.clone().unwrap_or_else(|| json!({})),
         &effective,
     )?;
-    if original.as_ref() == Some(&value) {
-        return Ok(());
-    }
-    write_config_value(&target_paths.config_path, &value)
+    Ok(MinimumLocalConfig {
+        paths: target_paths.clone(),
+        changed: original.as_ref() != Some(&value),
+        value,
+        original: original_raw,
+    })
 }
 
 pub(super) fn initialize_new_dev_openclaw_config(
@@ -898,6 +972,12 @@ fn minimum_local_config_value(
         value = json!({});
     }
 
+    let mode_missing =
+        value.pointer("/gateway/mode").is_none() && effective.pointer("/gateway/mode").is_none();
+    let bind_missing =
+        value.pointer("/gateway/bind").is_none() && effective.pointer("/gateway/bind").is_none();
+    let workspace_missing = value.pointer("/agents/defaults/workspace").is_none()
+        && effective.pointer("/agents/defaults/workspace").is_none();
     let root = value
         .as_object_mut()
         .ok_or_else(|| "OpenClaw config root must be an object".to_string())?;
@@ -905,10 +985,10 @@ fn minimum_local_config_value(
     let gateway = ensure_object_field(root, "gateway");
     // Root siblings override includes. Add defaults only when the effective
     // configuration lacks them, leaving authored include values at their source.
-    if effective.pointer("/gateway/mode").is_none() {
+    if mode_missing {
         gateway.insert("mode".to_string(), Value::String("local".to_string()));
     }
-    if effective.pointer("/gateway/bind").is_none() {
+    if bind_missing {
         gateway.insert("bind".to_string(), Value::String("loopback".to_string()));
     }
     gateway.insert(
@@ -916,7 +996,7 @@ fn minimum_local_config_value(
         Value::Number(serde_json::Number::from(gateway_port)),
     );
 
-    if effective.pointer("/agents/defaults/workspace").is_none() {
+    if workspace_missing {
         let agents = ensure_object_field(root, "agents");
         let defaults = ensure_object_field(agents, "defaults");
         defaults.insert("workspace".to_string(), Value::String(workspace));
@@ -1091,15 +1171,21 @@ fn audit_openclaw_config_value(
 }
 
 fn read_config_value(config_path: &Path) -> Result<Option<Value>, String> {
+    read_config_raw(config_path)?
+        .as_deref()
+        .map(json5::from_str)
+        .transpose()
+        .map_err(|error| error.to_string())
+}
+
+fn read_config_raw(config_path: &Path) -> Result<Option<String>, String> {
     match fs::symlink_metadata(config_path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     }
 
-    let raw = read_regular_text_file(config_path, "OpenClaw config", None)?;
-    let value = json5::from_str(&raw).map_err(|error| error.to_string())?;
-    Ok(Some(value))
+    read_regular_text_file(config_path, "OpenClaw config", None).map(Some)
 }
 
 fn ensure_object_field<'a>(
@@ -2422,6 +2508,28 @@ mod tests {
         fs::write(&paths.config_path, original).unwrap();
         assert!(ensure_minimum_local_openclaw_config(&paths, 19800).is_err());
         assert_eq!(fs::read(&paths.config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn prepared_minimum_config_does_not_overwrite_a_changed_root() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = derive_env_paths(root.path());
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        fs::write(&paths.config_path, "{}").unwrap();
+        let plan = prepare_minimum_local_openclaw_config(
+            &paths,
+            19800,
+            &OpenClawConfigReadContext::default(),
+        )
+        .unwrap();
+        let changed = "// changed during binding preparation\n{gateway:{bind:'lan'}}";
+        fs::write(&paths.config_path, changed).unwrap();
+        assert!(
+            plan.apply()
+                .unwrap_err()
+                .contains("changed during minimum setup")
+        );
+        assert_eq!(fs::read_to_string(&paths.config_path).unwrap(), changed);
     }
 
     #[test]

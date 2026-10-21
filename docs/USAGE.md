@@ -58,6 +58,17 @@ By default, it also installs and starts the environment service so OpenClaw keep
 Minimum setup fills missing settings using the effective configuration, preserving
 authored values supplied through supported internal `$include` files. Included
 files remain unchanged, and the environment’s selected Gateway port still applies.
+Minimum setup inspects only the settings it needs; unrelated include branches are
+left to OpenClaw and are not validated by this setup step.
+To use a shared include directory, supply `OPENCLAW_INCLUDE_ROOTS` to OCM; its
+platform-separated directory list is admitted to both minimum setup and the
+launched OpenClaw process. Relative entries use the configured Gateway working
+directory, and `~` uses the environment's OpenClaw home. Config `env` cannot
+authorize additional roots. If a required minimum setting depends on an include
+outside those roots, setup stops before writing configuration or launching a
+Gateway. Expose the root authorization to OCM or author that setting in an
+observable file; roots known only inside an opaque launcher cannot be inferred.
+This read-only permission does not relax clone/import/export containment.
 With `--onboard`, onboarding runs first, and OCM installs and starts the service only
 after onboarding succeeds. This also applies when you choose both onboarding and
 background running in `setup`. Failed or cancelled onboarding leaves a new

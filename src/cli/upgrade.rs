@@ -2179,11 +2179,8 @@ impl Cli {
                 meta = self
                     .environment_service()
                     .apply_effective_gateway_port(meta)?;
-                let paths = derive_env_paths(Path::new(&meta.root));
-                ensure_minimum_local_openclaw_config(
-                    &paths,
-                    meta.gateway_port.unwrap_or_default(),
-                )?;
+                self.prepare_minimum_local_config(&meta, meta.gateway_port.unwrap_or_default())?
+                    .apply()?;
                 self.ensure_simulation_dev_dependencies(&meta)?;
                 Ok((
                     "dev".to_string(),

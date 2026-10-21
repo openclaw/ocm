@@ -42,10 +42,7 @@ use crate::openclaw_repo::{
     inspect_source_dependencies_with_runner, validate_borrowed_openclaw_checkout,
 };
 use crate::service::service_backend_support_error;
-use crate::store::{
-    derive_env_paths, display_path, ensure_minimum_local_openclaw_config, resolve_absolute_path,
-    validate_name,
-};
+use crate::store::{derive_env_paths, display_path, resolve_absolute_path, validate_name};
 
 const SOURCE_WATCH_TREE_ACTIVE_ERROR: &str = "source watch process tree is still active";
 #[cfg(unix)]
@@ -1665,11 +1662,11 @@ impl Cli {
     }
 
     fn bootstrap_dev_env(&self, meta: &EnvMeta) -> Result<(), String> {
-        let paths = derive_env_paths(Path::new(&meta.root));
         let (gateway_port, _) = self
             .environment_service()
             .resolve_effective_gateway_port(meta)?;
-        ensure_minimum_local_openclaw_config(&paths, gateway_port)
+        self.prepare_minimum_local_config(meta, gateway_port)?
+            .apply()
     }
 
     fn prepare_dev_run(

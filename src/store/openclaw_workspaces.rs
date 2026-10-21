@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use super::common::path_exists;
-use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
+use super::config_include_read::read_guarded_config_include;
+use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path, resolve_absolute_path};
 
 const DEFAULT_AGENT_ID: &str = "main";
 const MAX_INCLUDE_DEPTH: usize = 10;
@@ -580,6 +581,186 @@ pub(crate) fn load_effective_openclaw_config(
     load_effective_openclaw_config_with_source_roots(config_path, &[])
 }
 
+/// Explicit native launch authorization, never derived from config.env.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OpenClawConfigReadContext {
+    include_roots: Vec<PathBuf>,
+}
+
+impl OpenClawConfigReadContext {
+    pub(crate) fn for_launch(env: &BTreeMap<String, String>, cwd: &Path) -> Result<Self, String> {
+        let mut path_env = env.clone();
+        if let Some(home) = env
+            .get("OPENCLAW_HOME")
+            .filter(|home| !home.trim().is_empty())
+        {
+            path_env.insert("HOME".to_string(), home.clone());
+        }
+        let mut include_roots = Vec::new();
+        for entry in env
+            .get("OPENCLAW_INCLUDE_ROOTS")
+            .map(String::as_str)
+            .unwrap_or("")
+            .split(if cfg!(windows) { ';' } else { ':' })
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            if entry.contains('\0') {
+                return Err("OPENCLAW_INCLUDE_ROOTS contains a null byte".to_string());
+            }
+            let root = resolve_absolute_path(entry, &path_env, cwd)?;
+            if !include_roots.contains(&root) {
+                include_roots.push(root);
+            }
+        }
+        Ok(Self { include_roots })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OpenClawConfigReadError {
+    OutsideAuthority(PathBuf),
+    Invalid(String),
+}
+
+impl From<String> for OpenClawConfigReadError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl std::fmt::Display for OpenClawConfigReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutsideAuthority(path) => write!(
+                f,
+                "OpenClaw include {} is outside the admitted configuration roots; supply OPENCLAW_INCLUDE_ROOTS to OCM or author the required setting in an observable configuration file",
+                display_path(path)
+            ),
+            Self::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
+/// Value and partial boolean evidence are separate: an unresolved later include
+/// must not erase a previously observed true when a caller protects TLS.
+#[derive(Debug)]
+pub(crate) struct OpenClawConfigField {
+    pub(crate) value: Result<Option<Value>, OpenClawConfigReadError>,
+    // Shared boolean evidence is consumed by the readiness integration.
+    #[allow(dead_code)]
+    pub(crate) observed_true: bool,
+}
+
+pub(crate) fn read_openclaw_config_field(
+    config_path: &Path,
+    field: &[&str],
+    context: &OpenClawConfigReadContext,
+) -> OpenClawConfigField {
+    let mut observed_true = false;
+    let result = (|| {
+        if !path_exists(config_path) {
+            return Ok(None);
+        }
+        let raw = read_regular_text_file(config_path, "OpenClaw config", None)
+            .map_err(OpenClawConfigReadError::Invalid)?;
+        let value =
+            parse_projection_json(&raw, config_path).map_err(OpenClawConfigReadError::Invalid)?;
+        let root = config_path.parent().ok_or_else(|| {
+            OpenClawConfigReadError::Invalid("config path has no parent".to_string())
+        })?;
+        let mut processor =
+            IncludeProcessor::new(root).map_err(OpenClawConfigReadError::Invalid)?;
+        processor.projection = Some(ConfigProjection {
+            paths: vec![field.iter().map(|key| (*key).to_string()).collect()],
+        });
+        processor.allowed_roots = context.include_roots.clone();
+        processor.canonical_allowed_roots = context
+            .include_roots
+            .iter()
+            .map(|root| canonicalize_path_allow_missing(root))
+            .collect::<Result<_, _>>()
+            .map_err(OpenClawConfigReadError::Invalid)?;
+        let result = processor.process(
+            value,
+            config_path,
+            0,
+            &mut vec![clean_path(config_path)],
+            &[],
+        );
+        observed_true = processor.observed_true;
+        let resolved = result.map_err(OpenClawConfigReadError::Invalid)?;
+        if let Some(path) = resolved.outside {
+            return Err(OpenClawConfigReadError::OutsideAuthority(path));
+        }
+        let mut selected = &resolved.value;
+        for key in field {
+            let Some(value) = selected.get(*key) else {
+                return Ok(None);
+            };
+            selected = value;
+        }
+        Ok(Some(selected.clone()))
+    })();
+    OpenClawConfigField {
+        value: result,
+        observed_true,
+    }
+}
+
+fn parse_projection_json(raw: &str, path: &Path) -> Result<Value, String> {
+    // Do not expose source excerpts from externally authorized config files.
+    json5::from_str(raw).map_err(|_| {
+        format!(
+            "invalid JSON/JSON5 in OpenClaw configuration {}",
+            display_path(path)
+        )
+    })
+}
+
+/// Resolve selected object-field paths without reading unrelated includes.
+/// Selected includes retain the full loader's confinement and read guards.
+/// This projects values; it does not validate omitted configuration branches.
+#[cfg(test)]
+fn load_openclaw_config_projection(
+    config_path: &Path,
+    selected_paths: &[&[&str]],
+) -> Result<Option<Value>, String> {
+    if !path_exists(config_path) {
+        return Ok(None);
+    }
+    if selected_paths.is_empty() {
+        return Ok(Some(Value::Object(Map::new())));
+    }
+    let raw = read_regular_text_file(config_path, "OpenClaw config", None)?;
+    let value = parse_json5(&raw, config_path, "OpenClaw config")?;
+    let config_root = config_path.parent().ok_or_else(|| {
+        format!(
+            "OpenClaw config path has no parent: {}",
+            config_path.display()
+        )
+    })?;
+    let mut processor = IncludeProcessor::new(config_root)?;
+    processor.projection = Some(ConfigProjection {
+        paths: selected_paths
+            .iter()
+            .map(|path| path.iter().map(|key| (*key).to_string()).collect())
+            .collect(),
+    });
+    processor
+        .process(
+            value,
+            config_path,
+            0,
+            &mut vec![clean_path(config_path)],
+            &[],
+        )
+        .and_then(|resolved| match resolved.outside {
+            Some(path) => Err(OpenClawConfigReadError::OutsideAuthority(path).to_string()),
+            None => Ok(Some(resolved.value)),
+        })
+}
+
 fn load_effective_openclaw_config_with_source_roots(
     config_path: &Path,
     source_roots: &[&Path],
@@ -618,7 +799,7 @@ fn resolve_effective_openclaw_config(
     )?;
 
     Ok(EffectiveOpenClawConfig {
-        value,
+        value: value.value,
         include_paths: processor.include_paths,
         include_scopes: processor.include_scopes,
     })
@@ -1283,12 +1464,116 @@ fn resolve_configured_path(
     Ok(clean_path(&expanded))
 }
 
+#[derive(Clone)]
+struct ConfigProjection {
+    paths: Vec<Vec<String>>,
+}
+
+impl ConfigProjection {
+    fn selects(&self, scope: &[String]) -> bool {
+        // Keep selected leaves, their ancestors and complete leaf values.
+        self.paths.iter().any(|path| {
+            path.iter()
+                .zip(scope)
+                .all(|(expected, actual)| expected == actual)
+        })
+    }
+
+    fn needed_from_include(&self, siblings: &Map<String, Value>, scope: &[String]) -> Self {
+        Self {
+            paths: self
+                .paths
+                .iter()
+                .filter(|path| {
+                    path.iter()
+                        .zip(scope)
+                        .all(|(expected, actual)| expected == actual)
+                        && (path.len() <= scope.len()
+                            || !scalar_override(siblings, &path[scope.len()..]))
+                })
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+// Scalars override an included value, including when they replace an ancestor
+// object. Objects and arrays may merge, so their includes still contribute.
+fn scalar_override(object: &Map<String, Value>, path: &[String]) -> bool {
+    let Some((key, remaining)) = path.split_first() else {
+        return false;
+    };
+    let Some(value) = object.get(key) else {
+        return false;
+    };
+    match value {
+        Value::Object(child) if !remaining.is_empty() => scalar_override(child, remaining),
+        Value::Object(_) | Value::Array(_) => false,
+        _ => true,
+    }
+}
+
+fn scalar_value_override(value: &Value, path: &[String]) -> bool {
+    match value {
+        Value::Object(object) => scalar_override(object, path),
+        Value::Array(_) => false,
+        _ => true,
+    }
+}
+
+fn include_path_within(path: &Path, root: &Path) -> bool {
+    #[cfg(not(windows))]
+    {
+        path.starts_with(root)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+        let mut parts = path.components();
+        root.components().all(|root_part| {
+            let Some(part) = parts.next() else {
+                return false;
+            };
+            let left: Vec<u16> = part.as_os_str().encode_wide().collect();
+            let right: Vec<u16> = root_part.as_os_str().encode_wide().collect();
+            unsafe {
+                CompareStringOrdinal(
+                    left.as_ptr(),
+                    left.len() as i32,
+                    right.as_ptr(),
+                    right.len() as i32,
+                    1,
+                ) == CSTR_EQUAL
+            }
+        })
+    }
+}
+
+struct ResolvedInclude {
+    value: Value,
+    outside: Option<PathBuf>,
+}
+
+impl ResolvedInclude {
+    fn known(value: Value) -> Self {
+        Self {
+            value,
+            outside: None,
+        }
+    }
+}
+
 struct IncludeProcessor {
     root_dir: PathBuf,
     archived_config_roots: Vec<PathBuf>,
     canonical_root_dir: PathBuf,
     include_paths: BTreeSet<PathBuf>,
     include_scopes: BTreeMap<PathBuf, BTreeSet<Vec<String>>>,
+    projection: Option<ConfigProjection>,
+    allowed_roots: Vec<PathBuf>,
+    canonical_allowed_roots: Vec<PathBuf>,
+    observed_true: bool,
 }
 
 impl IncludeProcessor {
@@ -1301,7 +1586,34 @@ impl IncludeProcessor {
             canonical_root_dir,
             include_paths: BTreeSet::new(),
             include_scopes: BTreeMap::new(),
+            projection: None,
+            allowed_roots: Vec::new(),
+            canonical_allowed_roots: Vec::new(),
+            observed_true: false,
         })
+    }
+
+    fn merge(
+        &self,
+        base: ResolvedInclude,
+        next: ResolvedInclude,
+        scope: &[String],
+    ) -> ResolvedInclude {
+        let masks_previous = self.projection.as_ref().is_some_and(|projection| {
+            projection
+                .paths
+                .iter()
+                .filter(|path| path.iter().zip(scope).all(|(a, b)| a == b))
+                .all(|path| {
+                    scalar_value_override(&next.value, path.get(scope.len()..).unwrap_or(&[]))
+                })
+        });
+        ResolvedInclude {
+            value: deep_merge(base.value, next.value),
+            outside: next
+                .outside
+                .or(if masks_previous { None } else { base.outside }),
+        }
     }
 
     fn process(
@@ -1311,56 +1623,98 @@ impl IncludeProcessor {
         depth: usize,
         stack: &mut Vec<PathBuf>,
         scope: &[String],
-    ) -> Result<Value, String> {
+    ) -> Result<ResolvedInclude, String> {
+        if let Some(projection) = &self.projection {
+            if !projection.selects(scope) {
+                return Ok(ResolvedInclude::known(Value::Null));
+            }
+            for path in &projection.paths {
+                if path.len() >= scope.len() && path.iter().zip(scope).all(|(a, b)| a == b) {
+                    let mut observed = Some(&value);
+                    for key in &path[scope.len()..] {
+                        observed = observed.and_then(|v| v.get(key));
+                    }
+                    self.observed_true |= observed == Some(&Value::Bool(true));
+                }
+            }
+        }
         match value {
-            Value::Array(values) => values
-                .into_iter()
-                .enumerate()
-                .map(|(index, value)| {
+            Value::Array(values) => {
+                let mut result = Vec::new();
+                let mut outside = None;
+                for (index, value) in values.into_iter().enumerate() {
                     let mut child_scope = scope.to_vec();
                     child_scope.push(index.to_string());
-                    self.process(value, containing_file, depth, stack, &child_scope)
+                    let child = self.process(value, containing_file, depth, stack, &child_scope)?;
+                    outside = outside.or(child.outside);
+                    result.push(child.value);
+                }
+                Ok(ResolvedInclude {
+                    value: Value::Array(result),
+                    outside,
                 })
-                .collect::<Result<Vec<_>, _>>()
-                .map(Value::Array),
+            }
             Value::Object(mut object) => {
-                let Some(include) = object.remove("$include") else {
-                    let mut resolved = Map::new();
-                    for (key, value) in object {
+                let had_siblings = object.keys().any(|key| key != "$include");
+                if let Some(projection) = &self.projection {
+                    object.retain(|key, _| {
+                        if key == "$include" {
+                            return true;
+                        }
                         let mut child_scope = scope.to_vec();
                         child_scope.push(key.clone());
-                        resolved.insert(
-                            key,
-                            self.process(value, containing_file, depth, stack, &child_scope)?,
-                        );
-                    }
-                    return Ok(Value::Object(resolved));
-                };
-
-                let included =
-                    self.resolve_include(include, containing_file, depth, stack, scope)?;
-                if object.is_empty() {
-                    return Ok(included);
+                        projection.selects(&child_scope)
+                    });
                 }
-                if !included.is_object() {
+                let include = object.remove("$include");
+                let had_include = include.is_some();
+                let included = if let Some(include) = include {
+                    if let Some(projection) = &self.projection {
+                        let needed = projection.needed_from_include(&object, scope);
+                        if needed.paths.is_empty() {
+                            ResolvedInclude::known(Value::Object(Map::new()))
+                        } else {
+                            let original = self.projection.replace(needed);
+                            let result =
+                                self.resolve_include(include, containing_file, depth, stack, scope);
+                            self.projection = original;
+                            result?
+                        }
+                    } else {
+                        self.resolve_include(include, containing_file, depth, stack, scope)?
+                    }
+                } else {
+                    ResolvedInclude::known(Value::Object(Map::new()))
+                };
+                if had_siblings && included.outside.is_none() && !included.value.is_object() {
                     return Err(
                         "OpenClaw $include sibling keys require included content to be an object"
                             .to_string(),
                     );
                 }
-
+                if object.is_empty() {
+                    return Ok(included);
+                }
                 let mut siblings = Map::new();
+                let mut outside = None;
                 for (key, value) in object {
                     let mut child_scope = scope.to_vec();
                     child_scope.push(key.clone());
-                    siblings.insert(
-                        key,
-                        self.process(value, containing_file, depth, stack, &child_scope)?,
-                    );
+                    let child = self.process(value, containing_file, depth, stack, &child_scope)?;
+                    outside = outside.or(child.outside);
+                    siblings.insert(key, child.value);
                 }
-                Ok(deep_merge(included, Value::Object(siblings)))
+                let siblings = ResolvedInclude {
+                    value: Value::Object(siblings),
+                    outside,
+                };
+                if had_include {
+                    Ok(self.merge(included, siblings, scope))
+                } else {
+                    Ok(siblings)
+                }
             }
-            value => Ok(value),
+            value => Ok(ResolvedInclude::known(value)),
         }
     }
 
@@ -1371,19 +1725,17 @@ impl IncludeProcessor {
         depth: usize,
         stack: &mut Vec<PathBuf>,
         scope: &[String],
-    ) -> Result<Value, String> {
+    ) -> Result<ResolvedInclude, String> {
         match include {
             Value::String(path) => self.load_include(&path, containing_file, depth, stack, scope),
             Value::Array(paths) => {
-                let mut merged = Value::Object(Map::new());
+                let mut merged = ResolvedInclude::known(Value::Object(Map::new()));
                 for path in paths {
                     let path = path.as_str().ok_or_else(|| {
                         "OpenClaw $include arrays must contain only paths".to_string()
                     })?;
-                    merged = deep_merge(
-                        merged,
-                        self.load_include(path, containing_file, depth, stack, scope)?,
-                    );
+                    let next = self.load_include(path, containing_file, depth, stack, scope)?;
+                    merged = self.merge(merged, next, scope);
                 }
                 Ok(merged)
             }
@@ -1398,14 +1750,28 @@ impl IncludeProcessor {
         depth: usize,
         stack: &mut Vec<PathBuf>,
         scope: &[String],
-    ) -> Result<Value, String> {
+    ) -> Result<ResolvedInclude, String> {
         if depth >= MAX_INCLUDE_DEPTH {
             return Err(format!(
                 "maximum OpenClaw $include depth ({MAX_INCLUDE_DEPTH}) exceeded at {include_path}"
             ));
         }
-        let resolved = self.resolve_include_path(include_path, containing_file)?;
-        if stack.contains(&resolved) {
+        let resolved = match self.resolve_include_path(include_path, containing_file) {
+            Ok(path) => path,
+            Err(OpenClawConfigReadError::OutsideAuthority(path)) if self.projection.is_some() => {
+                return Ok(ResolvedInclude {
+                    value: Value::Object(Map::new()),
+                    outside: Some(path),
+                });
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let identity = if self.projection.is_some() {
+            canonicalize_path_allow_missing(&resolved)?
+        } else {
+            resolved.clone()
+        };
+        if stack.contains(&identity) {
             let chain = stack
                 .iter()
                 .chain(std::iter::once(&resolved))
@@ -1415,15 +1781,25 @@ impl IncludeProcessor {
             return Err(format!("circular OpenClaw $include detected: {chain}"));
         }
 
-        let raw =
-            read_regular_text_file(&resolved, "OpenClaw include", Some(MAX_INCLUDE_FILE_BYTES))?;
-        let parsed = parse_json5(&raw, &resolved, "OpenClaw include")?;
+        let parsed = if self.projection.is_some() {
+            let mut roots = self.canonical_allowed_roots.clone();
+            roots.push(self.canonical_root_dir.clone());
+            let raw = read_guarded_config_include(&resolved, &roots, MAX_INCLUDE_FILE_BYTES)?;
+            parse_projection_json(&raw, &resolved)?
+        } else {
+            let raw = read_regular_text_file(
+                &resolved,
+                "OpenClaw include",
+                Some(MAX_INCLUDE_FILE_BYTES),
+            )?;
+            parse_json5(&raw, &resolved, "OpenClaw include")?
+        };
         self.include_paths.insert(resolved.clone());
         self.include_scopes
             .entry(resolved.clone())
             .or_default()
             .insert(scope.to_vec());
-        stack.push(resolved.clone());
+        stack.push(identity);
         let result = self.process(parsed, &resolved, depth + 1, stack, scope);
         stack.pop();
         result
@@ -1433,14 +1809,16 @@ impl IncludeProcessor {
         &self,
         include_path: &str,
         containing_file: &Path,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<PathBuf, OpenClawConfigReadError> {
         if include_path.contains('\0') {
-            return Err("OpenClaw $include path must not contain null bytes".to_string());
+            return Err(OpenClawConfigReadError::Invalid(
+                "OpenClaw $include path must not contain null bytes".to_string(),
+            ));
         }
         if include_path.len() >= MAX_INCLUDE_PATH_LENGTH {
-            return Err(format!(
+            return Err(OpenClawConfigReadError::Invalid(format!(
                 "OpenClaw $include path exceeds {MAX_INCLUDE_PATH_LENGTH} characters"
-            ));
+            )));
         }
         let include_path = Path::new(include_path);
         let resolved = if include_path.is_absolute() {
@@ -1455,22 +1833,45 @@ impl IncludeProcessor {
             )
         };
         if display_path(&resolved).len() >= MAX_INCLUDE_PATH_LENGTH {
-            return Err(format!(
+            return Err(OpenClawConfigReadError::Invalid(format!(
                 "resolved OpenClaw $include path exceeds {MAX_INCLUDE_PATH_LENGTH} characters"
-            ));
+            )));
         }
-        if !resolved.starts_with(&self.root_dir) {
-            return Err(format!(
-                "OpenClaw $include path escapes the config directory: {}",
-                display_path(&resolved)
-            ));
+        let internal = if self.projection.is_some() {
+            include_path_within(&resolved, &self.root_dir)
+        } else {
+            resolved.starts_with(&self.root_dir)
+        };
+        if !internal
+            && !self
+                .allowed_roots
+                .iter()
+                .any(|root| include_path_within(&resolved, root))
+        {
+            return Err(if self.projection.is_some() {
+                OpenClawConfigReadError::OutsideAuthority(resolved)
+            } else {
+                OpenClawConfigReadError::Invalid(format!(
+                    "OpenClaw $include path escapes the config directory: {}",
+                    display_path(&resolved)
+                ))
+            });
         }
         let canonical = canonicalize_path_allow_missing(&resolved)?;
-        if !canonical.starts_with(&self.canonical_root_dir) {
-            return Err(format!(
-                "OpenClaw $include path resolves outside the config directory: {}",
-                display_path(&resolved)
-            ));
+        if !canonical.starts_with(&self.canonical_root_dir)
+            && !self
+                .canonical_allowed_roots
+                .iter()
+                .any(|root| include_path_within(&canonical, root))
+        {
+            return Err(if self.projection.is_some() {
+                OpenClawConfigReadError::OutsideAuthority(canonical)
+            } else {
+                OpenClawConfigReadError::Invalid(format!(
+                    "OpenClaw $include path resolves outside the config directory: {}",
+                    display_path(&resolved)
+                ))
+            });
         }
         Ok(resolved)
     }
@@ -1667,6 +2068,407 @@ mod tests {
         assert_eq!(resolved.include_paths.len(), 3);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_projection_skips_unrelated_includes_and_preserves_merge_order() {
+        let root = test_root("readiness-projection");
+        let state_dir = root.join(".openclaw");
+        fs::create_dir_all(state_dir.join("config")).unwrap();
+        let config_path = state_dir.join("openclaw.json");
+        fs::write(
+            &config_path,
+            r#"{
+                $include: ['./config/base.json5', './config/override.json5'],
+                agents: { $include: '../outside-agents.json5' },
+                gateway: { tls: { certPath: 'sibling.pem' } }
+            }"#,
+        )
+        .unwrap();
+        fs::write(root.join("outside-agents.json5"), "{ list: [] }").unwrap();
+        fs::write(
+            state_dir.join("config/base.json5"),
+            r#"{
+                agents: { $include: '../../outside-agents.json5' },
+                gateway: { $include: './gateway.json5' },
+                env: { $include: '../../outside-env.json5' }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            state_dir.join("config/gateway.json5"),
+            r#"{
+                tls: { $include: './tls.json5' },
+                controlUi: { $include: '../../outside-ui.json5' }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            state_dir.join("config/tls.json5"),
+            r#"{
+                enabled: false,
+                certPath: 'base.pem',
+                keyPath: 'private.key'
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            state_dir.join("config/override.json5"),
+            "{ gateway: { tls: { enabled: true, certPath: 'override.pem' } } }",
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_openclaw_config_projection(
+                &config_path,
+                &[
+                    &["gateway", "tls", "enabled"],
+                    &["gateway", "tls", "certPath"]
+                ]
+            )
+            .unwrap(),
+            Some(serde_json::json!({
+                "gateway": { "tls": { "enabled": true, "certPath": "sibling.pem" } }
+            }))
+        );
+        let error = load_effective_openclaw_config(&config_path).unwrap_err();
+        assert!(error.contains("escapes the config directory"), "{error}");
+        assert!(error.contains("outside-agents.json5"), "{error}");
+        let error = load_openclaw_config_projection(
+            &config_path,
+            &[
+                &["gateway", "tls", "enabled"],
+                &["gateway", "tls", "certPath"],
+                &["env"],
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("outside the admitted configuration roots"),
+            "{error}"
+        );
+        assert!(error.contains("outside-env.json5"), "{error}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_projection_confines_selected_includes_and_preserves_read_guards() {
+        let root = test_root("readiness-selected-includes");
+        let state_dir = root.join(".openclaw");
+        fs::create_dir_all(&state_dir).unwrap();
+        let config_path = state_dir.join("openclaw.json");
+        fs::write(
+            &config_path,
+            r#"{
+                gateway: { tls: { enabled: true, certPath: '${CERT}' } },
+                env: { $include: './env.json5', vars: { CERT: 'sibling.pem' } }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            state_dir.join("env.json5"),
+            "{ vars: { CERT: 'included.pem', OTHER: 'retained' } }",
+        )
+        .unwrap();
+        let tls_only = load_openclaw_config_projection(
+            &config_path,
+            &[
+                &["gateway", "tls", "enabled"],
+                &["gateway", "tls", "certPath"],
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(tls_only.get("env").is_none());
+        let with_env = load_openclaw_config_projection(
+            &config_path,
+            &[
+                &["gateway", "tls", "enabled"],
+                &["gateway", "tls", "certPath"],
+                &["env"],
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            with_env.get("env"),
+            Some(&serde_json::json!({
+                "vars": { "CERT": "sibling.pem", "OTHER": "retained" }
+            }))
+        );
+
+        fs::write(
+            &config_path,
+            "{ gateway: { tls: { $include: '../outside-tls.json5' } } }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("outside-tls.json5"),
+            "{ enabled: true, certPath: 'outside.pem' }",
+        )
+        .unwrap();
+        let error = load_openclaw_config_projection(
+            &config_path,
+            &[
+                &["gateway", "tls", "enabled"],
+                &["gateway", "tls", "certPath"],
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("outside the admitted configuration roots"),
+            "{error}"
+        );
+
+        fs::write(
+            &config_path,
+            "{ gateway: { tls: { $include: './tls.json5' } } }",
+        )
+        .unwrap();
+        fs::write(state_dir.join("tls.json5"), "{ $include: './tls.json5' }").unwrap();
+        let error = load_openclaw_config_projection(
+            &config_path,
+            &[
+                &["gateway", "tls", "enabled"],
+                &["gateway", "tls", "certPath"],
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("circular OpenClaw $include"), "{error}");
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(state_dir.join("tls.json5")).unwrap();
+            std::os::unix::fs::symlink(root.join("outside-tls.json5"), state_dir.join("tls.json5"))
+                .unwrap();
+            let error = load_openclaw_config_projection(
+                &config_path,
+                &[
+                    &["gateway", "tls", "enabled"],
+                    &["gateway", "tls", "certPath"],
+                ],
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("outside the admitted configuration roots"),
+                "{error}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_projection_skips_empty_selection_and_nested_scalar_shadowing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join(".openclaw");
+        fs::create_dir_all(&state).unwrap();
+        let config_path = state.join("openclaw.json");
+        fs::write(&config_path, "{$include:'./missing.json'}").unwrap();
+        assert_eq!(
+            load_openclaw_config_projection(&config_path, &[]).unwrap(),
+            Some(serde_json::json!({}))
+        );
+        fs::write(&config_path, "{$include:'./base.json'}").unwrap();
+        fs::write(
+            state.join("base.json"),
+            r#"{
+            gateway: {$include:'../shared-gateway.json', mode:'remote', bind:'lan'},
+            agents: {defaults: {$include:'../shared-defaults.json', workspace:'~/custom'}}
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("shared-gateway.json"),
+            "{mode:'local',bind:'loopback'}",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("shared-defaults.json"),
+            "{workspace:'~/other'}",
+        )
+        .unwrap();
+        let projected = load_openclaw_config_projection(
+            &config_path,
+            &[
+                &["gateway", "mode"],
+                &["gateway", "bind"],
+                &["agents", "defaults", "workspace"],
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            projected,
+            serde_json::json!({
+                "gateway": {"mode":"remote", "bind":"lan"},
+                "agents": {"defaults":{"workspace":"~/custom"}}
+            })
+        );
+        assert!(
+            load_effective_openclaw_config(&config_path)
+                .unwrap_err()
+                .contains("escapes the config directory")
+        );
+    }
+
+    #[test]
+    fn config_projection_preserves_selected_object_array_and_ancestor_merge_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("openclaw.json");
+        fs::write(
+            &config_path,
+            r#"{
+            $include:['./base.json','./later.json'],
+            settings:{map:{b:5},list:[3]}
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("base.json"),
+            r#"{
+            settings:{map:{a:1,b:2},list:[1],child:{value:'inherited'}}, unrelated:true
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("later.json"),
+            r#"{
+            settings:{map:{b:3,c:4},list:[2],child:null}
+        }"#,
+        )
+        .unwrap();
+        let selected: &[&[&str]] = &[
+            &["settings", "map"],
+            &["settings", "list"],
+            &["settings", "child", "value"],
+        ];
+        let projected = load_openclaw_config_projection(&config_path, selected)
+            .unwrap()
+            .unwrap();
+        let full = load_effective_openclaw_config(&config_path)
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(projected["settings"], full["settings"]);
+        assert_eq!(
+            projected["settings"]["map"],
+            serde_json::json!({"a":1,"b":5,"c":4})
+        );
+        assert_eq!(projected["settings"]["list"], serde_json::json!([1, 2, 3]));
+        assert!(projected["settings"]["child"].is_null());
+        assert!(projected.get("unrelated").is_none());
+
+        fs::write(root.path().join("scalar.json"), "42").unwrap();
+        fs::write(&config_path, "{$include:'./scalar.json',unrelated:true}").unwrap();
+        let error = load_openclaw_config_projection(&config_path, selected).unwrap_err();
+        assert!(error.contains("sibling keys require included content to be an object"));
+    }
+
+    #[test]
+    fn selected_fields_use_explicit_launch_roots_and_safe_parse_errors() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("env");
+        let cwd = fixture.path().join("launcher");
+        let shared = cwd.join("shared");
+        let state = home.join(".openclaw");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir(home.join("trusted")).unwrap();
+        let config = state.join("openclaw.json");
+        let include = shared.join("config.json5");
+        fs::write(&include, "{gateway:{mode:'local',bind:'lan'}}").unwrap();
+        fs::write(&config, serde_json::json!({"$include":display_path(&include),"env":{"OPENCLAW_INCLUDE_ROOTS":display_path(&shared)}}).to_string()).unwrap();
+        let denied = read_openclaw_config_field(
+            &config,
+            &["gateway", "bind"],
+            &OpenClawConfigReadContext::default(),
+        );
+        assert!(matches!(
+            denied.value,
+            Err(OpenClawConfigReadError::OutsideAuthority(_))
+        ));
+        let roots = format!("shared{}~/trusted", if cfg!(windows) { ';' } else { ':' });
+        let context = OpenClawConfigReadContext::for_launch(
+            &BTreeMap::from([
+                ("OPENCLAW_HOME".into(), display_path(&home)),
+                ("HOME".into(), display_path(fixture.path())),
+                ("OPENCLAW_INCLUDE_ROOTS".into(), roots),
+            ]),
+            &cwd,
+        )
+        .unwrap();
+        assert_eq!(
+            context.include_roots,
+            vec![shared.clone(), home.join("trusted")]
+        );
+        assert_eq!(
+            read_openclaw_config_field(&config, &["gateway", "bind"], &context)
+                .value
+                .unwrap(),
+            Some(Value::String("lan".into()))
+        );
+        assert!(
+            load_effective_openclaw_config(&config)
+                .unwrap_err()
+                .contains("escapes the config directory")
+        );
+        fs::write(&include, "{gateway: [ PRIVATE_SENTINEL_924 } ").unwrap();
+        let error = read_openclaw_config_field(&config, &["gateway", "bind"], &context)
+            .value
+            .unwrap_err();
+        assert!(matches!(error, OpenClawConfigReadError::Invalid(_)));
+        assert!(!error.to_string().contains("PRIVATE_SENTINEL_924"));
+    }
+
+    #[test]
+    fn selected_field_retains_true_evidence_and_merge_order_across_unobservable_includes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = fixture.path().join("openclaw.json");
+        fs::write(
+            fixture.path().join("yes.json"),
+            "{gateway:{tls:{enabled:true}}}",
+        )
+        .unwrap();
+        fs::write(
+            fixture.path().join("no.json"),
+            "{gateway:{tls:{enabled:false}}}",
+        )
+        .unwrap();
+        let context = OpenClawConfigReadContext::default();
+        let field = &["gateway", "tls", "enabled"];
+        fs::write(&config, "{$include:['./yes.json','../unknown.json']}").unwrap();
+        let result = read_openclaw_config_field(&config, field, &context);
+        assert!(result.observed_true);
+        assert!(matches!(
+            result.value,
+            Err(OpenClawConfigReadError::OutsideAuthority(_))
+        ));
+        fs::write(&config, "{$include:['../unknown.json','./yes.json']}").unwrap();
+        let result = read_openclaw_config_field(&config, field, &context);
+        assert!(result.observed_true);
+        assert_eq!(result.value.unwrap(), Some(Value::Bool(true)));
+        fs::write(&config, "{$include:['./yes.json','./no.json']}").unwrap();
+        let result = read_openclaw_config_field(&config, field, &context);
+        assert!(result.observed_true);
+        assert_eq!(result.value.unwrap(), Some(Value::Bool(false)));
+        fs::write(
+            &config,
+            "{$include:'../unknown.json',gateway:{tls:{enabled:false}}}",
+        )
+        .unwrap();
+        let result = read_openclaw_config_field(&config, field, &context);
+        assert!(!result.observed_true);
+        assert_eq!(result.value.unwrap(), Some(Value::Bool(false)));
+        fs::write(fixture.path().join("broken.json"), "{invalid:").unwrap();
+        fs::write(&config, "{$include:['./yes.json','./broken.json']}").unwrap();
+        let result = read_openclaw_config_field(&config, field, &context);
+        assert!(result.observed_true);
+        assert!(matches!(
+            result.value,
+            Err(OpenClawConfigReadError::Invalid(_))
+        ));
     }
 
     #[test]

@@ -9,8 +9,8 @@ use crate::launcher::AddLauncherOptions;
 use crate::migrate::inspect_migration_source;
 use crate::service::service_backend_support_error;
 use crate::store::{
-    derive_env_paths, display_path, ensure_minimum_local_openclaw_config, resolve_absolute_path,
-    validate_name,
+    MinimumLocalConfig, OpenClawConfigReadContext, derive_env_paths, display_path,
+    prepare_minimum_local_openclaw_config, resolve_absolute_path, validate_name,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -193,6 +193,34 @@ impl Cli {
             return Err(error);
         }
 
+        // Resolve required settings before a binding update can synchronize a
+        // running supervisor. Unknown configuration must not launch a new child.
+        let minimum = if !onboarding_planned {
+            existing
+                .as_ref()
+                .map(|meta| {
+                    let mut prospective = meta.clone();
+                    match desired_binding.as_ref() {
+                        Some(StartBinding::Runtime(name)) => {
+                            prospective.default_runtime = Some(name.clone());
+                            prospective.default_launcher = None;
+                        }
+                        Some(StartBinding::Launcher(name)) => {
+                            prospective.default_launcher = Some(name.clone());
+                            prospective.default_runtime = None;
+                        }
+                        None => {}
+                    }
+                    let (port, _) = self
+                        .environment_service()
+                        .resolve_effective_gateway_port(&prospective)?;
+                    self.prepare_minimum_local_config(&prospective, port)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
         let mut meta = match existing {
             None => self
                 .environment_service()
@@ -227,10 +255,11 @@ impl Cli {
             .resolve_effective_gateway_port(&meta)?;
 
         if !onboarding_planned {
-            ensure_minimum_local_openclaw_config(
-                &derive_env_paths(Path::new(&meta.root)),
-                effective_port,
-            )?;
+            match minimum {
+                Some(plan) => plan,
+                None => self.prepare_minimum_local_config(&meta, effective_port)?,
+            }
+            .apply()?;
         }
 
         let detected_plain_home = if created {
@@ -373,6 +402,43 @@ impl Cli {
         }
 
         Ok(meta)
+    }
+
+    pub(super) fn prepare_minimum_local_config(
+        &self,
+        meta: &EnvMeta,
+        port: u32,
+    ) -> Result<MinimumLocalConfig, String> {
+        let (env, cwd) = match crate::env::resolve_execution_binding(meta, None, None)? {
+            crate::env::ExecutionBinding::Dev => {
+                let source = meta
+                    .dev
+                    .as_ref()
+                    .ok_or("dev binding is missing")?
+                    .execution_source_root()?;
+                (
+                    crate::infra::shell::build_openclaw_dev_source_env(meta, &self.env, source),
+                    source.to_path_buf(),
+                )
+            }
+            crate::env::ExecutionBinding::Runtime(_) => (
+                crate::infra::shell::build_openclaw_env(meta, &self.env),
+                Path::new(&meta.root).to_path_buf(),
+            ),
+            crate::env::ExecutionBinding::Launcher(name) => {
+                let launcher = crate::store::get_launcher(&name, &self.env, &self.cwd)?;
+                (
+                    crate::infra::shell::build_openclaw_env(meta, &self.env),
+                    crate::launcher::resolve_launcher_run_dir(&launcher, Path::new(&meta.root)),
+                )
+            }
+        };
+        let context = OpenClawConfigReadContext::for_launch(&env, &cwd)?;
+        prepare_minimum_local_openclaw_config(
+            &derive_env_paths(Path::new(&meta.root)),
+            port,
+            &context,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

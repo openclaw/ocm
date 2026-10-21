@@ -170,12 +170,31 @@ fn sanitized_openclaw_base_env(base_env: &BTreeMap<String, String>) -> BTreeMap<
     base_env
         .iter()
         .filter(|(key, _)| {
-            (!key.starts_with("OPENCLAW_") || is_openclaw_diagnostics_passthrough_key(key))
+            (!key.starts_with("OPENCLAW_")
+                || is_openclaw_diagnostics_passthrough_key(key)
+                || is_include_roots_key(key))
                 && key.as_str() != "OCM_ACTIVE_ENV"
                 && key.as_str() != "OCM_ACTIVE_ENV_ROOT"
         })
-        .map(|(key, value)| (key.clone(), value.clone()))
+        .map(|(key, value)| {
+            (
+                if is_include_roots_key(key) {
+                    "OPENCLAW_INCLUDE_ROOTS".to_string()
+                } else {
+                    key.clone()
+                },
+                value.clone(),
+            )
+        })
         .collect()
+}
+
+fn is_include_roots_key(key: &str) -> bool {
+    if cfg!(windows) {
+        key.eq_ignore_ascii_case("OPENCLAW_INCLUDE_ROOTS")
+    } else {
+        key == "OPENCLAW_INCLUDE_ROOTS"
+    }
 }
 
 fn is_openclaw_diagnostics_passthrough_key(key: &str) -> bool {
@@ -303,7 +322,7 @@ mod tests {
     use time::OffsetDateTime;
 
     #[test]
-    fn build_openclaw_env_preserves_diagnostics_passthrough_only() {
+    fn build_openclaw_env_preserves_diagnostics_and_explicit_include_roots() {
         let meta = EnvMeta {
             upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
@@ -332,6 +351,7 @@ mod tests {
             ("OPENCLAW_HOME".to_string(), "/tmp/wrong".to_string()),
             ("OPENCLAW_GATEWAY_PORT".to_string(), "12345".to_string()),
             ("OPENCLAW_PROFILE".to_string(), "wrong".to_string()),
+            ("OPENCLAW_INCLUDE_ROOTS".to_string(), "./shared".to_string()),
             ("OPENCLAW_DIAGNOSTICS".to_string(), "timeline".to_string()),
             (
                 "OPENCLAW_DIAGNOSTICS_TIMELINE_PATH".to_string(),
@@ -357,6 +377,10 @@ mod tests {
         ]);
 
         let env = build_openclaw_env(&meta, &base);
+        assert_eq!(
+            env.get("OPENCLAW_INCLUDE_ROOTS").map(String::as_str),
+            Some("./shared")
+        );
 
         assert_eq!(
             env.get("NODE_OPTIONS").map(String::as_str),

@@ -1,6 +1,7 @@
 mod checkpoint_scope;
 mod checkpoints;
 mod common;
+mod config_include_read;
 mod dev_registration;
 pub(crate) mod dev_sources;
 mod dev_ui_ports;
@@ -69,10 +70,11 @@ pub use layout::{
     upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir, validate_name,
 };
 pub(crate) use openclaw_config::{
-    OpenClawConfigAudit, OpenClawConfigRepair, audit_openclaw_config,
+    MinimumLocalConfig, OpenClawConfigAudit, OpenClawConfigRepair, audit_openclaw_config,
     clear_skip_bootstrap_for_openclaw_onboarding, dev_ui_gateway_base_path, dev_ui_gateway_url,
     ensure_minimum_local_openclaw_config, normalize_new_environment_sandbox_origin,
-    openclaw_config_include_paths, openclaw_config_uses_includes, prepare_openclaw_config_repair,
+    openclaw_config_include_paths, openclaw_config_uses_includes,
+    prepare_minimum_local_openclaw_config, prepare_openclaw_config_repair,
     reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
     rewrite_copied_config_include_directives, rewrite_external_workspace_paths_for_migration,
     rewrite_identity_bound_workspace_paths_for_target, rewrite_openclaw_config_for_migration,
@@ -168,3 +170,10 @@ pub fn summarize_env(meta: &EnvMeta) -> EnvSummary {
 }
 
 pub(crate) use envs::try_lock_environment_operation;
+
+#[allow(unused_imports)]
+// Internal shared context/observation contract for the readiness consumer.
+pub(crate) use openclaw_workspaces::{
+    OpenClawConfigField, OpenClawConfigReadContext, OpenClawConfigReadError,
+    read_openclaw_config_field,
+};
