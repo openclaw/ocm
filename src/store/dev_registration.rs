@@ -9,8 +9,7 @@ use crate::openclaw_repo::{
 
 use super::dev_sources::{
     DevSourceRemoval, SourceFootprint, ensure_dev_worktree_removal_preserves_dev_sources,
-    existing_source_path_entries, inspect_dev_source_footprint, inspect_source_footprint,
-    path_identity,
+    existing_source_path_entries, inspect_dev_source_identity_footprints, path_identity,
 };
 use super::envs::{environment_operation_lock_path, try_lock_environment_operation};
 use super::{
@@ -165,8 +164,7 @@ fn inspect_registration_path_inner(
 }
 
 fn source_identity(dev: &EnvDevMeta) -> Result<SourceIdentity, String> {
-    let repo = inspect_source_footprint(Path::new(dev.repo_root()))?;
-    let mut footprint = inspect_dev_source_footprint(dev)?;
+    let (repo, mut footprint) = inspect_dev_source_identity_footprints(dev)?;
     let mut preparation_paths = repo.entries.clone();
     preparation_paths.extend(repo.content_roots.iter().cloned());
     let mut locations = Vec::new();

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -252,6 +252,23 @@ pub(crate) struct SourceFootprint {
     pub(crate) reserved_roots: BTreeSet<PathBuf>,
 }
 
+impl SourceFootprint {
+    fn extend(&mut self, other: &Self) {
+        self.entries.extend(other.entries.iter().cloned());
+        self.content_roots
+            .extend(other.content_roots.iter().cloned());
+        self.reserved_roots
+            .extend(other.reserved_roots.iter().cloned());
+    }
+}
+
+// One complete observation only: callers create a new one at every lifecycle
+// barrier. Reuse complete fragments, not a visited set shared between outputs.
+#[derive(Default)]
+struct SourceObservation {
+    loose: BTreeMap<(PathBuf, bool), (SourceFootprint, usize)>,
+}
+
 fn record_path_entries(
     path: &Path,
     entries: &mut BTreeSet<PathBuf>,
@@ -322,6 +339,7 @@ fn append_git_footprint(
     reserve_missing: bool,
     links: &mut BTreeSet<PathBuf>,
     paths_left: &mut usize,
+    observation: &mut SourceObservation,
 ) -> Result<(), String> {
     for path in git.entries {
         record_git_path(&path, footprint, reserve_missing, links)?;
@@ -335,7 +353,14 @@ fn append_git_footprint(
             footprint.content_roots.insert(resolved);
         }
     }
-    append_git_object_footprint(footprint, objects, reserve_missing, links, paths_left)
+    append_git_object_footprint(
+        footprint,
+        objects,
+        reserve_missing,
+        links,
+        paths_left,
+        observation,
+    )
 }
 
 fn git_dependency_limit_error(path: &Path, kind: &str) -> String {
@@ -345,17 +370,94 @@ fn git_dependency_limit_error(path: &Path, kind: &str) -> String {
     )
 }
 
+fn append_loose_object_footprint(
+    footprint: &mut SourceFootprint,
+    objects: &Path,
+    reserve_missing: bool,
+    paths_left: &mut usize,
+    observation: &mut SourceObservation,
+) -> Result<(), String> {
+    let key = (objects.to_path_buf(), reserve_missing);
+    // A successful strict loose scan has no missing aliases, so its complete
+    // result also satisfies a reservation-aware output. The reverse is false.
+    let cached = observation
+        .loose
+        .get(&(objects.to_path_buf(), false))
+        .or_else(|| observation.loose.get(&key));
+    if let Some((observed, dependencies)) = cached {
+        *paths_left = paths_left
+            .checked_sub(*dependencies)
+            .ok_or_else(|| git_dependency_limit_error(objects, "loose storage alias"))?;
+        footprint.extend(observed);
+        return Ok(());
+    }
+
+    let mut observed = SourceFootprint::default();
+    let mut links = BTreeSet::new();
+    let before = *paths_left;
+    let mut alias = |path: &Path, directory: bool| -> Result<bool, String> {
+        *paths_left = paths_left
+            .checked_sub(1)
+            .ok_or_else(|| git_dependency_limit_error(path, "loose storage alias"))?;
+        let Some(resolved) = record_git_path(path, &mut observed, reserve_missing, &mut links)?
+        else {
+            return Ok(false);
+        };
+        if directory {
+            observed.content_roots.insert(resolved);
+        }
+        Ok(true)
+    };
+    // Git looks up these lowercase fanouts for both SHA-1 and SHA-256. Let the
+    // filesystem resolve equivalent spellings instead of filtering entry names
+    // (which can miss uppercase names on a case-insensitive volume).
+    for prefix in 0..=255u8 {
+        let directory = objects.join(format!("{prefix:02x}"));
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.is_symlink() && !alias(&directory, true)? {
+            continue;
+        }
+        if !metadata.is_dir() && !metadata.is_symlink() {
+            continue;
+        }
+        for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            // Stream entry types: ordinary objects/hardlinks neither require
+            // per-file canonicalization nor affect source identity or budgets.
+            // Conservatively keep every alias in a native fanout, without
+            // guessing the object format or filesystem filename equivalence.
+            if entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_symlink()
+            {
+                alias(&entry.path(), false)?;
+            }
+        }
+    }
+    footprint.extend(&observed);
+    observation
+        .loose
+        .insert(key, (observed, before - *paths_left));
+    Ok(())
+}
+
 fn append_git_object_footprint(
     footprint: &mut SourceFootprint,
     objects: PathBuf,
     reserve_missing: bool,
     links: &mut BTreeSet<PathBuf>,
     paths_left: &mut usize,
+    observation: &mut SourceObservation,
 ) -> Result<(), String> {
     let mut pending = vec![objects];
     let mut visited = BTreeSet::new();
-    // Bound the metadata graph, including repeated edges, without walking a
-    // checkout or loose-object files. Uninspectable graphs refuse the operation.
+    // Bound dependency edges, not ordinary object counts. Uninspectable graphs
+    // refuse the operation.
     while let Some(objects) = pending.pop() {
         if *paths_left == 0 {
             return Err(git_dependency_limit_error(&objects, "alternate"));
@@ -372,6 +474,13 @@ fn append_git_object_footprint(
         if !visited.insert(resolved.clone()) {
             continue;
         }
+        append_loose_object_footprint(
+            footprint,
+            &resolved,
+            reserve_missing,
+            paths_left,
+            observation,
+        )?;
         // Packed objects can live outside the object root through aliases of
         // the directory or its files, including in alternate stores. Inspect
         // only pack entries, never object contents or loose-object fanouts.
@@ -422,12 +531,13 @@ fn append_git_object_footprint(
 // This primitive describes existing paths, not source eligibility. Registration
 // may retain absent/non-Git tuples; callers own that policy and path reservations.
 pub(crate) fn inspect_source_footprint(root: &Path) -> Result<SourceFootprint, String> {
-    inspect_source_footprint_paths(root, false)
+    inspect_source_footprint_paths(root, false, &mut SourceObservation::default())
 }
 
 fn inspect_source_footprint_paths(
     root: &Path,
     reserve_missing: bool,
+    observation: &mut SourceObservation,
 ) -> Result<SourceFootprint, String> {
     let mut footprint = SourceFootprint::default();
     let mut pending = vec![root.to_path_buf()];
@@ -477,6 +587,7 @@ fn inspect_source_footprint_paths(
                 reserve_missing,
                 &mut links,
                 &mut paths_left,
+                observation,
             )?;
             for path in registrations {
                 append_git_footprint(
@@ -486,6 +597,7 @@ fn inspect_source_footprint_paths(
                     reserve_missing,
                     &mut links,
                     &mut paths_left,
+                    observation,
                 )?;
             }
             let modules = root.join(".gitmodules");
@@ -515,10 +627,17 @@ fn inspect_source_footprint_paths(
 }
 
 pub(crate) fn inspect_dev_source_metadata(dev: &EnvDevMeta) -> Result<SourceFootprint, String> {
+    inspect_dev_source_metadata_observed(dev, &mut SourceObservation::default())
+}
+
+fn inspect_dev_source_metadata_observed(
+    dev: &EnvDevMeta,
+    observation: &mut SourceObservation,
+) -> Result<SourceFootprint, String> {
     let Some((repo_root, worktree_root)) = dev.owned_worktree() else {
-        return inspect_source_footprint_paths(Path::new(dev.source_root()), true);
+        return inspect_source_footprint_paths(Path::new(dev.source_root()), true, observation);
     };
-    let mut footprint = inspect_source_footprint(Path::new(repo_root))?;
+    let mut footprint = inspect_source_footprint_paths(Path::new(repo_root), false, observation)?;
     let mut links = BTreeSet::new();
     let mut paths_left = 1024usize;
     for path in crate::openclaw_repo::worktree_registration_entries(
@@ -534,17 +653,38 @@ pub(crate) fn inspect_dev_source_metadata(dev: &EnvDevMeta) -> Result<SourceFoot
             false,
             &mut links,
             &mut paths_left,
+            observation,
         )?;
     }
     Ok(footprint)
 }
 
 pub(crate) fn inspect_dev_source_footprint(dev: &EnvDevMeta) -> Result<SourceFootprint, String> {
+    inspect_dev_source_footprint_observed(dev, &mut SourceObservation::default())
+}
+
+// The repository and dev outputs must each retain the complete dependencies.
+// Only expensive loose enumeration is shared; missing-path policy and incoming
+// alias recording still run for every output.
+pub(crate) fn inspect_dev_source_identity_footprints(
+    dev: &EnvDevMeta,
+) -> Result<(SourceFootprint, SourceFootprint), String> {
+    let mut observation = SourceObservation::default();
+    let repo = inspect_source_footprint_paths(Path::new(dev.repo_root()), false, &mut observation)?;
+    let footprint = inspect_dev_source_footprint_observed(dev, &mut observation)?;
+    Ok((repo, footprint))
+}
+
+fn inspect_dev_source_footprint_observed(
+    dev: &EnvDevMeta,
+    observation: &mut SourceObservation,
+) -> Result<SourceFootprint, String> {
     if let Some(source) = dev.borrowed_source_root() {
-        return borrowed_source_footprint(Path::new(source));
+        return borrowed_source_footprint_observed(Path::new(source), observation);
     }
-    let mut footprint = inspect_dev_source_metadata(dev)?;
-    let worktree = inspect_source_footprint(Path::new(dev.source_root()))?;
+    let mut footprint = inspect_dev_source_metadata_observed(dev, observation)?;
+    let worktree =
+        inspect_source_footprint_paths(Path::new(dev.source_root()), false, observation)?;
     footprint.entries.extend(worktree.entries);
     footprint.content_roots.extend(worktree.content_roots);
     if let Some(source) = existing_cleanup_path(Path::new(dev.source_root()))? {
@@ -612,7 +752,14 @@ pub(crate) fn registered_dev_source_footprint(
 }
 
 fn borrowed_source_footprint(source: &Path) -> Result<SourceFootprint, String> {
-    let mut footprint = inspect_source_footprint_paths(source, true)?;
+    borrowed_source_footprint_observed(source, &mut SourceObservation::default())
+}
+
+fn borrowed_source_footprint_observed(
+    source: &Path,
+    observation: &mut SourceObservation,
+) -> Result<SourceFootprint, String> {
+    let mut footprint = inspect_source_footprint_paths(source, true, observation)?;
     if let Some(source) = existing_cleanup_path(source)? {
         footprint.content_roots.insert(source);
     }

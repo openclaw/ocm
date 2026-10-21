@@ -153,6 +153,16 @@ with their own objects remain removable.
 This also applies to local upgrade simulations; retry after that operation finishes.
 Unchanged source bindings remain writable during restore and recovery.
 
+Storage protection also follows loose-object directory and file symlinks,
+including links introduced after registration. OCM streams the entries in Git's
+loose-object directories and retains alias dependencies; ordinary object writes
+do not change source identity or consume the dependency budget. This inspection
+takes time proportional to loose entries and repeats at lifecycle rechecks, so
+large loose stores can make admission and cleanup slower. Aliases within these
+directories are protected conservatively, including missing targets during
+cleanup; an unresolvable alias can prevent source admission. This protection
+does not certify file symlinks for every Git clone or maintenance operation.
+
 To keep a borrowed dev environment while explicitly changing its source checkout:
 
 ```bash

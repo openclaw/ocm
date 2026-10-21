@@ -711,7 +711,7 @@ fn cleanup_git(
     repo: &std::path::Path,
     env: &std::collections::BTreeMap<String, String>,
     args: &[&str],
-) {
+) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -721,28 +721,51 @@ fn cleanup_git(
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
+    stdout(&output).trim().to_string()
 }
 
 #[test]
 fn env_cleanup_refuses_registered_source_deletions_before_any_repair() {
     use crate::support::write_text;
-    for (location, separate_git) in [
-        ("ocm-home/envs/container/.openclaw/logs/source", false),
+    for (location, separate_git, loose_alias) in [
+        ("ocm-home/envs/container/.openclaw/logs/source", false, ""),
         (
             "ocm-home/envs/container/.openclaw/agents/main/sessions/source",
             false,
+            "",
         ),
         (
             "ocm-home/envs/container/.openclaw/extensions/demo/node_modules/source",
             false,
+            "",
         ),
-        ("external-source", true),
+        ("external-source", true, ""),
         #[cfg(unix)]
-        ("external-pack-source", false),
+        ("external-source", false, "directory"),
+        #[cfg(unix)]
+        ("external-source", false, "file"),
+        #[cfg(unix)]
+        ("external-pack-source", false, ""),
     ] {
         let root = TestDir::new("cleanup-registered-source");
         let (env, source) = cleanup_source_fixture(&root, location, true, separate_git);
         let state = root.child("ocm-home/envs/container/.openclaw");
+        #[cfg(unix)]
+        if !loose_alias.is_empty() {
+            let oid = cleanup_git(&source, &env, &["rev-parse", "HEAD:package.json"]);
+            let loose = source.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+            let entry = if loose_alias == "directory" {
+                loose.parent().unwrap()
+            } else {
+                &loose
+            };
+            let storage = state.join("logs/required-git-object");
+            fs::create_dir_all(storage.parent().unwrap()).unwrap();
+            fs::rename(entry, &storage).unwrap();
+            std::os::unix::fs::symlink(&storage, entry).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = loose_alias;
         #[cfg(unix)]
         if location == "external-pack-source" {
             cleanup_git(&source, &env, &["repack", "-ad"]);

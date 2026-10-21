@@ -344,3 +344,160 @@ fn temporary_admission_preserves_source_alias_entries_and_own_root() {
     drop(parent_lock);
     DevSourceRegistration::lock_temporary_source("child", &alias, &envs, &env, cwd).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn loose_storage_observation_keeps_complete_outputs_and_fresh_barriers() {
+    use crate::store::dev_sources::{inspect_dev_source_footprint, inspect_source_footprint};
+    use std::os::unix::fs::symlink;
+
+    let (temp, env, owned) = fixture();
+    let cwd = temp.path();
+    let repo = Path::new(owned.repo_root());
+    let objects = repo.join(".git/objects");
+    let fanout = fs::read_dir(&objects)
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_name().len() == 2)
+        .unwrap()
+        .path();
+    let backing = cwd.join("loose-backing");
+    fs::rename(&fanout, &backing).unwrap();
+    let intermediate = cwd.join("loose-intermediate");
+    symlink(&backing, &intermediate).unwrap();
+    symlink(&intermediate, &fanout).unwrap();
+    // Two incoming aliases to the same object store must both survive graph
+    // deduplication, including when the complete scan is reused by another output.
+    let first = cwd.join("first-objects");
+    let second = cwd.join("second-objects");
+    symlink(&objects, &first).unwrap();
+    symlink(&objects, &second).unwrap();
+    fs::write(
+        objects.join("info/alternates"),
+        format!("{}\n{}\n", first.display(), second.display()),
+    )
+    .unwrap();
+    for dev in [
+        owned.clone(),
+        EnvDevMeta::Borrowed {
+            source_root: display_path(repo),
+        },
+    ] {
+        let (observed_repo, observed_dev) = inspect_dev_source_identity_footprints(&dev).unwrap();
+        assert_eq!(observed_repo, inspect_source_footprint(repo).unwrap());
+        assert_eq!(observed_dev, inspect_dev_source_footprint(&dev).unwrap());
+        for output in [&observed_repo, &observed_dev] {
+            for path in [&fanout, &intermediate, &backing, &first, &second] {
+                assert!(output.entries.contains(path), "missing {}", path.display());
+            }
+            assert!(output.content_roots.contains(&backing));
+        }
+        let mut registration = DevSourceRegistration::lock_source(
+            &dev,
+            &list_environments(&env, cwd).unwrap(),
+            &env,
+            cwd,
+        )
+        .unwrap();
+        let original = fs::read_link(&fanout).unwrap();
+        let replacement = cwd.join("replacement-loose");
+        fs::create_dir_all(&replacement).unwrap();
+        fs::remove_file(&fanout).unwrap();
+        symlink(&replacement, &fanout).unwrap();
+        assert!(
+            registration
+                .recheck_source(&dev, &list_environments(&env, cwd).unwrap())
+                .unwrap_err()
+                .contains("changed during registration")
+        );
+        assert!(
+            registration
+                .prepared(&dev, false)
+                .unwrap_err()
+                .contains("changed during registration")
+        );
+        fs::remove_file(&fanout).unwrap();
+        symlink(original, &fanout).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn loose_storage_missing_aliases_keep_reservations_separate_from_strict_identity() {
+    use crate::store::dev_sources::inspect_dev_source_footprint;
+    use std::os::unix::fs::symlink;
+
+    for directory in [false, true] {
+        let (temp, _env, owned) = fixture();
+        let repo = Path::new(owned.repo_root());
+        let fanout = (0..=255u8)
+            .map(|prefix| repo.join(format!(".git/objects/{prefix:02x}")))
+            .find(|path| !path.exists())
+            .unwrap();
+        let missing = temp.path().join("absent/storage");
+        let alias = if directory {
+            fanout
+        } else {
+            fs::create_dir_all(&fanout).unwrap();
+            fanout.join("object-alias")
+        };
+        symlink(&missing, &alias).unwrap();
+        let dev = EnvDevMeta::Borrowed {
+            source_root: display_path(repo),
+        };
+        assert!(inspect_dev_source_identity_footprints(&dev).is_err());
+        let footprint = inspect_dev_source_footprint(&dev).unwrap();
+        assert!(footprint.entries.contains(&alias));
+        assert!(footprint.reserved_roots.contains(&missing));
+    }
+}
+
+#[test]
+fn ordinary_loose_object_writes_keep_registration_identity_and_budget() {
+    let (temp, env, owned) = fixture();
+    let repo = Path::new(owned.repo_root());
+    let dev = EnvDevMeta::Borrowed {
+        source_root: display_path(repo),
+    };
+    let before = source_identity(&dev).unwrap();
+    let registration = DevSourceRegistration::lock_source(
+        &dev,
+        &list_environments(&env, temp.path()).unwrap(),
+        &env,
+        temp.path(),
+    )
+    .unwrap();
+    let inputs = temp.path().join("object-inputs");
+    fs::create_dir(&inputs).unwrap();
+    let mut names = String::new();
+    for index in 0..1100 {
+        let path = inputs.join(index.to_string());
+        fs::write(&path, format!("ordinary loose object {index}\n")).unwrap();
+        names.push_str(&format!("{}\n", path.display()));
+    }
+    use std::io::Write;
+    let mut writer = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["hash-object", "-w", "--stdin-paths"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            temp.path().join("unused-global-config"),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    writer
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(names.as_bytes())
+        .unwrap();
+    assert!(writer.wait().unwrap().success());
+    assert!(source_identity(&dev).unwrap() == before);
+    registration
+        .recheck_source(&dev, &list_environments(&env, temp.path()).unwrap())
+        .unwrap();
+}

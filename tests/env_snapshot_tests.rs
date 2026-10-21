@@ -744,6 +744,8 @@ fn env_snapshot_restore_preserves_peer_temporary_source_footprints() {
         "disjoint",
         "excluded",
         "partial-exclusion",
+        "loose-directory",
+        "loose-file",
     ] {
         let root = TestDir::new(&format!("snapshot-temporary-source-{layout}"));
         let cwd = root.path();
@@ -754,7 +756,10 @@ fn env_snapshot_restore_preserves_peer_temporary_source_footprints() {
         }
         let target = get_environment("source", &env, cwd).unwrap();
         let target_root = Path::new(&target.root);
-        let checkout = if matches!(layout, "git-dir" | "disjoint") {
+        let checkout = if matches!(
+            layout,
+            "git-dir" | "disjoint" | "loose-directory" | "loose-file"
+        ) {
             root.child("checkout")
         } else {
             target_root.join("project/checkout")
@@ -782,6 +787,41 @@ fn env_snapshot_restore_preserves_peer_temporary_source_footprints() {
         let state_marker = target_root.join("surrounding-state");
         write_text(&source_marker, "captured source\n");
         write_text(&state_marker, "captured state\n");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .env_clear()
+                .envs(&env)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{layout}: {}", stderr(&output));
+            stdout(&output).trim().to_string()
+        };
+        if layout.starts_with("loose-") {
+            git(&["add", "authored"]);
+            git(&["commit", "-m", "required source object"]);
+            let oid = git(&["rev-parse", "HEAD:authored"]);
+            let loose = git_dir.join("objects").join(&oid[..2]).join(&oid[2..]);
+            let entry = if layout == "loose-directory" {
+                loose.parent().unwrap()
+            } else {
+                &loose
+            };
+            let storage = target_root.join("required-git-object");
+            fs::rename(entry, &storage).unwrap();
+            std::os::unix::fs::symlink(&storage, entry).unwrap();
+            git(&["fsck", "--full"]);
+        }
         let saved = run_ocm(
             cwd,
             &env,
@@ -872,6 +912,10 @@ fn env_snapshot_restore_preserves_peer_temporary_source_footprints() {
         assert_eq!(fs::read(&source_marker).unwrap(), b"active source\n");
         assert_eq!(fs::read(git_dir.join("HEAD")).unwrap(), git_before);
         assert_eq!(fs::read(&override_path).unwrap(), ownership_before);
+        if layout.starts_with("loose-") {
+            assert_eq!(git(&["show", "HEAD:authored"]), "captured source");
+            git(&["fsck", "--full"]);
+        }
         fs::remove_file(&override_path).unwrap();
         session["closed"] = true.into();
         write_json_replacing_path(&override_path.with_extension("session"), &session);

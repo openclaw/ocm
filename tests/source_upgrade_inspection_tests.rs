@@ -1129,6 +1129,8 @@ fn source_update_retains_relevant_and_unknown_foreground_protection() {
     for mode in [
         "target",
         "shared-git",
+        "loose-directory",
+        "loose-file",
         "takeover-shared",
         "takeover-alias",
         "unknown-takeover",
@@ -1138,8 +1140,30 @@ fn source_update_retains_relevant_and_unknown_foreground_protection() {
     ] {
         let root = TestDir::new("source-relevant-session");
         let (env, _) = execution_fixture(&root, false);
-        let registered = matches!(mode, "shared-git" | "stale-env");
+        let registered = matches!(
+            mode,
+            "shared-git" | "stale-env" | "loose-directory" | "loose-file"
+        );
         let peer = source_session_peer(&root, &env, registered, mode == "shared-git");
+        if mode.starts_with("loose-") {
+            let source = root.child("source");
+            let oid = git(&source, &["rev-parse", "HEAD:openclaw.mjs"]);
+            let relative = Path::new(".git/objects").join(&oid[..2]).join(&oid[2..]);
+            let peer_object = peer.join(&relative);
+            let source_object = source.join(&relative);
+            if mode == "loose-directory" {
+                fs::remove_dir_all(peer_object.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(
+                    source_object.parent().unwrap(),
+                    peer_object.parent().unwrap(),
+                )
+                .unwrap();
+            } else {
+                fs::remove_file(&peer_object).unwrap();
+                std::os::unix::fs::symlink(&source_object, &peer_object).unwrap();
+            }
+            git(&peer, &["fsck", "--full"]);
+        }
         let name = if mode == "target" { "demo" } else { "preview" };
         let mut session = unfinished_source_session(&root, &env, name);
         let path = ocm::store::source_watch_override_path(name, &env, root.path()).unwrap();
@@ -1190,6 +1214,13 @@ fn source_update_retains_relevant_and_unknown_foreground_protection() {
         let retained: Value =
             serde_json::from_slice(&fs::read(path.with_extension("session")).unwrap()).unwrap();
         assert_eq!(retained, session, "{mode}");
+        if mode.starts_with("loose-") {
+            assert_eq!(
+                git(&peer, &["show", "HEAD:openclaw.mjs"]),
+                git(&root.child("source"), &["show", "HEAD:openclaw.mjs"])
+            );
+            git(&peer, &["fsck", "--full"]);
+        }
     }
 }
 

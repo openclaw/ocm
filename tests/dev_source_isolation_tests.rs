@@ -449,15 +449,25 @@ fn borrowed_state_roots_cannot_overlap_the_source_or_its_git_metadata() {
 
 #[test]
 fn removal_preserves_shared_git_objects_but_allows_independent_clones() {
-    for mode in ["shared", "copied", "linked"] {
+    for mode in [
+        "shared",
+        "copied",
+        "linked",
+        #[cfg(unix)]
+        "linked-loose",
+    ] {
         let fixture = TestDir::new(&format!("git-objects-{mode}"));
         let cwd = fixture.path();
         let env = ocm_env(&fixture);
         let donor_root = fixture.child("donor-env");
         create("donor", Some(&donor_root), None, &env, cwd).unwrap();
-        let donor = init_checkout(&donor_root.join("checkout"));
+        let donor = init_checkout(&if mode == "linked-loose" {
+            fixture.child("external-checkout")
+        } else {
+            donor_root.join("checkout")
+        });
         let source = fixture.child("borrowed-source");
-        if mode == "linked" {
+        if mode.starts_with("linked") {
             git(
                 &donor,
                 &["worktree", "add", "--detach", &path_string(&source)],
@@ -476,6 +486,14 @@ fn removal_preserves_shared_git_objects_but_allows_independent_clones() {
                     &path_string(&source),
                 ],
             );
+        }
+        #[cfg(unix)]
+        if mode == "linked-loose" {
+            let oid = git(&donor, &["rev-parse", "HEAD:package.json"]);
+            let loose = donor.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+            let storage = donor_root.join("required-object");
+            fs::rename(&loose, &storage).unwrap();
+            std::os::unix::fs::symlink(&storage, &loose).unwrap();
         }
         let source = fs::canonicalize(source).unwrap();
         create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
@@ -559,7 +577,13 @@ fn removal_follows_relative_quoted_transitive_alternates_and_stops_cycles() {
 #[test]
 fn removal_preserves_git_object_and_alternates_path_aliases() {
     use std::os::unix::fs::symlink;
-    for mode in ["alternate-path", "alternate-file", "primary-objects"] {
+    for mode in [
+        "alternate-path",
+        "alternate-file",
+        "primary-objects",
+        "alternate-loose-directory",
+        "alternate-loose-file",
+    ] {
         let fixture = TestDir::new(&format!("git-object-alias-{mode}"));
         let cwd = fixture.path();
         let env = ocm_env(&fixture);
@@ -588,6 +612,17 @@ fn removal_preserves_git_object_and_alternates_path_aliases() {
                 fs::rename(&alternates, &alias).unwrap();
                 symlink(&alias, &alternates).unwrap();
             }
+            "alternate-loose-directory" | "alternate-loose-file" => {
+                let oid = git(&donor, &["rev-parse", "HEAD:package.json"]);
+                let loose = donor.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+                let entry = if mode == "alternate-loose-directory" {
+                    loose.parent().unwrap()
+                } else {
+                    &loose
+                };
+                fs::rename(entry, &alias).unwrap();
+                symlink(&alias, entry).unwrap();
+            }
             _ => {
                 fs::rename(&objects, &alias).unwrap();
                 symlink(&alias, &objects).unwrap();
@@ -606,6 +641,137 @@ fn removal_preserves_git_object_and_alternates_path_aliases() {
         assert!(donor_root.exists());
         assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
         git(&source, &["fsck", "--no-dangling"]);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn loose_object_aliases_preserve_storage_during_admission_and_removal() {
+    use std::os::unix::fs::symlink;
+
+    for mode in [
+        "directory",
+        "file",
+        "late-file",
+        "sha256-directory",
+        "sha256-file",
+        "uppercase-directory",
+        "uppercase-file",
+        "hardlink",
+    ] {
+        let fixture = TestDir::new(&format!("loose-object-storage-{mode}"));
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        if mode.starts_with("uppercase-") {
+            write_text(&fixture.child("case-probe"), "case equivalence\n");
+            if !fixture.child("CASE-PROBE").exists() {
+                continue;
+            }
+        }
+        let donor_root = fixture.child("donor-env");
+        create("donor", Some(&donor_root), None, &env, cwd).unwrap();
+        let checkout = fixture.child("source");
+        write_text(&checkout.join("openclaw.mjs"), "// finite source command\n");
+        write_text(&checkout.join("required.txt"), "test content\n");
+        if mode.starts_with("sha256-") {
+            git(&checkout, &["init", "--object-format=sha256"]);
+        }
+        let source = init_checkout(&checkout);
+        let oid = git(&source, &["rev-parse", "HEAD:required.txt"]);
+        assert_eq!(oid.len(), if mode.starts_with("sha256-") { 64 } else { 40 });
+        let loose = source.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        let original = if mode.ends_with("directory") {
+            loose.parent().unwrap().to_path_buf()
+        } else {
+            loose
+        };
+        let register = || {
+            run_ocm(
+                cwd,
+                &env,
+                &[
+                    "dev",
+                    "borrower",
+                    "--repo",
+                    &path_string(&source),
+                    "--no-watch",
+                    "--no-ui",
+                ],
+            )
+        };
+        if mode == "late-file" {
+            let registered = register();
+            assert!(
+                registered.status.success(),
+                "{mode}: {}",
+                stderr(&registered)
+            );
+        }
+        let storage = donor_root.join("required-object-storage");
+        if mode == "hardlink" {
+            fs::hard_link(&original, &storage).unwrap();
+        } else {
+            fs::rename(&original, &storage).unwrap();
+            let alias = if mode.starts_with("uppercase-") {
+                assert_ne!(
+                    original.file_name().unwrap(),
+                    original.file_name().unwrap().to_ascii_uppercase()
+                );
+                original.with_file_name(original.file_name().unwrap().to_ascii_uppercase())
+            } else {
+                original
+            };
+            symlink(&storage, alias).unwrap();
+        }
+        assert_eq!(git(&source, &["show", "HEAD:required.txt"]), "test content");
+        git(&source, &["fsck", "--full"]);
+        if matches!(mode, "directory" | "file") {
+            let lock_path = fixture.child("ocm-home/locks/environments/donor.lock");
+            fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+            let owner = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .unwrap();
+            fs2::FileExt::lock_exclusive(&owner).unwrap();
+            let rejected = register();
+            assert!(!rejected.status.success(), "{mode}: {}", stdout(&rejected));
+            assert!(
+                stderr(&rejected).contains("donor has an operation in progress"),
+                "{mode}: {}",
+                stderr(&rejected)
+            );
+            assert!(ocm::store::get_environment("borrower", &env, cwd).is_err());
+            drop(owner);
+        }
+        if mode != "late-file" {
+            let registered = register();
+            assert!(
+                registered.status.success(),
+                "{mode}: {}",
+                stderr(&registered)
+            );
+        }
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let before = fs::read(&registry).unwrap();
+        let removed = run_ocm(cwd, &env, &["env", "remove", "donor", "--force"]);
+        if mode == "hardlink" {
+            assert!(removed.status.success(), "{}", stderr(&removed));
+            assert!(!donor_root.exists());
+        } else {
+            assert!(!removed.status.success(), "{mode}: {}", stdout(&removed));
+            assert!(
+                stderr(&removed).contains("registered dev source"),
+                "{mode}: {}",
+                stderr(&removed)
+            );
+            assert_eq!(fs::read(&registry).unwrap(), before);
+            assert!(storage.exists());
+        }
+        assert_eq!(git(&source, &["show", "HEAD:required.txt"]), "test content");
+        git(&source, &["fsck", "--full"]);
     }
 }
 
@@ -724,6 +890,126 @@ fn nested_pack_storage_is_protected_by_removal_and_registration() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn public_dev_preserves_combined_packed_and_late_loose_storage() {
+    use std::os::unix::fs::symlink;
+
+    for aliases in [true, false] {
+        let fixture = TestDir::new("combined-git-storage");
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        let pack_owner = create("pack-owner", None, None, &env, cwd).unwrap();
+        let loose_owner = create("loose-owner", None, None, &env, cwd).unwrap();
+        let checkout = fixture.child("source");
+        write_text(&checkout.join("openclaw.mjs"), "// finite source command\n");
+        let source = init_checkout(&checkout);
+        let packed_commit = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["repack", "-ad"]);
+        git(&source, &["prune-packed"]);
+        write_text(&source.join("loose.txt"), "required loose content\n");
+        git(&source, &["add", "loose.txt"]);
+        git(
+            &source,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "loose content",
+            ],
+        );
+        let oid = git(&source, &["rev-parse", "HEAD:loose.txt"]);
+        let objects = source.join(".git/objects");
+        let pack_storage = Path::new(&pack_owner.root).join("packs");
+        fs::create_dir(&pack_storage).unwrap();
+        for entry in fs::read_dir(objects.join("pack")).unwrap() {
+            let entry = entry.unwrap();
+            let target = pack_storage.join(entry.file_name());
+            if aliases {
+                fs::rename(entry.path(), &target).unwrap();
+                symlink(&target, entry.path()).unwrap();
+            } else {
+                fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+        let register = |name| {
+            run_ocm(
+                cwd,
+                &env,
+                &[
+                    "dev",
+                    name,
+                    "--repo",
+                    &path_string(&source),
+                    "--no-watch",
+                    "--no-ui",
+                ],
+            )
+        };
+        let lock = support::hold_environment_operation(&fixture, "pack-owner");
+        let attempted = register("borrower");
+        assert_eq!(
+            attempted.status.success(),
+            !aliases,
+            "{}",
+            stderr(&attempted)
+        );
+        if aliases {
+            assert!(stderr(&attempted).contains("pack-owner has an operation in progress"));
+            assert!(ocm::store::get_environment("borrower", &env, cwd).is_err());
+        }
+        drop(lock);
+        if aliases {
+            let admitted = register("borrower");
+            assert!(admitted.status.success(), "{}", stderr(&admitted));
+        }
+        // The registered source acquires another dependency after admission.
+        let loose = objects.join(&oid[..2]).join(&oid[2..]);
+        let loose_storage = Path::new(&loose_owner.root).join("loose-object");
+        if aliases {
+            fs::rename(&loose, &loose_storage).unwrap();
+            symlink(&loose_storage, &loose).unwrap();
+        } else {
+            fs::copy(&loose, &loose_storage).unwrap();
+        }
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let before = fs::read(&registry).unwrap();
+        let lock = support::hold_environment_operation(&fixture, "loose-owner");
+        let attempted = register("second");
+        assert_eq!(
+            attempted.status.success(),
+            !aliases,
+            "{}",
+            stderr(&attempted)
+        );
+        if aliases {
+            assert!(stderr(&attempted).contains("loose-owner has an operation in progress"));
+            assert_eq!(fs::read(&registry).unwrap(), before);
+        }
+        drop(lock);
+        let before = fs::read(&registry).unwrap();
+        for owner in ["pack-owner", "loose-owner"] {
+            let removed = run_ocm(cwd, &env, &["env", "remove", owner]);
+            assert_eq!(removed.status.success(), !aliases, "{}", stderr(&removed));
+            if aliases {
+                assert!(stderr(&removed).contains("registered dev source"));
+                assert_eq!(fs::read(&registry).unwrap(), before);
+            }
+            assert_eq!(git(&source, &["cat-file", "-t", &packed_commit]), "commit");
+            assert_eq!(
+                git(&source, &["show", "HEAD:loose.txt"]),
+                "required loose content"
+            );
+            git(&source, &["fsck", "--full", "--no-dangling"]);
+        }
+    }
+}
+
 #[test]
 fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
     for mode in [
@@ -826,6 +1112,10 @@ fn removal_preserves_initialized_submodule_object_dependencies() {
         "copied",
         "index-fallback",
         "head-fallback",
+        #[cfg(unix)]
+        "loose-directory",
+        #[cfg(unix)]
+        "loose-file",
     ] {
         let fixture = TestDir::new(&format!("submodule-object-dependency-{mode}"));
         let cwd = fixture.path();
@@ -851,7 +1141,8 @@ fn removal_preserves_initialized_submodule_object_dependencies() {
         } else {
             source.clone()
         };
-        let module = add(&parent, &donor, mode != "copied");
+        let shared = !matches!(mode, "copied" | "loose-directory" | "loose-file");
+        let module = add(&parent, &donor, shared);
         if mode.ends_with("fallback") {
             git(
                 &source,
@@ -872,10 +1163,34 @@ fn removal_preserves_initialized_submodule_object_dependencies() {
             assert!(git(&source, &["submodule", "status"]).contains("dependency"));
         }
         let private = PathBuf::from(git(&module, &["rev-parse", "--absolute-git-dir"]));
-        assert_eq!(
-            private.join("objects/info/alternates").is_file(),
-            mode != "copied"
-        );
+        assert_eq!(private.join("objects/info/alternates").is_file(), shared);
+        #[cfg(unix)]
+        if mode.starts_with("loose-") {
+            write_text(&module.join("required.txt"), "submodule loose object\n");
+            git(&module, &["add", "required.txt"]);
+            git(
+                &module,
+                &[
+                    "-c",
+                    "user.name=OCM Tests",
+                    "-c",
+                    "user.email=tests@example.com",
+                    "commit",
+                    "-m",
+                    "required loose object",
+                ],
+            );
+            let oid = git(&module, &["rev-parse", "HEAD:required.txt"]);
+            let loose = private.join("objects").join(&oid[..2]).join(&oid[2..]);
+            let entry = if mode == "loose-directory" {
+                loose.parent().unwrap()
+            } else {
+                &loose
+            };
+            let storage = donor_root.join("required-submodule-object");
+            fs::rename(entry, &storage).unwrap();
+            std::os::unix::fs::symlink(&storage, entry).unwrap();
+        }
         if mode == "old-form" {
             // Git also supports a submodule with its own .git directory.
             git(

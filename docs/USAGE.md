@@ -874,6 +874,25 @@ independent clone with its own objects does not keep its former donor reserved.
 Missing borrowed object paths stay reserved, while unreadable or excessive Git
 dependency metadata requires restoring that metadata before cleanup can proceed.
 
+This includes loose-object fanout directory symlinks and individual object-file
+symlinks, even when introduced after registration. OCM inspects Git's native
+fanout paths using filesystem name equivalence and streams their entries for
+aliases, for both SHA-1 and SHA-256 stores. It conservatively protects all aliases
+within those directories, including missing targets for borrowed-source cleanup.
+Ordinary loose files and independent hardlinks do not add dependency records or
+change source identity when Git writes new objects. Uninspectable alias targets
+can prevent admission; the existing dependency bound applies to aliases, not the
+number of ordinary loose objects.
+
+Inspection time grows with loose entries and referenced stores. Complete scan
+results are shared within one identity observation, but lock, preparation,
+publication and destructive-operation rechecks observe the filesystem again.
+Large stores and filesystems that require extra entry-type lookups can therefore
+make those commands slower; there is no persistent cache or object-count limit.
+Storage preservation does not imply universal Git maintenance support for object
+file symlinks: Git can read an object while reporting its symlink as garbage in
+`count-objects`, and local cloning has separate restrictions.
+
 Removal, pruning, destroy, and simulation cleanup also protect checkouts and Git
 metadata used by another environment's active temporary source session, including
 `ocm dev <env> --repo <checkout> --watch --force`. A containing cleanup refuses
