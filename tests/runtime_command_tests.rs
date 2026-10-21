@@ -1640,6 +1640,7 @@ fn runtime_build_local_resolves_native_plugin_identity_to_declared_source() {
         ("minimax", "minimax", "entries"),
         ("minimax", "minimax-portal", "entries"),
         ("minimax", "MINIMAX-PORTAL-AUTH", "allow"),
+        ("minimax-portal-auth", "minimax-portal-auth", "entries"),
     ] {
         let root = TestDir::new("runtime-build-local-plugin-identity");
         let (cwd, mut env, state, _) = target_plugin_build_fixture(&root);

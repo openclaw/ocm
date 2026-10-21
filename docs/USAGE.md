@@ -248,8 +248,9 @@ including the native SQLite index, inline config and legacy JSON records,
 and follows transitive local plugin package dependencies. Policy IDs are trimmed
 and compared without case distinctions. The native built-in aliases
 `google-gemini-cli` → `google` and `minimax-portal` / `minimax-portal-auth` →
-`minimax` resolve against the selected checkout and installed records. Authored
-config and declared manifest IDs remain unchanged; unknown references still fail
+`minimax` resolve when the destination ID exists in the selected checkout or
+installed records. Older checkouts that still declare a legacy ID keep that
+identity. Authored config and declared manifest IDs remain unchanged; unknown references still fail
 validation. Installed external
 plugins satisfy that validation without being bundled into the new runtime;
 installed records do not select additional plugins. Disabled entries and denied

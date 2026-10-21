@@ -691,17 +691,27 @@ fn collect_plugin_ids_from_records(value: &serde_json::Value, ids: &mut BTreeSet
 }
 
 fn normalized_plugin_id(id: &str) -> Option<String> {
-    // Match OpenClaw's config policy identity, without rewriting authored config or manifests.
     let id = id.trim().to_lowercase();
+    (!id.is_empty()).then_some(id)
+}
+
+fn target_plugin_id(id: &str, available: &BTreeSet<String>) -> Option<String> {
+    let id = normalized_plugin_id(id)?;
+    // Modern OpenClaw maps these legacy IDs to canonical plugins. Older checkouts can still
+    // declare the legacy ID itself, so only resolve an alias when its destination is available.
     match id.as_str() {
-        "" => None,
-        "google-gemini-cli" => Some("google".to_string()),
-        "minimax-portal" | "minimax-portal-auth" => Some("minimax".to_string()),
+        "google-gemini-cli" if available.contains("google") => Some("google".to_string()),
+        "minimax-portal" | "minimax-portal-auth" if available.contains("minimax") => {
+            Some("minimax".to_string())
+        }
         _ => Some(id),
     }
 }
 
-fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<String> {
+fn collect_explicit_plugin_references(
+    config: &serde_json::Value,
+    available: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let Some(plugins) = config.get("plugins").and_then(serde_json::Value::as_object) else {
         return ids;
@@ -711,7 +721,7 @@ fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<St
             values
                 .iter()
                 .filter_map(serde_json::Value::as_str)
-                .filter_map(normalized_plugin_id),
+                .filter_map(|id| target_plugin_id(id, available)),
         );
     }
     if let Some(entries) = plugins
@@ -719,7 +729,7 @@ fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<St
         .and_then(serde_json::Value::as_object)
     {
         for (id, entry) in entries {
-            let Some(id) = normalized_plugin_id(id) else {
+            let Some(id) = target_plugin_id(id, available) else {
                 continue;
             };
             // Disabling a plugin can leave its identifier in the allowlist.
@@ -736,14 +746,14 @@ fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<St
                 .values()
                 .filter_map(serde_json::Value::as_str)
                 .filter(|id| id.trim() != "none")
-                .filter_map(normalized_plugin_id),
+                .filter_map(|id| target_plugin_id(id, available)),
         );
     }
     if let Some(deny) = plugins.get("deny").and_then(serde_json::Value::as_array) {
         for id in deny
             .iter()
             .filter_map(serde_json::Value::as_str)
-            .filter_map(normalized_plugin_id)
+            .filter_map(|id| target_plugin_id(id, available))
         {
             ids.remove(&id);
         }
@@ -800,8 +810,13 @@ fn resolve_target_source_plugin_closure(
             ));
         }
     }
-    let explicit = collect_explicit_plugin_references(&config);
     let installed = installed_target_plugin_ids(&paths, &config);
+    let available = source_ids
+        .keys()
+        .chain(installed.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let explicit = collect_explicit_plugin_references(&config, &available);
     let missing = explicit
         .iter()
         .filter(|id| !source_ids.contains_key(*id) && !installed.contains(*id))
@@ -3863,6 +3878,7 @@ mod tests {
 
     #[test]
     fn target_plugin_identity_matches_native_aliases_and_case() {
+        let available = BTreeSet::from(["google".to_string(), "minimax".to_string()]);
         for (raw, expected) in [
             ("google", Some("google")),
             (" GOOGLE-GEMINI-CLI ", Some("google")),
@@ -3873,7 +3889,17 @@ mod tests {
             ("unknown", Some("unknown")),
             ("  ", None),
         ] {
-            assert_eq!(super::normalized_plugin_id(raw).as_deref(), expected);
+            assert_eq!(
+                super::target_plugin_id(raw, &available).as_deref(),
+                expected
+            );
+        }
+        for legacy in ["google-gemini-cli", "minimax-portal-auth"] {
+            let available = BTreeSet::from([legacy.to_string()]);
+            assert_eq!(
+                super::target_plugin_id(legacy, &available).as_deref(),
+                Some(legacy)
+            );
         }
         let config = serde_json::json!({"plugins": {
             "entries": {"google-gemini-cli": {"enabled": true}},
@@ -3881,7 +3907,10 @@ mod tests {
             "deny": ["GOOGLE", "minimax-portal-auth"]
         }});
         assert_eq!(
-            collect_explicit_plugin_references(&config),
+            collect_explicit_plugin_references(
+                &config,
+                &BTreeSet::from(["google".to_string(), "minimax".to_string()])
+            ),
             BTreeSet::from(["external".to_string()])
         );
     }
@@ -3902,7 +3931,7 @@ mod tests {
         });
 
         assert_eq!(
-            collect_explicit_plugin_references(&config),
+            collect_explicit_plugin_references(&config, &BTreeSet::new()),
             BTreeSet::from([
                 "allowed".to_string(),
                 "memory-core".to_string(),
