@@ -381,16 +381,16 @@ fn append_git_object_footprint(
                 if let Some(packs) = record_git_path(&packs, footprint, reserve_missing, links)? {
                     footprint.content_roots.insert(packs.clone());
                     for entry in fs::read_dir(&packs).map_err(|error| error.to_string())? {
-                        if *paths_left == 0 {
-                            return Err(git_dependency_limit_error(&packs, "pack"));
-                        }
-                        *paths_left -= 1;
                         let entry = entry.map_err(|error| error.to_string())?;
                         if entry
                             .file_type()
                             .map_err(|error| error.to_string())?
                             .is_symlink()
                         {
+                            if *paths_left == 0 {
+                                return Err(git_dependency_limit_error(&packs, "pack alias"));
+                            }
+                            *paths_left -= 1;
                             record_git_path(&entry.path(), footprint, reserve_missing, links)?;
                         }
                     }

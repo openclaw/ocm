@@ -730,7 +730,9 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
         "directory",
         "oversized",
         "too-many",
-        "pack-limit",
+        "pack-entries",
+        #[cfg(unix)]
+        "pack-alias-limit",
     ] {
         let fixture = TestDir::new(&format!("git-alternate-metadata-{mode}"));
         let cwd = fixture.path();
@@ -766,9 +768,19 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
                 fs::create_dir(&alternates).unwrap();
             }
             "oversized" => write_text(&alternates, &"#".repeat(65537)),
-            "pack-limit" => {
+            "pack-entries" => {
                 for index in 0..1024 {
                     write_text(&source.join(format!(".git/objects/pack/entry-{index}")), "");
+                }
+            }
+            #[cfg(unix)]
+            "pack-alias-limit" => {
+                for index in 0..1024 {
+                    std::os::unix::fs::symlink(
+                        &alternates,
+                        source.join(format!(".git/objects/pack/entry-{index}")),
+                    )
+                    .unwrap();
                 }
             }
             _ => write_text(&alternates, &".\n".repeat(1024)),
@@ -778,9 +790,9 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
         let removed = run_ocm(cwd, &env, &["env", "remove", "donor"]);
         assert!(!removed.status.success(), "{mode}");
         let expected = match mode {
-            "missing" => "registered dev source",
+            "missing" | "pack-entries" => "registered dev source",
             "too-many" => "too many alternate paths",
-            "pack-limit" => "too many pack paths",
+            "pack-alias-limit" => "too many pack alias paths",
             _ => "invalid Git alternates file",
         };
         assert!(
@@ -794,7 +806,7 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
         }
         assert!(donor_root.exists());
         assert_eq!(fs::read(&registry).unwrap(), before);
-        if mode == "missing" {
+        if mode == "missing" || mode == "pack-entries" {
             // Missing unrelated storage remains reserved but does not block a
             // disjoint removal or hide the surviving donor dependency.
             let removed = run_ocm(cwd, &env, &["env", "remove", "unrelated"]);
