@@ -691,8 +691,14 @@ fn collect_plugin_ids_from_records(value: &serde_json::Value, ids: &mut BTreeSet
 }
 
 fn normalized_plugin_id(id: &str) -> Option<String> {
-    let id = id.trim();
-    (!id.is_empty()).then(|| id.to_string())
+    // Match OpenClaw's config policy identity, without rewriting authored config or manifests.
+    let id = id.trim().to_lowercase();
+    match id.as_str() {
+        "" => None,
+        "google-gemini-cli" => Some("google".to_string()),
+        "minimax-portal" | "minimax-portal-auth" => Some("minimax".to_string()),
+        _ => Some(id),
+    }
 }
 
 fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<String> {
@@ -734,8 +740,12 @@ fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<St
         );
     }
     if let Some(deny) = plugins.get("deny").and_then(serde_json::Value::as_array) {
-        for id in deny.iter().filter_map(serde_json::Value::as_str) {
-            ids.remove(id.trim());
+        for id in deny
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter_map(normalized_plugin_id)
+        {
+            ids.remove(&id);
         }
     }
     ids
@@ -779,12 +789,22 @@ fn resolve_target_source_plugin_closure(
     // Only OpenClaw's explicit plugin policy fields are part of this contract. Inferring plugin
     // ids from arbitrary provider, agent, or plugin-owned config would create false dependencies.
     let inventory = source_plugin_inventory(repo_path)?;
-    let source_ids = inventory.by_id.keys().cloned().collect::<BTreeSet<_>>();
+    // Resolve policy keys back to declared manifest IDs. Packaging and dependency closure must
+    // retain those IDs, including their case, to match built manifests and runtime exports.
+    let mut source_ids = BTreeMap::new();
+    for id in inventory.by_id.keys() {
+        let policy_id = id.to_lowercase();
+        if let Some(previous) = source_ids.insert(policy_id.clone(), id) {
+            return Err(format!(
+                "source plugin policy id \"{policy_id}\" is ambiguous between plugin ids \"{previous}\" and \"{id}\""
+            ));
+        }
+    }
     let explicit = collect_explicit_plugin_references(&config);
     let installed = installed_target_plugin_ids(&paths, &config);
     let missing = explicit
         .iter()
-        .filter(|id| !source_ids.contains(*id) && !installed.contains(*id))
+        .filter(|id| !source_ids.contains_key(*id) && !installed.contains(*id))
         .cloned()
         .collect::<Vec<_>>();
     if !missing.is_empty() {
@@ -794,7 +814,10 @@ fn resolve_target_source_plugin_closure(
         ));
     }
 
-    let mut direct = explicit;
+    let mut direct = explicit
+        .iter()
+        .filter_map(|id| source_ids.get(id).map(|id| (*id).clone()))
+        .collect::<BTreeSet<_>>();
     direct.retain(|id| {
         inventory
             .by_id
@@ -3836,6 +3859,31 @@ mod tests {
         );
         drop(writer);
         drop(super::try_lock_runtime_mutation("selected", &env, cwd).unwrap());
+    }
+
+    #[test]
+    fn target_plugin_identity_matches_native_aliases_and_case() {
+        for (raw, expected) in [
+            ("google", Some("google")),
+            (" GOOGLE-GEMINI-CLI ", Some("google")),
+            ("Minimax-Portal", Some("minimax")),
+            ("minimax-portal-auth", Some("minimax")),
+            (" External ", Some("external")),
+            ("google-gemini-cli-auth", Some("google-gemini-cli-auth")),
+            ("unknown", Some("unknown")),
+            ("  ", None),
+        ] {
+            assert_eq!(super::normalized_plugin_id(raw).as_deref(), expected);
+        }
+        let config = serde_json::json!({"plugins": {
+            "entries": {"google-gemini-cli": {"enabled": true}},
+            "allow": ["MINIMAX-PORTAL", " External "],
+            "deny": ["GOOGLE", "minimax-portal-auth"]
+        }});
+        assert_eq!(
+            collect_explicit_plugin_references(&config),
+            BTreeSet::from(["external".to_string()])
+        );
     }
 
     #[test]

@@ -169,10 +169,15 @@ fn openclaw_package_tarball_with_bundled_extension(script_body: &str, version: &
 }
 
 fn source_extension_package_tarball() -> Vec<u8> {
-    source_extension_package_tarball_with_manifest(br#"{"name":"@openclaw/codex","version":"2026.4.25","dependencies":{"codex-runtime":"1.0.0"},"peerDependencies":{"openclaw":"*"}}"#)
+    source_extension_package_tarball_for("codex", "@openclaw/codex")
 }
 
-fn source_extension_package_tarball_with_manifest(manifest: &[u8]) -> Vec<u8> {
+fn source_extension_package_tarball_for(id: &str, package_name: &str) -> Vec<u8> {
+    let manifest = serde_json::json!({"name":package_name,"version":"2026.4.25","dependencies":{"codex-runtime":"1.0.0"},"peerDependencies":{"openclaw":"*"}});
+    source_extension_package_tarball_with_manifest(id, manifest.to_string().as_bytes())
+}
+
+fn source_extension_package_tarball_with_manifest(id: &str, manifest: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     {
         let mut builder = Builder::new(&mut encoder);
@@ -180,7 +185,9 @@ fn source_extension_package_tarball_with_manifest(manifest: &[u8]) -> Vec<u8> {
         append_tar_file(
             &mut builder,
             "package/openclaw.plugin.json",
-            br#"{"id":"codex","configSchema":{"type":"object"}}"#,
+            serde_json::json!({"id":id,"configSchema":{"type":"object"}})
+                .to_string()
+                .as_bytes(),
             0o644,
         );
         append_tar_file(
@@ -1341,7 +1348,7 @@ fn runtime_build_local_derives_source_plugins_from_target_env_before_pack() {
     let source_extension_archive = root.child("openclaw-codex-2026.4.25.tgz");
     fs::write(
         &source_extension_archive,
-        source_extension_package_tarball_with_manifest(manifest),
+        source_extension_package_tarball_with_manifest("codex", manifest),
     )
     .unwrap();
 
@@ -1622,6 +1629,101 @@ fn runtime_build_local_rejects_missing_target_plugin_before_pack() {
     );
 }
 
+#[test]
+fn runtime_build_local_resolves_native_plugin_identity_to_declared_source() {
+    for (id, configured, field) in [
+        ("google", "google", "entries"),
+        ("google", " google ", "entries"),
+        ("google", "google-gemini-cli", "entries"),
+        ("google", " GOOGLE-GEMINI-CLI ", "allow"),
+        ("Google", "GOOGLE", "entries"),
+        ("minimax", "minimax", "entries"),
+        ("minimax", "minimax-portal", "entries"),
+        ("minimax", "MINIMAX-PORTAL-AUTH", "allow"),
+    ] {
+        let root = TestDir::new("runtime-build-local-plugin-identity");
+        let (cwd, mut env, state, _) = target_plugin_build_fixture(&root);
+        let repo = cwd.join("openclaw");
+        let package_name = "@openclaw/identity-fixture";
+        // The directory, declared manifest ID and npm name intentionally differ.
+        for prefix in ["extensions", "dist/extensions"] {
+            let dir = repo.join(prefix).join("provider-source");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("openclaw.plugin.json"),
+                serde_json::json!({"id":id}).to_string(),
+            )
+            .unwrap();
+            fs::write(
+                dir.join("package.json"),
+                serde_json::json!({"name":package_name,"version":"2026.4.25"}).to_string(),
+            )
+            .unwrap();
+            fs::write(dir.join("index.js"), "export const build = 'source';\n").unwrap();
+        }
+        let archive = root.child("source-plugin.tgz");
+        fs::write(
+            &archive,
+            source_extension_package_tarball_for(id, package_name),
+        )
+        .unwrap();
+        for (key, value) in [
+            ("FAKE_SOURCE_EXTENSION_ARCHIVE", path_string(&archive)),
+            ("FAKE_SOURCE_EXTENSION_NAME", package_name.to_string()),
+            (
+                "FAKE_SOURCE_EXTENSION_FILENAME",
+                "source-plugin.tgz".to_string(),
+            ),
+            (
+                "FAKE_SOURCE_EXTENSION_INSTALL_PATH",
+                package_name.to_string(),
+            ),
+        ] {
+            env.insert(key.to_string(), value);
+        }
+        let config = if field == "entries" {
+            serde_json::json!({"plugins":{"entries":{configured:{"enabled":true}}}})
+        } else {
+            serde_json::json!({"plugins":{"allow":[configured]}})
+        }
+        .to_string();
+        fs::write(state.join("openclaw.json"), &config).unwrap();
+        let build = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "build-local",
+                "target",
+                "--repo",
+                "./openclaw",
+                "--for-env",
+                "primary",
+                "--raw",
+            ],
+        );
+        assert!(
+            build.status.success(),
+            "{id}/{configured}/{field}: {}",
+            stderr(&build)
+        );
+        let runtime_root = runtime_install_root("target", &env, &cwd)
+            .unwrap()
+            .join("files/node_modules/openclaw");
+        let manifest: Value = serde_json::from_slice(
+            &fs::read(runtime_root.join("dist/extensions/provider-source/openclaw.plugin.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["id"], id);
+        assert!(!runtime_root.join("dist/extensions/codex").exists());
+        assert_eq!(
+            fs::read_to_string(state.join("openclaw.json")).unwrap(),
+            config
+        );
+    }
+}
+
 fn write_target_plugin_index(state: &Path, dedicated: bool, raw: &str) {
     let database = state.join("state/openclaw.sqlite");
     fs::create_dir_all(database.parent().unwrap()).unwrap();
@@ -1655,9 +1757,10 @@ fn runtime_build_local_accepts_installed_target_plugin_record_formats() {
         let root = TestDir::new("runtime-build-local-installed-target-plugin");
         let (cwd, env, state, _) = target_plugin_build_fixture(&root);
         // codex is in the checkout but unselected. Its install record must not cause it
-        // to be packed, and external must remain outside the bundled extension set.
-        let records = serde_json::json!({"external": {"source":"path"}, "codex": {"source":"npm"}});
-        let mut config = serde_json::json!({"plugins":{"entries":{"external":{"enabled":true}}}});
+        // to be packed, and google must remain outside the bundled extension set.
+        let records = serde_json::json!({"GOOGLE": {"source":"path"}, "codex": {"source":"npm"}});
+        let mut config =
+            serde_json::json!({"plugins":{"entries":{"google-gemini-cli":{"enabled":true}}}});
         match format {
             "inline" => config["plugins"]["installs"] = records,
             "legacy-json" | "legacy-array" => {
@@ -1665,7 +1768,7 @@ fn runtime_build_local_accepts_installed_target_plugin_record_formats() {
                 let value = if format == "legacy-json" {
                     serde_json::json!({"installRecords":records})
                 } else {
-                    serde_json::json!({"plugins":[{"pluginId":"external"},{"pluginId":"codex"}]})
+                    serde_json::json!({"plugins":[{"pluginId":"GOOGLE"},{"pluginId":"codex"}]})
                 };
                 fs::write(state.join("plugins/installs.json"), value.to_string()).unwrap();
             }
@@ -1700,7 +1803,7 @@ fn runtime_build_local_accepts_installed_target_plugin_record_formats() {
             .unwrap()
             .join("files/node_modules/openclaw");
         assert!(
-            !runtime_root.join("dist/extensions/external").exists(),
+            !runtime_root.join("dist/extensions/google").exists(),
             "{format}"
         );
         assert!(

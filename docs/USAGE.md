@@ -245,7 +245,12 @@ ocm runtime build-local primary-test \
 OCM reads the target environment's effective config before `npm pack`, validates
 explicit plugin references against the checkout and installed-plugin records,
 including the native SQLite index, inline config and legacy JSON records,
-and follows transitive local plugin package dependencies. Installed external
+and follows transitive local plugin package dependencies. Policy IDs are trimmed
+and compared without case distinctions. The native built-in aliases
+`google-gemini-cli` → `google` and `minimax-portal` / `minimax-portal-auth` →
+`minimax` resolve against the selected checkout and installed records. Authored
+config and declared manifest IDs remain unchanged; unknown references still fail
+validation. Installed external
 plugins satisfy that validation without being bundled into the new runtime;
 installed records do not select additional plugins. Disabled entries and denied
 plugins remain excluded from the explicit selection, even when their identifiers
