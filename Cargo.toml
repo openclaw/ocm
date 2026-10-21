@@ -37,6 +37,7 @@ filetime = "0.2"
 tar = "0.4"
 tempfile = "3.27"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 indicatif = { version = "0.18", default-features = false, features = ["unicode-width"] }
 unicode-width = "0.2"

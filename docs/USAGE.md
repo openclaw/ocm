@@ -512,6 +512,23 @@ maintenance. This protects the caller from the supervisor's signals to that
 group. A systemd unit stop or restart can still terminate the caller through its
 service cgroup.
 
+Service readiness requests `/health` on the local Gateway port using the
+configured transport. With `gateway.tls.enabled: true`, OCM verifies the peer
+against the environment's configured public `gateway.tls.certPath`, or the
+Gateway's default `.openclaw/gateway/tls/gateway-cert.pem`, and verifies its TLS
+handshake. This supports the Gateway's generated self-signed certificates as
+well as explicitly configured certificates. Relative certificate paths follow
+the Gateway's launch directory; `~` follows its isolated OpenClaw home. OCM
+never generates certificates, reads the server private key, or falls back to
+plaintext for a TLS environment. For templated certificate paths in dev and
+installed OpenClaw package bindings, it makes one private, bounded native
+`config get gateway.tls.certPath --json` call so OpenClaw owns `.env` resolution.
+Generic launchers and registered executables are not sent configuration commands;
+their certificate paths use literals, inherited variables, or `config.env` values.
+Missing or mismatched certificates keep the
+Gateway unready within the normal readiness timeout. HTTP environments retain
+the ordinary HTTP health check.
+
 ### Supervisor bootstrap logs on a separate filesystem
 
 By default, the supervisor's own stdout/stderr logs live under

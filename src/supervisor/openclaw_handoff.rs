@@ -245,26 +245,51 @@ fn run_openclaw_machine_command_with_timeout(
     let program = program_arguments
         .first()
         .ok_or_else(|| "restart-handoff command is missing a program".to_string())?;
+    let mut command = Command::new(program);
+    command
+        .args(program_arguments.iter().skip(1))
+        .env_clear()
+        .envs(&spec.process_env)
+        .current_dir(Path::new(&spec.run_dir));
+    run_captured_machine_command(command, timeout, &spec.env_name)
+}
+
+/// Reuse bounded capture and process-group settlement without exposing private
+/// native configuration output or stderr in readiness errors.
+pub(crate) fn read_private_config_command(
+    command: Command,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    match run_captured_machine_command(command, timeout, "Gateway TLS configuration") {
+        Ok(output) if output.status.success() => Ok(output.stdout),
+        Ok(_) => Err("OpenClaw could not resolve gateway.tls.certPath".to_string()),
+        Err(error) if error.cleanup_verified => {
+            Err("OpenClaw TLS configuration lookup failed or timed out".to_string())
+        }
+        Err(error) => Err(error.detail),
+    }
+}
+
+fn run_captured_machine_command(
+    mut command: Command,
+    timeout: Duration,
+    env_name: &str,
+) -> Result<CommandOutput, MachineCommandError> {
     // Configure capture before spawning so every post-spawn failure settles the child.
     let (mut stdout, stdout_writer) = CommandCapture::new()
         .map_err(|error| format!("failed capturing restart-handoff stdout: {error}"))?;
     let (mut stderr, stderr_writer) = CommandCapture::new()
         .map_err(|error| format!("failed capturing restart-handoff stderr: {error}"))?;
-    let mut command = Command::new(program);
     command
-        .args(program_arguments.iter().skip(1))
         .stdin(Stdio::null())
         .stdout(stdout_writer)
-        .stderr(stderr_writer)
-        .env_clear()
-        .envs(&spec.process_env)
-        .current_dir(Path::new(&spec.run_dir));
+        .stderr(stderr_writer);
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(|error| {
         format!(
             "failed running restart-handoff command for env \"{}\": {error}",
-            spec.env_name
+            env_name
         )
     })?;
     // Command retains the parent-side writers even after spawn.

@@ -852,6 +852,19 @@ fn resolve_openclaw_workspaces_with_config(
     )
 }
 
+pub(super) fn resolve_openclaw_config_env(
+    config: Value,
+    env: &BTreeMap<String, String>,
+    openclaw_home: &Path,
+    state_dir: &Path,
+    config_path: &Path,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+) -> Value {
+    let mut config_env = openclaw_config_env(env, openclaw_home, state_dir, config_path, runtime);
+    apply_openclaw_config_env(&config, &mut config_env);
+    resolve_config_env_vars(config, &config_env)
+}
+
 fn resolve_openclaw_workspaces_from_config(
     config_path: &Path,
     state_dir: &Path,
@@ -865,10 +878,9 @@ fn resolve_openclaw_workspaces_from_config(
         .as_ref()
         .map(|resolved| resolved.value.clone())
         .unwrap_or_else(|| Value::Object(Map::new()));
-    let mut config_env = openclaw_config_env(env, openclaw_home, state_dir, config_path, runtime);
-    apply_openclaw_config_env(&config, &mut config_env);
     let authored_entries = agent_entries(&config);
-    let config = resolve_config_env_vars(config, &config_env);
+    let config =
+        resolve_openclaw_config_env(config, env, openclaw_home, state_dir, config_path, runtime);
     let config_include_paths = resolved
         .map(|resolved| resolved.include_paths)
         .unwrap_or_default();

@@ -42,6 +42,7 @@ use crate::store::{
 };
 
 mod openclaw_handoff;
+pub(crate) use openclaw_handoff::read_private_config_command;
 mod ownership;
 
 pub use ownership::{ServiceRecoverySummary, SupervisorRetainedOwnership};

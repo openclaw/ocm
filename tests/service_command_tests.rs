@@ -2563,3 +2563,10 @@ fn service_status_keeps_failed_backoff_as_issue() {
         "process exited with 1; retrying after backoff"
     );
 }
+
+// The fixture uses a real supervisor and finite Node HTTP(S) peers; only the
+// native service manager is replaced. These are readiness transport checks, not
+// a claim to exercise a full OpenClaw runtime.
+#[cfg(unix)]
+#[path = "support/service_tls_readiness.rs"]
+mod service_tls_readiness;
