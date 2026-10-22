@@ -170,9 +170,11 @@ def flow(action, prefix):
         observer.write_text(
             "const fs=require('node:fs'),path=require('node:path');\n"
             "const root=" + json.dumps(str(home / "entry-receipts")) + ";\n"
+            "if(require('node:worker_threads').isMainThread){\n"
             "fs.mkdirSync(root,{recursive:true,mode:0o700});\n"
             "fs.writeFileSync(path.join(root,process.pid+'.json'),JSON.stringify({"
-            "pid:process.pid,argv:process.argv,cwd:process.cwd(),execPath:process.execPath}));\n"
+            "pid:process.pid,argv:process.argv,cwd:process.cwd(),execPath:process.execPath}),{flag:'wx'});\n"
+            "}\n"
         )
 
     def scrub(text):
