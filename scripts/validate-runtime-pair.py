@@ -60,7 +60,12 @@ def run(label, command, repo, runtime, timeout=900):
     state.mkdir()
     # Only operating-system/tool paths reach the tested process; no Actions token.
     env = {key: value for key, value in os.environ.items()
-           if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "PROCESSOR_ARCHITECTURE", "RUSTUP_HOME", "CARGO_HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA"}}
+           if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "PROCESSOR_ARCHITECTURE", "RUSTUP_HOME", "CARGO_HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA",
+                               "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "SYSTEMDRIVE",
+                               "INCLUDE", "LIB", "LIBPATH", "VCINSTALLDIR", "VCTOOLSINSTALLDIR",
+                               "VSINSTALLDIR", "WINDOWSSDKDIR", "WINDOWSSDKVERSION",
+                               "UNIVERSALCRTSDKDIR", "UCRTVERSION", "VCTOOLSVERSION",
+                               "VSCMD_ARG_TGT_ARCH", "VSCMD_ARG_HOST_ARCH", "VSCMD_VER", "VS170COMNTOOLS"}}
     env.update(HOME=str(state), OCM_HOME=str(state / "ocm-home"),
                CI="1", npm_config_cache=str(state / "npm-cache"), PATH=str(nodes[runtime].parent) + os.pathsep + env.get("PATH", ""))
     began = time.monotonic()
