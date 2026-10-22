@@ -316,6 +316,11 @@ def flow(action, prefix):
             assert sha(binary) == meta["candidateSha256"] != meta["predecessorSha256"]
             before = json.loads((evidence / "before.json").read_text())
             oc("candidate-prewarm", "runtime", "install", "--version", OPENCLAW, "--json", timeout=600)
+            # runtime install republishes the bound service plan. A changed Node
+            # executable causes an asynchronous restart, so use the public normal
+            # readiness boundary before requiring RPC health.
+            ready = json.loads(oc("prewarm-service-ready", "service", "start", ENV_NAME, "--json").stdout)
+            assert ready["gatewayReady"] is True, ready
             rpc("during-prewarm-health", "health")
             oc("candidate-daemon-refresh", "service", "refresh-daemon", "--acknowledge-gateway-restarts", "--json")
             for label in ["after", "restart"]:

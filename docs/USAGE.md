@@ -387,6 +387,7 @@ Official package installation reads `engines.node` from the integrity-verified a
 Ordinary runtime execution reads the installed package manifest and uses a compatible host Node.js when available, otherwise a compatible private toolchain.
 OCM validates cached executables with `node --version` and reuses only its selected private Node.js patch.
 Run `ocm runtime install --channel stable` while online to refresh an older private cache, including when the OpenClaw package is already installed.
+Refreshing a bound runtime also synchronizes its managed service. If the selected Node.js executable changes, the gateway restarts asynchronously. Use a maintenance window and run `ocm service start <env>` to wait for normal gateway readiness before checking health.
 Once refreshed, the selected private runtime remains usable offline.
 If neither the host nor OCM's approved private Node.js version satisfies the package, install a compatible host Node.js and npm before retrying.
 Packages without a declared Node.js engine retain the legacy baseline; source launchers and manually registered commands retain their selected toolchains.
