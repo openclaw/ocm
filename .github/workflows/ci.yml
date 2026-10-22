@@ -186,13 +186,9 @@ jobs:
         run: |
           private_config_test_binary=$(cargo test --locked --lib --no-run --message-format=json | python3 -c 'import json,sys; paths=[entry["executable"] for line in sys.stdin if (entry:=json.loads(line)).get("reason")=="compiler-artifact" and entry.get("profile",{}).get("test") and entry.get("executable")]; assert len(paths)==1,paths; print(paths[0])')
           sudo -n -- "$private_config_test_binary" --ignored --exact store::openclaw_config::macos_privacy_tests::private_config_creation_excludes_other_users --nocapture
-      - name: Run test suite
-        run: cargo test --locked
-      - name: Smoke test cargo install
-        run: |
-          cargo install --locked --path . --root "$RUNNER_TEMP/ocm-install"
-          "$RUNNER_TEMP/ocm-install/bin/ocm" --version
-
+      - name: Build upgrade candidate (finite PR568 validation)
+        if: github.event_name == 'pull_request' && github.event.pull_request.number == 568 && runner.os == 'Linux'
+        run: cargo install --locked --path . --root "$RUNNER_TEMP/ocm-install"
       - name: Prove real released-predecessor service upgrade (finite PR568 validation)
         if: github.event_name == 'pull_request' && github.event.pull_request.number == 568 && runner.os == 'Linux'
         timeout-minutes: 25
@@ -215,6 +211,14 @@ jobs:
             ${{ runner.temp }}/ocm-released-upgrade/*.log
           if-no-files-found: error
           retention-days: 7
+
+      - name: Run test suite
+        run: cargo test --locked
+      - name: Smoke test cargo install
+        run: |
+          cargo install --locked --path . --root "$RUNNER_TEMP/ocm-install"
+          "$RUNNER_TEMP/ocm-install/bin/ocm" --version
+
 
   npm:
     name: npm (${{ matrix.name }}, Node ${{ matrix.node }})

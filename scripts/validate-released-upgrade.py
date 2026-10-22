@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import traceback
 import urllib.request
 from urllib.parse import urlsplit
 
@@ -61,6 +62,15 @@ def actor(meta, action):
            "CI=1", "npm_config_cache=" + meta["home"] + "/npm-cache"]
     return ["sudo", "-n", "-u", user, "--", "env", "-i", *env,
             "/usr/bin/python3", meta["home"] + "/driver.py", "flow", action, meta["prefix"]]
+
+
+def run_actor(meta, action, output, timeout):
+    result = subprocess.run(actor(meta, action), cwd="/", capture_output=True, text=True, timeout=timeout)
+    (output / ("actor-" + action + ".log")).write_text(result.stdout + result.stderr)
+    print(result.stdout, end="", flush=True)
+    if result.returncode:
+        print(result.stderr, end="", file=sys.stderr, flush=True)
+        raise RuntimeError("Task actor " + action + " failed; retained actor diagnostics")
 
 
 def export(meta, output):
@@ -136,9 +146,10 @@ def prepare(prefix, output, candidate):
     command(["sudo", "-n", "install", "-o", user, "-g", user, "-m", "0700", Path(__file__).resolve(), home + "/driver.py"])
     command(["sudo", "-n", "loginctl", "enable-linger", user])
     command(["sudo", "-n", "systemctl", "start", "user@" + str(meta["uid"]) + ".service"])
-    result = command(actor(meta, "before"), cwd="/", timeout=1500)
-    print(result.stdout, end="", flush=True)
-    export(meta, output)
+    try:
+        run_actor(meta, "before", output, 1500)
+    finally:
+        export(meta, output)
 
 
 def flow(action, prefix):
@@ -198,23 +209,30 @@ def flow(action, prefix):
         return next({k: x[k] for k in ["key", "sessionId", "label", "lifecycleRevision"] if k in x}
                     for x in rows if x.get("key") == SESSION_KEY)
 
+    def checkpoint(phase):
+        write_json(evidence / "phase.json", {"action": action, "phase": phase})
+
     def snapshot(label, expected_node):
         status = json.loads(oc(label + "-status", "service", "status", ENV_NAME, "--json").stdout)
         assert status["running"] and status["gatewayState"] == "running", status
         rpc(label + "-health", "health")
+        checkpoint(label + "-http-health")
         with urllib.request.urlopen("http://127.0.0.1:" + str(meta["port"]) + "/healthz", timeout=5) as response:
             assert response.status == 200
         daemon = status["ocmServicePid"]
         child = status["childPid"]
         processes = {}
         for key, pid in [("daemon", daemon), ("child", child)]:
+            checkpoint(label + "-" + key + "-proc-executable")
             exe = Path("/proc") / str(pid) / "exe"
             processes[key] = {"pid": pid, "executable": os.readlink(exe), "sha256": sha(exe)}
         assert processes["daemon"]["sha256"] == sha(binary)
+        checkpoint(label + "-selected-node-version")
         selected = command([Path("/proc") / str(child) / "exe", "--version"]).stdout.strip()
         assert selected == "v" + expected_node, selected
         assert expected_node in processes["child"]["executable"]
         assert command([Path(meta["ambientBin"]) / "node", "--version"]).stdout.strip() == "v22.15.0"
+        checkpoint(label + "-entry-receipt")
         receipt = json.loads((home / "entry-receipts" / (str(child) + ".json")).read_text())
         processes["child"]["observedArgv"] = receipt["argv"]
         entry = Path(receipt["argv"][1]).resolve()
@@ -222,6 +240,7 @@ def flow(action, prefix):
         assert str(entry) in status["args"], "Running Node entry differs from OCM's selected package"
         package = entry.parent / "package.json"
         assert json.loads(package.read_text())["version"] == OPENCLAW
+        checkpoint(label + "-gateway-probe")
         probe = json.loads(oc(label + "-gateway-probe", "env", "run", ENV_NAME, "--", "gateway", "probe", "--json", record=False).stdout)
         target = next(t for t in probe["targets"] if t["connect"]["ok"]
                       and urlsplit(t["url"]).port == meta["port"]
@@ -289,6 +308,11 @@ def flow(action, prefix):
             oc("cleanup-uninstall", "service", "uninstall", ENV_NAME, require=False)
         else:
             raise RuntimeError("Unknown flow action")
+    except Exception:
+        failure = scrub(traceback.format_exc())
+        (evidence / ("failure-" + action + ".log")).write_text(failure)
+        print(failure, file=sys.stderr, flush=True)
+        raise SystemExit(1)
     finally:
         if action != "export":
             run("diagnostic-journal-" + action, ["journalctl", "--user", "-u", UNIT, "--no-pager"], require=False)
@@ -318,17 +342,25 @@ def main():
     if not meta["createdUser"]:
         return
     try:
-        result = command(actor(meta, "after" if args.action == "verify" else "cleanup"), cwd="/", timeout=900)
-        print(result.stdout, end="", flush=True)
+        run_actor(meta, "after" if args.action == "verify" else "cleanup", args.output, 900)
     finally:
         try:
             export(meta, args.output)
         finally:
             if args.action == "cleanup":
                 command(["sudo", "-n", "loginctl", "disable-linger", meta["user"]])
-                command(["sudo", "-n", "loginctl", "terminate-user", meta["user"]])
-                remaining = subprocess.run(["pgrep", "-u", str(meta["uid"])], capture_output=True, text=True)
-                assert remaining.returncode == 1, "Task processes remain after termination"
+                terminated = subprocess.run(["sudo", "-n", "loginctl", "terminate-user", meta["user"]], capture_output=True, text=True)
+                (args.output / "cleanup-user-manager.log").write_text(terminated.stdout + terminated.stderr)
+                # Disabling lingering may already have removed the user manager.
+                # Accept that only when the actual owned-process postcondition holds.
+                deadline = time.monotonic() + 30
+                while True:
+                    remaining = subprocess.run(["pgrep", "-u", str(meta["uid"])], capture_output=True, text=True)
+                    if remaining.returncode == 1:
+                        break
+                    if remaining.returncode != 0 or time.monotonic() >= deadline:
+                        raise RuntimeError("Task processes remain or process inspection failed: " + remaining.stdout + remaining.stderr)
+                    time.sleep(1)
                 write_json(args.output / "cleanup.json", {"ownedServiceStopped": True, "taskUserTerminated": True,
                            "privateState": "Retained only on disposable runner until destruction; not uploaded"})
 
