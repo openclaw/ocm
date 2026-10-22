@@ -226,13 +226,10 @@ impl DevUiTarget {
         source: &Path,
         env: &BTreeMap<String, String>,
     ) -> Command {
-        // The selected cwd already owns this entry. Hardened Node on Windows
-        // rejects an extended absolute main path while resolving its drive.
-        let args = vec![
-            "./openclaw.mjs".to_string(),
+        let args = crate::env::source_watch_openclaw_program_args(&[
             "dashboard".to_string(),
             "--json".to_string(),
-        ];
+        ]);
         let mut command = gated_dev_command("node", &args);
         command
             .stdin(Stdio::null())

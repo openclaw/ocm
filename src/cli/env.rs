@@ -1470,8 +1470,7 @@ impl Cli {
             let source_env =
                 build_openclaw_dev_source_env(&meta, &self.env, Path::new(&source.repo_root));
             if after[0] == "openclaw" {
-                let mut node_args = vec![source.openclaw_entry_path().display().to_string()];
-                node_args.extend(after[1..].iter().cloned());
+                let node_args = crate::env::source_watch_openclaw_program_args(&after[1..]);
                 return run_direct(
                     "node",
                     &node_args,

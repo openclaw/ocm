@@ -1,4 +1,4 @@
-INPUT_FILES = ["Cargo.lock", "src/managed_node.rs", "tests/windows_dev_stop_tests.rs", "tests/support/windows_dev_stop.cjs", "tests/support/dev_ui.cjs"]
+INPUT_FILES = ["Cargo.lock", "src/managed_node.rs", "src/env/execution.rs", "src/cli/env.rs", "src/cli/dev/ui.rs", "src/env/mod.rs", "tests/windows_dev_stop_tests.rs", "tests/support/windows_dev_stop.cjs", "tests/support/dev_ui.cjs"]
 """Finite native Windows validation; no publication or installed-user state."""
 import ctypes
 import hashlib
@@ -56,7 +56,7 @@ fixture = "tests/support/windows_dev_stop.cjs"
 identities["base_pristine_fixture_sha256"] = digest(base / fixture)
 (base / fixture).write_bytes((candidate / fixture).read_bytes())
 identities["shared_fixture_overlay_sha256"] = digest(base / fixture)
-identities["validation_mode"] = "repaired-candidate-hardened-runtime"
+identities["validation_mode"] = "paired-source-command-repair-hardened-runtime"
 identities["historical_control_run"] = 39724566762
 identities["input_hashes"] = {}
 for label, repo in [("base", base), ("candidate", candidate)]:
@@ -95,9 +95,8 @@ def run(label, command, repo, runtime, timeout=900):
     return code == 0 and not timed_out
 
 executables = {}
-for label, repo in [("candidate", candidate)]:
-    # Source/runtime attribution is retained in historical_control_run.
-    # Build and prove only the repaired candidate; baseline failures are not gates.
+for label, repo in [("base", base), ("candidate", candidate)]:
+    # Same fixture and hardened Node; source argv is the only repaired owner.
     if not run(label + "-compile", ["cargo", "test", "--locked", "--test", "windows_dev_stop_tests", "--no-run", "--message-format=json"], repo, "new", 1200):
         raise SystemExit("Compilation failed; lifecycle comparison is not a product verdict")
     records = []
@@ -114,7 +113,22 @@ for label, repo in [("candidate", candidate)]:
     identities[label + "_test_binary_sha256"] = digest(records[0])
     identities[label + "_ocm_binary_sha256"] = digest(repo / "target/debug/ocm.exe")
 (output / "identity.json").write_text(json.dumps(identities, indent=2))
+# The controlled old source must reach both real CLI entry points and exhibit
+# the exact resolver error, rather than failing setup or merely timing out.
+run("control-new-source-commands", [executables["base"], "--exact", "native_windows_dev_stop_lifecycle", "--nocapture"], base, "new", 210)
+control = results[-1]
+control_log = (output / "control-new-source-commands.log").read_text(errors="replace")
+marker = '{"sourceCommandProbes":'
+position = control_log.find(marker)
+observations = json.JSONDecoder().raw_decode(control_log[position:])[0]["sourceCommandProbes"] if position >= 0 else []
+qualified = (control["exit"] == 101 and not control["timeout"] and len(observations) == 2
+             and observations[0]["args"][:2] == ["env", "run"]
+             and observations[1]["args"][:2] == ["env", "exec"]
+             and all(row["status"] == 1 and "EISDIR" in row["stderr"] for row in observations))
+(output / "control-qualification.json").write_text(json.dumps({"qualified": qualified, "observations": observations}, indent=2))
+if not qualified:
+    raise SystemExit("Controlled source-command failure did not reach the required boundary")
 run("candidate-new-lifecycle", [executables["candidate"], "--exact", "native_windows_dev_stop_lifecycle", "--nocapture"], candidate, "new", 210)
 # Real official ZIP installation and offline reuse for the repaired candidate.
 run("candidate-managed-zip", ["cargo", "test", "--locked", "--lib", "managed_node::tests::windows_managed_node_zip_installs_and_reuses_offline", "--", "--ignored", "--exact", "--nocapture"], candidate, "new", 600)
-raise SystemExit(1 if any(result["exit"] != 0 or result["timeout"] for result in results) else 0)
+raise SystemExit(1 if any(result["exit"] != 0 or result["timeout"] for result in results if result["label"].startswith("candidate-")) else 0)

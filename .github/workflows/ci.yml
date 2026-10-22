@@ -122,7 +122,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
         with:
-          ref: 9ab0d1be3c8506eb445e3ca836eca055e44f1937
+          ref: 223395b59718f2c32565a8eac83a879355158508
           path: base
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1

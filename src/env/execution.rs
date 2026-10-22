@@ -383,7 +383,7 @@ impl<'a> EnvironmentService<'a> {
             && let Some(source) = self.active_source_watch_override(&env.name)?
         {
             let env = self.source_watch_environment(env, &source)?;
-            let program_args = source_watch_openclaw_program_args(&source, &args);
+            let program_args = source_watch_openclaw_program_args(&args);
             let run_dir = PathBuf::from(&source.repo_root);
             return Ok(ResolvedExecution::SourceWatch {
                 env,
@@ -544,7 +544,7 @@ fn source_watch_gateway_process_spec(
         "--port".to_string(),
         port.to_string(),
     ];
-    let args = source_watch_openclaw_program_args(&source, &gateway_args);
+    let args = source_watch_openclaw_program_args(&gateway_args);
 
     Ok(GatewayProcessSpec {
         env_name: env_meta.name.clone(),
@@ -565,11 +565,10 @@ fn source_watch_gateway_process_spec(
     })
 }
 
-fn source_watch_openclaw_program_args(
-    source: &SourceWatchOverride,
-    openclaw_args: &[String],
-) -> Vec<String> {
-    let mut program_args = vec![display_path(&source.openclaw_entry_path())];
+pub(crate) fn source_watch_openclaw_program_args(openclaw_args: &[String]) -> Vec<String> {
+    // Every source caller pins cwd to its selected checkout. Hardened Node on
+    // Windows rejects canonical extended absolute main paths at the drive.
+    let mut program_args = vec!["./openclaw.mjs".to_string()];
     program_args.extend(openclaw_args.iter().cloned());
     program_args
 }

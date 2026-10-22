@@ -161,7 +161,7 @@ async function start(name, watching = true, withUi = false, defaults = false) {
     for (const entry of ['watch-node.mjs', 'run-node.mjs']) {
       fs.writeFileSync(path.join(repo, 'scripts', entry), "import './dev-ui-fixture.cjs';\n");
     }
-    fs.writeFileSync(path.join(repo, 'openclaw.mjs'), "if (process.argv.includes('--version')) console.log(process.version); else await import('./scripts/dev-ui-fixture.cjs');\n");
+    fs.writeFileSync(path.join(repo, 'openclaw.mjs'), "if (process.argv.includes('--version')) console.log('source-entry:' + process.version); else await import('./scripts/dev-ui-fixture.cjs');\n");
     for (const name of ['vite', 'dompurify']) {
       const module = path.join(repo, 'node_modules', name);
       fs.mkdirSync(module, {recursive:true});
@@ -243,8 +243,6 @@ async function start(name, watching = true, withUi = false, defaults = false) {
     record.identities.push(uiIdentity, {pid:ui.descendantPid, startedAt:startIdentity(ui.descendantPid)});
     record.sourcePids.push(ui.pid, ui.descendantPid);
     assert.ok(!fs.existsSync(path.join(directory, 'dashboard-attempts')), 'Gateway document readiness was bypassed');
-    // Keep this regression on the canonical extended Windows source path.
-    assert.ok(output().includes("source=\\\\?\\"), "Windows fixture must retain its extended source path");
     fs.writeFileSync(path.join(directory, 'gateway-document-ready'), 'ready');
     const helperFile = path.join(directory, 'dashboard-attempt-1');
     await waitFor(() => fs.existsSync(helperFile), () => 'Native handoff did not start\n' + output() + (fs.existsSync(diagnosticLog) ? '\n' + fs.readFileSync(diagnosticLog, 'utf8') : ''));
@@ -319,6 +317,8 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     assert.equal(native('ready').ready, true);
     run(['runtime','add','proof-node','--path',process.execPath]);
     const normal = await start('normal.stop', true, true, true);
+    // Keep this regression on the canonical extended Windows source path.
+    assert.ok(normal.output().includes("source=\\\\?\\"), "Windows fixture must retain its extended source path");
     fs.rmSync(path.join(normal.directory, 'dashboard-hold'));
     await waitFor(() => !alive(normal.helperPid) && !session(normal.name).ui.children.command && normal.output().includes('UI: '),
       'Completed initial handoff was not acknowledged');
@@ -333,7 +333,7 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
       return {args, status:result.status, stdout:result.stdout, stderr:result.stderr};
     });
     console.error(JSON.stringify({sourceCommandProbes:sourceCommands}));
-    assert.ok(sourceCommands.every(result => result.status === 0 && result.stdout.trim() === process.version),
+    assert.ok(sourceCommands.every(result => result.status === 0 && result.stdout.trim() === 'source-entry:' + process.version),
       'Active source CLI commands failed: ' + JSON.stringify(sourceCommands));
     const active = JSON.parse(run(['dev','status',normal.name,'--json']).stdout);
     assert.equal(active.sourceWatch.state, 'active', 'Held watch lease was not readable by dev status');

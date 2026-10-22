@@ -5332,21 +5332,29 @@ fn dev_takeover_retains_its_source_when_the_selected_alias_is_retargeted() {
     );
     let mut route_env = env.clone();
     prepend_fake_bin(&mut route_env, &route_bin);
-    let routed = run_ocm(&cwd, &route_env, &["env", "run", "demo", "--", "--probe"]);
-    assert!(routed.status.success(), "{}", stderr(&routed));
-    assert_eq!(
-        stdout(&routed),
-        format!(
-            "{}\n{}\n",
-            repo.display(),
-            repo.join("openclaw.mjs").display()
-        )
-    );
+    for args in [
+        vec!["env", "run", "demo", "--", "--probe"],
+        vec!["env", "exec", "demo", "--", "openclaw", "--probe"],
+    ] {
+        let routed = run_ocm(&cwd, &route_env, &args);
+        assert!(routed.status.success(), "{}", stderr(&routed));
+        let output = stdout(&routed);
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(Path::new(lines[0]), repo);
+        assert_eq!(
+            fs::canonicalize(Path::new(lines[0]).join(lines[1])).unwrap(),
+            repo.join("openclaw.mjs")
+        );
+    }
     let gateway = ocm::env::EnvironmentService::new(&env, &cwd)
         .resolve_gateway_process("demo", false)
         .unwrap();
     assert_eq!(gateway.run_dir, repo);
-    assert_eq!(gateway.args[0], path_string(&repo.join("openclaw.mjs")));
+    assert_eq!(
+        fs::canonicalize(gateway.run_dir.join(&gateway.args[0])).unwrap(),
+        repo.join("openclaw.mjs")
+    );
     let mismatch = run_ocm(&cwd, &env, &args);
     assert!(!mismatch.status.success());
     assert!(stderr(&mismatch).contains("stop that session before selecting"));
