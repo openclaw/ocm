@@ -26,9 +26,12 @@ fn bin_wrapper_runs_with_an_overridden_home() {
     std::fs::create_dir_all(&ocm_home).unwrap();
     std::fs::create_dir_all(&shim_bin).unwrap();
 
-    let cargo = find_executable("rustup")
-        .or_else(|| find_executable("cargo"))
-        .expect("cargo must be available for wrapper tests");
+    // Homebrew's rustup shell wrapper preserves its own command name, so
+    // renaming it to cargo does not select Cargo proxy dispatch.
+    let cargo = find_executable("cargo")
+        .expect("cargo must be available for wrapper tests")
+        .canonicalize()
+        .expect("cargo must resolve to an installed entrypoint");
     std::os::unix::fs::symlink(cargo, shim_bin.join("cargo")).unwrap();
     let path = std::env::join_paths(std::iter::once(shim_bin).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -45,6 +48,12 @@ fn bin_wrapper_runs_with_an_overridden_home() {
     command.env_remove("RUSTUP_HOME");
 
     let output = command.output().unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        output.status.success(),
+        "wrapper exited {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        stdout(&output),
+        stderr(&output)
+    );
     assert!(stdout(&output).contains("OpenClaw Manager"));
 }
