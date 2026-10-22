@@ -42,6 +42,30 @@ fn install_fake_node(root: &TestDir, env: &mut BTreeMap<String, String>) -> Path
     node_log
 }
 
+fn assert_node_uses_source(node_log: &str, source_repo: &Path) {
+    let fields: BTreeMap<_, _> = node_log
+        .trim_end()
+        .split('|')
+        .map(|field| field.split_once('=').unwrap())
+        .collect();
+    let run_dir = Path::new(fields["pwd"]);
+    let (entry_arg, forwarded_args) = fields["args"].split_once(' ').unwrap();
+    assert_eq!(forwarded_args, "status");
+    assert_eq!(
+        fs::canonicalize(run_dir).unwrap(),
+        fs::canonicalize(source_repo).unwrap()
+    );
+    assert_eq!(
+        fs::canonicalize(run_dir.join(entry_arg)).unwrap(),
+        fs::canonicalize(source_repo.join("openclaw.mjs")).unwrap()
+    );
+    assert_eq!(
+        fields["bundled"],
+        path_string(&source_repo.join("extensions"))
+    );
+    assert_eq!(fields["devroot"], path_string(source_repo));
+}
+
 fn create_source_repo(root: &TestDir) -> PathBuf {
     let repo = root.child("source/openclaw");
     fs::create_dir_all(repo.join("extensions/codex")).unwrap();
@@ -463,12 +487,7 @@ fn source_watch_override_takes_precedence_for_resolve_and_run() {
     assert_eq!(stdout(&run), "node-ok\n");
 
     let node_log = fs::read_to_string(node_log).unwrap();
-    assert!(node_log.contains(&format!(
-        "args={} status|bundled={}|devroot={}",
-        path_string(&entry),
-        path_string(&source_repo.join("extensions")),
-        path_string(&source_repo)
-    )));
+    assert_node_uses_source(&node_log, &source_repo);
 }
 
 #[test]
@@ -1012,15 +1031,17 @@ fn source_watch_override_flows_to_env_exec_and_status_surfaces() {
         format!("node {} gateway run --port 21901", path_string(&entry))
     );
     assert_eq!(service_status["binaryPath"], "node");
-    assert_eq!(service_status["args"][0], path_string(&entry));
+    assert_eq!(
+        fs::canonicalize(
+            Path::new(service_status["runDir"].as_str().unwrap())
+                .join(service_status["args"][0].as_str().unwrap())
+        )
+        .unwrap(),
+        fs::canonicalize(&entry).unwrap()
+    );
     assert_eq!(service_status["args"][1], "gateway");
     assert_eq!(service_status["runDir"], path_string(&source_repo));
 
     let node_log = fs::read_to_string(node_log).unwrap();
-    assert!(node_log.contains(&format!(
-        "args={} status|bundled={}|devroot={}",
-        path_string(&entry),
-        path_string(&source_repo.join("extensions")),
-        path_string(&source_repo)
-    )));
+    assert_node_uses_source(&node_log, &source_repo);
 }
