@@ -4,6 +4,33 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+## 0.3.6 - 2026-10-22
+
+**Highlights:** Safer recovery and migration, TLS-aware Gateway readiness, reliable targeted builds, and refreshed managed Node.js.
+
+### Added
+
+- Store a separate supervisor bootstrap-log directory through `OCM_DAEMON_LOG_DIR`, preserving it across service refresh and upgrade while keeping Gateway logs in their existing locations. ([#150](https://github.com/openclaw/ocm/pull/150))
+
+### Fixed
+
+- Stop rejected Gateways before snapshot compensation replaces their files, retain recovery data when shutdown cannot be confirmed, and preserve dangling environment-root links during rollback. ([#548](https://github.com/openclaw/ocm/pull/548), [#549](https://github.com/openclaw/ocm/pull/549))
+- Preserve replacement environments and runtimes borrowed by other environments when an earlier upgrade simulation cleans up. ([#547](https://github.com/openclaw/ocm/pull/547), [#554](https://github.com/openclaw/ocm/pull/554))
+- Keep migration target ownership through import and failure cleanup, relocate admitted nested absolute configuration includes, and preserve included settings during minimum setup. ([#552](https://github.com/openclaw/ocm/pull/552), [#551](https://github.com/openclaw/ocm/pull/551), [#545](https://github.com/openclaw/ocm/pull/545))
+- Exclude an export archive from its own contents, including when its destination is reached through a directory alias. ([#546](https://github.com/openclaw/ocm/pull/546))
+- Preserve linked pack and loose Git object storage required by registered development sources during admission and cleanup. ([#553](https://github.com/openclaw/ocm/pull/553), [#558](https://github.com/openclaw/ocm/pull/558))
+- Honor disabled plugins, accept native aliases and case variants, and resolve selected extension workspace dependencies in targeted local builds without rewriting source manifests. ([#544](https://github.com/openclaw/ocm/pull/544), [#550](https://github.com/openclaw/ocm/pull/550), [#555](https://github.com/openclaw/ocm/pull/555))
+- Recognize healthy TLS Gateways using verified local certificates and the supervised configuration, with bounded configuration lookup and helper cleanup. ([#556](https://github.com/openclaw/ocm/pull/556))
+- Keep Windows development sessions alive while status readers retain session snapshots, and use the selected source working directory for entry paths rejected by hardened Windows Node.js. ([#569](https://github.com/openclaw/ocm/pull/569), [#568](https://github.com/openclaw/ocm/pull/568))
+
+### Changed
+
+- Refresh the private Node.js toolchain to 24.22.1, reject stale cached patches, and prepare the selected private runtime even when reusing an already-installed OpenClaw package. Compatible host Node.js selection remains unchanged. ([#568](https://github.com/openclaw/ocm/pull/568))
+
+### Upgrade notes
+
+Refresh an older private Node.js cache while online before relying on offline launches; see [package runtime Node.js selection](docs/USAGE.md#package-runtime-nodejs-selection). Refreshing a bound runtime can restart its Gateway asynchronously. Use a maintenance window and wait for normal service readiness before checking health.
+
 ## 0.3.5 - 2026-10-20
 
 **Highlights:** Prevent cross-environment data loss during restore and cleanup, preserve imported state, and refresh compatible dependencies.
