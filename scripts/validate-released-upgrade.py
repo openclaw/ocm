@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import re
 import socket
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -112,6 +113,7 @@ def prepare(prefix, output, candidate):
     meta["predecessorSha256"] = sha(prefix / "bin/ocm")
     if meta["predecessorSha256"] != "ffd7c3b58b8d73974f102f006a652a58f1d60e0d59afeb8ae8a16ce3db0512ca":
         raise RuntimeError("Unexpected released predecessor executable")
+    shutil.copy2(prefix / "bin/ocm", prefix / "predecessor-ocm")
     node_name = "node-v22.15.0-linux-x64.tar.xz"
     node_url = "https://nodejs.org/dist/v22.15.0/"
     manifest = urllib.request.urlopen(node_url + "SHASUMS256.txt", timeout=60).read()
@@ -184,15 +186,27 @@ def flow(action, prefix):
                 text = text.replace(token, "[redacted task token]")
         return re.sub(r"(?im)^.*(?:agent model:|modelRuntime|providerApiKey).*$", "[model configuration omitted]", text)
 
+    def failure_output(text):
+        try:
+            value = json.loads(text)
+        except ValueError:
+            return scrub(text)
+        def redact(value):
+            if isinstance(value, dict):
+                return {k: "[redacted diagnostic field]" if re.search(r"model|provider|token|secret|api.?key", k, re.I) else redact(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [redact(v) for v in value]
+            return scrub(value) if isinstance(value, str) else value
+        return json.dumps(redact(value), indent=2)
+
     def run(label, args, timeout=120, require=True, record=True):
         started = time.monotonic()
         result = subprocess.run([str(a) for a in args], capture_output=True, text=True, timeout=timeout)
         if record:
             (evidence / (label + ".log")).write_text(scrub(result.stdout + result.stderr))
         elif result.returncode:
-            # RPC success payloads may include private model configuration.
-            # Retain only sanitized stderr when the command itself fails.
-            (evidence / (label + "-failure.log")).write_text(scrub(result.stderr))
+            # Retain failures emitted on either stream, without private fields.
+            (evidence / (label + "-failure.log")).write_text(failure_output(result.stdout) + "\n" + scrub(result.stderr))
         row = {"step": label, "exit": result.returncode, "seconds": round(time.monotonic() - started, 3)}
         print(json.dumps(row), flush=True)
         if require and result.returncode:
@@ -203,7 +217,14 @@ def flow(action, prefix):
         return run(label, [binary, *args], **kwargs)
 
     def rpc(label, method, *args):
-        result = oc(label, "env", "run", ENV_NAME, "--", "gateway", "call", method, *args, "--json", record=False)
+        result = oc(label, "env", "run", ENV_NAME, "--", "gateway", "call", method, *args, "--json", record=False, require=False)
+        if result.returncode:
+            if label == "during-prewarm-health":
+                run("prewarm-old-cli-control", [prefix / "predecessor-ocm", "env", "run", ENV_NAME, "--", "gateway", "call", "health", "--json"], record=False, require=False)
+                oc("prewarm-service-status", "service", "status", ENV_NAME, "--json", require=False)
+                with urllib.request.urlopen("http://127.0.0.1:" + str(meta["port"]) + "/healthz", timeout=5) as response:
+                    write_json(evidence / "prewarm-http-health.json", {"status": response.status})
+            raise RuntimeError(label + " failed; see sanitized failure output and controls")
         value = json.loads(result.stdout)
         if method == "health":
             assert value["ok"] is True, "Authenticated Gateway health failed"
