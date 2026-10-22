@@ -2,6 +2,7 @@
 
 mod support;
 
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -32,6 +33,17 @@ fn bin_wrapper_runs_with_an_overridden_home() {
         .expect("cargo must be available for wrapper tests")
         .canonicalize()
         .expect("cargo must resolve to an installed entrypoint");
+    // Native rustup installs cargo as a hard link too. Keep its rustup name
+    // discoverable by the wrapper without substituting a different shell entrypoint.
+    let rustup = cargo.with_file_name("rustup");
+    let cargo = match (std::fs::metadata(&cargo), std::fs::metadata(&rustup)) {
+        (Ok(cargo_meta), Ok(rustup_meta))
+            if cargo_meta.dev() == rustup_meta.dev() && cargo_meta.ino() == rustup_meta.ino() =>
+        {
+            rustup
+        }
+        _ => cargo,
+    };
     std::os::unix::fs::symlink(cargo, shim_bin.join("cargo")).unwrap();
     let path = std::env::join_paths(std::iter::once(shim_bin).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
