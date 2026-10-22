@@ -385,7 +385,9 @@ Names ending in `.json` remain supported when their destinations are available, 
 
 Official package installation reads `engines.node` from the integrity-verified archive before invoking npm.
 Ordinary runtime execution reads the installed package manifest and uses a compatible host Node.js when available, otherwise a compatible private toolchain.
-OCM validates cached executables with `node --version`; older caches remain usable offline for compatible packages.
+OCM validates cached executables with `node --version` and reuses only its selected private Node.js patch.
+Run `ocm runtime install --channel stable` while online to refresh an older private cache, including when the OpenClaw package is already installed.
+Once refreshed, the selected private runtime remains usable offline.
 If neither the host nor OCM's approved private Node.js version satisfies the package, install a compatible host Node.js and npm before retrying.
 Packages without a declared Node.js engine retain the legacy baseline; source launchers and manually registered commands retain their selected toolchains.
 `doctor host` and its `officialReleaseReady` field describe baseline availability and managed-toolchain support, without resolving any particular package version.

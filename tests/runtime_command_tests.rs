@@ -3738,8 +3738,12 @@ fn check_managed_node_install(previous_toolchain: bool) {
         tarball_server.url(),
         integrity
     );
-    let packument_server =
-        TestHttpServer::serve_bytes("/openclaw", "application/json", packument.as_bytes());
+    let packument_server = TestHttpServer::serve_bytes_times(
+        "/openclaw",
+        "application/json",
+        packument.as_bytes(),
+        if previous_toolchain { 2 } else { 1 },
+    );
     let mut env = ocm_env(&root);
     install_fake_node_and_npm(&root, &mut env, "22.22.3");
     let managed_node = install_fake_managed_node_archive(&root, &mut env, "24.22.1");
@@ -3788,6 +3792,46 @@ fn check_managed_node_install(previous_toolchain: bool) {
     assert!(run.status.success(), "{}", stderr(&run));
     assert_eq!(stdout(&run), "stable\n");
     assert_eq!(managed_node.requests().len(), 1);
+
+    if previous_toolchain {
+        // A previously installed release must prewarm the newly selected cache,
+        // even when its package bytes already match the selected release.
+        let selected_cache = fs::read_dir(root.child("ocm-home/toolchains/node"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("node-v24.22.1-")
+            })
+            .unwrap();
+        fs::remove_dir_all(selected_cache).unwrap();
+        let refreshed = install_fake_managed_node_archive(&root, &mut env, "24.22.1");
+        let reused = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "install", "--channel", "stable", "--json"],
+        );
+        assert!(reused.status.success(), "{}", stderr(&reused));
+        assert_eq!(
+            refreshed.requests().len(),
+            1,
+            "runtime reuse skipped private Node recovery"
+        );
+        assert_eq!(
+            tarball_server.requests().len(),
+            1,
+            "private Node recovery replaced the installed package"
+        );
+        env.insert(
+            "OCM_INTERNAL_MANAGED_NODE_ARCHIVE_URL".into(),
+            format!("{}/unavailable", refreshed.url()),
+        );
+        let offline = run_ocm(&cwd, &env, &["env", "run", "managed", "--", "--version"]);
+        assert!(offline.status.success(), "{}", stderr(&offline));
+        assert_eq!(stdout(&offline), "stable\n");
+    }
 }
 
 #[cfg(unix)]

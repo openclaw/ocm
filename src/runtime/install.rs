@@ -363,6 +363,8 @@ impl<'a> RuntimeService<'a> {
             };
 
             if !options.force && healthy && same_release && matches_requested_selector {
+                // Reusing package files must still prepare the selected Node cache.
+                super::resolve_runtime_launch(&existing, &[], self.env, self.cwd, true)?;
                 return Ok(StagedRuntimeInstall {
                     prepared: PreparedRuntimeInstall::reuse(existing),
                     action: OfficialRuntimePrepareAction::Reused,
