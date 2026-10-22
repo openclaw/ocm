@@ -50,6 +50,12 @@ identities["runtimes"] = {name: {"version": subprocess.check_output([str(node), 
 expected_versions = {'old': 'v22.15.0', 'new': 'v22.23.4'}
 if {name: value["version"] for name, value in identities["runtimes"].items()} != expected_versions:
     raise SystemExit("Runtime preparation mismatch; comparison is not a product verdict")
+# A shared synthetic-fixture diagnostic captures pre-entry errors without
+# changing either production revision or exposing product child stderr.
+fixture = "tests/support/windows_dev_stop.cjs"
+identities["base_pristine_fixture_sha256"] = digest(base / fixture)
+(base / fixture).write_bytes((candidate / fixture).read_bytes())
+identities["shared_fixture_overlay_sha256"] = digest(base / fixture)
 identities["input_hashes"] = {}
 for label, repo in [("base", base), ("candidate", candidate)]:
     identities["input_hashes"][label] = {name: digest(repo / name) for name in INPUT_FILES}

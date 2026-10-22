@@ -193,12 +193,17 @@ async function start(name, watching = true, withUi = false, defaults = false) {
   }
   const modes = defaults ? [] : [watching ? '--watch' : '--no-watch', withUi ? '--ui' : '--no-ui'];
   const args = ['dev',name,...(defaults ? [] : ['--repo',repo]),...(takeover ? ['--force'] : ['--root',envRoot,'--port',port]),...modes];
+  // Capture pre-entry failures only inside this synthetic fixture. The real
+  // dashboard owner intentionally keeps child stderr private.
+  const diagnostic = path.join(directory, 'node-entry-diagnostic.cjs');
+  const diagnosticLog = path.join(directory, 'node-entry-diagnostic.log');
+  fs.writeFileSync(diagnostic, 'process.on("uncaughtExceptionMonitor",error=>require("node:fs").appendFileSync(' + JSON.stringify(diagnosticLog) + ',String(error.stack)+"\\n"));\n');
   const sourceEnv = {
     ...env,
     ...(withUi ? {OCM_TEST_DEV_UI_DIR:directory, OCM_TEST_DEV_UI_DESCENDANTS:'1', OCM_TEST_UI_BASE:'/console'} : {}),
     NoDe_CoMpIlE_CaChE: path.join(directory, 'inherited-cache'),
     nOdE_dIsAbLe_CoMpIlE_cAcHe: '0',
-    NODE_OPTIONS: '--no-warnings'
+    NODE_OPTIONS: '--no-warnings --require=' + JSON.stringify(diagnostic)
   };
   const controller = cp.spawn(binary, args, {cwd:defaults ? repo : root, env:sourceEnv, stdio:['ignore','pipe','pipe'], windowsHide:true});
   const output = capture(controller);
@@ -240,7 +245,7 @@ async function start(name, watching = true, withUi = false, defaults = false) {
     assert.ok(!fs.existsSync(path.join(directory, 'dashboard-attempts')), 'Gateway document readiness was bypassed');
     fs.writeFileSync(path.join(directory, 'gateway-document-ready'), 'ready');
     const helperFile = path.join(directory, 'dashboard-attempt-1');
-    await waitFor(() => fs.existsSync(helperFile), () => 'Native handoff did not start\n' + output());
+    await waitFor(() => fs.existsSync(helperFile), () => 'Native handoff did not start\n' + output() + (fs.existsSync(diagnosticLog) ? '\n' + fs.readFileSync(diagnosticLog, 'utf8') : ''));
     const pid = Number(fs.readFileSync(helperFile));
     const helperIdentity = {pid, startedAt:startIdentity(pid)};
     assert.deepEqual(session(name).ui.children.command, helperIdentity);
