@@ -243,6 +243,8 @@ async function start(name, watching = true, withUi = false, defaults = false) {
     record.identities.push(uiIdentity, {pid:ui.descendantPid, startedAt:startIdentity(ui.descendantPid)});
     record.sourcePids.push(ui.pid, ui.descendantPid);
     assert.ok(!fs.existsSync(path.join(directory, 'dashboard-attempts')), 'Gateway document readiness was bypassed');
+    // Keep this regression on the canonical extended Windows source path.
+    assert.ok(output().includes("source=\\\\?\\"), "Windows fixture must retain its extended source path");
     fs.writeFileSync(path.join(directory, 'gateway-document-ready'), 'ready');
     const helperFile = path.join(directory, 'dashboard-attempt-1');
     await waitFor(() => fs.existsSync(helperFile), () => 'Native handoff did not start\n' + output() + (fs.existsSync(diagnosticLog) ? '\n' + fs.readFileSync(diagnosticLog, 'utf8') : ''));

@@ -226,8 +226,10 @@ impl DevUiTarget {
         source: &Path,
         env: &BTreeMap<String, String>,
     ) -> Command {
+        // The selected cwd already owns this entry. Hardened Node on Windows
+        // rejects an extended absolute main path while resolving its drive.
         let args = vec![
-            display_path(&source.join("openclaw.mjs")),
+            "./openclaw.mjs".to_string(),
             "dashboard".to_string(),
             "--json".to_string(),
         ];
