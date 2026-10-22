@@ -189,6 +189,10 @@ def flow(action, prefix):
         result = subprocess.run([str(a) for a in args], capture_output=True, text=True, timeout=timeout)
         if record:
             (evidence / (label + ".log")).write_text(scrub(result.stdout + result.stderr))
+        elif result.returncode:
+            # RPC success payloads may include private model configuration.
+            # Retain only sanitized stderr when the command itself fails.
+            (evidence / (label + "-failure.log")).write_text(scrub(result.stderr))
         row = {"step": label, "exit": result.returncode, "seconds": round(time.monotonic() - started, 3)}
         print(json.dumps(row), flush=True)
         if require and result.returncode:
