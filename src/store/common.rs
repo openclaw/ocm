@@ -14,12 +14,6 @@ use crate::infra::sqlite_snapshot::create_sqlite_snapshot;
 
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-};
 
 pub(crate) fn path_exists(path: &Path) -> bool {
     path.exists()
@@ -656,23 +650,10 @@ pub(super) fn replace_path(source: &Path, destination: &Path) -> Result<(), Stri
     replace_path_io(source, destination).map_err(|error| error.to_string())
 }
 
-#[cfg(not(windows))]
 fn replace_path_io(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // On Windows, std retries access-denied replacement with POSIX rename
+    // semantics so readers that share deletion can retain the old snapshot.
     fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn replace_path_io(source: &Path, destination: &Path) -> std::io::Result<()> {
-    let mut source_wide = source.as_os_str().encode_wide().collect::<Vec<_>>();
-    source_wide.push(0);
-    let mut destination_wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
-    destination_wide.push(0);
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
-    let moved = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), flags) };
-    if moved == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 pub(crate) fn load_json_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -756,6 +737,42 @@ mod tests {
         super::write_file_replacing_path_detailed(&destination, b"first").unwrap();
         write_file_replacing_path(&destination, b"second").unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"second");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_watch_replacement_preserves_an_open_reader() {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("session.json");
+        fs::write(&destination, b"before").unwrap();
+        let mut reader = fs::File::open(&destination).unwrap();
+        super::write_file_replacing_path_detailed(&destination, b"after").unwrap();
+        let mut original = Vec::new();
+        reader.read_to_end(&mut original).unwrap();
+        assert_eq!(original, b"before");
+        assert_eq!(fs::read(&destination).unwrap(), b"after");
+        drop(reader);
+
+        // A reader that refuses deletion must still block replacement.
+        let protected = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&destination)
+            .unwrap();
+        let error =
+            super::write_file_replacing_path_detailed(&destination, b"rejected").unwrap_err();
+        assert!(matches!(
+            error.operation,
+            Some(super::FileWriteOperation::Replace)
+        ));
+        assert!(error.os_error.is_some());
+        assert_eq!(fs::read(&destination).unwrap(), b"after");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        drop(protected);
     }
 
     #[cfg(unix)]

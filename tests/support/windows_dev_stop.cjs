@@ -416,15 +416,25 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     assert.ok(alive(abandoned.helperIdentity.pid), 'Requester exit killed the controller-owned helper');
     assert.deepEqual(session(normal.name).ui.children.command, abandoned.helperIdentity);
     assertOriginalOwner();
-    fs.rmSync(hold);
-    await waitFor(() => !alive(abandoned.helperIdentity.pid) && !session(normal.name).ui.children.command,
-      'Abandoned handoff helper did not complete under the original controller');
-    assert.equal(attempts(), 3, 'Abandoned requester caused a replacement helper');
-    assert.ok(!abandoned.output().includes('synthetic-owner-grant'), 'Abandoned requester received a grant');
-    assert.ok(!normal.output().includes('synthetic-owner-grant-3'), 'Abandoned grant reached the original terminal');
-    assertFreshGrant(run(reuseArgs), 4);
-    await waitFor(() => !session(normal.name).ui.children.command, 'Next handoff retained completed helper ownership');
-    assertOriginalOwner();
+    // Ordinary status readers must not prevent the controller from publishing
+    // helper completion or the next handoff's ownership. Keep the old snapshot
+    // open across both updates so replacement cannot depend on reader timing.
+    const sessionReader = fs.openSync(sessionPath(normal.name), 'r');
+    try {
+      fs.rmSync(hold);
+      await waitFor(() => {
+        assertOriginalOwner();
+        return !alive(abandoned.helperIdentity.pid) && !session(normal.name).ui.children.command;
+      }, 'Abandoned handoff helper did not complete under the original controller');
+      assert.equal(attempts(), 3, 'Abandoned requester caused a replacement helper');
+      assert.ok(!abandoned.output().includes('synthetic-owner-grant'), 'Abandoned requester received a grant');
+      assert.ok(!normal.output().includes('synthetic-owner-grant-3'), 'Abandoned grant reached the original terminal');
+      assertFreshGrant(run(reuseArgs), 4);
+      await waitFor(() => !session(normal.name).ui.children.command, 'Next handoff retained completed helper ownership');
+      assertOriginalOwner();
+    } finally {
+      fs.closeSync(sessionReader);
+    }
     assert.equal(JSON.parse(run(['dev','status',normal.name,'--json']).stdout).sourceWatch.state, 'active');
 
     // Keep a native helper active while named stop closes the original component
