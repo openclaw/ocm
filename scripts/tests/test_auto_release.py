@@ -135,8 +135,8 @@ class CIGateTests(unittest.TestCase):
                    "conclusion": "success", "html_url": "https://github.com/openclaw/ocm/actions/runs/42"}
         names = ("Format", "Rust 1.88 minimum", "Windows compile",
                  "Test (ubuntu-latest)", "Test (macos-latest)",
-                 "npm (ubuntu-latest, Node 22.15.0)", "npm (ubuntu-latest, Node 24)",
-                 "npm (xcode-27-x86_64, Node 24)", "npm (xcode-27-arm64, Node 24)")
+                 "npm (ubuntu-latest, Node 22.23.4)", "npm (ubuntu-latest, Node 24.22.1)",
+                 "npm (xcode-27-x86_64, Node 24.22.1)", "npm (xcode-27-arm64, Node 24.22.1)")
         self.jobs = {"total_count": len(names), "jobs": [
             {"name": name, "conclusion": "success"} for name in names]}
 

@@ -23,8 +23,8 @@ REPO = "openclaw/ocm"
 MARKER = "<!-- ocm-auto-release:v1 -->"
 JOBS = ("Format", "Rust 1.88 minimum", "Windows compile",
         "Test (ubuntu-latest)", "Test (macos-latest)",
-        "npm (ubuntu-latest, Node 22.15.0)", "npm (ubuntu-latest, Node 24)",
-        "npm (xcode-27-x86_64, Node 24)", "npm (xcode-27-arm64, Node 24)")
+        "npm (ubuntu-latest, Node 22.23.4)", "npm (ubuntu-latest, Node 24.22.1)",
+        "npm (xcode-27-x86_64, Node 24.22.1)", "npm (xcode-27-arm64, Node 24.22.1)")
 
 
 class ReleaseBoundaryTests(unittest.TestCase):
