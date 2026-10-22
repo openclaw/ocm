@@ -113,6 +113,52 @@ jobs:
           cargo test --locked --lib windows_source_watch_ -- --nocapture
           cargo test --locked --test windows_dev_stop_tests native_windows_dev_stop_lifecycle -- --exact --nocapture
 
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        with:
+          ref: 9ab0d1be3c8506eb445e3ca836eca055e44f1937
+          path: base
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        with:
+          node-version: '22.15.0'
+          package-manager-cache: false
+      - name: Record previous runtime
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        shell: pwsh
+        run: '"PAIR_OLD_NODE=$((Get-Command node).Source)" >> $env:GITHUB_ENV'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        with:
+          node-version: '22.23.4'
+          package-manager-cache: false
+      - name: Record patched runtime and runner resources
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        shell: pwsh
+        run: |
+          "PAIR_NEW_NODE=$((Get-Command node).Source)" >> $env:GITHUB_ENV
+          Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory,NumberOfLogicalProcessors | ConvertTo-Json
+          Get-PSDrive C | Select-Object Used,Free | ConvertTo-Json
+      - name: Compare pinned revisions and runtimes serially
+        timeout-minutes: 80
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        shell: pwsh
+        run: python candidate/scripts/validate-runtime-pair.py candidate base "$env:RUNNER_TEMP/runtime-regression-pair"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        with:
+          name: runtime-regression-pair
+          path: ${{ runner.temp }}/runtime-regression-pair
+          if-no-files-found: error
+          retention-days: 7
+
   test:
     # Keep required check names stable when runner labels change.
     name: Test (${{ matrix.name }})
