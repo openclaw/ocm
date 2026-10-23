@@ -14,11 +14,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub use execution::ExecutionSummary;
-pub(crate) use execution::source_watch_openclaw_program_args;
 pub use execution::{
     ExecutionBinding, GatewayProcessSpec, ResolvedExecution, resolve_execution_binding,
     resolve_gateway_process_spec, resolve_runtime_run_dir,
 };
+pub(crate) use execution::{resolve_config_read_context, source_watch_openclaw_program_args};
 pub use health::{
     EnvCleanupActionSummary, EnvCleanupBatchSummary, EnvCleanupSummary, EnvDoctorSummary,
 };

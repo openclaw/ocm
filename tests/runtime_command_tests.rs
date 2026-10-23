@@ -1539,6 +1539,182 @@ fn runtime_build_local_derives_source_plugins_from_target_env_before_pack() {
     );
 }
 
+#[test]
+fn runtime_build_local_reads_target_authorized_plugin_includes() {
+    let root = TestDir::new("runtime-target-include-policy");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        repo.join("package.json"),
+        br#"{"name":"openclaw","version":"2026.4.25","bin":{"openclaw":"openclaw.mjs"},"files":["openclaw.mjs","dist"]}"#,
+    ).unwrap();
+    fs::write(repo.join("openclaw.mjs"), "#!/usr/bin/env node\n").unwrap();
+    for base in ["extensions/codex", "dist/extensions/codex"] {
+        let dir = repo.join(base);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            br#"{"name":"@ocm-test/codex","version":"1.0.0","main":"index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("openclaw.plugin.json"),
+            br#"{"id":"codex","configSchema":{"type":"object"}}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("index.js"), "module.exports = {};\n").unwrap();
+    }
+    let mut env = ocm_env(&root);
+    env.insert("npm_config_offline".into(), "true".into());
+    env.insert(
+        "npm_config_cache".into(),
+        path_string(&root.child("npm-cache")),
+    );
+    env.insert("npm_config_audit".into(), "false".into());
+    env.insert("npm_config_fund".into(), "false".into());
+    let runtime = cwd.join("old-openclaw");
+    write_executable_script(&runtime, "#!/bin/sh\nexit 0\n");
+    for args in [
+        vec![
+            "runtime",
+            "add",
+            "fixture",
+            "--path",
+            runtime.to_str().unwrap(),
+        ],
+        vec!["env", "create", "primary", "--runtime", "fixture"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let env_root = root.child("ocm-home/envs/primary");
+    let state = env_root.join(".openclaw");
+    let shared = env_root.join("shared");
+    fs::create_dir_all(&shared).unwrap();
+    let policy = serde_json::json!({"plugins":{"allow":["codex"]}});
+    for path in [shared.join("policy.json"), state.join("policy.json")] {
+        fs::write(path, policy.to_string()).unwrap();
+    }
+    let launcher_dir = root.child("launcher");
+    fs::create_dir_all(launcher_dir.join("shared")).unwrap();
+    fs::write(launcher_dir.join("shared/policy.json"), policy.to_string()).unwrap();
+    let config_path = state.join("openclaw.json");
+    let cases = [
+        ("literal", policy.clone(), None, true),
+        (
+            "internal",
+            serde_json::json!({"$include":"policy.json"}),
+            None,
+            true,
+        ),
+        (
+            "shared",
+            serde_json::json!({"$include":shared.join("policy.json")}),
+            Some(path_string(&shared)),
+            true,
+        ),
+        (
+            "relative",
+            serde_json::json!({"$include":shared.join("policy.json")}),
+            Some("shared".into()),
+            true,
+        ),
+        (
+            "unauthorized",
+            serde_json::json!({"$include":shared.join("policy.json")}),
+            None,
+            false,
+        ),
+        (
+            "config-env",
+            serde_json::json!({"$include":shared.join("policy.json"),"env":{"OPENCLAW_INCLUDE_ROOTS":shared}}),
+            None,
+            false,
+        ),
+        (
+            "unrelated",
+            serde_json::json!({"plugins":{"allow":["codex"]},"models":{"$include":"absent-models.json"}}),
+            None,
+            true,
+        ),
+        (
+            "launcher-relative",
+            serde_json::json!({"$include":launcher_dir.join("shared/policy.json")}),
+            Some("shared".into()),
+            true,
+        ),
+    ];
+    for (name, config, roots, success) in cases {
+        if name == "launcher-relative" {
+            for args in [
+                vec![
+                    "launcher",
+                    "add",
+                    "custom",
+                    "--command",
+                    "node openclaw.mjs",
+                    "--cwd",
+                    launcher_dir.to_str().unwrap(),
+                ],
+                vec!["env", "set-runtime", "primary", "none"],
+                vec!["env", "set-launcher", "primary", "custom"],
+            ] {
+                let output = run_ocm(&cwd, &env, &args);
+                assert!(output.status.success(), "{}", stderr(&output));
+            }
+        }
+        env.remove("OPENCLAW_INCLUDE_ROOTS");
+        if let Some(roots) = roots {
+            env.insert("OPENCLAW_INCLUDE_ROOTS".into(), roots);
+        }
+        fs::write(&config_path, config.to_string()).unwrap();
+        if success {
+            let start = run_ocm(&cwd, &env, &["start", "primary", "--no-service", "--json"]);
+            assert!(start.status.success(), "{name}: {}", stderr(&start));
+        }
+        let before = fs::read(&config_path).unwrap();
+        let build = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "build-local",
+                name,
+                "--repo",
+                repo.to_str().unwrap(),
+                "--for-env",
+                "primary",
+                "--raw",
+            ],
+        );
+        assert_eq!(
+            build.status.success(),
+            success,
+            "{name}: {}",
+            stderr(&build)
+        );
+        assert_eq!(fs::read(&config_path).unwrap(), before, "{name}");
+        if success {
+            let installed = runtime_install_root(name, &env, &cwd)
+                .unwrap()
+                .join("files/node_modules/openclaw/dist/extensions/codex");
+            assert_eq!(
+                fs::read_to_string(installed.join("index.js")).unwrap(),
+                "module.exports = {};\n",
+                "{name}"
+            );
+        } else {
+            assert!(
+                stderr(&build).contains("outside the admitted configuration roots"),
+                "{}",
+                stderr(&build)
+            );
+            assert!(!runtime_meta_path(name, &env, &cwd).unwrap().exists());
+        }
+    }
+}
+
 fn target_plugin_build_fixture(
     root: &TestDir,
 ) -> (PathBuf, BTreeMap<String, String>, PathBuf, PathBuf) {

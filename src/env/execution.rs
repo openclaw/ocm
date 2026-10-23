@@ -89,6 +89,48 @@ pub fn resolve_execution_binding(
     ))
 }
 
+/// Read configuration with the environment and cwd used by ordinary target startup.
+/// This does not execute the binding or acquire authority from config.env.
+pub(crate) fn resolve_config_read_context(
+    meta: &EnvMeta,
+    process_env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<crate::store::OpenClawConfigReadContext, String> {
+    // A target can be built before it has a runtime binding. Its isolated root
+    // remains the default launch directory; do not require a runnable artifact.
+    if meta.default_runtime.is_none() && meta.default_launcher.is_none() && meta.dev.is_none() {
+        return crate::store::OpenClawConfigReadContext::for_launch(
+            &build_openclaw_env(meta, process_env),
+            Path::new(&meta.root),
+        );
+    }
+    let (env, cwd) = match crate::env::resolve_execution_binding(meta, None, None)? {
+        crate::env::ExecutionBinding::Dev => {
+            let source = meta
+                .dev
+                .as_ref()
+                .ok_or("dev binding is missing")?
+                .execution_source_root()?;
+            (
+                crate::infra::shell::build_openclaw_dev_source_env(meta, process_env, source),
+                source.to_path_buf(),
+            )
+        }
+        crate::env::ExecutionBinding::Runtime(_) => (
+            crate::infra::shell::build_openclaw_env(meta, process_env),
+            Path::new(&meta.root).to_path_buf(),
+        ),
+        crate::env::ExecutionBinding::Launcher(name) => {
+            let launcher = crate::store::get_launcher(&name, process_env, cwd)?;
+            (
+                crate::infra::shell::build_openclaw_env(meta, process_env),
+                crate::launcher::resolve_launcher_run_dir(&launcher, Path::new(&meta.root)),
+            )
+        }
+    };
+    crate::store::OpenClawConfigReadContext::for_launch(&env, &cwd)
+}
+
 pub fn resolve_runtime_run_dir(fallback_cwd: &Path) -> PathBuf {
     fallback_cwd.to_path_buf()
 }

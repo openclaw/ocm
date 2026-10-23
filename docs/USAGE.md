@@ -242,7 +242,7 @@ ocm runtime build-local primary-test \
   --force
 ```
 
-OCM reads the target environment's effective config before `npm pack`, validates
+OCM reads the target environment's effective plugin policy before `npm pack`, validates
 explicit plugin references against the checkout and installed-plugin records,
 including the native SQLite index, inline config and legacy JSON records,
 and follows transitive local plugin package dependencies. Policy IDs are trimmed
@@ -253,6 +253,13 @@ so older checkouts keep their legacy identity even if a canonical installed
 record exists. Installed legacy IDs remain recognized when their canonical
 replacement is unavailable. Authored config and declared manifest IDs remain
 unchanged; unknown enabled references still fail validation.
+
+Policy reads honor `OPENCLAW_INCLUDE_ROOTS` explicitly supplied to OCM, using
+that target's startup environment and working directory (including launcher or
+dev source directories for relative roots). They do not infer roots from launcher
+shell commands or `config.env`, read unrelated configuration branches, or copy
+shared fragments. Clone, import, and export retain their existing containment
+rules.
 
 Installed external plugins satisfy that validation without being bundled into
 the new runtime; installed records do not select additional plugins. Disabled

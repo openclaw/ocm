@@ -41,7 +41,7 @@ use super::layout::{
 };
 use super::now_utc;
 use super::openclaw_state::installed_plugin_index_ids;
-use super::openclaw_workspaces::load_effective_openclaw_config;
+use super::openclaw_workspaces::read_openclaw_config_field;
 
 const OPENCLAW_OCM_RUNTIME_BUILD_PROFILE_ENV: &str = "OPENCLAW_OCM_RUNTIME_BUILD_PROFILE";
 const OPENCLAW_OCM_SOURCE_PERFORMANCE_BUILD_PROFILE: &str = "sourcePerformance";
@@ -812,9 +812,12 @@ fn resolve_target_source_plugin_closure(
     let target_env = validate_name(target_env, "Environment name")?;
     let target = get_environment(&target_env, context.env, context.cwd)?;
     let paths = derive_env_paths(Path::new(&target.root));
-    let config = load_effective_openclaw_config(&paths.config_path)?
-        .map(|resolved| resolved.value)
+    let read_context = crate::env::resolve_config_read_context(&target, context.env, context.cwd)?;
+    let plugins = read_openclaw_config_field(&paths.config_path, &["plugins"], &read_context)
+        .value
+        .map_err(|error| error.to_string())?
         .unwrap_or_else(|| serde_json::json!({}));
+    let config = serde_json::json!({ "plugins": plugins });
     if config
         .pointer("/plugins/enabled")
         .and_then(serde_json::Value::as_bool)

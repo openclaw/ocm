@@ -9,8 +9,8 @@ use crate::launcher::AddLauncherOptions;
 use crate::migrate::inspect_migration_source;
 use crate::service::service_backend_support_error;
 use crate::store::{
-    MinimumLocalConfig, OpenClawConfigReadContext, derive_env_paths, display_path,
-    prepare_minimum_local_openclaw_config, resolve_absolute_path, validate_name,
+    MinimumLocalConfig, derive_env_paths, display_path, prepare_minimum_local_openclaw_config,
+    resolve_absolute_path, validate_name,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -409,31 +409,7 @@ impl Cli {
         meta: &EnvMeta,
         port: u32,
     ) -> Result<MinimumLocalConfig, String> {
-        let (env, cwd) = match crate::env::resolve_execution_binding(meta, None, None)? {
-            crate::env::ExecutionBinding::Dev => {
-                let source = meta
-                    .dev
-                    .as_ref()
-                    .ok_or("dev binding is missing")?
-                    .execution_source_root()?;
-                (
-                    crate::infra::shell::build_openclaw_dev_source_env(meta, &self.env, source),
-                    source.to_path_buf(),
-                )
-            }
-            crate::env::ExecutionBinding::Runtime(_) => (
-                crate::infra::shell::build_openclaw_env(meta, &self.env),
-                Path::new(&meta.root).to_path_buf(),
-            ),
-            crate::env::ExecutionBinding::Launcher(name) => {
-                let launcher = crate::store::get_launcher(&name, &self.env, &self.cwd)?;
-                (
-                    crate::infra::shell::build_openclaw_env(meta, &self.env),
-                    crate::launcher::resolve_launcher_run_dir(&launcher, Path::new(&meta.root)),
-                )
-            }
-        };
-        let context = OpenClawConfigReadContext::for_launch(&env, &cwd)?;
+        let context = crate::env::resolve_config_read_context(meta, &self.env, &self.cwd)?;
         prepare_minimum_local_openclaw_config(
             &derive_env_paths(Path::new(&meta.root)),
             port,
