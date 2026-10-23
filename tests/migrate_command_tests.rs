@@ -2098,6 +2098,199 @@ fn adopt_import_relocates_managed_plugin_install_records_into_the_imported_state
 
 #[cfg(unix)]
 #[test]
+fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
+    for adopt in [false, true] {
+        for folded in [false, true] {
+            for case in [
+                "physical",
+                "canonical-record",
+                "alias-record",
+                "internal-link",
+                "mixed-record",
+                "mixed-link",
+                "target-record",
+                "target-link",
+                "config-alias",
+                "config-include",
+                "config-shared",
+                "external",
+                "escape",
+            ] {
+                let root = TestDir::new("migrate-plugin-home-alias");
+                let env = ocm_env(&root);
+                let source = root.child("source/.openclaw");
+                seed_plain_openclaw_home(&source);
+                let source = fs::canonicalize(source).unwrap();
+                let alias = root.child("alias");
+                std::os::unix::fs::symlink(source.parent().unwrap(), &alias).unwrap();
+                let alias = alias.join(".openclaw");
+                let plugin = source.join("extensions/demo");
+                fs::create_dir_all(&plugin).unwrap();
+                fs::write(plugin.join("index.js"), "plugin payload\n").unwrap();
+                let external = root.child("external");
+                fs::create_dir_all(&external).unwrap();
+                fs::write(external.join("index.js"), "external payload\n").unwrap();
+                // Keep the escape outside generated plugin directories so copying
+                // reaches plugin-record admission instead of a traversal guard.
+                std::os::unix::fs::symlink(&external, source.join("escape")).unwrap();
+                std::os::unix::fs::symlink(&plugin, source.join("linked-plugin")).unwrap();
+                let recorded = match case {
+                    "alias-record" => alias.join("extensions/demo"),
+                    "external" => external.clone(),
+                    "escape" => source.join("escape"),
+                    "internal-link" | "mixed-link" | "config-alias" | "config-include"
+                    | "config-shared" => source.join("linked-plugin"),
+                    "target-record" => root.child("ocm-home/envs/copied/.openclaw/extensions/demo"),
+                    "target-link" => root.child("ocm-home/envs/copied/.openclaw/linked-plugin"),
+                    _ => plugin.clone(),
+                };
+                let source_recorded = match case {
+                    "mixed-record" => alias.join("extensions/demo"),
+                    "mixed-link" => alias.join("linked-plugin"),
+                    _ => recorded.clone(),
+                };
+                let config_path = source.join("openclaw.json");
+                let mut config: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+                let configured = if case.starts_with("config-") {
+                    alias.join("linked-plugin")
+                } else {
+                    source_recorded.clone()
+                };
+                config["plugins"] = serde_json::json!({"load": {"paths": [&configured]}});
+                if matches!(case, "config-include" | "config-shared") {
+                    config["plugins"] = serde_json::json!({"$include": "./plugins.json"});
+                    fs::write(
+                        source.join("plugins.json"),
+                        r#"{"load":{"$include":"./load.json"}}"#,
+                    )
+                    .unwrap();
+                    fs::write(
+                        source.join("load.json"),
+                        serde_json::json!({"paths": [&configured]}).to_string(),
+                    )
+                    .unwrap();
+                    if case == "config-shared" {
+                        config["unrelated"] = serde_json::json!({"$include": "./load.json"});
+                    }
+                }
+                fs::write(&config_path, config.to_string()).unwrap();
+                let records = serde_json::json!({"demo": {
+                    "source": "path", "installPath": &recorded, "sourcePath": &source_recorded
+                }});
+                if !folded {
+                    seed_installed_plugin_index(&source, records.clone());
+                }
+                fs::create_dir_all(source.join("state")).unwrap();
+                let database = Connection::open(source.join("state/openclaw.sqlite")).unwrap();
+                if folded {
+                    database.execute_batch(
+                        "CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL) STRICT;"
+                    ).unwrap();
+                    database.execute(
+                        "INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?1, 42)",
+                        [serde_json::json!({"revision": 42, "index": {"installRecords": records}}).to_string()],
+                    ).unwrap();
+                }
+                database.execute_batch(
+                    "CREATE TABLE durable_fixture (value TEXT); INSERT INTO durable_fixture VALUES ('retained setting');"
+                ).unwrap();
+                drop(database);
+                let before = migration_source_inventory(&source);
+                let external_before = migration_source_inventory(&external);
+                let selected = if case == "physical" { &source } else { &alias };
+                let args = if adopt {
+                    vec![
+                        "adopt",
+                        "import",
+                        "--name",
+                        "copied",
+                        selected.to_str().unwrap(),
+                    ]
+                } else {
+                    vec!["migrate", "copied", selected.to_str().unwrap()]
+                };
+                let output = run_ocm(root.path(), &env, &args);
+                assert_eq!(migration_source_inventory(&source), before);
+                assert_eq!(migration_source_inventory(&external), external_before);
+                let target = root.child("ocm-home/envs/copied/.openclaw");
+                if matches!(
+                    case,
+                    "external" | "escape" | "target-link" | "config-shared"
+                ) {
+                    assert!(!output.status.success(), "{case}: {}", stdout(&output));
+                    assert!(
+                        stderr(&output).contains(if case == "config-shared" {
+                            "cannot safely rewrite plugin load paths"
+                        } else {
+                            "plugin path(s) could not be isolated"
+                        }),
+                        "{case}: {}",
+                        stderr(&output)
+                    );
+                    assert!(!target.parent().unwrap().exists());
+                    let listing = run_ocm(root.path(), &env, &["env", "list", "--json"]);
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&stdout(&listing)).unwrap(),
+                        serde_json::json!([])
+                    );
+                    continue;
+                }
+                assert!(output.status.success(), "{case}: {}", stderr(&output));
+                assert_eq!(
+                    fs::read(target.join("extensions/demo/index.js")).unwrap(),
+                    b"plugin payload\n"
+                );
+                let copied = Connection::open(target.join("state/openclaw.sqlite")).unwrap();
+                let durable: String = copied
+                    .query_row("SELECT value FROM durable_fixture", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(durable, "retained setting");
+                let rewritten = if folded {
+                    let raw: String = copied.query_row(
+                        "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'", [], |row| row.get(0)
+                    ).unwrap();
+                    let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    assert_eq!(doc["revision"], 42);
+                    doc["index"]["installRecords"].clone()
+                } else {
+                    read_imported_plugin_install_records(&root, "copied")
+                };
+                for field in ["installPath", "sourcePath"] {
+                    assert_eq!(
+                        rewritten["demo"][field],
+                        target.join("extensions/demo").to_str().unwrap()
+                    );
+                    assert_eq!(
+                        fs::canonicalize(rewritten["demo"][field].as_str().unwrap()).unwrap(),
+                        fs::canonicalize(target.join("extensions/demo")).unwrap()
+                    );
+                }
+                let config: serde_json::Value = serde_json::from_str(
+                    &fs::read_to_string(target.join("openclaw.json")).unwrap(),
+                )
+                .unwrap();
+                let loaded = if case == "config-include" {
+                    let included: serde_json::Value = serde_json::from_str(
+                        &fs::read_to_string(target.join("load.json")).unwrap(),
+                    )
+                    .unwrap();
+                    included["paths"][0].clone()
+                } else {
+                    config["plugins"]["load"]["paths"][0].clone()
+                };
+                assert_eq!(loaded, target.join("extensions/demo").to_str().unwrap());
+                assert_eq!(
+                    fs::canonicalize(loaded.as_str().unwrap()).unwrap(),
+                    fs::canonicalize(target.join("extensions/demo")).unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn adopt_import_rejects_a_symlinked_plugin_database_without_mutating_its_target() {
     let root = TestDir::new("adopt-import-symlinked-plugin-database");
     let cwd = root.child("workspace");
@@ -2193,26 +2386,16 @@ fn adopt_import_checks_copied_plugin_links_before_preserving_provenance() {
             ],
         );
         let target = root.child("ocm-home/envs/mira");
-        if absolute {
-            assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
-            assert!(
-                stderr(&output).contains("could not be isolated"),
-                "{}",
-                stderr(&output)
-            );
-            assert!(!target.exists());
-        } else {
-            assert!(output.status.success(), "{}", stderr(&output));
-            let records = read_imported_plugin_install_records(&root, "mira");
-            let copied = std::path::Path::new(records["demo"]["installPath"].as_str().unwrap());
-            assert!(
-                fs::canonicalize(copied)
-                    .unwrap()
-                    .starts_with(fs::canonicalize(&target).unwrap())
-            );
-            assert_eq!(records["demo"]["sourcePath"], project.to_str().unwrap());
-            fs::write(copied.join("marker.txt"), "target update").unwrap();
-        }
+        assert!(output.status.success(), "{}", stderr(&output));
+        let records = read_imported_plugin_install_records(&root, "mira");
+        let copied = std::path::Path::new(records["demo"]["installPath"].as_str().unwrap());
+        assert!(
+            fs::canonicalize(copied)
+                .unwrap()
+                .starts_with(fs::canonicalize(&target).unwrap())
+        );
+        assert_eq!(records["demo"]["sourcePath"], project.to_str().unwrap());
+        fs::write(copied.join("marker.txt"), "target update").unwrap();
         assert_eq!(fs::read(&database).unwrap(), before);
         assert_eq!(fs::read_link(&installed).unwrap(), link_target);
         assert_eq!(
@@ -3931,43 +4114,52 @@ fn migration_preserves_saved_skill_revisions() {
 fn migration_rejects_only_mutating_saved_skill_includes() {
     for adopt in [false, true] {
         for needs_rewrite in [false, true] {
-            let root = TestDir::new("migrate-skill-include");
-            let source = root.child("plain-home/.openclaw");
-            let library = skill_library::SkillLibrary::seed(&source);
-            library.configure_include(&source, &library.config_include(&source, needs_rewrite));
-            let mut env = ocm_env(&root);
-            install_fake_openclaw_on_path(&root, &mut env);
-            let args = if adopt {
-                vec![
-                    "adopt",
-                    "import",
-                    "--name",
-                    "target",
-                    source.to_str().unwrap(),
-                    "--json",
-                ]
-            } else {
-                vec!["migrate", "target", source.to_str().unwrap(), "--json"]
-            };
-            let imported = run_ocm(root.path(), &env, &args);
-            assert_eq!(
-                imported.status.success(),
-                !needs_rewrite,
-                "{}",
-                stderr(&imported)
-            );
-            let target = root.child("ocm-home/envs/target/.openclaw");
-            if needs_rewrite {
-                assert!(
-                    stderr(&imported).contains("integrity-protected history"),
+            for plugin_load in [false, true] {
+                let root = TestDir::new("migrate-skill-include");
+                let source = root.child("plain-home/.openclaw");
+                let library = skill_library::SkillLibrary::seed(&source);
+                library.configure_include(&source, &library.config_include(&source, needs_rewrite));
+                if plugin_load {
+                    let config_path = source.join("openclaw.json");
+                    let mut config: serde_json::Value =
+                        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+                    config["plugins"] = serde_json::json!({"load": {"$include": library.config_include(&source, needs_rewrite)}});
+                    fs::write(config_path, config.to_string()).unwrap();
+                }
+                let mut env = ocm_env(&root);
+                install_fake_openclaw_on_path(&root, &mut env);
+                let args = if adopt {
+                    vec![
+                        "adopt",
+                        "import",
+                        "--name",
+                        "target",
+                        source.to_str().unwrap(),
+                        "--json",
+                    ]
+                } else {
+                    vec!["migrate", "target", source.to_str().unwrap(), "--json"]
+                };
+                let imported = run_ocm(root.path(), &env, &args);
+                assert_eq!(
+                    imported.status.success(),
+                    !needs_rewrite,
                     "{}",
                     stderr(&imported)
                 );
-                assert!(!target.parent().unwrap().exists());
-            } else {
-                library.assert_preserved(&target);
+                let target = root.child("ocm-home/envs/target/.openclaw");
+                if needs_rewrite {
+                    assert!(
+                        stderr(&imported).contains("integrity-protected history"),
+                        "{}",
+                        stderr(&imported)
+                    );
+                    assert!(!target.parent().unwrap().exists());
+                } else {
+                    library.assert_preserved(&target);
+                }
+                library.assert_preserved(&source);
             }
-            library.assert_preserved(&source);
         }
     }
 }

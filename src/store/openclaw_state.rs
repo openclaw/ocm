@@ -287,7 +287,9 @@ pub(crate) fn prepare_migrated_runtime_state(
         &paths.state_dir.join("state/openclaw.sqlite"),
         source_state_root,
         &paths.state_dir,
-        PluginPathRelocation::Imported,
+        PluginPathRelocation::Imported {
+            canonical_source: canonical_source_state_root,
+        },
     )?;
     changed |= plugin_paths.changed;
     let mut databases = BTreeMap::new();
@@ -2240,7 +2242,9 @@ fn is_legacy_audit_generation(suffix: &str) -> bool {
 
 #[derive(Clone, Copy)]
 enum PluginPathRelocation<'a> {
-    Imported,
+    Imported {
+        canonical_source: &'a Path,
+    },
     Cloned {
         source: &'a EnvPaths,
         target: &'a EnvPaths,
@@ -2361,7 +2365,7 @@ fn relocate_installed_plugin_index_paths(
     relocation: PluginPathRelocation<'_>,
 ) -> Result<MigratedRuntimeStateResult, String> {
     let database_root = match relocation {
-        PluginPathRelocation::Imported => target_state_root,
+        PluginPathRelocation::Imported { .. } => target_state_root,
         PluginPathRelocation::Cloned { target, .. } => &target.root,
     };
     let Some(database_path) =
@@ -2453,12 +2457,26 @@ fn rewrite_plugin_install_records(
                 continue;
             };
             let path = Path::new(path);
-            let Some(relative) = relocatable_plugin_path(path, source_state_root, !is_path_plugin)
-            else {
-                // Native discovery prefers installPath. Once that payload is
-                // isolated, an external sourcePath is project/archive provenance.
+            let relative = relocatable_plugin_path(path, source_state_root, !is_path_plugin)
+                .or_else(|| match relocation {
+                    PluginPathRelocation::Imported { canonical_source } => {
+                        relocatable_plugin_path(path, canonical_source, !is_path_plugin)
+                    }
+                    PluginPathRelocation::Cloned { .. } => None,
+                });
+            // Map the physical payload for either admitted root. Absolute links
+            // are copied verbatim and would otherwise still select the source.
+            let relative = relative.and_then(|relative| {
+                existing_plugin_relative(&source_state_root.join(relative), source_state_root)
+            });
+            let Some(relative) = relative.filter(|relative| {
+                contained_plugin_path(&target_state_root.join(relative), target_state_root)
+            }) else {
+                // Native discovery prefers the proved installed payload.
+                // External sourcePath values then record provenance.
                 has_external_path |= path.is_absolute()
-                    && !path.starts_with(target_state_root)
+                    && !(path.starts_with(target_state_root)
+                        && contained_plugin_path(path, target_state_root))
                     && !(field == "sourcePath" && has_owned_install);
                 continue;
             };
