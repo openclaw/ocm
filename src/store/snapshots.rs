@@ -1232,7 +1232,7 @@ pub fn remove_env_snapshot(
             "linked upgrade recovery cleanup failed after snapshot removal: {error}"
         ));
     }
-    if let Err(error) = fs::remove_dir_all(&staging_dir) {
+    if let Err(error) = remove_tree_if_present(&staging_dir) {
         warnings.push(format!(
             "staged snapshot artifact cleanup failed at {}: {error}",
             display_path(&staging_dir)

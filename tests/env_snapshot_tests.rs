@@ -3523,6 +3523,99 @@ fn env_snapshot_remove_json_reports_removed_snapshot_metadata() {
     assert!(output.contains("\"archivePath\":"));
 }
 
+#[cfg(unix)]
+#[test]
+fn env_snapshot_removal_reclaims_readonly_trees_without_changing_sources() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for prune in [false, true] {
+        for mode in [0o555, 0o755] {
+            let root = TestDir::new("env-snapshot-remove-permissions");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let env = ocm_env(&root);
+            let run = |args: &[&str]| {
+                let output = run_ocm(&cwd, &env, args);
+                assert!(output.status.success(), "{}", stderr(&output));
+                output
+            };
+            run(&["env", "create", "source"]);
+            let source = root.child("ocm-home/envs/source/durable");
+            let external = root.child("external");
+            for path in [&source, &external] {
+                write_text(&path.join("payload"), "preserved bytes\n");
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            symlink(&external, root.child("ocm-home/envs/source/borrowed")).unwrap();
+            let snapshot = run(&["env", "snapshot", "create", "source", "--json"]);
+            let captured: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+            let artifact = Path::new(captured["archivePath"].as_str().unwrap());
+            let captured_source = artifact.join("durable");
+            assert_eq!(
+                fs::metadata(&captured_source).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert!(
+                fs::symlink_metadata(artifact.join("borrowed"))
+                    .unwrap()
+                    .is_symlink()
+            );
+
+            // A second checkpoint must survive either removal route, including its modes.
+            let snapshot = run(&["env", "snapshot", "create", "source", "--json"]);
+            let keeper: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+            let removed = if prune {
+                run(&[
+                    "env", "snapshot", "prune", "source", "--keep", "1", "--yes", "--json",
+                ])
+            } else {
+                run(&[
+                    "env",
+                    "snapshot",
+                    "remove",
+                    "source",
+                    captured["id"].as_str().unwrap(),
+                    "--json",
+                ])
+            };
+            assert!(
+                !stdout(&removed).contains("cleanup failed"),
+                "{}",
+                stdout(&removed)
+            );
+            assert!(!artifact.exists());
+            let snapshot_dir = root.child("ocm-home/snapshots/source");
+            assert!(fs::read_dir(&snapshot_dir).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".remove-")
+            }));
+            let list = run(&["env", "snapshot", "list", "source", "--json"]);
+            let listed: Value = serde_json::from_str(&stdout(&list)).unwrap();
+            assert_eq!(listed.as_array().unwrap().len(), 1);
+            assert_eq!(listed[0]["id"], keeper["id"]);
+            let kept_source = Path::new(keeper["archivePath"].as_str().unwrap()).join("durable");
+            for path in [&source, &external, &kept_source] {
+                assert_eq!(
+                    fs::read_to_string(path.join("payload")).unwrap(),
+                    "preserved bytes\n"
+                );
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+            }
+
+            // Restore only fixture permissions after all preservation assertions.
+            for path in [&source, &external, &kept_source] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+    }
+}
+
 #[test]
 fn env_snapshot_remove_reports_cleanup_warnings_after_logical_removal() {
     let root = TestDir::new("env-snapshot-remove-warning");
