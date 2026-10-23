@@ -63,7 +63,10 @@ left to OpenClaw and are not validated by this setup step.
 To use a shared include directory, supply `OPENCLAW_INCLUDE_ROOTS` to OCM; its
 platform-separated directory list is admitted to both minimum setup and the
 launched OpenClaw process. Relative entries use the configured Gateway working
-directory, and `~` uses the environment's OpenClaw home. Config `env` cannot
+directory, and `~` uses the environment's OpenClaw home. Foreground `dev` uses
+its recorded source checkout for relative roots, even when the environment
+retains a runtime or launcher default. Ordinary `start` and `dev --service`
+continue to use the selected default binding's working directory. Config `env` cannot
 authorize additional roots. If a required minimum setting depends on an include
 outside those roots, setup stops before writing configuration or launching a
 Gateway. Expose the root authorization to OCM or author that setting in an

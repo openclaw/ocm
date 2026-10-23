@@ -18,7 +18,10 @@ pub use execution::{
     ExecutionBinding, GatewayProcessSpec, ResolvedExecution, resolve_execution_binding,
     resolve_gateway_process_spec, resolve_runtime_run_dir,
 };
-pub(crate) use execution::{resolve_config_read_context, source_watch_openclaw_program_args};
+pub(crate) use execution::{
+    config_read_context_for_binding, resolve_config_read_context,
+    source_watch_openclaw_program_args,
+};
 pub use health::{
     EnvCleanupActionSummary, EnvCleanupBatchSummary, EnvCleanupSummary, EnvDoctorSummary,
 };

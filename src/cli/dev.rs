@@ -755,7 +755,13 @@ impl Cli {
                 )))?;
                 crate::store::dev_ui_gateway_url(&base, prepared.gateway_port.unwrap_or_default())?;
             }
-            self.bootstrap_dev_env(&prepared)?;
+            let binding = if service_requested {
+                crate::env::resolve_execution_binding(&prepared, None, None)?
+            } else {
+                // Foreground dev runs its source even when another default is retained.
+                crate::env::ExecutionBinding::Dev
+            };
+            self.bootstrap_dev_env(&prepared, binding)?;
             Ok::<_, String>(prepared)
         })();
         let meta = match prepared {
@@ -1661,12 +1667,22 @@ impl Cli {
         })
     }
 
-    fn bootstrap_dev_env(&self, meta: &EnvMeta) -> Result<(), String> {
+    fn bootstrap_dev_env(
+        &self,
+        meta: &EnvMeta,
+        binding: crate::env::ExecutionBinding,
+    ) -> Result<(), String> {
         let (gateway_port, _) = self
             .environment_service()
             .resolve_effective_gateway_port(meta)?;
-        self.prepare_minimum_local_config(meta, gateway_port)?
-            .apply()
+        let context =
+            crate::env::config_read_context_for_binding(meta, &self.env, &self.cwd, binding)?;
+        crate::store::prepare_minimum_local_openclaw_config(
+            &derive_env_paths(Path::new(&meta.root)),
+            gateway_port,
+            &context,
+        )?
+        .apply()
     }
 
     fn prepare_dev_run(

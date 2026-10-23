@@ -104,7 +104,18 @@ pub(crate) fn resolve_config_read_context(
             Path::new(&meta.root),
         );
     }
-    let (env, cwd) = match crate::env::resolve_execution_binding(meta, None, None)? {
+    let binding = resolve_execution_binding(meta, None, None)?;
+    config_read_context_for_binding(meta, process_env, cwd, binding)
+}
+
+/// Read configuration in an explicitly selected binding's launch context.
+pub(crate) fn config_read_context_for_binding(
+    meta: &EnvMeta,
+    process_env: &BTreeMap<String, String>,
+    cwd: &Path,
+    binding: ExecutionBinding,
+) -> Result<crate::store::OpenClawConfigReadContext, String> {
+    let (env, cwd) = match binding {
         crate::env::ExecutionBinding::Dev => {
             let source = meta
                 .dev

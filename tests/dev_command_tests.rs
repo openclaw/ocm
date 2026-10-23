@@ -2666,6 +2666,122 @@ fn dev_rejects_conflicting_modes_before_creating_environment_state() {
 }
 
 #[test]
+fn foreground_dev_minimum_setup_uses_source_context_with_retained_defaults() {
+    for kind in ["runtime", "launcher"] {
+        let root = TestDir::new(&format!("dev-source-config-{kind}"));
+        let repo = init_openclaw_repo(&root);
+        let source = fs::canonicalize(&repo).unwrap();
+        let cwd = root.child("caller");
+        let other = root.child("launcher-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let mut env = service_env(&root);
+        install_fake_dev_runners(&root, &mut env);
+        let first = run_ocm(
+            &cwd,
+            &env,
+            &dev_plain(&["demo", "--repo", &path_string(&source)]),
+        );
+        assert!(first.status.success(), "{}", stderr(&first));
+        let meta = get_environment("demo", &env, &cwd).unwrap();
+        let config = Path::new(&meta.root).join(".openclaw/openclaw.json");
+        let contents = fs::read(&config).unwrap();
+        let shared = source.join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let include = shared.join("config.json");
+        fs::write(&include, &contents).unwrap();
+        let authored = serde_json::json!({"$include": path_string(&include), "gateway": {"port": meta.gateway_port}}).to_string();
+        fs::write(&config, &authored).unwrap();
+        let runner = path_string(&root.child("fake-dev-bin/pnpm"));
+        let add_args = if kind == "runtime" {
+            vec!["runtime", "add", "secondary", "--path", &runner]
+        } else {
+            vec![
+                "launcher",
+                "add",
+                "secondary",
+                "--command",
+                &runner,
+                "--cwd",
+            ]
+        };
+        let other_arg = path_string(&other);
+        let mut add_args = add_args;
+        if kind == "launcher" {
+            add_args.push(&other_arg);
+        }
+        let add = run_ocm(&cwd, &env, &add_args);
+        assert!(add.status.success(), "{}", stderr(&add));
+        let bound = run_ocm(
+            &cwd,
+            &env,
+            &["env", &format!("set-{kind}"), "demo", "secondary"],
+        );
+        assert!(bound.status.success(), "{}", stderr(&bound));
+        let binding = get_environment("demo", &env, &cwd).unwrap();
+
+        // The source command must ignore the saved default for config admission.
+        for roots in ["shared".to_string(), path_string(&shared)] {
+            env.insert("OPENCLAW_INCLUDE_ROOTS".into(), roots);
+            fs::remove_file(root.child("node.log")).unwrap();
+            let resumed = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
+            assert!(resumed.status.success(), "{}", stderr(&resumed));
+            let log = fs::read_to_string(root.child("node.log")).unwrap();
+            assert!(log.contains("scripts/run-node.mjs gateway run --port"));
+            assert!(
+                log.lines()
+                    .all(|line| line.starts_with(&format!("{}|", path_string(&source))))
+            );
+            assert_eq!(fs::read_to_string(&config).unwrap(), authored);
+            assert_eq!(fs::read(&include).unwrap(), contents);
+            let after = get_environment("demo", &env, &cwd).unwrap();
+            assert_eq!(after.dev, binding.dev);
+            assert_eq!(after.default_runtime, binding.default_runtime);
+            assert_eq!(after.default_launcher, binding.default_launcher);
+        }
+        env.remove("OPENCLAW_INCLUDE_ROOTS");
+        let denied = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
+        assert!(!denied.status.success());
+        assert!(stderr(&denied).contains("outside the admitted configuration roots"));
+        assert_eq!(fs::read_to_string(&config).unwrap(), authored);
+
+        // Ordinary start and service preparation must still use the saved default.
+        env.insert("OPENCLAW_INCLUDE_ROOTS".into(), "shared".into());
+        for args in [
+            vec!["start", "demo", "--no-service"],
+            vec!["dev", "demo", "--service"],
+        ] {
+            let denied = run_ocm(&cwd, &env, &args);
+            assert!(!denied.status.success(), "{}", stdout(&denied));
+            assert!(
+                stderr(&denied).contains("outside the admitted configuration roots"),
+                "{}",
+                stderr(&denied)
+            );
+            assert_eq!(fs::read_to_string(&config).unwrap(), authored);
+        }
+        let default_cwd = if kind == "runtime" {
+            Path::new(&meta.root)
+        } else {
+            &other
+        };
+        let default_shared = default_cwd.join("shared");
+        fs::create_dir_all(&default_shared).unwrap();
+        let default_include = default_shared.join("config.json");
+        fs::write(&default_include, &contents).unwrap();
+        let default_authored =
+            serde_json::json!({"$include": path_string(&default_include), "gateway": {"port": meta.gateway_port}}).to_string();
+        fs::write(&config, &default_authored).unwrap();
+        let started = run_ocm(&cwd, &env, &["start", "demo", "--no-service"]);
+        assert!(started.status.success(), "{}", stderr(&started));
+        assert_eq!(fs::read_to_string(&config).unwrap(), default_authored);
+        let denied = run_ocm(&cwd, &env, &dev_plain(&["demo"]));
+        assert!(!denied.status.success());
+        assert!(stderr(&denied).contains("outside the admitted configuration roots"));
+    }
+}
+
+#[test]
 fn dev_command_borrows_checkout_bootstraps_config_and_runs_gateway() {
     let root = TestDir::new("dev-command-run");
     let repo = init_openclaw_repo(&root);
