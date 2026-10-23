@@ -408,53 +408,7 @@ fn is_local_ipv4(host: Ipv4Addr) -> Result<bool, String> {
     }
 }
 
-#[cfg(windows)]
-fn is_local_ipv4(host: Ipv4Addr) -> Result<bool, String> {
-    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetIpAddrTable, MIB_IPADDRROW_XP, MIB_IPADDRTABLE,
-    };
-    let mut bytes = 0;
-    // SAFETY: the first call obtains the size. u32 storage provides the table's
-    // alignment; the bounded retry handles an interface change between calls.
-    unsafe {
-        if GetIpAddrTable(std::ptr::null_mut(), &mut bytes, 0) != ERROR_INSUFFICIENT_BUFFER {
-            return Err("Cannot inspect local Gateway interface addresses".to_string());
-        }
-        for _ in 0..3 {
-            if bytes as usize > 1024 * 1024
-                || (bytes as usize) < std::mem::size_of::<MIB_IPADDRTABLE>()
-            {
-                return Err("Invalid local Gateway interface address table size".to_string());
-            }
-            let mut storage = vec![0u32; (bytes as usize).div_ceil(4)];
-            let table = storage.as_mut_ptr().cast::<MIB_IPADDRTABLE>();
-            match GetIpAddrTable(table, &mut bytes, 0) {
-                ERROR_INSUFFICIENT_BUFFER => continue,
-                NO_ERROR => {
-                    let count = (*table).dwNumEntries as usize;
-                    let offset = std::mem::offset_of!(MIB_IPADDRTABLE, table);
-                    if count
-                        > (storage.len() * 4 - offset) / std::mem::size_of::<MIB_IPADDRROW_XP>()
-                    {
-                        return Err("Invalid local Gateway interface address table".to_string());
-                    }
-                    let rows = std::slice::from_raw_parts(
-                        std::ptr::addr_of!((*table).table).cast::<MIB_IPADDRROW_XP>(),
-                        count,
-                    );
-                    return Ok(rows
-                        .iter()
-                        .any(|row| Ipv4Addr::from(row.dwAddr.to_ne_bytes()) == host));
-                }
-                _ => break,
-            }
-        }
-    }
-    Err("Cannot inspect local Gateway interface addresses".to_string())
-}
-
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn is_local_ipv4(_host: Ipv4Addr) -> Result<bool, String> {
     Err("Local Gateway interface inspection is unavailable on this platform".to_string())
 }
