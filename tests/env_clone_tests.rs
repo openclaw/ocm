@@ -4020,3 +4020,36 @@ fn env_clone_preserves_saved_skill_revisions() {
         stdout(&doctor)
     );
 }
+
+#[test]
+fn env_clone_rejects_only_mutating_saved_skill_includes() {
+    for needs_rewrite in [false, true] {
+        let root = TestDir::new("clone-skill-include");
+        let env = ocm_env(&root);
+        let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let source = root.child("ocm-home/envs/source/.openclaw");
+        let library = skill_library::SkillLibrary::seed(&source);
+        let include = library.config_include(&source, needs_rewrite);
+        library.configure_include(&source, &include);
+        let copied = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+        assert_eq!(
+            copied.status.success(),
+            !needs_rewrite,
+            "{}",
+            stderr(&copied)
+        );
+        let target = root.child("ocm-home/envs/target/.openclaw");
+        if needs_rewrite {
+            assert!(
+                stderr(&copied).contains("integrity-protected history"),
+                "{}",
+                stderr(&copied)
+            );
+            assert!(!target.parent().unwrap().exists());
+        } else {
+            library.assert_preserved(&target);
+        }
+        library.assert_preserved(&source);
+    }
+}

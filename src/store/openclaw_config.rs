@@ -462,7 +462,7 @@ pub(crate) fn rewrite_copied_config_include_directives(
             target_config_root,
             &|_| false,
         ) {
-            write_copied_config_value(path, &value)?;
+            write_copied_config_value(path, target_config_root, &value)?;
         }
     }
     Ok(())
@@ -560,7 +560,7 @@ fn rewrite_openclaw_config_includes_with_path_rewriter(
             )
         })?;
         if rewrite_paths(&mut value) {
-            write_copied_config_value(&include_path, &value)?;
+            write_copied_config_value(&include_path, state_dir, &value)?;
             changed = true;
         }
     }
@@ -616,6 +616,7 @@ pub(crate) fn rewrite_included_agent_directories_for_target(
             rewritten = Some(candidate);
         }
         if let Some(rewritten) = rewritten.filter(|rewritten| *rewritten != value) {
+            reject_protected_config_write(&derive_env_paths(target_root).state_dir, &path)?;
             write_config_value(&path, &rewritten)?;
             changed = true;
         }
@@ -1440,7 +1441,32 @@ fn ensure_object_field<'a>(
         .expect("object field must exist after reset")
 }
 
-fn write_copied_config_value(path: &Path, value: &Value) -> Result<(), String> {
+fn reject_protected_config_write(state_dir: &Path, path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "copied config has no parent".to_string())?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "copied config has no filename".to_string())?;
+    // Replacement changes parent/name, not an old leaf symlink's referent.
+    let destination = fs::canonicalize(parent)
+        .map_err(|error| error.to_string())?
+        .join(name);
+    if super::openclaw_state::is_integrity_protected_history_destination(
+        state_dir,
+        parent,
+        &destination,
+    )? {
+        return Err(format!(
+            "cannot rewrite OpenClaw config in integrity-protected history: {}; use a mutable config include outside the published payload",
+            display_path(path)
+        ));
+    }
+    Ok(())
+}
+
+fn write_copied_config_value(path: &Path, state_dir: &Path, value: &Value) -> Result<(), String> {
+    reject_protected_config_write(state_dir, path)?;
     let permissions = fs::metadata(path)
         .map_err(|error| error.to_string())?
         .permissions();

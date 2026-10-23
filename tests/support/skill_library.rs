@@ -1,4 +1,7 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -30,6 +33,12 @@ const SKILL_ID: &str = "00000000-0000-0000-0000-000000000001";
 impl SkillLibrary {
     pub fn seed(state: &Path) -> Self {
         fs::create_dir_all(state.join("state")).unwrap();
+        let payload = tempfile::NamedTempFile::new_in(state).unwrap();
+        let payload_db = Connection::open(payload.path()).unwrap();
+        payload_db.execute_batch("CREATE TABLE example(value TEXT); INSERT INTO example VALUES ('authored payload');").unwrap();
+        drop(payload_db);
+        let sqlite_bytes = fs::read(payload.path()).unwrap();
+        drop(payload);
         let db = Connection::open(state.join("state/openclaw.sqlite")).unwrap();
         db.execute_batch(
             "CREATE TABLE skill_library_entries (
@@ -45,10 +54,18 @@ impl SkillLibrary {
         )
         .unwrap();
         let mut revisions = Vec::new();
-        for instruction in [
+        for (index, instruction) in [
             "Use the ordinary saved procedure.".to_string(),
             format!("Read {}/workspace/notes.txt", state.display()),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let config = if index == 0 {
+                serde_json::json!({"paths": []})
+            } else {
+                serde_json::json!({"paths": [state.join("workspace")]})
+            };
             let files = vec![
                 (
                     "SKILL.md".to_string(),
@@ -62,6 +79,21 @@ impl SkillLibrary {
                     "scripts/example.sh".to_string(),
                     format!("#!/bin/sh\n# {instruction}\nexit 0\n").into_bytes(),
                     true,
+                ),
+                (
+                    "support/config.json5".to_string(),
+                    config.to_string().into_bytes(),
+                    false,
+                ),
+                (
+                    "support/example.sqlite".to_string(),
+                    sqlite_bytes.clone(),
+                    false,
+                ),
+                (
+                    "support/example.sqlite-journal".to_string(),
+                    b"authored supporting bytes".to_vec(),
+                    false,
                 ),
                 // A name that would be volatile in runtime state is authored here.
                 (
@@ -111,6 +143,28 @@ impl SkillLibrary {
         }
         db.execute("INSERT INTO skill_library_entries VALUES (?1, 'fixture-profile', 'fixture-profile', 'fixture', ?2, 0, 1, 0, 1, 1)", params![SKILL_ID, revisions.last().unwrap().0]).unwrap();
         Self { revisions }
+    }
+
+    pub fn config_include(&self, state: &Path, needs_rewrite: bool) -> PathBuf {
+        state
+            .join("skill-library")
+            .join(SKILL_ID)
+            .join("revisions")
+            .join(&self.revisions[usize::from(needs_rewrite)].0)
+            .join("support/config.json5")
+    }
+
+    pub fn configure_include(&self, state: &Path, include: &Path) {
+        fs::create_dir_all(state.join("workspace")).unwrap();
+        fs::write(
+            state.join("openclaw.json"),
+            serde_json::json!({
+                "agents": {"defaults": {"workspace": state.join("workspace")}},
+                "plugins": {"entries": {"fixture": {"config": {"$include": include}}}}
+            })
+            .to_string(),
+        )
+        .unwrap();
     }
 
     pub fn assert_preserved(&self, state: &Path) {

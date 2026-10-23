@@ -104,6 +104,7 @@ pub struct EnvArchiveOptions {
     pub included_path_roots: BTreeSet<PathBuf>,
     pub excluded_path_roots: BTreeSet<PathBuf>,
     pub snapshot_sqlite_files: bool,
+    pub should_preserve_bytes: fn(&Path) -> bool,
     pub private_output: bool,
     pub relocate_internal_symlinks: bool,
     pub sqlite_content_roots: BTreeSet<PathBuf>,
@@ -117,6 +118,7 @@ impl Default for EnvArchiveOptions {
             included_path_roots: BTreeSet::new(),
             excluded_path_roots: BTreeSet::new(),
             snapshot_sqlite_files: false,
+            should_preserve_bytes: |_| false,
             private_output: false,
             relocate_internal_symlinks: false,
             sqlite_content_roots: BTreeSet::new(),
@@ -373,10 +375,12 @@ fn append_env_root(
         if options.should_skip(relative_path, entry_kind) {
             continue;
         }
-        let discover_sqlite = options
-            .sqlite_content_roots
-            .iter()
-            .any(|root| relative_path.starts_with(root));
+        let preserve_bytes = (options.should_preserve_bytes)(relative_path);
+        let discover_sqlite = !preserve_bytes
+            && options
+                .sqlite_content_roots
+                .iter()
+                .any(|root| relative_path.starts_with(root));
         let mut captured = if discover_sqlite && metadata.is_file() {
             Some(capture.unwrap().file(relative_path, &metadata)?)
         } else {
@@ -399,7 +403,8 @@ fn append_env_root(
                 continue;
             }
         }
-        if !discover_sqlite
+        if !preserve_bytes
+            && !discover_sqlite
             && options.snapshot_sqlite_files
             && sqlite_database_path_for_sidecar(relative_path).is_some()
         {
@@ -436,7 +441,8 @@ fn append_env_root(
         }
 
         if state_database
-            || (!discover_sqlite
+            || (!preserve_bytes
+                && !discover_sqlite
                 && options.snapshot_sqlite_files
                 && metadata.is_file()
                 && is_sqlite_database_path(relative_path))
@@ -1207,7 +1213,9 @@ fn classify_sqlite_children(
         let child_relative = child
             .strip_prefix(source_root)
             .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
-        if options.should_skip(child_relative, env_archive_entry_kind(&child_meta)) {
+        if options.should_skip(child_relative, env_archive_entry_kind(&child_meta))
+            || (options.should_preserve_bytes)(child_relative)
+        {
             continue;
         }
         if child_meta.is_file() {

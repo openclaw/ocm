@@ -202,6 +202,9 @@ pub(crate) fn openclaw_env_state_archive_options(
         should_exclude_path: should_exclude_state_archive_path,
         sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
         snapshot_sqlite_files: true,
+        should_preserve_bytes: |path| {
+            is_integrity_protected_history_path(Path::new(".openclaw"), path)
+        },
         relocate_internal_symlinks: true,
         private_output: true,
         ..EnvArchiveOptions::default()
@@ -2111,7 +2114,7 @@ fn copied_history_state_roots(
 // Use only after containment establishes the actual write destination. For a
 // symlink entry replacement, resolve its parent and pass parent/name as the
 // destination, without following the old leaf. Keep lexical tree walkers pure.
-fn is_integrity_protected_history_destination(
+pub(super) fn is_integrity_protected_history_destination(
     state_root: &Path,
     resolution_path: &Path,
     destination: &Path,

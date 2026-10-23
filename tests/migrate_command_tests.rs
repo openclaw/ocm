@@ -3793,3 +3793,48 @@ fn migration_preserves_saved_skill_revisions() {
         assert!(source.join("run/live.sock").exists());
     }
 }
+
+#[test]
+fn migration_rejects_only_mutating_saved_skill_includes() {
+    for adopt in [false, true] {
+        for needs_rewrite in [false, true] {
+            let root = TestDir::new("migrate-skill-include");
+            let source = root.child("plain-home/.openclaw");
+            let library = skill_library::SkillLibrary::seed(&source);
+            library.configure_include(&source, &library.config_include(&source, needs_rewrite));
+            let mut env = ocm_env(&root);
+            install_fake_openclaw_on_path(&root, &mut env);
+            let args = if adopt {
+                vec![
+                    "adopt",
+                    "import",
+                    "--name",
+                    "target",
+                    source.to_str().unwrap(),
+                    "--json",
+                ]
+            } else {
+                vec!["migrate", "target", source.to_str().unwrap(), "--json"]
+            };
+            let imported = run_ocm(root.path(), &env, &args);
+            assert_eq!(
+                imported.status.success(),
+                !needs_rewrite,
+                "{}",
+                stderr(&imported)
+            );
+            let target = root.child("ocm-home/envs/target/.openclaw");
+            if needs_rewrite {
+                assert!(
+                    stderr(&imported).contains("integrity-protected history"),
+                    "{}",
+                    stderr(&imported)
+                );
+                assert!(!target.parent().unwrap().exists());
+            } else {
+                library.assert_preserved(&target);
+            }
+            library.assert_preserved(&source);
+        }
+    }
+}
