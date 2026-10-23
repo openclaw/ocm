@@ -2286,8 +2286,18 @@ fn runtime_build_local_resolves_manifest_aliases_with_real_npm() {
                 "providers":["fish-provider"], "channels":["fish-channel"],
                 "cliBackends":["fish-cli"],
                 "setup":{"providers":[{"id":"fish-setup"}], "cliBackends":["fish-setup-cli"]},
-                "modelCatalog":{"providers":{"fish-provider":{"models":[]}}, "aliases":{"fish-catalog":{"provider":"fish-provider"}}},
-                "providerAuthAliases":{"fish-auth":"fish-provider"}
+                "modelCatalog":{
+                    "providers":{
+                        "fish-provider":{"models":[]},
+                        "fish-catalog-decision":{"models":[{"id":"model","inference":{"chat":false,"decision":{"protocol":"decision-v1","input":["text"]}}}]},
+                        "discarded-model":{"models":[{"id":"reserved","inference":{"chat":"invalid"}}]},
+                        "discarded-unowned":{"models":[{"id":"model"}]}
+                    },
+                    "aliases":{"fish-catalog":{"provider":"fish-provider"}, "discarded-catalog-alias":{"provider":"unowned"}, "__proto__":{"provider":"fish-provider"}}
+                },
+                "providerAuthAliases":{"fish-auth":"fish-provider", "discarded-auth":"", "discarded-auth-object":{"provider":"fish-provider","baseUrls":[]}},
+                "contracts":{"decisionProviders":["fish-decision", "fish-catalog-decision", "discarded-model"]},
+                "decisionModels":[{"provider":"fish-decision","id":"model","name":"Model"}, {"provider":"discarded-model","id":"reserved","name":"Model"}]
             }),
         ),
         // Native locale ordering puts fish before Zulu; byte ordering does not.
@@ -2334,7 +2344,7 @@ fn runtime_build_local_resolves_manifest_aliases_with_real_npm() {
         ),
         (
             "aliases",
-            serde_json::json!({"allow":[" FISH-AUDIO ","fish-provider","fish-channel","fish-cli","fish-setup","fish-setup-cli","fish-catalog","fish-auth"]}),
+            serde_json::json!({"allow":[" FISH-AUDIO ","fish-provider","fish-channel","fish-cli","fish-setup","fish-setup-cli","fish-catalog","fish-auth","fish-decision","fish-catalog-decision"]}),
             Some(Some("fish-audio-speech")),
         ),
         (
@@ -2381,6 +2391,16 @@ fn runtime_build_local_resolves_manifest_aliases_with_real_npm() {
             "installed-wins",
             serde_json::json!({"allow":["fish-audio"],"installs":{"fish-audio":{"source":"path"}}}),
             Some(None),
+        ),
+        (
+            "discarded-metadata",
+            serde_json::json!({"allow":["fish-audio-speech"], "deny":["discarded-auth","discarded-auth-object","discarded-unowned","discarded-catalog-alias","discarded-model","__proto__"]}),
+            Some(Some("fish-audio-speech")),
+        ),
+        (
+            "discarded-model",
+            serde_json::json!({"allow":["discarded-model"]}),
+            None,
         ),
         (
             "unknown",
@@ -2434,7 +2454,11 @@ fn runtime_build_local_resolves_manifest_aliases_with_real_npm() {
                 "{label}"
             );
         } else {
-            assert!(stderr(&build).contains("unavailable-example"));
+            assert!(stderr(&build).contains(if label == "unknown" {
+                "unavailable-example"
+            } else {
+                "discarded-model"
+            }));
         }
     }
 }
