@@ -8264,6 +8264,90 @@ fn env_set_runtime_uses_the_transactional_upgrade_path_for_existing_bindings() {
 }
 
 #[test]
+fn upgrade_rejects_blocking_finalizer_receipts_before_binding_publication() {
+    for receipt in [
+        serde_json::json!({"status": "error", "mode": "finalize"}),
+        serde_json::json!({"status": "ok", "postUpdate": {"plugins": {"status": "error"}}}),
+        serde_json::json!({
+            "status": "warning",
+            "postUpdate": {"plugins": {"status": "warning", "npm": {"outcomes": [{
+                "pluginId": "discord", "status": "error", "code": "PLUGIN_CAPABILITY_CONSENT_REQUIRED"
+            }]}}},
+            "phaseTimings": [
+                {"phase": "plugins", "startedOffsetMs": 0, "durationMs": 1, "outcome": "warning"},
+                {"phase": "targetConfigConvergence", "startedOffsetMs": 1, "durationMs": 1, "outcome": "warning"}
+            ]
+        }),
+        serde_json::json!({"phaseTimings": [
+            {"phase": "targetConfigConvergence", "startedOffsetMs": 0, "durationMs": 1, "outcome": "failed"}
+        ]}),
+    ] {
+        let root = TestDir::new("upgrade-blocking-finalizer-receipt");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        for (name, version) in [("old-local", "old-openclaw"), ("new-local", "new-openclaw")] {
+            let runtime = root.child(name);
+            let script = recording_openclaw_script(version).replace(
+                "printf '{\"status\":\"ok\",\"mode\":\"finalize\",\"postUpdate\":{\"doctor\":{\"status\":\"ok\"},\"plugins\":{\"status\":\"ok\"}}}\\n'",
+                &format!("printf '%s\\n' '{receipt}'"),
+            );
+            assert!(
+                script.contains(&receipt.to_string()),
+                "fixture was not replaced"
+            );
+            write_executable_script(&runtime, &script);
+            let add = run_ocm(
+                &cwd,
+                &env,
+                &["runtime", "add", name, "--path", &path_string(&runtime)],
+            );
+            assert!(add.status.success(), "{}", stderr(&add));
+        }
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "demo", "--runtime", "old-local"],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        let upgrade = run_ocm(
+            &cwd,
+            &env,
+            &["upgrade", "demo", "--runtime", "new-local", "--json"],
+        );
+        assert!(
+            !upgrade.status.success(),
+            "blocking receipt accepted: {}",
+            stdout(&upgrade)
+        );
+        let result: Value = serde_json::from_str(&stdout(&upgrade)).unwrap();
+        assert!(
+            result["note"]
+                .as_str()
+                .unwrap()
+                .contains("openclaw update finalize"),
+            "{result}"
+        );
+        let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+        assert!(history.status.success(), "{}", stderr(&history));
+        let records: Value = serde_json::from_str(&stdout(&history)).unwrap();
+        let record = &records[0];
+        assert_eq!(record["finalization"]["status"], "failed", "{record}");
+        assert_eq!(record["rollback"], "restored", "{record}");
+        assert!(record["note"].is_null(), "{record}");
+        assert!(!record.to_string().contains("bindingPublish"), "{record}");
+        assert!(!record.to_string().contains("httpReady"), "{record}");
+        assert_eq!(
+            ocm::store::get_environment("demo", &env, &cwd)
+                .unwrap()
+                .default_runtime
+                .as_deref(),
+            Some("old-local")
+        );
+    }
+}
+
+#[test]
 fn upgrade_rolls_back_runtime_binding_when_update_finalization_fails() {
     let root = TestDir::new("upgrade-finalize-rollback");
     let cwd = root.child("workspace");

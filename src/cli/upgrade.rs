@@ -4601,7 +4601,12 @@ impl Cli {
             }
         };
         let child_phases = parse_openclaw_finalize_phases(&output.stdout);
-        if !output.status.success() {
+        let failure = if output.status.success() {
+            openclaw_finalize_blocker(&output.stdout, &child_phases).map(str::to_string)
+        } else {
+            Some(output.failure_summary())
+        };
+        if let Some(failure) = failure {
             if child_phases.is_empty() {
                 timings.finish(
                     "ocm",
@@ -4614,8 +4619,7 @@ impl Cli {
                 timings.append_openclaw_phases(finalize_started, &child_phases);
             }
             return Err(PostCoreUpdateFailure::Finalization(format!(
-                "openclaw update finalize failed: {}",
-                output.failure_summary()
+                "openclaw update finalize failed: {failure}"
             )));
         }
         let completion_deferred = child_phases
@@ -5857,6 +5861,40 @@ fn parse_openclaw_finalize_phases(stdout: &str) -> Vec<OpenClawFinalizePhaseTimi
         .collect()
 }
 
+fn openclaw_finalize_blocker(
+    stdout: &str,
+    phases: &[OpenClawFinalizePhaseTiming],
+) -> Option<&'static str> {
+    let receipt: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let plugins = &receipt["postUpdate"]["plugins"];
+    // A warning receipt can still contain a typed restart blocker. Ordinary
+    // plugin fetch warnings and completion-cache failures are not blockers.
+    if plugins["npm"]["outcomes"]
+        .as_array()
+        .is_some_and(|outcomes| {
+            outcomes.iter().any(|outcome| {
+                outcome["status"] == "error"
+                    && outcome["code"] == "PLUGIN_CAPABILITY_CONSENT_REQUIRED"
+            })
+        })
+    {
+        return Some(
+            "plugin capability consent is required; review the target OpenClaw plugin capabilities before retrying",
+        );
+    }
+    if receipt["status"] == "error"
+        || plugins["status"] == "error"
+        || phases
+            .iter()
+            .any(|phase| phase.phase != "completionCache" && phase.outcome == "failed")
+    {
+        return Some(
+            "the finalizer reported a blocking error; repair the target OpenClaw configuration and plugins before retrying",
+        );
+    }
+    None
+}
+
 impl PreparedUpgradeTarget {
     fn commit(mut self) -> Result<Self, String> {
         if let Some(staged) = self.staged.take() {
@@ -6769,10 +6807,10 @@ fn gateway_auth_failure_proves_reachable(error: &str) -> bool {
 mod tests {
     use super::{
         UpgradeSimulationSummary, candidate_codex_preflight_is_unsupported,
-        command_output_reports_unsupported_command, parse_openclaw_finalize_phases,
-        record_simulation_cleanup_failure, release_version_from_output,
-        simulation_requires_attention, summarize_command_failure_text, verify_gateway_build_id,
-        verify_gateway_status_readiness, version_output_matches_expected,
+        command_output_reports_unsupported_command, openclaw_finalize_blocker,
+        parse_openclaw_finalize_phases, record_simulation_cleanup_failure,
+        release_version_from_output, simulation_requires_attention, summarize_command_failure_text,
+        verify_gateway_build_id, verify_gateway_status_readiness, version_output_matches_expected,
     };
 
     #[cfg(unix)]
@@ -7105,6 +7143,23 @@ mod tests {
         assert_eq!(phases[0].started_offset_ms, 7);
         assert_eq!(phases[0].duration_ms, 11);
         assert_eq!(phases[0].outcome, "warning");
+    }
+
+    #[test]
+    fn finalizer_blockers_preserve_nonblocking_and_legacy_results() {
+        for receipt in [
+            "",
+            "Update finalization completed.",
+            r#"{"status":"ok","mode":"finalize"}"#,
+            r#"{"status":"warning","postUpdate":{"plugins":{"status":"warning","npm":{"outcomes":[{"status":"error","message":"registry temporarily unavailable"}]}}}}"#,
+            r#"{"phaseTimings":[{"phase":"completionCache","startedOffsetMs":0,"durationMs":1,"outcome":"failed"},{"phase":"plugins","startedOffsetMs":1,"durationMs":1,"outcome":"warning"}]}"#,
+        ] {
+            assert_eq!(
+                openclaw_finalize_blocker(receipt, &parse_openclaw_finalize_phases(receipt)),
+                None,
+                "{receipt}"
+            );
+        }
     }
 
     #[test]

@@ -4,6 +4,10 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Reject blocking OpenClaw finalization receipts before publishing a replacement runtime, including capability-consent errors returned with a successful exit status, while preserving nonblocking plugin warnings. Thanks @hannesrudolph (#132).
+
 ## 0.3.6 - 2026-10-22
 
 **Highlights:** Safer recovery and migration, TLS-aware Gateway readiness, reliable targeted builds, and refreshed managed Node.js.

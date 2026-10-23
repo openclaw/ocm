@@ -330,6 +330,8 @@ Use `upgrade simulate` when you want to test what would happen against a publish
 - a running managed gateway is stopped only for checkpoint capture, runtime publication, environment mutation, and finalization
 - new checkpoints capture the complete environment root; APFS clone support is used when available and a metadata-preserving full copy is the fallback
 - when an env moves to a new runtime, OCM runs OpenClaw's update finalization path cold before service restart
+- OCM rejects structured finalizer errors and plugin capability-consent blockers before publishing the replacement binding, even if the finalizer exits successfully; ordinary nonblocking plugin warnings and completion-cache failures remain allowed
+- finalization can change environment state, so a rejected finalizer still restores the pre-upgrade snapshot and restarts the previous managed gateway unless `--no-rollback` is set; it does not start the rejected replacement
 - if service reconciliation fails, OCM restores the snapshot and previous runtime unless `--no-rollback` is set
 - pinned runtimes stay pinned unless you pass `--version`, `--channel`, or `--runtime`
 - local-command environments are reported clearly instead of being changed behind your back
