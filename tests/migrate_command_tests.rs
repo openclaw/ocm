@@ -2105,6 +2105,7 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                 "physical",
                 "canonical-record",
                 "alias-record",
+                "internal-link",
                 "external",
                 "escape",
             ] {
@@ -2125,10 +2126,12 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                 // Keep the escape outside generated plugin directories so copying
                 // reaches plugin-record admission instead of a traversal guard.
                 std::os::unix::fs::symlink(&external, source.join("escape")).unwrap();
+                std::os::unix::fs::symlink(&plugin, source.join("linked-plugin")).unwrap();
                 let recorded = match case {
                     "alias-record" => alias.join("extensions/demo"),
                     "external" => external.clone(),
                     "escape" => source.join("escape"),
+                    "internal-link" => source.join("linked-plugin"),
                     _ => plugin.clone(),
                 };
                 let config_path = source.join("openclaw.json");
@@ -2214,6 +2217,10 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                     assert_eq!(
                         rewritten["demo"][field],
                         target.join("extensions/demo").to_str().unwrap()
+                    );
+                    assert_eq!(
+                        fs::canonicalize(rewritten["demo"][field].as_str().unwrap()).unwrap(),
+                        fs::canonicalize(target.join("extensions/demo")).unwrap()
                     );
                 }
                 let config: serde_json::Value = serde_json::from_str(

@@ -2460,7 +2460,12 @@ fn rewrite_plugin_install_records(
             let relative = relocatable_plugin_path(path, source_state_root, !is_path_plugin)
                 .or_else(|| match relocation {
                     PluginPathRelocation::Imported { canonical_source } => {
-                        relocatable_plugin_path(path, canonical_source, !is_path_plugin)
+                        relocatable_plugin_path(path, canonical_source, !is_path_plugin)?;
+                        // Map the physical payload: an absolute internal link is
+                        // copied verbatim and would still select the source home.
+                        let relative = existing_plugin_relative(path, canonical_source)?;
+                        contained_plugin_path(&target_state_root.join(&relative), target_state_root)
+                            .then_some(relative)
                     }
                     PluginPathRelocation::Cloned { .. } => None,
                 });
