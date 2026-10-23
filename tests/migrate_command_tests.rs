@@ -2386,26 +2386,16 @@ fn adopt_import_checks_copied_plugin_links_before_preserving_provenance() {
             ],
         );
         let target = root.child("ocm-home/envs/mira");
-        if absolute {
-            assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
-            assert!(
-                stderr(&output).contains("could not be isolated"),
-                "{}",
-                stderr(&output)
-            );
-            assert!(!target.exists());
-        } else {
-            assert!(output.status.success(), "{}", stderr(&output));
-            let records = read_imported_plugin_install_records(&root, "mira");
-            let copied = std::path::Path::new(records["demo"]["installPath"].as_str().unwrap());
-            assert!(
-                fs::canonicalize(copied)
-                    .unwrap()
-                    .starts_with(fs::canonicalize(&target).unwrap())
-            );
-            assert_eq!(records["demo"]["sourcePath"], project.to_str().unwrap());
-            fs::write(copied.join("marker.txt"), "target update").unwrap();
-        }
+        assert!(output.status.success(), "{}", stderr(&output));
+        let records = read_imported_plugin_install_records(&root, "mira");
+        let copied = std::path::Path::new(records["demo"]["installPath"].as_str().unwrap());
+        assert!(
+            fs::canonicalize(copied)
+                .unwrap()
+                .starts_with(fs::canonicalize(&target).unwrap())
+        );
+        assert_eq!(records["demo"]["sourcePath"], project.to_str().unwrap());
+        fs::write(copied.join("marker.txt"), "target update").unwrap();
         assert_eq!(fs::read(&database).unwrap(), before);
         assert_eq!(fs::read_link(&installed).unwrap(), link_target);
         assert_eq!(
