@@ -3525,12 +3525,12 @@ fn migrate_and_adopt_relocate_includes_through_a_source_home_alias() {
 #[test]
 fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
     for adopt in [false, true] {
-        for (relative_root, source_arg, include_root) in [
-            (false, "alias", "alias"),
-            (true, "alias", "alias"),
-            (false, "sub/../alias", "sub/../alias"),
-            (false, "sub/../alias", "alias"),
-            (false, "hop/../plain-home", "hop/../plain-home"),
+        for (relative_root, relative_source, source_arg, include_root) in [
+            (false, false, "alias", "alias"),
+            (true, false, "alias", "alias"),
+            (false, true, "sub/../alias", "sub/../alias"),
+            (false, true, "sub/../alias", "alias"),
+            (false, true, "hop/../plain-home", "hop/../plain-home"),
         ] {
             let root = TestDir::new("migrate-alias-authored-includes");
             let env = ocm_env(&root);
@@ -3541,7 +3541,20 @@ fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
             fs::create_dir_all(root.child("sub")).unwrap();
             fs::create_dir_all(root.child("source/deep")).unwrap();
             std::os::unix::fs::symlink(root.child("source/deep"), root.child("hop")).unwrap();
-            let authored_alias = root.child(include_root);
+            // Relative arguments resolve from the physical process cwd. Preserve
+            // the home alias, but do not introduce a second, unsupplied parent
+            // alias (for example macOS /var versus /private/var).
+            let source_parent = if relative_source {
+                fs::canonicalize(root.path()).unwrap()
+            } else {
+                root.path().to_path_buf()
+            };
+            let authored_alias = source_parent.join(include_root);
+            let source_arg = if relative_source {
+                std::path::PathBuf::from(source_arg)
+            } else {
+                root.child(source_arg)
+            };
             let root_include = if relative_root {
                 std::path::PathBuf::from("./config/plugins.json")
             } else {
@@ -3563,9 +3576,15 @@ fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
                 support::write_text(&source.join(path), contents);
             }
             let args = if adopt {
-                vec!["adopt", "import", "--name", "copied", source_arg]
+                vec![
+                    "adopt",
+                    "import",
+                    "--name",
+                    "copied",
+                    source_arg.to_str().unwrap(),
+                ]
             } else {
-                vec!["migrate", "copied", source_arg]
+                vec!["migrate", "copied", source_arg.to_str().unwrap()]
             };
             let imported = run_ocm(root.path(), &env, &args);
             assert!(imported.status.success(), "{}", stderr(&imported));
