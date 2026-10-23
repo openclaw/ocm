@@ -1701,7 +1701,8 @@ mod tests {
             );
             let prepared = super::PreparedTreeCheckpoint {
                 independent: Vec::new(),
-                source: source.clone(),
+                requested_source: source.clone(),
+                source: fs::canonicalize(&source).unwrap(),
                 cleanup,
                 cloned: true,
                 entries,
