@@ -1656,9 +1656,10 @@ fn env_import_preserves_saved_skill_revisions() {
         fs::read(source.join("state/openclaw.sqlite")).unwrap(),
         source_db
     );
+    let relocated = fs::read_to_string(target.join("logs/runtime.log")).unwrap();
     assert_eq!(
-        fs::read_to_string(target.join("logs/runtime.log")).unwrap(),
-        format!("cwd={}\n", target.join("workspace").display())
+        Path::new(relocated.trim_end().strip_prefix("cwd=").unwrap()),
+        target.join("workspace")
     );
     assert!(!target.join("gateway.pid").exists());
     assert!(source.join("gateway.pid").exists());
