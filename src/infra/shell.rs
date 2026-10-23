@@ -249,6 +249,7 @@ pub fn render_use_script(
         .collect::<Vec<_>>();
     let target_env = build_openclaw_env(meta, base_env);
     for key in [
+        "OPENCLAW_INCLUDE_ROOTS",
         "OPENCLAW_HOME",
         "OPENCLAW_STATE_DIR",
         "OPENCLAW_CONFIG_PATH",

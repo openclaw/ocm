@@ -1555,6 +1555,11 @@ even when the inherited `SHELL` names a different shell. An explicit
 `ocm_use mira --shell bash` still overrides the activation format. Direct
 `ocm env use mira --shell bash` prints the script without evaluating it.
 
+Activation preserves explicitly exported `OPENCLAW_INCLUDE_ROOTS`, so authorized
+shared configuration remains available after selecting an environment. It does
+not derive that authorization from configuration files. Unrelated stale
+`OPENCLAW_*` environment controls are still cleared.
+
 ## Output modes
 
 By default, `ocm` formats output for people in a terminal.

@@ -169,3 +169,134 @@ printf 'activation and caller controls passed\n'
         }
     }
 }
+
+#[test]
+fn activation_renders_explicit_include_roots_for_each_supported_shell() {
+    let root = TestDir::new("shell-include-roots-render");
+    let mut env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "demo"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+
+    for roots in [None, Some(""), Some("/shared roots")] {
+        env.remove("OPENCLAW_INCLUDE_ROOTS");
+        if let Some(roots) = roots {
+            env.insert("OPENCLAW_INCLUDE_ROOTS".into(), roots.into());
+        }
+        for shell in ["bash", "sh", "zsh", "fish"] {
+            let output = run_ocm(root.path(), &env, &["env", "use", "demo", "--shell", shell]);
+            assert!(output.status.success(), "{}", stderr(&output));
+            let script = stdout(&output);
+            match roots {
+                None => assert!(!script.contains("OPENCLAW_INCLUDE_ROOTS"), "{script}"),
+                Some(value) => {
+                    let assignment = if shell == "fish" {
+                        format!("set -gx OPENCLAW_INCLUDE_ROOTS '{value}';")
+                    } else {
+                        format!("export OPENCLAW_INCLUDE_ROOTS='{value}'")
+                    };
+                    assert!(script.contains(&assignment), "{shell}: {script}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn activation_and_init_preserve_authorized_include_access() {
+    use std::process::Command;
+
+    use crate::support::{ocm_test_binary_path, path_string};
+
+    let root = TestDir::new("shell-include-roots-executed");
+    let shared = root.child("shared one's\\config;$HOME");
+    fs::create_dir_all(&shared).unwrap();
+    let mut env = ocm_env(&root);
+    let binary = ocm_test_binary_path();
+    env.insert("OCM_SELF".into(), path_string(&binary));
+    env.insert("PROBE_OCM".into(), path_string(&binary));
+    env.insert("EXPECTED_ROOTS".into(), path_string(&shared));
+    let added = run_ocm(
+        root.path(),
+        &env,
+        &["launcher", "add", "fixture", "--command", "/bin/true"],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let created = run_ocm(
+        root.path(),
+        &env,
+        &["env", "create", "demo", "--launcher", "fixture"],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let include = shared.join("settings.json");
+    fs::write(
+        &include,
+        r#"{"gateway":{"mode":"local","bind":"loopback"}}"#,
+    )
+    .unwrap();
+    let config_path = root.child("ocm-home/envs/demo/.openclaw/openclaw.json");
+    let config = serde_json::json!({
+        "$include": path_string(&include),
+        "env": {"OPENCLAW_INCLUDE_ROOTS": path_string(&shared)}
+    })
+    .to_string();
+    fs::write(&config_path, &config).unwrap();
+    env.insert("OPENCLAW_INCLUDE_ROOTS".into(), path_string(&shared));
+    let prepared = run_ocm(
+        root.path(),
+        &env,
+        &["start", "demo", "--no-service", "--json"],
+    );
+    assert!(prepared.status.success(), "{}", stderr(&prepared));
+    let config = fs::read_to_string(&config_path).unwrap();
+    for shell in ["bash", "sh"] {
+        for use_init in [false, true] {
+            for authorized in [false, true] {
+                env.remove("OPENCLAW_INCLUDE_ROOTS");
+                if authorized {
+                    env.insert("OPENCLAW_INCLUDE_ROOTS".into(), path_string(&shared));
+                }
+                env.insert("OPENCLAW_RANDOM_USER_VALUE".into(), "stale".into());
+                env.insert("OPENCLAW_SYSTEMD_UNIT".into(), "stale.service".into());
+                env.insert("OCM_ACTIVE_ENV".into(), "old".into());
+                let activation = if use_init {
+                    format!("eval \"$(\"$PROBE_OCM\" init {shell})\"; ocm_use demo")
+                } else {
+                    format!("eval \"$(\"$PROBE_OCM\" env use demo --shell {shell})\"")
+                };
+                let roots_check = if authorized {
+                    "[ \"$OPENCLAW_INCLUDE_ROOTS\" = \"$EXPECTED_ROOTS\" ]"
+                } else {
+                    "[ -z \"${OPENCLAW_INCLUDE_ROOTS+x}\" ]"
+                };
+                let script = format!(
+                    r#"{activation} || exit 10
+{roots_check} || exit 11
+[ "$OCM_ACTIVE_ENV" = demo ] || exit 12
+[ -z "${{OPENCLAW_RANDOM_USER_VALUE+x}}" ] || exit 13
+[ -z "${{OPENCLAW_SYSTEMD_UNIT+x}}" ] || exit 14
+"$PROBE_OCM" start demo --no-service --json
+"#
+                );
+                let output = Command::new(shell)
+                    .args(["-c", &script])
+                    .current_dir(root.path())
+                    .env_clear()
+                    .envs(&env)
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(if authorized { 0 } else { 1 }),
+                    "shell={shell}, init={use_init}, authorized={authorized}: {} {}",
+                    stdout(&output),
+                    stderr(&output)
+                );
+                if !authorized {
+                    assert!(stderr(&output).contains("outside the admitted configuration roots"));
+                }
+                assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+            }
+        }
+    }
+}
