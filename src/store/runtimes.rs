@@ -768,13 +768,15 @@ fn collect_explicit_plugin_references(
         }
     }
     if let Some(slots) = plugins.get("slots").and_then(serde_json::Value::as_object) {
-        ids.extend(
-            slots
-                .values()
-                .filter_map(serde_json::Value::as_str)
-                .filter(|id| id.trim() != "none")
-                .filter_map(|id| target_plugin_id(id, source_ids, installed)),
-        );
+        ids.extend(slots.iter().filter_map(|(slot, value)| {
+            let id = value.as_str()?.trim();
+            // Native slot sentinels do not select a plugin. Only contextEngine
+            // owns the built-in legacy engine; memory still requires its plugin.
+            if id.eq_ignore_ascii_case("none") || (slot == "contextEngine" && id == "legacy") {
+                return None;
+            }
+            target_plugin_id(id, source_ids, installed)
+        }));
     }
     if let Some(deny) = plugins.get("deny").and_then(serde_json::Value::as_array) {
         for id in deny

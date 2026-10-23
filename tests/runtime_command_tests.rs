@@ -1630,6 +1630,104 @@ fn runtime_build_local_rejects_missing_target_plugin_before_pack() {
 }
 
 #[test]
+fn runtime_build_local_recognizes_native_slot_values() {
+    for (scenario, config, missing) in [
+        ("omitted", serde_json::json!({}), None),
+        (
+            "builtin",
+            serde_json::json!({"plugins":{"slots":{"contextEngine":" legacy "}}}),
+            None,
+        ),
+        (
+            "lower-none",
+            serde_json::json!({"plugins":{"slots":{"memory":"none"}}}),
+            None,
+        ),
+        (
+            "mixed-none",
+            serde_json::json!({"plugins":{"slots":{"memory":" NONE ","contextEngine":" NoNe "}}}),
+            None,
+        ),
+        (
+            "missing",
+            serde_json::json!({"plugins":{"slots":{"contextEngine":"missing-slot-plugin"}}}),
+            Some("missing-slot-plugin"),
+        ),
+        (
+            "memory-legacy",
+            serde_json::json!({"plugins":{"slots":{"memory":"legacy"}}}),
+            Some("legacy"),
+        ),
+        (
+            "uppercase-legacy",
+            serde_json::json!({"plugins":{"slots":{"contextEngine":"LEGACY"}}}),
+            Some("legacy"),
+        ),
+        (
+            "allow-legacy",
+            serde_json::json!({"plugins":{"allow":["legacy"],"slots":{"contextEngine":"legacy"}}}),
+            Some("legacy"),
+        ),
+        (
+            "entry-none",
+            serde_json::json!({"plugins":{"entries":{"none":{"enabled":true}},"slots":{"memory":"NONE"}}}),
+            Some("none"),
+        ),
+    ] {
+        let root = TestDir::new("runtime-build-local-native-slot-values");
+        let (cwd, env, state, npm_log) = target_plugin_build_fixture(&root);
+        let config = config.to_string();
+        fs::write(state.join("openclaw.json"), &config).unwrap();
+        let build = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "build-local",
+                "target",
+                "--repo",
+                "./openclaw",
+                "--for-env",
+                "primary",
+                "--raw",
+            ],
+        );
+        if let Some(missing) = missing {
+            assert!(!build.status.success(), "{scenario}: {}", stdout(&build));
+            assert!(
+                stderr(&build).contains("references plugins unavailable"),
+                "{scenario}: {}",
+                stderr(&build)
+            );
+            assert!(
+                stderr(&build).contains(missing),
+                "{scenario}: {}",
+                stderr(&build)
+            );
+            assert!(
+                !npm_log.exists(),
+                "{scenario}: unavailable plugin reached npm pack"
+            );
+        } else {
+            assert!(build.status.success(), "{scenario}: {}", stderr(&build));
+            let runtime_root = runtime_install_root("target", &env, &cwd)
+                .unwrap()
+                .join("files/node_modules/openclaw");
+            assert!(runtime_root.join("openclaw.mjs").is_file(), "{scenario}");
+            assert!(
+                !runtime_root.join("dist/extensions/codex").exists(),
+                "{scenario}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(state.join("openclaw.json")).unwrap(),
+            config,
+            "{scenario}"
+        );
+    }
+}
+
+#[test]
 fn runtime_build_local_resolves_native_plugin_identity_to_declared_source() {
     for (id, configured, field, installed) in [
         ("google", "google", "entries", None),

@@ -262,7 +262,9 @@ plugin is no longer installed. Disable and deny references use the same
 selected-source identity rules. Alias/case-equivalent entries share enablement:
 a later object without `enabled` preserves the previous value, while a later
 explicit boolean replaces it. Explicit slot references still require the
-selected plugin to be available. The resulting runtime adds only required
+selected plugin to be available, except the native built-in `contextEngine: "legacy"`
+and case-insensitive `"none"` disabled values. The `legacy` exemption applies only
+to the context-engine slot. The resulting runtime adds only required
 source plugins omitted from the core package. `--for-env` and
 `--include-source-extensions` are mutually exclusive. A build without either
 option remains release-shaped.
