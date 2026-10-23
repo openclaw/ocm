@@ -553,6 +553,17 @@ Skill Workshop bundles also retain their original bytes, including drafts, suppo
 files, proposal metadata, and rollback receipts. OpenClaw owns their stored hashes
 and target relocation; OCM preserves the historical paths and excludes them from
 copied-runtime-reference diagnostics.
+Saved skill-library revisions under `.openclaw/skill-library` retain their payload
+bytes and file modes during clone, migration, and state-inclusive archive import.
+OpenClaw owns their manifest hashes and revision identity; embedded paths remain
+authored content rather than runtime references. Cleanup and copied-reference
+diagnostics preserve the same ownership. Archive export copies protected SQLite
+payloads and their supporting files verbatim rather than snapshotting them.
+A config include that needs rewriting inside a protected payload causes the copy
+to fail and roll back; move that active configuration to a mutable include outside
+the published revision. Unchanged includes remain supported. Ordinary runtime paths still
+relocate and volatile process state follows each command's existing cleanup policy.
+
 Migration refuses an active state database that resolves to protected history and rolls back the partial import; passive history and ordinary unprotected database aliases remain supported.
 
 When a configured agent workspace is a repository checkout outside the plain

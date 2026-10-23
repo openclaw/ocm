@@ -1,5 +1,7 @@
 #[path = "support/config_includes.rs"]
 mod config_includes;
+#[path = "support/skill_library.rs"]
+mod skill_library;
 mod support;
 
 use std::{fs, path::Path};
@@ -1609,5 +1611,105 @@ fn env_import_relocates_config_includes_after_source_removal() {
                 fs::set_permissions(config, fs::Permissions::from_mode(0o700)).unwrap();
             }
         }
+    }
+}
+
+#[test]
+fn env_import_preserves_saved_skill_revisions() {
+    let root = TestDir::new("import-skill-revisions");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let created = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    let library = skill_library::SkillLibrary::seed(&source);
+    write_text(
+        &source.join("logs/runtime.log"),
+        &format!("cwd={}\n", source.join("workspace").display()),
+    );
+    write_text(&source.join("gateway.pid"), "4242\n");
+    let source_db = fs::read(source.join("state/openclaw.sqlite")).unwrap();
+    let exported = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "source.tar",
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let imported = run_ocm(
+        &cwd,
+        &env,
+        &["env", "import", "source.tar", "--name", "target"],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    let target = root.child("ocm-home/envs/target/.openclaw");
+    library.assert_preserved(&target);
+    library.assert_preserved(&source);
+    assert_eq!(
+        fs::read(source.join("state/openclaw.sqlite")).unwrap(),
+        source_db
+    );
+    let relocated = fs::read_to_string(target.join("logs/runtime.log")).unwrap();
+    assert_eq!(
+        Path::new(relocated.trim_end().strip_prefix("cwd=").unwrap()),
+        target.join("workspace")
+    );
+    assert!(!target.join("gateway.pid").exists());
+    assert!(source.join("gateway.pid").exists());
+}
+
+#[test]
+fn env_import_rejects_only_mutating_saved_skill_includes() {
+    for needs_rewrite in [false, true] {
+        let root = TestDir::new("import-skill-include");
+        let env = ocm_env(&root);
+        let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let source = root.child("ocm-home/envs/source/.openclaw");
+        let library = skill_library::SkillLibrary::seed(&source);
+        library.configure_include(&source, &library.config_include(&source, needs_rewrite));
+        let exported = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--include-state",
+                "--output",
+                "source.tar",
+            ],
+        );
+        assert!(exported.status.success(), "{}", stderr(&exported));
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &["env", "import", "source.tar", "--name", "target"],
+        );
+        assert_eq!(
+            imported.status.success(),
+            !needs_rewrite,
+            "{}",
+            stderr(&imported)
+        );
+        let target = root.child("ocm-home/envs/target/.openclaw");
+        if needs_rewrite {
+            assert!(
+                stderr(&imported).contains("integrity-protected history"),
+                "{}",
+                stderr(&imported)
+            );
+            assert!(!target.parent().unwrap().exists());
+        } else {
+            library.assert_preserved(&target);
+        }
+        library.assert_preserved(&source);
     }
 }

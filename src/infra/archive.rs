@@ -104,6 +104,7 @@ pub struct EnvArchiveOptions {
     pub included_path_roots: BTreeSet<PathBuf>,
     pub excluded_path_roots: BTreeSet<PathBuf>,
     pub snapshot_sqlite_files: bool,
+    pub should_preserve_bytes: fn(&Path) -> bool,
     pub private_output: bool,
     pub relocate_internal_symlinks: bool,
     pub sqlite_content_roots: BTreeSet<PathBuf>,
@@ -117,6 +118,7 @@ impl Default for EnvArchiveOptions {
             included_path_roots: BTreeSet::new(),
             excluded_path_roots: BTreeSet::new(),
             snapshot_sqlite_files: false,
+            should_preserve_bytes: |_| false,
             private_output: false,
             relocate_internal_symlinks: false,
             sqlite_content_roots: BTreeSet::new(),
@@ -373,6 +375,7 @@ fn append_env_root(
         if options.should_skip(relative_path, entry_kind) {
             continue;
         }
+        let preserve_bytes = (options.should_preserve_bytes)(relative_path);
         let discover_sqlite = options
             .sqlite_content_roots
             .iter()
@@ -382,7 +385,7 @@ fn append_env_root(
         } else {
             None
         };
-        let state_database = if let Some(captured) = &mut captured {
+        let state_database = if !preserve_bytes && let Some(captured) = &mut captured {
             state_databases.contains(&path)
                 || file_is_sqlite_database(&mut captured.file)
                     .map_err(EnvArchiveWriteError::Fatal)?
@@ -391,7 +394,7 @@ fn append_env_root(
         };
         if state_database {
             state_sidecars.extend(sqlite_sidecar_paths(&path));
-        } else if let Some(captured) = &mut captured {
+        } else if !preserve_bytes && let Some(captured) = &mut captured {
             if state_sidecars.contains(&path)
                 || is_orphan_sqlite_sidecar(&path, &mut captured.file)
                     .map_err(EnvArchiveWriteError::from_entry_io)?
@@ -399,7 +402,8 @@ fn append_env_root(
                 continue;
             }
         }
-        if !discover_sqlite
+        if !preserve_bytes
+            && !discover_sqlite
             && options.snapshot_sqlite_files
             && sqlite_database_path_for_sidecar(relative_path).is_some()
         {
@@ -436,7 +440,8 @@ fn append_env_root(
         }
 
         if state_database
-            || (!discover_sqlite
+            || (!preserve_bytes
+                && !discover_sqlite
                 && options.snapshot_sqlite_files
                 && metadata.is_file()
                 && is_sqlite_database_path(relative_path))
@@ -1207,7 +1212,9 @@ fn classify_sqlite_children(
         let child_relative = child
             .strip_prefix(source_root)
             .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
-        if options.should_skip(child_relative, env_archive_entry_kind(&child_meta)) {
+        if options.should_skip(child_relative, env_archive_entry_kind(&child_meta))
+            || (options.should_preserve_bytes)(child_relative)
+        {
             continue;
         }
         if child_meta.is_file() {
@@ -1930,6 +1937,59 @@ mod tests {
             }
         }
         assert!(found);
+    }
+
+    #[cfg(unix)]
+    static PRESERVED_FILE_REPLACEMENT: Mutex<Option<(PathBuf, PathBuf, bool)>> = Mutex::new(None);
+
+    #[cfg(unix)]
+    fn replace_preserved_file_parent(path: &Path, kind: EnvArchiveEntryKind) -> bool {
+        if path == Path::new("opaque/payload.txt") && kind == EnvArchiveEntryKind::File {
+            let mut fixture = PRESERVED_FILE_REPLACEMENT.lock().unwrap();
+            let (source, outside, replaced) = fixture.as_mut().unwrap();
+            if !*replaced {
+                fs::rename(source.join("opaque"), source.join("saved")).unwrap();
+                std::os::unix::fs::symlink(outside, source.join("opaque")).unwrap();
+                *replaced = true;
+            }
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserved_archive_bytes_keep_file_acquisition_guards() {
+        for preserve in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("home");
+            let outside = fixture.path().join("outside");
+            fs::create_dir_all(source.join("opaque")).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(source.join("opaque/payload.txt"), b"owned artifact").unwrap();
+            let external = b"external private fixture";
+            fs::write(outside.join("payload.txt"), external).unwrap();
+            *PRESERVED_FILE_REPLACEMENT.lock().unwrap() = Some((source.clone(), outside, false));
+            let output = fixture.path().join("archive.tar");
+            let mut options = EnvArchiveOptions {
+                sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
+                snapshot_sqlite_files: true,
+                should_exclude_path: replace_preserved_file_parent,
+                relocate_internal_symlinks: true,
+                private_output: true,
+                ..EnvArchiveOptions::default()
+            };
+            if preserve {
+                options.should_preserve_bytes = |path| path.starts_with("opaque");
+            }
+            write_env_archive_with_options(&(), &source, &output, options).unwrap();
+            assert!(PRESERVED_FILE_REPLACEMENT.lock().unwrap().take().unwrap().2);
+            assert!(
+                !fs::read(output)
+                    .unwrap()
+                    .windows(external.len())
+                    .any(|bytes| bytes == external)
+            );
+        }
     }
 
     #[cfg(unix)]
