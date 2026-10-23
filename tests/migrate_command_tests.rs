@@ -1,5 +1,7 @@
 #[path = "support/config_includes.rs"]
 mod config_includes;
+#[path = "support/skill_library.rs"]
+mod skill_library;
 mod support;
 
 use std::fs;
@@ -3750,5 +3752,44 @@ fn migrate_and_adopt_reject_external_nested_config_includes() {
             serde_json::from_str::<serde_json::Value>(&stdout(&listing)).unwrap(),
             serde_json::json!([])
         );
+    }
+}
+
+#[test]
+fn migration_preserves_saved_skill_revisions() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-skill-revisions");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let source = root.child("plain-home/.openclaw");
+        seed_plain_openclaw_home(&source);
+        let library = skill_library::SkillLibrary::seed(&source);
+        let source_db = fs::read(source.join("state/openclaw.sqlite")).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_openclaw_on_path(&root, &mut env);
+        let args = if adopt {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "target",
+                source.to_str().unwrap(),
+                "--json",
+            ]
+        } else {
+            vec!["migrate", "target", source.to_str().unwrap(), "--json"]
+        };
+        let imported = run_ocm(&cwd, &env, &args);
+        assert!(imported.status.success(), "{}", stderr(&imported));
+        let target = root.child("ocm-home/envs/target/.openclaw");
+        library.assert_preserved(&target);
+        library.assert_preserved(&source);
+        assert_imported_plain_openclaw_home(&target, &source);
+        assert_eq!(
+            fs::read(source.join("state/openclaw.sqlite")).unwrap(),
+            source_db
+        );
+        assert!(source.join("gateway.pid").exists());
+        assert!(source.join("run/live.sock").exists());
     }
 }

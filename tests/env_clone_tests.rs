@@ -1,5 +1,7 @@
 #[path = "support/config_includes.rs"]
 mod config_includes;
+#[path = "support/skill_library.rs"]
+mod skill_library;
 mod support;
 
 use std::fs;
@@ -3976,4 +3978,45 @@ fn env_clone_relocates_nested_and_shared_config_includes() {
     assert!(clone.status.success(), "{}", stderr(&clone));
     fixture.assert_relocated(&root.child("ocm-home/envs/copied/.openclaw"));
     fixture.assert_source_unchanged(&source);
+}
+
+#[test]
+fn env_clone_preserves_saved_skill_revisions() {
+    let root = TestDir::new("clone-skill-revisions");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let created = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    let library = skill_library::SkillLibrary::seed(&source);
+    write_text(&source.join("gateway.pid"), "4242\n");
+    write_text(&source.join("logs/runtime.log"), "runtime residue\n");
+    let source_db = fs::read(source.join("state/openclaw.sqlite")).unwrap();
+
+    let cloned = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+    assert!(cloned.status.success(), "{}", stderr(&cloned));
+    let target = root.child("ocm-home/envs/target/.openclaw");
+    library.assert_preserved(&target);
+    library.assert_preserved(&source);
+    assert_eq!(
+        fs::read(source.join("state/openclaw.sqlite")).unwrap(),
+        source_db
+    );
+    assert!(!target.join("gateway.pid").exists());
+    assert!(!target.join("logs/runtime.log").exists());
+    assert!(source.join("gateway.pid").exists());
+    assert!(source.join("logs/runtime.log").exists());
+    let doctor = run_ocm(&cwd, &env, &["env", "doctor", "target", "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let health: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert!(
+        health["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|issue| !issue.as_str().unwrap().contains("OpenClaw runtime state")),
+        "{}",
+        stdout(&doctor)
+    );
 }

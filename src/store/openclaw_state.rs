@@ -2079,13 +2079,14 @@ pub(super) fn with_owner_write_permission<T>(
     }
 }
 
-// Workshop drafts, support files, and rollback receipts share stored hashes.
+// Saved skill revisions and Workshop drafts, support files, and rollback receipts
+// share stored hashes.
 // OpenClaw owns their validation and target relocation; rewriting even embedded
 // path text can invalidate the bundle or change the content restored by rollback.
 fn is_integrity_protected_history_path(state_root: &Path, path: &Path) -> bool {
-    path.strip_prefix(state_root)
-        .is_ok_and(|relative| relative.starts_with("skill-workshop"))
-        || is_legacy_audit_history_path(state_root, path)
+    path.strip_prefix(state_root).is_ok_and(|relative| {
+        relative.starts_with("skill-workshop") || relative.starts_with("skill-library")
+    }) || is_legacy_audit_history_path(state_root, path)
 }
 
 // A known source state can also occur inside a copied enclosing workspace.
@@ -2148,8 +2149,8 @@ fn is_integrity_protected_history_destination(
     )
 }
 
-fn integrity_protected_history_namespaces(state_root: &Path) -> [PathBuf; 3] {
-    ["skill-workshop", "logs", "audit"].map(|name| state_root.join(name))
+fn integrity_protected_history_namespaces(state_root: &Path) -> [PathBuf; 4] {
+    ["skill-workshop", "skill-library", "logs", "audit"].map(|name| state_root.join(name))
 }
 
 // Callers establish containment and supply forward resolution observations.
@@ -3338,6 +3339,14 @@ mod tests {
         let selected = state.join("selected.sqlite");
         symlink("logs/config-audit.jsonl", &selected).unwrap();
         assert!(classify(&selected));
+        assert!(!classify(&unprotected));
+
+        let library = temp.path().join("library");
+        fs::create_dir(&library).unwrap();
+        let payload = library.join("payload.sqlite");
+        fs::write(&payload, b"immutable fixture").unwrap();
+        symlink("../library", state.join("skill-library")).unwrap();
+        assert!(classify(&payload));
         assert!(!classify(&unprotected));
 
         fs::remove_file(&selected).unwrap();
