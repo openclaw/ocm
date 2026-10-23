@@ -347,11 +347,16 @@ pub(super) fn map_archived_config_include(
     if !path.is_absolute() {
         return None;
     }
-    let path = clean_path(path);
-    source_config_roots
-        .iter()
-        .find_map(|root| strip_archive_root_prefix(&path, root))
-        .map(|relative| clean_path(&target_config_root.join(relative)))
+    let normalized = clean_path(path);
+    let relative = source_config_roots.iter().find_map(|root| {
+        strip_archive_root_prefix(&normalized, root)
+            // A supplied home can contain symlink/.. components. Preserve its
+            // exact spelling: cleaning that root can name a different directory.
+            .or_else(|| strip_archive_root_prefix(path, root))
+    })?;
+    let target_root = clean_path(target_config_root);
+    let mapped = clean_path(&target_root.join(relative));
+    mapped.starts_with(&target_root).then_some(mapped)
 }
 
 fn validate_internal_migration_path(
@@ -558,8 +563,7 @@ pub(crate) fn resolve_plain_openclaw_workspaces(
     state_dir: &Path,
     env: &BTreeMap<String, String>,
 ) -> Result<OpenClawWorkspaceInventory, String> {
-    let source_alias =
-        clean_path(&std::path::absolute(state_dir).map_err(|error| error.to_string())?);
+    let source_alias = std::path::absolute(state_dir).map_err(|error| error.to_string())?;
     let state_dir = canonicalize_path_allow_missing(state_dir)?;
     let config_path = state_dir.join("openclaw.json");
     // Admit the explicitly supplied spelling, while keeping the canonical home

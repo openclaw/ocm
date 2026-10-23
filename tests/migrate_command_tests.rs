@@ -3525,7 +3525,12 @@ fn migrate_and_adopt_relocate_includes_through_a_source_home_alias() {
 #[test]
 fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
     for adopt in [false, true] {
-        for (relative_root, parent_source) in [(false, false), (true, false), (false, true)] {
+        for (relative_root, source_arg) in [
+            (false, "alias"),
+            (true, "alias"),
+            (false, "sub/../alias"),
+            (false, "hop/../plain-home"),
+        ] {
             let root = TestDir::new("migrate-alias-authored-includes");
             let env = ocm_env(&root);
             let source = root.child("source/plain-home");
@@ -3533,16 +3538,9 @@ fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
             fs::create_dir_all(&source).unwrap();
             std::os::unix::fs::symlink(&source, &alias).unwrap();
             fs::create_dir_all(root.child("sub")).unwrap();
-            let authored_alias = if parent_source {
-                root.child("sub/../alias")
-            } else {
-                alias.clone()
-            };
-            let source_arg = if parent_source {
-                "sub/../alias"
-            } else {
-                "alias"
-            };
+            fs::create_dir_all(root.child("source/deep")).unwrap();
+            std::os::unix::fs::symlink(root.child("source/deep"), root.child("hop")).unwrap();
+            let authored_alias = root.child(source_arg);
             let root_include = if relative_root {
                 std::path::PathBuf::from("./config/plugins.json")
             } else {
@@ -3616,16 +3614,25 @@ fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
 #[test]
 fn migrate_and_adopt_reject_escaping_and_unsupplied_include_aliases() {
     for adopt in [false, true] {
-        for escape in [false, true] {
+        for scenario in ["unsupplied", "escape", "parent-lookalike"] {
             let root = TestDir::new("migrate-include-alias-boundary");
             let env = ocm_env(&root);
             let source = root.child("source/plain-home");
             let alias = root.child("alias");
-            let outside = root.child("outside");
+            let outside = root.child("plain-home");
             support::write_text(&source.join("plugins.json"), "{\"enabled\":false}\n");
             support::write_text(&outside.join("plugins.json"), "{\"enabled\":true}\n");
             std::os::unix::fs::symlink(&source, &alias).unwrap();
-            let include = if escape {
+            let source_arg = if scenario == "parent-lookalike" {
+                fs::create_dir_all(root.child("source/deep")).unwrap();
+                std::os::unix::fs::symlink(root.child("source/deep"), root.child("hop")).unwrap();
+                root.child("hop/../plain-home")
+            } else {
+                alias.clone()
+            };
+            let include = if scenario == "parent-lookalike" {
+                outside.join("plugins.json")
+            } else if scenario == "escape" {
                 std::os::unix::fs::symlink(&outside, source.join("redirect")).unwrap();
                 alias.join("redirect/plugins.json")
             } else {
@@ -3641,14 +3648,14 @@ fn migrate_and_adopt_reject_escaping_and_unsupplied_include_aliases() {
                     "import",
                     "--name",
                     "copied",
-                    alias.to_str().unwrap(),
+                    source_arg.to_str().unwrap(),
                 ]
             } else {
-                vec!["migrate", "copied", alias.to_str().unwrap()]
+                vec!["migrate", "copied", source_arg.to_str().unwrap()]
             };
             let imported = run_ocm(root.path(), &env, &args);
             assert!(!imported.status.success());
-            let expected = if escape {
+            let expected = if scenario == "escape" {
                 "resolves outside the config directory"
             } else {
                 "escapes the config directory"
