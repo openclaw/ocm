@@ -2147,6 +2147,79 @@ fn adopt_import_rejects_a_symlinked_plugin_database_without_mutating_its_target(
     assert_eq!(fs::read(&external_database).unwrap(), external_before);
 }
 
+#[cfg(unix)]
+#[test]
+fn adopt_import_checks_copied_plugin_links_before_preserving_provenance() {
+    for absolute in [false, true] {
+        let root = TestDir::new("adopt-import-plugin-provenance-link");
+        let cwd = root.child("workspace");
+        let source_home = root.child("legacy-home/.openclaw");
+        let project = root.child("external-project");
+        fs::create_dir_all(&cwd).unwrap();
+        seed_plain_openclaw_home(&source_home);
+        fs::create_dir_all(&project).unwrap();
+        let payload = source_home.join("payload");
+        fs::create_dir_all(&payload).unwrap();
+        fs::write(payload.join("marker.txt"), "installed payload").unwrap();
+        fs::create_dir_all(source_home.join("extensions")).unwrap();
+        let installed = source_home.join("extensions/demo");
+        let link_target = if absolute {
+            payload.clone()
+        } else {
+            "../payload".into()
+        };
+        std::os::unix::fs::symlink(&link_target, &installed).unwrap();
+        seed_installed_plugin_index(
+            &source_home,
+            serde_json::json!({"demo": {
+                "source": "path", "installPath": installed, "sourcePath": project
+            }}),
+        );
+        let database = source_home.join("state/openclaw.sqlite");
+        let before = fs::read(&database).unwrap();
+        let env = ocm_env(&root);
+        let output = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "adopt",
+                "import",
+                "--name",
+                "mira",
+                source_home.to_str().unwrap(),
+                "--json",
+            ],
+        );
+        let target = root.child("ocm-home/envs/mira");
+        if absolute {
+            assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+            assert!(
+                stderr(&output).contains("could not be isolated"),
+                "{}",
+                stderr(&output)
+            );
+            assert!(!target.exists());
+        } else {
+            assert!(output.status.success(), "{}", stderr(&output));
+            let records = read_imported_plugin_install_records(&root, "mira");
+            let copied = std::path::Path::new(records["demo"]["installPath"].as_str().unwrap());
+            assert!(
+                fs::canonicalize(copied)
+                    .unwrap()
+                    .starts_with(fs::canonicalize(&target).unwrap())
+            );
+            assert_eq!(records["demo"]["sourcePath"], project.to_str().unwrap());
+            fs::write(copied.join("marker.txt"), "target update").unwrap();
+        }
+        assert_eq!(fs::read(&database).unwrap(), before);
+        assert_eq!(fs::read_link(&installed).unwrap(), link_target);
+        assert_eq!(
+            fs::read_to_string(payload.join("marker.txt")).unwrap(),
+            "installed payload"
+        );
+    }
+}
+
 #[test]
 fn adopt_import_rejects_external_plugin_paths_without_mutating_the_source() {
     for preferred in [

@@ -2454,7 +2454,11 @@ fn rewrite_plugin_install_records(
                     && !(field == "sourcePath" && has_owned_install);
                 continue;
             };
-            has_owned_install |= field == "installPath";
+            // An absolute source-internal link can still point back to the
+            // original home after copying. Prove ownership in the target too.
+            has_owned_install |= field == "installPath"
+                && existing_plugin_relative(&target_state_root.join(&relative), target_state_root)
+                    .is_some();
             record.insert(
                 field.to_string(),
                 Value::String(display_path(&target_state_root.join(&relative))),
