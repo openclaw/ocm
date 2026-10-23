@@ -330,6 +330,14 @@ restart. Other filesystems retain the fully verified copy path.
 Checkpoints contain secrets and share the source filesystem. Keep `OCM_HOME`
 private, allow enough space for checkpoint divergence plus a restore candidate,
 and retain an off-disk backup for disaster recovery.
+
+A symlinked environment root is resolved for capture so the checkpoint contains
+independent bytes; links inside the root remain links. Restore replaces the
+registered root entry with the captured directory. If that entry is a symlink,
+its former backing directory is left untouched. Older tree checkpoints whose
+artifact is itself a symlink are refused on restore: they did not retain
+historical contents. Create a new snapshot to protect the current contents.
+
 Snapshot removal validates that the stored environment, snapshot ID, and
 artifact path match the named snapshot before deleting anything. It takes the
 live metadata and checkpoint out of service together, then reports warnings if

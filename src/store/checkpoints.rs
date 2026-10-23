@@ -26,6 +26,7 @@ pub(crate) const STORAGE_TAR_ARCHIVE: &str = "tar-archive-v1";
 
 #[derive(Debug)]
 pub(crate) struct PreparedTreeCheckpoint {
+    requested_source: PathBuf,
     source: PathBuf,
     independent: Vec<PathBuf>,
     cleanup: CheckpointCleanup,
@@ -164,6 +165,14 @@ pub(crate) fn prepare_scoped_tree_checkpoint_in(
         ));
     }
 
+    // The admitted root names the environment contents, even when its final
+    // component is a directory link. Only resolve this boundary: links inside
+    // the tree retain their existing no-follow copy and verification semantics.
+    let requested_source = source.to_path_buf();
+    let resolved_source = fs::canonicalize(source).map_err(|error| error.to_string())?;
+    let source = resolved_source.as_path();
+    ensure_checkpoint_source(&requested_source, source)?;
+
     #[cfg(target_os = "macos")]
     let mut entries = prepare_entries(source, independent)?;
     #[cfg(not(target_os = "macos"))]
@@ -185,6 +194,7 @@ pub(crate) fn prepare_scoped_tree_checkpoint_in(
     };
 
     Ok(PreparedTreeCheckpoint {
+        requested_source,
         source: source.to_path_buf(),
         independent: independent.to_vec(),
         cleanup,
@@ -209,6 +219,7 @@ pub(crate) fn create_tree_checkpoint_from_preparation(
         ensure_dir(parent)?;
     }
 
+    ensure_checkpoint_source(&prepared.requested_source, &prepared.source)?;
     let candidate = prepared.cleanup.candidate();
     #[cfg(target_os = "macos")]
     if prepared.cloned {
@@ -220,6 +231,7 @@ pub(crate) fn create_tree_checkpoint_from_preparation(
             &prepared.independent,
         )?;
         sync_tree_root(&candidate)?;
+        ensure_checkpoint_source(&prepared.requested_source, &prepared.source)?;
         fs::rename(&candidate, destination).map_err(|error| error.to_string())?;
         return Ok(STORAGE_APFS_CLONE.to_string());
     }
@@ -234,11 +246,37 @@ pub(crate) fn create_tree_checkpoint_from_preparation(
     verify_selected_tree_checkpoint(&prepared.source, &candidate, &prepared.independent)?;
     verify_sqlite_databases(&candidate)?;
     sync_tree_root(&candidate)?;
+    ensure_checkpoint_source(&prepared.requested_source, &prepared.source)?;
     fs::rename(&candidate, destination).map_err(|error| error.to_string())?;
     Ok(STORAGE_FULL_COPY.to_string())
 }
 
+fn ensure_checkpoint_source(requested: &Path, resolved: &Path) -> Result<(), String> {
+    if fs::canonicalize(requested).map_err(|error| error.to_string())? != resolved
+        || !fs::symlink_metadata(resolved)
+            .map_err(|error| error.to_string())?
+            .is_dir()
+    {
+        return Err(format!(
+            "checkpoint source is not the prepared directory: {}",
+            display_path(requested)
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn copy_tree_checkpoint(source: &Path, destination: &Path) -> Result<(), String> {
+    // Historical checkpoints could contain only a link back to live state.
+    // Dereferencing those now cannot recover the bytes at capture time.
+    if !fs::symlink_metadata(source)
+        .map_err(|error| error.to_string())?
+        .is_dir()
+    {
+        return Err(format!(
+            "checkpoint artifact is not an independent directory: {}",
+            display_path(source)
+        ));
+    }
     let _ = create_tree_checkpoint(source, destination)?;
     Ok(())
 }
@@ -1348,6 +1386,7 @@ fn preserve_metadata(
 #[cfg(test)]
 mod tests {
     use std::fs;
+
     #[cfg(unix)]
     use std::os::unix::fs::FileTypeExt;
     use std::path::Path;
@@ -1358,6 +1397,40 @@ mod tests {
         prepare_tree_checkpoint, sqlite_primary_for_sidecar, verify_tree_checkpoint,
     };
     use crate::infra::tree_digest::inventory_tree;
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_refuses_root_alias_retargeted_after_preparation() {
+        for parent_alias in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let first = fixture.path().join("first");
+            let second = fixture.path().join("second");
+            for directory in [&first, &second] {
+                fs::create_dir_all(directory.join("home")).unwrap();
+                fs::write(directory.join("home/marker"), b"state").unwrap();
+            }
+            let alias = fixture.path().join("alias");
+            std::os::unix::fs::symlink(&first, &alias).unwrap();
+            let source = if parent_alias {
+                alias.join("home")
+            } else {
+                alias.clone()
+            };
+            let prepared = super::prepare_tree_checkpoint(&source).unwrap();
+            fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&second, &alias).unwrap();
+            let destination = fixture.path().join("checkpoint");
+            let error =
+                super::create_tree_checkpoint_from_preparation(prepared, &destination).unwrap_err();
+            assert!(
+                error.contains("checkpoint source is not the prepared directory"),
+                "{error}"
+            );
+            assert!(!destination.exists());
+            assert_eq!(fs::read(first.join("home/marker")).unwrap(), b"state");
+            assert_eq!(fs::read(second.join("home/marker")).unwrap(), b"state");
+        }
+    }
 
     #[test]
     fn selected_checkpoint_never_reads_independent_databases_in_clone_or_full_copy() {

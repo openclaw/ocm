@@ -1195,6 +1195,13 @@ sidecars, modes, symlinks, plugin data, and unknown future paths. Restore stages
 an exclusive candidate beside the live root and retains the displaced root
 until service acceptance; failed acceptance restores the displaced root.
 
+A symlinked environment root is resolved for capture so the checkpoint contains
+independent bytes; links inside the root remain links. Restore replaces the
+registered root entry with the captured directory. If that entry is a symlink,
+its former backing directory is left untouched. Older tree checkpoints whose
+artifact is itself a symlink are refused on restore: they did not retain
+historical contents. Create a new snapshot to protect the current contents.
+
 Unix sockets are transient process endpoints and are omitted from checkpoints,
 including inactive socket files left by stopped processes. Snapshot creation
 leaves source endpoints untouched. Restore does not recreate sockets; their
