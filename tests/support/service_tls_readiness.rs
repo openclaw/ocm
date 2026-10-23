@@ -18,11 +18,20 @@ impl ReadinessFixture {
     }
 
     fn with_native(mode: &str, certificate: &str, native: Option<&str>) -> Self {
+        Self::with_bind(mode, certificate, native, None)
+    }
+
+    fn with_bind(mode: &str, certificate: &str, native: Option<&str>, host: Option<&str>) -> Self {
         let root = TestDir::new("service-tls-readiness");
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
         let mut env = systemd_env(&root);
         env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
+        let listener_host = if host == Some("192.0.2.1") {
+            "127.0.0.1"
+        } else {
+            host.unwrap_or("127.0.0.1")
+        };
         env.insert(
             "OCM_INTERNAL_GATEWAY_READINESS_TIMEOUT_MS".into(),
             "3000".into(),
@@ -39,7 +48,8 @@ impl ReadinessFixture {
         write_executable_script(
             &launcher,
             &format!(
-                "#!/bin/sh\nexec {} {} {} {}\n",
+                "#!/bin/sh\nexport READINESS_BIND_HOST={}\nexec {} {} {} {}\n",
+                quote_posix(listener_host),
                 quote_posix(&node),
                 quote_posix(&path_string(&peer)),
                 quote_posix(mode),
@@ -48,12 +58,13 @@ impl ReadinessFixture {
         );
         let native_script = |behavior: &str| {
             format!(
-                "#!/usr/bin/env node\nconst peer = {};\nconst mode = {};\nconst behavior = {};\nconst requests = {};\nconst queries = {};\n{}",
+                "#!/usr/bin/env node\nconst peer = {};\nconst mode = {};\nconst behavior = {};\nconst requests = {};\nconst queries = {};\nprocess.env.READINESS_BIND_HOST = {};\n{}",
                 json!(peer),
                 json!(mode),
                 json!(behavior),
                 json!(root.child("requests.jsonl")),
                 json!(root.child("queries.jsonl")),
+                json!(listener_host),
                 include_str!("tls_native_config.mjs"),
             )
         };
@@ -138,6 +149,15 @@ impl ReadinessFixture {
                 "auth": {"mode": "token", "token": "synthetic-readiness-token"},
                 "tls": {"enabled": mode != "http"}}
         });
+        if let Some(host) = host {
+            config["gateway"]["bind"] = json!("custom");
+            config["gateway"]["customBindHost"] = json!(host);
+            if native.is_some() {
+                config["gateway"]["customBindHost"] = json!("${READINESS_DOTENV_HOST}");
+            } else if certificate == "include" {
+                config["gateway"]["customBindHost"] = json!("${READINESS_CONFIG_HOST}");
+            }
+        }
         // No configured private key exists: readiness requires the public leaf,
         // while the synthetic server keeps its own public test-only key.
         let mut paths = vec![cert.clone()];
@@ -150,11 +170,15 @@ impl ReadinessFixture {
                 "fixture-cert.pem"
             };
             fs::write(&dotenv, format!("# Native config owns dotenv parsing and interpolation.\nREADINESS_DOTENV_CERT=\"{initial_certificate}\" # public fixture certificate\n")).unwrap();
+            if let Some(host) = host {
+                let contents = fs::read_to_string(&dotenv).unwrap();
+                fs::write(&dotenv, format!("{contents}READINESS_DOTENV_HOST={host}\n")).unwrap();
+            }
             if native != Some("retry-generation") {
                 paths.push(dotenv);
             }
         } else if certificate == "include" {
-            config["env"] = json!({"vars": {"READINESS_CERT": "fixture-cert.pem"}});
+            config["env"] = json!({"vars": {"READINESS_CERT": "fixture-cert.pem", "READINESS_CONFIG_HOST": host.unwrap_or("127.0.0.1")}});
             config["gateway"]["tls"] = json!({"$include": "tls.json5"});
             let included = environment.join(".openclaw/tls.json5");
             fs::write(&included, "// Relative to the Gateway launch directory, not this file.\n{ enabled: true, certPath: '${READINESS_CERT}', }\n").unwrap();
@@ -1144,5 +1168,80 @@ fn service_readiness_native_http_override_completes_initial_partial_tls_decision
             .all(|request| request["path"] == "/health" && request["tls"] == false),
         "initial native HTTP decision did not reach the configured listener"
     );
+    fixture.stop();
+}
+
+// Linux exposes the whole 127/8 range without requiring an added interface alias.
+// macOS manager coverage remains in the ordinary loopback/TLS cases above.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_readiness_uses_custom_loopback_without_weakening_tls_or_health() {
+    for (mode, certificate, native, ready) in [
+        ("http", "explicit", None, true),
+        ("tls", "include", None, true),
+        ("tls", "native-root", Some("success"), true),
+        ("unhealthy-tls", "explicit", None, false),
+        ("tls", "wrong", None, false),
+    ] {
+        let fixture = ReadinessFixture::with_bind(mode, certificate, native, Some("127.0.0.2"));
+        let started = fixture.action(&["service", "start", "demo", "--json"], ready);
+        if ready {
+            let restarted =
+                fixture.action(&["service", "restart", "demo", "--force", "--json"], true);
+            assert_ne!(started["childPid"], restarted["childPid"]);
+        }
+        if certificate == "wrong" {
+            assert!(
+                !fixture.root.child("requests.jsonl").exists(),
+                "sent HTTP before authenticating TLS"
+            );
+        } else {
+            let requests = fs::read_to_string(fixture.root.child("requests.jsonl")).unwrap();
+            assert!(requests.lines().all(|line| {
+                let request: Value = serde_json::from_str(line).unwrap();
+                request["host"] == format!("127.0.0.2:{}", fixture._port.0)
+                    && request["tls"] == (mode != "http")
+            }));
+        }
+        if native.is_some() {
+            let queries = fs::read_to_string(fixture.root.child("queries.jsonl")).unwrap();
+            assert_eq!(
+                queries.lines().count(),
+                2,
+                "one shared native lookup per start/restart child"
+            );
+        }
+        fixture.stop();
+    }
+}
+
+#[test]
+fn service_readiness_rejects_nonlocal_custom_host_even_with_a_loopback_listener() {
+    let fixture = ReadinessFixture::with_bind("http", "explicit", None, Some("192.0.2.1"));
+    fixture.action(&["service", "start", "demo", "--json"], false);
+    assert!(
+        !fixture.root.child("requests.jsonl").exists(),
+        "nonlocal configuration must not probe another listener"
+    );
+    fixture.stop();
+}
+
+#[test]
+fn service_readiness_uses_assigned_local_interface_address() {
+    let output = Command::new("node").args(["-p", "Object.values(require('node:os').networkInterfaces()).flat().find(a => a.family === 'IPv4' && !a.internal)?.address || ''"]).output().unwrap();
+    assert!(output.status.success());
+    let host = String::from_utf8(output.stdout).unwrap();
+    let host = host.trim();
+    if host.is_empty() {
+        eprintln!("no assigned non-loopback IPv4 interface on this host");
+        return;
+    }
+    let fixture = ReadinessFixture::with_bind("tls", "explicit", None, Some(host));
+    fixture.action(&["service", "start", "demo", "--json"], true);
+    let requests = fs::read_to_string(fixture.root.child("requests.jsonl")).unwrap();
+    assert!(requests.lines().all(|line| {
+        let request: Value = serde_json::from_str(line).unwrap();
+        request["host"] == format!("{host}:{}", fixture._port.0) && request["tls"] == true
+    }));
     fixture.stop();
 }

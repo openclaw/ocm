@@ -72,7 +72,7 @@ pub use layout::{
 pub(crate) use openclaw_config::{
     MinimumLocalConfig, OpenClawConfigAudit, OpenClawConfigRepair, audit_openclaw_config,
     clear_skip_bootstrap_for_openclaw_onboarding, dev_ui_gateway_base_path, dev_ui_gateway_url,
-    ensure_minimum_local_openclaw_config, gateway_readiness_certificate,
+    ensure_minimum_local_openclaw_config, gateway_readiness_certificate, gateway_readiness_host,
     normalize_new_environment_sandbox_origin, openclaw_config_include_paths,
     openclaw_config_uses_includes, prepare_minimum_local_openclaw_config,
     prepare_openclaw_config_repair, reject_include_owned_agent_workspaces,

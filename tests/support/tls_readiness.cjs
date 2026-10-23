@@ -87,6 +87,7 @@ if (process.argv[2] === "--certificate") {
   let activeServer;
   let switched = false;
   const port = Number(process.env.OPENCLAW_GATEWAY_PORT);
+  const host = process.env.READINESS_BIND_HOST || "127.0.0.1";
   const configureTimeouts = server => {
     server.requestTimeout = 2000;
     server.headersTimeout = 2000;
@@ -94,7 +95,7 @@ if (process.argv[2] === "--certificate") {
   };
   const handle = (request, response) => {
     fs.appendFileSync(log, JSON.stringify({pid: process.pid, path: request.url,
-      tls: !!request.socket.encrypted}) + "\n");
+      host: request.headers.host, tls: !!request.socket.encrypted}) + "\n");
     if (!switched && request.socket.encrypted &&
         (mode === "tls-then-missing" || mode === "tls-then-http-config")) {
       switched = true;
@@ -136,7 +137,7 @@ if (process.argv[2] === "--certificate") {
     }, handle);
     activeServer = server;
     configureTimeouts(server);
-    server.listen(port, "127.0.0.1", () => {
+    server.listen(port, host, () => {
       fs.writeFileSync(log + ".listening", JSON.stringify({pid: process.pid, tls: !plain}));
     });
   }

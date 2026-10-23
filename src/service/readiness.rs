@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::inspect::{ServiceSummary, service_readiness_observation};
 use crate::env::{EnvMeta, EnvironmentService, ExecutionBinding, resolve_execution_binding};
-use crate::store::gateway_readiness_certificate;
+use crate::store::{gateway_readiness_certificate, gateway_readiness_host};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -118,28 +118,36 @@ fn wait_for_gateway_readiness_with_timeout(
                     if let Some(Err(error)) = &native_gateway_config {
                         return Err(error.clone());
                     }
-                    gateway_readiness_certificate(
+                    let mut resolve_native = || {
+                        native_gateway_config
+                            .get_or_insert_with(|| {
+                                resolve_native_gateway_config(
+                                    &meta,
+                                    Path::new(&child.run_dir),
+                                    &child.process_env,
+                                    cwd,
+                                    observation_deadline,
+                                    interrupt_generation,
+                                )
+                            })
+                            .clone()
+                    };
+                    let certificate = gateway_readiness_certificate(
                         &meta,
                         port,
                         Path::new(&child.run_dir),
                         &child.process_env,
                         &mut known_tls,
-                        || {
-                            native_gateway_config
-                                .get_or_insert_with(|| {
-                                    resolve_native_gateway_config(
-                                        &meta,
-                                        Path::new(&child.run_dir),
-                                        &child.process_env,
-                                        cwd,
-                                        observation_deadline,
-                                        interrupt_generation,
-                                    )
-                                })
-                                .clone()
-                        },
-                    )
-                    .and_then(|certificate| gateway_health_ok(port, certificate, observation_deadline))
+                        &mut resolve_native,
+                    )?;
+                    let host = gateway_readiness_host(
+                        &meta,
+                        port,
+                        Path::new(&child.run_dir),
+                        &child.process_env,
+                        &mut resolve_native,
+                    )?;
+                    gateway_health_ok(host, port, certificate, observation_deadline)
                 })
         } else {
             Ok(false)
@@ -371,13 +379,97 @@ impl Write for ProbeSocket {
     }
 }
 
+// Query interface assignments rather than testing bind(): nonlocal bind can be
+// enabled by the OS. No hostname lookup or network request authorizes a target.
+#[cfg(unix)]
+fn is_local_ipv4(host: Ipv4Addr) -> Result<bool, String> {
+    let mut addresses = std::ptr::null_mut();
+    // SAFETY: getifaddrs initializes the list on success; all pointers remain
+    // valid until the single freeifaddrs below, including on a found address.
+    unsafe {
+        if libc::getifaddrs(&mut addresses) != 0 {
+            return Err("Cannot inspect local Gateway interface addresses".to_string());
+        }
+        let mut current = addresses;
+        let mut found = false;
+        while !current.is_null() {
+            let address = (*current).ifa_addr;
+            if !address.is_null() && (*address).sa_family as i32 == libc::AF_INET {
+                let address = &*address.cast::<libc::sockaddr_in>();
+                if Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()) == host {
+                    found = true;
+                    break;
+                }
+            }
+            current = (*current).ifa_next;
+        }
+        libc::freeifaddrs(addresses);
+        Ok(found)
+    }
+}
+
+#[cfg(windows)]
+fn is_local_ipv4(host: Ipv4Addr) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetIpAddrTable, MIB_IPADDRROW_XP, MIB_IPADDRTABLE,
+    };
+    let mut bytes = 0;
+    // SAFETY: the first call obtains the size. u32 storage provides the table's
+    // alignment; the bounded retry handles an interface change between calls.
+    unsafe {
+        if GetIpAddrTable(std::ptr::null_mut(), &mut bytes, 0) != ERROR_INSUFFICIENT_BUFFER {
+            return Err("Cannot inspect local Gateway interface addresses".to_string());
+        }
+        for _ in 0..3 {
+            if bytes as usize > 1024 * 1024
+                || (bytes as usize) < std::mem::size_of::<MIB_IPADDRTABLE>()
+            {
+                return Err("Invalid local Gateway interface address table size".to_string());
+            }
+            let mut storage = vec![0u32; (bytes as usize).div_ceil(4)];
+            let table = storage.as_mut_ptr().cast::<MIB_IPADDRTABLE>();
+            match GetIpAddrTable(table, &mut bytes, 0) {
+                ERROR_INSUFFICIENT_BUFFER => continue,
+                NO_ERROR => {
+                    let count = (*table).dwNumEntries as usize;
+                    let offset = std::mem::offset_of!(MIB_IPADDRTABLE, table);
+                    if count
+                        > (storage.len() * 4 - offset) / std::mem::size_of::<MIB_IPADDRROW_XP>()
+                    {
+                        return Err("Invalid local Gateway interface address table".to_string());
+                    }
+                    let rows = std::slice::from_raw_parts(
+                        std::ptr::addr_of!((*table).table).cast::<MIB_IPADDRROW_XP>(),
+                        count,
+                    );
+                    return Ok(rows
+                        .iter()
+                        .any(|row| Ipv4Addr::from(row.dwAddr.to_ne_bytes()) == host));
+                }
+                _ => break,
+            }
+        }
+    }
+    Err("Cannot inspect local Gateway interface addresses".to_string())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_local_ipv4(_host: Ipv4Addr) -> Result<bool, String> {
+    Err("Local Gateway interface inspection is unavailable on this platform".to_string())
+}
+
 fn gateway_health_ok(
+    host: Ipv4Addr,
     port: u32,
     certificate: Option<Vec<u8>>,
     readiness_deadline: Instant,
 ) -> Result<bool, String> {
     if port == 0 || port > u16::MAX as u32 {
         return Ok(false);
+    }
+    if !host.is_loopback() && !is_local_ipv4(host)? {
+        return Err("Gateway custom bind address is not assigned to a local interface".to_string());
     }
     let now = Instant::now();
     // The caller owns any late-observation grace. Bound IO within its remaining
@@ -389,7 +481,7 @@ fn gateway_health_ok(
     if connect_timeout.is_zero() {
         return Ok(false);
     }
-    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port as u16);
+    let addr = SocketAddrV4::new(host, port as u16);
     let Ok(stream) = TcpStream::connect_timeout(&addr.into(), connect_timeout) else {
         return Ok(false);
     };
@@ -406,11 +498,9 @@ fn gateway_health_ok(
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
-        let mut connection = rustls::ClientConnection::new(
-            Arc::new(config),
-            ServerName::IpAddress(Ipv4Addr::LOCALHOST.into()),
-        )
-        .map_err(|error| error.to_string())?;
+        let mut connection =
+            rustls::ClientConnection::new(Arc::new(config), ServerName::IpAddress(host.into()))
+                .map_err(|error| error.to_string())?;
         // Authenticate the handshake before submitting the health request.
         while connection.is_handshaking() {
             if connection.complete_io(&mut socket).is_err() {
@@ -419,16 +509,17 @@ fn gateway_health_ok(
         }
         Ok(health_response_ok(
             &mut rustls::Stream::new(&mut connection, &mut socket),
+            host,
             port,
         ))
     } else {
-        Ok(health_response_ok(&mut socket, port))
+        Ok(health_response_ok(&mut socket, host, port))
     }
 }
 
-fn health_response_ok(stream: &mut (impl Read + Write), port: u32) -> bool {
+fn health_response_ok(stream: &mut (impl Read + Write), host: Ipv4Addr, port: u32) -> bool {
     let request =
-        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        format!("GET /health HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
     if stream.write_all(request.as_bytes()).is_err() || stream.flush().is_err() {
         return false;
     }

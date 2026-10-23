@@ -41,6 +41,10 @@ function fixtureGateway() {
     gateway.tls.certPath = gateway.tls.certPath.replace(/\$\{([^}]+)\}/g,
       (_, name) => environment[name] ?? '');
   }
+  if (typeof gateway.customBindHost === 'string') {
+    gateway.customBindHost = gateway.customBindHost.replace(/\$\{([^}]+)\}/g,
+      (_, name) => environment[name] ?? '');
+  }
   return gateway;
 }
 

@@ -1007,6 +1007,99 @@ fn minimum_local_config_value(
 }
 
 /// Resolve only public TLS material; the Gateway owns key loading and generation.
+/// Resolve only the bind settings needed by readiness, using launch authority.
+/// The readiness owner verifies that a selected address belongs to this host.
+pub(crate) fn gateway_readiness_host(
+    meta: &EnvMeta,
+    port: u32,
+    run_dir: &Path,
+    env: &BTreeMap<String, String>,
+    resolve_native: impl FnOnce() -> Result<Option<Value>, String>,
+) -> Result<std::net::Ipv4Addr, String> {
+    let paths = derive_env_paths(Path::new(&meta.root));
+    let context = OpenClawConfigReadContext::for_launch(env, run_dir)?;
+    let local = (|| -> Result<Value, OpenClawConfigReadError> {
+        let mut gateway = Map::new();
+        for field in ["bind", "customBindHost"] {
+            if field == "customBindHost"
+                && gateway.get("bind").and_then(Value::as_str) != Some("custom")
+                && !gateway
+                    .get("bind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v.contains("${"))
+            {
+                break;
+            }
+            if let Some(value) =
+                read_openclaw_config_field(&paths.config_path, &["gateway", field], &context)
+                    .value?
+            {
+                gateway.insert(field.to_string(), value);
+            }
+        }
+        Ok(json!({"gateway": gateway}))
+    })();
+    let templated = local.as_ref().ok().is_some_and(|config| {
+        ["bind", "customBindHost"].iter().any(|field| {
+            config["gateway"][field]
+                .as_str()
+                .is_some_and(|v| v.contains("${"))
+        })
+    });
+    let native = if matches!(&local, Err(OpenClawConfigReadError::OutsideAuthority(_))) || templated
+    {
+        resolve_native()?
+    } else {
+        None
+    };
+    let config = match native {
+        Some(gateway) => json!({"gateway": gateway}),
+        None => {
+            let mut config = match local {
+                Ok(config) => config,
+                // Preserve opaque launchers' existing loopback destination.
+                Err(OpenClawConfigReadError::OutsideAuthority(_)) => {
+                    return Ok(std::net::Ipv4Addr::LOCALHOST);
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            if templated {
+                if let Some(values) =
+                    read_openclaw_config_field(&paths.config_path, &["env"], &context)
+                        .value
+                        .map_err(|error| error.to_string())?
+                {
+                    config["env"] = values;
+                }
+                config = resolve_openclaw_config_env(
+                    config,
+                    env,
+                    &paths.openclaw_home,
+                    &paths.state_dir,
+                    &paths.config_path,
+                    OpenClawWorkspaceRuntime::for_env(&meta.name, Some(port)),
+                );
+            }
+            config
+        }
+    };
+    let gateway = &config["gateway"];
+    if gateway.get("bind").and_then(Value::as_str) == Some("custom") {
+        // Native custom binds accept IPv4 literals only; never resolve DNS.
+        let host = gateway
+            .get("customBindHost")
+            .and_then(Value::as_str)
+            .and_then(|host| host.trim().parse::<std::net::Ipv4Addr>().ok())
+            .ok_or("Gateway custom bind host must be an IPv4 address")?;
+        return Ok(if host.is_unspecified() {
+            std::net::Ipv4Addr::LOCALHOST
+        } else {
+            host
+        });
+    }
+    Ok(std::net::Ipv4Addr::LOCALHOST)
+}
+
 pub(crate) fn gateway_readiness_certificate(
     meta: &EnvMeta,
     port: u32,
