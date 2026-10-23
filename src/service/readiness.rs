@@ -505,8 +505,21 @@ fn gateway_bind_health_ok(
     // Native tailnet mode can retain a loopback fallback chosen before an
     // interface appeared; newer Gateways also keep a second loopback listener.
     // Preserve that existing local probe and share one IO budget with tailnet.
-    let deadline = readiness_deadline.min(Instant::now() + GATEWAY_READINESS_PROBE_BUDGET);
-    let loopback = gateway_health_ok(Ipv4Addr::LOCALHOST, port, certificate.clone(), deadline);
+    let now = Instant::now();
+    let deadline = readiness_deadline.min(now + GATEWAY_READINESS_PROBE_BUDGET);
+    // A trickling first listener must not consume the second listener's chance
+    // to answer. Reserve half of the remaining budget when both are candidates.
+    let loopback_deadline = if tailnet.is_some() {
+        now + deadline.saturating_duration_since(now) / 2
+    } else {
+        deadline
+    };
+    let loopback = gateway_health_ok(
+        Ipv4Addr::LOCALHOST,
+        port,
+        certificate.clone(),
+        loopback_deadline,
+    );
     if matches!(loopback, Ok(true)) {
         return loopback;
     }
