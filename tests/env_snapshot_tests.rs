@@ -685,6 +685,9 @@ fn env_snapshot_restore_preserves_registered_root_access_links() {
         let created = run_ocm(cwd, &env, &["env", "create", "parent"]);
         assert!(created.status.success(), "{}", stderr(&created));
         let parent = get_environment("parent", &env, cwd).unwrap();
+        let actual_parent = root.child("actual-parent");
+        fs::rename(&parent.root, &actual_parent).unwrap();
+        std::os::unix::fs::symlink(&actual_parent, &parent.root).unwrap();
         let captured = run_ocm(
             cwd,
             &env,
@@ -692,9 +695,6 @@ fn env_snapshot_restore_preserves_registered_root_access_links() {
         );
         assert!(captured.status.success(), "{}", stderr(&captured));
         let snapshot: Value = serde_json::from_slice(&captured.stdout).unwrap();
-        let actual_parent = root.child("actual-parent");
-        fs::rename(&parent.root, &actual_parent).unwrap();
-        std::os::unix::fs::symlink(&actual_parent, &parent.root).unwrap();
         let child_root = if through_alias {
             Path::new(&parent.root).join("child")
         } else {
@@ -4005,4 +4005,136 @@ fn env_snapshot_restore_displaces_root_entries_without_following_links() {
                 .any(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_snapshot_captures_root_alias_contents_independently() {
+    use std::os::unix::fs::symlink;
+
+    for layout in ["ordinary", "parent", "absolute", "relative"] {
+        let root = TestDir::new("snapshot-root-alias");
+        let cwd = root.path();
+        let env = ocm_env(&root);
+        let backing = root.child("backing");
+        fs::create_dir(&backing).unwrap();
+        let live = match layout {
+            "ordinary" => backing.clone(),
+            "parent" => {
+                symlink(&backing, root.child("alias")).unwrap();
+                root.child("alias/home")
+            }
+            _ => {
+                symlink(
+                    if layout == "relative" {
+                        Path::new("backing")
+                    } else {
+                        &backing
+                    },
+                    root.child("alias"),
+                )
+                .unwrap();
+                root.child("alias")
+            }
+        };
+        let create = run_ocm(
+            cwd,
+            &env,
+            &["env", "create", "source", "--root", &path_string(&live)],
+        );
+        assert!(create.status.success(), "{layout}: {}", stderr(&create));
+        let marker = live.join(".openclaw/workspace/marker");
+        fs::write(&marker, b"before").unwrap();
+        let external = root.child("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("keep"), b"external").unwrap();
+        symlink(&external, live.join("borrowed")).unwrap();
+        let capture = run_ocm(
+            cwd,
+            &env,
+            &["env", "snapshot", "create", "source", "--json"],
+        );
+        assert!(capture.status.success(), "{layout}: {}", stderr(&capture));
+        let snapshot: Value = serde_json::from_slice(&capture.stdout).unwrap();
+        let checkpoint = Path::new(snapshot["archivePath"].as_str().unwrap());
+        assert!(fs::symlink_metadata(checkpoint).unwrap().is_dir());
+        fs::write(&marker, b"after").unwrap();
+        assert_eq!(
+            fs::read(checkpoint.join(".openclaw/workspace/marker")).unwrap(),
+            b"before"
+        );
+        assert_eq!(
+            fs::read_link(checkpoint.join("borrowed")).unwrap(),
+            external
+        );
+        let restore = run_ocm(
+            cwd,
+            &env,
+            &[
+                "env",
+                "snapshot",
+                "restore",
+                "source",
+                snapshot["id"].as_str().unwrap(),
+            ],
+        );
+        assert!(restore.status.success(), "{layout}: {}", stderr(&restore));
+        assert_eq!(fs::read(&marker).unwrap(), b"before");
+        assert!(fs::symlink_metadata(&live).unwrap().is_dir());
+        assert_eq!(fs::read_link(live.join("borrowed")).unwrap(), external);
+        assert_eq!(fs::read(external.join("keep")).unwrap(), b"external");
+        if matches!(layout, "absolute" | "relative") {
+            // Restore replaces the link entry, never the unowned backing tree.
+            assert_eq!(
+                fs::read(backing.join(".openclaw/workspace/marker")).unwrap(),
+                b"after"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_snapshot_restore_refuses_historical_live_alias_artifact() {
+    let root = TestDir::new("snapshot-historical-alias");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    let create = run_ocm(cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let meta = get_environment("source", &env, cwd).unwrap();
+    let marker = Path::new(&meta.root).join(".openclaw/workspace/marker");
+    fs::write(&marker, b"before").unwrap();
+    let capture = run_ocm(
+        cwd,
+        &env,
+        &["env", "snapshot", "create", "source", "--json"],
+    );
+    assert!(capture.status.success(), "{}", stderr(&capture));
+    let snapshot: Value = serde_json::from_slice(&capture.stdout).unwrap();
+    let checkpoint = Path::new(snapshot["archivePath"].as_str().unwrap());
+    fs::remove_dir_all(checkpoint).unwrap();
+    std::os::unix::fs::symlink(&meta.root, checkpoint).unwrap();
+    fs::write(&marker, b"after").unwrap();
+    let registry = env_registry_path(&env, cwd).unwrap();
+    let registry_before = fs::read(&registry).unwrap();
+    let restore = run_ocm(
+        cwd,
+        &env,
+        &[
+            "env",
+            "snapshot",
+            "restore",
+            "source",
+            snapshot["id"].as_str().unwrap(),
+        ],
+    );
+    assert!(!restore.status.success());
+    assert!(
+        stderr(&restore).contains("checkpoint artifact is not an independent directory"),
+        "{}",
+        stderr(&restore)
+    );
+    assert_eq!(fs::read(&marker).unwrap(), b"after");
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
+    assert_eq!(fs::read_link(checkpoint).unwrap(), Path::new(&meta.root));
 }
