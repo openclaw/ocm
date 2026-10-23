@@ -538,11 +538,21 @@ fn dev_rebind_waits_for_stopped_history_retirement() {
     let repo = init_openclaw_repo(&root);
     let mut env = service_env_with_gateway_admission(&root);
     install_fake_dev_runners(&root, &mut env);
-    for name in ["demo", "sibling"] {
+    // Stopped services leave their retained families unbound. Keep them below
+    // automatic allocation at 18789 so parallel fixture stores cannot probe them.
+    for (name, port) in [("demo", "16789"), ("sibling", "17789")] {
         let created = run_ocm(
             root.path(),
             &env,
-            &["dev", name, "--repo", &path_string(&repo), "--service"],
+            &[
+                "dev",
+                name,
+                "--repo",
+                &path_string(&repo),
+                "--service",
+                "--port",
+                port,
+            ],
         );
         assert!(created.status.success(), "{}", stderr(&created));
     }
