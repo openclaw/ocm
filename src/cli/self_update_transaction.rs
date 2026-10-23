@@ -413,7 +413,7 @@ impl Cli {
             return Err("staged candidate changed after verification".into());
         }
         validate_staged_binary(&candidate, &receipt.target_version)?;
-        let before = service.daemon_status()?;
+        let before = service.daemon_status_for_self_update()?;
         receipt.daemon_was_running = before.running;
         if before.running {
             let runtime = service.runtime()?;
