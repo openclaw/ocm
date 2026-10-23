@@ -983,6 +983,11 @@ directives stay relative. Includes outside
 the source home, including symlink escapes, remain rejected.
 The existing restrictions on include-owned agent workspaces and sandbox origins
 still apply.
+Migration and adoption also relocate installed-plugin records authored under either
+the supplied home spelling or its canonical path. This includes internal local
+plugins when the home is supplied through an alias. Payloads must remain inside
+the selected source home; external active paths and symlink escapes are rejected
+and the provisional target is removed.
 
 Clone does not copy dev source bindings. The usual next step is:
 
