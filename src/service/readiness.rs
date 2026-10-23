@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::CStr;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::Path;
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use super::inspect::{ServiceSummary, service_readiness_observation};
 use crate::env::{EnvMeta, EnvironmentService, ExecutionBinding, resolve_execution_binding};
-use crate::store::{gateway_readiness_certificate, gateway_readiness_host};
+use crate::store::{GatewayReadinessHost, gateway_readiness_certificate, gateway_readiness_host};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -147,7 +148,7 @@ fn wait_for_gateway_readiness_with_timeout(
                         &child.process_env,
                         &mut resolve_native,
                     )?;
-                    gateway_health_ok(host, port, certificate, observation_deadline)
+                    gateway_bind_health_ok(host, port, certificate, observation_deadline)
                 })
         } else {
             Ok(false)
@@ -382,7 +383,9 @@ impl Write for ProbeSocket {
 // Query interface assignments rather than testing bind(): nonlocal bind can be
 // enabled by the OS. No hostname lookup or network request authorizes a target.
 #[cfg(unix)]
-fn is_local_ipv4(host: Ipv4Addr) -> Result<bool, String> {
+fn visit_local_addresses(
+    mut visit: impl FnMut(&CStr, u32, Option<Ipv4Addr>) -> bool,
+) -> Result<(), String> {
     let mut addresses = std::mem::MaybeUninit::<*mut libc::ifaddrs>::uninit();
     // SAFETY: getifaddrs initializes the output slot on success; all pointers remain
     // valid until the single freeifaddrs below, including on a found address.
@@ -392,26 +395,138 @@ fn is_local_ipv4(host: Ipv4Addr) -> Result<bool, String> {
         }
         let addresses = addresses.assume_init();
         let mut current = addresses;
-        let mut found = false;
         while !current.is_null() {
             let address = (*current).ifa_addr;
-            if !address.is_null() && (*address).sa_family as i32 == libc::AF_INET {
-                let address = &*address.cast::<libc::sockaddr_in>();
-                if Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()) == host {
-                    found = true;
-                    break;
+            if !address.is_null() && !(*current).ifa_name.is_null() {
+                let family = (*address).sa_family as i32;
+                if family == libc::AF_INET || family == libc::AF_INET6 {
+                    let host = if family == libc::AF_INET {
+                        let address = &*address.cast::<libc::sockaddr_in>();
+                        Some(Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()))
+                    } else {
+                        None
+                    };
+                    if visit(
+                        CStr::from_ptr((*current).ifa_name),
+                        (*current).ifa_flags,
+                        host,
+                    ) {
+                        break;
+                    }
                 }
             }
             current = (*current).ifa_next;
         }
         libc::freeifaddrs(addresses);
-        Ok(found)
+        Ok(())
     }
 }
 
 #[cfg(not(unix))]
-fn is_local_ipv4(_host: Ipv4Addr) -> Result<bool, String> {
+fn visit_local_addresses(
+    _visit: impl FnMut(&CStr, u32, Option<Ipv4Addr>) -> bool,
+) -> Result<(), String> {
     Err("Local Gateway interface inspection is unavailable on this platform".to_string())
+}
+
+fn is_local_ipv4(host: Ipv4Addr) -> Result<bool, String> {
+    let mut found = false;
+    visit_local_addresses(|_, _, address| {
+        found = address == Some(host);
+        found
+    })?;
+    Ok(found)
+}
+
+// Object.values(os.networkInterfaces()) enumerates array-index names first in
+// numeric order, then other names in insertion order. IPv6 entries can establish
+// a name's insertion order even though only IPv4 is eligible for this listener.
+fn interface_order(name: &CStr, insertion_order: usize) -> (bool, usize) {
+    let index = name.to_str().ok().and_then(|name| {
+        name.parse::<u32>()
+            .ok()
+            .filter(|index| *index < u32::MAX && index.to_string() == name)
+    });
+    match index {
+        Some(index) => (false, index as usize),
+        None => (true, insertion_order),
+    }
+}
+
+fn tailnet_ipv4() -> Result<Option<Ipv4Addr>, String> {
+    let mut interfaces = BTreeMap::new();
+    let mut selected = None;
+    visit_local_addresses(|name, flags, host| {
+        if !is_external_interface(flags) {
+            return false;
+        }
+        let next = interfaces.len();
+        let order = *interfaces.entry(name.to_bytes().to_vec()).or_insert(next);
+        if let Some(host) = host.filter(|host| is_tailnet_interface(*host, flags)) {
+            let order = interface_order(name, order);
+            if selected.is_none_or(|(previous, _)| order < previous) {
+                selected = Some((order, host));
+            }
+        }
+        false
+    })?;
+    Ok(selected.map(|(_, host)| host))
+}
+
+// Match Node's external interface inventory and OpenClaw's 100.64.0.0/10
+// selection. An interface name or a bindable nonlocal address is not authority.
+#[cfg(unix)]
+fn is_external_interface(flags: u32) -> bool {
+    let required = (libc::IFF_UP | libc::IFF_RUNNING) as u32;
+    flags & required == required && flags & libc::IFF_LOOPBACK as u32 == 0
+}
+
+#[cfg(not(unix))]
+fn is_external_interface(_flags: u32) -> bool {
+    false
+}
+
+fn is_tailnet_interface(host: Ipv4Addr, flags: u32) -> bool {
+    is_external_interface(flags) && host.octets()[0] == 100 && (64..128).contains(&host.octets()[1])
+}
+
+fn gateway_bind_health_ok(
+    host: GatewayReadinessHost,
+    port: u32,
+    certificate: Option<Vec<u8>>,
+    readiness_deadline: Instant,
+) -> Result<bool, String> {
+    let tailnet = match host {
+        GatewayReadinessHost::Address(host) => {
+            return gateway_health_ok(host, port, certificate, readiness_deadline);
+        }
+        GatewayReadinessHost::Tailnet => tailnet_ipv4()?,
+    };
+    // Native tailnet mode can retain a loopback fallback chosen before an
+    // interface appeared; newer Gateways also keep a second loopback listener.
+    // Preserve that existing local probe and share one IO budget with tailnet.
+    let now = Instant::now();
+    let deadline = readiness_deadline.min(now + GATEWAY_READINESS_PROBE_BUDGET);
+    // A trickling first listener must not consume the second listener's chance
+    // to answer. Reserve half of the remaining budget when both are candidates.
+    let loopback_deadline = if tailnet.is_some() {
+        now + deadline.saturating_duration_since(now) / 2
+    } else {
+        deadline
+    };
+    let loopback = gateway_health_ok(
+        Ipv4Addr::LOCALHOST,
+        port,
+        certificate.clone(),
+        loopback_deadline,
+    );
+    if matches!(loopback, Ok(true)) {
+        return loopback;
+    }
+    match tailnet {
+        Some(host) => gateway_health_ok(host, port, certificate, deadline),
+        None => loopback,
+    }
 }
 
 fn gateway_health_ok(
@@ -424,7 +539,7 @@ fn gateway_health_ok(
         return Ok(false);
     }
     if !host.is_loopback() && !is_local_ipv4(host)? {
-        return Err("Gateway custom bind address is not assigned to a local interface".to_string());
+        return Err("Gateway bind address is not assigned to a local interface".to_string());
     }
     let now = Instant::now();
     // The caller owns any late-observation grace. Bound IO within its remaining
@@ -526,6 +641,44 @@ fn should_wait_for_scheduled_gateway_retry(
 #[cfg(test)]
 mod tests {
     use super::should_wait_for_scheduled_gateway_retry;
+
+    #[test]
+    fn interface_order_matches_native_numeric_names() {
+        use super::interface_order;
+        use std::ffi::CString;
+        for (name, expected) in [
+            ("0", (false, 0)),
+            ("1", (false, 1)),
+            ("4294967294", (false, 4294967294)),
+            ("01", (true, 7)),
+            ("-1", (true, 7)),
+            ("4294967295", (true, 7)),
+            ("tailscale0", (true, 7)),
+        ] {
+            assert_eq!(interface_order(&CString::new(name).unwrap(), 7), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tailnet_selection_requires_an_active_external_cgnat_assignment() {
+        use super::is_tailnet_interface;
+        use std::net::Ipv4Addr;
+        let active = (libc::IFF_UP | libc::IFF_RUNNING) as u32;
+        for host in ["100.64.0.0", "100.100.100.1", "100.127.255.255"] {
+            let host = host.parse::<Ipv4Addr>().unwrap();
+            assert!(is_tailnet_interface(host, active));
+            assert!(!is_tailnet_interface(host, libc::IFF_UP as u32));
+            assert!(!is_tailnet_interface(host, libc::IFF_RUNNING as u32));
+            assert!(!is_tailnet_interface(
+                host,
+                active | libc::IFF_LOOPBACK as u32
+            ));
+        }
+        for host in ["100.63.255.255", "100.128.0.0", "127.0.0.1", "192.0.2.1"] {
+            assert!(!is_tailnet_interface(host.parse().unwrap(), active));
+        }
+    }
 
     #[test]
     fn scheduled_retry_allows_only_the_observed_next_attempt() {

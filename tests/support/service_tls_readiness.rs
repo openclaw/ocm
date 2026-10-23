@@ -22,6 +22,16 @@ impl ReadinessFixture {
     }
 
     fn with_bind(mode: &str, certificate: &str, native: Option<&str>, host: Option<&str>) -> Self {
+        Self::with_binding(mode, certificate, native, host, false)
+    }
+
+    fn with_binding(
+        mode: &str,
+        certificate: &str,
+        native: Option<&str>,
+        host: Option<&str>,
+        tailnet: bool,
+    ) -> Self {
         let root = TestDir::new("service-tls-readiness");
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
@@ -157,6 +167,13 @@ impl ReadinessFixture {
             } else if certificate == "include" {
                 config["gateway"]["customBindHost"] = json!("${READINESS_CONFIG_HOST}");
             }
+        }
+        if tailnet {
+            config["gateway"]["bind"] = json!("tailnet");
+            config["gateway"]
+                .as_object_mut()
+                .unwrap()
+                .remove("customBindHost");
         }
         // No configured private key exists: readiness requires the public leaf,
         // while the synthetic server keeps its own public test-only key.
@@ -1244,4 +1261,39 @@ fn service_readiness_uses_assigned_local_interface_address() {
         request["host"] == format!("{host}:{}", fixture._port.0) && request["tls"] == true
     }));
     fixture.stop();
+}
+
+#[test]
+fn service_readiness_uses_tailnet_selection_with_native_tls_and_loopback_fallback() {
+    // Use the native inventory even on CI hosts without a tailnet assignment.
+    // The isolated namespace proof exercises the assigned-CGNAT pinned runtime.
+    let output = Command::new("node").args(["-p", "Object.values(require('node:os').networkInterfaces()).flat().find(a => a.family === 'IPv4' && !a.internal && a.address.split('.')[0] === '100' && +a.address.split('.')[1] >= 64 && +a.address.split('.')[1] < 128)?.address || '127.0.0.1'"]).output().unwrap();
+    assert!(output.status.success());
+    let host = String::from_utf8(output.stdout).unwrap();
+    let host = host.trim();
+    for (mode, certificate, native, ready) in [
+        ("http", "explicit", None, true),
+        ("tls", "native-root", Some("success"), true),
+        ("tls", "wrong", None, false),
+    ] {
+        let fixture = ReadinessFixture::with_binding(mode, certificate, native, Some(host), true);
+        let started = fixture.action(&["service", "start", "demo", "--json"], ready);
+        if ready {
+            let restarted =
+                fixture.action(&["service", "restart", "demo", "--force", "--json"], true);
+            assert_ne!(started["childPid"], restarted["childPid"]);
+            let requests = fs::read_to_string(fixture.root.child("requests.jsonl")).unwrap();
+            assert!(requests.lines().all(|line| {
+                let request: Value = serde_json::from_str(line).unwrap();
+                request["host"] == format!("{host}:{}", fixture._port.0)
+                    && request["tls"] == (mode != "http")
+            }));
+        } else {
+            assert!(
+                !fixture.root.child("requests.jsonl").exists(),
+                "sent HTTP before authenticating TLS"
+            );
+        }
+        fixture.stop();
+    }
 }

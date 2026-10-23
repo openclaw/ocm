@@ -544,8 +544,12 @@ Use `service install` when you want a background service for an environment that
 Service readiness requests `/health` on the local Gateway port using the
 configured transport. A `gateway.bind: "custom"` with an IPv4
 `gateway.customBindHost` assigned to this machine uses that address, including for pinned runtimes that
-do not add a second listener on `127.0.0.1`. Other bindings and the wildcard `0.0.0.0` retain the
-`127.0.0.1` probe. Custom loopback addresses are local; other custom addresses
+do not add a second listener on `127.0.0.1`. A `gateway.bind: "tailnet"` uses the
+native Gateway's first IPv4 address in `100.64.0.0/10` on an active external
+local interface. It also retains the loopback probe for the native fallback and
+newer Gateways' second listener, including when an interface appears after a
+Gateway started on loopback. Both probes share one time budget. Other bindings and the wildcard `0.0.0.0`
+retain the `127.0.0.1` probe. Custom loopback addresses are local; other selected addresses
 are checked against OS interface assignments before connecting. Nonlocal
 addresses or failed interface inspection keep the Gateway unready. Readiness
 never resolves hostnames or connects to a remote address. Bind settings use the same supervised launch context, authorized
