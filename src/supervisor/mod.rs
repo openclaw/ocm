@@ -954,6 +954,12 @@ impl<'a> SupervisorService<'a> {
     pub(crate) fn daemon_status_for_activation(&self) -> Result<SupervisorDaemonSummary, String> {
         self.daemon_summary("status", true)
     }
+    pub(crate) fn daemon_status_for_self_update(&self) -> Result<SupervisorDaemonSummary, String> {
+        // Like ownership recovery, replacement must preserve unknown observation
+        // and reject a loaded job whose definition cannot be verified.
+        self.daemon_summary_with_inspector("status", inspect_job_for_recovery)
+            .map_err(|error| format!("{error}; self-update requires a known daemon state. Restore service-manager access or wait for its state to settle, then retry"))
+    }
 
     fn build_state(&self) -> Result<SupervisorState, String> {
         ensure_store(self.env, self.cwd)?;

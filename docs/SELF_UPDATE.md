@@ -7,6 +7,17 @@ replaces the CLI, refreshes a running daemon, and checks the daemon version and
 HTTP readiness of previously running managed gateways. It leaves the persisted
 desired service state intact. An absent or stopped daemon stays stopped.
 
+An installation with no service definition, supervisor plan, or runtime record
+can update without a user service manager. Once any of that managed state exists,
+the helper requires a readable service-manager observation with a known daemon
+state and, for a loaded daemon, the expected service definition before replacing
+the CLI. Failed reads or ambiguous states fail the transaction before
+publication, leaving the installed CLI and running daemon unchanged. Restore
+service-manager access or let its state settle, then retry the update. A terminal
+`failed` receipt needs no rollback; `--recover` leaves that receipt unchanged.
+Refresh and rollback still wait for a readable running daemon with the expected
+version; failed observations cannot establish successful convergence.
+
 The refresh briefly interrupts gateways, including a gateway hosting the caller.
 The helper runs in a separate session with detached standard streams, so it does
 not need the caller to remain connected. On Linux, a helper inside the OCM

@@ -413,9 +413,10 @@ impl Cli {
             return Err("staged candidate changed after verification".into());
         }
         validate_staged_binary(&candidate, &receipt.target_version)?;
-        let before = service.daemon_status()?;
-        receipt.daemon_was_running = before.running;
-        if before.running {
+        // Never-managed installations do not require a usable user service manager.
+        receipt.daemon_was_running =
+            service.has_daemon_state()? && service.daemon_status_for_self_update()?.running;
+        if receipt.daemon_was_running {
             let runtime = service.runtime()?;
             if !runtime.present
                 || runtime.daemon_version.as_deref() != Some(&receipt.current_version)

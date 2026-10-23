@@ -169,6 +169,10 @@ if (args[0] === 'managername') {{ console.log('Aqua'); process.exit(0); }}
 if (args[0] === 'print-disabled' || args[0] === 'enable') process.exit(0);
 if (args[0] === 'print') {{
   if (/^(gui|user)\/[0-9]+$/.test(args[1])) process.exit(0);
+  if (fs.existsSync(root + '/observation-error')) {{ console.error('injected manager read failure'); process.exit(1); }}
+  if (fs.existsSync(root + '/observation-unknown')) process.exit(0);
+  if (fs.existsSync(root + '/observation-foreign')) {{ console.log('state = running\npid = 1\npath = ' + root + '/foreign-definition'); process.exit(0); }}
+  if (fs.existsSync(root + '/observation-stopped')) {{ console.log('state = not running\npath = ' + fs.readFileSync(definitionFile, 'utf8')); process.exit(0); }}
   const pid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, 'utf8')) : 0;
   if (pid && alive(pid)) {{ console.log('state = running\npid = ' + pid + '\npath = ' + fs.readFileSync(definitionFile, 'utf8')); process.exit(0); }}
   console.error('Could not find service "' + args[1].split('/').pop() + '" in domain for user gui'); process.exit(1);
@@ -390,6 +394,10 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
         );
         fs::write(&definition, &original_definition).unwrap();
 
+        // Cover both confirmed absence and a loaded, positively stopped job.
+        if !relative {
+            fs::write(stopped.root.child("observation-stopped"), "yes").unwrap();
+        }
         let updated = stopped.run(&["self", "update", "--version", "9.9.9", "--json"]);
         assert!(
             updated.status.success(),
@@ -420,6 +428,92 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
     assert!(!managed_service_definition_path(&absent.env, absent.root.path(), "stopped").exists());
     assert!(!absent.root.child("ocm-home/ocm-home").exists());
     drop(absent);
+
+    let uncertain = Fixture::new(&candidate, "transaction-unknown-observation");
+    uncertain.setup_gateway();
+    let original_binary = file_sha256(&uncertain.binary).unwrap();
+    let original_pid = fs::read(uncertain.root.child("daemon.pid")).unwrap();
+    let original_state = fs::read(uncertain.root.child("ocm-home/supervisor/state.json")).unwrap();
+    let status: Value = serde_json::from_slice(
+        &uncertain
+            .run(&["service", "status", "running", "--json"])
+            .stdout,
+    )
+    .unwrap();
+    let original_gateway = status["childPid"].clone();
+    for (fault, error) in [
+        ("observation-error", "failed to inspect managed service"),
+        ("observation-unknown", "unknown process state"),
+        ("observation-foreign", "unverified definition path"),
+    ] {
+        fs::write(uncertain.root.child(fault), "yes").unwrap();
+        let manager_before = fs::read_to_string(uncertain.root.child("manager.log")).unwrap();
+        let result = uncertain.run(&["self", "update", "--version", "9.9.9", "--json"]);
+        assert!(!result.status.success(), "{fault}: update succeeded");
+        let receipt = uncertain.receipt();
+        assert_eq!(receipt["phase"], "failed", "{fault}: {}", stderr(&result));
+        assert!(
+            receipt["error"].as_str().unwrap().contains(error),
+            "{receipt}"
+        );
+        assert_eq!(file_sha256(&uncertain.binary).unwrap(), original_binary);
+        assert_eq!(
+            fs::read(uncertain.root.child("daemon.pid")).unwrap(),
+            original_pid
+        );
+        assert_eq!(
+            fs::read(uncertain.root.child("ocm-home/supervisor/state.json")).unwrap(),
+            original_state
+        );
+        let manager_after = fs::read_to_string(uncertain.root.child("manager.log")).unwrap();
+        for line in manager_after[manager_before.len()..].lines() {
+            assert!(
+                line.starts_with("print ") || line == "managername",
+                "{line}"
+            );
+        }
+        uncertain.wait_for_update_lock();
+        let recovered = uncertain.run(&["self", "update", "--recover"]);
+        assert!(!recovered.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&recovered.stdout).unwrap(),
+            receipt
+        );
+        assert_eq!(uncertain.receipt(), receipt);
+        assert_eq!(
+            fs::read_to_string(uncertain.root.child("manager.log")).unwrap(),
+            manager_after
+        );
+        fs::remove_file(uncertain.root.child(fault)).unwrap();
+        let status: Value = serde_json::from_slice(
+            &uncertain
+                .run(&["service", "status", "running", "--json"])
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(status["running"], true);
+        assert_eq!(status["childPid"], original_gateway);
+        assert_eq!(status["ocmServiceVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(status["ocmServiceVersionStatus"], "current");
+    }
+    let retried = uncertain.run(&["self", "update", "--version", "9.9.9", "--json"]);
+    assert!(retried.status.success(), "{}", stderr(&retried));
+    assert_eq!(uncertain.receipt()["phase"], "updated");
+    assert_eq!(uncertain.receipt()["daemonWasRunning"], true);
+    assert_ne!(
+        fs::read(uncertain.root.child("daemon.pid")).unwrap(),
+        original_pid
+    );
+    let status: Value = serde_json::from_slice(
+        &uncertain
+            .run(&["service", "status", "running", "--json"])
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(status["running"], true);
+    assert_eq!(status["ocmServiceVersion"], "9.9.9");
+    assert_eq!(status["ocmServiceVersionStatus"], "current");
+    drop(uncertain);
 
     // The source gateway launches the update in its own group. Refresh kills
     // that group, including the CLI. Only the detached retained helper survives.
