@@ -8,6 +8,10 @@ All notable changes to OCM are documented here.
 
 - Reject blocking OpenClaw finalization receipts before publishing a replacement runtime, including capability-consent errors returned with a successful exit status, while preserving nonblocking plugin warnings. Thanks @hannesrudolph (#132).
 
+### Changed
+
+- Refresh 28 compatible Rust dependencies, including ICU 2.4, ureq 3.5, plist 1.10.3, and Git configuration support, while retaining Rust 1.88 support.
+
 ## 0.3.6 - 2026-10-22
 
 **Highlights:** Safer recovery and migration, TLS-aware Gateway readiness, reliable targeted builds, and refreshed managed Node.js.
