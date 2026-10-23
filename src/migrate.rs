@@ -8,12 +8,13 @@ use serde::Serialize;
 use crate::env::{CreateEnvironmentOptions, EnvImportSummary, EnvironmentService};
 use crate::launcher::{AddLauncherOptions, LauncherService};
 use crate::store::{
-    MigrationWorkspaceCopy, OpenClawDirectoryCopy, OpenClawWorkspaceRuntime, default_env_root,
-    derive_env_paths, display_path, list_environments, normalize_new_environment_sandbox_origin,
-    prepare_migrated_runtime_state, reject_include_owned_agent_workspaces,
-    reject_include_owned_sandbox_origin, resolve_plain_openclaw_workspaces, resolve_user_home,
-    rewrite_copied_config_include_directives, rewrite_external_workspace_paths_for_migration,
-    rewrite_openclaw_config_for_migration, validate_name,
+    MigrationWorkspaceCopy, OpenClawDirectoryCopy, OpenClawWorkspaceRuntime, clean_path,
+    default_env_root, derive_env_paths, display_path, list_environments,
+    normalize_new_environment_sandbox_origin, prepare_migrated_runtime_state,
+    reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
+    resolve_plain_openclaw_workspaces, resolve_user_home, rewrite_copied_config_include_directives,
+    rewrite_external_workspace_paths_for_migration, rewrite_openclaw_config_for_migration,
+    validate_name,
 };
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -556,7 +557,7 @@ fn complete_migration_import(
         copied_configs.push(target_paths.config_path.clone());
         rewrite_copied_config_include_directives(
             &copied_configs,
-            &[source_home.to_path_buf(), canonical_source_home.clone()],
+            &[clean_path(source_home), canonical_source_home.clone()],
             &target_paths.state_dir,
         )?;
     }

@@ -3525,17 +3525,28 @@ fn migrate_and_adopt_relocate_includes_through_a_source_home_alias() {
 #[test]
 fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
     for adopt in [false, true] {
-        for relative_root in [false, true] {
+        for (relative_root, parent_source) in [(false, false), (true, false), (false, true)] {
             let root = TestDir::new("migrate-alias-authored-includes");
             let env = ocm_env(&root);
             let source = root.child("source/plain-home");
             let alias = root.child("alias");
             fs::create_dir_all(&source).unwrap();
             std::os::unix::fs::symlink(&source, &alias).unwrap();
+            fs::create_dir_all(root.child("sub")).unwrap();
+            let authored_alias = if parent_source {
+                root.child("sub/../alias")
+            } else {
+                alias.clone()
+            };
+            let source_arg = if parent_source {
+                "sub/../alias"
+            } else {
+                "alias"
+            };
             let root_include = if relative_root {
                 std::path::PathBuf::from("./config/plugins.json")
             } else {
-                alias.join("config/plugins.json")
+                authored_alias.join("config/plugins.json")
             };
             let files = [
                 (
@@ -3544,7 +3555,8 @@ fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
                 ),
                 (
                     "config/plugins.json",
-                    serde_json::json!({"$include": alias.join("config/leaf.json")}).to_string(),
+                    serde_json::json!({"$include": authored_alias.join("config/leaf.json")})
+                        .to_string(),
                 ),
                 ("config/leaf.json", "{\"enabled\":false}\n".to_string()),
             ];
@@ -3552,9 +3564,9 @@ fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
                 support::write_text(&source.join(path), contents);
             }
             let args = if adopt {
-                vec!["adopt", "import", "--name", "copied", "alias"]
+                vec!["adopt", "import", "--name", "copied", source_arg]
             } else {
-                vec!["migrate", "copied", "alias"]
+                vec!["migrate", "copied", source_arg]
             };
             let imported = run_ocm(root.path(), &env, &args);
             assert!(imported.status.success(), "{}", stderr(&imported));
