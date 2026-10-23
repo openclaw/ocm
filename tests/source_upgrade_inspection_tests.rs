@@ -1038,15 +1038,23 @@ fn source_update_ignores_independent_unfinished_dev_session() {
         "takeover",
         "job",
         "shared-global-config",
+        "shared-global-config-alias",
         "shared-local-config",
     ] {
         let root = TestDir::new("source-independent-session");
-        let (env, _) = execution_fixture(&root, false);
+        let (mut env, _) = execution_fixture(&root, false);
         let peer = source_session_peer(&root, &env, mode != "takeover", false);
         if mode.starts_with("shared-") {
             let settings = root.child("shared.gitconfig");
             write_text(&settings, "[user]\n name = Shared settings\n");
-            if mode == "shared-global-config" {
+            if mode == "shared-global-config-alias" {
+                // Like /var -> /private/var on macOS, this access alias's
+                // target contains both checkouts without either owning it.
+                let alias = root.child("home-parent-alias");
+                std::os::unix::fs::symlink(fs::canonicalize(root.path()).unwrap(), &alias).unwrap();
+                env.insert("HOME".to_string(), path_string(&alias.join("home")));
+            }
+            if mode.starts_with("shared-global-config") {
                 write_text(
                     &Path::new(&env["HOME"]).join(".gitconfig"),
                     &format!("[include]\n path = {}\n", settings.display()),
