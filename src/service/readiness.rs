@@ -383,13 +383,14 @@ impl Write for ProbeSocket {
 // enabled by the OS. No hostname lookup or network request authorizes a target.
 #[cfg(unix)]
 fn is_local_ipv4(host: Ipv4Addr) -> Result<bool, String> {
-    let mut addresses = std::ptr::null_mut();
-    // SAFETY: getifaddrs initializes the list on success; all pointers remain
+    let mut addresses = std::mem::MaybeUninit::<*mut libc::ifaddrs>::uninit();
+    // SAFETY: getifaddrs initializes the output slot on success; all pointers remain
     // valid until the single freeifaddrs below, including on a found address.
     unsafe {
-        if libc::getifaddrs(&mut addresses) != 0 {
+        if libc::getifaddrs(addresses.as_mut_ptr()) != 0 {
             return Err("Cannot inspect local Gateway interface addresses".to_string());
         }
+        let addresses = addresses.assume_init();
         let mut current = addresses;
         let mut found = false;
         while !current.is_null() {
