@@ -1225,7 +1225,7 @@ fn matching_env_key(
         .flatten()
 }
 
-fn contains_config_env_reference(value: &str) -> bool {
+pub(super) fn contains_config_env_reference(value: &str) -> bool {
     let bytes = value.as_bytes();
     let mut index = 0;
     while index < bytes.len() {

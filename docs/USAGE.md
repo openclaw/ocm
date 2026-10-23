@@ -256,10 +256,18 @@ unchanged; unknown enabled references still fail validation.
 
 Policy reads honor `OPENCLAW_INCLUDE_ROOTS` explicitly supplied to OCM, using
 that target's startup environment and working directory (including launcher or
-dev source directories for relative roots). They do not infer roots from launcher
-shell commands or `config.env`, read unrelated configuration branches, or copy
-shared fragments. Clone, import, and export retain their existing containment
-rules.
+dev source directories for relative roots). They read plugin policy and, only when its values use environment templates,
+its config environment inputs, without inferring roots from launcher shell commands
+or `config.env`, reading unrelated configuration branches, or copying shared
+fragments. Clone, import, and export retain their existing containment rules.
+
+Plugin policy string values resolve supported `${VAR}` templates after includes
+are loaded, using the target environment context and config `env`/`env.vars`.
+Nonblank process values take precedence over config-provided values. Object
+keys are not substituted, and unresolved required references still fail availability
+checks. This inspection does not load additional `.env` files or shell
+environments. Authored config stays unchanged, and failures hide resolved
+policy values rather than printing potentially sensitive environment contents.
 
 Installed external plugins satisfy that validation without being bundled into
 the new runtime; installed records do not select additional plugins. Disabled

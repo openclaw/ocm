@@ -41,7 +41,10 @@ use super::layout::{
 };
 use super::now_utc;
 use super::openclaw_state::installed_plugin_index_ids;
-use super::openclaw_workspaces::read_openclaw_config_field;
+use super::openclaw_workspaces::{
+    OpenClawWorkspaceRuntime, contains_config_env_reference, read_openclaw_config_field,
+    resolve_openclaw_config_env,
+};
 
 const OPENCLAW_OCM_RUNTIME_BUILD_PROFILE_ENV: &str = "OPENCLAW_OCM_RUNTIME_BUILD_PROFILE";
 const OPENCLAW_OCM_SOURCE_PERFORMANCE_BUILD_PROFILE: &str = "sourcePerformance";
@@ -817,14 +820,42 @@ fn resolve_target_source_plugin_closure(
         .value
         .map_err(|error| error.to_string())?
         .unwrap_or_else(|| serde_json::json!({}));
-    let config = serde_json::json!({ "plugins": plugins });
-    if config
-        .pointer("/plugins/enabled")
-        .and_then(serde_json::Value::as_bool)
-        == Some(false)
-    {
+    if plugins.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
         return Ok(BTreeSet::new());
     }
+    // Config-local variables are relevant only to policy string values, not literal IDs,
+    // object keys or plugin-owned config. Preserve the selected reader's lazy include scope.
+    let policy_uses_env = ["allow", "deny"]
+        .into_iter()
+        .filter_map(|field| plugins.get(field).and_then(serde_json::Value::as_array))
+        .flatten()
+        .chain(
+            plugins
+                .get("slots")
+                .and_then(serde_json::Value::as_object)
+                .into_iter()
+                .flat_map(|slots| slots.values()),
+        )
+        .filter_map(serde_json::Value::as_str)
+        .any(contains_config_env_reference);
+    let config_env = if policy_uses_env {
+        read_openclaw_config_field(&paths.config_path, &["env"], &read_context)
+            .value
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    let config = serde_json::json!({ "plugins": plugins, "env": config_env });
+    let authored_plugins = config.get("plugins").cloned();
+    let config = resolve_openclaw_config_env(
+        config,
+        context.env,
+        &paths.openclaw_home,
+        &paths.state_dir,
+        &paths.config_path,
+        OpenClawWorkspaceRuntime::for_env(&target.name, target.gateway_port),
+    );
 
     // Only OpenClaw's explicit plugin policy fields are part of this contract. Inferring plugin
     // ids from arbitrary provider, agent, or plugin-owned config would create false dependencies.
@@ -848,9 +879,16 @@ fn resolve_target_source_plugin_closure(
         .cloned()
         .collect::<Vec<_>>();
     if !missing.is_empty() {
+        // A substituted value can contain a secret. Keep the usual literal-ID diagnostic,
+        // but never echo resolved policy values when environment substitution changed them.
+        let missing = if config.get("plugins") != authored_plugins.as_ref() {
+            "one or more environment-resolved plugin references (values hidden)".to_string()
+        } else {
+            missing.join(", ")
+        };
         return Err(format!(
             "target environment \"{target_env}\" references plugins unavailable from the selected checkout or its installed plugin records: {}. Repair the target plugin config or install the missing plugins before building",
-            missing.join(", ")
+            missing
         ));
     }
 

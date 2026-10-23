@@ -1770,6 +1770,236 @@ fn target_plugin_build_fixture(
 }
 
 #[test]
+fn runtime_build_local_resolves_target_plugin_policy_environment_values() {
+    for (label, mut config, ambient, include_scope, succeeds, selects_codex) in [
+        (
+            "config-allow",
+            serde_json::json!({"env":{"vars":{"SELECTED_PLUGIN":"codex"}},"plugins":{"allow":["${SELECTED_PLUGIN}"]}}),
+            None,
+            None,
+            true,
+            true,
+        ),
+        (
+            "included-slot",
+            serde_json::json!({"env":{"vars":{"SELECTED_PLUGIN":"codex"}},"plugins":{"slots":{"memory":"${SELECTED_PLUGIN}"}}}),
+            None,
+            Some("internal"),
+            true,
+            true,
+        ),
+        (
+            "shared-env-allow",
+            serde_json::json!({"env":{"vars":{"SELECTED_PLUGIN":"codex"}},"plugins":{"allow":["${SELECTED_PLUGIN}"]}}),
+            None,
+            Some("shared"),
+            true,
+            true,
+        ),
+        (
+            "literal-unrelated-env",
+            serde_json::json!({"env":{"$include":"external-env.json"},"plugins":{"allow":["codex"]}}),
+            None,
+            None,
+            true,
+            true,
+        ),
+        (
+            "disabled-unrelated-env",
+            serde_json::json!({"env":{"$include":"external-env.json"},"plugins":{"enabled":false,"allow":["${SELECTED_PLUGIN}"]}}),
+            None,
+            None,
+            true,
+            false,
+        ),
+        (
+            "escaped-unrelated-env",
+            serde_json::json!({"env":{"$include":"external-env.json"},"plugins":{"allow":["$${SELECTED_PLUGIN}"]}}),
+            None,
+            None,
+            false,
+            false,
+        ),
+        (
+            "plugin-config-unrelated-env",
+            serde_json::json!({"env":{"$include":"external-env.json"},"plugins":{"allow":["codex"],"entries":{"codex":{"config":{"token":"${SELECTED_PLUGIN}"}}}}}),
+            None,
+            None,
+            true,
+            true,
+        ),
+        (
+            "ambient-precedence",
+            serde_json::json!({"env":{"vars":{"SELECTED_PLUGIN":"unavailable"}},"plugins":{"allow":["${SELECTED_PLUGIN}"]}}),
+            Some("codex"),
+            None,
+            true,
+            true,
+        ),
+        (
+            "blank-ambient",
+            serde_json::json!({"env":{"SELECTED_PLUGIN":"codex"},"plugins":{"allow":["${SELECTED_PLUGIN}"]}}),
+            Some(" "),
+            None,
+            true,
+            true,
+        ),
+        (
+            "resolved-deny",
+            serde_json::json!({"env":{"vars":{"SELECTED_PLUGIN":"unavailable"}},"plugins":{"allow":["unavailable"],"deny":["${SELECTED_PLUGIN}"]}}),
+            None,
+            None,
+            true,
+            false,
+        ),
+        (
+            "missing-variable",
+            serde_json::json!({"plugins":{"allow":["${SELECTED_PLUGIN}"]}}),
+            None,
+            None,
+            false,
+            false,
+        ),
+        (
+            "escaped-template",
+            serde_json::json!({"env":{"vars":{"SELECTED_PLUGIN":"codex"}},"plugins":{"allow":["$${SELECTED_PLUGIN}"]}}),
+            None,
+            None,
+            false,
+            false,
+        ),
+        (
+            "literal-object-key",
+            serde_json::json!({"env":{"vars":{"SELECTED_PLUGIN":"codex"}},"plugins":{"entries":{"${SELECTED_PLUGIN}":{"enabled":true}}}}),
+            None,
+            None,
+            false,
+            false,
+        ),
+        (
+            "private-unknown-value",
+            serde_json::json!({"env":{"vars":{"SELECTED_PLUGIN":"codex"}},"plugins":{"allow":["${SELECTED_PLUGIN}"]}}),
+            Some("private-plugin-value"),
+            None,
+            false,
+            false,
+        ),
+    ] {
+        let root = TestDir::new("runtime-build-local-plugin-env");
+        let (cwd, mut env, state, npm_log) = target_plugin_build_fixture(&root);
+        if config.pointer("/env/$include").and_then(Value::as_str) == Some("external-env.json") {
+            let external_env = root.child("external-env.json");
+            fs::write(&external_env, r#"{"vars":{"SELECTED_PLUGIN":"codex"}}"#).unwrap();
+            config["env"]["$include"] = serde_json::json!(external_env);
+        }
+        env.remove("OPENCLAW_INCLUDE_ROOTS");
+        env.remove("SELECTED_PLUGIN");
+        if let Some(value) = ambient {
+            env.insert("SELECTED_PLUGIN".to_string(), value.to_string());
+        }
+        let repo = cwd.join("openclaw");
+        let built = repo.join("dist/extensions/codex");
+        fs::create_dir_all(&built).unwrap();
+        for name in ["package.json", "openclaw.plugin.json"] {
+            fs::copy(repo.join("extensions/codex").join(name), built.join(name)).unwrap();
+        }
+        fs::write(built.join("index.js"), "export const build = 'source';\n").unwrap();
+        let archive = root.child("source-plugin.tgz");
+        fs::write(
+            &archive,
+            source_extension_package_tarball_for("codex", "@openclaw/codex"),
+        )
+        .unwrap();
+        for (key, value) in [
+            ("FAKE_SOURCE_EXTENSION_ARCHIVE", path_string(&archive)),
+            ("FAKE_SOURCE_EXTENSION_NAME", "@openclaw/codex".to_string()),
+            (
+                "FAKE_SOURCE_EXTENSION_FILENAME",
+                "source-plugin.tgz".to_string(),
+            ),
+            (
+                "FAKE_SOURCE_EXTENSION_INSTALL_PATH",
+                "@openclaw/codex".to_string(),
+            ),
+        ] {
+            env.insert(key.to_string(), value);
+        }
+        let config = config.to_string();
+        let policy_path = if include_scope == Some("shared") {
+            let shared = root.child("shared-policy");
+            fs::create_dir_all(&shared).unwrap();
+            env.insert("OPENCLAW_INCLUDE_ROOTS".into(), path_string(&shared));
+            shared.join("policy.json")
+        } else {
+            state.join("policy.json")
+        };
+        let authored = if include_scope.is_some() {
+            serde_json::json!({"$include":policy_path}).to_string()
+        } else {
+            config.clone()
+        };
+        fs::write(state.join("openclaw.json"), &authored).unwrap();
+        if include_scope.is_some() {
+            fs::write(&policy_path, &config).unwrap();
+        }
+        let build = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "build-local",
+                "target",
+                "--repo",
+                "./openclaw",
+                "--for-env",
+                "primary",
+                "--raw",
+            ],
+        );
+        assert_eq!(
+            build.status.success(),
+            succeeds,
+            "{label}: {}",
+            stderr(&build)
+        );
+        if succeeds {
+            let runtime_root = runtime_install_root("target", &env, &cwd)
+                .unwrap()
+                .join("files/node_modules/openclaw");
+            assert_eq!(
+                runtime_root
+                    .join("dist/extensions/codex/openclaw.plugin.json")
+                    .exists(),
+                selects_codex,
+                "{label}"
+            );
+        } else {
+            assert!(
+                stderr(&build).contains("plugins unavailable"),
+                "{label}: {}",
+                stderr(&build)
+            );
+            assert!(
+                !npm_log.exists(),
+                "{label}: npm must not run after policy rejection"
+            );
+        }
+        assert!(
+            !stderr(&build).contains("private-plugin-value"),
+            "resolved values must stay private"
+        );
+        assert_eq!(
+            fs::read_to_string(state.join("openclaw.json")).unwrap(),
+            authored,
+            "{label}"
+        );
+        if include_scope.is_some() {
+            assert_eq!(fs::read_to_string(&policy_path).unwrap(), config, "{label}");
+        }
+    }
+}
+
+#[test]
 fn runtime_build_local_rejects_missing_target_plugin_before_pack() {
     let root = TestDir::new("runtime-build-local-missing-target-plugin");
     let (cwd, env, state, npm_log) = target_plugin_build_fixture(&root);
