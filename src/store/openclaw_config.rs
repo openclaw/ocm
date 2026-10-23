@@ -218,7 +218,7 @@ fn rewrite_migrated_plugin_load_paths(
             rewritten = Some((candidate, final_candidate));
         }
         if let Some((rewritten, _)) = rewritten.filter(|(rewritten, _)| *rewritten != value) {
-            write_copied_config_value(&path, &rewritten)?;
+            write_copied_config_value(&path, &target.state_dir, &rewritten)?;
         }
     }
     Ok(())
