@@ -2110,6 +2110,9 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                 "mixed-link",
                 "target-record",
                 "target-link",
+                "config-alias",
+                "config-include",
+                "config-shared",
                 "external",
                 "escape",
             ] {
@@ -2135,7 +2138,8 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                     "alias-record" => alias.join("extensions/demo"),
                     "external" => external.clone(),
                     "escape" => source.join("escape"),
-                    "internal-link" | "mixed-link" => source.join("linked-plugin"),
+                    "internal-link" | "mixed-link" | "config-alias" | "config-include"
+                    | "config-shared" => source.join("linked-plugin"),
                     "target-record" => root.child("ocm-home/envs/copied/.openclaw/extensions/demo"),
                     "target-link" => root.child("ocm-home/envs/copied/.openclaw/linked-plugin"),
                     _ => plugin.clone(),
@@ -2148,7 +2152,28 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                 let config_path = source.join("openclaw.json");
                 let mut config: serde_json::Value =
                     serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-                config["plugins"] = serde_json::json!({"load": {"paths": [&source_recorded]}});
+                let configured = if case.starts_with("config-") {
+                    alias.join("linked-plugin")
+                } else {
+                    source_recorded.clone()
+                };
+                config["plugins"] = serde_json::json!({"load": {"paths": [&configured]}});
+                if matches!(case, "config-include" | "config-shared") {
+                    config["plugins"] = serde_json::json!({"$include": "./plugins.json"});
+                    fs::write(
+                        source.join("plugins.json"),
+                        r#"{"load":{"$include":"./load.json"}}"#,
+                    )
+                    .unwrap();
+                    fs::write(
+                        source.join("load.json"),
+                        serde_json::json!({"paths": [&configured]}).to_string(),
+                    )
+                    .unwrap();
+                    if case == "config-shared" {
+                        config["unrelated"] = serde_json::json!({"$include": "./load.json"});
+                    }
+                }
                 fs::write(&config_path, config.to_string()).unwrap();
                 let records = serde_json::json!({"demo": {
                     "source": "path", "installPath": &recorded, "sourcePath": &source_recorded
@@ -2189,10 +2214,17 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                 assert_eq!(migration_source_inventory(&source), before);
                 assert_eq!(migration_source_inventory(&external), external_before);
                 let target = root.child("ocm-home/envs/copied/.openclaw");
-                if matches!(case, "external" | "escape" | "mixed-link" | "target-link") {
+                if matches!(
+                    case,
+                    "external" | "escape" | "target-link" | "config-shared"
+                ) {
                     assert!(!output.status.success(), "{case}: {}", stdout(&output));
                     assert!(
-                        stderr(&output).contains("plugin path(s) could not be isolated"),
+                        stderr(&output).contains(if case == "config-shared" {
+                            "cannot safely rewrite plugin load paths"
+                        } else {
+                            "plugin path(s) could not be isolated"
+                        }),
                         "{case}: {}",
                         stderr(&output)
                     );
@@ -2238,9 +2270,19 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                     &fs::read_to_string(target.join("openclaw.json")).unwrap(),
                 )
                 .unwrap();
+                let loaded = if case == "config-include" {
+                    let included: serde_json::Value = serde_json::from_str(
+                        &fs::read_to_string(target.join("load.json")).unwrap(),
+                    )
+                    .unwrap();
+                    included["paths"][0].clone()
+                } else {
+                    config["plugins"]["load"]["paths"][0].clone()
+                };
+                assert_eq!(loaded, target.join("extensions/demo").to_str().unwrap());
                 assert_eq!(
-                    config["plugins"]["load"]["paths"][0],
-                    target.join("extensions/demo").to_str().unwrap()
+                    fs::canonicalize(loaded.as_str().unwrap()).unwrap(),
+                    fs::canonicalize(target.join("extensions/demo")).unwrap()
                 );
             }
         }

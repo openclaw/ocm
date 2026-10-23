@@ -988,6 +988,9 @@ the supplied home spelling or its canonical path. This includes internal local
 plugins when the home is supplied through an alias. Payloads must remain inside
 the selected source home; external active paths and symlink escapes are rejected
 and the provisional target is removed.
+Plugin load paths, including supported include fragments, select the same copied
+physical payload. A shared fragment that would require different plugin-load and
+other values is rejected; separate those include consumers before migration.
 
 Clone does not copy dev source bindings. The usual next step is:
 

@@ -579,6 +579,7 @@ fn complete_migration_import(
     let config_rewrite = rewrite_openclaw_config_for_migration(
         target_paths,
         source_home,
+        &canonical_source_home,
         created.gateway_port,
         sandbox_origin,
     )?;

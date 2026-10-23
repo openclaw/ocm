@@ -163,15 +163,120 @@ pub(crate) fn rewrite_openclaw_config_for_new_environment(
 pub(crate) fn rewrite_openclaw_config_for_migration(
     target_paths: &EnvPaths,
     source_state_root: &Path,
+    canonical_source_state_root: &Path,
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
+    rewrite_migrated_plugin_load_paths(
+        target_paths,
+        source_state_root,
+        canonical_source_state_root,
+    )?;
     rewrite_openclaw_config_with_root_mapping(
         target_paths,
         Some((source_state_root, target_paths.state_dir.as_path())),
         gateway_port,
         SandboxOriginPolicy::NewEnvironment(sandbox_origin),
     )
+}
+
+fn rewrite_migrated_plugin_load_paths(
+    target: &EnvPaths,
+    source: &Path,
+    canonical_source: &Path,
+) -> Result<(), String> {
+    let Some(effective) = load_effective_openclaw_config(&target.config_path)? else {
+        return Ok(());
+    };
+    let mut scopes = effective.include_scopes;
+    scopes.insert(target.config_path.clone(), BTreeSet::from([Vec::new()]));
+    for (path, scopes) in scopes {
+        let Some(value) = read_config_value(&path)? else {
+            continue;
+        };
+        let mut rewritten = None;
+        for mut scope in scopes {
+            let mut candidate = value.clone();
+            rewrite_migrated_plugin_paths_in_scope(
+                &mut candidate,
+                &mut scope,
+                source,
+                canonical_source,
+                &target.state_dir,
+            );
+            let mut final_candidate = candidate.clone();
+            rewrite_env_root_paths(&mut final_candidate, source, &target.state_dir);
+            if rewritten
+                .as_ref()
+                .is_some_and(|(_, previous)| previous != &final_candidate)
+            {
+                return Err(format!(
+                    "cannot safely rewrite plugin load paths in shared OpenClaw include {}; separate plugin-load and other include consumers before migration",
+                    display_path(&path)
+                ));
+            }
+            rewritten = Some((candidate, final_candidate));
+        }
+        if let Some((rewritten, _)) = rewritten.filter(|(rewritten, _)| *rewritten != value) {
+            write_copied_config_value(&path, &rewritten)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_migrated_plugin_paths_in_scope(
+    value: &mut Value,
+    scope: &mut Vec<String>,
+    source: &Path,
+    canonical_source: &Path,
+    target: &Path,
+) {
+    if scope.len() == 4
+        && scope[..3] == ["plugins", "load", "paths"]
+        && let Some(raw) = value.as_str()
+    {
+        let path = Path::new(raw);
+        let mut admitted = raw.to_string();
+        // Resolve only the two admitted identities. Copying preserves absolute
+        // links, so lexical replacement alone can keep loading source bytes.
+        if (path.starts_with(source) || path.starts_with(canonical_source))
+            && rewrite_env_root_string(&mut admitted, source, target)
+            && let Ok(physical) = fs::canonicalize(path)
+            && let Ok(relative) = physical.strip_prefix(canonical_source)
+        {
+            *value = Value::String(display_path(&target.join(relative)));
+        }
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                scope.push(key.clone());
+                rewrite_migrated_plugin_paths_in_scope(
+                    child,
+                    scope,
+                    source,
+                    canonical_source,
+                    target,
+                );
+                scope.pop();
+            }
+        }
+        Value::Array(array) => {
+            for (index, child) in array.iter_mut().enumerate() {
+                scope.push(index.to_string());
+                rewrite_migrated_plugin_paths_in_scope(
+                    child,
+                    scope,
+                    source,
+                    canonical_source,
+                    target,
+                );
+                scope.pop();
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn rewrite_external_workspace_paths_for_migration(
