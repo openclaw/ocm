@@ -2463,17 +2463,18 @@ fn rewrite_plugin_install_records(
                         relocatable_plugin_path(path, canonical_source, !is_path_plugin)?;
                         // Map the physical payload: an absolute internal link is
                         // copied verbatim and would still select the source home.
-                        let relative = existing_plugin_relative(path, canonical_source)?;
-                        contained_plugin_path(&target_state_root.join(&relative), target_state_root)
-                            .then_some(relative)
+                        existing_plugin_relative(path, canonical_source)
                     }
                     PluginPathRelocation::Cloned { .. } => None,
                 });
-            let Some(relative) = relative else {
-                // Native discovery prefers installPath. Once that payload is
-                // isolated, an external sourcePath is project/archive provenance.
+            let Some(relative) = relative.filter(|relative| {
+                contained_plugin_path(&target_state_root.join(relative), target_state_root)
+            }) else {
+                // Native discovery prefers the proved installed payload.
+                // External sourcePath values then record provenance.
                 has_external_path |= path.is_absolute()
-                    && !path.starts_with(target_state_root)
+                    && !(path.starts_with(target_state_root)
+                        && contained_plugin_path(path, target_state_root))
                     && !(field == "sourcePath" && has_owned_install);
                 continue;
             };

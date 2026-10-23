@@ -2106,6 +2106,10 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                 "canonical-record",
                 "alias-record",
                 "internal-link",
+                "mixed-record",
+                "mixed-link",
+                "target-record",
+                "target-link",
                 "external",
                 "escape",
             ] {
@@ -2131,16 +2135,23 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                     "alias-record" => alias.join("extensions/demo"),
                     "external" => external.clone(),
                     "escape" => source.join("escape"),
-                    "internal-link" => source.join("linked-plugin"),
+                    "internal-link" | "mixed-link" => source.join("linked-plugin"),
+                    "target-record" => root.child("ocm-home/envs/copied/.openclaw/extensions/demo"),
+                    "target-link" => root.child("ocm-home/envs/copied/.openclaw/linked-plugin"),
                     _ => plugin.clone(),
+                };
+                let source_recorded = match case {
+                    "mixed-record" => alias.join("extensions/demo"),
+                    "mixed-link" => alias.join("linked-plugin"),
+                    _ => recorded.clone(),
                 };
                 let config_path = source.join("openclaw.json");
                 let mut config: serde_json::Value =
                     serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-                config["plugins"] = serde_json::json!({"load": {"paths": [&recorded]}});
+                config["plugins"] = serde_json::json!({"load": {"paths": [&source_recorded]}});
                 fs::write(&config_path, config.to_string()).unwrap();
                 let records = serde_json::json!({"demo": {
-                    "source": "path", "installPath": &recorded, "sourcePath": &recorded
+                    "source": "path", "installPath": &recorded, "sourcePath": &source_recorded
                 }});
                 if !folded {
                     seed_installed_plugin_index(&source, records.clone());
@@ -2178,7 +2189,7 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                 assert_eq!(migration_source_inventory(&source), before);
                 assert_eq!(migration_source_inventory(&external), external_before);
                 let target = root.child("ocm-home/envs/copied/.openclaw");
-                if matches!(case, "external" | "escape") {
+                if matches!(case, "external" | "escape" | "mixed-link" | "target-link") {
                     assert!(!output.status.success(), "{case}: {}", stdout(&output));
                     assert!(
                         stderr(&output).contains("plugin path(s) could not be isolated"),
