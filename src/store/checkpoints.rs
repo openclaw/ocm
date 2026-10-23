@@ -258,7 +258,7 @@ fn ensure_checkpoint_source(requested: &Path, resolved: &Path) -> Result<(), Str
             .is_dir()
     {
         return Err(format!(
-            "checkpoint source is not the prepared directory: {}",
+            "checkpoint source is not the prepared directory: {}; keep the environment root stable and retry snapshot capture",
             display_path(requested)
         ));
     }
@@ -273,7 +273,7 @@ pub(crate) fn copy_tree_checkpoint(source: &Path, destination: &Path) -> Result<
         .is_dir()
     {
         return Err(format!(
-            "checkpoint artifact is not an independent directory: {}",
+            "checkpoint artifact is not an independent directory: {}; this artifact cannot recover historical contents. Use another independent backup for recovery and create a new snapshot to protect current contents",
             display_path(source)
         ));
     }
