@@ -13,7 +13,9 @@ pub use manage::{ServiceActionSummary, ServiceInstallSummary, ServiceRestartOpti
 pub(crate) use platform::{
     ServiceManagerKind, service_backend_support_error, service_manager_kind,
 };
-pub(crate) use readiness::{gateway_readiness_timeout, wait_for_gateway_readiness};
+pub(crate) use readiness::{
+    gateway_health_ok, gateway_readiness_timeout, read_gateway_config, wait_for_gateway_readiness,
+};
 
 pub struct ServiceService<'a> {
     env: &'a BTreeMap<String, String>,

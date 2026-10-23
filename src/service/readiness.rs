@@ -270,6 +270,14 @@ fn resolve_native_gateway_config(
         ExecutionBinding::Launcher(_) => return Ok(None),
     };
     command.current_dir(run_dir);
+    read_gateway_config(command, deadline, interrupt_generation)
+}
+
+pub(crate) fn read_gateway_config(
+    command: Command,
+    deadline: Instant,
+    interrupt_generation: u64,
+) -> Result<Option<serde_json::Value>, String> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(
@@ -529,7 +537,7 @@ fn gateway_bind_health_ok(
     }
 }
 
-fn gateway_health_ok(
+pub(crate) fn gateway_health_ok(
     host: Ipv4Addr,
     port: u32,
     certificate: Option<Vec<u8>>,
