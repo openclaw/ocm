@@ -93,7 +93,7 @@ enum OpenClawPathSelection {
 }
 
 impl OpenClawWorkspaceInventory {
-    pub(super) fn config_include_paths(&self) -> impl Iterator<Item = &PathBuf> {
+    pub(crate) fn config_include_paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.config_include_paths.iter()
     }
 
@@ -558,15 +558,21 @@ pub(crate) fn resolve_plain_openclaw_workspaces(
     state_dir: &Path,
     env: &BTreeMap<String, String>,
 ) -> Result<OpenClawWorkspaceInventory, String> {
+    let source_alias = std::path::absolute(state_dir).map_err(|error| error.to_string())?;
     let state_dir = canonicalize_path_allow_missing(state_dir)?;
+    let config_path = state_dir.join("openclaw.json");
+    // Admit the explicitly supplied spelling, while keeping the canonical home
+    // as the include boundary and the source of workspace defaults.
+    let config = load_effective_openclaw_config_with_config_roots(&config_path, &[source_alias])?;
     let openclaw_home = state_dir.parent().unwrap_or(&state_dir);
-    let mut inventory = resolve_openclaw_workspaces(
+    let mut inventory = resolve_openclaw_workspaces_from_config(
         &state_dir.join("openclaw.json"),
         &state_dir,
         openclaw_home,
         env,
         OpenClawWorkspaceRuntime::default(),
         OpenClawPathSelection::Workspaces,
+        config,
     )
     .map_err(OpenClawCleanupPathError::into_message)?;
     inventory
@@ -765,19 +771,30 @@ fn load_effective_openclaw_config_with_source_roots(
     config_path: &Path,
     source_roots: &[&Path],
 ) -> Result<Option<EffectiveOpenClawConfig>, String> {
+    let config_roots = source_roots
+        .iter()
+        .map(|root| derive_env_paths(root).state_dir)
+        .collect::<Vec<_>>();
+    load_effective_openclaw_config_with_config_roots(config_path, &config_roots)
+}
+
+fn load_effective_openclaw_config_with_config_roots(
+    config_path: &Path,
+    source_config_roots: &[PathBuf],
+) -> Result<Option<EffectiveOpenClawConfig>, String> {
     if !path_exists(config_path) {
         return Ok(None);
     }
 
     let raw = read_regular_text_file(config_path, "OpenClaw config", None)?;
     let value = parse_json5(&raw, config_path, "OpenClaw config")?;
-    resolve_effective_openclaw_config(config_path, value, source_roots).map(Some)
+    resolve_effective_openclaw_config(config_path, value, source_config_roots).map(Some)
 }
 
 fn resolve_effective_openclaw_config(
     config_path: &Path,
     value: Value,
-    source_roots: &[&Path],
+    source_config_roots: &[PathBuf],
 ) -> Result<EffectiveOpenClawConfig, String> {
     let config_root = config_path.parent().ok_or_else(|| {
         format!(
@@ -786,10 +803,7 @@ fn resolve_effective_openclaw_config(
         )
     })?;
     let mut processor = IncludeProcessor::new(config_root)?;
-    processor.archived_config_roots = source_roots
-        .iter()
-        .map(|root| derive_env_paths(root).state_dir)
-        .collect();
+    processor.archived_config_roots = source_config_roots.to_vec();
     let value = processor.process(
         value,
         config_path,

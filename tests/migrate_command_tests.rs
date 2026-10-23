@@ -3521,6 +3521,149 @@ fn migrate_and_adopt_relocate_includes_through_a_source_home_alias() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
+    for adopt in [false, true] {
+        for relative_root in [false, true] {
+            let root = TestDir::new("migrate-alias-authored-includes");
+            let env = ocm_env(&root);
+            let source = root.child("source/plain-home");
+            let alias = root.child("alias");
+            fs::create_dir_all(&source).unwrap();
+            std::os::unix::fs::symlink(&source, &alias).unwrap();
+            let root_include = if relative_root {
+                std::path::PathBuf::from("./config/plugins.json")
+            } else {
+                alias.join("config/plugins.json")
+            };
+            let files = [
+                (
+                    "openclaw.json",
+                    serde_json::json!({"plugins": {"$include": root_include}}).to_string(),
+                ),
+                (
+                    "config/plugins.json",
+                    serde_json::json!({"$include": alias.join("config/leaf.json")}).to_string(),
+                ),
+                ("config/leaf.json", "{\"enabled\":false}\n".to_string()),
+            ];
+            for (path, contents) in &files {
+                support::write_text(&source.join(path), contents);
+            }
+            let args = if adopt {
+                vec!["adopt", "import", "--name", "copied", "alias"]
+            } else {
+                vec!["migrate", "copied", "alias"]
+            };
+            let imported = run_ocm(root.path(), &env, &args);
+            assert!(imported.status.success(), "{}", stderr(&imported));
+            for (path, contents) in &files {
+                assert_eq!(fs::read_to_string(source.join(path)).unwrap(), *contents);
+            }
+            assert_eq!(fs::read_link(&alias).unwrap(), source);
+            let target = root.child("ocm-home/envs/copied/.openclaw");
+            let read = |path: &str| -> serde_json::Value {
+                serde_json::from_str(&fs::read_to_string(target.join(path)).unwrap()).unwrap()
+            };
+            assert_eq!(
+                read("openclaw.json")["plugins"]["$include"],
+                serde_json::json!(if relative_root {
+                    std::path::PathBuf::from("./config/plugins.json")
+                } else {
+                    target.join("config/plugins.json")
+                })
+            );
+            assert_eq!(
+                read("config/plugins.json")["$include"],
+                serde_json::json!(target.join("config/leaf.json"))
+            );
+            assert_eq!(
+                fs::read_to_string(target.join("config/leaf.json")).unwrap(),
+                files[2].1
+            );
+            fs::remove_dir_all(&source).unwrap();
+            let archive = root.child("copied.tar");
+            let exported = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "export",
+                    "copied",
+                    "--output",
+                    archive.to_str().unwrap(),
+                ],
+            );
+            assert!(exported.status.success(), "{}", stderr(&exported));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_and_adopt_reject_escaping_and_unsupplied_include_aliases() {
+    for adopt in [false, true] {
+        for escape in [false, true] {
+            let root = TestDir::new("migrate-include-alias-boundary");
+            let env = ocm_env(&root);
+            let source = root.child("source/plain-home");
+            let alias = root.child("alias");
+            let outside = root.child("outside");
+            support::write_text(&source.join("plugins.json"), "{\"enabled\":false}\n");
+            support::write_text(&outside.join("plugins.json"), "{\"enabled\":true}\n");
+            std::os::unix::fs::symlink(&source, &alias).unwrap();
+            let include = if escape {
+                std::os::unix::fs::symlink(&outside, source.join("redirect")).unwrap();
+                alias.join("redirect/plugins.json")
+            } else {
+                let other_alias = root.child("unsupplied-alias");
+                std::os::unix::fs::symlink(&source, &other_alias).unwrap();
+                other_alias.join("plugins.json")
+            };
+            let config = serde_json::json!({"plugins": {"$include": include}}).to_string();
+            support::write_text(&source.join("openclaw.json"), &config);
+            let args = if adopt {
+                vec![
+                    "adopt",
+                    "import",
+                    "--name",
+                    "copied",
+                    alias.to_str().unwrap(),
+                ]
+            } else {
+                vec!["migrate", "copied", alias.to_str().unwrap()]
+            };
+            let imported = run_ocm(root.path(), &env, &args);
+            assert!(!imported.status.success());
+            let expected = if escape {
+                "resolves outside the config directory"
+            } else {
+                "escapes the config directory"
+            };
+            assert!(
+                stderr(&imported).contains(expected),
+                "{}",
+                stderr(&imported)
+            );
+            assert!(!root.child("ocm-home/envs/copied").exists());
+            assert_eq!(
+                fs::read_to_string(source.join("openclaw.json")).unwrap(),
+                config
+            );
+            assert_eq!(
+                fs::read_to_string(source.join("plugins.json")).unwrap(),
+                "{\"enabled\":false}\n"
+            );
+            assert_eq!(
+                fs::read_to_string(outside.join("plugins.json")).unwrap(),
+                "{\"enabled\":true}\n"
+            );
+            assert_eq!(fs::read_link(&alias).unwrap(), source);
+        }
+    }
+}
+
 #[test]
 fn migrate_and_adopt_reject_external_nested_config_includes() {
     for adopt in [false, true] {

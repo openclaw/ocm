@@ -933,7 +933,8 @@ Rewritten fragments retain their copied Unix file modes.
 Migration and adoption relocate absolute internal `$include` directives, including
 nested directives, before resolving the copied graph. Accepted directives select
 the corresponding target copies, including when the source home is supplied
-through a filesystem alias; relative directives stay relative. Includes outside
+through a filesystem alias and absolute directives use that same alias. Relative
+directives stay relative. Includes outside
 the source home, including symlink escapes, remain rejected.
 The existing restrictions on include-owned agent workspaces and sandbox origins
 still apply.
