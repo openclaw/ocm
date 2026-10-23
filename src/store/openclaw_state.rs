@@ -1213,14 +1213,12 @@ fn plan_runtime_state_cleanup(
 fn is_durable_openclaw_state_root(name: &OsStr) -> bool {
     matches!(
         name.to_str(),
-        Some("state")
-            | Some("plugins")
-            | Some("extensions")
-            | Some("npm")
-            | Some("git")
-            | Some("skills")
-            | Some(".clawhub")
-    )
+        Some("state") | Some("plugins") | Some("extensions") | Some("npm") | Some("git")
+    ) || is_shared_skill_state_root(name)
+}
+
+fn is_shared_skill_state_root(name: &OsStr) -> bool {
+    matches!(name.to_str(), Some("skills") | Some(".clawhub"))
 }
 
 fn rewrite_runtime_state_root_refs(
@@ -3183,6 +3181,7 @@ fn collect_runtime_state_path_refs(
 ) {
     visit_runtime_state_files(
         &paths.state_dir,
+        &paths.state_dir,
         &paths.config_path,
         workspaces,
         &mut |path| {
@@ -3213,6 +3212,7 @@ fn collect_runtime_state_path_refs(
 }
 
 fn visit_runtime_state_files(
+    state_root: &Path,
     root: &Path,
     config_path: &Path,
     workspaces: &OpenClawWorkspaceInventory,
@@ -3223,7 +3223,13 @@ fn visit_runtime_state_files(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path == config_path || workspaces.contains(&path) {
+        // Authored shared skills and their installation tracking are durable
+        // content, not evidence of a copied process. Retaining them while
+        // auditing their prose would repeatedly reset unrelated live sessions.
+        if path == config_path
+            || workspaces.contains(&path)
+            || (root == state_root && is_shared_skill_state_root(&entry.file_name()))
+        {
             continue;
         }
 
@@ -3231,7 +3237,7 @@ fn visit_runtime_state_files(
             continue;
         };
         if metadata.is_dir() {
-            visit_runtime_state_files(&path, config_path, workspaces, on_file);
+            visit_runtime_state_files(state_root, &path, config_path, workspaces, on_file);
         } else if metadata.is_file() {
             on_file(&path);
         }
