@@ -787,6 +787,16 @@ impl Cli {
         Ok(session)
     }
 
+    pub(super) fn dev_ui_gateway_base_path(
+        &self,
+        meta: &EnvMeta,
+        source: &Path,
+    ) -> Result<String, String> {
+        let env = build_openclaw_dev_source_env(meta, &self.env, source);
+        let context = crate::store::OpenClawConfigReadContext::for_launch(&env, source)?;
+        crate::store::dev_ui_gateway_base_path(&derive_env_paths(Path::new(&meta.root)), &context)
+    }
+
     pub(super) fn prepare_dev_ui(
         &self,
         meta: &EnvMeta,
@@ -797,8 +807,7 @@ impl Cli {
         if source_watch_cancelled(lease, stop)? {
             return Ok(130);
         }
-        let base =
-            crate::store::dev_ui_gateway_base_path(&derive_env_paths(Path::new(&meta.root)))?;
+        let base = self.dev_ui_gateway_base_path(meta, source)?;
         crate::store::dev_ui_gateway_url(&base, meta.gateway_port.unwrap_or_default())?;
         if !source.join("scripts/ui.js").is_file() || !source.join("ui/index.html").is_file() {
             return Err("the selected source does not contain the native Control UI development entry point".to_string().into());

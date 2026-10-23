@@ -1149,14 +1149,17 @@ pub(crate) fn gateway_readiness_certificate(
     Ok(Some(certificate.der().to_vec()))
 }
 
-pub(crate) fn dev_ui_gateway_base_path(paths: &EnvPaths) -> Result<String, String> {
-    let config = load_effective_openclaw_config(&paths.config_path)?
-        .map(|config| config.value)
-        .unwrap_or_else(|| json!({}));
-    let gateway = config.get("gateway");
-    if gateway
-        .and_then(|value| value.get("tls"))
-        .and_then(|value| value.get("enabled"))
+pub(crate) fn dev_ui_gateway_base_path(
+    paths: &EnvPaths,
+    context: &OpenClawConfigReadContext,
+) -> Result<String, String> {
+    let read = |field: &[&str]| {
+        read_openclaw_config_field(&paths.config_path, field, context)
+            .value
+            .map_err(|error| error.to_string())
+    };
+    if read(&["gateway", "tls", "enabled"])?
+        .as_ref()
         .and_then(Value::as_bool)
         == Some(true)
     {
@@ -1165,9 +1168,8 @@ pub(crate) fn dev_ui_gateway_base_path(paths: &EnvPaths) -> Result<String, Strin
                 .to_string(),
         );
     }
-    let control_ui = gateway.and_then(|value| value.get("controlUi"));
-    if control_ui
-        .and_then(|value| value.get("enabled"))
+    if read(&["gateway", "controlUi", "enabled"])?
+        .as_ref()
         .and_then(Value::as_bool)
         == Some(false)
     {
@@ -1176,12 +1178,11 @@ pub(crate) fn dev_ui_gateway_base_path(paths: &EnvPaths) -> Result<String, Strin
                 .to_string(),
         );
     }
-    let base = match control_ui.and_then(|value| value.get("basePath")) {
-        None | Some(Value::Null) => "",
-        Some(Value::String(value)) => value,
-        Some(_) => return Err("gateway.controlUi.basePath must be a URL path".to_string()),
-    };
-    Ok(base.to_string())
+    match read(&["gateway", "controlUi", "basePath"])? {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(value)) => Ok(value),
+        Some(_) => Err("gateway.controlUi.basePath must be a URL path".to_string()),
+    }
 }
 
 pub(crate) fn dev_ui_gateway_url(base: &str, port: u32) -> Result<String, String> {

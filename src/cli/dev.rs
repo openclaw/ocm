@@ -750,9 +750,12 @@ impl Cli {
                 .environment_service()
                 .apply_effective_gateway_port(current)?;
             if ui {
-                let base = crate::store::dev_ui_gateway_base_path(&derive_env_paths(Path::new(
-                    &prepared.root,
-                )))?;
+                let source = prepared
+                    .dev
+                    .as_ref()
+                    .ok_or("dev source is missing")?
+                    .execution_source_root()?;
+                let base = self.dev_ui_gateway_base_path(&prepared, source)?;
                 crate::store::dev_ui_gateway_url(&base, prepared.gateway_port.unwrap_or_default())?;
             }
             self.bootstrap_dev_env(&prepared)?;

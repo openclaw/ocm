@@ -1918,6 +1918,120 @@ fn create_ui_config_environment(
 
 #[cfg(unix)]
 #[test]
+fn dev_ui_uses_explicit_source_include_authority() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for variant in [
+        "absolute",
+        "relative",
+        "home",
+        "unauthorized",
+        "config-env",
+        "tls",
+        "disabled",
+        "invalid-base",
+    ] {
+        let root = TestDir::new(&format!("dev-ui-include-{variant}"));
+        let mut env = ocm_env(&root);
+        let repo = prepare_initial_ui_repo(&root, &mut env);
+        let meta = create_ui_config_environment(&repo, &env);
+        let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
+        let shared = if variant == "home" {
+            Path::new(&meta.root).join("shared")
+        } else {
+            repo.join("shared")
+        };
+        fs::create_dir_all(&shared).unwrap();
+        let include_path = shared.join("control-ui.json");
+        let include = match variant {
+            "disabled" => br#"{"enabled":false}"#.as_slice(),
+            "invalid-base" => br#"{"basePath":"/../escape"}"#.as_slice(),
+            _ => br#"{"enabled":true,"basePath":"/shared"}"#.as_slice(),
+        };
+        fs::write(&include_path, include).unwrap();
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config["gateway"]["controlUi"] =
+            serde_json::json!({"$include": path_string(&include_path)});
+        if variant == "tls" {
+            fs::write(shared.join("tls.json"), r#"{"enabled":true}"#).unwrap();
+            config["gateway"]["tls"] =
+                serde_json::json!({"$include": path_string(&shared.join("tls.json"))});
+        }
+        // Neither a config variable nor an unrelated branch grants authority.
+        config["env"] = serde_json::json!({"OPENCLAW_INCLUDE_ROOTS": path_string(&shared)});
+        config["plugins"] =
+            serde_json::json!({"$include": path_string(&root.child("unread-plugin.json"))});
+        let config_bytes = serde_json::to_vec_pretty(&config).unwrap();
+        fs::write(&config_path, &config_bytes).unwrap();
+        if !matches!(variant, "unauthorized" | "config-env") {
+            env.insert(
+                "OPENCLAW_INCLUDE_ROOTS".into(),
+                match variant {
+                    "relative" => "shared".into(),
+                    "home" => "~/shared".into(),
+                    _ => path_string(&shared),
+                },
+            );
+        }
+        if variant == "unauthorized" {
+            env.insert(
+                "OPENCLAW_INCLUDE_ROOTS".into(),
+                path_string(&root.child("unrelated")),
+            );
+        }
+        let caller = root.child("caller");
+        fs::create_dir_all(&caller).unwrap();
+        let args = ["dev", "demo", "--no-watch"];
+        let expected_error = match variant {
+            "unauthorized" | "config-env" => Some("outside the admitted configuration roots"),
+            "tls" => Some("requires a local HTTP Gateway"),
+            "disabled" => Some("disables the Control UI"),
+            "invalid-base" => Some("dot segments"),
+            _ => None,
+        };
+        if let Some(expected) = expected_error {
+            let rejected = run_ocm(&caller, &env, &args);
+            assert!(!rejected.status.success(), "{variant}");
+            assert!(
+                stderr(&rejected).contains(expected),
+                "{variant}: {}",
+                stderr(&rejected)
+            );
+            assert!(!root.child("gateway.json").exists(), "{variant}");
+            assert!(!root.child("ui.json").exists(), "{variant}");
+        } else {
+            let mut controller = DevWatchFixture::spawn(&root, &caller, &env, &args);
+            let gateway = initial_ui_process(&root, "gateway", &mut controller);
+            let ui = initial_ui_process(&root, "ui", &mut controller);
+            assert_eq!(
+                Path::new(gateway["cwd"].as_str().unwrap()),
+                fs::canonicalize(&repo).unwrap()
+            );
+            assert!(ui["gatewayUrl"].as_str().unwrap().ends_with("/shared/"));
+            let stopped = run_dev_stop(&caller, &env);
+            assert!(stopped.status.success(), "{variant}: {}", stderr(&stopped));
+            assert_eq!(controller.wait_without_release().status.code(), Some(130));
+            for process in [gateway, ui] {
+                assert!(wait_for_process_exit(
+                    process["pid"].as_u64().unwrap() as u32,
+                    Duration::from_secs(3)
+                ));
+            }
+        }
+        assert_eq!(
+            read_source_watch_session(&root)["closed"],
+            true,
+            "{variant}"
+        );
+        assert_eq!(fs::read(&config_path).unwrap(), config_bytes, "{variant}");
+        assert_eq!(fs::read(&include_path).unwrap(), include, "{variant}");
+        assert!(!root.child("unread-plugin.json").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_ui_resolves_native_config_once_and_reuses_the_captured_target() {
     let _serial = INITIAL_UI_TEST_LOCK
         .lock()

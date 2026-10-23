@@ -157,6 +157,11 @@ reservation. Removing the environment releases it. `ocm dev status luna` reports
 the address. On Linux, macOS, and Windows, a matching repeated start requests a
 fresh native browser grant from the existing controller without restarting
 Gateway or Vite. Busy or unready requests report a pending link.
+Dev UI preflight reads its Gateway settings with the same explicit
+`OPENCLAW_INCLUDE_ROOTS` authorization as the selected source launch. Relative
+roots use that source checkout, and `~` uses the environment's OpenClaw home.
+Config `env` cannot grant include access; unrelated config branches remain for
+OpenClaw to resolve. TLS and disabled-Control-UI guards still apply.
 Templated `gateway.controlUi.basePath` values are resolved by the selected
 checkout's native config command before startup, including OpenClaw's `.env`
 and config environment rules. The private read preserves the authored config,
