@@ -251,6 +251,43 @@ fn env_cleanup_yes_clears_copied_openclaw_runtime_state() {
         fs::write(path, &workshop_content).unwrap();
     }
 
+    let skill_content = format!(
+        "---\nname: shared\ndescription: Shared procedure\n---\nHistorical example: {}\n",
+        source_root.join(".openclaw/workspace").display()
+    );
+    let skill_tracking = serde_json::json!({
+        "version": 1,
+        "skills": {"shared": {"version": "1.0.0", "installedAt": 1,
+            "sourceUrl": source_root.join("shared-skill-source")}}
+    })
+    .to_string();
+    let shared_skills = [
+        ("skills/shared/SKILL.md", skill_content.as_str()),
+        ("skills/shared/scripts/task.sh", "#!/bin/sh\nexit 0\n"),
+        (
+            "skills/shared/.clawhub/origin.json",
+            r#"{"version":1,"registry":"https://clawhub.ai","slug":"shared","installedVersion":"1.0.0","installedAt":1}"#,
+        ),
+        (".clawhub/lock.json", skill_tracking.as_str()),
+    ];
+    for (relative, content) in shared_skills {
+        crate::support::write_text(&target_state.join(relative), content);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if relative.ends_with(".sh") {
+                0o750
+            } else {
+                0o600
+            };
+            fs::set_permissions(
+                target_state.join(relative),
+                fs::Permissions::from_mode(mode),
+            )
+            .unwrap();
+        }
+    }
+
     let doctor = run_ocm(&cwd, &env, &["env", "doctor", "target", "--json"]);
     assert!(doctor.status.success(), "{}", stderr(&doctor));
     let doctor_value: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
@@ -282,6 +319,65 @@ fn env_cleanup_yes_clears_copied_openclaw_runtime_state() {
             )),
             workshop_content
         );
+    }
+    for (relative, content) in shared_skills {
+        assert_eq!(
+            fs::read_to_string(target_state.join(relative)).unwrap(),
+            content
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if relative.ends_with(".sh") {
+                0o750
+            } else {
+                0o600
+            };
+            assert_eq!(
+                fs::metadata(target_state.join(relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                mode,
+                "{relative}"
+            );
+        }
+    }
+    // The retained historical references must not schedule another destructive
+    // reset after the genuine stale session has gone.
+    let fresh_session = target_state.join("agents/main/sessions/fresh.jsonl");
+    let fresh_content = serde_json::json!({"cwd": target_state.join("workspace")}).to_string();
+    crate::support::write_text(&fresh_session, &fresh_content);
+    for args in [
+        vec!["env", "cleanup", "target", "--json"],
+        vec!["env", "cleanup", "target", "--yes", "--json"],
+    ] {
+        let cleanup = run_ocm(&cwd, &env, &args);
+        assert!(cleanup.status.success(), "{}", stderr(&cleanup));
+        let value: Value = serde_json::from_str(&stdout(&cleanup)).unwrap();
+        assert!(
+            !value["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| { action["kind"] == "reset-openclaw-runtime-state" }),
+            "{value}"
+        );
+        assert!(
+            !value["issuesBefore"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| {
+                    issue
+                        .as_str()
+                        .unwrap()
+                        .contains("OpenClaw runtime state contains")
+                }),
+            "{value}"
+        );
+        assert_eq!(fs::read_to_string(&fresh_session).unwrap(), fresh_content);
     }
 }
 

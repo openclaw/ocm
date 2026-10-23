@@ -949,6 +949,7 @@ ocm env clone mira rowan
 Automatic Gateway port selection searches upward from the preferred port through 65535, preserving existing environment and dev UI reservations. If no candidate remains, creation, cloning, or archive import fails without registering an environment or creating its destination root; it does not wrap to a lower port.
 
 Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Configured agent directories inside the environment retain their payloads through clone and ordinary export/import, including custom and nested locations.
+Clone retains shared managed skills under `.openclaw/skills` and their global ClawHub tracking metadata under `.openclaw/.clawhub`.
 Clone and upgrade simulation preserve supported internal OpenClaw `$include` graphs, including nested absolute directives and shared include arrays. Absolute directives select the copied files; relative directives and source files stay unchanged. Includes must remain inside the configuration directory. Ordinary clone retains its restrictions on include-owned agent workspaces and sandbox origins, while simulation retains its identity overlay.
 Agent directories remain separate from workspaces; external locations and paths reached through symlinks are rejected by these copy operations.
 Upgrade simulation rejects an identity-dependent agent directory supplied by an include shared with unrelated configuration fields; give those consumers separate include files before retrying.
@@ -1416,6 +1417,8 @@ ocm env repair-marker mira
 ```
 
 Runtime-state cleanup preserves configured agent directories inside the environment, including their authentication and state files beneath generated plugin dependencies.
+It also retains shared managed skills under `.openclaw/skills` and their global ClawHub tracking metadata under `.openclaw/.clawhub`.
+References in these authored skills and installation records do not trigger a runtime-state reset; stale session references still do.
 It still removes stale sessions and unselected generated files beside those directories.
 Configuring an agent directory above `agents/<id>/sessions` preserves agent payload beside that subtree without hiding its stale sessions from cleanup.
 If an agent directory is exactly `agents/<id>/sessions`, cleanup preview and apply refuse the conflicting ownership before changing any configuration or data.

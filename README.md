@@ -572,7 +572,9 @@ Environment clone, export, and import flows preserve managed OpenClaw plugin
 payloads under the legacy, extension, npm, and Git install roots. Clone and default archive
 import clear legacy file-based sessions, logs, backups, and process residue so the new
 environment does not share active runtime state with its source. New clones also
-clear copied agent database process leases while keeping the state database,
+retain shared managed skills under `.openclaw/skills` and their global ClawHub
+tracking metadata under `.openclaw/.clawhub`; ordinary runtime-state cleanup retains
+these roots too. Clones also clear copied agent database process leases while keeping the state database,
 durable rows, and source leases unchanged.
 Default import refuses configured active databases inside protected history and removes the partial target before registration, including for archives without source-root metadata.
 
