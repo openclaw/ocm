@@ -1213,7 +1213,13 @@ fn plan_runtime_state_cleanup(
 fn is_durable_openclaw_state_root(name: &OsStr) -> bool {
     matches!(
         name.to_str(),
-        Some("state") | Some("plugins") | Some("extensions") | Some("npm") | Some("git")
+        Some("state")
+            | Some("plugins")
+            | Some("extensions")
+            | Some("npm")
+            | Some("git")
+            | Some("skills")
+            | Some(".clawhub")
     )
 }
 
@@ -3803,6 +3809,10 @@ mod tests {
         )
         .unwrap();
         for path in [
+            "skills/shared/SKILL.md",
+            "skills/shared/scripts/task.sh",
+            "skills/shared/.clawhub/origin.json",
+            ".clawhub/lock.json",
             "plugins/installs.json",
             "extensions/demo/openclaw.plugin.json",
             "extensions/demo/node_modules/package/index.js",
@@ -3860,6 +3870,10 @@ mod tests {
                 .exists()
         );
         for path in [
+            "skills/shared/SKILL.md",
+            "skills/shared/scripts/task.sh",
+            "skills/shared/.clawhub/origin.json",
+            ".clawhub/lock.json",
             "plugins/installs.json",
             "extensions/demo/openclaw.plugin.json",
             "extensions/demo/node_modules/package/index.js",

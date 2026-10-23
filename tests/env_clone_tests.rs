@@ -1020,7 +1020,7 @@ fn env_clone_copies_state_into_a_new_environment() {
 }
 
 #[test]
-fn env_clone_preserves_plugin_payloads_while_clearing_live_runtime_state() {
+fn env_clone_preserves_plugin_and_shared_skill_payloads_while_clearing_live_runtime_state() {
     let root = TestDir::new("env-clone-plugin-payloads");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -1031,6 +1031,19 @@ fn env_clone_preserves_plugin_payloads_while_clearing_live_runtime_state() {
 
     let source_state = root.child("ocm-home/envs/source/.openclaw");
     let payloads = [
+        (
+            "skills/shared/SKILL.md",
+            "---\nname: shared\ndescription: Shared procedure\n---\nKeep this skill.\n",
+        ),
+        ("skills/shared/scripts/task.sh", "#!/bin/sh\nexit 0\n"),
+        (
+            "skills/shared/.clawhub/origin.json",
+            r#"{"version":1,"registry":"https://clawhub.ai","slug":"shared","installedVersion":"1.0.0","installedAt":1}"#,
+        ),
+        (
+            ".clawhub/lock.json",
+            r#"{"version":1,"skills":{"shared":{"version":"1.0.0","installedAt":1}}}"#,
+        ),
         (
             "plugins/installs.json",
             "{\"legacy\":{\"source\":\"path\"}}\n",
@@ -1063,6 +1076,12 @@ fn env_clone_preserves_plugin_payloads_while_clearing_live_runtime_state() {
     ];
     for (path, contents) in payloads {
         write_text(&source_state.join(path), contents);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if path.ends_with(".sh") { 0o750 } else { 0o600 };
+            fs::set_permissions(source_state.join(path), fs::Permissions::from_mode(mode)).unwrap();
+        }
     }
     write_text(
         &source_state.join("agents/main/sessions/session.jsonl"),
@@ -1092,7 +1111,29 @@ fn env_clone_preserves_plugin_payloads_while_clearing_live_runtime_state() {
             contents,
             "{path}"
         );
+        assert_eq!(
+            fs::read_to_string(source_state.join(path)).unwrap(),
+            contents
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if path.ends_with(".sh") { 0o750 } else { 0o600 };
+            for state in [&source_state, &target_state] {
+                assert_eq!(
+                    fs::metadata(state.join(path)).unwrap().permissions().mode() & 0o777,
+                    mode,
+                    "{path}"
+                );
+            }
+        }
     }
+    assert!(
+        source_state
+            .join("agents/main/sessions/session.jsonl")
+            .exists()
+    );
+    assert!(source_state.join("logs/gateway.log").exists());
     assert!(!target_state.join("agents/main/sessions").exists());
     assert!(!target_state.join("logs").exists());
     for path in [

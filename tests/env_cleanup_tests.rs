@@ -251,6 +251,39 @@ fn env_cleanup_yes_clears_copied_openclaw_runtime_state() {
         fs::write(path, &workshop_content).unwrap();
     }
 
+    let shared_skills = [
+        (
+            "skills/shared/SKILL.md",
+            "---\nname: shared\ndescription: Shared procedure\n---\nKeep this skill.\n",
+        ),
+        ("skills/shared/scripts/task.sh", "#!/bin/sh\nexit 0\n"),
+        (
+            "skills/shared/.clawhub/origin.json",
+            r#"{"version":1,"registry":"https://clawhub.ai","slug":"shared","installedVersion":"1.0.0","installedAt":1}"#,
+        ),
+        (
+            ".clawhub/lock.json",
+            r#"{"version":1,"skills":{"shared":{"version":"1.0.0","installedAt":1}}}"#,
+        ),
+    ];
+    for (relative, content) in shared_skills {
+        crate::support::write_text(&target_state.join(relative), content);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if relative.ends_with(".sh") {
+                0o750
+            } else {
+                0o600
+            };
+            fs::set_permissions(
+                target_state.join(relative),
+                fs::Permissions::from_mode(mode),
+            )
+            .unwrap();
+        }
+    }
+
     let doctor = run_ocm(&cwd, &env, &["env", "doctor", "target", "--json"]);
     assert!(doctor.status.success(), "{}", stderr(&doctor));
     let doctor_value: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
@@ -282,6 +315,30 @@ fn env_cleanup_yes_clears_copied_openclaw_runtime_state() {
             )),
             workshop_content
         );
+    }
+    for (relative, content) in shared_skills {
+        assert_eq!(
+            fs::read_to_string(target_state.join(relative)).unwrap(),
+            content
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if relative.ends_with(".sh") {
+                0o750
+            } else {
+                0o600
+            };
+            assert_eq!(
+                fs::metadata(target_state.join(relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                mode,
+                "{relative}"
+            );
+        }
     }
 }
 
