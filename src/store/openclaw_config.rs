@@ -1006,7 +1006,12 @@ fn minimum_local_config_value(
     Ok(value)
 }
 
-/// Resolve only public TLS material; the Gateway owns key loading and generation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GatewayReadinessHost {
+    Address(std::net::Ipv4Addr),
+    Tailnet,
+}
+
 /// Resolve only the bind settings needed by readiness, using launch authority.
 /// The readiness owner verifies that a selected address belongs to this host.
 pub(crate) fn gateway_readiness_host(
@@ -1015,7 +1020,7 @@ pub(crate) fn gateway_readiness_host(
     run_dir: &Path,
     env: &BTreeMap<String, String>,
     resolve_native: impl FnOnce() -> Result<Option<Value>, String>,
-) -> Result<std::net::Ipv4Addr, String> {
+) -> Result<GatewayReadinessHost, String> {
     let paths = derive_env_paths(Path::new(&meta.root));
     let context = OpenClawConfigReadContext::for_launch(env, run_dir)?;
     let local = (|| -> Result<Value, OpenClawConfigReadError> {
@@ -1059,7 +1064,7 @@ pub(crate) fn gateway_readiness_host(
                 Ok(config) => config,
                 // Preserve opaque launchers' existing loopback destination.
                 Err(OpenClawConfigReadError::OutsideAuthority(_)) => {
-                    return Ok(std::net::Ipv4Addr::LOCALHOST);
+                    return Ok(GatewayReadinessHost::Address(std::net::Ipv4Addr::LOCALHOST));
                 }
                 Err(error) => return Err(error.to_string()),
             };
@@ -1091,15 +1096,19 @@ pub(crate) fn gateway_readiness_host(
             .and_then(Value::as_str)
             .and_then(|host| host.trim().parse::<std::net::Ipv4Addr>().ok())
             .ok_or("Gateway custom bind host must be an IPv4 address")?;
-        return Ok(if host.is_unspecified() {
+        return Ok(GatewayReadinessHost::Address(if host.is_unspecified() {
             std::net::Ipv4Addr::LOCALHOST
         } else {
             host
-        });
+        }));
     }
-    Ok(std::net::Ipv4Addr::LOCALHOST)
+    if gateway.get("bind").and_then(Value::as_str) == Some("tailnet") {
+        return Ok(GatewayReadinessHost::Tailnet);
+    }
+    Ok(GatewayReadinessHost::Address(std::net::Ipv4Addr::LOCALHOST))
 }
 
+/// Resolve only public TLS material; the Gateway owns key loading and generation.
 pub(crate) fn gateway_readiness_certificate(
     meta: &EnvMeta,
     port: u32,
@@ -2415,6 +2424,32 @@ mod tests {
             std::process::id(),
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ))
+    }
+
+    #[test]
+    fn readiness_tailnet_bind_uses_launch_scoped_include_and_variables() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = derive_env_paths(&root.path().join("environment"));
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        let meta = meta("demo", paths.root.to_str().unwrap(), Some(18789));
+        fs::write(&paths.config_path, r#"{"$include":"bind.json"}"#).unwrap();
+        fs::write(
+            paths.state_dir.join("bind.json"),
+            r#"{"gateway":{"bind":"${BIND_MODE}"}}"#,
+        )
+        .unwrap();
+        let env = BTreeMap::from([("BIND_MODE".to_string(), "tailnet".to_string())]);
+        assert_eq!(
+            gateway_readiness_host(&meta, 18789, root.path(), &env, || Ok(None)).unwrap(),
+            GatewayReadinessHost::Tailnet
+        );
+        assert_eq!(
+            gateway_readiness_host(&meta, 18789, root.path(), &env, || Ok(Some(
+                json!({"bind":"custom", "customBindHost":"127.0.0.2"})
+            )))
+            .unwrap(),
+            GatewayReadinessHost::Address("127.0.0.2".parse().unwrap())
+        );
     }
 
     #[test]
