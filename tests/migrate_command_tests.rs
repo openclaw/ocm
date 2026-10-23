@@ -4121,8 +4121,7 @@ fn migration_rejects_only_mutating_saved_skill_includes() {
                     let root = TestDir::new("migrate-skill-include");
                     let source = root.child("plain-home/.openclaw");
                     let library = skill_library::SkillLibrary::seed_at(&source, alias);
-                    let include =
-                        fs::canonicalize(library.config_include(&source, needs_rewrite)).unwrap();
+                    let include = library.physical_config_include(&source, needs_rewrite);
                     library.configure_include(&source, &include);
                     if plugin_load {
                         let config_path = source.join("openclaw.json");

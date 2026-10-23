@@ -562,7 +562,10 @@ payloads and their supporting files verbatim rather than snapshotting them.
 An existing saved-skill namespace may be a directory alias to another location
 inside the same OpenClaw state directory; its physical payload keeps the same
 protection, including when nested below an otherwise disposable runtime directory.
-This does not include external linked content or change links inside a revision.
+Cleanup retains intermediate links required to reach that namespace. Clone and
+migration project absolute namespace routes into the copied state so saved skills
+do not continue reading the source. This does not include external linked content
+or change links inside a revision.
 A config include that needs rewriting inside a protected payload causes the copy
 to fail and roll back; move that active configuration to a mutable include outside
 the published revision. Unchanged includes remain supported. Ordinary runtime paths still

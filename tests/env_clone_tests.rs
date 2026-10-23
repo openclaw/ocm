@@ -2842,8 +2842,15 @@ fn env_clone_rolls_back_unresolvable_or_locked_managed_git_graphs() {
         let before = file_bytes(&source);
         let output = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
         assert!(!output.status.success(), "{variant} unexpectedly succeeded");
+        let expected = if variant == "protected-registry-namespace" {
+            // Namespace projection exposes the registry's protected role before
+            // the managed Git graph can request any writes.
+            "copied OpenClaw database selects integrity-protected history"
+        } else {
+            "cannot copy managed worktree"
+        };
         assert!(
-            stderr(&output).contains("cannot copy managed worktree"),
+            stderr(&output).contains(expected),
             "{variant}: {}",
             stderr(&output)
         );
@@ -4074,7 +4081,7 @@ fn env_clone_rejects_only_mutating_saved_skill_includes() {
             assert!(created.status.success(), "{}", stderr(&created));
             let source = root.child("ocm-home/envs/source/.openclaw");
             let library = skill_library::SkillLibrary::seed_at(&source, alias);
-            let include = fs::canonicalize(library.config_include(&source, needs_rewrite)).unwrap();
+            let include = library.physical_config_include(&source, needs_rewrite);
             library.configure_include(&source, &include);
             let copied = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
             assert_eq!(

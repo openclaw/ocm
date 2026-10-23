@@ -1679,7 +1679,7 @@ fn env_import_rejects_only_mutating_saved_skill_includes() {
             let library = skill_library::SkillLibrary::seed_at(&source, alias);
             library.configure_include(
                 &source,
-                &fs::canonicalize(library.config_include(&source, needs_rewrite)).unwrap(),
+                &library.physical_config_include(&source, needs_rewrite),
             );
             let exported = run_ocm(
                 root.path(),

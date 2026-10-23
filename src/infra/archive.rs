@@ -106,6 +106,7 @@ pub struct EnvArchiveOptions {
     pub snapshot_sqlite_files: bool,
     pub should_preserve_bytes: fn(&Path) -> bool,
     pub preserved_byte_roots: BTreeSet<PathBuf>,
+    pub preserved_entry_paths: BTreeSet<PathBuf>,
     pub private_output: bool,
     pub relocate_internal_symlinks: bool,
     pub sqlite_content_roots: BTreeSet<PathBuf>,
@@ -121,6 +122,7 @@ impl Default for EnvArchiveOptions {
             snapshot_sqlite_files: false,
             should_preserve_bytes: |_| false,
             preserved_byte_roots: BTreeSet::new(),
+            preserved_entry_paths: BTreeSet::new(),
             private_output: false,
             relocate_internal_symlinks: false,
             sqlite_content_roots: BTreeSet::new(),
@@ -142,15 +144,19 @@ impl EnvArchiveOptions {
         // ancestors otherwise look like runtime debris. Descending an ancestor
         // does not preserve unrelated siblings, and never follows a link.
         if kind != EnvArchiveEntryKind::Other
-            && self
+            && (self
                 .preserved_byte_roots
                 .iter()
                 .any(|root| relative_path.starts_with(root) || root.starts_with(relative_path))
+                || self
+                    .preserved_entry_paths
+                    .iter()
+                    .any(|entry| entry.starts_with(relative_path)))
         {
             return false;
         }
         if (self.should_exclude_path)(relative_path, kind)
-            || (!self.preserved_byte_roots.is_empty()
+            || ((!self.preserved_byte_roots.is_empty() || !self.preserved_entry_paths.is_empty())
                 && relative_path.ancestors().skip(1).any(|parent| {
                     (self.should_exclude_path)(parent, EnvArchiveEntryKind::Directory)
                 }))
