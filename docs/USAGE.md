@@ -1538,7 +1538,16 @@ and the captured UI process and HTML document separately. JSON includes
 `gatewayHealthReady`, `ui.processRunning`, `ui.httpReady`, and `ui.issue`;
 unverifiable UI ownership keeps readiness `null`. The existing `uiUrl`/`ui_url`
 address remains available for active UI sessions. These observations use bounded
-loopback requests and leave recorded state unchanged.
+loopback requests and leave recorded state unchanged. For a TLS Gateway running
+with `--no-ui`, status uses an `https://` Gateway URL and pins the configured
+public certificate before requesting `/health`. An unreadable or mismatched
+certificate, a failed TLS handshake, or a non-200 response leaves
+`gatewayHealthReady` false; status never retries a known TLS endpoint with HTTP.
+The recorded foreground source, environment root and port take precedence over
+later registration changes. Certificate paths are resolved in that source's
+launch context, including the existing native lookup for templated paths.
+These are current configuration observations, not a saved copy of the running
+Gateway's configuration or the launching terminal's inherited variables.
 
 `dev <env> --service` records its preparation children until verified completion.
 Use `dev stop <env>` to cancel setup; a managed Gateway already running keeps its

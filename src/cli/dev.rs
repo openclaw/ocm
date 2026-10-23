@@ -11,7 +11,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -2408,6 +2408,50 @@ impl Cli {
         let paths = derive_env_paths(Path::new(active_root));
         let root = active_root.to_string();
         let env_name = meta.name.clone();
+        // Probe the recorded foreground endpoint, even if the registered binding,
+        // root or port has since changed. Native config reads must use that source.
+        let mut probe_meta = meta.clone();
+        probe_meta.root = root.clone();
+        probe_meta.gateway_port = Some(gateway_port);
+        let source = active_source
+            .as_deref()
+            .or_else(|| dev.map(|dev| dev.source_root()));
+        let run_dir = source.map(Path::new).unwrap_or(Path::new(active_root));
+        let probe_env = build_openclaw_dev_source_env(&probe_meta, &self.env, run_dir);
+        let deadline = Instant::now() + Duration::from_millis(2100);
+        let mut tls = false;
+        let gateway_health_ready = crate::store::gateway_readiness_certificate(
+            &probe_meta,
+            gateway_port,
+            run_dir,
+            &probe_env,
+            &mut tls,
+            || {
+                if source.is_none() {
+                    return Ok(None);
+                }
+                let mut command = Command::new("node");
+                command
+                    .args(["scripts/run-node.mjs", "config", "get", "gateway", "--json"])
+                    .current_dir(run_dir)
+                    .env_clear()
+                    .envs(&probe_env);
+                crate::service::read_gateway_config(
+                    command,
+                    deadline,
+                    crate::infra::interrupt::generation(),
+                )
+            },
+        )
+        .and_then(|certificate| {
+            crate::service::gateway_health_ok(
+                std::net::Ipv4Addr::LOCALHOST,
+                gateway_port,
+                certificate,
+                deadline.min(Instant::now() + Duration::from_millis(350)),
+            )
+        })
+        .unwrap_or(false);
         Ok(Some(DevStatusSummary {
             env_name: env_name.clone(),
             root,
@@ -2416,9 +2460,12 @@ impl Cli {
                 .or_else(|| active_source.clone()),
             worktree_root: active_source.or_else(|| dev.map(|dev| dev.source_root().to_string())),
             gateway_port,
-            gateway_url: dev_gateway_url(gateway_port),
+            gateway_url: format!(
+                "{}://127.0.0.1:{gateway_port}",
+                if tls { "https" } else { "http" },
+            ),
             gateway_port_reachable: crate::service::inspect::tcp_port_reachable(gateway_port),
-            gateway_health_ready: ui::http_ready(gateway_port, "/health", false),
+            gateway_health_ready,
             ui_url,
             ui,
             config_path: display_path(&paths.config_path),

@@ -4880,6 +4880,196 @@ fn dev_command_can_onboard_then_watch() {
     assert!(!source_watch_override_path(&root, "demo").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn dev_status_uses_configured_tls_and_recorded_foreground_endpoint() {
+    for variant in [
+        "http",
+        "tls",
+        "relative",
+        "templated",
+        "wrong-certificate",
+        "unhealthy-tls",
+    ] {
+        let root = TestDir::new(&format!("dev-status-{variant}"));
+        let repo = init_openclaw_repo(&root);
+        let env = ocm_env(&root);
+        let peer = repo.join("scripts/tls-readiness.cjs");
+        fs::write(&peer, include_str!("support/tls_readiness.cjs")).unwrap();
+        let log = root.child("requests.jsonl");
+        let runner = format!(
+            r#"import fs from 'node:fs';
+import {{pathToFileURL}} from 'node:url';
+if (process.env.OCM_TEST_SETUP === '1') process.exit(0);
+if (process.argv[2] === 'config') {{
+  const config = JSON.parse(fs.readFileSync(process.env.OPENCLAW_CONFIG_PATH, 'utf8'));
+  config.gateway.tls.certPath = 'public.pem';
+  fs.writeFileSync({config_log}, JSON.stringify({{cwd: process.cwd(), root: process.env.OCM_ACTIVE_ENV_ROOT, port: process.env.OPENCLAW_GATEWAY_PORT}}));
+  console.log(JSON.stringify(config.gateway));
+  process.exit(0);
+}}
+const peer = {peer};
+process.argv = [process.argv[0], peer, {mode}, {log}];
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));
+await import(pathToFileURL(peer).href);
+"#,
+            config_log =
+                serde_json::to_string(&path_string(&root.child("config-read.json"))).unwrap(),
+            peer = serde_json::to_string(&path_string(&peer)).unwrap(),
+            mode = serde_json::to_string(if variant == "http" {
+                "http"
+            } else if variant == "unhealthy-tls" {
+                "unhealthy-tls"
+            } else {
+                "tls"
+            })
+            .unwrap(),
+            log = serde_json::to_string(&path_string(&log)).unwrap(),
+        );
+        fs::write(repo.join("scripts/run-node.mjs"), &runner).unwrap();
+        let mut setup_env = env.clone();
+        setup_env.insert("OCM_TEST_SETUP".to_string(), "1".to_string());
+        // Keep this live peer out of the default port families used by other
+        // fixture stores while their environments are temporarily stopped.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+            .to_string();
+        let setup = run_ocm(
+            &repo,
+            &setup_env,
+            &dev_plain(&["demo", "--repo", &path_string(&repo), "--port", &port]),
+        );
+        assert!(setup.status.success(), "{variant}: {}", stderr(&setup));
+        let original = get_environment("demo", &env, &repo).unwrap();
+        let config_path = Path::new(&original.root).join(".openclaw/openclaw.json");
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config["gateway"]["tls"] = serde_json::json!({"enabled": variant != "http"});
+        let cert = Command::new("node")
+            .arg(&peer)
+            .arg(if variant == "wrong-certificate" {
+                "--other-certificate"
+            } else {
+                "--certificate"
+            })
+            .output()
+            .unwrap();
+        assert!(cert.status.success());
+        let cert_path = if matches!(variant, "relative" | "templated") {
+            config["gateway"]["tls"]["certPath"] = serde_json::json!(if variant == "relative" {
+                "public.pem"
+            } else {
+                "${CERT_NAME}"
+            });
+            repo.join("public.pem")
+        } else {
+            Path::new(&original.root).join(".openclaw/gateway/tls/gateway-cert.pem")
+        };
+        fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
+        fs::write(&cert_path, cert.stdout).unwrap();
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let mut live = DevWatchFixture::spawn(
+            &root,
+            &repo,
+            &env,
+            &["dev", "demo", "--no-watch", "--no-ui"],
+        );
+        assert!(
+            wait_for_path(
+                &log.with_extension("jsonl.listening"),
+                Duration::from_secs(10)
+            ),
+            "{variant}: peer did not listen"
+        );
+        let ready = !matches!(variant, "wrong-certificate" | "unhealthy-tls");
+        let check = |summary: &Value| {
+            assert_eq!(summary["sourceWatch"]["state"], "active", "{variant}");
+            assert_eq!(summary["gatewayPortReachable"], true, "{variant}");
+            assert_eq!(summary["gatewayHealthReady"], ready, "{variant}");
+            assert_eq!(
+                summary["gatewayUrl"],
+                format!(
+                    "{}://127.0.0.1:{}",
+                    if variant == "http" { "http" } else { "https" },
+                    original.gateway_port.unwrap()
+                ),
+                "{variant}"
+            );
+        };
+        let status = run_ocm(root.path(), &env, &["dev", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{variant}: {}", stderr(&status));
+        check(&serde_json::from_str::<Value>(&stdout(&status)).unwrap());
+        let list = run_ocm(root.path(), &env, &["dev", "status", "--json"]);
+        assert!(list.status.success(), "{variant}: {}", stderr(&list));
+        check(&serde_json::from_str::<Value>(&stdout(&list)).unwrap()[0]);
+        let reuse = run_ocm(&repo, &env, &["dev", "demo", "--no-watch", "--no-ui"]);
+        assert!(reuse.status.success(), "{variant}: {}", stderr(&reuse));
+        assert!(
+            stdout(&reuse).contains(if variant == "http" {
+                "http://127.0.0.1:"
+            } else {
+                "https://127.0.0.1:"
+            }),
+            "{variant}: {}",
+            stdout(&reuse)
+        );
+        // The active endpoint wins over later registration changes. A decoy
+        // source/root must neither supply the certificate nor receive config IO.
+        let mut moved = original.clone();
+        moved.root = path_string(&root.child("decoy-root"));
+        moved.gateway_port = Some(1);
+        moved.dev = None;
+        save_environment(moved, &env, &repo).unwrap();
+        let drifted = run_ocm(root.path(), &env, &["dev", "status", "demo", "--json"]);
+        assert!(drifted.status.success(), "{variant}: {}", stderr(&drifted));
+        let drifted: Value = serde_json::from_str(&stdout(&drifted)).unwrap();
+        check(&drifted);
+        assert_eq!(drifted["root"], original.root);
+        save_environment(original.clone(), &env, &repo).unwrap();
+        if variant == "templated" {
+            let observed: Value =
+                serde_json::from_slice(&fs::read(root.child("config-read.json")).unwrap()).unwrap();
+            assert_eq!(
+                observed["cwd"],
+                path_string(&fs::canonicalize(&repo).unwrap())
+            );
+            assert_eq!(observed["root"], original.root);
+            assert_eq!(observed["port"], original.gateway_port.unwrap().to_string());
+        }
+        if variant == "wrong-certificate" {
+            assert!(
+                !log.exists(),
+                "an unauthenticated peer received a health request"
+            );
+        }
+        if variant == "tls" {
+            fs::remove_file(&cert_path).unwrap();
+            let missing = run_ocm(root.path(), &env, &["dev", "status", "demo", "--json"]);
+            assert!(missing.status.success(), "{}", stderr(&missing));
+            let missing: Value = serde_json::from_str(&stdout(&missing)).unwrap();
+            assert_eq!(missing["gatewayHealthReady"], false);
+            assert!(
+                missing["gatewayUrl"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://")
+            );
+        }
+        let stopped = run_dev_stop(&repo, &env);
+        assert!(stopped.status.success(), "{variant}: {}", stderr(&stopped));
+        assert_eq!(live.wait_without_release().status.code(), Some(130));
+        let status = run_ocm(root.path(), &env, &["dev", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{variant}: {}", stderr(&status));
+        let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+        assert_eq!(status["sourceWatch"]["state"], "inactive");
+        assert_eq!(status["gatewayPortReachable"], false);
+        assert_eq!(status["gatewayHealthReady"], false);
+    }
+}
+
 #[test]
 fn dev_status_reports_dev_envs() {
     let root = TestDir::new("dev-status");
