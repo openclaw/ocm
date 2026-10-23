@@ -3525,11 +3525,12 @@ fn migrate_and_adopt_relocate_includes_through_a_source_home_alias() {
 #[test]
 fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
     for adopt in [false, true] {
-        for (relative_root, source_arg) in [
-            (false, "alias"),
-            (true, "alias"),
-            (false, "sub/../alias"),
-            (false, "hop/../plain-home"),
+        for (relative_root, source_arg, include_root) in [
+            (false, "alias", "alias"),
+            (true, "alias", "alias"),
+            (false, "sub/../alias", "sub/../alias"),
+            (false, "sub/../alias", "alias"),
+            (false, "hop/../plain-home", "hop/../plain-home"),
         ] {
             let root = TestDir::new("migrate-alias-authored-includes");
             let env = ocm_env(&root);
@@ -3540,7 +3541,7 @@ fn migrate_and_adopt_admit_includes_authored_under_the_supplied_home_alias() {
             fs::create_dir_all(root.child("sub")).unwrap();
             fs::create_dir_all(root.child("source/deep")).unwrap();
             std::os::unix::fs::symlink(root.child("source/deep"), root.child("hop")).unwrap();
-            let authored_alias = root.child(source_arg);
+            let authored_alias = root.child(include_root);
             let root_include = if relative_root {
                 std::path::PathBuf::from("./config/plugins.json")
             } else {

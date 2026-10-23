@@ -561,14 +561,15 @@ fn resolve_env_openclaw_paths(
 
 pub(crate) fn resolve_plain_openclaw_workspaces(
     state_dir: &Path,
+    source_config_roots: &[PathBuf],
     env: &BTreeMap<String, String>,
 ) -> Result<OpenClawWorkspaceInventory, String> {
-    let source_alias = std::path::absolute(state_dir).map_err(|error| error.to_string())?;
     let state_dir = canonicalize_path_allow_missing(state_dir)?;
     let config_path = state_dir.join("openclaw.json");
-    // Admit the explicitly supplied spelling, while keeping the canonical home
-    // as the include boundary and the source of workspace defaults.
-    let config = load_effective_openclaw_config_with_config_roots(&config_path, &[source_alias])?;
+    // The migration owner supplies verified source spellings. The canonical
+    // home remains the include boundary and the source of workspace defaults.
+    let config =
+        load_effective_openclaw_config_with_config_roots(&config_path, source_config_roots)?;
     let openclaw_home = state_dir.parent().unwrap_or(&state_dir);
     let mut inventory = resolve_openclaw_workspaces_from_config(
         &state_dir.join("openclaw.json"),
