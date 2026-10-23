@@ -133,8 +133,8 @@ worktrees and original repository selection.
 
 New borrowers may prepare missing tooling with `pnpm install --frozen-lockfile`.
 Before automatic installation, OCM reads the selected pnpm configuration and
-refuses linked modules or virtual-store destinations, including custom paths and
-linked parents. Failed configuration readback also requires explicit preparation;
+refuses linked modules or virtual-store destinations, including custom project
+and global stores, lockfile-relative modules, and linked parents. Failed configuration readback also requires explicit preparation;
 physical default and custom destinations remain supported.
 Resumed borrowers report missing tooling for explicit preparation; they do not
 reinstall dependencies. Removing a borrower preserves source files, dependencies,

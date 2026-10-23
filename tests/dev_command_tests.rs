@@ -4056,6 +4056,8 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
         "physical",
         "linked-store",
         "linked-parent",
+        "linked-global-store",
+        "linked-lockfile-modules",
         "invalid-config",
         "failed-config",
     ] {
@@ -4083,9 +4085,31 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
             })
             .to_string(),
         );
+        let link =
+            if case == "linked-lockfile-modules" {
+                env.insert("OCM_TEST_PNPM_CONFIG".to_string(), serde_json::json!({
+                "lockfileDir": "lockfiles", "modulesDir": "modules", "virtualStoreDir": "store",
+            }).to_string());
+                fs::create_dir(repo.join("lockfiles")).unwrap();
+                repo.join("lockfiles/modules")
+            } else {
+                if case == "linked-global-store" {
+                    env.insert(
+                        "OCM_TEST_PNPM_CONFIG".to_string(),
+                        serde_json::json!({
+                            "virtualStoreType": "global", "globalVirtualStoreDir": "custom-store",
+                        })
+                        .to_string(),
+                    );
+                }
+                repo.join("custom-store")
+            };
         match case {
-            "linked-store" | "linked-parent" => {
-                std::os::unix::fs::symlink(&borrowed, repo.join("custom-store")).unwrap();
+            "linked-store"
+            | "linked-parent"
+            | "linked-global-store"
+            | "linked-lockfile-modules" => {
+                std::os::unix::fs::symlink(&borrowed, &link).unwrap();
             }
             "invalid-config" => {
                 env.insert(
@@ -4128,7 +4152,7 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
         }
         if case.starts_with("linked-") {
             assert!(stderr(&result).contains("refusing to install"), "{case}");
-            assert_eq!(fs::read_link(repo.join("custom-store")).unwrap(), borrowed);
+            assert_eq!(fs::read_link(&link).unwrap(), borrowed);
         }
     }
 }

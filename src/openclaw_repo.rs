@@ -417,8 +417,9 @@ pub(crate) fn ensure_source_dependency_install_config(
     let config = config
         .as_object()
         .ok_or_else(|| "pnpm returned invalid dependency destination configuration".to_string())?;
+    let value = |camel: &str, kebab: &str| config.get(camel).or_else(|| config.get(kebab));
     let setting = |camel: &str, kebab: &str| -> Result<Option<&str>, String> {
-        match config.get(camel).or_else(|| config.get(kebab)) {
+        match value(camel, kebab) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
             _ => Err(format!(
@@ -430,11 +431,36 @@ pub(crate) fn ensure_source_dependency_install_config(
     let modules = clean_path(&repo_root.join(modules_setting));
     let lockfile_root =
         clean_path(&repo_root.join(setting("lockfileDir", "lockfile-dir")?.unwrap_or(".")));
-    let virtual_store = match setting("virtualStoreDir", "virtual-store-dir")? {
-        Some(value) => clean_path(&lockfile_root.join(value)),
-        None => clean_path(&lockfile_root.join(modules_setting).join(".pnpm")),
+    let lockfile_modules = clean_path(&lockfile_root.join(modules_setting));
+    let global = match setting("virtualStoreType", "virtual-store-type")? {
+        Some("global") => true,
+        Some("project") => false,
+        None => match value("enableGlobalVirtualStore", "enable-global-virtual-store") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(enabled)) => *enabled,
+            _ => {
+                return Err("pnpm returned an invalid enableGlobalVirtualStore setting".to_string());
+            }
+        },
+        _ => return Err("pnpm returned an invalid virtualStoreType setting".to_string()),
     };
-    for target in [modules, virtual_store] {
+    // pnpm keeps per-project modules as well as lockfile-root installation
+    // metadata. Global stores retain that metadata in the latter's .pnpm.
+    let mut targets = vec![modules, lockfile_modules.clone()];
+    if global {
+        targets.push(lockfile_modules.join(".pnpm"));
+        if let Some(directory) = setting("globalVirtualStoreDir", "global-virtual-store-dir")?
+            .or(setting("virtualStoreDir", "virtual-store-dir")?)
+        {
+            targets.push(clean_path(&repo_root.join(directory)));
+        }
+    } else {
+        targets.push(match setting("virtualStoreDir", "virtual-store-dir")? {
+            Some(value) => clean_path(&lockfile_root.join(value)),
+            None => lockfile_modules.join(".pnpm"),
+        });
+    }
+    for target in targets {
         // Check every traversed component below the common ancestor, including
         // broken links and an absent target beneath an existing linked parent.
         // The checkout itself has already been admitted by its canonical identity.
@@ -1432,12 +1458,30 @@ mod tests {
         std::os::unix::fs::symlink(repo.join("absent"), repo.join("lockfiles/store")).unwrap();
         std::os::unix::fs::symlink(repo.join("physical-store"), repo.join("linked-modules"))
             .unwrap();
+        std::os::unix::fs::symlink(repo.join("physical-store"), repo.join("lockfiles/modules"))
+            .unwrap();
+        // An unused global-store setting must not reject an ordinary project install.
+        super::ensure_source_dependency_install_config(
+            &repo,
+            &serde_json::to_vec(&serde_json::json!({
+                "virtualStoreType": "project", "globalVirtualStoreDir": "linked-modules",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        super::ensure_source_dependency_install_config(&repo, &serde_json::to_vec(&serde_json::json!({
+            "virtualStoreType": "global", "globalVirtualStoreDir": "physical-store", "virtualStoreDir": "linked-modules",
+        })).unwrap()).unwrap();
         for config in [
             serde_json::json!({"modulesDir": "modules"}),
             serde_json::json!({"modules-dir": "modules"}),
             serde_json::json!({"modulesDir": "linked-modules", "virtualStoreDir": "physical-store"}),
             serde_json::json!({"lockfileDir": "lockfiles", "virtualStoreDir": "store"}),
             serde_json::json!({"virtual-store-dir": repo.join("lockfiles/store")}),
+            serde_json::json!({"lockfileDir": "lockfiles", "modulesDir": "modules", "virtualStoreDir": "physical-store"}),
+            serde_json::json!({"virtualStoreType": "global", "globalVirtualStoreDir": "linked-modules"}),
+            serde_json::json!({"enable-global-virtual-store": true, "global-virtual-store-dir": "linked-modules"}),
+            serde_json::json!({"lockfileDir": "lockfiles", "virtualStoreType": "global", "virtualStoreDir": "linked-modules"}),
         ] {
             let error = super::ensure_source_dependency_install_config(
                 &repo,
