@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -445,6 +446,7 @@ struct LocalSourceExtensionArchive {
 
 #[derive(Clone, Debug)]
 struct SourcePluginDefinition {
+    aliases: BTreeSet<String>,
     directory_name: String,
     package_name: Option<String>,
     dependency_names: BTreeSet<String>,
@@ -641,6 +643,7 @@ fn source_plugin_inventory(repo_path: &Path) -> Result<SourcePluginInventory, St
         inventory.by_id.insert(
             id,
             SourcePluginDefinition {
+                aliases: source_plugin_aliases(&manifest),
                 directory_name,
                 package_name,
                 dependency_names,
@@ -648,6 +651,389 @@ fn source_plugin_inventory(repo_path: &Path) -> Result<SourcePluginInventory, St
         );
     }
     Ok(inventory)
+}
+
+fn manifest_string(value: &serde_json::Value) -> Option<&str> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn manifest_strings(value: Option<&serde_json::Value>) -> Vec<&str> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(manifest_string)
+        .collect()
+}
+
+fn manifest_record_key(id: &str) -> bool {
+    !id.is_empty() && !matches!(id, "__proto__" | "prototype" | "constructor")
+}
+
+// A catalog provider contributes an identity only if native normalization keeps
+// a model or explicit credential ownership. Invalid inference declarations drop
+// the model rather than silently turning it into a legacy chat model.
+fn catalog_model_is_valid(model: &serde_json::Value) -> bool {
+    model.get("id").and_then(manifest_string).is_some()
+        && model
+            .get("inference")
+            .is_none_or(catalog_inference_is_valid)
+}
+
+fn catalog_inference_is_valid(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    fn optional(value: &Value, key: &str, check: impl Fn(&Value) -> bool) -> bool {
+        value.get(key).is_none_or(check)
+    }
+    fn one_of(value: &Value, choices: &[&str]) -> bool {
+        value.as_str().is_some_and(|s| choices.contains(&s))
+    }
+    fn positive_integer(value: &Value) -> bool {
+        value
+            .as_f64()
+            .is_some_and(|n| n > 0.0 && n <= 9_007_199_254_740_991.0 && n.fract() == 0.0)
+    }
+    fn list(value: &Value, choices: &[&str], unique: bool) -> bool {
+        value.as_array().is_some_and(|items| {
+            !items.is_empty()
+                && items.len() <= choices.len()
+                && items.iter().all(|v| one_of(v, choices))
+                && (!unique
+                    || items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        == items.len())
+        })
+    }
+    const KINDS: &[&str] = &["boolean", "choice", "score", "sort", "tags", "box"];
+    fn question(value: &Value) -> bool {
+        value.is_object()
+            && value.get("probabilities").is_some_and(|v| {
+                one_of(
+                    v,
+                    &[
+                        "boolean",
+                        "categorical",
+                        "independent",
+                        "provider-defined",
+                        "none",
+                    ],
+                )
+            })
+            && value.get("abstention").is_some_and(Value::is_boolean)
+            && ["minOptions", "maxOptions", "maxImageOptions"]
+                .iter()
+                .all(|key| optional(value, key, positive_integer))
+            && optional(value, "requiresCriteria", Value::is_boolean)
+            && match (
+                value.get("minOptions").and_then(Value::as_f64),
+                value.get("maxOptions").and_then(Value::as_f64),
+            ) {
+                (Some(min), Some(max)) => min <= max,
+                _ => true,
+            }
+    }
+    if !value.get("chat").is_some_and(Value::is_boolean) {
+        return false;
+    }
+    optional(value, "decision", |decision| {
+        if !decision.is_object() {
+            return false;
+        }
+        let protocol_ok = decision
+            .get("protocol")
+            .and_then(Value::as_str)
+            .is_some_and(|s| {
+                s.len() <= 64
+                    && s.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                    && s.split(['.', '_', '-']).all(|part| {
+                        !part.is_empty()
+                            && part
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                    })
+            });
+        let kinds_supported = |kinds: &Value| {
+            list(kinds, KINDS, true)
+                && kinds.as_array().unwrap().iter().all(|kind| {
+                    decision
+                        .get("questions")
+                        .is_none_or(|q| q.get(kind.as_str().unwrap()).is_some())
+                })
+        };
+        protocol_ok
+            && decision
+                .get("input")
+                .is_some_and(|v| list(v, &["text", "image"], true))
+            && optional(decision, "questions", |q| {
+                q.is_object()
+                    && KINDS.iter().any(|k| q.get(k).is_some())
+                    && KINDS.iter().all(|k| optional(q, k, question))
+            })
+            && optional(decision, "confidence", |v| {
+                one_of(v, &["provider-specific", "none"])
+            })
+            && optional(decision, "reasoning", |r| {
+                r.is_object()
+                    && r.get("modes")
+                        .is_some_and(|v| list(v, &["auto", "off", "on"], true))
+                    && optional(r, "default", |v| r["modes"].as_array().unwrap().contains(v))
+                    && optional(r, "metadata", Value::is_boolean)
+                    && optional(r, "questionTypes", kinds_supported)
+            })
+            && optional(decision, "grounding", |g| {
+                g.is_object()
+                    && g.get("webSearch").is_some_and(Value::is_boolean)
+                    && optional(g, "questionTypes", kinds_supported)
+            })
+            && optional(decision, "limits", |l| {
+                l.is_object()
+                    && [
+                        "maxQuestions",
+                        "maxRequestTokens",
+                        "maxStateAndQuestionTokens",
+                        "maxInputTokens",
+                    ]
+                    .iter()
+                    .all(|k| optional(l, k, positive_integer))
+                    && optional(l, "inputTokenScope", |v| {
+                        one_of(v, &["encoded-question", "state-plus-each-criterion"])
+                    })
+                    && optional(l, "image", |i| {
+                        i.is_object()
+                            && decision["input"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|v| v == "image")
+                            && i.get("maxBytes").is_some_and(positive_integer)
+                            && i.get("mimeTypes").is_some_and(|v| {
+                                list(v, &["image/png", "image/jpeg", "image/webp"], false)
+                            })
+                            && i.get("remoteUrls").is_some_and(Value::is_boolean)
+                    })
+            })
+            && optional(decision, "billing", |b| {
+                b.is_object()
+                    && b.get("source").is_some_and(|v| {
+                        one_of(v, &["provider-docs", "provider-catalog", "configured"])
+                    })
+                    && match b.get("unit").and_then(Value::as_str) {
+                        Some("tokens") => optional(b, "usdPerMillion", |r| {
+                            r.is_object()
+                                && ["input", "output"].iter().all(|k| {
+                                    optional(r, k, |v| {
+                                        v.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0)
+                                    })
+                                })
+                        }),
+                        Some("decision-units" | "requests") => b.get("usdPerMillion").is_none(),
+                        _ => false,
+                    }
+            })
+    })
+}
+
+// These are the manifest fields used by OpenClaw's manifest ID normalizer, not
+// arbitrary provider names found in the target's configuration.
+fn source_plugin_aliases(manifest: &serde_json::Value) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    for pointer in [
+        "/providers",
+        "/channels",
+        "/cliBackends",
+        "/setup/cliBackends",
+        "/legacyPluginIds",
+    ] {
+        if let Some(values) = manifest
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_array)
+        {
+            aliases.extend(
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter_map(normalized_plugin_id),
+            );
+        }
+    }
+    if let Some(providers) = manifest
+        .pointer("/setup/providers")
+        .and_then(serde_json::Value::as_array)
+    {
+        aliases.extend(
+            providers
+                .iter()
+                .filter_map(|provider| provider.get("id")?.as_str())
+                .filter_map(normalized_plugin_id),
+        );
+    }
+    if let Some(values) = manifest
+        .get("providerAuthAliases")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, value) in values {
+            if manifest_record_key(key.trim())
+                && (manifest_string(value).is_some()
+                    || (value.get("provider").and_then(manifest_string).is_some()
+                        && !manifest_strings(value.get("baseUrls")).is_empty()))
+            {
+                aliases.extend(normalized_plugin_id(key));
+            }
+        }
+    }
+    let decision_providers = manifest_strings(manifest.pointer("/contracts/decisionProviders"));
+    let owned = manifest_strings(manifest.get("providers"))
+        .into_iter()
+        .chain(manifest_strings(manifest.get("cliBackends")))
+        .chain(decision_providers.iter().copied())
+        .filter_map(normalized_plugin_id)
+        .collect::<BTreeSet<_>>();
+    let catalog_providers = manifest
+        .pointer("/modelCatalog/providers")
+        .and_then(serde_json::Value::as_object);
+    if let Some(providers) = catalog_providers {
+        for (id, provider) in providers {
+            let Some(id) = normalized_plugin_id(id) else {
+                continue;
+            };
+            let scope = provider.get("authScope");
+            if id != "__proto__"
+                && owned.contains(&id)
+                && provider.is_object()
+                && scope.is_none_or(|v| matches!(v.as_str(), Some("agent" | "plugin")))
+                && (scope.is_some()
+                    || provider
+                        .get("models")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|models| models.iter().any(catalog_model_is_valid)))
+            {
+                aliases.insert(id);
+            }
+        }
+    }
+    if let Some(values) = manifest
+        .pointer("/modelCatalog/aliases")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, value) in values {
+            // Native catalog records use ordinary JS objects; this setter key
+            // never becomes an own enumerable alias.
+            if normalized_plugin_id(key).as_deref() != Some("__proto__")
+                && value
+                    .get("provider")
+                    .and_then(manifest_string)
+                    .and_then(normalized_plugin_id)
+                    .is_some_and(|provider| owned.contains(&provider))
+            {
+                aliases.extend(normalized_plugin_id(key));
+            }
+        }
+    }
+    if let Some(models) = manifest
+        .get("decisionModels")
+        .and_then(serde_json::Value::as_array)
+    {
+        for model in models {
+            let Some(provider) = model.get("provider").and_then(manifest_string) else {
+                continue;
+            };
+            let Some(id) = model.get("id").and_then(manifest_string) else {
+                continue;
+            };
+            let policy_id = provider.to_lowercase();
+            if !decision_providers.contains(&provider)
+                || !manifest_record_key(&policy_id)
+                || model.get("name").and_then(manifest_string).is_none()
+            {
+                continue;
+            }
+            // Explicit rows reserve their identity even if native validation drops them.
+            let declared = catalog_providers
+                .into_iter()
+                .flat_map(|values| values.iter())
+                .filter(|(key, _)| normalized_plugin_id(key).as_deref() == Some(policy_id.as_str()))
+                .filter_map(|(_, value)| value.get("models").and_then(serde_json::Value::as_array))
+                .flatten()
+                .any(|row| row.get("id").and_then(manifest_string) == Some(id));
+            if !declared {
+                aliases.insert(policy_id);
+            }
+        }
+    }
+    aliases
+}
+
+fn source_plugin_policy_ids(
+    inventory: &SourcePluginInventory,
+    installed: &BTreeSet<String>,
+    repo_path: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut ids = BTreeMap::new();
+    for id in inventory.by_id.keys() {
+        let policy_id = id.to_lowercase();
+        if let Some(previous) = ids.insert(policy_id.clone(), id.clone()) {
+            return Err(format!(
+                "source plugin policy id \"{policy_id}\" is ambiguous between plugin ids \"{previous}\" and \"{id}\""
+            ));
+        }
+    }
+    let mut owners = BTreeMap::<&str, Vec<&str>>::new();
+    for (id, plugin) in &inventory.by_id {
+        for alias in &plugin.aliases {
+            // A declared source identity wins; an installed identity also reserves its name.
+            if !ids.contains_key(alias) && !installed.contains(alias) {
+                owners.entry(alias).or_default().push(id);
+            }
+        }
+    }
+    let competing = owners
+        .values()
+        .filter(|ids| ids.len() > 1)
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let ordered = if competing.is_empty() {
+        Vec::new()
+    } else {
+        // Native aliases are first-wins in String.localeCompare order. Use the build's
+        // existing Node host for collisions rather than approximate ICU collation in Rust.
+        let mut child = Command::new("node")
+            .args(["-e", "let s='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>process.stdout.write(JSON.stringify(JSON.parse(s).sort((a,b)=>a.localeCompare(b)))));"])
+            .envs(env)
+            .current_dir(repo_path)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().map_err(|error| format!("failed to order source plugin aliases: {error}"))?;
+        let input = serde_json::to_vec(&competing).map_err(|error| error.to_string())?;
+        let written = child.stdin.take().unwrap().write_all(&input);
+        let output = child
+            .wait_with_output()
+            .map_err(|error| error.to_string())?;
+        written.map_err(|error| format!("failed to order source plugin aliases: {error}"))?;
+        if !output.status.success() {
+            return Err("failed to order source plugin aliases with Node.js".to_string());
+        }
+        serde_json::from_slice::<Vec<String>>(&output.stdout)
+            .map_err(|error| format!("invalid source plugin alias order: {error}"))?
+    };
+    for (alias, candidates) in owners {
+        let owner = if candidates.len() == 1 {
+            candidates[0]
+        } else {
+            ordered
+                .iter()
+                .find(|id| candidates.contains(&id.as_str()))
+                .ok_or_else(|| "source plugin alias order omitted an identity".to_string())?
+        };
+        ids.insert(alias.to_string(), owner.to_string());
+    }
+    Ok(ids)
 }
 
 fn source_plugin_dependency_closure(
@@ -704,8 +1090,8 @@ fn target_plugin_id(
     installed: &BTreeSet<String>,
 ) -> Option<String> {
     let id = normalized_plugin_id(id)?;
-    if source_ids.contains_key(&id) {
-        return Some(id);
+    if let Some(canonical) = source_ids.get(&id) {
+        return normalized_plugin_id(canonical);
     }
     // Modern OpenClaw maps these legacy IDs to canonical plugins. Older checkouts can still
     // declare the legacy ID itself; that source identity takes precedence over installed records.
@@ -864,16 +1250,8 @@ fn resolve_target_source_plugin_closure(
     let inventory = source_plugin_inventory(repo_path)?;
     // Resolve policy keys back to declared manifest IDs. Packaging and dependency closure must
     // retain those IDs, including their case, to match built manifests and runtime exports.
-    let mut source_ids = BTreeMap::new();
-    for id in inventory.by_id.keys() {
-        let policy_id = id.to_lowercase();
-        if let Some(previous) = source_ids.insert(policy_id.clone(), id.clone()) {
-            return Err(format!(
-                "source plugin policy id \"{policy_id}\" is ambiguous between plugin ids \"{previous}\" and \"{id}\""
-            ));
-        }
-    }
     let installed = installed_target_plugin_ids(&paths, &config);
+    let source_ids = source_plugin_policy_ids(&inventory, &installed, repo_path, context.env)?;
     let explicit = collect_explicit_plugin_references(&config, &source_ids, &installed);
     let missing = explicit
         .iter()
@@ -4037,6 +4415,7 @@ mod tests {
                 (
                     "codex".to_string(),
                     SourcePluginDefinition {
+                        aliases: BTreeSet::new(),
                         directory_name: "codex".to_string(),
                         package_name: Some("@openclaw/codex".to_string()),
                         dependency_names: BTreeSet::from(["@openclaw/shared-ui".to_string()]),
@@ -4045,6 +4424,7 @@ mod tests {
                 (
                     "shared-ui".to_string(),
                     SourcePluginDefinition {
+                        aliases: BTreeSet::new(),
                         directory_name: "shared-ui".to_string(),
                         package_name: Some("@openclaw/shared-ui".to_string()),
                         dependency_names: BTreeSet::new(),

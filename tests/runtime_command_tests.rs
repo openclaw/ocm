@@ -2250,6 +2250,220 @@ fn runtime_build_local_resolves_native_plugin_identity_to_declared_source() {
 }
 
 #[test]
+fn runtime_build_local_resolves_manifest_aliases_with_real_npm() {
+    let root = TestDir::new("runtime-manifest-aliases-real-npm");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    fs::create_dir_all(&repo).unwrap();
+    let mut env = ocm_env(&root);
+    for (key, value) in [
+        ("npm_config_offline", "true".to_string()),
+        ("npm_config_cache", path_string(&root.child("npm-cache"))),
+        ("npm_config_audit", "false".to_string()),
+        ("npm_config_fund", "false".to_string()),
+    ] {
+        env.insert(key.to_string(), value);
+    }
+    fs::write(
+        repo.join("package.json"),
+        serde_json::json!({
+            "name":"openclaw", "version":"2026.4.25", "bin":{"openclaw":"openclaw.mjs"},
+            "files":["openclaw.mjs"], "engines":{"node":">=22.22.3"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    write_executable_script(
+        &repo.join("openclaw.mjs"),
+        "#!/usr/bin/env node\nconsole.log('2026.4.25');\n",
+    );
+    for (directory, manifest) in [
+        (
+            "fish-audio-speech",
+            serde_json::json!({
+                "id":"fish-audio-speech", "configSchema":{"type":"object"},
+                "legacyPluginIds":["fish-audio", "shared", "Zulu"],
+                "providers":["fish-provider"], "channels":["fish-channel"],
+                "cliBackends":["fish-cli"],
+                "setup":{"providers":[{"id":"fish-setup"}], "cliBackends":["fish-setup-cli"]},
+                "modelCatalog":{
+                    "providers":{
+                        "fish-provider":{"models":[]},
+                        "fish-catalog-decision":{"models":[{"id":"model","inference":{"chat":false,"decision":{"protocol":"decision-v1","input":["text"]}}}]},
+                        "discarded-model":{"models":[{"id":"reserved","inference":{"chat":"invalid"}}]},
+                        "discarded-unowned":{"models":[{"id":"model"}]}
+                    },
+                    "aliases":{"fish-catalog":{"provider":"fish-provider"}, "discarded-catalog-alias":{"provider":"unowned"}, "__proto__":{"provider":"fish-provider"}}
+                },
+                "providerAuthAliases":{"fish-auth":"fish-provider", "discarded-auth":"", "discarded-auth-object":{"provider":"fish-provider","baseUrls":[]}},
+                "contracts":{"decisionProviders":["fish-decision", "fish-catalog-decision", "discarded-model"]},
+                "decisionModels":[{"provider":"fish-decision","id":"model","name":"Model"}, {"provider":"discarded-model","id":"reserved","name":"Model"}]
+            }),
+        ),
+        // Native locale ordering puts fish before Zulu; byte ordering does not.
+        (
+            "zulu",
+            serde_json::json!({"id":"Zulu", "legacyPluginIds":["shared"]}),
+        ),
+    ] {
+        for prefix in ["extensions", "dist/extensions"] {
+            let dir = repo.join(prefix).join(directory);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("openclaw.plugin.json"), manifest.to_string()).unwrap();
+            fs::write(dir.join("package.json"), serde_json::json!({
+                "name":format!("@openclaw/{directory}"), "version":"2026.4.25", "type":"module",
+                "files":["index.js","openclaw.plugin.json"], "openclaw":{"runtimeExtensions":["./index.js"]}
+            }).to_string()).unwrap();
+            fs::write(
+                dir.join("index.js"),
+                format!("export default {{id:{}}};\n", manifest["id"]),
+            )
+            .unwrap();
+        }
+    }
+    let old = cwd.join("old-openclaw");
+    write_executable_script(&old, "#!/bin/sh\nexit 0\n");
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "old", "--path", old.to_str().unwrap()],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "primary", "--runtime", "old"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let config_path = root.child("ocm-home/envs/primary/.openclaw/openclaw.json");
+    for (label, policy, expected) in [
+        (
+            "canonical",
+            serde_json::json!({"allow":["fish-audio-speech"]}),
+            Some(Some("fish-audio-speech")),
+        ),
+        (
+            "aliases",
+            serde_json::json!({"allow":[" FISH-AUDIO ","fish-provider","fish-channel","fish-cli","fish-setup","fish-setup-cli","fish-catalog","fish-auth","fish-decision","fish-catalog-decision"]}),
+            Some(Some("fish-audio-speech")),
+        ),
+        (
+            "entry",
+            serde_json::json!({"entries":{"FISH-AUDIO":{"enabled":true}}}),
+            Some(Some("fish-audio-speech")),
+        ),
+        (
+            "slot",
+            serde_json::json!({"slots":{"memory":"fish-setup"}}),
+            Some(Some("fish-audio-speech")),
+        ),
+        (
+            "disabled",
+            serde_json::json!({"allow":["fish-audio"],"entries":{"fish-audio-speech":{"enabled":false}}}),
+            Some(None),
+        ),
+        (
+            "denied",
+            serde_json::json!({"slots":{"memory":"fish-audio-speech"},"entries":{"fish-audio":{"enabled":true}},"deny":["FISH-SETUP"]}),
+            Some(None),
+        ),
+        (
+            "merged",
+            serde_json::json!({"allow":["fish-audio"],"entries":{"fish-audio":{"enabled":false},"fish-audio-speech":{"config":{}}}}),
+            Some(None),
+        ),
+        (
+            "reenabled",
+            serde_json::json!({"entries":{"fish-audio":{"enabled":false},"fish-audio-speech":{"enabled":true}}}),
+            Some(Some("fish-audio-speech")),
+        ),
+        (
+            "shared",
+            serde_json::json!({"allow":["shared"]}),
+            Some(Some("fish-audio-speech")),
+        ),
+        (
+            "canonical-wins",
+            serde_json::json!({"allow":["zulu"]}),
+            Some(Some("Zulu")),
+        ),
+        (
+            "installed-wins",
+            serde_json::json!({"allow":["fish-audio"],"installs":{"fish-audio":{"source":"path"}}}),
+            Some(None),
+        ),
+        (
+            "discarded-metadata",
+            serde_json::json!({"allow":["fish-audio-speech"], "deny":["discarded-auth","discarded-auth-object","discarded-unowned","discarded-catalog-alias","discarded-model","__proto__"]}),
+            Some(Some("fish-audio-speech")),
+        ),
+        (
+            "discarded-model",
+            serde_json::json!({"allow":["discarded-model"]}),
+            None,
+        ),
+        (
+            "unknown",
+            serde_json::json!({"allow":["unavailable-example"]}),
+            None,
+        ),
+    ] {
+        let config = serde_json::json!({"plugins":policy}).to_string();
+        fs::write(&config_path, &config).unwrap();
+        let build = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "build-local",
+                label,
+                "--repo",
+                repo.to_str().unwrap(),
+                "--for-env",
+                "primary",
+                "--raw",
+            ],
+        );
+        assert_eq!(
+            build.status.success(),
+            expected.is_some(),
+            "{label}: {}",
+            stderr(&build)
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), config, "{label}");
+        let meta = runtime_meta_path(label, &env, &cwd).unwrap();
+        assert_eq!(meta.exists(), expected.is_some(), "{label}");
+        if let Some(expected) = expected {
+            let built = runtime_install_root(label, &env, &cwd)
+                .unwrap()
+                .join("files/node_modules/openclaw/dist/extensions");
+            let mut ids = Vec::new();
+            if built.exists() {
+                for entry in fs::read_dir(built).unwrap() {
+                    let manifest = entry.unwrap().path().join("openclaw.plugin.json");
+                    if manifest.exists() {
+                        let value: Value =
+                            serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+                        ids.push(value["id"].as_str().unwrap().to_string());
+                    }
+                }
+            }
+            assert_eq!(
+                ids,
+                expected.into_iter().map(str::to_string).collect::<Vec<_>>(),
+                "{label}"
+            );
+        } else {
+            assert!(stderr(&build).contains(if label == "unknown" {
+                "unavailable-example"
+            } else {
+                "discarded-model"
+            }));
+        }
+    }
+}
+
+#[test]
 fn runtime_build_local_combines_native_identity_and_disabled_policy() {
     for (scenario, source_id, config, missing) in [
         (
