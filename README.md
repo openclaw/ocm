@@ -559,6 +559,10 @@ OpenClaw owns their manifest hashes and revision identity; embedded paths remain
 authored content rather than runtime references. Cleanup and copied-reference
 diagnostics preserve the same ownership. Archive export copies protected SQLite
 payloads and their supporting files verbatim rather than snapshotting them.
+An existing saved-skill namespace may be a directory alias to another location
+inside the same OpenClaw state directory; its physical payload keeps the same
+protection, including when nested below an otherwise disposable runtime directory.
+This does not include external linked content or change links inside a revision.
 A config include that needs rewriting inside a protected payload causes the copy
 to fail and roll back; move that active configuration to a mutable include outside
 the published revision. Unchanged includes remain supported. Ordinary runtime paths still

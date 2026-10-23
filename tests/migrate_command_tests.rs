@@ -4073,92 +4073,99 @@ fn migrate_and_adopt_reject_external_nested_config_includes() {
 
 #[test]
 fn migration_preserves_saved_skill_revisions() {
-    for adopt in [false, true] {
-        let root = TestDir::new("migrate-skill-revisions");
-        let cwd = root.child("workspace");
-        fs::create_dir_all(&cwd).unwrap();
-        let source = root.child("plain-home/.openclaw");
-        seed_plain_openclaw_home(&source);
-        let library = skill_library::SkillLibrary::seed(&source);
-        let source_db = fs::read(source.join("state/openclaw.sqlite")).unwrap();
-        let mut env = ocm_env(&root);
-        install_fake_openclaw_on_path(&root, &mut env);
-        let args = if adopt {
-            vec![
-                "adopt",
-                "import",
-                "--name",
-                "target",
-                source.to_str().unwrap(),
-                "--json",
-            ]
-        } else {
-            vec!["migrate", "target", source.to_str().unwrap(), "--json"]
-        };
-        let imported = run_ocm(&cwd, &env, &args);
-        assert!(imported.status.success(), "{}", stderr(&imported));
-        let target = root.child("ocm-home/envs/target/.openclaw");
-        library.assert_preserved(&target);
-        library.assert_preserved(&source);
-        assert_imported_plain_openclaw_home(&target, &source);
-        assert_eq!(
-            fs::read(source.join("state/openclaw.sqlite")).unwrap(),
-            source_db
-        );
-        assert!(source.join("gateway.pid").exists());
-        assert!(source.join("run/live.sock").exists());
+    for &alias in skill_library::layouts() {
+        for adopt in [false, true] {
+            let root = TestDir::new("migrate-skill-revisions");
+            let cwd = root.child("workspace");
+            fs::create_dir_all(&cwd).unwrap();
+            let source = root.child("plain-home/.openclaw");
+            seed_plain_openclaw_home(&source);
+            let library = skill_library::SkillLibrary::seed_at(&source, alias);
+            let source_db = fs::read(source.join("state/openclaw.sqlite")).unwrap();
+            let mut env = ocm_env(&root);
+            install_fake_openclaw_on_path(&root, &mut env);
+            let args = if adopt {
+                vec![
+                    "adopt",
+                    "import",
+                    "--name",
+                    "target",
+                    source.to_str().unwrap(),
+                    "--json",
+                ]
+            } else {
+                vec!["migrate", "target", source.to_str().unwrap(), "--json"]
+            };
+            let imported = run_ocm(&cwd, &env, &args);
+            assert!(imported.status.success(), "{}", stderr(&imported));
+            let target = root.child("ocm-home/envs/target/.openclaw");
+            library.assert_preserved(&target);
+            library.assert_preserved(&source);
+            assert_imported_plain_openclaw_home(&target, &source);
+            assert_eq!(
+                fs::read(source.join("state/openclaw.sqlite")).unwrap(),
+                source_db
+            );
+            assert!(source.join("gateway.pid").exists());
+            assert!(source.join("run/live.sock").exists());
+        }
     }
 }
 
 #[test]
 fn migration_rejects_only_mutating_saved_skill_includes() {
-    for adopt in [false, true] {
-        for needs_rewrite in [false, true] {
-            for plugin_load in [false, true] {
-                let root = TestDir::new("migrate-skill-include");
-                let source = root.child("plain-home/.openclaw");
-                let library = skill_library::SkillLibrary::seed(&source);
-                library.configure_include(&source, &library.config_include(&source, needs_rewrite));
-                if plugin_load {
-                    let config_path = source.join("openclaw.json");
-                    let mut config: serde_json::Value =
-                        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-                    config["plugins"] = serde_json::json!({"load": {"$include": library.config_include(&source, needs_rewrite)}});
-                    fs::write(config_path, config.to_string()).unwrap();
-                }
-                let mut env = ocm_env(&root);
-                install_fake_openclaw_on_path(&root, &mut env);
-                let args = if adopt {
-                    vec![
-                        "adopt",
-                        "import",
-                        "--name",
-                        "target",
-                        source.to_str().unwrap(),
-                        "--json",
-                    ]
-                } else {
-                    vec!["migrate", "target", source.to_str().unwrap(), "--json"]
-                };
-                let imported = run_ocm(root.path(), &env, &args);
-                assert_eq!(
-                    imported.status.success(),
-                    !needs_rewrite,
-                    "{}",
-                    stderr(&imported)
-                );
-                let target = root.child("ocm-home/envs/target/.openclaw");
-                if needs_rewrite {
-                    assert!(
-                        stderr(&imported).contains("integrity-protected history"),
-                        "{}",
+    for &alias in skill_library::layouts() {
+        for adopt in [false, true] {
+            for needs_rewrite in [false, true] {
+                for plugin_load in [false, true] {
+                    let root = TestDir::new("migrate-skill-include");
+                    let source = root.child("plain-home/.openclaw");
+                    let library = skill_library::SkillLibrary::seed_at(&source, alias);
+                    let include =
+                        fs::canonicalize(library.config_include(&source, needs_rewrite)).unwrap();
+                    library.configure_include(&source, &include);
+                    if plugin_load {
+                        let config_path = source.join("openclaw.json");
+                        let mut config: serde_json::Value =
+                            serde_json::from_str(&fs::read_to_string(&config_path).unwrap())
+                                .unwrap();
+                        config["plugins"] = serde_json::json!({"load": {"$include": include}});
+                        fs::write(config_path, config.to_string()).unwrap();
+                    }
+                    let mut env = ocm_env(&root);
+                    install_fake_openclaw_on_path(&root, &mut env);
+                    let args = if adopt {
+                        vec![
+                            "adopt",
+                            "import",
+                            "--name",
+                            "target",
+                            source.to_str().unwrap(),
+                            "--json",
+                        ]
+                    } else {
+                        vec!["migrate", "target", source.to_str().unwrap(), "--json"]
+                    };
+                    let imported = run_ocm(root.path(), &env, &args);
+                    assert_eq!(
+                        imported.status.success(),
+                        !needs_rewrite,
+                        "alias={alias:?}, adopt={adopt}, needs_rewrite={needs_rewrite}, plugin_load={plugin_load}: {}",
                         stderr(&imported)
                     );
-                    assert!(!target.parent().unwrap().exists());
-                } else {
-                    library.assert_preserved(&target);
+                    let target = root.child("ocm-home/envs/target/.openclaw");
+                    if needs_rewrite {
+                        assert!(
+                            stderr(&imported).contains("integrity-protected history"),
+                            "{}",
+                            stderr(&imported)
+                        );
+                        assert!(!target.parent().unwrap().exists());
+                    } else {
+                        library.assert_preserved(&target);
+                    }
+                    library.assert_preserved(&source);
                 }
-                library.assert_preserved(&source);
             }
         }
     }

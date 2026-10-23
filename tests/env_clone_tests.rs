@@ -4023,74 +4023,78 @@ fn env_clone_relocates_nested_and_shared_config_includes() {
 
 #[test]
 fn env_clone_preserves_saved_skill_revisions() {
-    let root = TestDir::new("clone-skill-revisions");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-    let created = run_ocm(&cwd, &env, &["env", "create", "source"]);
-    assert!(created.status.success(), "{}", stderr(&created));
-    let source = root.child("ocm-home/envs/source/.openclaw");
-    let library = skill_library::SkillLibrary::seed(&source);
-    write_text(&source.join("gateway.pid"), "4242\n");
-    write_text(&source.join("logs/runtime.log"), "runtime residue\n");
-    let source_db = fs::read(source.join("state/openclaw.sqlite")).unwrap();
+    for &alias in skill_library::layouts() {
+        let root = TestDir::new("clone-skill-revisions");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let created = run_ocm(&cwd, &env, &["env", "create", "source"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let source = root.child("ocm-home/envs/source/.openclaw");
+        let library = skill_library::SkillLibrary::seed_at(&source, alias);
+        write_text(&source.join("gateway.pid"), "4242\n");
+        write_text(&source.join("logs/runtime.log"), "runtime residue\n");
+        let source_db = fs::read(source.join("state/openclaw.sqlite")).unwrap();
 
-    let cloned = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
-    assert!(cloned.status.success(), "{}", stderr(&cloned));
-    let target = root.child("ocm-home/envs/target/.openclaw");
-    library.assert_preserved(&target);
-    library.assert_preserved(&source);
-    assert_eq!(
-        fs::read(source.join("state/openclaw.sqlite")).unwrap(),
-        source_db
-    );
-    assert!(!target.join("gateway.pid").exists());
-    assert!(!target.join("logs/runtime.log").exists());
-    assert!(source.join("gateway.pid").exists());
-    assert!(source.join("logs/runtime.log").exists());
-    let doctor = run_ocm(&cwd, &env, &["env", "doctor", "target", "--json"]);
-    assert!(doctor.status.success(), "{}", stderr(&doctor));
-    let health: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
-    assert!(
-        health["issues"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|issue| !issue.as_str().unwrap().contains("OpenClaw runtime state")),
-        "{}",
-        stdout(&doctor)
-    );
+        let cloned = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+        assert!(cloned.status.success(), "{}", stderr(&cloned));
+        let target = root.child("ocm-home/envs/target/.openclaw");
+        library.assert_preserved(&target);
+        library.assert_preserved(&source);
+        assert_eq!(
+            fs::read(source.join("state/openclaw.sqlite")).unwrap(),
+            source_db
+        );
+        assert!(!target.join("gateway.pid").exists());
+        assert!(!target.join("logs/runtime.log").exists());
+        assert!(source.join("gateway.pid").exists());
+        assert!(source.join("logs/runtime.log").exists());
+        let doctor = run_ocm(&cwd, &env, &["env", "doctor", "target", "--json"]);
+        assert!(doctor.status.success(), "{}", stderr(&doctor));
+        let health: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+        assert!(
+            health["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|issue| !issue.as_str().unwrap().contains("OpenClaw runtime state")),
+            "{}",
+            stdout(&doctor)
+        );
+    }
 }
 
 #[test]
 fn env_clone_rejects_only_mutating_saved_skill_includes() {
-    for needs_rewrite in [false, true] {
-        let root = TestDir::new("clone-skill-include");
-        let env = ocm_env(&root);
-        let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
-        assert!(created.status.success(), "{}", stderr(&created));
-        let source = root.child("ocm-home/envs/source/.openclaw");
-        let library = skill_library::SkillLibrary::seed(&source);
-        let include = library.config_include(&source, needs_rewrite);
-        library.configure_include(&source, &include);
-        let copied = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
-        assert_eq!(
-            copied.status.success(),
-            !needs_rewrite,
-            "{}",
-            stderr(&copied)
-        );
-        let target = root.child("ocm-home/envs/target/.openclaw");
-        if needs_rewrite {
-            assert!(
-                stderr(&copied).contains("integrity-protected history"),
+    for &alias in skill_library::layouts() {
+        for needs_rewrite in [false, true] {
+            let root = TestDir::new("clone-skill-include");
+            let env = ocm_env(&root);
+            let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+            assert!(created.status.success(), "{}", stderr(&created));
+            let source = root.child("ocm-home/envs/source/.openclaw");
+            let library = skill_library::SkillLibrary::seed_at(&source, alias);
+            let include = fs::canonicalize(library.config_include(&source, needs_rewrite)).unwrap();
+            library.configure_include(&source, &include);
+            let copied = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+            assert_eq!(
+                copied.status.success(),
+                !needs_rewrite,
                 "{}",
                 stderr(&copied)
             );
-            assert!(!target.parent().unwrap().exists());
-        } else {
-            library.assert_preserved(&target);
+            let target = root.child("ocm-home/envs/target/.openclaw");
+            if needs_rewrite {
+                assert!(
+                    stderr(&copied).contains("integrity-protected history"),
+                    "{}",
+                    stderr(&copied)
+                );
+                assert!(!target.parent().unwrap().exists());
+            } else {
+                library.assert_preserved(&target);
+            }
+            library.assert_preserved(&source);
         }
-        library.assert_preserved(&source);
     }
 }

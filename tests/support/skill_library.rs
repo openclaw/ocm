@@ -30,7 +30,32 @@ fn hash(bytes: &[u8]) -> String {
 
 const SKILL_ID: &str = "00000000-0000-0000-0000-000000000001";
 
+pub fn layouts() -> &'static [Option<&'static str>] {
+    #[cfg(unix)]
+    {
+        &[None, Some("published"), Some("run/published")]
+    }
+    #[cfg(not(unix))]
+    {
+        &[None]
+    }
+}
+
 impl SkillLibrary {
+    pub fn seed_at(state: &Path, alias: Option<&str>) -> Self {
+        let library = Self::seed(state);
+        #[cfg(unix)]
+        if let Some(alias) = alias {
+            let destination = state.join(alias);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::rename(state.join("skill-library"), &destination).unwrap();
+            std::os::unix::fs::symlink(alias, state.join("skill-library")).unwrap();
+        }
+        #[cfg(not(unix))]
+        assert!(alias.is_none());
+        library
+    }
+
     pub fn seed(state: &Path) -> Self {
         fs::create_dir_all(state.join("state")).unwrap();
         let payload = tempfile::NamedTempFile::new_in(state).unwrap();

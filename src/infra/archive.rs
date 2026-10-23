@@ -105,6 +105,7 @@ pub struct EnvArchiveOptions {
     pub excluded_path_roots: BTreeSet<PathBuf>,
     pub snapshot_sqlite_files: bool,
     pub should_preserve_bytes: fn(&Path) -> bool,
+    pub preserved_byte_roots: BTreeSet<PathBuf>,
     pub private_output: bool,
     pub relocate_internal_symlinks: bool,
     pub sqlite_content_roots: BTreeSet<PathBuf>,
@@ -119,6 +120,7 @@ impl Default for EnvArchiveOptions {
             excluded_path_roots: BTreeSet::new(),
             snapshot_sqlite_files: false,
             should_preserve_bytes: |_| false,
+            preserved_byte_roots: BTreeSet::new(),
             private_output: false,
             relocate_internal_symlinks: false,
             sqlite_content_roots: BTreeSet::new(),
@@ -127,8 +129,31 @@ impl Default for EnvArchiveOptions {
 }
 
 impl EnvArchiveOptions {
+    fn preserves_bytes(&self, relative_path: &Path) -> bool {
+        (self.should_preserve_bytes)(relative_path)
+            || self
+                .preserved_byte_roots
+                .iter()
+                .any(|root| relative_path.starts_with(root))
+    }
+
     pub(crate) fn should_skip(&self, relative_path: &Path, kind: EnvArchiveEntryKind) -> bool {
+        // Preserve contained immutable namespaces even when their physical
+        // ancestors otherwise look like runtime debris. Descending an ancestor
+        // does not preserve unrelated siblings, and never follows a link.
+        if kind != EnvArchiveEntryKind::Other
+            && self
+                .preserved_byte_roots
+                .iter()
+                .any(|root| relative_path.starts_with(root) || root.starts_with(relative_path))
+        {
+            return false;
+        }
         if (self.should_exclude_path)(relative_path, kind)
+            || (!self.preserved_byte_roots.is_empty()
+                && relative_path.ancestors().skip(1).any(|parent| {
+                    (self.should_exclude_path)(parent, EnvArchiveEntryKind::Directory)
+                }))
             || self
                 .excluded_path_roots
                 .iter()
@@ -375,7 +400,7 @@ fn append_env_root(
         if options.should_skip(relative_path, entry_kind) {
             continue;
         }
-        let preserve_bytes = (options.should_preserve_bytes)(relative_path);
+        let preserve_bytes = options.preserves_bytes(relative_path);
         let discover_sqlite = options
             .sqlite_content_roots
             .iter()
@@ -1213,7 +1238,7 @@ fn classify_sqlite_children(
             .strip_prefix(source_root)
             .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
         if options.should_skip(child_relative, env_archive_entry_kind(&child_meta))
-            || (options.should_preserve_bytes)(child_relative)
+            || options.preserves_bytes(child_relative)
         {
             continue;
         }
