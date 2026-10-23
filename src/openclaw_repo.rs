@@ -960,7 +960,6 @@ pub(crate) fn git_config_paths(identity: &GitIdentityPaths) -> Result<BTreeSet<P
             "config",
             "--includes",
             "--null",
-            "--show-scope",
             "--show-origin",
             "--name-only",
             "--list",
@@ -975,21 +974,17 @@ pub(crate) fn git_config_paths(identity: &GitIdentityPaths) -> Result<BTreeSet<P
     }
     let mut paths = BTreeSet::new();
     let mut fields = output.stdout.split(|byte| *byte == 0);
-    while let Some(scope) = fields.next() {
-        if scope.is_empty() {
+    while let Some(origin) = fields.next() {
+        if origin.is_empty() {
             continue;
         }
-        let origin = fields
-            .next()
-            .ok_or("invalid Git configuration origin output")?;
         let _name = fields
             .next()
             .ok_or("invalid Git configuration name output")?;
-        if !matches!(scope, b"local" | b"worktree") {
-            continue;
-        }
         let Some(path) = origin.strip_prefix(b"file:") else {
-            return Err("repository Git configuration has no file origin".into());
+            // Command-line settings have no file dependency. File-backed
+            // settings remain required regardless of local/global/system scope.
+            continue;
         };
         let path = PathBuf::from(git_path_from_bytes(path)?);
         paths.insert(if path.is_absolute() {

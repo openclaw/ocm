@@ -247,6 +247,10 @@ fn existing_cleanup_path(path: &Path) -> Result<Option<PathBuf>, String> {
 pub(crate) struct SourceFootprint {
     pub(crate) entries: BTreeSet<PathBuf>,
     pub(crate) content_roots: BTreeSet<PathBuf>,
+    // Required read dependencies, which may be shared by independent sources.
+    // Preserve them during deletion without treating shared settings as shared
+    // mutable checkout or Git storage.
+    pub(crate) config_entries: BTreeSet<PathBuf>,
     // In-memory locations only. Existing-path identity checks must not stat an
     // absent borrowed checkout, and legacy Owned paths remain unreserved.
     pub(crate) reserved_roots: BTreeSet<PathBuf>,
@@ -257,6 +261,8 @@ impl SourceFootprint {
         self.entries.extend(other.entries.iter().cloned());
         self.content_roots
             .extend(other.content_roots.iter().cloned());
+        self.config_entries
+            .extend(other.config_entries.iter().cloned());
         self.reserved_roots
             .extend(other.reserved_roots.iter().cloned());
     }
@@ -344,10 +350,17 @@ fn append_git_footprint(
     // Protect the common config even if it has no entries or its symlink target
     // is missing. Other files are selected by Git, preserving conditional-include
     // and worktree-config semantics instead of interpreting config ourselves.
+    let mut configuration = SourceFootprint::default();
+    let mut config_links = BTreeSet::new();
     let config = git.common_dir.join("config");
     match fs::symlink_metadata(&config) {
         Ok(_) => {
-            record_git_path(&config, footprint, reserve_missing, links)?;
+            record_git_path(
+                &config,
+                &mut configuration,
+                reserve_missing,
+                &mut config_links,
+            )?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
@@ -359,9 +372,18 @@ fn append_git_footprint(
             *paths_left = paths_left
                 .checked_sub(1)
                 .ok_or_else(|| git_dependency_limit_error(&path, "configuration"))?;
-            record_git_path(&path, footprint, reserve_missing, links)?;
+            record_git_path(
+                &path,
+                &mut configuration,
+                reserve_missing,
+                &mut config_links,
+            )?;
         }
     }
+    footprint.config_entries.extend(configuration.entries);
+    footprint
+        .reserved_roots
+        .extend(configuration.reserved_roots);
     for path in git.entries {
         record_git_path(&path, footprint, reserve_missing, links)?;
     }
@@ -708,6 +730,7 @@ fn inspect_dev_source_footprint_observed(
         inspect_source_footprint_paths(Path::new(dev.source_root()), false, observation)?;
     footprint.entries.extend(worktree.entries);
     footprint.content_roots.extend(worktree.content_roots);
+    footprint.config_entries.extend(worktree.config_entries);
     if let Some(source) = existing_cleanup_path(Path::new(dev.source_root()))? {
         footprint.content_roots.insert(source);
     }
@@ -1034,6 +1057,7 @@ impl DevSourceRemoval {
         for (path, contents) in footprint
             .entries
             .iter()
+            .chain(&footprint.config_entries)
             .map(|path| (path, false))
             .chain(footprint.content_roots.iter().map(|path| (path, true)))
         {
@@ -1154,6 +1178,7 @@ pub(super) fn ensure_root_outside_borrowed_source(
     for (path, contents) in footprint
         .entries
         .iter()
+        .chain(&footprint.config_entries)
         .map(|path| (path, false))
         .chain(footprint.content_roots.iter().map(|path| (path, true)))
         .chain(footprint.reserved_roots.iter().map(|path| (path, true)))

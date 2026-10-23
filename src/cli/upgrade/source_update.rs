@@ -92,7 +92,23 @@ fn source_footprints_overlap(
 ) -> Result<bool, String> {
     let mut other = crate::store::dev_sources::inspect_source_footprint(watched)?;
     other.content_roots.insert(watched.to_path_buf());
+    // Two sources may read the same settings safely. A mutable source path
+    // containing the other's config is still an overlap that must be protected.
     for left in footprint.entries.iter().chain(&footprint.content_roots) {
+        for right in other
+            .entries
+            .iter()
+            .chain(&other.content_roots)
+            .chain(&other.config_entries)
+        {
+            if crate::store::dev_sources::contains_existing(left, right)?
+                || crate::store::dev_sources::contains_existing(right, left)?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    for left in &footprint.config_entries {
         for right in other.entries.iter().chain(&other.content_roots) {
             if crate::store::dev_sources::contains_existing(left, right)?
                 || crate::store::dev_sources::contains_existing(right, left)?

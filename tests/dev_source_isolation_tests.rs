@@ -188,10 +188,15 @@ fn create_clone_and_import_reject_registered_dev_source_destinations() {
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
+    git_with_env(repo, args, &BTreeMap::new())
+}
+
+fn git_with_env(repo: &Path, args: &[&str], env: &BTreeMap<String, String>) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
+        .envs(env)
         .output()
         .unwrap();
     assert!(
@@ -1024,6 +1029,8 @@ fn public_dev_preserves_required_git_configuration() {
         "common",
         "include",
         "conditional",
+        "global",
+        "global-inactive",
         "worktree",
         "contained",
         "inactive",
@@ -1031,7 +1038,16 @@ fn public_dev_preserves_required_git_configuration() {
         let fixture = TestDir::new(&format!("git-config-{mode}"));
         let cwd = fixture.path();
         let env = ocm_env(&fixture);
+        let git = |repo: &Path, args: &[&str]| git_with_env(repo, args, &env);
         let owner = create("owner", None, None, &env, cwd).unwrap();
+        let snapshot = if mode == "global" {
+            let created = run_ocm(cwd, &env, &["env", "snapshot", "create", "owner", "--json"]);
+            assert!(created.status.success(), "{}", stderr(&created));
+            let value: serde_json::Value = serde_json::from_str(&stdout(&created)).unwrap();
+            Some(value["id"].as_str().unwrap().to_string())
+        } else {
+            None
+        };
         let checkout = fixture.child("source");
         fs::create_dir_all(&checkout).unwrap();
         git(&checkout, &["init", "--object-format=sha256"]);
@@ -1039,9 +1055,14 @@ fn public_dev_preserves_required_git_configuration() {
         write_text(&source.join("openclaw.mjs"), "// finite source command\n");
         let config = source.join(".git/config");
         let original = fs::read(&config).unwrap();
-        let required = Path::new(&owner.root).join("required.config");
+        let required = Path::new(&owner.root).join(if mode == "global" {
+            ".openclaw/logs/required.config"
+        } else {
+            "required.config"
+        });
+        fs::create_dir_all(required.parent().unwrap()).unwrap();
         fs::write(&required, &original).unwrap();
-        if matches!(mode, "include" | "conditional" | "worktree") {
+        if matches!(mode, "include" | "conditional" | "global" | "worktree") {
             // Repository format is read from the common config before normal
             // include selection. Keep it there and exercise ordinary Git
             // configuration through the included/worktree file.
@@ -1075,6 +1096,24 @@ fn public_dev_preserves_required_git_configuration() {
                     &[
                         "config",
                         &format!("includeIf.gitdir:{git_dir}.path"),
+                        &path_string(&required),
+                    ],
+                );
+            }
+            "global" | "global-inactive" => {
+                let git_dir = git(&source, &["rev-parse", "--absolute-git-dir"]);
+                let condition = if mode == "global" {
+                    format!("gitdir:{git_dir}")
+                } else {
+                    write_text(&required, "[invalid\n");
+                    "onbranch:never-selected".to_string()
+                };
+                git(
+                    &source,
+                    &[
+                        "config",
+                        "--global",
+                        &format!("includeIf.{condition}.path"),
                         &path_string(&required),
                     ],
                 );
@@ -1115,13 +1154,13 @@ fn public_dev_preserves_required_git_configuration() {
         let before_head = git(&source, &["rev-parse", "--verify", "HEAD"]);
         assert_eq!(before_head.len(), 64);
         git(&source, &["fsck", "--full"]);
-        if matches!(mode, "include" | "conditional" | "worktree") {
+        if matches!(mode, "include" | "conditional" | "global" | "worktree") {
             assert_eq!(
                 git(&source, &["config", "--get", "remote.origin.url"]),
                 "https://example.invalid/source.git"
             );
         }
-        let dependent = !matches!(mode, "contained" | "inactive");
+        let dependent = !matches!(mode, "contained" | "inactive" | "global-inactive");
         let register = || {
             run_ocm(
                 cwd,
@@ -1155,6 +1194,28 @@ fn public_dev_preserves_required_git_configuration() {
         let registry = env_registry_path(&env, cwd).unwrap();
         let before_registry = fs::read(&registry).unwrap();
         let before_config = fs::read(&required).unwrap();
+        if let Some(snapshot) = &snapshot {
+            // Make runtime cleanup actionable using the existing stale-session
+            // boundary, with the required config inside the selected log tree.
+            write_text(
+                &Path::new(&owner.root).join(".openclaw/agents/main/sessions/stale.jsonl"),
+                &serde_json::json!({"cwd":fixture.child("ocm-home/envs/borrower/.openclaw/workspace")}).to_string(),
+            );
+            for args in [
+                vec!["env", "cleanup", "owner", "--yes", "--json"],
+                vec!["env", "snapshot", "restore", "owner", snapshot.as_str()],
+            ] {
+                let rejected = run_ocm(cwd, &env, &args);
+                assert!(!rejected.status.success(), "{}", stdout(&rejected));
+                assert!(
+                    stderr(&rejected).contains("registered dev source"),
+                    "{}",
+                    stderr(&rejected)
+                );
+                assert_eq!(fs::read(&registry).unwrap(), before_registry);
+                assert_eq!(fs::read(&required).unwrap(), before_config);
+            }
+        }
         let removed = run_ocm(cwd, &env, &["env", "remove", "owner"]);
         assert_eq!(
             removed.status.success(),
@@ -1174,7 +1235,7 @@ fn public_dev_preserves_required_git_configuration() {
             git(&source, &["rev-parse", "--verify", "HEAD"]),
             before_head
         );
-        if matches!(mode, "include" | "conditional" | "worktree") {
+        if matches!(mode, "include" | "conditional" | "global" | "worktree") {
             assert_eq!(
                 git(&source, &["config", "--get", "remote.origin.url"]),
                 "https://example.invalid/source.git"

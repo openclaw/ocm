@@ -924,10 +924,13 @@ number of ordinary loose objects.
 
 Repository configuration is part of the same protected footprint: the common
 `config`, enabled `config.worktree`, and active included configuration files,
-including their access symlinks. Git selects conditional includes in the source
+including user/system configuration and their access symlinks. Git selects conditional includes in the source
 repository context; inactive include targets do not reserve another environment.
 Inspection reads configuration names and origins without running hooks or configured
 commands. Unreadable or invalid configuration refuses the operation before deletion.
+Sources may share read-only settings without blocking independent upgrades; an
+upgrade still refuses when its mutable checkout or Git storage overlaps another
+source's required configuration.
 
 Inspection time grows with loose entries and referenced stores. Complete scan
 results are shared within one identity observation, but lock, preparation,
