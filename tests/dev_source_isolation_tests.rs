@@ -188,13 +188,23 @@ fn create_clone_and_import_reject_registered_dev_source_destinations() {
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
+    git_with_env(repo, args, &BTreeMap::new())
+}
+
+fn git_with_env(repo: &Path, args: &[&str], env: &BTreeMap<String, String>) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
+        .envs(env)
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        output.status.success(),
+        "git -C {} {args:?}: {}",
+        repo.display(),
+        stderr(&output)
+    );
     stdout(&output).trim().to_string()
 }
 
@@ -1007,6 +1017,264 @@ fn public_dev_preserves_combined_packed_and_late_loose_storage() {
             );
             git(&source, &["fsck", "--full", "--no-dangling"]);
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn public_dev_preserves_required_git_configuration() {
+    use std::os::unix::fs::symlink;
+
+    for mode in [
+        "common",
+        "include",
+        "conditional",
+        "global",
+        "global-inactive",
+        "worktree",
+        "contained",
+        "inactive",
+    ] {
+        let fixture = TestDir::new(&format!("git-config-{mode}"));
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        let git = |repo: &Path, args: &[&str]| git_with_env(repo, args, &env);
+        let owner = create("owner", None, None, &env, cwd).unwrap();
+        let snapshot = if mode == "global" {
+            let created = run_ocm(cwd, &env, &["env", "snapshot", "create", "owner", "--json"]);
+            assert!(created.status.success(), "{}", stderr(&created));
+            let value: serde_json::Value = serde_json::from_str(&stdout(&created)).unwrap();
+            Some(value["id"].as_str().unwrap().to_string())
+        } else {
+            None
+        };
+        let checkout = fixture.child("source");
+        fs::create_dir_all(&checkout).unwrap();
+        git(&checkout, &["init", "--object-format=sha256"]);
+        let mut source = init_checkout(&checkout);
+        write_text(&source.join("openclaw.mjs"), "// finite source command\n");
+        let config = source.join(".git/config");
+        let original = fs::read(&config).unwrap();
+        let required = Path::new(&owner.root).join(if mode == "global" {
+            ".openclaw/logs/required.config"
+        } else {
+            "required.config"
+        });
+        fs::create_dir_all(required.parent().unwrap()).unwrap();
+        fs::write(&required, &original).unwrap();
+        if matches!(mode, "include" | "conditional" | "global" | "worktree") {
+            // Repository format is read from the common config before normal
+            // include selection. Keep it there and exercise ordinary Git
+            // configuration through the included/worktree file.
+            write_text(
+                &required,
+                "[remote \"origin\"]\n url = https://example.invalid/source.git\n",
+            );
+        }
+        match mode {
+            "common" => {
+                fs::remove_file(&config).unwrap();
+                symlink(&required, &config).unwrap();
+            }
+            "include" => {
+                // Relative includes use the authored alias's directory, not the
+                // physical target's directory. Both aliases must be retained.
+                let directory = source.join(".git/configs");
+                fs::create_dir(&directory).unwrap();
+                let parent = Path::new(&owner.root).join("parent.config");
+                write_text(&parent, "[include]\n path = child\n");
+                symlink(&parent, directory.join("parent")).unwrap();
+                symlink(&required, directory.join("child")).unwrap();
+                git(&source, &["config", "include.path", "configs/parent"]);
+            }
+            "conditional" => {
+                // Match this Git directory itself. A trailing slash asks Git
+                // to match descendants instead of the directory's exact path.
+                let git_dir = git(&source, &["rev-parse", "--absolute-git-dir"]);
+                git(
+                    &source,
+                    &[
+                        "config",
+                        &format!("includeIf.gitdir:{git_dir}.path"),
+                        &path_string(&required),
+                    ],
+                );
+            }
+            "global" | "global-inactive" => {
+                let git_dir = git(&source, &["rev-parse", "--absolute-git-dir"]);
+                let condition = if mode == "global" {
+                    format!("gitdir:{git_dir}")
+                } else {
+                    write_text(&required, "[invalid\n");
+                    "onbranch:never-selected".to_string()
+                };
+                git(
+                    &source,
+                    &[
+                        "config",
+                        "--global",
+                        &format!("includeIf.{condition}.path"),
+                        &path_string(&required),
+                    ],
+                );
+            }
+            "worktree" => {
+                git(&source, &["config", "extensions.worktreeConfig", "true"]);
+                let linked = fixture.child("linked");
+                git(
+                    &source,
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        "config-proof",
+                        &path_string(&linked),
+                    ],
+                );
+                write_text(&linked.join("openclaw.mjs"), "// finite source command\n");
+                let private = PathBuf::from(git(&linked, &["rev-parse", "--absolute-git-dir"]));
+                symlink(&required, private.join("config.worktree")).unwrap();
+                source = linked;
+            }
+            "inactive" => {
+                // A malformed, inactive include is not a dependency.
+                write_text(&required, "[invalid\n");
+                git(
+                    &source,
+                    &[
+                        "config",
+                        "includeIf.onbranch:never-selected.path",
+                        &path_string(&required),
+                    ],
+                );
+            }
+            "contained" => {}
+            _ => unreachable!(),
+        }
+        let before_head = git(&source, &["rev-parse", "--verify", "HEAD"]);
+        assert_eq!(before_head.len(), 64);
+        git(&source, &["fsck", "--full"]);
+        if matches!(mode, "include" | "conditional" | "global" | "worktree") {
+            assert_eq!(
+                git(&source, &["config", "--get", "remote.origin.url"]),
+                "https://example.invalid/source.git"
+            );
+        }
+        let dependent = !matches!(mode, "contained" | "inactive" | "global-inactive");
+        let register = || {
+            run_ocm(
+                cwd,
+                &env,
+                &[
+                    "dev",
+                    "borrower",
+                    "--repo",
+                    &path_string(&source),
+                    "--no-watch",
+                    "--no-ui",
+                ],
+            )
+        };
+        let lock = support::hold_environment_operation(&fixture, "owner");
+        let attempted = register();
+        assert_eq!(
+            attempted.status.success(),
+            !dependent,
+            "{mode}: {}",
+            stderr(&attempted)
+        );
+        if dependent {
+            assert!(stderr(&attempted).contains("owner has an operation in progress"));
+        }
+        drop(lock);
+        if dependent {
+            let admitted = register();
+            assert!(admitted.status.success(), "{mode}: {}", stderr(&admitted));
+        }
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let before_registry = fs::read(&registry).unwrap();
+        let before_config = fs::read(&required).unwrap();
+        if let Some(snapshot) = &snapshot {
+            // Make runtime cleanup actionable using the existing stale-session
+            // boundary, with the required config inside the selected log tree.
+            write_text(
+                &Path::new(&owner.root).join(".openclaw/agents/main/sessions/stale.jsonl"),
+                &serde_json::json!({"cwd":fixture.child("ocm-home/envs/borrower/.openclaw/workspace")}).to_string(),
+            );
+            for args in [
+                vec!["env", "cleanup", "owner", "--yes", "--json"],
+                vec!["env", "snapshot", "restore", "owner", snapshot.as_str()],
+            ] {
+                let rejected = run_ocm(cwd, &env, &args);
+                assert!(!rejected.status.success(), "{}", stdout(&rejected));
+                assert!(
+                    stderr(&rejected).contains("registered dev source"),
+                    "{}",
+                    stderr(&rejected)
+                );
+                assert_eq!(fs::read(&registry).unwrap(), before_registry);
+                assert_eq!(fs::read(&required).unwrap(), before_config);
+            }
+        }
+        let removed = run_ocm(cwd, &env, &["env", "remove", "owner"]);
+        assert_eq!(
+            removed.status.success(),
+            !dependent,
+            "{mode}: {}",
+            stderr(&removed)
+        );
+        if dependent {
+            assert!(stderr(&removed).contains("registered dev source"));
+            assert_eq!(fs::read(&registry).unwrap(), before_registry);
+            assert_eq!(fs::read(&required).unwrap(), before_config);
+        } else {
+            assert!(!Path::new(&owner.root).exists());
+        }
+        git(&source, &["fsck", "--full"]);
+        assert_eq!(
+            git(&source, &["rev-parse", "--verify", "HEAD"]),
+            before_head
+        );
+        if matches!(mode, "include" | "conditional" | "global" | "worktree") {
+            assert_eq!(
+                git(&source, &["config", "--get", "remote.origin.url"]),
+                "https://example.invalid/source.git"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn removal_rechecks_late_and_unreadable_git_configuration() {
+    use std::os::unix::fs::symlink;
+
+    for mode in ["late", "missing", "cycle"] {
+        let fixture = TestDir::new(&format!("late-git-config-{mode}"));
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        let owner = create("owner", None, None, &env, cwd).unwrap();
+        let source = init_checkout(&fixture.child("source"));
+        create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
+        let config = source.join(".git/config");
+        let required = Path::new(&owner.root).join("required.config");
+        fs::rename(&config, &required).unwrap();
+        symlink(&required, &config).unwrap();
+        if mode == "missing" {
+            fs::remove_file(&required).unwrap();
+        } else if mode == "cycle" {
+            write_text(
+                &required,
+                &format!("[include]\n path = {}\n", path_string(&required)),
+            );
+        }
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let before = fs::read(&registry).unwrap();
+        let removed = run_ocm(cwd, &env, &["env", "remove", "owner"]);
+        assert!(!removed.status.success(), "{mode}: {}", stderr(&removed));
+        assert_eq!(fs::read(&registry).unwrap(), before);
+        assert!(Path::new(&owner.root).is_dir());
+        assert_eq!(fs::read_link(&config).unwrap(), required);
     }
 }
 

@@ -167,6 +167,7 @@ fn source_identity(dev: &EnvDevMeta) -> Result<SourceIdentity, String> {
     let (repo, mut footprint) = inspect_dev_source_identity_footprints(dev)?;
     let mut preparation_paths = repo.entries.clone();
     preparation_paths.extend(repo.content_roots.iter().cloned());
+    preparation_paths.extend(repo.config_entries.iter().cloned());
     let mut locations = Vec::new();
     // Before worktree creation, retain the existing path through .worktrees,
     // including symlinks into another environment. This reserves no new paths.
@@ -180,6 +181,7 @@ fn source_identity(dev: &EnvDevMeta) -> Result<SourceIdentity, String> {
         .entries
         .iter()
         .chain(&footprint.content_roots)
+        .chain(&footprint.config_entries)
         .map(|path| Ok((path.clone(), path_identity(path)?)))
         .collect::<Result<_, String>>()?;
     Ok(SourceIdentity {

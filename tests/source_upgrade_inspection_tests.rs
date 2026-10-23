@@ -1037,10 +1037,34 @@ fn source_update_ignores_independent_unfinished_dev_session() {
         "restoring",
         "takeover",
         "job",
+        "shared-global-config",
+        "shared-global-config-alias",
+        "shared-local-config",
     ] {
         let root = TestDir::new("source-independent-session");
-        let (env, _) = execution_fixture(&root, false);
+        let (mut env, _) = execution_fixture(&root, false);
         let peer = source_session_peer(&root, &env, mode != "takeover", false);
+        if mode.starts_with("shared-") {
+            let settings = root.child("shared.gitconfig");
+            write_text(&settings, "[user]\n name = Shared settings\n");
+            if mode == "shared-global-config-alias" {
+                // Like /var -> /private/var on macOS, this access alias's
+                // target contains both checkouts without either owning it.
+                let alias = root.child("home-parent-alias");
+                std::os::unix::fs::symlink(fs::canonicalize(root.path()).unwrap(), &alias).unwrap();
+                env.insert("HOME".to_string(), path_string(&alias.join("home")));
+            }
+            if mode.starts_with("shared-global-config") {
+                write_text(
+                    &Path::new(&env["HOME"]).join(".gitconfig"),
+                    &format!("[include]\n path = {}\n", settings.display()),
+                );
+            } else {
+                for source in [&root.child("source"), &peer] {
+                    git(source, &["config", "include.path", &path_string(&settings)]);
+                }
+            }
+        }
         let mut session = unfinished_source_session(&root, &env, "preview");
         let path = ocm::store::source_watch_override_path("preview", &env, root.path()).unwrap();
         if matches!(mode, "inactive" | "starting" | "restoring") {
@@ -1131,6 +1155,8 @@ fn source_update_retains_relevant_and_unknown_foreground_protection() {
         "shared-git",
         "loose-directory",
         "loose-file",
+        "config-in-source",
+        "config-in-peer",
         "takeover-shared",
         "takeover-alias",
         "unknown-takeover",
@@ -1142,9 +1168,25 @@ fn source_update_retains_relevant_and_unknown_foreground_protection() {
         let (env, _) = execution_fixture(&root, false);
         let registered = matches!(
             mode,
-            "shared-git" | "stale-env" | "loose-directory" | "loose-file"
+            "shared-git"
+                | "stale-env"
+                | "loose-directory"
+                | "loose-file"
+                | "config-in-source"
+                | "config-in-peer"
         );
         let peer = source_session_peer(&root, &env, registered, mode == "shared-git");
+        if mode.starts_with("config-in-") {
+            let source = root.child("source");
+            let (writer, reader) = if mode == "config-in-source" {
+                (&source, &peer)
+            } else {
+                (&peer, &source)
+            };
+            let settings = writer.join(".git/shared.config");
+            write_text(&settings, "[user]\n name = Shared settings\n");
+            git(reader, &["config", "include.path", &path_string(&settings)]);
+        }
         if mode.starts_with("loose-") {
             let source = root.child("source");
             let oid = git(&source, &["rev-parse", "HEAD:openclaw.mjs"]);
