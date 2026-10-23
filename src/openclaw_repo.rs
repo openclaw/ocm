@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
@@ -867,6 +867,7 @@ pub(crate) struct GitIdentityPaths {
     pub(crate) private_dir: PathBuf,
     pub(crate) common_dir: PathBuf,
     pub(crate) worktree_entry: Option<PathBuf>,
+    pub(crate) worktree_root: Option<PathBuf>,
 }
 
 // Keep raw pointer paths: Git's resolved query output can erase an intermediate
@@ -890,6 +891,10 @@ pub(crate) fn git_identity_paths(root: &Path) -> Result<Option<GitIdentityPaths>
             Err(error) => return Err(error.to_string()),
         }
     }
+    let worktree_root = git_entry
+        .as_ref()
+        .and_then(|entry| entry.parent())
+        .map(Path::to_path_buf);
     let Some(git_entry) = git_entry.or_else(|| git_rev_parse_path(root, "--git-dir")) else {
         return Ok(None); // Missing/non-Git tuples remain valid store inputs.
     };
@@ -903,6 +908,7 @@ pub(crate) fn git_identity_paths(root: &Path) -> Result<Option<GitIdentityPaths>
             .ok_or_else(|| format!("Git entry disappeared: {}", display_path(&git_entry)))?
     };
     let mut identity = git_registration_paths(&private_dir)?;
+    identity.worktree_root = worktree_root.or(identity.worktree_root);
     identity.entries.push(git_entry);
     Ok(Some(identity))
 }
@@ -925,8 +931,77 @@ pub(crate) fn git_registration_paths(private_dir: &Path) -> Result<GitIdentityPa
         entries,
         private_dir: private_dir.to_path_buf(),
         common_dir,
+        worktree_root: worktree_entry
+            .as_ref()
+            .and_then(|entry| entry.parent())
+            .map(Path::to_path_buf),
         worktree_entry,
     })
+}
+
+// Git selects conditional includes and config.worktree using the repository's
+// own context. This read-only builtin does not run hooks, aliases or helpers;
+// request names only so configuration values never enter diagnostics.
+pub(crate) fn git_config_paths(identity: &GitIdentityPaths) -> Result<BTreeSet<PathBuf>, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let private_dir = cwd.join(&identity.private_dir);
+    let mut command = git_command();
+    command
+        .current_dir(&private_dir)
+        .arg("--git-dir")
+        .arg(&private_dir)
+        .env("GIT_COMMON_DIR", cwd.join(&identity.common_dir))
+        .env_remove("GIT_CONFIG");
+    if let Some(root) = &identity.worktree_root {
+        command.arg("--work-tree").arg(cwd.join(root));
+    }
+    let output = command
+        .args([
+            "config",
+            "--includes",
+            "--null",
+            "--show-scope",
+            "--show-origin",
+            "--name-only",
+            "--list",
+        ])
+        .output()
+        .map_err(|error| format!("cannot inspect Git configuration: {error}"))?;
+    if !output.status.success() {
+        return Err(
+            "cannot inspect Git configuration; restore readable configuration before retrying"
+                .into(),
+        );
+    }
+    let mut paths = BTreeSet::new();
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    while let Some(scope) = fields.next() {
+        if scope.is_empty() {
+            continue;
+        }
+        let origin = fields
+            .next()
+            .ok_or("invalid Git configuration origin output")?;
+        let _name = fields
+            .next()
+            .ok_or("invalid Git configuration name output")?;
+        if !matches!(scope, b"local" | b"worktree") {
+            continue;
+        }
+        let Some(path) = origin.strip_prefix(b"file:") else {
+            return Err("repository Git configuration has no file origin".into());
+        };
+        let path = PathBuf::from(git_path_from_bytes(path)?);
+        paths.insert(if path.is_absolute() {
+            path
+        } else {
+            private_dir.join(path)
+        });
+        if paths.len() > 1024 {
+            return Err("cannot inspect Git configuration: too many configuration paths".into());
+        }
+    }
+    Ok(paths)
 }
 
 pub(crate) fn worktree_registration_entries(

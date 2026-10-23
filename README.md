@@ -149,7 +149,8 @@ referenced by `objects/info/alternates`,
 including shared clones, transitive references, and initialized submodules declared
 in `.gitmodules` (including nested submodules). Removing a containing environment
 refuses while another registered source depends on that storage. Independent clones
-with their own objects remain removable.
+with their own objects remain removable. Repository configuration, active includes and
+enabled per-worktree configuration are protected with their symlink paths as well.
 This also applies to local upgrade simulations; retry after that operation finishes.
 Unchanged source bindings remain writable during restore and recovery.
 

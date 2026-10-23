@@ -341,6 +341,27 @@ fn append_git_footprint(
     paths_left: &mut usize,
     observation: &mut SourceObservation,
 ) -> Result<(), String> {
+    // Protect the common config even if it has no entries or its symlink target
+    // is missing. Other files are selected by Git, preserving conditional-include
+    // and worktree-config semantics instead of interpreting config ourselves.
+    let config = git.common_dir.join("config");
+    match fs::symlink_metadata(&config) {
+        Ok(_) => {
+            record_git_path(&config, footprint, reserve_missing, links)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    if existing_cleanup_path(&git.private_dir)?.is_some()
+        && existing_cleanup_path(&git.common_dir)?.is_some()
+    {
+        for path in crate::openclaw_repo::git_config_paths(&git)? {
+            *paths_left = paths_left
+                .checked_sub(1)
+                .ok_or_else(|| git_dependency_limit_error(&path, "configuration"))?;
+            record_git_path(&path, footprint, reserve_missing, links)?;
+        }
+    }
     for path in git.entries {
         record_git_path(&path, footprint, reserve_missing, links)?;
     }
