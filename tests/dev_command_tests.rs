@@ -1940,7 +1940,8 @@ fn dev_ui_uses_explicit_source_include_authority() {
         let shared = if variant == "home" {
             Path::new(&meta.root).join("shared")
         } else {
-            repo.join("shared")
+            // Match the recorded launch cwd, including macOS /var aliases.
+            Path::new(meta.dev.as_ref().unwrap().source_root()).join("shared")
         };
         fs::create_dir_all(&shared).unwrap();
         let include_path = shared.join("control-ui.json");
