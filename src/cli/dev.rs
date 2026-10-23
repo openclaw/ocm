@@ -38,8 +38,9 @@ use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::infra::terminal::{Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table};
 use crate::openclaw_repo::{
     detect_openclaw_checkout, discover_enclosing_openclaw_checkout,
-    ensure_source_dependency_install_target, inspect_source_dependencies,
-    inspect_source_dependencies_with_runner, validate_borrowed_openclaw_checkout,
+    ensure_source_dependency_install_config, ensure_source_dependency_install_target,
+    inspect_source_dependencies, inspect_source_dependencies_with_runner,
+    validate_borrowed_openclaw_checkout,
 };
 use crate::service::service_backend_support_error;
 use crate::store::{derive_env_paths, display_path, resolve_absolute_path, validate_name};
@@ -1972,6 +1973,55 @@ impl Cli {
             return Err(source_dependency_preparation_error(source_root, &issue).into());
         }
         ensure_source_dependency_install_target(source_root, &process_env)?;
+
+        let mut command = {
+            #[cfg(unix)]
+            {
+                if lease.is_some() {
+                    let mut command = Command::new("/bin/sh");
+                    command.args(["-c", SOURCE_WATCH_SETUP_SHIM, "ocm-dev-config", "pnpm"]);
+                    command
+                } else {
+                    Command::new("pnpm")
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                Command::new("pnpm")
+            }
+        };
+        command
+            .args(["config", "list", "--json"])
+            .env_clear()
+            .envs(&process_env)
+            .current_dir(source_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = match (lease.as_deref_mut(), stop) {
+            (Some(lease), Some(stop)) => {
+                let Some(output) = self.run_owned_source_watch_command(
+                    command,
+                    lease,
+                    stop,
+                    SourcePreparationCommand::CapturedSource,
+                )?
+                else {
+                    return Ok(130);
+                };
+                output
+            }
+            _ => command
+                .output()
+                .map_err(|error| format!("failed reading pnpm dependency destinations: {error}"))?,
+        };
+        if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+            return Ok(130);
+        }
+        if !output.status.success() {
+            return Err("could not read pnpm dependency destinations; inspect `pnpm config list --json` in the selected checkout before retrying dev".to_string().into());
+        }
+        ensure_source_dependency_install_config(source_root, &output.stdout)?;
 
         self.stderr_lines(render_dev_run_step(
             "Dependencies",

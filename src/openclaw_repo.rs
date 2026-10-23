@@ -385,21 +385,64 @@ pub(crate) fn ensure_source_dependency_install_target(
         .into_iter()
         .flat_map(|root| [root.clone(), root.join(".pnpm")])
     {
-        match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(format!(
-                    "refusing to install OpenClaw source dependencies through {}; preserve the linked or invalid dependency tree and prepare it explicitly",
-                    display_path(&directory)
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "failed inspecting OpenClaw dependency install target {}: {error}",
-                    display_path(&directory)
-                ));
-            }
+        ensure_physical_dependency_directory(&directory)?;
+    }
+    Ok(())
+}
+
+fn ensure_physical_dependency_directory(directory: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(format!(
+            "refusing to install OpenClaw source dependencies through {}; preserve the linked or invalid dependency tree and prepare it explicitly",
+            display_path(directory)
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed inspecting OpenClaw dependency install target {}: {error}",
+            display_path(directory)
+        )),
+    }
+}
+
+pub(crate) fn ensure_source_dependency_install_config(
+    repo_root: &Path,
+    output: &[u8],
+) -> Result<(), String> {
+    // Ask the selected pnpm to merge its own supported configuration sources.
+    // Do not reproduce its YAML/npmrc/environment precedence in OCM, or include
+    // the returned configuration (which may contain private values) in errors.
+    let config: Value = serde_json::from_slice(output)
+        .map_err(|_| "pnpm returned invalid dependency destination configuration".to_string())?;
+    let config = config
+        .as_object()
+        .ok_or_else(|| "pnpm returned invalid dependency destination configuration".to_string())?;
+    let setting = |camel: &str, kebab: &str| -> Result<Option<&str>, String> {
+        match config.get(camel).or_else(|| config.get(kebab)) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
+            _ => Err(format!(
+                "pnpm returned an invalid {camel} dependency destination"
+            )),
+        }
+    };
+    let modules_setting = setting("modulesDir", "modules-dir")?.unwrap_or("node_modules");
+    let modules = clean_path(&repo_root.join(modules_setting));
+    let lockfile_root =
+        clean_path(&repo_root.join(setting("lockfileDir", "lockfile-dir")?.unwrap_or(".")));
+    let virtual_store = match setting("virtualStoreDir", "virtual-store-dir")? {
+        Some(value) => clean_path(&lockfile_root.join(value)),
+        None => clean_path(&lockfile_root.join(modules_setting).join(".pnpm")),
+    };
+    for target in [modules, virtual_store] {
+        // Check every traversed component below the common ancestor, including
+        // broken links and an absent target beneath an existing linked parent.
+        // The checkout itself has already been admitted by its canonical identity.
+        let common = repo_root
+            .ancestors()
+            .find(|ancestor| target.starts_with(ancestor));
+        for directory in target.ancestors().take_while(|path| Some(*path) != common) {
+            ensure_physical_dependency_directory(directory)?;
         }
     }
     Ok(())
@@ -1363,6 +1406,59 @@ mod tests {
         ensure_openclaw_worktree, parse_legacy_registered_worktree_paths,
         prepare_openclaw_simulation_worktree_cleanup, remove_openclaw_worktree,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_install_config_checks_native_path_layouts() {
+        let root = TempDir::new().unwrap();
+        let repo = fs::canonicalize(root.path()).unwrap();
+        fs::create_dir(repo.join("modules")).unwrap();
+        fs::create_dir(repo.join("lockfiles")).unwrap();
+        fs::create_dir(repo.join("physical-store")).unwrap();
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"modulesDir": "modules"}),
+            serde_json::json!({"virtualStoreDir": "physical-store"}),
+            serde_json::json!({"virtual-store-dir": repo.join("physical-store")}),
+        ] {
+            super::ensure_source_dependency_install_config(
+                &repo,
+                &serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(repo.join("physical-store"), repo.join("modules/.pnpm"))
+            .unwrap();
+        std::os::unix::fs::symlink(repo.join("absent"), repo.join("lockfiles/store")).unwrap();
+        std::os::unix::fs::symlink(repo.join("physical-store"), repo.join("linked-modules"))
+            .unwrap();
+        for config in [
+            serde_json::json!({"modulesDir": "modules"}),
+            serde_json::json!({"modules-dir": "modules"}),
+            serde_json::json!({"modulesDir": "linked-modules", "virtualStoreDir": "physical-store"}),
+            serde_json::json!({"lockfileDir": "lockfiles", "virtualStoreDir": "store"}),
+            serde_json::json!({"virtual-store-dir": repo.join("lockfiles/store")}),
+        ] {
+            let error = super::ensure_source_dependency_install_config(
+                &repo,
+                &serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap_err();
+            assert!(error.contains("refusing to install"), "{error}");
+        }
+        for config in [
+            serde_json::json!([]),
+            serde_json::json!({"virtualStoreDir": false}),
+        ] {
+            assert!(
+                super::ensure_source_dependency_install_config(
+                    &repo,
+                    &serde_json::to_vec(&config).unwrap()
+                )
+                .is_err()
+            );
+        }
+    }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
         let output = Command::new("git")
