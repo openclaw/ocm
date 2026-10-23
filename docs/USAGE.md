@@ -254,7 +254,12 @@ OCM reads the target environment's effective plugin policy before `npm pack`, va
 explicit plugin references against the checkout and installed-plugin records,
 including the native SQLite index, inline config and legacy JSON records,
 and follows transitive local plugin package dependencies. Policy IDs are trimmed
-and compared without case distinctions. OCM recognizes the native built-in
+and compared without case distinctions. Aliases declared by the selected source
+manifests (provider, channel, setup, CLI backend, model catalog, provider auth,
+and legacy plugin IDs) resolve to their canonical plugin IDs across allow,
+deny, entries and slots. Canonical source and installed identities take
+precedence over manifest aliases; shared aliases use native plugin ID ordering.
+OCM also recognizes the native built-in
 aliases `google-gemini-cli` → `google` and `minimax-portal` /
 `minimax-portal-auth` → `minimax`. An exact declared source ID takes precedence,
 so older checkouts keep their legacy identity even if a canonical installed

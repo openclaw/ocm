@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -445,6 +446,7 @@ struct LocalSourceExtensionArchive {
 
 #[derive(Clone, Debug)]
 struct SourcePluginDefinition {
+    aliases: BTreeSet<String>,
     directory_name: String,
     package_name: Option<String>,
     dependency_names: BTreeSet<String>,
@@ -641,6 +643,7 @@ fn source_plugin_inventory(repo_path: &Path) -> Result<SourcePluginInventory, St
         inventory.by_id.insert(
             id,
             SourcePluginDefinition {
+                aliases: source_plugin_aliases(&manifest),
                 directory_name,
                 package_name,
                 dependency_names,
@@ -648,6 +651,122 @@ fn source_plugin_inventory(repo_path: &Path) -> Result<SourcePluginInventory, St
         );
     }
     Ok(inventory)
+}
+
+// These are the manifest fields used by OpenClaw's manifest ID normalizer, not
+// arbitrary provider names found in the target's configuration.
+fn source_plugin_aliases(manifest: &serde_json::Value) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    for pointer in [
+        "/providers",
+        "/channels",
+        "/cliBackends",
+        "/setup/cliBackends",
+        "/legacyPluginIds",
+    ] {
+        if let Some(values) = manifest
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_array)
+        {
+            aliases.extend(
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter_map(normalized_plugin_id),
+            );
+        }
+    }
+    if let Some(providers) = manifest
+        .pointer("/setup/providers")
+        .and_then(serde_json::Value::as_array)
+    {
+        aliases.extend(
+            providers
+                .iter()
+                .filter_map(|provider| provider.get("id")?.as_str())
+                .filter_map(normalized_plugin_id),
+        );
+    }
+    for pointer in [
+        "/modelCatalog/providers",
+        "/modelCatalog/aliases",
+        "/providerAuthAliases",
+    ] {
+        if let Some(values) = manifest
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_object)
+        {
+            aliases.extend(values.keys().filter_map(|id| normalized_plugin_id(id)));
+        }
+    }
+    aliases
+}
+
+fn source_plugin_policy_ids(
+    inventory: &SourcePluginInventory,
+    installed: &BTreeSet<String>,
+    repo_path: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut ids = BTreeMap::new();
+    for id in inventory.by_id.keys() {
+        let policy_id = id.to_lowercase();
+        if let Some(previous) = ids.insert(policy_id.clone(), id.clone()) {
+            return Err(format!(
+                "source plugin policy id \"{policy_id}\" is ambiguous between plugin ids \"{previous}\" and \"{id}\""
+            ));
+        }
+    }
+    let mut owners = BTreeMap::<&str, Vec<&str>>::new();
+    for (id, plugin) in &inventory.by_id {
+        for alias in &plugin.aliases {
+            // A declared source identity wins; an installed identity also reserves its name.
+            if !ids.contains_key(alias) && !installed.contains(alias) {
+                owners.entry(alias).or_default().push(id);
+            }
+        }
+    }
+    let competing = owners
+        .values()
+        .filter(|ids| ids.len() > 1)
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let ordered = if competing.is_empty() {
+        Vec::new()
+    } else {
+        // Native aliases are first-wins in String.localeCompare order. Use the build's
+        // existing Node host for collisions rather than approximate ICU collation in Rust.
+        let mut child = Command::new("node")
+            .args(["-e", "let s='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>process.stdout.write(JSON.stringify(JSON.parse(s).sort((a,b)=>a.localeCompare(b)))));"])
+            .envs(env)
+            .current_dir(repo_path)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().map_err(|error| format!("failed to order source plugin aliases: {error}"))?;
+        let input = serde_json::to_vec(&competing).map_err(|error| error.to_string())?;
+        let written = child.stdin.take().unwrap().write_all(&input);
+        let output = child
+            .wait_with_output()
+            .map_err(|error| error.to_string())?;
+        written.map_err(|error| format!("failed to order source plugin aliases: {error}"))?;
+        if !output.status.success() {
+            return Err("failed to order source plugin aliases with Node.js".to_string());
+        }
+        serde_json::from_slice::<Vec<String>>(&output.stdout)
+            .map_err(|error| format!("invalid source plugin alias order: {error}"))?
+    };
+    for (alias, candidates) in owners {
+        let owner = if candidates.len() == 1 {
+            candidates[0]
+        } else {
+            ordered
+                .iter()
+                .find(|id| candidates.contains(&id.as_str()))
+                .ok_or_else(|| "source plugin alias order omitted an identity".to_string())?
+        };
+        ids.insert(alias.to_string(), owner.to_string());
+    }
+    Ok(ids)
 }
 
 fn source_plugin_dependency_closure(
@@ -704,8 +823,8 @@ fn target_plugin_id(
     installed: &BTreeSet<String>,
 ) -> Option<String> {
     let id = normalized_plugin_id(id)?;
-    if source_ids.contains_key(&id) {
-        return Some(id);
+    if let Some(canonical) = source_ids.get(&id) {
+        return normalized_plugin_id(canonical);
     }
     // Modern OpenClaw maps these legacy IDs to canonical plugins. Older checkouts can still
     // declare the legacy ID itself; that source identity takes precedence over installed records.
@@ -864,16 +983,8 @@ fn resolve_target_source_plugin_closure(
     let inventory = source_plugin_inventory(repo_path)?;
     // Resolve policy keys back to declared manifest IDs. Packaging and dependency closure must
     // retain those IDs, including their case, to match built manifests and runtime exports.
-    let mut source_ids = BTreeMap::new();
-    for id in inventory.by_id.keys() {
-        let policy_id = id.to_lowercase();
-        if let Some(previous) = source_ids.insert(policy_id.clone(), id.clone()) {
-            return Err(format!(
-                "source plugin policy id \"{policy_id}\" is ambiguous between plugin ids \"{previous}\" and \"{id}\""
-            ));
-        }
-    }
     let installed = installed_target_plugin_ids(&paths, &config);
+    let source_ids = source_plugin_policy_ids(&inventory, &installed, repo_path, context.env)?;
     let explicit = collect_explicit_plugin_references(&config, &source_ids, &installed);
     let missing = explicit
         .iter()
@@ -4037,6 +4148,7 @@ mod tests {
                 (
                     "codex".to_string(),
                     SourcePluginDefinition {
+                        aliases: BTreeSet::new(),
                         directory_name: "codex".to_string(),
                         package_name: Some("@openclaw/codex".to_string()),
                         dependency_names: BTreeSet::from(["@openclaw/shared-ui".to_string()]),
@@ -4045,6 +4157,7 @@ mod tests {
                 (
                     "shared-ui".to_string(),
                     SourcePluginDefinition {
+                        aliases: BTreeSet::new(),
                         directory_name: "shared-ui".to_string(),
                         package_name: Some("@openclaw/shared-ui".to_string()),
                         dependency_names: BTreeSet::new(),
