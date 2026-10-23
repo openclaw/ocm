@@ -2439,6 +2439,7 @@ fn rewrite_plugin_install_records(
         }
         let is_path_plugin = record.get("source").and_then(Value::as_str) == Some("path");
         let mut has_external_path = false;
+        let mut has_owned_install = false;
         for field in ["installPath", "sourcePath"] {
             let Some(path) = record.get(field).and_then(Value::as_str) else {
                 continue;
@@ -2446,9 +2447,14 @@ fn rewrite_plugin_install_records(
             let path = Path::new(path);
             let Some(relative) = relocatable_plugin_path(path, source_state_root, !is_path_plugin)
             else {
-                has_external_path |= path.is_absolute() && !path.starts_with(target_state_root);
+                // Native discovery prefers installPath. Once that payload is
+                // isolated, an external sourcePath is project/archive provenance.
+                has_external_path |= path.is_absolute()
+                    && !path.starts_with(target_state_root)
+                    && !(field == "sourcePath" && has_owned_install);
                 continue;
             };
+            has_owned_install |= field == "installPath";
             record.insert(
                 field.to_string(),
                 Value::String(display_path(&target_state_root.join(&relative))),

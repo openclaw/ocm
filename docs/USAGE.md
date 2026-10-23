@@ -1021,6 +1021,12 @@ Active plugin paths and copied databases must remain inside the cloned environme
 locations that escape through external paths or symlinks are rejected before publication. The
 same plugin isolation applies to upgrade simulation clones.
 
+Plain-home migration also keeps external project and archive paths as source
+information when the preferred `installPath` resolves to a copied internal
+payload. The source project or archive is neither copied nor modified. An
+external active payload, or a missing preferred installation whose ownership
+cannot be established, still makes migration fail and remove the partial target.
+
 Clone (including upgrade simulation) and import require real directories at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` when those entries exist.
 Symlinks, including dangling links, and other file types at those traversal boundaries are refused before copied-state rewrites or cleanup; the source stays unchanged and no target is registered.
 Unconfigured agent directory links are still removed from the copy without changing the linked data.

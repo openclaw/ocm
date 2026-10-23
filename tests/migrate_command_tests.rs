@@ -1996,7 +1996,14 @@ fn adopt_import_relocates_managed_plugin_install_records_into_the_imported_state
 
     let managed_hub = source_home.join("extensions/managed-hub");
     let managed_npm = source_home.join("npm/node_modules/example-managed-npm");
-    for plugin_dir in [&managed_hub, &managed_npm] {
+    let local_copy = source_home.join("extensions/local-copy");
+    let archive_copy = source_home.join("extensions/archive-copy");
+    let project = root.child("external-project");
+    let archive = root.child("plugin.tgz");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("marker.txt"), "project unchanged").unwrap();
+    fs::write(&archive, "archive unchanged").unwrap();
+    for plugin_dir in [&managed_hub, &managed_npm, &local_copy, &archive_copy] {
         fs::create_dir_all(plugin_dir).unwrap();
         fs::write(plugin_dir.join("openclaw.plugin.json"), "{}\n").unwrap();
     }
@@ -2011,10 +2018,19 @@ fn adopt_import_relocates_managed_plugin_install_records_into_the_imported_state
             "managed-npm": {
                 "source": "npm",
                 "installPath": managed_npm.display().to_string()
+            },
+            "local-copy": {
+                "source": "path", "sourcePath": project, "installPath": local_copy,
+                "version": "1.0.0"
+            },
+            "archive-copy": {
+                "source": "archive", "sourcePath": archive, "installPath": archive_copy
             }
         }),
     );
 
+    let source_database = source_home.join("state/openclaw.sqlite");
+    let source_database_before = fs::read(&source_database).unwrap();
     let env = ocm_env(&root);
     let output = run_ocm(
         &cwd,
@@ -2048,6 +2064,29 @@ fn adopt_import_relocates_managed_plugin_install_records_into_the_imported_state
                 .as_ref()
         )
     );
+    for (id, provenance) in [("local-copy", &project), ("archive-copy", &archive)] {
+        let target = root.child(format!("ocm-home/envs/mira/.openclaw/extensions/{id}"));
+        assert_eq!(
+            imported_records[id]["installPath"],
+            target.to_str().unwrap()
+        );
+        assert_eq!(
+            imported_records[id]["sourcePath"],
+            provenance.to_str().unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("openclaw.plugin.json")).unwrap(),
+            "{}\n"
+        );
+        assert!(!target.join("marker.txt").exists());
+    }
+    assert_eq!(imported_records["local-copy"]["version"], "1.0.0");
+    assert_eq!(fs::read(&source_database).unwrap(), source_database_before);
+    assert_eq!(
+        fs::read_to_string(project.join("marker.txt")).unwrap(),
+        "project unchanged"
+    );
+    assert_eq!(fs::read_to_string(&archive).unwrap(), "archive unchanged");
     assert!(
         !imported_records
             .to_string()
@@ -2110,56 +2149,77 @@ fn adopt_import_rejects_a_symlinked_plugin_database_without_mutating_its_target(
 
 #[test]
 fn adopt_import_rejects_external_plugin_paths_without_mutating_the_source() {
-    let root = TestDir::new("adopt-import-external-plugin");
-    let cwd = root.child("workspace");
-    let source_home = root.child("legacy-home/.openclaw");
-    let external_plugin = root.child("external-checkout/example-dev-plugin");
-    fs::create_dir_all(&cwd).unwrap();
-    seed_plain_openclaw_home(&source_home);
-    fs::create_dir_all(&external_plugin).unwrap();
-    fs::write(external_plugin.join("marker.txt"), "external checkout\n").unwrap();
+    for preferred in [
+        "external",
+        "absent",
+        "empty",
+        "relative",
+        "missing",
+        "internal-source",
+    ] {
+        let root = TestDir::new("adopt-import-external-plugin");
+        let cwd = root.child("workspace");
+        let source_home = root.child("legacy-home/.openclaw");
+        let external_plugin = root.child("external-checkout/example-dev-plugin");
+        fs::create_dir_all(&cwd).unwrap();
+        seed_plain_openclaw_home(&source_home);
+        fs::create_dir_all(&external_plugin).unwrap();
+        fs::write(external_plugin.join("marker.txt"), "external checkout\n").unwrap();
 
-    seed_installed_plugin_index(
-        &source_home,
-        serde_json::json!({
-            "external-dev": {
-                "source": "path",
-                "sourcePath": external_plugin.display().to_string(),
-                "installPath": external_plugin.display().to_string()
-            }
-        }),
-    );
-    let source_database = source_home.join("state/openclaw.sqlite");
-    let source_database_before = fs::read(&source_database).unwrap();
+        let mut record = serde_json::json!({"source": "path", "sourcePath": external_plugin});
+        let install_path = match preferred {
+            "absent" => None,
+            "empty" => Some(String::new()),
+            "relative" => Some("extensions/plugin".to_string()),
+            "missing" => Some(source_home.join("extensions/missing").display().to_string()),
+            _ => Some(external_plugin.display().to_string()),
+        };
+        if let Some(path) = install_path {
+            record["installPath"] = serde_json::Value::String(path);
+        }
+        if preferred == "internal-source" {
+            let internal = source_home.join("extensions/internal");
+            fs::create_dir_all(&internal).unwrap();
+            record["sourcePath"] = serde_json::json!(internal);
+        }
+        seed_installed_plugin_index(&source_home, serde_json::json!({"external-dev": record}));
+        let source_database = source_home.join("state/openclaw.sqlite");
+        let source_database_before = fs::read(&source_database).unwrap();
 
-    let env = ocm_env(&root);
-    let output = run_ocm(
-        &cwd,
-        &env,
-        &[
-            "adopt",
-            "import",
-            "--name",
-            "mira",
-            source_home.to_string_lossy().as_ref(),
-            "--json",
-        ],
-    );
+        let env = ocm_env(&root);
+        let output = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "adopt",
+                "import",
+                "--name",
+                "mira",
+                source_home.to_string_lossy().as_ref(),
+                "--json",
+            ],
+        );
 
-    assert_eq!(output.status.code(), Some(1));
-    assert!(
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{preferred}: {}",
+            stdout(&output)
+        );
+        assert!(
         stderr(&output).contains(
             "imported OpenClaw plugin path(s) could not be isolated inside the env state: external-dev"
         ),
         "{}",
         stderr(&output)
     );
-    assert!(!root.child("ocm-home/envs/mira").exists());
-    assert_eq!(fs::read(&source_database).unwrap(), source_database_before);
-    assert_eq!(
-        fs::read_to_string(external_plugin.join("marker.txt")).unwrap(),
-        "external checkout\n"
-    );
+        assert!(!root.child("ocm-home/envs/mira").exists());
+        assert_eq!(fs::read(&source_database).unwrap(), source_database_before);
+        assert_eq!(
+            fs::read_to_string(external_plugin.join("marker.txt")).unwrap(),
+            "external checkout\n"
+        );
+    }
 }
 
 #[test]
