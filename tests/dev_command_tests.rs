@@ -4882,6 +4882,113 @@ fn dev_command_can_onboard_then_watch() {
 
 #[cfg(unix)]
 #[test]
+fn dev_status_native_config_rejects_replaced_owned_checkout() {
+    let root = TestDir::new("dev-status-replaced-native-config");
+    let repo = init_openclaw_repo(&root);
+    let env = ocm_env(&root);
+    let worktree = create_owned_dev_env(&repo, "demo", &env, root.path());
+    let meta = get_environment("demo", &env, root.path()).unwrap();
+    let config_path = Path::new(&meta.root).join(".openclaw/openclaw.json");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    fs::write(
+        &config_path,
+        br#"{"gateway":{"tls":{"enabled":true,"certPath":"${CERT_NAME}"}}}"#,
+    )
+    .unwrap();
+    let marker = root.child("config-helper-ran");
+    let started = root.child("gateway-started");
+    let runner = format!(
+        r#"import fs from 'node:fs';
+if (process.argv[2] === 'gateway') {{
+  fs.writeFileSync({started}, 'started');
+  const parent = process.ppid;
+  setTimeout(() => process.exit(0), 45000).unref();
+  setInterval(() => {{ try {{ process.kill(parent, 0); }} catch {{ process.exit(0); }} }}, 100);
+  process.on('SIGTERM', () => process.exit(0));
+  process.on('SIGINT', () => process.exit(0));
+}} else {{
+  fs.writeFileSync({marker}, 'config helper ran');
+  console.log(JSON.stringify({{tls: {{enabled: true, certPath: 'missing-public.pem'}}}}));
+}}
+"#,
+        started = serde_json::to_string(&path_string(&started)).unwrap(),
+        marker = serde_json::to_string(&path_string(&marker)).unwrap(),
+    );
+    fs::write(worktree.join("scripts/run-node.mjs"), &runner).unwrap();
+    let valid = run_ocm(root.path(), &env, &["dev", "status", "demo", "--json"]);
+    assert!(valid.status.success(), "{}", stderr(&valid));
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "config helper ran");
+    fs::remove_file(&marker).unwrap();
+    let mut live = DevWatchFixture::spawn(
+        &root,
+        root.path(),
+        &env,
+        &["dev", "demo", "--no-ui", "--no-watch"],
+    );
+    assert!(wait_for_path(&started, Duration::from_secs(10)));
+    let valid = run_ocm(root.path(), &env, &["dev", "status", "demo", "--json"]);
+    assert!(valid.status.success(), "{}", stderr(&valid));
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "config helper ran");
+    fs::remove_file(&marker).unwrap();
+    let config_before = fs::read(&config_path).unwrap();
+    let watch_path = source_watch_override_path(&root, "demo");
+    let watch_before = fs::read(&watch_path).unwrap();
+
+    // Retain the running process/root but replace its owned Git identity with
+    // an unrelated checkout and a script that would leave an execution marker.
+    fs::remove_file(worktree.join(".git")).unwrap();
+    init_nested_openclaw_repo(&worktree);
+    fs::write(worktree.join("scripts/run-node.mjs"), &runner).unwrap();
+    let mut executed = Vec::new();
+    for state in ["active", "inactive"] {
+        for args in [
+            vec!["dev", "status", "demo", "--json"],
+            vec!["dev", "status", "--json"],
+        ] {
+            let status = run_ocm(root.path(), &env, &args);
+            assert!(status.status.success(), "{}", stderr(&status));
+            let summary: Value = serde_json::from_str(&stdout(&status)).unwrap();
+            let summary = if summary.is_array() {
+                &summary[0]
+            } else {
+                &summary
+            };
+            assert_eq!(summary["sourceWatch"]["state"], state);
+            assert_eq!(summary["gatewayHealthReady"], false);
+            assert!(
+                summary["gatewayUrl"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://")
+            );
+            if marker.exists() {
+                executed.push(format!("{state}: {}", args.join(" ")));
+                fs::remove_file(&marker).unwrap();
+            }
+            assert_eq!(fs::read(&config_path).unwrap(), config_before);
+            if state == "active" {
+                assert_eq!(fs::read(&watch_path).unwrap(), watch_before);
+            }
+        }
+        if state == "active" {
+            let stopped = run_dev_stop(root.path(), &env);
+            assert!(stopped.status.success(), "{}", stderr(&stopped));
+            assert_eq!(live.wait_without_release().status.code(), Some(130));
+        }
+    }
+    // Assert after normal controller/child cleanup, including on the failing head.
+    assert!(
+        executed.is_empty(),
+        "status executed the replacement checkout: {executed:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("SENTINEL")).unwrap(),
+        "preserve me\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_status_uses_configured_tls_and_recorded_foreground_endpoint() {
     for variant in [
         "http",

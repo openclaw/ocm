@@ -2430,6 +2430,21 @@ impl Cli {
                 if source.is_none() {
                     return Ok(None);
                 }
+                // Status remains inspectable when a saved checkout is replaced,
+                // but a native config read executes code and needs the same
+                // source validation as other environment commands.
+                if let Some(dev) = dev {
+                    let validated = dev.execution_source_root()?;
+                    if fs::canonicalize(validated).map_err(|error| error.to_string())?
+                        != fs::canonicalize(run_dir).map_err(|error| error.to_string())?
+                    {
+                        return Err(
+                            "The registered dev source differs from the active source".to_string()
+                        );
+                    }
+                } else {
+                    validate_borrowed_openclaw_checkout(run_dir)?;
+                }
                 let mut command = Command::new("node");
                 command
                     .args(["scripts/run-node.mjs", "config", "get", "gateway", "--json"])

@@ -1546,6 +1546,8 @@ certificate, a failed TLS handshake, or a non-200 response leaves
 The recorded foreground source, environment root and port take precedence over
 later registration changes. Certificate paths are resolved in that source's
 launch context, including the existing native lookup for templated paths.
+Before executing that lookup, OCM validates the selected source checkout;
+missing, replaced or mismatched sources stay inspectable with health not ready.
 These are current configuration observations, not a saved copy of the running
 Gateway's configuration or the launching terminal's inherited variables.
 
