@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -301,6 +301,7 @@ pub(crate) fn copy_dir_with_sqlite_snapshots(
 pub(crate) struct OpenClawDirectoryCopy<'a> {
     selection: OpenClawSqliteCopy<'a>,
     databases: HashSet<PathBuf>,
+    namespace_links: BTreeMap<PathBuf, (PathBuf, PathBuf)>,
 }
 
 impl<'a> OpenClawDirectoryCopy<'a> {
@@ -312,10 +313,12 @@ impl<'a> OpenClawDirectoryCopy<'a> {
         Ok(Self {
             selection,
             databases: HashSet::new(),
+            namespace_links: BTreeMap::new(),
         })
     }
 
     pub(crate) fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), String> {
+        self.namespace_links = self.selection.namespace_link_targets(source)?;
         copy_dir_recursive_inner(source, destination, Some(self), None, false)
     }
 
@@ -472,7 +475,15 @@ fn copy_path_inner(
         });
         #[cfg(not(windows))]
         let directory_hint = None;
-        return copy_symlink(source, destination, directory_hint);
+        let namespace_target = copying
+            .as_ref()
+            .and_then(|copying| copying.namespace_links.get(source));
+        let directory_hint = if namespace_target.is_some() {
+            Some(true)
+        } else {
+            directory_hint
+        };
+        return copy_symlink(source, destination, directory_hint, namespace_target);
     }
     if file_type.is_dir() {
         return copy_dir_recursive_inner(
@@ -499,11 +510,18 @@ fn copy_symlink(
     source_path: &Path,
     destination_path: &Path,
     _directory_hint: Option<bool>,
+    namespace_target: Option<&(PathBuf, PathBuf)>,
 ) -> Result<(), String> {
     if let Some(parent) = destination_path.parent() {
         ensure_dir(parent)?;
     }
-    let target = fs::read_link(source_path).map_err(|error| error.to_string())?;
+    let mut target = fs::read_link(source_path).map_err(|error| error.to_string())?;
+    if let Some((expected, projected)) = namespace_target {
+        if &target != expected {
+            return Err("saved-skill namespace link changed during copying".into());
+        }
+        target = projected.clone();
+    }
 
     #[cfg(unix)]
     {

@@ -30,7 +30,56 @@ fn hash(bytes: &[u8]) -> String {
 
 const SKILL_ID: &str = "00000000-0000-0000-0000-000000000001";
 
+pub fn layouts() -> &'static [Option<&'static str>] {
+    #[cfg(unix)]
+    {
+        &[
+            None,
+            Some("published"),
+            Some("run/published"),
+            Some("absolute"),
+            Some("chain"),
+            Some("absolute-hop"),
+        ]
+    }
+    #[cfg(not(unix))]
+    {
+        &[None]
+    }
+}
+
 impl SkillLibrary {
+    pub fn seed_at(state: &Path, alias: Option<&str>) -> Self {
+        let library = Self::seed(state);
+        #[cfg(unix)]
+        if let Some(alias) = alias {
+            let physical = match alias {
+                "absolute" | "chain" | "absolute-hop" => "run/published",
+                path => path,
+            };
+            let destination = state.join(physical);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::rename(state.join("skill-library"), &destination).unwrap();
+            let target = match alias {
+                "absolute" => fs::canonicalize(&destination).unwrap(),
+                "chain" | "absolute-hop" => {
+                    let hop = if alias == "absolute-hop" {
+                        fs::canonicalize(state.join("run")).unwrap()
+                    } else {
+                        PathBuf::from("run")
+                    };
+                    std::os::unix::fs::symlink(hop, state.join("alias-hop")).unwrap();
+                    PathBuf::from("alias-hop/published")
+                }
+                path => PathBuf::from(path),
+            };
+            std::os::unix::fs::symlink(target, state.join("skill-library")).unwrap();
+        }
+        #[cfg(not(unix))]
+        assert!(alias.is_none());
+        library
+    }
+
     pub fn seed(state: &Path) -> Self {
         fs::create_dir_all(state.join("state")).unwrap();
         let payload = tempfile::NamedTempFile::new_in(state).unwrap();
@@ -154,6 +203,14 @@ impl SkillLibrary {
             .join("support/config.json5")
     }
 
+    pub fn physical_config_include(&self, state: &Path, needs_rewrite: bool) -> PathBuf {
+        let path = fs::canonicalize(self.config_include(state, needs_rewrite)).unwrap();
+        let root = fs::canonicalize(state).unwrap();
+        // Resolve the namespace without changing the admitted home spelling
+        // (for example /var versus /private/var on macOS).
+        state.join(path.strip_prefix(root).unwrap())
+    }
+
     pub fn configure_include(&self, state: &Path, include: &Path) {
         fs::create_dir_all(state.join("workspace")).unwrap();
         fs::write(
@@ -197,6 +254,13 @@ impl SkillLibrary {
                     .join("revisions")
                     .join(revision)
                     .join(name);
+                assert!(
+                    fs::canonicalize(&path)
+                        .unwrap()
+                        .starts_with(fs::canonicalize(state).unwrap()),
+                    "saved payload must belong to its copied state: {}",
+                    path.display()
+                );
                 let actual =
                     fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
                 assert_eq!(&actual, bytes, "{}", path.display());

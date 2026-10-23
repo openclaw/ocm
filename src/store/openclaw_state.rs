@@ -197,9 +197,25 @@ pub(crate) fn openclaw_env_state_archive_options(
     } else {
         BTreeSet::new()
     };
+    let history = IntegrityProtectedLibraryPaths::new(&paths.state_dir)?;
+    let relative = |root: PathBuf| {
+        root.strip_prefix(&paths.root)
+            .map(Path::to_path_buf)
+            .map_err(|error| error.to_string())
+    };
     Ok(EnvArchiveOptions {
         excluded_path_roots,
         should_exclude_path: should_exclude_state_archive_path,
+        preserved_byte_roots: history
+            .roots
+            .into_iter()
+            .map(relative)
+            .collect::<Result<_, _>>()?,
+        preserved_entry_paths: history
+            .links
+            .into_iter()
+            .map(relative)
+            .collect::<Result<_, _>>()?,
         sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
         snapshot_sqlite_files: true,
         should_preserve_bytes: |path| {
@@ -365,6 +381,7 @@ pub(crate) fn prepare_migrated_runtime_state(
         )?;
         rewritten_roots.insert(source_root);
     }
+    IntegrityProtectedLibraryPaths::new(&paths.state_dir)?.preserve_in(&mut workspaces);
     changed |= clear_volatile_runtime_state(
         &paths.state_dir,
         &paths.state_dir,
@@ -388,6 +405,7 @@ pub(super) fn prepare_archived_worktrees(
     paths: &EnvPaths,
     source_roots: &[&Path],
 ) -> Result<CopiedWorktrees, String> {
+    let history = IntegrityProtectedLibraryPaths::new(&paths.state_dir)?;
     let mut directories = vec![paths.root.clone()];
     let mut git_roots = BTreeSet::new();
     let mut bare_contexts = Vec::new();
@@ -403,7 +421,9 @@ pub(super) fn prepare_archived_worktrees(
         for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
             let path = entry.path();
-            if is_integrity_protected_history_path(&paths.state_dir, &path) {
+            if is_integrity_protected_history_path(&paths.state_dir, &path)
+                || history.roots.iter().any(|root| path.starts_with(root))
+            {
                 continue;
             }
             if entry.file_name() == ".git" {
@@ -554,6 +574,7 @@ pub(super) fn relocate_copied_databases(
     let mut selection = OpenClawSqliteCopy {
         state_root: &paths.state_dir,
         registered_agents: BTreeSet::new(),
+        history: IntegrityProtectedLibraryPaths::new(&paths.state_dir)?,
     };
     if let Some(database) = global {
         if is_sqlite_database(&database)? {
@@ -1145,6 +1166,13 @@ fn plan_runtime_state_cleanup(
     preserved_roots: &BTreeSet<PathBuf>,
     preserved_files: &BTreeSet<PathBuf>,
 ) -> Result<OpenClawRuntimeStateCleanup, String> {
+    let history = IntegrityProtectedLibraryPaths::new(&paths.state_dir)?;
+    let mut workspaces = workspaces.clone();
+    history.preserve_in(&mut workspaces);
+    let mut preserved_roots = preserved_roots.clone();
+    preserved_roots.extend(history.roots);
+    let mut preserved_files = preserved_files.clone();
+    preserved_files.extend(history.links);
     let mut removals = BTreeSet::new();
     if !path_exists(&paths.state_dir) {
         return Ok(OpenClawRuntimeStateCleanup { removals });
@@ -1152,7 +1180,7 @@ fn plan_runtime_state_cleanup(
     for relative_path in runtime_debris_outside_preserved_paths(
         &paths.state_dir,
         &workspaces,
-        preserved_roots,
+        &preserved_roots,
         openclaw_extension_runtime_debris_roots(&paths.state_dir)?,
     )? {
         let path = paths.state_dir.join(relative_path);
@@ -1185,7 +1213,7 @@ fn plan_runtime_state_cleanup(
             continue;
         }
         if name == OsStr::new("agents") {
-            collect_agent_runtime_cleanup(&path, workspaces, &mut removals)?;
+            collect_agent_runtime_cleanup(&path, &workspaces, &mut removals)?;
             continue;
         }
         if workspaces.has_descendant(&path) {
@@ -1235,6 +1263,8 @@ fn rewrite_runtime_state_root_refs(
     archived: bool,
     aliases: Option<&mut MigrationPathAliases<'_>>,
 ) -> Result<bool, String> {
+    let mut workspaces = workspaces.clone();
+    IntegrityProtectedLibraryPaths::new(root)?.preserve_in(&mut workspaces);
     let mut changed = false;
     let source_roots = source_state_roots
         .iter()
@@ -1245,7 +1275,7 @@ fn rewrite_runtime_state_root_refs(
         root,
         root,
         config_path,
-        workspaces,
+        &workspaces,
         &source_roots,
         &target_root,
         archived,
@@ -2098,6 +2128,95 @@ fn is_integrity_protected_history_path(state_root: &Path, path: &Path) -> bool {
     }) || is_legacy_audit_history_path(state_root, path)
 }
 
+// Observe namespace resolution once, without traversing revision payloads.
+// Physical payload roots and the link entries needed to reach them have different
+// retention roles: retaining a link must not retain its target's other children.
+struct IntegrityProtectedLibraryPaths {
+    roots: BTreeSet<PathBuf>,
+    links: BTreeSet<PathBuf>,
+    copy_links: BTreeMap<PathBuf, (PathBuf, PathBuf)>,
+}
+
+impl IntegrityProtectedLibraryPaths {
+    fn new(state_root: &Path) -> Result<Self, String> {
+        let mut paths = Self {
+            roots: BTreeSet::from([
+                state_root.join("skill-library"),
+                state_root.join("skill-workshop"),
+            ]),
+            links: BTreeSet::new(),
+            copy_links: BTreeMap::new(),
+        };
+        let canonical_state = match fs::canonicalize(state_root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
+            Err(error) => return Err(error.to_string()),
+        };
+        for name in ["skill-library", "skill-workshop"] {
+            let namespace = canonical_state.join(name);
+            let resolved = match fs::canonicalize(&namespace) {
+                Ok(resolved) => resolved,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            let Ok(relative) = resolved.strip_prefix(&canonical_state) else {
+                continue; // External namespace payloads are not acquired by copying.
+            };
+            if !resolved.is_dir() {
+                continue;
+            }
+            paths.roots.insert(state_root.join(relative));
+            let mut absolute_route = false;
+            for entry in super::dev_sources::existing_source_path_entries(&namespace)? {
+                let Ok(entry_relative) = entry.strip_prefix(&canonical_state) else {
+                    continue;
+                };
+                if fs::symlink_metadata(&entry)
+                    .map_err(|error| error.to_string())?
+                    .is_symlink()
+                {
+                    absolute_route |= fs::read_link(&entry)
+                        .map_err(|error| error.to_string())?
+                        .is_absolute();
+                    paths.links.insert(state_root.join(entry_relative));
+                }
+            }
+            // A raw absolute route would still select the source after copying.
+            // Project only the namespace entry to its admitted physical location;
+            // links inside revisions and other directory aliases stay untouched.
+            if absolute_route {
+                let original = fs::read_link(&namespace).map_err(|error| error.to_string())?;
+                let target = if relative.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    relative.to_path_buf()
+                };
+                paths.copy_links.insert(namespace, (original, target));
+            }
+        }
+        Ok(paths)
+    }
+
+    fn preserve_in(&self, workspaces: &mut OpenClawWorkspaceInventory) {
+        workspaces.preserve_copied_roots(&self.roots);
+        workspaces.preserve_copied_config_paths(&self.links);
+    }
+
+    fn copied_links(&self, source: &Path) -> Result<BTreeMap<PathBuf, (PathBuf, PathBuf)>, String> {
+        let canonical_source = fs::canonicalize(source).map_err(|error| error.to_string())?;
+        Ok(self
+            .copy_links
+            .iter()
+            .filter_map(|(entry, targets)| {
+                entry
+                    .strip_prefix(&canonical_source)
+                    .ok()
+                    .map(|relative| (source.join(relative), targets.clone()))
+            })
+            .collect())
+    }
+}
+
 // A known source state can also occur inside a copied enclosing workspace.
 // Preserve its history role in every actual projection without discovering
 // unrelated directories that merely resemble an OpenClaw home.
@@ -2723,9 +2842,17 @@ fn relocatable_plugin_path(
 pub(super) struct OpenClawSqliteCopy<'a> {
     state_root: &'a Path,
     registered_agents: BTreeSet<PathBuf>,
+    history: IntegrityProtectedLibraryPaths,
 }
 
 impl<'a> OpenClawSqliteCopy<'a> {
+    pub(super) fn namespace_link_targets(
+        &self,
+        source: &Path,
+    ) -> Result<BTreeMap<PathBuf, (PathBuf, PathBuf)>, String> {
+        self.history.copied_links(source)
+    }
+
     pub(super) fn admit_registered_databases(&self, owned_root: &Path) -> Result<(), String> {
         let root = fs::canonicalize(owned_root).map_err(|error| error.to_string())?;
         for selected in &self.registered_agents {
@@ -2742,6 +2869,7 @@ impl<'a> OpenClawSqliteCopy<'a> {
         let mut selection = Self {
             state_root,
             registered_agents: BTreeSet::new(),
+            history: IntegrityProtectedLibraryPaths::new(state_root)?,
         };
         let database = state_root.join("state/openclaw.sqlite");
         // Preserve the existing handling of linked state; never discover owners
@@ -2810,7 +2938,9 @@ impl<'a> OpenClawSqliteCopy<'a> {
     }
 
     pub(super) fn contains(&self, path: &Path) -> bool {
-        if is_integrity_protected_history_path(self.state_root, path) {
+        if is_integrity_protected_history_path(self.state_root, path)
+            || self.history.roots.iter().any(|root| path.starts_with(root))
+        {
             return false;
         }
         let relative = path.strip_prefix(self.state_root).ok();
@@ -3211,11 +3341,17 @@ fn collect_runtime_state_path_refs(
     known_refs: &mut BTreeMap<String, (PathBuf, usize)>,
     inferred_refs: &mut BTreeMap<PathBuf, usize>,
 ) {
+    let mut workspaces = workspaces.clone();
+    // Audit is best-effort, like the file visitor below. Mutation paths report
+    // resolution failures before writing or removing copied state.
+    if let Ok(history) = IntegrityProtectedLibraryPaths::new(&paths.state_dir) {
+        history.preserve_in(&mut workspaces);
+    }
     visit_runtime_state_files(
         &paths.state_dir,
         &paths.state_dir,
         &paths.config_path,
-        workspaces,
+        &workspaces,
         &mut |path| {
             if is_integrity_protected_history_path(&paths.state_dir, path) {
                 return;
@@ -3354,6 +3490,105 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn internal_library_alias_preserves_physical_roles_without_following_payload_links() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join(".openclaw");
+        let library = state.join("run/published");
+        fs::create_dir_all(&library).unwrap();
+        fs::create_dir_all(state.join("memory")).unwrap();
+        fs::write(state.join("memory/ordinary.sqlite"), b"ordinary").unwrap();
+        symlink("run", state.join("alias-hop")).unwrap();
+        symlink("alias-hop/published", state.join("skill-library")).unwrap();
+        symlink("../../memory", library.join("nested")).unwrap();
+        let history = IntegrityProtectedLibraryPaths::new(&state).unwrap();
+        let roots = &history.roots;
+        assert!(roots.contains(&library));
+        assert!(!roots.contains(&state.join("memory")));
+        assert!(!roots.contains(&state.join("run")));
+        assert!(history.links.contains(&state.join("alias-hop")));
+        assert!(!history.links.contains(&library.join("nested")));
+        let paths = derive_env_paths(temp.path());
+        let options = openclaw_env_state_archive_options(&paths).unwrap();
+        assert!(!options.should_skip(Path::new(".openclaw/run"), EnvArchiveEntryKind::Directory));
+        assert!(!options.should_skip(
+            Path::new(".openclaw/run/published/payload.sqlite-journal"),
+            EnvArchiveEntryKind::File
+        ));
+        assert!(options.should_skip(
+            Path::new(".openclaw/run/ordinary.lock"),
+            EnvArchiveEntryKind::File
+        ));
+
+        // A cleanup of the original chained layout must keep its route entry
+        // without treating all of run/ as immutable library content.
+        fs::write(state.join("run/ordinary.lock"), b"runtime").unwrap();
+        let workspaces = resolve_env_openclaw_cleanup_paths(
+            &paths,
+            &BTreeMap::new(),
+            OpenClawWorkspaceRuntime::for_env("fixture", None),
+        )
+        .unwrap();
+        let cleanup =
+            plan_runtime_state_cleanup(&paths, &workspaces, &BTreeSet::new(), &BTreeSet::new())
+                .unwrap();
+        assert!(
+            cleanup
+                .removals()
+                .contains(&state.join("run/ordinary.lock"))
+        );
+        assert!(
+            !cleanup
+                .removals()
+                .iter()
+                .any(|removed| state.join("alias-hop").starts_with(removed)
+                    || library.starts_with(removed))
+        );
+
+        // An immutable root overlapping a usual database location must not
+        // acquire SQLite copy ownership from that physical basename.
+        fs::remove_file(state.join("skill-library")).unwrap();
+        symlink("memory", state.join("skill-library")).unwrap();
+        let selection = OpenClawSqliteCopy::new(&state).unwrap();
+        assert!(!selection.contains(&state.join("memory/ordinary.sqlite")));
+        assert!(
+            contained_imported_database(
+                &state.join("memory/ordinary.sqlite"),
+                temp.path(),
+                &state,
+                true
+            )
+            .is_err()
+        );
+
+        fs::remove_file(state.join("skill-library")).unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        symlink("../external", state.join("skill-library")).unwrap();
+        assert!(
+            !IntegrityProtectedLibraryPaths::new(&state)
+                .unwrap()
+                .roots
+                .contains(&external)
+        );
+        fs::remove_file(state.join("skill-library")).unwrap();
+        symlink("missing", state.join("skill-library")).unwrap();
+        assert!(
+            !IntegrityProtectedLibraryPaths::new(&state)
+                .unwrap()
+                .roots
+                .contains(&state.join("missing"))
+        );
+        assert!(
+            OpenClawSqliteCopy::new(&state)
+                .unwrap()
+                .contains(&state.join("memory/ordinary.sqlite"))
+        );
+    }
 
     #[cfg(unix)]
     #[test]
