@@ -41,6 +41,10 @@ impl<'a> ServiceService<'a> {
         inspect::service_status_fast(name, self.env, self.cwd)
     }
 
+    pub fn status_with_gateway_url(&self, name: &str) -> Result<ServiceSummary, String> {
+        inspect::service_status_with_gateway_url(name, self.env, self.cwd)
+    }
+
     pub fn install(&self, name: &str) -> Result<ServiceInstallSummary, String> {
         let _lock = crate::env::EnvironmentService::new(self.env, self.cwd).lock_operation(name)?;
         manage::install_service(name, self.env, self.cwd)

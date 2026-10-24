@@ -46,7 +46,12 @@ impl Cli {
         };
         Self::assert_no_extra_args(&args[1..])?;
 
-        let summary = self.service_service().status(name)?;
+        // Only the formatted view shows a Gateway URL.
+        let summary = if !json_flag && profile.pretty {
+            self.service_service().status_with_gateway_url(name)?
+        } else {
+            self.service_service().status(name)?
+        };
         if json_flag {
             self.print_json(&summary)?;
             return Ok(0);

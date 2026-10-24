@@ -410,6 +410,22 @@ impl ReadinessFixture {
         status
     }
 
+    fn assert_status_url(&self, tls: bool) {
+        let status = run_ocm(
+            &self.cwd,
+            &self.env,
+            &["service", "status", "demo", "--color", "always"],
+        );
+        assert!(status.status.success(), "{}", stderr(&status));
+        let output = String::from_utf8_lossy(&status.stdout);
+        let url = format!(
+            "{}://127.0.0.1:{}",
+            if tls { "https" } else { "http" },
+            self._port.0
+        );
+        assert!(output.contains(&url), "expected {url}: {output}");
+    }
+
     fn assert_sources_unchanged(&self) {
         for (path, bytes) in &self.sources {
             assert_eq!(
@@ -462,6 +478,7 @@ fn service_readiness_probes_http_and_tls_across_start_and_forced_restart() {
     ] {
         let fixture = ReadinessFixture::new(mode, certificate);
         let started = fixture.action(&["service", "start", "demo", "--json"], true);
+        fixture.assert_status_url(mode != "http");
         let restarted = fixture.action(&["service", "restart", "demo", "--force", "--json"], true);
         assert_ne!(
             started["childPid"], restarted["childPid"],
@@ -491,6 +508,7 @@ fn service_readiness_resolves_included_tls_and_config_env_relative_certificate()
         .env
         .insert("READINESS_CERT".into(), "caller-missing-cert.pem".into());
     fixture.action(&["service", "start", "demo", "--json"], true);
+    fixture.assert_status_url(true);
     fixture.stop();
 }
 
@@ -884,6 +902,7 @@ fn service_readiness_ignores_unrelated_shared_config_includes() {
     for mode in ["http", "tls"] {
         let fixture = ReadinessFixture::new(mode, "shared-unrelated");
         fixture.action(&["service", "start", "demo", "--json"], true);
+        fixture.assert_status_url(mode == "tls");
         fixture.action(&["service", "restart", "demo", "--force", "--json"], true);
         fixture.stop();
     }
@@ -946,6 +965,8 @@ fn service_readiness_visible_tls_does_not_downgrade_when_selected_include_is_ina
     for certificate in ["blocked-tls-include", "blocked-root-after-tls"] {
         let fixture = ReadinessFixture::new("plaintext-only", certificate);
         fixture.action(&["service", "start", "demo", "--json"], false);
+        // Visible TLS is advertised as HTTPS, as readiness never downgrades it.
+        fixture.assert_status_url(true);
         assert!(
             fixture.root.child("requests.jsonl.listening").exists(),
             "plaintext peer never listened"
