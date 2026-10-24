@@ -110,6 +110,9 @@ pub struct EnvArchiveOptions {
     pub private_output: bool,
     pub relocate_internal_symlinks: bool,
     pub sqlite_content_roots: BTreeSet<PathBuf>,
+    /// Source-relative path of the file this archive is being written to.
+    /// Set by the archive writer; it is never archived, wherever it lives.
+    pub(crate) own_output_path: Option<PathBuf>,
 }
 
 impl Default for EnvArchiveOptions {
@@ -126,6 +129,7 @@ impl Default for EnvArchiveOptions {
             private_output: false,
             relocate_internal_symlinks: false,
             sqlite_content_roots: BTreeSet::new(),
+            own_output_path: None,
         }
     }
 }
@@ -140,6 +144,11 @@ impl EnvArchiveOptions {
     }
 
     pub(crate) fn should_skip(&self, relative_path: &Path, kind: EnvArchiveEntryKind) -> bool {
+        // The archive never reads the bytes it is writing, even inside a
+        // preserved namespace.
+        if self.own_output_path.as_deref() == Some(relative_path) {
+            return true;
+        }
         // Preserve contained immutable namespaces even when their physical
         // ancestors otherwise look like runtime debris. Descending an ancestor
         // does not preserve unrelated siblings, and never follows a link.
@@ -291,9 +300,10 @@ fn write_env_archive_with_capture<T: Serialize>(
         let canonical_output = archive_path
             .canonicalize()
             .map_err(|error| error.to_string())?;
-        if let Ok(relative) = canonical_output.strip_prefix(source_root) {
-            options.excluded_path_roots.insert(relative.to_path_buf());
-        }
+        options.own_output_path = canonical_output
+            .strip_prefix(source_root)
+            .ok()
+            .map(Path::to_path_buf);
         match write_env_archive_attempt(metadata, source_root, file, options.clone(), capture) {
             Ok(()) => {
                 if let Some(staged) = staged {
@@ -2281,6 +2291,28 @@ mod tests {
         ));
         assert!(options.should_skip(
             Path::new(".openclaw/extensions/demo/node_modules/package/index.js"),
+            EnvArchiveEntryKind::File
+        ));
+    }
+
+    #[test]
+    fn archive_options_exclude_own_output_inside_preserved_namespaces() {
+        let options = EnvArchiveOptions {
+            preserved_byte_roots: BTreeSet::from([PathBuf::from(".openclaw/skill-workshop")]),
+            own_output_path: Some(PathBuf::from(".openclaw/skill-workshop/.ocm-export-demo")),
+            ..EnvArchiveOptions::default()
+        };
+
+        assert!(options.should_skip(
+            Path::new(".openclaw/skill-workshop/.ocm-export-demo"),
+            EnvArchiveEntryKind::File
+        ));
+        assert!(!options.should_skip(
+            Path::new(".openclaw/skill-workshop"),
+            EnvArchiveEntryKind::Directory
+        ));
+        assert!(!options.should_skip(
+            Path::new(".openclaw/skill-workshop/proposals/demo/PROPOSAL.md"),
             EnvArchiveEntryKind::File
         ));
     }
