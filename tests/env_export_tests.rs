@@ -1801,3 +1801,201 @@ fn env_export_retains_agent_payload_under_equivalent_root_spellings() {
         );
     }
 }
+
+fn export_git_argument(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(path) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{path}");
+        }
+        if let Some(path) = value.strip_prefix(r"\\?\") {
+            return path.to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn export_git(
+    path: &std::path::Path,
+    env: &std::collections::BTreeMap<String, String>,
+    args: &[&str],
+) -> String {
+    let result = std::process::Command::new("git")
+        .arg("-C")
+        .arg(export_git_argument(&path.to_string_lossy()))
+        .args(args.iter().map(|value| export_git_argument(value)))
+        .env_clear()
+        .envs(env)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", stderr(&result));
+    stdout(&result).trim().to_string()
+}
+
+#[test]
+fn default_export_omits_legacy_stores_that_default_import_removes() {
+    let fixture = TestDir::new("export-legacy-stores");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    let removed = [
+        "credentials/oauth.json",
+        "credentials/whatsapp/default/creds.json",
+        "identity/device.json",
+        "devices/paired.json",
+        "cron/jobs.json",
+        "memory/notes.md",
+    ];
+    for relative in removed {
+        write_text(&state.join(relative), "synthetic secret\n");
+    }
+    let kept = [
+        "agents/main/agent/auth-profiles.json",
+        "workspace/AGENTS.md",
+        "plugins/installs.json",
+        "extensions/demo/package.json",
+    ];
+    for relative in kept {
+        write_text(&state.join(relative), "{}\n");
+    }
+
+    // Import keeps Git configuration and repositories inside those stores.
+    let git = |path: &std::path::Path, args: &[&str]| export_git(path, &env, args);
+    let repository = source.join("projects/repository");
+    fs::create_dir_all(&repository).unwrap();
+    git(&repository, &["init", "-q"]);
+    write_text(&repository.join("authored.txt"), "authored\n");
+    git(&repository, &["add", "authored.txt"]);
+    git(
+        &repository,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    );
+    let included = state.join("credentials/shared.gitconfig");
+    let inactive = state.join("credentials/inactive.gitconfig");
+    write_text(&included, "[fixture]\n\tretained = selected\n");
+    write_text(&inactive, "inactive malformed [configuration");
+    let quote = |path: &std::path::Path| {
+        serde_json::to_string(&export_git_argument(&path.to_string_lossy())).unwrap()
+    };
+    let mut config = fs::read_to_string(repository.join(".git/config")).unwrap();
+    config.push_str(&format!(
+        "[include]\n\tpath = {}\n[includeIf \"onbranch:never-selected\"]\n\tpath = {}\n",
+        quote(&included),
+        quote(&inactive)
+    ));
+    fs::write(repository.join(".git/config"), config).unwrap();
+    assert_eq!(
+        git(&repository, &["config", "--get", "fixture.retained"]),
+        "selected"
+    );
+    let bare = state.join("memory/notes.git");
+    fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "-q", "--bare"]);
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let mut archived = std::collections::BTreeSet::new();
+    for entry in tar::Archive::new(fs::File::open(&archive).unwrap())
+        .entries()
+        .unwrap()
+    {
+        let path = entry.unwrap().path().unwrap().into_owned();
+        if let Ok(relative) = path.strip_prefix("root/.openclaw") {
+            archived.insert(relative.to_path_buf());
+        }
+    }
+    for relative in removed {
+        assert!(
+            !archived.contains(std::path::Path::new(relative)),
+            "{relative} should not be archived"
+        );
+    }
+    for relative in kept.iter().chain(&[
+        "credentials/shared.gitconfig",
+        "credentials/inactive.gitconfig",
+        "memory/notes.git/HEAD",
+    ]) {
+        assert!(
+            archived.contains(std::path::Path::new(relative)),
+            "{relative} should be archived"
+        );
+    }
+
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    let target_state = target.join(".openclaw");
+    for relative in removed {
+        assert!(!target_state.join(relative).exists(), "{relative}");
+    }
+    for relative in kept {
+        assert!(target_state.join(relative).is_file(), "{relative}");
+    }
+    assert_eq!(
+        fs::read_to_string(target_state.join("credentials/shared.gitconfig")).unwrap(),
+        "[fixture]\n\tretained = selected\n"
+    );
+    assert_eq!(
+        fs::read_to_string(target_state.join("credentials/inactive.gitconfig")).unwrap(),
+        "inactive malformed [configuration"
+    );
+    let target_repository = target.join("projects/repository");
+    assert_eq!(
+        fs::canonicalize(git(
+            &target_repository,
+            &["config", "--get", "include.path"]
+        ))
+        .unwrap(),
+        fs::canonicalize(target_state.join("credentials/shared.gitconfig")).unwrap()
+    );
+    assert_eq!(
+        git(&target_repository, &["config", "--get", "fixture.retained"]),
+        "selected"
+    );
+    assert!(target_state.join("memory/notes.git/HEAD").is_file());
+}

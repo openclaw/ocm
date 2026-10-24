@@ -175,13 +175,112 @@ pub(crate) fn openclaw_env_archive_options(
         &BTreeSet::new(),
         excluded_path_roots,
     )?;
-    Ok(EnvArchiveOptions {
+    let mut options = EnvArchiveOptions {
         should_skip_path: should_skip_openclaw_env_archive_path,
         included_path_roots,
         excluded_path_roots,
         snapshot_sqlite_files: true,
         ..EnvArchiveOptions::default()
-    })
+    };
+    let git_paths = archived_git_paths_in_import_removed_roots(paths, &options)?;
+    options.included_path_roots.extend(git_paths);
+    Ok(options)
+}
+
+/// Legacy file stores that default import, like clone, removes. The default
+/// archive omits them so it does not carry credentials or identity that no
+/// default import restores.
+const IMPORT_REMOVED_STATE_ROOTS: [&str; 5] =
+    ["credentials", "cron", "devices", "identity", "memory"];
+
+/// Default import retains Git repositories found in the archive, and the
+/// configuration files they select, wherever they are copied. Keep the ones
+/// inside the omitted legacy stores, using the same discovery and selection
+/// as import; without path mappings the selection edits nothing.
+fn archived_git_paths_in_import_removed_roots(
+    paths: &EnvPaths,
+    options: &EnvArchiveOptions,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let removed_roots = IMPORT_REMOVED_STATE_ROOTS
+        .iter()
+        .map(|name| paths.state_dir.join(name))
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()))
+        .collect::<Vec<_>>();
+    if removed_roots.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let canonical_root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
+    let history = IntegrityProtectedLibraryPaths::new(&paths.state_dir)?;
+    let mut contexts = Vec::new();
+    let mut directories = vec![paths.root.clone()];
+    while let Some(directory) = directories.pop() {
+        let (mut git_entry, mut head, mut objects) = (false, false, false);
+        let mut children = Vec::new();
+        for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            git_entry |= name == ".git";
+            head |= name == "HEAD";
+            objects |= name == "objects";
+            let path = entry.path();
+            if name == ".git"
+                || !entry
+                    .file_type()
+                    .map_err(|error| error.to_string())?
+                    .is_dir()
+                || is_integrity_protected_history_path(&paths.state_dir, &path)
+                || history.roots.iter().any(|root| path.starts_with(root))
+            {
+                continue;
+            }
+            // Only archived directories reach import; the omitted stores are
+            // searched because this selection may keep repositories there.
+            let relative = path
+                .strip_prefix(&paths.root)
+                .map_err(|error| error.to_string())?;
+            if removed_roots.iter().any(|root| path.starts_with(root))
+                || !options.should_skip(relative, EnvArchiveEntryKind::Directory)
+            {
+                children.push(path);
+            }
+        }
+        // The listing supplies the repository markers that import's
+        // recognition checks, so most directories need no further lookups.
+        if (git_entry || (head && objects))
+            && let Some(context) =
+                git_config::copied_destination_git_context(&canonical_root, &directory)?
+        {
+            contexts.push(context);
+            if !git_entry {
+                continue; // Do not scan a native bare repository's administrative storage.
+            }
+        }
+        directories.extend(children);
+    }
+    let selected = git_config::relocate_copied_git_config(&paths.root, &[], &contexts)?
+        .into_iter()
+        .chain(
+            contexts
+                .into_iter()
+                .flat_map(|context| [context.checkout, context.private_dir, context.common_dir]),
+        );
+    let mut archived = BTreeSet::new();
+    for path in selected {
+        let Some(relative) = path
+            .strip_prefix(&paths.root)
+            .or_else(|_| path.strip_prefix(&canonical_root))
+            .ok()
+        else {
+            continue;
+        };
+        if matches!(
+            path_components(relative).as_slice(),
+            [".openclaw", name, ..] if IMPORT_REMOVED_STATE_ROOTS.contains(name)
+        ) {
+            archived.insert(relative.to_path_buf());
+        }
+    }
+    Ok(archived)
 }
 
 pub(crate) fn openclaw_env_state_archive_options(
@@ -3169,11 +3268,6 @@ fn is_durable_openclaw_archive_path(components: &[&str]) -> bool {
             | [".openclaw", "workspace", ..]
             | [".openclaw", "openclaw.json"]
             | [".openclaw", "agents", ..]
-            | [".openclaw", "credentials", ..]
-            | [".openclaw", "cron", ..]
-            | [".openclaw", "devices", ..]
-            | [".openclaw", "identity", ..]
-            | [".openclaw", "memory", ..]
             | [".openclaw", "plugins", ..]
             | [".openclaw", "extensions", ..]
             | [".openclaw", "npm", ..]
@@ -4457,6 +4551,11 @@ mod tests {
             );
         }
         for path in [
+            ".openclaw/credentials/oauth.json",
+            ".openclaw/cron/jobs.json",
+            ".openclaw/devices/paired.json",
+            ".openclaw/identity/device.json",
+            ".openclaw/memory/notes.md",
             ".openclaw/plugin-runtime-deps/node_modules/demo/index.js",
             ".openclaw/bundled-plugin-runtime-deps/node_modules/demo/index.js",
             ".openclaw/.openclaw-pnpm-store/v3/files/cache",

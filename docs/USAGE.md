@@ -1350,7 +1350,13 @@ specified. The archive can be inside the environment, including through a
 directory alias: its own output is excluded from the archived contents. An
 existing output path is refused.
 
-Export omits `.openclaw/state` by default. `--include-state` means "export this
+Export omits `.openclaw/state` by default. It also omits the legacy file stores
+`.openclaw/credentials`, `identity`, `devices`, `cron`, and `memory`, which
+default import removes as clone does, so the archive does not carry
+credentials or device identity that no default import restores. Git
+repositories inside those stores, and the Git configuration files there that
+archived repositories select, are still archived because import retains them.
+`--include-state` means "export this
 environment as the same installation": it includes every file under the
 environment root, including plugin payloads and dependencies, SQLite-backed and
 file-based sessions, and unrelated or legacy data. Only non-durable process
