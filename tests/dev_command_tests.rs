@@ -6022,6 +6022,54 @@ fn dev_watch_force_takes_over_runtime_env_without_rebinding() {
 
 #[cfg(unix)]
 #[test]
+fn source_watch_restore_of_a_runtime_env_uses_its_configured_gateway_transport() {
+    for tls in [false, true] {
+        let root = TestDir::new(&format!("dev-command-runtime-restore-transport-{tls}"));
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env_with_gateway_admission(&root);
+        install_fake_dev_runners(&root, &mut env);
+        create_runtime_backed_env(&cwd, &env);
+        let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        let show: Value = serde_json::from_str(&stdout(&show)).unwrap();
+        let config_path = PathBuf::from(show["configPath"].as_str().unwrap());
+        let mut config: Value = fs::read(&config_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        config["gateway"]["tls"] = serde_json::json!({"enabled": tls});
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(start.status.success(), "{}", stderr(&start));
+        let watch = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--force",
+                "--no-ui",
+            ],
+        );
+        assert!(watch.status.success(), "{}", stderr(&watch));
+        assert!(stdout(&watch).contains("service restored for demo"));
+        assert!(stdout(&watch).contains("binding=unchanged"));
+        let url = format!(
+            "url={}://127.0.0.1:21901\n",
+            if tls { "https" } else { "http" }
+        );
+        assert!(stdout(&watch).contains(&url), "{}", stdout(&watch));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_takeover_retains_its_source_when_the_selected_alias_is_retargeted() {
     let root = TestDir::new("dev-takeover-source-alias");
     let other = TestDir::new("dev-takeover-other-source");
@@ -9420,6 +9468,74 @@ fn dev_watch_force_temporarily_takes_over_and_restores_the_background_service() 
     let node_log = fs::read_to_string(root.child("node.log")).unwrap();
     assert!(node_log.contains("scripts/watch-node.mjs"));
     assert!(node_log.contains("gateway run --port"));
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_service_outputs_and_service_status_use_the_configured_gateway_transport() {
+    for tls in [false, true] {
+        let root = TestDir::new(&format!("dev-command-service-transport-{tls}"));
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env_with_gateway_admission(&root);
+        install_fake_dev_runners(&root, &mut env);
+        let service_args = ["dev", "demo", "--repo", &path_string(&repo), "--service"];
+
+        let created = run_ocm(&cwd, &env, &service_args);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        let show: Value = serde_json::from_str(&stdout(&show)).unwrap();
+        let config_path = Path::new(show["root"].as_str().unwrap()).join(".openclaw/openclaw.json");
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        // No certificate is needed to choose the advertised transport.
+        config["gateway"]["tls"] = serde_json::json!({"enabled": tls});
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let url = format!(
+            "{}://127.0.0.1:{}",
+            if tls { "https" } else { "http" },
+            show["gatewayPort"]
+        );
+
+        let started = run_ocm(&cwd, &env, &service_args);
+        assert!(started.status.success(), "{}", stderr(&started));
+        assert!(
+            stdout(&started).contains(&format!("url={url}\n")),
+            "{}",
+            stdout(&started)
+        );
+        let mut pretty_args = vec!["--color", "always"];
+        pretty_args.extend(service_args);
+        let started = run_ocm(&cwd, &env, &pretty_args);
+        assert!(started.status.success(), "{}", stderr(&started));
+        assert!(stdout(&started).contains(&url), "{}", stdout(&started));
+
+        let status = run_ocm(
+            &cwd,
+            &env,
+            &["service", "status", "demo", "--color", "always"],
+        );
+        assert!(status.status.success(), "{}", stderr(&status));
+        assert!(stdout(&status).contains(&url), "{}", stdout(&status));
+        let json = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+        assert!(json.status.success(), "{}", stderr(&json));
+        let json: Value = serde_json::from_str(&stdout(&json)).unwrap();
+        assert!(json.get("gatewayUrl").is_none(), "{json}");
+
+        let watch = run_ocm(&cwd, &env, &dev_watch(&["demo", "--watch", "--force"]));
+        assert!(watch.status.success(), "{}", stderr(&watch));
+        assert!(stdout(&watch).contains("service restored for demo"));
+        assert!(
+            stdout(&watch).contains(&format!("url={url}\n")),
+            "{}",
+            stdout(&watch)
+        );
+        let other = if tls { "http://" } else { "https://" };
+        for output in [&started, &status, &watch] {
+            assert!(!stdout(output).contains(other), "{}", stdout(output));
+        }
+    }
 }
 
 #[cfg(unix)]
