@@ -422,6 +422,106 @@ result=$?
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn plain_activation_follows_the_evaluating_shell_instead_of_the_shell_hint() {
+    use std::io::ErrorKind;
+    use std::process::Command;
+
+    use crate::support::ocm_test_binary_path;
+
+    let root = TestDir::new("shell-activation-evaluator");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let binary = ocm_test_binary_path();
+    let mut paths = vec![binary.parent().unwrap().to_path_buf()];
+    paths.extend(std::env::split_paths(env.get("PATH").unwrap()));
+    env.insert(
+        "PATH".to_string(),
+        std::env::join_paths(paths)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+
+    // Without a shell parent, the SHELL hint still selects the dialect.
+    env.insert("SHELL".to_string(), "/opt/homebrew/bin/fish".to_string());
+    let hinted = run_ocm(&cwd, &env, &["env", "use", "demo"]);
+    assert!(hinted.status.success(), "{}", stderr(&hinted));
+    assert!(stdout(&hinted).contains("set -gx OCM_ACTIVE_ENV 'demo';"));
+
+    let posix = r#"set -- 'caller one' 'caller two'
+before_options=$-
+eval "$(ocm env use demo)" || exit 10
+[ "$OCM_ACTIVE_ENV" = demo ] || exit 11
+[ -n "$OPENCLAW_HOME" ] || exit 12
+[ -z "${OPENCLAW_PROFILE+x}" ] || exit 13
+[ "$-" = "$before_options" ] || exit 14
+[ "$#" = 2 ] && [ "$1" = 'caller one' ] && [ "$2" = 'caller two' ] || exit 15
+case "$(ocm env use demo --shell fish)" in *"set -gx OCM_ACTIVE_ENV 'demo';"*) ;; *) exit 16 ;; esac
+printf 'activated\n'
+"#;
+    let fish = r#"ocm env use demo | source
+test "$OCM_ACTIVE_ENV" = demo; or exit 11
+test -n "$OPENCLAW_HOME"; or exit 12
+set -q OPENCLAW_PROFILE; and exit 13
+string match -q 'unset *' -- (ocm env use demo --shell zsh)[1]; or exit 16
+printf 'activated\n'
+"#;
+    let mut evaluated = Vec::new();
+    for (shell, script) in [
+        ("bash", posix),
+        ("sh", posix),
+        ("zsh", posix),
+        ("fish", fish),
+    ] {
+        let mismatched = if shell == "fish" {
+            "/bin/zsh"
+        } else {
+            "/usr/bin/fish"
+        };
+        for hint in [mismatched.to_string(), format!("/bin/{shell}")] {
+            env.insert("SHELL".to_string(), hint.clone());
+            env.insert("OPENCLAW_PROFILE".to_string(), "stale".to_string());
+            let mut command = Command::new(shell);
+            match shell {
+                "zsh" => command.arg("-f"),
+                "fish" => command.arg("--no-config"),
+                _ => &mut command,
+            };
+            let output = match command
+                .args(["-c", script])
+                .current_dir(&cwd)
+                .env_clear()
+                .envs(&env)
+                .output()
+            {
+                Ok(output) => output,
+                // Bash and sh are required; zsh and fish run where installed.
+                Err(error)
+                    if error.kind() == ErrorKind::NotFound && !matches!(shell, "bash" | "sh") =>
+                {
+                    break;
+                }
+                Err(error) => panic!("failed to run {shell}: {error}"),
+            };
+            assert!(
+                output.status.success() && stderr(&output).is_empty(),
+                "shell={shell}, hint={hint}, status={}: {} {}",
+                output.status,
+                stdout(&output),
+                stderr(&output)
+            );
+            assert_eq!(stdout(&output), "activated\n", "shell={shell}, hint={hint}");
+            evaluated.push(shell);
+        }
+    }
+    assert!(evaluated.contains(&"bash") && evaluated.contains(&"sh"));
+}
+
 #[test]
 fn activation_renders_explicit_include_roots_for_each_supported_shell() {
     let root = TestDir::new("shell-include-roots-render");

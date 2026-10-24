@@ -1481,9 +1481,13 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             )],
             vec![
                 format!("eval \"$({cmd} env use mira)\""),
+                format!("{cmd} env use mira | source"),
                 format!("{cmd} env use mira --shell zsh"),
             ],
-            &["This command prints shell code. Use `eval` to apply it."],
+            &[
+                "This command prints shell code. Use `eval` to apply it, or `| source` in Fish.",
+                "Without --shell, the code matches the shell that runs this command, even when SHELL names another login shell. If that is not a recognized shell, the SHELL hint selects Fish, otherwise Zsh.",
+            ],
         ),
         "exec" => render_leaf(
             "Run a command inside an environment",

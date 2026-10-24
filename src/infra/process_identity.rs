@@ -75,6 +75,60 @@ pub(crate) fn process_scope_id() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// The parent process's executable path, then its short process name, for
+/// whichever of them this platform can read. Unreadable values are omitted.
+#[cfg(target_os = "linux")]
+pub(crate) fn parent_process_names() -> Vec<String> {
+    let parent = std::os::unix::process::parent_id();
+    let mut names = Vec::new();
+    if let Ok(path) = fs::read_link(format!("/proc/{parent}/exe")) {
+        names.push(path.to_string_lossy().into_owned());
+    }
+    if let Ok(name) = fs::read_to_string(format!("/proc/{parent}/comm")) {
+        names.push(name.trim_end_matches('\n').to_string());
+    }
+    names
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn parent_process_names() -> Vec<String> {
+    fn until_nul(bytes: &[u8]) -> String {
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
+    }
+
+    let parent = std::os::unix::process::parent_id() as i32;
+    let mut names = Vec::new();
+    let mut path = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length = unsafe { libc::proc_pidpath(parent, path.as_mut_ptr().cast(), path.len() as u32) };
+    if length > 0 {
+        names.push(until_nul(&path[..(length as usize).min(path.len())]));
+    }
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let size = std::mem::size_of_val(&info) as i32;
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            parent,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    if bytes == size {
+        names.push(until_nul(&info.pbi_comm.map(|byte| byte as u8)));
+    }
+    names
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn parent_process_names() -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn observe_process(pid: u32) -> Result<Option<ProcessObservation>, String> {
     let path = format!("/proc/{pid}/stat");

@@ -24,7 +24,7 @@ use crate::infra::process_identity::ProcessIdentity;
 #[cfg(unix)]
 use crate::infra::process_identity::process_start_id;
 use crate::infra::shell::{
-    build_openclaw_dev_source_env, build_openclaw_env, render_use_script, resolve_shell_name,
+    build_openclaw_dev_source_env, build_openclaw_env, render_use_script, resolve_activation_shell,
 };
 use crate::service::ServiceSummary;
 use crate::store::{
@@ -1370,7 +1370,7 @@ impl Cli {
             return Err("environment name is required".to_string());
         };
         Self::assert_no_extra_args(&args[1..])?;
-        let shell = resolve_shell_name(shell_name.as_deref(), &self.env)?;
+        let shell = resolve_activation_shell(shell_name.as_deref(), &self.env)?;
 
         let meta = self
             .environment_service()

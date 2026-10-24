@@ -1761,6 +1761,15 @@ The helper runs in the current shell but leaves the shell's other variables,
 options and positional parameters unchanged, apart from setting and clearing
 the activation variables.
 
+Direct `ocm env use mira` without `--shell` prints code for the shell that runs
+it, so `eval "$(ocm env use mira)"` in Bash, Zsh or `sh` and
+`ocm env use mira | source` in Fish activate correctly even when `SHELL` names a
+different login shell. When the command is not run directly by a recognized
+shell (Bash, Zsh, Fish, or a POSIX `sh` such as Dash, ash, ksh or mksh), it
+falls back to the `SHELL` hint in the same way as bare `ocm init`. A wrapper
+that runs `ocm env use` from one shell for evaluation in another should pass
+`--shell` explicitly.
+
 Activation preserves explicitly exported `OPENCLAW_INCLUDE_ROOTS`, so authorized
 shared configuration remains available after selecting an environment. It does
 not derive that authorization from configuration files. Unrelated stale
