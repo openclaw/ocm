@@ -1,6 +1,8 @@
 mod support;
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::Path;
 
 use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
@@ -192,6 +194,131 @@ fn start_rejects_services_on_unsupported_backends() {
     let show = run_ocm(&cwd, &env, &["env", "show", "demo"]);
     assert_eq!(show.status.code(), Some(1));
     assert!(stderr(&show).contains("environment \"demo\" does not exist"));
+    assert_launcher_absent(&cwd, &env, "demo.local");
+
+    // A corrected retry from another directory behaves like a first start.
+    let checkout = root.child("checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    let retry = run_ocm(
+        &checkout,
+        &env,
+        &[
+            "start",
+            "demo",
+            "--command",
+            "pnpm openclaw",
+            "--cwd",
+            ".",
+            "--no-service",
+        ],
+    );
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    let launcher = run_ocm(&cwd, &env, &["launcher", "show", "demo.local", "--json"]);
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let launcher: Value = serde_json::from_str(&stdout(&launcher)).unwrap();
+    assert_eq!(launcher["command"], "pnpm openclaw");
+    assert_eq!(
+        launcher["cwd"],
+        path_string(&checkout.canonicalize().unwrap())
+    );
+}
+
+fn assert_launcher_absent(cwd: &Path, env: &BTreeMap<String, String>, name: &str) {
+    let show = run_ocm(cwd, env, &["launcher", "show", name]);
+    assert_eq!(show.status.code(), Some(1));
+    assert!(
+        stderr(&show).contains(&format!("launcher \"{name}\" does not exist")),
+        "{}",
+        stderr(&show)
+    );
+}
+
+#[test]
+fn start_refused_by_a_non_empty_root_removes_the_launcher_it_created() {
+    let root = TestDir::new("start-refused-root-launcher");
+    let cwd = root.child("workspace");
+    let occupied = root.child("occupied");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&occupied).unwrap();
+    fs::write(occupied.join("keep.txt"), "user data").unwrap();
+    let env = ocm_env(&root);
+    let occupied_arg = path_string(&occupied);
+
+    let refused = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "start",
+            "demo",
+            "--command",
+            "openclaw",
+            "--root",
+            &occupied_arg,
+            "--no-service",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr(&refused).contains("root already exists and is not empty"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_launcher_absent(&cwd, &env, "demo.local");
+    assert_eq!(
+        fs::read_to_string(occupied.join("keep.txt")).unwrap(),
+        "user data"
+    );
+
+    let retry = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "start",
+            "demo",
+            "--command",
+            "pnpm openclaw",
+            "--no-service",
+        ],
+    );
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    assert!(stdout(&retry).contains("launcher: demo.local"));
+}
+
+#[test]
+fn start_refused_for_an_existing_env_removes_only_a_launcher_it_created() {
+    let root = TestDir::new("start-refused-existing-launcher");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "unsupported".to_string(),
+    );
+
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let refused = run_ocm(&cwd, &env, &["start", "demo", "--command", "openclaw"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr(&refused).contains("managed services are not supported on this platform yet"));
+    assert_launcher_absent(&cwd, &env, "demo.local");
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let show: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert!(show["defaultLauncher"].is_null());
+
+    // A launcher that already existed is reused by the refused start and kept.
+    let added = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "demo.local", "--command", "openclaw"],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let launcher_path = root.child("ocm-home/launchers/demo.local.json");
+    let original = fs::read(&launcher_path).unwrap();
+    let refused = run_ocm(&cwd, &env, &["start", "demo", "--command", "openclaw"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr(&refused).contains("managed services are not supported on this platform yet"));
+    assert_eq!(fs::read(&launcher_path).unwrap(), original);
 }
 
 #[test]
