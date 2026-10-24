@@ -2604,3 +2604,93 @@ fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_use
         "selected"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn default_export_keeps_every_alternate_object_store_import_requires() {
+    // Import follows the whole alternates chain and resolves each list file.
+    let fixture = TestDir::new("export-legacy-store-alternates");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    let repository = source.join("projects/repository");
+    fs::create_dir_all(&repository).unwrap();
+    export_git(&repository, &env, &["init", "-q"]);
+    let stores = (1..=6)
+        .map(|index| state.join(format!("memory/a{index}/objects")))
+        .collect::<Vec<_>>();
+    for store in &stores {
+        write_text(&store.join("pack/keep"), "");
+    }
+    write_text(
+        &repository.join(".git/objects/info/alternates"),
+        &format!("{}\n", stores[0].display()),
+    );
+    for pair in stores.windows(2) {
+        write_text(
+            &pair[0].join("info/alternates"),
+            &format!("{}\n", pair[1].display()),
+        );
+    }
+    // The last store's alternates list is itself a link into another store.
+    write_text(&state.join("credentials/alternate-list"), "");
+    fs::create_dir_all(stores[5].join("info")).unwrap();
+    std::os::unix::fs::symlink(
+        state.join("credentials/alternate-list"),
+        stores[5].join("info/alternates"),
+    )
+    .unwrap();
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let archived = archived_state_paths(&archive);
+    for index in 1..=6 {
+        let relative = format!("memory/a{index}/objects/pack/keep");
+        assert!(
+            archived.contains(std::path::Path::new(&relative)),
+            "{relative}"
+        );
+    }
+    assert!(archived.contains(std::path::Path::new("credentials/alternate-list")));
+    fs::rename(&source, root.join("offline")).unwrap();
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert!(target.join(".openclaw/memory/a6/objects").is_dir());
+}

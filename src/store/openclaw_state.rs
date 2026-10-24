@@ -391,17 +391,17 @@ fn archived_git_paths_in_import_removed_roots(
                 }
             }
         }
-        // Import also requires the object stores a repository uses, including
-        // alternates that other alternates name (Git follows five levels).
-        let mut object_dirs = vec![(context.common_dir.join("objects"), 0)];
-        while let Some((objects, depth)) = object_dirs.pop() {
-            if depth < 5 {
-                object_dirs.extend(
-                    git_alternate_object_dirs(&objects)
-                        .into_iter()
-                        .map(|alternate| (alternate, depth + 1)),
-                );
+        // Import also requires every object store a repository uses and the
+        // alternates files naming them, following the whole chain once.
+        let mut object_dirs = vec![context.common_dir.join("objects")];
+        let mut seen_object_dirs = BTreeSet::new();
+        while let Some(objects) = object_dirs.pop() {
+            let identity = fs::canonicalize(&objects).unwrap_or_else(|_| objects.clone());
+            if !seen_object_dirs.insert(identity) {
+                continue;
             }
+            object_dirs.extend(git_alternate_object_dirs(&objects));
+            storage.push(objects.join("info/alternates"));
             storage.push(objects);
         }
         for path in storage {
