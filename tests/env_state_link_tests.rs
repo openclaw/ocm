@@ -171,13 +171,15 @@ fn check_copy_layout(layout: &str, import: bool) {
         );
     }
     if import {
-        assert_eq!(
-            fs::read_dir(temporary.join("ocm-env-imports"))
-                .unwrap()
-                .count(),
-            0,
-            "import staging remains"
+        assert!(
+            !temporary.join("ocm-env-imports").exists(),
+            "import staged in the shared temp directory"
         );
+        let staging = fs::read_dir(root.child("ocm-home/import-staging"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != ".lock")
+            .count();
+        assert_eq!(staging, 0, "import staging remains");
     }
 }
 
