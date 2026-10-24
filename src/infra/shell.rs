@@ -278,19 +278,36 @@ pub fn render_use_script(
     format!("{}\n", lines.join("\n"))
 }
 
+// The helper runs in the caller's shell, so it assigns nothing there: the loop variable
+// and the captured activation text live in the command substitution's subshell (the text in
+// its positional parameters), and a failed `env use` is relayed as a `return` for the eval,
+// discarding its output, so the caller sees the status and no capture variable can collide
+// with a caller's own.
 fn render_init_posix(command: &str, shell: &str) -> String {
     let command = quote_posix(command);
+    let relay = |indent: &str, suffix: &str| {
+        format!(
+            r#"{indent}set -- "$(if command {command} env use "$@"{suffix}; then echo " 0"; else echo " $?"; fi)"
+{indent}case "${{1##* }}" in
+{indent}  (0) printf '%s\n' "${{1% *}}" ;;
+{indent}  (*) printf 'return %s\n' "${{1##* }}" ;;
+{indent}esac"#
+        )
+    };
+    let explicit = relay("          ", "");
+    let implicit = relay("    ", &format!(" --shell {shell}"));
     format!(
         r#"ocm_use() {{
-  script="$(
+  eval "$(
     for _ocm_arg in "$@"; do
       case "$_ocm_arg" in
-        (--shell|--shell=*) command {command} env use "$@"; exit $? ;;
+        (--shell|--shell=*)
+{explicit}
+          exit ;;
       esac
     done
-    command {command} env use "$@" --shell {shell}
-  )" || return $?
-  eval "$script"
+{implicit}
+  )"
 }}
 "#
     )

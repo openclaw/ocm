@@ -1742,6 +1742,10 @@ even when the inherited `SHELL` names a different shell. An explicit
 `--shell` accepts only `zsh`, `bash`, `sh` or `fish`; any other value is
 rejected, as it is for `ocm init`.
 
+The helper runs in the current shell but leaves the shell's other variables,
+options and positional parameters unchanged, apart from setting and clearing
+the activation variables.
+
 Activation preserves explicitly exported `OPENCLAW_INCLUDE_ROOTS`, so authorized
 shared configuration remains available after selecting an environment. It does
 not derive that authorization from configuration files. Unrelated stale
