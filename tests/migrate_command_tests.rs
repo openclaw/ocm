@@ -1671,18 +1671,22 @@ fn migration_retargets_absolute_links_inside_the_source_home_into_the_environmen
         let source = outer.join(".openclaw");
         let alias = root.child("legacy-alias");
         let external = root.child("external-logs");
+        let ops_workspace = root.child("ops-workspace");
         fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&ops_workspace).unwrap();
         fs::create_dir_all(source.join("workspace")).unwrap();
         fs::create_dir_all(source.join("data/logs")).unwrap();
         fs::create_dir_all(source.join("data/sessions")).unwrap();
         fs::create_dir_all(source.join("agents/main")).unwrap();
         fs::create_dir_all(source.join("skill-workshop/bundles/demo")).unwrap();
         fs::create_dir_all(external.join("sub")).unwrap();
-        let config = if enclosing {
-            serde_json::json!({"agents": {"defaults": {"workspace": &outer}}})
-        } else {
-            serde_json::json!({})
-        };
+        let mut config = serde_json::json!({"agents": {"list": [
+            {"id": "main", "default": true},
+            {"id": "ops", "workspace": &ops_workspace}
+        ]}});
+        if enclosing {
+            config["agents"]["defaults"] = serde_json::json!({"workspace": &outer});
+        }
         fs::write(source.join("openclaw.json"), config.to_string()).unwrap();
         fs::write(source.join("data/logs/gateway.log"), "old-log\n").unwrap();
         fs::write(source.join("data/sessions/s1.jsonl"), "{}\n").unwrap();
@@ -1708,6 +1712,7 @@ fn migration_retargets_absolute_links_inside_the_source_home_into_the_environmen
             symlink(target, source.join(link)).unwrap();
         }
         symlink(source.join("data/logs"), outer.join("outer-logs")).unwrap();
+        symlink(source.join("data/logs"), ops_workspace.join("home-logs")).unwrap();
         let mut env = ocm_env(&root);
         install_fake_openclaw_on_path(&root, &mut env);
 
@@ -1744,10 +1749,22 @@ fn migration_retargets_absolute_links_inside_the_source_home_into_the_environmen
             ),
             ("latest.log", Path::new("data/logs/gateway.log")),
         ];
+        let imported: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.join("openclaw.json")).unwrap()).unwrap();
+        // An external workspace copy points into the environment's state.
+        let ops_copy = Path::new(imported["agents"]["list"][1]["workspace"].as_str().unwrap())
+            .join("home-logs");
+        assert!(
+            fs::read_link(&ops_copy).unwrap().is_relative(),
+            "{scenario}"
+        );
+        assert_eq!(
+            fs::canonicalize(&ops_copy).unwrap(),
+            fs::canonicalize(state.join("data/logs")).unwrap(),
+            "{scenario}"
+        );
         let mut copies = vec![state.clone()];
         if enclosing {
-            let imported: serde_json::Value =
-                serde_json::from_slice(&fs::read(state.join("openclaw.json")).unwrap()).unwrap();
             let outer_copy = Path::new(
                 imported["agents"]["defaults"]["workspace"]
                     .as_str()
