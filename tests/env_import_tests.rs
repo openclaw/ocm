@@ -1720,3 +1720,130 @@ fn env_import_rejects_only_mutating_saved_skill_includes() {
         }
     }
 }
+
+fn import_staging_leaves(root: &TestDir) -> Vec<String> {
+    let mut leaves = fs::read_dir(root.child("ocm-home/import-staging"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".lock")
+        .collect::<Vec<_>>();
+    leaves.sort();
+    leaves
+}
+
+fn export_marked_source(
+    root: &TestDir,
+    cwd: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+) {
+    let create = run_ocm(cwd, env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    write_text(
+        &root.child("ocm-home/envs/source/.openclaw/openclaw.json"),
+        r#"{"marker":"archived-source"}"#,
+    );
+    write_text(
+        &root.child("ocm-home/envs/source/.openclaw/workspace/notes.txt"),
+        "archived notes",
+    );
+    let export = run_ocm(cwd, env, &["env", "export", "source"]);
+    assert!(export.status.success(), "{}", stderr(&export));
+}
+
+#[test]
+fn env_import_stages_under_the_ocm_home_instead_of_the_shared_temp_directory() {
+    let root = TestDir::new("env-import-private-staging");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let shared_temp = root.child("shared-temp");
+    fs::create_dir_all(&shared_temp).unwrap();
+    for name in ["TMPDIR", "TMP", "TEMP"] {
+        env.insert(name.to_string(), shared_temp.to_string_lossy().into_owned());
+    }
+    export_marked_source(&root, &cwd, &env);
+
+    // Another user can create this former staging path before any import runs.
+    let planted = shared_temp.join("ocm-env-imports");
+    write_text(&planted, "planted by another user");
+
+    let import = run_ocm(
+        &cwd,
+        &env,
+        &["env", "import", "./source.ocm-env.tar", "--name", "target"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    assert_eq!(
+        fs::read_to_string(&planted).unwrap(),
+        "planted by another user"
+    );
+    let target_state = root.child("ocm-home/envs/target/.openclaw");
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(target_state.join("openclaw.json")).unwrap())
+            .unwrap();
+    assert_eq!(config["marker"], "archived-source");
+    assert_eq!(
+        fs::read_to_string(target_state.join("workspace/notes.txt")).unwrap(),
+        "archived notes"
+    );
+    assert!(import_staging_leaves(&root).is_empty());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(root.child("ocm-home/import-staging"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    // A failure after extraction removes its staging too.
+    let duplicate = run_ocm(
+        &cwd,
+        &env,
+        &["env", "import", "./source.ocm-env.tar", "--name", "target"],
+    );
+    assert!(!duplicate.status.success());
+    assert!(stderr(&duplicate).contains("environment \"target\" already exists"));
+    assert!(import_staging_leaves(&root).is_empty());
+}
+
+#[test]
+fn env_import_removes_abandoned_staging_and_keeps_staging_in_use() {
+    let root = TestDir::new("env-import-abandoned-staging");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    export_marked_source(&root, &cwd, &env);
+
+    let staging = root.child("ocm-home/import-staging");
+    let abandoned = staging.join("import-abandoned");
+    write_text(&abandoned.join(".lock"), "");
+    write_text(
+        &abandoned.join("archive/root/.openclaw/workspace/secret.txt"),
+        "staged",
+    );
+    let in_use = staging.join("import-in-use");
+    write_text(
+        &in_use.join("archive/root/.openclaw/workspace/secret.txt"),
+        "staged",
+    );
+    let in_use_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(in_use.join(".lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&in_use_lock).unwrap();
+
+    let import = run_ocm(
+        &cwd,
+        &env,
+        &["env", "import", "./source.ocm-env.tar", "--name", "target"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    assert!(!abandoned.exists());
+    assert_eq!(import_staging_leaves(&root), ["import-in-use"]);
+    drop(in_use_lock);
+}

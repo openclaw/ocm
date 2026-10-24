@@ -1313,6 +1313,10 @@ Import:
 ocm env import ./mira-with-state.ocm-env.tar --name rowan
 ```
 
+Import unpacks the archive in a new private directory under
+`$OCM_HOME/import-staging` and removes it when the import finishes. A later
+import removes staging left behind by an interrupted one.
+
 Export writes `<env>.ocm-env.tar` in the current directory unless `--output` is
 specified. The archive can be inside the environment, including through a
 directory alias: its own output is excluded from the archived contents. An

@@ -1269,14 +1269,11 @@ pub(crate) fn import_environment_with_sandbox_origin(
 ) -> Result<ImportEnvironmentResult, String> {
     let sandbox_origin = normalize_new_environment_sandbox_origin(sandbox_origin)?;
     let archive_path = resolve_absolute_path(&options.archive, env, cwd)?;
-    let staging_dir = import_staging_dir();
-    if path_exists(&staging_dir) {
-        let _ = super::common::remove_owned_tree(&staging_dir);
-    }
+    let staging = ImportStaging::create(env, cwd)?;
+    let staging_dir = staging.archive_dir.as_path();
 
     let result = (|| {
-        super::common::ensure_private_dir(&staging_dir)?;
-        let extracted = extract_env_archive::<EnvArchiveMetadata>(&archive_path, &staging_dir)?;
+        let extracted = extract_env_archive::<EnvArchiveMetadata>(&archive_path, staging_dir)?;
         if extracted.metadata.kind != "ocm-env-archive" {
             return Err(format!(
                 "unsupported archive kind: {}",
@@ -1293,7 +1290,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
         if extracted.metadata.include_state {
             crate::infra::archive::restore_env_archive_directory_permissions(
                 &archive_path,
-                &staging_dir,
+                staging_dir,
             )?;
         }
 
@@ -1584,7 +1581,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
         }
     })();
 
-    let _ = super::common::remove_owned_tree(&staging_dir);
+    drop(staging);
     result
 }
 
@@ -1712,11 +1709,95 @@ pub(crate) fn with_locked_environments<T>(
     action(&registry.envs)
 }
 
-fn import_staging_dir() -> PathBuf {
-    let id = NEXT_IMPORT_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir()
-        .join("ocm-env-imports")
-        .join(format!("{}-{id}", std::process::id()))
+const IMPORT_STAGING_DIR: &str = "import-staging";
+const IMPORT_STAGING_PREFIX: &str = "import-";
+const IMPORT_STAGING_LOCK: &str = ".lock";
+
+/// Archive extraction space owned by one import.
+///
+/// Staging lives in a private directory under the OCM home rather than the
+/// shared system temp directory, where another local user could pre-create
+/// the path. Each import holds its leaf's lock until the leaf is removed, so a
+/// later import can remove leaves that an interrupted import left behind.
+struct ImportStaging {
+    root: PathBuf,
+    archive_dir: PathBuf,
+    lock: Option<super::common::ExclusiveFileLock>,
+}
+
+impl ImportStaging {
+    fn create(env: &BTreeMap<String, String>, cwd: &Path) -> Result<Self, String> {
+        let parent = resolve_store_paths(env, cwd)?.home.join(IMPORT_STAGING_DIR);
+        super::common::ensure_private_dir(&parent)?;
+        // Serializes sweeping with creation, so a leaf is locked before any
+        // other import can consider it abandoned.
+        let _creation =
+            super::common::lock_file(&parent.join(IMPORT_STAGING_LOCK), "import staging")?;
+        remove_abandoned_import_staging(&parent);
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(IMPORT_STAGING_PREFIX);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let root = builder
+            .tempdir_in(&parent)
+            .map_err(|error| {
+                format!(
+                    "failed to create import staging in {}: {error}",
+                    display_path(&parent)
+                )
+            })?
+            .keep();
+        let mut staging = Self {
+            archive_dir: root.join("archive"),
+            root,
+            lock: None,
+        };
+        // Also replaces inherited ACL grants on macOS and Windows.
+        super::common::ensure_private_dir(&staging.root)?;
+        staging.lock = Some(super::common::lock_file(
+            &staging.root.join(IMPORT_STAGING_LOCK),
+            "import staging",
+        )?);
+        super::common::ensure_private_dir(&staging.archive_dir)?;
+        Ok(staging)
+    }
+}
+
+impl Drop for ImportStaging {
+    fn drop(&mut self) {
+        // Windows cannot remove a directory while its lock file is open.
+        drop(self.lock.take());
+        let _ = super::common::remove_owned_tree(&self.root);
+    }
+}
+
+fn remove_abandoned_import_staging(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(IMPORT_STAGING_PREFIX)
+        {
+            continue;
+        }
+        let path = entry.path();
+        if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+            continue;
+        }
+        // A running import holds its leaf lock until it removes the leaf.
+        if let Ok(Some(lock)) =
+            super::common::try_lock_file(&path.join(IMPORT_STAGING_LOCK), "import staging")
+        {
+            drop(lock);
+            let _ = super::common::remove_owned_tree(&path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1729,7 +1810,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CloneEnvironmentOptions, NEXT_IMPORT_ID, OpenClawWorkspaceRuntime, Ordering,
+        CloneEnvironmentOptions, ImportStaging, NEXT_IMPORT_ID, OpenClawWorkspaceRuntime, Ordering,
         clear_simulation_runtime_state_preserving_includes, clone_environment_for_simulation,
         create_environment, create_private_simulation_staging_dir, derive_env_paths,
         get_environment, remove_environment, restore_environment_service_policy, save_environment,
@@ -2281,6 +2362,59 @@ mod tests {
             fs::metadata(&staging).unwrap().permissions().mode() & 0o777,
             0o700
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_staging_is_a_new_private_locked_directory_under_the_ocm_home() {
+        let id = NEXT_IMPORT_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join("ocm-env-import-staging-tests")
+            .join(format!("{}-{id}", std::process::id()));
+        let ocm_home = root.join("ocm-home");
+        let env = BTreeMap::from([(
+            "OCM_HOME".to_string(),
+            ocm_home.to_string_lossy().into_owned(),
+        )]);
+
+        let first = ImportStaging::create(&env, &root).unwrap();
+        let second = ImportStaging::create(&env, &root).unwrap();
+
+        let parent = ocm_home.join("import-staging");
+        assert_ne!(first.root, second.root);
+        for staging in [&first, &second] {
+            assert_eq!(staging.root.parent(), Some(parent.as_path()));
+            assert_eq!(staging.archive_dir, staging.root.join("archive"));
+            assert!(fs::read_dir(&staging.archive_dir).unwrap().next().is_none());
+            // Windows may report the contended lock as an error, which the
+            // abandoned-staging sweep also treats as in use.
+            assert!(
+                !matches!(
+                    crate::store::common::try_lock_file(&staging.root.join(".lock"), "test"),
+                    Ok(Some(_))
+                ),
+                "a live import must hold its staging lock"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&parent, &first.root, &first.archive_dir] {
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700,
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+
+        let (first_root, second_root) = (first.root.clone(), second.root.clone());
+        drop(first);
+        assert!(!first_root.exists());
+        assert!(second_root.exists());
+        drop(second);
+        assert!(!second_root.exists());
         fs::remove_dir_all(root).unwrap();
     }
 }
