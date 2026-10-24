@@ -578,14 +578,28 @@ fn pnpm_destinations(repo_root: &Path, output: &[u8]) -> Result<PnpmDestinations
         return Err("refusing to install OpenClaw source dependencies with per-project pnpm lockfiles (sharedWorkspaceLockfile: false); prepare them explicitly".to_string());
     }
     let mut projects = BTreeSet::new();
-    // Other projects take only the last component of a multi-component or
-    // absolute modulesDir; check both forms.
-    let modules_name = Path::new(modules_setting).file_name();
-    let branch_lockfiles = match value("gitBranchLockfile", "git-branch-lockfile") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(enabled)) => *enabled,
-        _ => return Err("pnpm returned an invalid gitBranchLockfile setting".to_string()),
+    // pnpm reduces an absolute modulesDir, or one that climbs with `..`, to its
+    // last component for workspace projects; check both forms then.
+    let modules_path = Path::new(modules_setting);
+    let modules_name = (modules_path.is_absolute()
+        || modules_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir)))
+    .then(|| modules_path.file_name())
+    .flatten();
+    let flag = |camel: &str, kebab: &str| match value(camel, kebab) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        _ => Err(format!("pnpm returned an invalid {camel} setting")),
     };
+    // Branch lockfiles are read for per-branch lockfiles and when merging them.
+    let branch_lockfiles = flag("gitBranchLockfile", "git-branch-lockfile")?
+        || flag("mergeGitBranchLockfiles", "merge-git-branch-lockfiles")?
+        || value(
+            "mergeGitBranchLockfilesBranchPattern",
+            "merge-git-branch-lockfiles-branch-pattern",
+        )
+        .is_some_and(|pattern| !pattern.is_null());
     for project in lockfile_projects(&lockfile_root, branch_lockfiles)? {
         let project = clean_path(&lockfile_root.join(project));
         projects.insert(clean_path(&project.join(modules_setting)));
@@ -1881,8 +1895,10 @@ mod tests {
         std::os::unix::fs::symlink(&borrowed, repo.join("ui/modules")).unwrap();
         check(serde_json::json!({})).unwrap();
         assert!(check(serde_json::json!({"modulesDir": "modules"})).is_err());
-        // Other projects use only the last component of a multi-component modulesDir.
-        assert!(check(serde_json::json!({"modulesDir": "nested/modules"})).is_err());
+        // A relative multi-component modulesDir is kept whole for every project;
+        // one that climbs with `..` is reduced to its last component.
+        check(serde_json::json!({"modulesDir": "nested/modules"})).unwrap();
+        assert!(check(serde_json::json!({"modulesDir": "../outside/modules"})).is_err());
         fs::remove_file(repo.join("ui/modules")).unwrap();
         // pnpm writes through a linked project directory.
         fs::create_dir(repo.join("extensions")).unwrap();
@@ -1918,6 +1934,11 @@ mod tests {
         std::os::unix::fs::symlink(&borrowed, repo.join("extensions/b/node_modules")).unwrap();
         check(serde_json::json!({})).unwrap();
         assert!(check(serde_json::json!({"gitBranchLockfile": true})).is_err());
+        // Merging branch lockfiles reads them too.
+        assert!(check(serde_json::json!({"mergeGitBranchLockfiles": true})).is_err());
+        assert!(
+            check(serde_json::json!({"mergeGitBranchLockfilesBranchPattern": ["main"]})).is_err()
+        );
         fs::write(repo.join("pnpm-lock.yaml"), "importers: [unclosed\n").unwrap();
         let error = check(serde_json::json!({})).unwrap_err();
         assert!(error.contains("could not read the projects"), "{error}");
