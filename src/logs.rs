@@ -9,7 +9,9 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
-use crate::store::{derive_env_paths, display_path, supervisor_logs_dir};
+use crate::store::{
+    derive_env_paths, display_path, supervisor_child_log_path, supervisor_logs_dir,
+};
 
 const FOLLOW_POLL_INTERVAL_MS: u64 = 250;
 const TAIL_READ_CHUNK_SIZE: usize = 8 * 1024;
@@ -171,7 +173,7 @@ impl<'a> LogService<'a> {
                 _ => unreachable!("stream validated by normalize_stream"),
             });
         let service_path =
-            supervisor_logs_dir(self.env, self.cwd)?.join(format!("{}.{}.log", name, stream));
+            supervisor_child_log_path(&supervisor_logs_dir(self.env, self.cwd)?, name, &stream);
 
         Ok(LogSources {
             env_name: name.to_string(),

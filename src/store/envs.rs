@@ -202,6 +202,20 @@ fn upsert_environment(
             &registry.envs,
         )?;
     }
+    if registry
+        .envs
+        .iter()
+        .all(|current| current.name != meta.name)
+    {
+        // A newly registered name must not inherit service output captured
+        // for an earlier environment of the same name.
+        crate::supervisor::discard_child_logs(
+            &meta.name,
+            registry.envs.iter().map(|current| current.name.as_str()),
+            env,
+            cwd,
+        )?;
+    }
     registry.envs.retain(|entry| entry.name != meta.name);
     registry.envs.push(meta.clone());
     Ok((meta, admission))
@@ -650,6 +664,15 @@ fn create_environment_with_runtime_validation(
         None => choose_available_gateway_port(DEFAULT_GATEWAY_PORT, &registry.envs, env)?,
     });
 
+    // Registration repeats this. Doing it after validation keeps the earlier
+    // logs when creation is rejected, and before the root is written so a
+    // failure here leaves nothing behind.
+    crate::supervisor::discard_child_logs(
+        &name,
+        registry.envs.iter().map(|current| current.name.as_str()),
+        env,
+        cwd,
+    )?;
     ensure_dir(&paths.root)?;
     ensure_dir(&paths.state_dir)?;
     ensure_dir(&paths.workspace_dir)?;

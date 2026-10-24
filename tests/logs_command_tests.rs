@@ -268,6 +268,272 @@ fn logs_fall_back_to_supervisor_logs_when_gateway_logs_are_missing() {
     assert_eq!(body["content"], "hello from supervisor stdout\n");
 }
 
+fn write_service_logs(root: &TestDir, name: &str, label: &str) -> std::path::PathBuf {
+    let logs_dir = root.child("ocm-home/supervisor/logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+    for stream in ["stdout", "stderr"] {
+        fs::write(
+            logs_dir.join(format!("{name}.{stream}.log")),
+            format!("{label} {stream}\n"),
+        )
+        .unwrap();
+    }
+    logs_dir
+}
+
+fn assert_no_logs(cwd: &std::path::Path, env: &std::collections::BTreeMap<String, String>) {
+    let output = run_ocm(cwd, env, &["logs", "demo", "--json"]);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("no logs exist for env \"demo\" across stdout or stderr"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_recreated_env_does_not_show_the_removed_envs_service_logs() {
+    let cases: [(&[&str], &[&str]); 3] = [
+        (
+            &["env", "remove", "demo"],
+            &["env", "create", "demo", "--launcher", "stable"],
+        ),
+        (
+            &["env", "destroy", "demo", "--yes"],
+            &["env", "clone", "keep", "demo"],
+        ),
+        (
+            &["env", "remove", "demo"],
+            &["env", "import", "keep.tar", "--name", "demo"],
+        ),
+    ];
+    for (removal, creation) in cases {
+        let root = TestDir::new("logs-recreated-env-service-logs");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        setup_launcher_env(&cwd, &env);
+        let sibling = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "keep", "--launcher", "stable"],
+        );
+        assert!(sibling.status.success(), "{}", stderr(&sibling));
+        let exported = run_ocm(
+            &cwd,
+            &env,
+            &["env", "export", "keep", "--output", "keep.tar"],
+        );
+        assert!(exported.status.success(), "{}", stderr(&exported));
+        let logs_dir = write_service_logs(&root, "demo", "removed env");
+        write_service_logs(&root, "keep", "sibling");
+
+        let removed = run_ocm(&cwd, &env, removal);
+        assert!(
+            removed.status.success(),
+            "{removal:?}: {}",
+            stderr(&removed)
+        );
+        let recreated = run_ocm(&cwd, &env, creation);
+        assert!(
+            recreated.status.success(),
+            "{creation:?}: {}",
+            stderr(&recreated)
+        );
+        assert!(!logs_dir.join("demo.stdout.log").exists(), "{creation:?}");
+        assert!(!logs_dir.join("demo.stderr.log").exists(), "{creation:?}");
+        assert_no_logs(&cwd, &env);
+
+        let sibling_logs = run_ocm(&cwd, &env, &["logs", "keep", "--json"]);
+        assert!(sibling_logs.status.success(), "{}", stderr(&sibling_logs));
+        let body: Value = serde_json::from_str(&stdout(&sibling_logs)).unwrap();
+        assert_eq!(body["sourceKind"], "service");
+        let content = body["content"].as_str().unwrap();
+        assert!(content.contains("sibling stdout"), "{content}");
+        assert!(content.contains("sibling stderr"), "{content}");
+    }
+}
+
+#[test]
+fn a_new_env_does_not_inherit_service_logs_left_under_its_name() {
+    let root = TestDir::new("logs-new-env-orphaned-service-logs");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    // Logs left by an environment removed before this cleanup existed.
+    let logs_dir = write_service_logs(&root, "demo", "orphaned");
+
+    setup_launcher_env(&cwd, &env);
+    assert!(!logs_dir.join("demo.stdout.log").exists());
+    assert!(!logs_dir.join("demo.stderr.log").exists());
+    assert_no_logs(&cwd, &env);
+}
+
+#[test]
+fn a_rejected_create_keeps_the_earlier_service_logs() {
+    let root = TestDir::new("logs-rejected-create-keeps-logs");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let logs_dir = write_service_logs(&root, "demo", "removed env");
+
+    let rejected = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--launcher", "missing"],
+    );
+    assert!(!rejected.status.success());
+    assert!(logs_dir.join("demo.stdout.log").exists());
+    assert!(logs_dir.join("demo.stderr.log").exists());
+}
+
+#[test]
+fn updating_a_registered_env_keeps_its_service_logs() {
+    let root = TestDir::new("logs-update-keeps-service-logs");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    setup_launcher_env(&cwd, &env);
+    write_service_logs(&root, "demo", "current");
+
+    let protected = run_ocm(&cwd, &env, &["env", "protect", "demo", "on"]);
+    assert!(protected.status.success(), "{}", stderr(&protected));
+    let output = run_ocm(&cwd, &env, &["logs", "demo", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let body: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let content = body["content"].as_str().unwrap();
+    assert!(content.contains("current stdout"), "{content}");
+    assert!(content.contains("current stderr"), "{content}");
+}
+
+#[test]
+fn creating_a_case_variant_name_keeps_the_registered_envs_logs() {
+    let root = TestDir::new("logs-case-variant-name");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    setup_launcher_env(&cwd, &env);
+    let logs_dir = write_service_logs(&root, "demo", "current");
+    // On a case-insensitive filesystem Demo.stdout.log is demo's own file; a
+    // hard link gives the same aliasing here.
+    if let Err(error) = fs::hard_link(
+        logs_dir.join("demo.stdout.log"),
+        logs_dir.join("Demo.stdout.log"),
+    ) {
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    let other_root = root.child("other-root");
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "Demo",
+            "--launcher",
+            "stable",
+            "--root",
+            &path_string(&other_root),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    assert!(logs_dir.join("Demo.stdout.log").exists());
+    let output = run_ocm(&cwd, &env, &["logs", "demo", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let body: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let content = body["content"].as_str().unwrap();
+    assert!(content.contains("current stdout"), "{content}");
+    assert!(content.contains("current stderr"), "{content}");
+}
+
+#[test]
+fn env_create_fails_when_an_earlier_service_log_cannot_be_deleted() {
+    let root = TestDir::new("logs-create-undeletable");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+
+    // A directory in place of the log file makes its deletion fail.
+    let blocked = root.child("ocm-home/supervisor/logs/demo.stdout.log");
+    fs::create_dir_all(blocked.join("nested")).unwrap();
+
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--launcher", "stable"],
+    );
+    assert!(!created.status.success());
+    assert!(
+        stderr(&created).contains("failed removing earlier service log"),
+        "{}",
+        stderr(&created)
+    );
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(!show.status.success());
+    assert!(stderr(&show).contains("environment \"demo\" does not exist"));
+    assert!(!root.child("ocm-home/envs/demo").exists());
+}
+
+#[test]
+fn an_env_named_daemon_keeps_only_the_daemons_own_logs() {
+    for layout in ["default", "relocated", "alias", "case"] {
+        if layout == "alias" && !cfg!(unix) {
+            continue;
+        }
+        let name = if layout == "case" { "Daemon" } else { "daemon" };
+        let root = TestDir::new("logs-env-named-daemon");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let launcher = run_ocm(
+            &cwd,
+            &env,
+            &["launcher", "add", "stable", "--command", "openclaw"],
+        );
+        assert!(launcher.status.success(), "{}", stderr(&launcher));
+        let log = root.child("ocm-home/supervisor/logs/daemon.stdout.log");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(&log, "earlier output\n").unwrap();
+        let daemon_logs = root.child("daemon-logs");
+        match layout {
+            "relocated" => fs::create_dir_all(&daemon_logs).unwrap(),
+            // Another path to the same directory still holds the daemon's logs.
+            #[cfg(unix)]
+            "alias" => std::os::unix::fs::symlink(log.parent().unwrap(), &daemon_logs).unwrap(),
+            _ => {}
+        }
+        if layout == "case" {
+            // On a case-insensitive filesystem Daemon.stdout.log is the
+            // daemon's own file; a hard link gives the same aliasing here.
+            let alias = log.with_file_name("Daemon.stdout.log");
+            if let Err(error) = fs::hard_link(&log, &alias) {
+                assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            }
+        }
+        if layout == "relocated" || layout == "alias" {
+            fs::write(
+                root.child("ocm-home/supervisor/daemon-log-config.json"),
+                serde_json::json!({ "logDir": path_string(&daemon_logs) }).to_string(),
+            )
+            .unwrap();
+        }
+
+        let created = run_ocm(&cwd, &env, &["env", "create", name, "--launcher", "stable"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        // In the daemon's directory the file is its own log; after relocation
+        // it can only be an earlier env's output.
+        assert_eq!(log.exists(), layout != "relocated", "{layout}");
+        assert!(layout != "case" || log.with_file_name("Daemon.stdout.log").exists());
+    }
+}
+
 #[test]
 fn logs_prefer_the_newer_service_log_when_gateway_log_is_stale() {
     let root = TestDir::new("logs-prefer-newer-service");

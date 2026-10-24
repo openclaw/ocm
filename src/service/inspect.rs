@@ -12,7 +12,10 @@ use super::platform::{
 use crate::cli::render::format_rfc3339;
 use crate::env::GatewayProcessSpec;
 use crate::env::{EnvMeta, EnvironmentService};
-use crate::store::{display_path, gateway_url_for_launch, list_environments, supervisor_logs_dir};
+use crate::store::{
+    display_path, gateway_url_for_launch, list_environments, supervisor_child_log_path,
+    supervisor_logs_dir,
+};
 use crate::supervisor::{
     SupervisorChildSpec, SupervisorDaemonSummary, SupervisorInspection, SupervisorRuntimeChild,
     SupervisorRuntimeService, SupervisorService,
@@ -355,8 +358,8 @@ fn build_service_summary(
             ),
         });
     let logs_dir = supervisor_logs_dir(env, cwd)?;
-    let fallback_stdout = display_path(&logs_dir.join(format!("{}.stdout.log", meta.name)));
-    let fallback_stderr = display_path(&logs_dir.join(format!("{}.stderr.log", meta.name)));
+    let fallback_stdout = display_path(&supervisor_child_log_path(&logs_dir, &meta.name, "stdout"));
+    let fallback_stderr = display_path(&supervisor_child_log_path(&logs_dir, &meta.name, "stderr"));
     let binding = binding_from_meta(meta);
     let installed = meta.service_enabled;
     let desired_running = meta.service_running;

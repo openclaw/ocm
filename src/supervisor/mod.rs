@@ -38,7 +38,8 @@ use crate::service::platform::{
 use crate::store::{
     display_path, ensure_dir, ensure_store, list_environments, lock_file, now_utc,
     openclaw_port_family_available, openclaw_port_family_range, read_json, resolve_ocm_home,
-    supervisor_logs_dir, supervisor_runtime_path, supervisor_state_path, write_json,
+    supervisor_child_log_path, supervisor_logs_dir, supervisor_runtime_path, supervisor_state_path,
+    write_json,
 };
 
 mod openclaw_handoff;
@@ -363,6 +364,71 @@ pub fn sync_supervisor_env_if_present(
     }
     SupervisorService::new(env, cwd).sync_env(env_name)?;
     Ok(true)
+}
+
+/// Delete the service output captured under an environment name before that
+/// name is registered for a new environment. These files live outside the
+/// environment root and are keyed only by name, so they can hold output from an
+/// earlier environment of the same name, including one removed by an older OCM.
+///
+/// On a case-insensitive filesystem the path can also resolve to a file that
+/// still belongs to someone else: a registered env whose name differs only in
+/// case, or the daemon's own daemon.<stream>.log. Those files are kept.
+pub(crate) fn discard_child_logs<'n>(
+    env_name: &str,
+    registered: impl IntoIterator<Item = &'n str>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(), String> {
+    let logs_dir = supervisor_logs_dir(env, cwd)?;
+    let mut owners = registered
+        .into_iter()
+        .filter(|name| *name != env_name)
+        .map(|name| (logs_dir.clone(), name.to_string()))
+        .collect::<Vec<_>>();
+    if env_name.eq_ignore_ascii_case("daemon") {
+        let daemon_logs_dir = SupervisorService::new(env, cwd).saved_daemon_logs_dir()?;
+        owners.push((daemon_logs_dir, "daemon".to_string()));
+    }
+    for stream in ["stdout", "stderr"] {
+        let path = supervisor_child_log_path(&logs_dir, env_name, stream);
+        if owners
+            .iter()
+            .any(|(dir, owner)| is_same_file(&path, &supervisor_child_log_path(dir, owner, stream)))
+        {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed removing earlier service log {} for env \"{env_name}\": {error}",
+                    display_path(&path)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether both paths exist and resolve to the same file.
+fn is_same_file(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        matches!(
+            (fs::metadata(left), fs::metadata(right)),
+            (Ok(left), Ok(right)) if left.dev() == right.dev() && left.ino() == right.ino()
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(
+            (fs::canonicalize(left), fs::canonicalize(right)),
+            (Ok(left), Ok(right)) if left == right
+        )
+    }
 }
 
 pub fn sync_supervisor_binding_if_present(
@@ -1057,12 +1123,16 @@ impl<'a> SupervisorService<'a> {
                         args,
                         run_dir: display_path(&process.run_dir),
                         child_port,
-                        stdout_path: display_path(
-                            &logs_dir.join(format!("{}.stdout.log", process.env_name)),
-                        ),
-                        stderr_path: display_path(
-                            &logs_dir.join(format!("{}.stderr.log", process.env_name)),
-                        ),
+                        stdout_path: display_path(&supervisor_child_log_path(
+                            &logs_dir,
+                            &process.env_name,
+                            "stdout",
+                        )),
+                        stderr_path: display_path(&supervisor_child_log_path(
+                            &logs_dir,
+                            &process.env_name,
+                            "stderr",
+                        )),
                         process_env,
                     });
                 }

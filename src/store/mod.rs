@@ -65,9 +65,10 @@ pub use layout::{
     env_registry_path, launcher_meta_path, resolve_absolute_path, resolve_ocm_home,
     resolve_store_paths, resolve_user_home, runtime_install_files_dir, runtime_install_root,
     runtime_meta_path, snapshot_archive_path, snapshot_checkpoint_path, snapshot_env_dir,
-    snapshot_meta_path, source_watch_override_path, supervisor_logs_dir, supervisor_runtime_path,
-    supervisor_state_path, upgrade_history_env_dir, upgrade_history_meta_path,
-    upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir, validate_name,
+    snapshot_meta_path, source_watch_override_path, supervisor_child_log_path, supervisor_logs_dir,
+    supervisor_runtime_path, supervisor_state_path, upgrade_history_env_dir,
+    upgrade_history_meta_path, upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir,
+    validate_name,
 };
 pub(crate) use openclaw_config::{
     GatewayReadinessHost, MinimumLocalConfig, OpenClawConfigAudit, OpenClawConfigRepair,
