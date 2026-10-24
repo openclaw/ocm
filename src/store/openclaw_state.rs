@@ -193,10 +193,12 @@ pub(crate) fn openclaw_env_archive_options(
 const IMPORT_REMOVED_STATE_ROOTS: [&str; 5] =
     ["credentials", "cron", "devices", "identity", "memory"];
 
-/// Default import retains Git repositories found in the archive, and the
-/// configuration files they select, wherever they are copied. Keep the ones
-/// inside the omitted legacy stores, using the same discovery and selection
-/// as import; without path mappings the selection edits nothing.
+/// Default import retains Git repositories found in the archive, their storage,
+/// and the configuration files they select, wherever they are copied. Keep the
+/// ones inside the omitted legacy stores, using import's repository recognition
+/// and configuration selection; without path mappings the selection edits
+/// nothing. Includes are selected where the repository is now, so a condition
+/// that depends on its location (such as `gitdir:`) is evaluated at the source.
 fn archived_git_paths_in_import_removed_roots(
     paths: &EnvPaths,
     options: &EnvArchiveOptions,
@@ -211,23 +213,33 @@ fn archived_git_paths_in_import_removed_roots(
     }
     let canonical_root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
     let history = IntegrityProtectedLibraryPaths::new(&paths.state_dir)?;
+    let in_removed_root = |path: &Path| removed_roots.iter().any(|root| path.starts_with(root));
     let mut contexts = Vec::new();
     let mut directories = vec![paths.root.clone()];
     while let Some(directory) = directories.pop() {
         let (mut git_entry, mut head, mut objects) = (false, false, false);
         let mut children = Vec::new();
-        for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
+        // The archive writer tolerates entries that disappear while a live
+        // environment is exported; so does this selection.
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        for entry in entries {
             let entry = entry.map_err(|error| error.to_string())?;
             let name = entry.file_name();
             git_entry |= name == ".git";
             head |= name == "HEAD";
             objects |= name == "objects";
             let path = entry.path();
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            };
             if name == ".git"
-                || !entry
-                    .file_type()
-                    .map_err(|error| error.to_string())?
-                    .is_dir()
+                || !kind.is_dir()
                 || is_integrity_protected_history_path(&paths.state_dir, &path)
                 || history.roots.iter().any(|root| path.starts_with(root))
             {
@@ -238,7 +250,7 @@ fn archived_git_paths_in_import_removed_roots(
             let relative = path
                 .strip_prefix(&paths.root)
                 .map_err(|error| error.to_string())?;
-            if removed_roots.iter().any(|root| path.starts_with(root))
+            if in_removed_root(&path)
                 || !options.should_skip(relative, EnvArchiveEntryKind::Directory)
             {
                 children.push(path);
@@ -246,9 +258,17 @@ fn archived_git_paths_in_import_removed_roots(
         }
         // The listing supplies the repository markers that import's
         // recognition checks, so most directories need no further lookups.
+        // Import sees a checkout only when its `.git` entry is archived.
+        let relative = directory
+            .strip_prefix(&paths.root)
+            .map_err(|error| error.to_string())?;
         if (git_entry || (head && objects))
+            && (!git_entry
+                || in_removed_root(&directory)
+                || !options.should_skip(&relative.join(".git"), EnvArchiveEntryKind::Directory))
             && let Some(context) =
-                git_config::copied_destination_git_context(&canonical_root, &directory)?
+                git_config::copied_destination_git_context(&canonical_root, &directory)
+                    .map_err(|error| export_git_selection_error(&directory, error))?
         {
             contexts.push(context);
             if !git_entry {
@@ -257,30 +277,68 @@ fn archived_git_paths_in_import_removed_roots(
         }
         directories.extend(children);
     }
-    let selected = git_config::relocate_copied_git_config(&paths.root, &[], &contexts)?
-        .into_iter()
-        .chain(
-            contexts
-                .into_iter()
-                .flat_map(|context| [context.checkout, context.private_dir, context.common_dir]),
-        );
+
     let mut archived = BTreeSet::new();
-    for path in selected {
-        let Some(relative) = path
-            .strip_prefix(&paths.root)
-            .or_else(|_| path.strip_prefix(&canonical_root))
-            .ok()
-        else {
-            continue;
-        };
-        if matches!(
-            path_components(relative).as_slice(),
-            [".openclaw", name, ..] if IMPORT_REMOVED_STATE_ROOTS.contains(name)
-        ) {
-            archived.insert(relative.to_path_buf());
+    let mut archive_relative = |relative: &Path| {
+        match path_components(relative).as_slice() {
+            // A checkout at the environment root makes import retain the
+            // whole state directory, including these stores.
+            [] => archived.extend(
+                removed_roots
+                    .iter()
+                    .filter_map(|root| root.strip_prefix(&paths.root).ok())
+                    .map(Path::to_path_buf),
+            ),
+            [".openclaw", name, ..] if IMPORT_REMOVED_STATE_ROOTS.contains(name) => {
+                archived.insert(relative.to_path_buf());
+            }
+            _ => {}
+        }
+    };
+    for context in &contexts {
+        // Retained configuration paths include the alias links needed to
+        // reach them, so they are matched as returned, not resolved.
+        for path in
+            git_config::relocate_copied_git_config(&paths.root, &[], std::slice::from_ref(context))
+                .map_err(|error| export_git_selection_error(&context.checkout, error))?
+        {
+            if let Ok(relative) = path.strip_prefix(&paths.root) {
+                archive_relative(relative);
+            }
+        }
+        let objects = context.common_dir.join("objects");
+        let mut storage = vec![
+            context.checkout.clone(),
+            context.private_dir.clone(),
+            context.common_dir.clone(),
+            objects.clone(),
+        ];
+        // Import also requires the alternate object stores a repository names.
+        if let Ok(alternates) = fs::read_to_string(objects.join("info/alternates")) {
+            storage.extend(
+                alternates
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(|line| objects.join(line)),
+            );
+        }
+        for path in storage {
+            if let Ok(resolved) = fs::canonicalize(&path)
+                && let Ok(relative) = resolved.strip_prefix(&canonical_root)
+            {
+                archive_relative(relative);
+            }
         }
     }
     Ok(archived)
+}
+
+fn export_git_selection_error(repository: &Path, error: String) -> String {
+    format!(
+        "cannot select the Git files that import keeps for the repository at {}: {error}",
+        display_path(repository)
+    )
 }
 
 pub(crate) fn openclaw_env_state_archive_options(
