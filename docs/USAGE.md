@@ -81,7 +81,9 @@ starting a background service. Gateway readiness is still checked when OCM start
 the service after onboarding.
 Repeating `ocm start luna --command ... --cwd .` from the same directory reuses the local
 launcher, as does the equivalent absolute directory. A different command or
-directory is refused without changing the existing launcher.
+directory is refused without changing the existing launcher. When `start` is
+refused before it creates or rebinds the env, it removes the launcher it just
+created, so a corrected retry starts like a first attempt.
 
 ## Common scenarios
 

@@ -521,7 +521,7 @@ fn rollback_migrated_launcher(
     Ok(())
 }
 
-fn with_rollback_error(
+pub(crate) fn with_rollback_error(
     primary_error: String,
     operation: &str,
     rollback: Result<(), String>,
