@@ -410,6 +410,23 @@ fn reap_if_running(pid: libc::pid_t) -> bool {
     running
 }
 
+/// Give OCM no controlling terminal, as under a process manager, so a test
+/// run from an interactive terminal exercises the same placement as CI.
+#[cfg(unix)]
+fn without_terminal(command: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
 /// Send `signal` to the OCM process alone, as process managers and harnesses
 /// do, and require OCM to pass it on and outlive the command's shutdown.
 #[cfg(unix)]
@@ -422,8 +439,7 @@ fn assert_command_receives_signal(
     use std::os::unix::process::ExitStatusExt;
 
     let marker = fixture.marker(label);
-    let mut process = fixture
-        .command(args, &marker)
+    let mut process = without_terminal(&mut fixture.command(args, &marker))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -511,7 +527,7 @@ fn an_ignored_signal_stays_ignored_for_the_command() {
         ],
         &marker,
     );
-    command
+    without_terminal(&mut command)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -550,24 +566,23 @@ fn foreground_runs_end_by_the_stop_signal_that_ended_their_command() {
 
     let fixture = SignalFixture::new("cli-foreground-stop-signal");
     let marker = fixture.marker("default");
-    let mut process = fixture
-        .command(
-            &[
-                "env",
-                "exec",
-                "bound",
-                "--",
-                "sh",
-                "-c",
-                r#"echo "ready $$" >> "$OCM_TEST_SIGNAL_MARKER"; exec sleep 30"#,
-            ],
-            &marker,
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut process = without_terminal(&mut fixture.command(
+        &[
+            "env",
+            "exec",
+            "bound",
+            "--",
+            "sh",
+            "-c",
+            r#"echo "ready $$" >> "$OCM_TEST_SIGNAL_MARKER"; exec sleep 30"#,
+        ],
+        &marker,
+    ))
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
     let command_pid = ready_pid(&marker);
     unsafe {
         libc::kill(process.id() as libc::pid_t, libc::SIGTERM);

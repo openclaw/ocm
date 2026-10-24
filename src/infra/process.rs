@@ -224,8 +224,11 @@ mod foreground {
         let status = child.wait();
         terminal.restore();
         let death = status.as_ref().ok().and_then(ExitStatusExt::signal);
-        let terminal_stop =
-            terminal.owned && matches!(death, Some(libc::SIGINT | libc::SIGQUIT | libc::SIGHUP));
+        // Only a command group holding the terminal receives its keys without
+        // OCM; in a shared job OCM saw them itself and relayed them.
+        let terminal_stop = isolate
+            && terminal.owned
+            && matches!(death, Some(libc::SIGINT | libc::SIGQUIT | libc::SIGHUP));
         // A shell leader can exit before the processes it started finish
         // handling the same stop request. The group ID stays reserved while
         // any member remains. Waiting is best effort: an unreadable process
