@@ -329,9 +329,9 @@ impl Cli {
         }
 
         if request.service_requested {
-            self.with_progress(format!("Installing service for {}", request.name), || {
-                self.service_service().install(&request.name)
-            })?;
+            // Start enables the service and installs an absent daemon itself.
+            // Install first would publish stopped intent that the daemon can
+            // act on, replacing a Gateway that is already running.
             self.with_progress(format!("Starting service for {}", request.name), || {
                 self.service_service().start(&request.name)
             })?;
