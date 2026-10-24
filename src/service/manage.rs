@@ -13,7 +13,9 @@ use super::inspect::ServiceSummary;
 use super::readiness::GatewayReadiness;
 use super::service_backend_support_error;
 use crate::env::{EnvironmentService, ResolvedExecution};
-use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
+use crate::infra::shell::{
+    build_openclaw_dev_source_env, build_openclaw_env, render_env_scoped_login_command,
+};
 use crate::managed_node::apply_path_prepend_to_environment;
 use crate::store::{restore_environment_service_policy, set_environment_service_policy};
 use crate::supervisor::{SupervisorService, sync_supervisor_env_if_present};
@@ -465,7 +467,10 @@ fn resolved_restart_command(
             } else {
                 Ok(ResolvedRestartCommand {
                     program: "sh".to_string(),
-                    args: vec!["-lc".to_string(), command],
+                    args: vec![
+                        "-lc".to_string(),
+                        render_env_scoped_login_command(&command, &openclaw_env),
+                    ],
                     env: openclaw_env,
                     cwd: run_dir,
                 })
@@ -884,5 +889,83 @@ fn service_action_summary(
         stdout_path: summary.stdout_path,
         stderr_path: summary.stderr_path,
         warnings,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn launcher_restart_command_keeps_env_values_after_the_login_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("ocm-home/envs/demo");
+        let helper = home.path().join("profile-bin/launcher-openclaw");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$OPENCLAW_STATE_DIR\" \"$OCM_ACTIVE_ENV\" \"${OPENCLAW_UPDATE_IN_PROGRESS-unset}\" \"$*\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            home.path().join(".profile"),
+            "export OPENCLAW_STATE_DIR=/native/.openclaw\nexport OCM_ACTIVE_ENV=other\nexport OPENCLAW_UPDATE_IN_PROGRESS=0\nPATH=\"$HOME/profile-bin:$PATH\"; export PATH\n",
+        )
+        .unwrap();
+        let caller_env = BTreeMap::from([
+            (
+                "HOME".to_string(),
+                home.path().to_string_lossy().into_owned(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ]);
+        let resolved = ResolvedExecution::Launcher {
+            env: crate::env::EnvMeta {
+                upgrade_independent_paths: Vec::new(),
+                kind: "ocm-env".to_string(),
+                name: "demo".to_string(),
+                root: root.to_string_lossy().into_owned(),
+                gateway_port: Some(19011),
+                gateway_port_auto_assigned: false,
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: Some("profiled".to_string()),
+                dev: None,
+                dev_ui_port: None,
+                protected: false,
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                last_used_at: None,
+            },
+            launcher_name: "profiled".to_string(),
+            command: "launcher-openclaw gateway restart".to_string(),
+            run_dir: home.path().to_path_buf(),
+        };
+
+        let command = resolved_restart_command(resolved, &caller_env).unwrap();
+        let output = Command::new(&command.program)
+            .args(&command.args)
+            .env_clear()
+            .envs(&command.env)
+            .current_dir(&command.cwd)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "{}|demo|unset|gateway restart\n",
+                root.join(".openclaw").display()
+            )
+        );
     }
 }

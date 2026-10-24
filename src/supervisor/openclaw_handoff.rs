@@ -849,4 +849,56 @@ mod tests {
             assert!(!prepared.process_env.contains_key(key));
         }
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_machine_command_keeps_env_values_after_the_login_profile() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let helper = home.path().join("profile-bin/launcher-openclaw");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s|%s|%s|%s|%s\\n' \"$OPENCLAW_STATE_DIR\" \"$OCM_ACTIVE_ENV\" \"$OPENCLAW_SERVICE_KIND\" \"${OPENCLAW_PROFILE-unset}\" \"$*\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            home.path().join(".profile"),
+            "export OPENCLAW_STATE_DIR=/native/.openclaw\nexport OCM_ACTIVE_ENV=other\nexport OPENCLAW_SERVICE_KIND=bad\nexport OPENCLAW_PROFILE=work\nPATH=\"$HOME/profile-bin:$PATH\"; export PATH\n",
+        )
+        .unwrap();
+        let mut spec = direct_spec();
+        spec.binding_kind = "launcher".to_string();
+        spec.binary_path = None;
+        spec.args = Vec::new();
+        spec.command = Some("launcher-openclaw 'gateway' 'run' '--port' '19001'".to_string());
+        spec.run_dir = home.path().to_string_lossy().into_owned();
+        spec.process_env.extend([
+            (
+                "HOME".to_string(),
+                home.path().to_string_lossy().into_owned(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            (
+                "OPENCLAW_STATE_DIR".to_string(),
+                "/ocm/envs/demo/.openclaw".to_string(),
+            ),
+            ("OCM_ACTIVE_ENV".to_string(), "demo".to_string()),
+        ]);
+
+        let output = run_openclaw_machine_command_with_timeout(
+            &spec,
+            &["capabilities"],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "/ocm/envs/demo/.openclaw|demo|gateway|unset|capabilities\n"
+        );
+    }
 }

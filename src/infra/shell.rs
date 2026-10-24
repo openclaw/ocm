@@ -229,28 +229,20 @@ pub fn render_env_scoped_login_command(command: &str, env: &BTreeMap<String, Str
         .collect::<Vec<_>>()
         .join("|");
     // `export -p` is a builtin in every POSIX sh; bash prints `declare -x`
-    // outside POSIX mode. Only validated identifiers reach `unset`.
+    // outside POSIX mode. Only validated identifiers reach `unset`. Case
+    // patterns carry a leading `(` because bash 3.2 (macOS /bin/sh) cannot
+    // parse the bare form inside `$(...)`. The prelude stays on one line so
+    // the launcher command starts on line 2 of the script.
     let mut script = format!(
-        r#"eval "$(export -p | while IFS= read -r ocm_line; do
-  case $ocm_line in
-    'export '*) ocm_key=${{ocm_line#export }} ;;
-    'declare -x '*) ocm_key=${{ocm_line#declare -x }} ;;
-    *) continue ;;
-  esac
-  ocm_key=${{ocm_key%%=*}}
-  case $ocm_key in
-    {passthrough}|*[!{IDENTIFIER_CHARS}]*) ;;
-    OPENCLAW_*|OCM_ACTIVE_ENV|OCM_ACTIVE_ENV_ROOT) printf 'unset %s\n' "$ocm_key" ;;
-  esac
-done)"
-"#
+        r#"eval "$(export -p | while IFS= read -r ocm_line; do case $ocm_line in ('export '*) ocm_key=${{ocm_line#export }} ;; ('declare -x '*) ocm_key=${{ocm_line#declare -x }} ;; (*) continue ;; esac; ocm_key=${{ocm_key%%=*}}; case $ocm_key in ({passthrough}|*[!{IDENTIFIER_CHARS}]*) ;; (OPENCLAW_*|OCM_ACTIVE_ENV|OCM_ACTIVE_ENV_ROOT) printf 'unset %s\n' "$ocm_key" ;; esac; done)""#
     );
     for (key, value) in env {
         if is_env_scoped_key(key) && is_shell_identifier(key) {
+            script.push_str("; ");
             script.push_str(&render_assignment("sh", key, value));
-            script.push('\n');
         }
     }
+    script.push('\n');
     script.push_str(command);
     script
 }

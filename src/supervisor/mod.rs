@@ -5524,4 +5524,63 @@ mod tests {
         assert!(!process_env.contains_key("GH_TOKEN"));
         assert!(!process_env.contains_key("PWD"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_route_child_keeps_env_values_after_the_login_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let helper = home.path().join("profile-bin/launcher-openclaw");
+        fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s\\n' \"$OPENCLAW_CONFIG_PATH\" \"$OPENCLAW_GATEWAY_PORT\" \"$OCM_ACTIVE_ENV\" \"$OPENCLAW_SUPERVISOR_MODE\" \"${OPENCLAW_NO_RESPAWN-unset}\" \"$*\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            home.path().join(".profile"),
+            "export OPENCLAW_CONFIG_PATH=/native/openclaw.json\nexport OPENCLAW_GATEWAY_PORT=18789\nexport OCM_ACTIVE_ENV=other\nexport OPENCLAW_SUPERVISOR_MODE=none\nexport OPENCLAW_NO_RESPAWN=1\nPATH=\"$HOME/profile-bin:$PATH\"; export PATH\n",
+        )
+        .unwrap();
+        let mut spec = child_spec("demo", 19011);
+        spec.binding_kind = "launcher".to_string();
+        spec.binary_path = None;
+        spec.command = Some("exec launcher-openclaw gateway run --port 19011".to_string());
+        spec.process_env = BTreeMap::from([
+            (
+                "HOME".to_string(),
+                home.path().to_string_lossy().into_owned(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            (
+                "OPENCLAW_CONFIG_PATH".to_string(),
+                "/ocm/envs/demo/.openclaw/openclaw.json".to_string(),
+            ),
+            ("OPENCLAW_GATEWAY_PORT".to_string(), "19011".to_string()),
+            ("OCM_ACTIVE_ENV".to_string(), "demo".to_string()),
+            (
+                "OPENCLAW_SUPERVISOR_MODE".to_string(),
+                "external".to_string(),
+            ),
+        ]);
+
+        let program_arguments = supervisor_program_arguments(&spec);
+        let output = std::process::Command::new(&program_arguments[0])
+            .args(&program_arguments[1..])
+            .env_clear()
+            .envs(&spec.process_env)
+            .current_dir(home.path())
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "/ocm/envs/demo/.openclaw/openclaw.json|19011|demo|external|unset|gateway run --port 19011\n"
+        );
+    }
 }

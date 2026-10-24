@@ -146,14 +146,17 @@ pub fn resolve_runtime_run_dir(fallback_cwd: &Path) -> PathBuf {
     fallback_cwd.to_path_buf()
 }
 
-fn gateway_shell_program_arguments(command: &str) -> Vec<String> {
+fn gateway_shell_program_arguments(
+    command: &str,
+    process_env: &BTreeMap<String, String>,
+) -> Vec<String> {
     if cfg!(windows) {
         vec!["cmd".to_string(), "/C".to_string(), command.to_string()]
     } else {
         vec![
             "/bin/sh".to_string(),
             "-lc".to_string(),
-            command.to_string(),
+            crate::infra::shell::render_env_scoped_login_command(command, process_env),
         ]
     }
 }
@@ -368,7 +371,7 @@ impl GatewayProcessSpec {
                 program_arguments.extend(self.args.iter().cloned());
                 program_arguments
             }
-            (None, Some(command)) => gateway_shell_program_arguments(command),
+            (None, Some(command)) => gateway_shell_program_arguments(command, &self.process_env),
             (None, None) => Vec::new(),
         }
     }

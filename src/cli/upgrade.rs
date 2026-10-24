@@ -26,7 +26,9 @@ use crate::env::{
     CloneEnvironmentOptions, CreateEnvSnapshotOptions, EnvSnapshotSummary,
     RestoreEnvSnapshotOptions, resolve_runtime_run_dir,
 };
-use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
+use crate::infra::shell::{
+    build_openclaw_dev_source_env, build_openclaw_env, render_env_scoped_login_command,
+};
 use crate::openclaw_repo::{
     detect_openclaw_checkout, ensure_source_dependency_install_config,
     ensure_source_dependency_install_target, source_dependency_install_needs_store_path,
@@ -2394,16 +2396,16 @@ impl Cli {
         extra_env: &[(&str, &str)],
         operation_lock: Option<&UpgradeCommandLocks<'_>>,
     ) -> Result<SimulationCommandOutput, String> {
-        let (mut command, env_meta, source_root, path_prepend) = match resolved {
+        let (mut command, env_meta, source_root, path_prepend, launcher_command) = match resolved {
             crate::env::ResolvedExecution::Launcher {
                 env,
                 command,
                 run_dir,
                 ..
             } => {
-                let mut process = shell_command(&command);
+                let mut process = Command::new(if cfg!(windows) { "cmd" } else { "/bin/sh" });
                 process.current_dir(run_dir);
-                (process, env, None, None)
+                (process, env, None, None, Some(command))
             }
             crate::env::ResolvedExecution::Runtime {
                 env,
@@ -2415,7 +2417,7 @@ impl Cli {
             } => {
                 let mut process = Command::new(program);
                 process.args(program_args).current_dir(run_dir);
-                (process, env, None, path_prepend)
+                (process, env, None, path_prepend, None)
             }
             crate::env::ResolvedExecution::Dev {
                 env,
@@ -2427,7 +2429,7 @@ impl Cli {
             } => {
                 let mut process = Command::new(program);
                 process.args(program_args).current_dir(run_dir);
-                (process, env, Some(PathBuf::from(worktree_root)), None)
+                (process, env, Some(PathBuf::from(worktree_root)), None, None)
             }
             crate::env::ResolvedExecution::SourceWatch {
                 env,
@@ -2439,7 +2441,13 @@ impl Cli {
             } => {
                 let mut process = Command::new(program);
                 process.args(program_args).current_dir(run_dir);
-                (process, env, Some(PathBuf::from(source.repo_root)), None)
+                (
+                    process,
+                    env,
+                    Some(PathBuf::from(source.repo_root)),
+                    None,
+                    None,
+                )
             }
         };
         let mut process_env = match source_root {
@@ -2452,6 +2460,9 @@ impl Cli {
         )?;
         for (key, value) in extra_env {
             process_env.insert((*key).to_string(), (*value).to_string());
+        }
+        if let Some(launcher_command) = launcher_command {
+            command.args(shell_command_args(&launcher_command, &process_env));
         }
         command
             .env_clear()
@@ -6614,15 +6625,14 @@ fn candidate_codex_preflight_is_unsupported(stdout: &str, stderr: &str) -> bool 
     candidate_codex_preflight_text_is_unsupported(stdout, stderr)
 }
 
-fn shell_command(command: &str) -> Command {
+fn shell_command_args(command: &str, env: &BTreeMap<String, String>) -> [String; 2] {
     if cfg!(windows) {
-        let mut process = Command::new("cmd");
-        process.args(["/C", command]);
-        process
+        ["/C".to_string(), command.to_string()]
     } else {
-        let mut process = Command::new("/bin/sh");
-        process.args(["-lc", command]);
-        process
+        [
+            "-lc".to_string(),
+            render_env_scoped_login_command(command, env),
+        ]
     }
 }
 
@@ -7310,5 +7320,72 @@ mod tests {
             "",
             "error: unknown option '--lint'\nfatal: staged runtime could not load its configuration"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_simulation_check_keeps_env_values_after_the_login_profile() {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("ocm-home/envs/demo");
+        let helper = home.path().join("profile-bin/launcher-openclaw");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$OPENCLAW_STATE_DIR\" \"$OCM_ACTIVE_ENV\" \"${OPENCLAW_UPDATE_IN_PROGRESS-unset}\" \"$*\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            home.path().join(".profile"),
+            "export OPENCLAW_STATE_DIR=/native/.openclaw\nexport OCM_ACTIVE_ENV=other\nexport OPENCLAW_UPDATE_IN_PROGRESS=0\nPATH=\"$HOME/profile-bin:$PATH\"; export PATH\n",
+        )
+        .unwrap();
+        let caller_env = BTreeMap::from([
+            (
+                "HOME".to_string(),
+                home.path().to_string_lossy().into_owned(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ]);
+        let cli = super::Cli {
+            env: caller_env,
+            cwd: home.path().to_path_buf(),
+        };
+        let resolved = crate::env::ResolvedExecution::Launcher {
+            env: crate::env::EnvMeta {
+                upgrade_independent_paths: Vec::new(),
+                kind: "ocm-env".to_string(),
+                name: "demo".to_string(),
+                root: root.to_string_lossy().into_owned(),
+                gateway_port: Some(19011),
+                gateway_port_auto_assigned: false,
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: Some("profiled".to_string()),
+                dev: None,
+                dev_ui_port: None,
+                protected: false,
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                last_used_at: None,
+            },
+            launcher_name: "profiled".to_string(),
+            command: "launcher-openclaw --version".to_string(),
+            run_dir: home.path().to_path_buf(),
+        };
+
+        let output = cli
+            .run_resolved_for_simulation(resolved, &[("OPENCLAW_UPDATE_IN_PROGRESS", "1")])
+            .unwrap();
+
+        assert!(output.status.success(), "{}", output.stderr);
+        assert_eq!(
+            output.stdout,
+            format!("{}|demo|1|--version\n", root.join(".openclaw").display())
+        );
     }
 }
