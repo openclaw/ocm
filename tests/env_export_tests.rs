@@ -2463,3 +2463,89 @@ fn default_export_searches_inside_a_state_directory_bare_repository() {
             .exists()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_uses() {
+    // Import retains the alias links on the way to selected configuration.
+    let fixture = TestDir::new("export-legacy-store-alias");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    write_text(
+        &source.join("projects/git-settings/selected.conf"),
+        "[fixture]\n\taliased = selected\n",
+    );
+    std::os::unix::fs::symlink("../projects/git-settings", state.join("credentials")).unwrap();
+    let repository = source.join("projects/repository");
+    fs::create_dir_all(&repository).unwrap();
+    export_git(&repository, &env, &["init", "-q"]);
+    export_git(
+        &repository,
+        &env,
+        &[
+            "config",
+            "include.path",
+            state.join("credentials/selected.conf").to_str().unwrap(),
+        ],
+    );
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    assert!(archived_state_paths(&archive).contains(std::path::Path::new("credentials")));
+    // The source is unavailable while importing.
+    fs::rename(&source, root.join("offline")).unwrap();
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert!(
+        fs::symlink_metadata(target.join(".openclaw/credentials"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        export_git(
+            &target.join("projects/repository"),
+            &env,
+            &["config", "--get", "fixture.aliased"]
+        ),
+        "selected"
+    );
+}

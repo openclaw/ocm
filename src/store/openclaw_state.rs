@@ -206,7 +206,9 @@ fn archived_git_paths_in_import_removed_roots(
     let removed_roots = IMPORT_REMOVED_STATE_ROOTS
         .iter()
         .map(|name| paths.state_dir.join(name))
-        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()))
+        // A store can also be an alias that selected Git configuration is
+        // reached through; the walk below still never follows links.
+        .filter(|path| fs::symlink_metadata(path).is_ok())
         .collect::<Vec<_>>();
     if removed_roots.is_empty() {
         return Ok(BTreeSet::new());
