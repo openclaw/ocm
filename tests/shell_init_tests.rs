@@ -93,6 +93,10 @@ fn fish_helper_returns_the_activation_status() {
     use crate::support::ocm_test_binary_path;
 
     if Command::new("fish").arg("--version").output().is_err() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "fish must be installed when CI is set"
+        );
         eprintln!("skipping: fish is not installed");
         return;
     }
