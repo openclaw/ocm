@@ -87,6 +87,104 @@ fn init_defaults_to_fish_when_shell_env_points_to_fish() {
 
 #[cfg(unix)]
 #[test]
+fn fish_helper_returns_the_activation_status() {
+    use std::process::Command;
+
+    use crate::support::ocm_test_binary_path;
+
+    if Command::new("fish").arg("--version").output().is_err() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "fish must be installed when CI is set"
+        );
+        eprintln!("skipping: fish is not installed");
+        return;
+    }
+
+    let root = TestDir::new("shell-init-fish-executed");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let binary = ocm_test_binary_path();
+    env.insert(
+        "OCM_SELF".to_string(),
+        binary.to_string_lossy().into_owned(),
+    );
+    let mut paths = vec![binary.parent().unwrap().to_path_buf()];
+    paths.extend(std::env::split_paths(env.get("PATH").unwrap()));
+    env.insert(
+        "PATH".to_string(),
+        std::env::join_paths(paths)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let init = run_ocm(&cwd, &env, &["init", "fish"]);
+    assert!(init.status.success(), "{}", stderr(&init));
+    let helper = stdout(&init);
+
+    let controls = [
+        "OPENCLAW_PROFILE",
+        "OPENCLAW_GATEWAY_PORT",
+        "OPENCLAW_DEV_SOURCE_ROOT",
+        "OPENCLAW_BUNDLED_PLUGINS_DIR",
+        "OPENCLAW_SERVICE_MARKER",
+        "OPENCLAW_SERVICE_KIND",
+        "OPENCLAW_SUPERVISOR_MODE",
+        "OPENCLAW_NO_RESPAWN",
+        "OPENCLAW_LAUNCHD_LABEL",
+        "OPENCLAW_SYSTEMD_UNIT",
+        "OPENCLAW_WINDOWS_TASK_NAME",
+    ];
+    let preset = controls
+        .iter()
+        .map(|key| format!("set -gx {key} stale"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let erased = controls
+        .iter()
+        .map(|key| format!("test \"${key}\" != stale; or exit 15"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (label, prelude) in [("fresh", ""), ("controls already set", preset.as_str())] {
+        let script = format!(
+            r#"{prelude}
+{helper}
+ocm_use demo
+set result $status
+test $result -eq 0; or begin; echo "{label}: status $result"; exit 10; end
+test "$OCM_ACTIVE_ENV" = demo; or exit 11
+{erased}
+ocm_use demo; and echo chained
+ocm env use demo --shell fish | source
+test $status -eq 0; or exit 12
+ocm_use missing 2>/dev/null
+test $status -eq 1; or exit 13
+test "$OCM_ACTIVE_ENV" = demo; or exit 14
+"#
+        );
+        let output = Command::new("fish")
+            .args(["--no-config", "-c", &script])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{label}: status={}: {} {}",
+            output.status,
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(stdout(&output).contains("chained"), "{label}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn posix_helpers_keep_the_selected_shell_and_preserve_the_caller() {
     use std::process::Command;
 

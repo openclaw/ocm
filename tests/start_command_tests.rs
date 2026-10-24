@@ -10,8 +10,8 @@ use tar::{Builder, Header};
 
 use crate::support::{
     TestDir, TestHttpServer, install_fake_launchctl, install_fake_managed_node_archive,
-    install_fake_node_and_npm, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script,
+    install_fake_node_and_npm, install_fake_systemd_tools, ocm_env, path_string, run_ocm, stderr,
+    stdout, write_executable_script,
 };
 
 fn append_tar_file(
@@ -884,4 +884,93 @@ fn failed_onboarding_preserves_an_existing_service() {
     let log = fs::read_to_string(root.child("launchctl.log")).unwrap();
     assert!(!log.contains("bootout"), "{log}");
     assert!(!log.contains("bootstrap"), "{log}");
+}
+
+#[test]
+fn start_rerun_keeps_a_running_service_in_the_supervisor_plan() {
+    for systemd in [false, true] {
+        let root = TestDir::new("start-rerun-keeps-running-service");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        let binary = if systemd {
+            install_fake_systemd_tools(&root, &mut env);
+            "systemctl"
+        } else {
+            env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+            install_fake_launchctl(&root, &mut env);
+            "launchctl"
+        };
+        let peer = root.child("bin/openclaw");
+        write_executable_script(&peer, "#!/bin/sh\nexit 0\n");
+        let first = run_ocm(
+            &cwd,
+            &env,
+            &["start", "demo", "--command", &path_string(&peer)],
+        );
+        assert!(first.status.success(), "{}", stderr(&first));
+        let state_path = root.child("ocm-home/supervisor/state.json");
+        let initial: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            initial["children"].as_array().unwrap().len(),
+            1,
+            "{initial}"
+        );
+
+        // The daemon acts on whatever plan it reads, so record the persisted
+        // plan at every service-manager call the rerun makes.
+        let snapshots = root.child("plan-snapshots");
+        fs::create_dir_all(&snapshots).unwrap();
+        let manager_path = root.child(format!("fake-bin/{binary}"));
+        let original = fs::read_to_string(&manager_path).unwrap();
+        write_executable_script(
+            &manager_path,
+            &format!(
+                "#!/bin/sh\nn=$(ls '{snapshots}' | wc -l | tr -d ' ')\ncp '{state}' '{snapshots}/'\"$n\".json\n{original}",
+                snapshots = path_string(&snapshots),
+                state = path_string(&state_path),
+            ),
+        );
+
+        let rerun = run_ocm(&cwd, &env, &["start", "demo", "--json"]);
+        assert!(rerun.status.success(), "{}", stderr(&rerun));
+        let summary: Value = serde_json::from_str(&stdout(&rerun)).unwrap();
+        assert_eq!(summary["created"], false);
+        assert_eq!(summary["serviceStarted"], true);
+        let mut observed = 0;
+        for entry in fs::read_dir(&snapshots).unwrap() {
+            let path = entry.unwrap().path();
+            let plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                plan["children"],
+                initial["children"],
+                "rerun published a plan without the running child ({})",
+                path.display()
+            );
+            observed += 1;
+        }
+        assert!(observed > 0, "the rerun made no service-manager call");
+        let after: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(after["children"], initial["children"]);
+        assert_eq!(after["restartRequests"], initial["restartRequests"]);
+
+        // Start still activates a stopped service, reinstalling the daemon
+        // that stopping the last running service removed.
+        fs::write(&manager_path, original).unwrap();
+        let stopped = run_ocm(&cwd, &env, &["service", "stop", "demo"]);
+        assert!(stopped.status.success(), "{}", stderr(&stopped));
+        let restarted = run_ocm(&cwd, &env, &["start", "demo", "--json"]);
+        assert!(restarted.status.success(), "{}", stderr(&restarted));
+        let resumed: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            resumed["children"].as_array().unwrap().len(),
+            1,
+            "{resumed}"
+        );
+        let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        let shown: Value = serde_json::from_str(&stdout(&show)).unwrap();
+        assert_eq!(shown["serviceEnabled"], true);
+        assert_eq!(shown["serviceRunning"], true);
+    }
 }

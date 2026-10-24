@@ -353,6 +353,7 @@ Use `upgrade simulate` when you want to test what would happen against a publish
 
 - channel-tracked runtimes move forward
 - simulations clone the source env, run OpenClaw's update dry-run plan for published targets, validate local repo builds for repo targets, then run update-mode doctor, plugin update dry-run, and gateway status checks
+- local repo targets install dependencies with `pnpm install --frozen-lockfile` in the simulation's own worktree, after the same pnpm destination checks `dev` applies; a linked destination, a modules-directory override outside the worktree or a workspace-directory override naming another directory fails the `prepare target` check before anything is installed
 - simulation envs and unused temporary runtimes are cleaned up automatically; use `--keep-simulations` only when you need retained debug artifacts
 - cleanup removes only the simulation environment generation created by that run; if the name was removed and recreated during checks, the replacement is preserved and cleanup reports failure without changing the functional outcome
 - if another environment binds to a temporary runtime, cleanup preserves that runtime and reports `cleanup: "failed"` with the dependent environment names; the functional `outcome` is unchanged, and the command exits nonzero. Clear those bindings before removing the retained runtime with `ocm runtime remove <name>`
@@ -367,6 +368,7 @@ Use `upgrade simulate` when you want to test what would happen against a publish
 - if service reconciliation fails, OCM restores the snapshot and previous runtime unless `--no-rollback` is set
 - pinned runtimes stay pinned unless you pass `--version`, `--channel`, or `--runtime`
 - local-command environments are reported clearly instead of being changed behind your back
+- dev environments registered with `ocm dev` are reported as `dev-checkout` and left on their checkout; update that checkout outside OCM
 
 ### 8. Run OpenClaw without activating the shell first
 
@@ -439,6 +441,10 @@ An idle unbound alias does not prevent mutation, and unrelated runtimes remain u
 Runtime registrations and managed directories share a namespace: the registration for `old` occupies the install directory of `old.json`.
 OCM refuses an installation that would replace another runtime's registration or payload, including with `--force`; choose another name when these paths conflict.
 Names ending in `.json` remain supported when their destinations are available, and `--force` still replaces an unbound runtime of the same name.
+
+Runtime installs unpack into a hidden staging directory and publish it only when they succeed.
+If OCM is interrupted or killed during an install, a later install that prepares a new runtime, of any name, removes the leftover staging directory.
+A leftover is kept while another operation holds that runtime's lock and is removed by a later install after the lock is released; removal is best effort, like the cleanup of an ordinary failed install.
 
 ### Package runtime Node.js selection
 
@@ -517,6 +523,11 @@ This is the shortest non-interactive path.
 ocm env exec mira -- sh -lc 'echo "$OPENCLAW_HOME"'
 ```
 
+`ocm @<env> --`, `ocm env run` and `ocm env exec` exit with the command's exit
+code. On Unix, when a signal ends the command, OCM exits with 128 plus the
+signal number, as a shell does (for example 137 for `SIGKILL`), and names the
+signal on stderr unless it was `SIGINT` or `SIGPIPE`.
+
 OCM env execution sets OpenClaw's env-scoped paths for you:
 `OPENCLAW_HOME`, `OPENCLAW_STATE_DIR`, and `OPENCLAW_CONFIG_PATH`.
 It also sets `OPENCLAW_SERVICE_REPAIR_POLICY=external`, which tells OpenClaw
@@ -532,9 +543,10 @@ stops a foreground Gateway. In a terminal, the command's group holds the
 foreground while it runs, so Ctrl-C reaches it once, directly, and Ctrl-Z
 suspends OCM along with it. After passing a signal on, or when the command dies
 from Ctrl-C or a hangup, OCM also waits for the rest of its process group. If
-the command was ended by that SIGTERM, SIGINT or SIGHUP, OCM then exits by the
-same signal, so a calling shell or supervisor sees the interruption. SIGKILL
-cannot be passed on: sent to OCM or its process group, it stops OCM alone.
+that SIGTERM, SIGINT or SIGHUP is what ended the command, OCM then ends by the
+same signal instead of exiting with 128 plus its number, so a calling shell or
+supervisor sees the interruption. SIGKILL cannot be passed on: sent to OCM or
+its process group, it stops OCM alone.
 
 When OCM shares its terminal job with other processes, for example in
 `ocm env exec mira -- openclaw logs | less` or under a script that runs it in
@@ -688,6 +700,12 @@ ocm logs mira --tail 50
 ocm logs mira --stream error
 ocm logs mira --follow
 ```
+
+`logs` reads the newer of the env's own Gateway log and the background service
+child log. A single-stream follow such as `ocm logs mira --stream error --follow`
+started before either file exists waits for both and follows whichever appears
+first, so it shows the service output after a later `ocm service start mira`.
+Once attached, it stays on that file like `tail -f`.
 
 ### Start, stop, restart
 
@@ -901,6 +919,7 @@ ocm upgrade --all
 ```
 
 This updates channel-tracked environments and restarts their running services when needed.
+Pinned, manual-runtime, local-command and `ocm dev` environments are reported as skipped and left unchanged.
 
 ### Move a pinned or local env to a different published release
 
@@ -1063,6 +1082,7 @@ Session locations follow the actual shared workspace projection, while in-home d
 When a configured workspace contains the original home, its workspace locations select the enclosing workspace copy; active runtime databases still use the new `.openclaw` state directory.
 Recognized legacy session headers with an in-home `cwd` follow the same workspace projection; other legacy text and external references keep their existing relocation policy.
 It maps resolved locations so internal links do not leave retained sessions pointing back at the source; references outside the copied roots and unresolved links remain unchanged.
+Symlinks in the copied home keep their targets, except that an absolute link into the original home, spelled through the home or an alias of it (for example `logs` or `agents/<id>/sessions` linked to another directory in the same home), is recreated as a relative link to the same location in the copy, so the environment does not keep reading or writing the source home. The same applies to links in copied external workspaces, which point at the new state directory, while an enclosing workspace copy that contains the home keeps such links within that workspace copy. Links inside saved skill-library and Skill Workshop revisions, relative links and links outside the home are copied unchanged; a link into the home that cannot be mapped fails the migration and rolls back the partial import.
 It uses the copy operation's recorded database destinations, including registered databases already copied from external workspaces, without copying additional external contents.
 Authored database payloads, approval and integrity metadata, and protected history remain unchanged; the source databases are never rewritten.
 The original home's history protection also applies when those files are carried into an enclosing workspace copy.
@@ -1538,6 +1558,19 @@ Destroy the environment, uninstall its environment service, and remove its snaps
 ocm env destroy mira
 ocm env destroy mira --yes
 ```
+
+Remove environments that no `env use`, `env exec` or `env run` has touched within
+a threshold (14 days by default); the command previews until `--yes` is given:
+
+```bash
+ocm env prune
+ocm env prune --older-than 30 --yes
+```
+
+Prune skips protected environments and environments whose background service is
+set to run, such as those started with `ocm start`, because their Gateway is in
+use without any of those commands. Run `ocm service stop <env>` first to make one
+eligible again, or use `ocm env destroy` to remove it with its service.
 
 For legacy layouts created before overlapping roots were rejected, removal refuses
 to delete another registered environment's root or a link needed to reach it,

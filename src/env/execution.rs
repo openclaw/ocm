@@ -248,10 +248,54 @@ pub fn resolve_gateway_process_spec(
     }
 }
 
+/// Yields the OpenClaw command words in forwarded arguments, such as `gateway`
+/// and `stop`, the way OpenClaw finds its command path: root options are
+/// skipped with their values (`--no-color`, `--log-level debug`), other flags
+/// are skipped, a leading `--` makes the following tokens literal words, and a
+/// `--` after a command word ends the command.
+pub(crate) fn openclaw_command_words(args: &[String]) -> impl Iterator<Item = &str> {
+    openclaw_command_path(args).map(|(word, _)| word)
+}
+
+/// Like `openclaw_command_words`, also telling whether each word follows a
+/// leading `--`, where OpenClaw passes the remaining tokens as operands rather
+/// than options.
+fn openclaw_command_path(args: &[String]) -> impl Iterator<Item = (&str, bool)> {
+    let mut index = 0;
+    let mut literal = false;
+    let mut found = false;
+    std::iter::from_fn(move || {
+        while let Some(arg) = args.get(index).map(String::as_str) {
+            index += 1;
+            if !literal {
+                if arg == "--" {
+                    if found {
+                        index = args.len();
+                        return None;
+                    }
+                    literal = true;
+                    continue;
+                }
+                if matches!(arg, "--profile" | "--log-level" | "--container") {
+                    // OpenClaw requires a value here and takes the next token as it is.
+                    index = (index + 1).min(args.len());
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    continue;
+                }
+            }
+            found = true;
+            return Some((arg, literal));
+        }
+        None
+    })
+}
+
 fn normalize_openclaw_args_for_env(args: &[String]) -> Result<Vec<String>, String> {
-    if !matches!(args.first().map(String::as_str), Some("onboard")) {
+    let Some(("onboard", after_terminator)) = openclaw_command_path(args).next() else {
         return Ok(args.to_vec());
-    }
+    };
 
     if args.iter().any(|arg| arg == "--install-daemon") {
         return Err(
@@ -264,6 +308,12 @@ fn normalize_openclaw_args_for_env(args: &[String]) -> Result<Vec<String>, Strin
         .any(|arg| arg == "--no-install-daemon" || arg == "--skip-daemon")
     {
         return Ok(args.to_vec());
+    }
+
+    if after_terminator {
+        return Err(
+            "env onboarding cannot add --no-install-daemon when \"--\" comes before onboard, because OpenClaw then reads it as an argument; remove that \"--\" or run onboard outside OCM".to_string(),
+        );
     }
 
     let mut normalized = args.to_vec();
@@ -630,4 +680,94 @@ fn source_watch_command_label(source: &SourceWatchOverride, openclaw_args: &[Str
     let mut parts = vec![source.command_label()];
     parts.extend(openclaw_args.iter().cloned());
     parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_openclaw_args_for_env, openclaw_command_words};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn command_words_skip_openclaw_root_options() {
+        let cases: [(&[&str], &[&str]); 11] = [
+            (&["onboard"], &["onboard"]),
+            (&["--no-color", "onboard"], &["onboard"]),
+            (&["--dev", "--log-level", "debug", "onboard"], &["onboard"]),
+            (
+                &["--log-level=debug", "gateway", "stop"],
+                &["gateway", "stop"],
+            ),
+            (
+                &["--profile", "work", "--container", "box", "setup"],
+                &["setup"],
+            ),
+            (
+                &["--log-level", "--no-color", "gateway", "stop"],
+                &["gateway", "stop"],
+            ),
+            (&["--profile", "--", "onboard"], &["onboard"]),
+            (
+                &["--", "onboard", "--install-daemon"],
+                &["onboard", "--install-daemon"],
+            ),
+            (&["--log-level", "debug", "--", "onboard"], &["onboard"]),
+            (&["onboard", "--", "setup"], &["onboard"]),
+            (&["--log-level"], &[]),
+        ];
+        for (forwarded, expected) in cases {
+            assert_eq!(
+                openclaw_command_words(&args(forwarded)).collect::<Vec<_>>(),
+                expected,
+                "{forwarded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn onboarding_normalization_applies_after_root_options() {
+        assert_eq!(
+            normalize_openclaw_args_for_env(&args(&["--log-level", "debug", "onboard"])).unwrap(),
+            args(&["--log-level", "debug", "onboard", "--no-install-daemon"])
+        );
+        assert_eq!(
+            normalize_openclaw_args_for_env(&args(&["--no-color", "onboard", "--skip-daemon"]))
+                .unwrap(),
+            args(&["--no-color", "onboard", "--skip-daemon"])
+        );
+        assert_eq!(
+            normalize_openclaw_args_for_env(&args(&["--profile", "--", "onboard"])).unwrap(),
+            args(&["--profile", "--", "onboard", "--no-install-daemon"])
+        );
+        for forwarded in [
+            &["--", "onboard"][..],
+            &["--log-level", "debug", "--", "onboard"],
+        ] {
+            let error = normalize_openclaw_args_for_env(&args(forwarded)).unwrap_err();
+            assert!(
+                error.contains("when \"--\" comes before onboard"),
+                "{forwarded:?}: {error}"
+            );
+        }
+        let refused: [&[&str]; 5] = [
+            &["--no-color", "onboard", "--install-daemon"],
+            &["--", "onboard", "--install-daemon"],
+            &["--log-level", "debug", "--", "onboard", "--install-daemon"],
+            &["--log-level=debug", "onboard", "--install-daemon"],
+            &["--profile", "work", "onboard", "--install-daemon"],
+        ];
+        for forwarded in refused {
+            let error = normalize_openclaw_args_for_env(&args(forwarded)).unwrap_err();
+            assert!(
+                error.contains("the daemon service is global"),
+                "{forwarded:?}: {error}"
+            );
+        }
+        assert_eq!(
+            normalize_openclaw_args_for_env(&args(&["--log-level", "debug", "status"])).unwrap(),
+            args(&["--log-level", "debug", "status"])
+        );
+    }
 }

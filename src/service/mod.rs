@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 pub use inspect::{ServiceSummary, ServiceSummaryList};
 pub use manage::{ServiceActionSummary, ServiceInstallSummary, ServiceRestartOptions};
 pub(crate) use platform::{
-    ServiceManagerKind, service_backend_support_error, service_manager_kind,
+    ServiceManagerKind, service_backend_support_error, service_manager_binary, service_manager_kind,
 };
 pub(crate) use readiness::{
     gateway_health_ok, gateway_readiness_timeout, read_gateway_config, wait_for_gateway_readiness,

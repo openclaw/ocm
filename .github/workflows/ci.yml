@@ -181,6 +181,15 @@ jobs:
         with:
           node-version: '24.22.1'
           package-manager-cache: false
+      - name: Install fish for the executed fish helper test
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends fish
+          else
+            brew install fish
+          fi
+          fish --version
       - name: Prove macOS private config creation across users
         if: runner.os == 'macOS'
         run: |

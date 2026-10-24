@@ -86,27 +86,31 @@ fn get_runtime_accepts_json_without_optional_fields() {
 }
 
 #[test]
-fn prune_selection_uses_last_used_at_and_skips_protected_envs() {
+fn prune_selection_uses_last_used_at_and_skips_protected_and_service_backed_envs() {
     let now = now_utc();
+    let old = |name: &str, service_enabled: bool, service_running: bool| EnvMeta {
+        upgrade_independent_paths: Vec::new(),
+        kind: "ocm-env".to_string(),
+        name: name.to_string(),
+        root: format!("/tmp/{name}"),
+        gateway_port: None,
+        gateway_port_auto_assigned: false,
+        service_enabled,
+        service_running,
+        default_runtime: None,
+        default_launcher: None,
+        dev: None,
+        dev_ui_port: None,
+        protected: false,
+        created_at: now - Duration::days(30),
+        updated_at: now - Duration::days(30),
+        last_used_at: None,
+    };
     let envs = vec![
-        EnvMeta {
-            upgrade_independent_paths: Vec::new(),
-            kind: "ocm-env".to_string(),
-            name: "old".to_string(),
-            root: "/tmp/old".to_string(),
-            gateway_port: None,
-            gateway_port_auto_assigned: false,
-            service_enabled: true,
-            service_running: true,
-            default_runtime: None,
-            default_launcher: None,
-            dev: None,
-            dev_ui_port: None,
-            protected: false,
-            created_at: now - Duration::days(30),
-            updated_at: now - Duration::days(30),
-            last_used_at: None,
-        },
+        old("old", false, false),
+        // An installed service that was stopped no longer keeps the env in use.
+        old("stopped-service", true, false),
+        old("running-service", true, true),
         EnvMeta {
             upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
@@ -114,8 +118,8 @@ fn prune_selection_uses_last_used_at_and_skips_protected_envs() {
             root: "/tmp/recent".to_string(),
             gateway_port: None,
             gateway_port_auto_assigned: false,
-            service_enabled: true,
-            service_running: true,
+            service_enabled: false,
+            service_running: false,
             default_runtime: None,
             default_launcher: None,
             dev: None,
@@ -132,8 +136,8 @@ fn prune_selection_uses_last_used_at_and_skips_protected_envs() {
             root: "/tmp/protected".to_string(),
             gateway_port: None,
             gateway_port_auto_assigned: false,
-            service_enabled: true,
-            service_running: true,
+            service_enabled: false,
+            service_running: false,
             default_runtime: None,
             default_launcher: None,
             dev: None,
@@ -150,5 +154,5 @@ fn prune_selection_uses_last_used_at_and_skips_protected_envs() {
         .into_iter()
         .map(|meta| meta.name)
         .collect::<Vec<_>>();
-    assert_eq!(names, vec!["old".to_string()]);
+    assert_eq!(names, vec!["old", "stopped-service"]);
 }

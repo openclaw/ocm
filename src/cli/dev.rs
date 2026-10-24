@@ -1597,7 +1597,14 @@ impl Cli {
                     display_path(&target)
                 ));
             }
-            self.validate_existing_dev_request(meta, repo_root, root, None)?;
+            // An active session is checked against its launch endpoint below.
+            // A starting or restoring session has no endpoint yet, so check
+            // the recorded port before reporting the session as kept.
+            let unlaunched_port = match &observation {
+                SourceWatchState::Active(_) => None,
+                _ => gateway_port,
+            };
+            self.validate_existing_dev_request(meta, repo_root, root, unlaunched_port)?;
             PathBuf::from(dev.source_root())
         } else {
             if root.is_some() {

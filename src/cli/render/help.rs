@@ -236,6 +236,7 @@ pub fn logs_help(cmd: &str) -> String {
             "By default OCM shows both stdout and stderr together in time order.",
             "Follow mode cannot be combined with --json.",
             "When both env and service logs exist, OCM reads the newer active file.",
+            "A --stream follow started before either log exists waits for both files and follows whichever appears first.",
             "Foreground runs still work because OCM can still read the env's own gateway log files directly.",
         ],
     )
@@ -736,6 +737,7 @@ pub fn upgrade_help(cmd: &str) -> String {
             "For managed-runtime upgrades, if service restart/start fails, ocm restores the snapshot and previous runtime unless --no-rollback is set.",
             "Pinned runtimes stay pinned unless you pass --version, --channel, or --runtime explicitly.",
             "Opaque or unsupported local-command environments are reported without attempting an update.",
+            "Dev environments run their checkout and are reported as dev-checkout without an update; update that checkout outside ocm.",
         ],
     )
 }
@@ -1725,6 +1727,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} env prune --older-than 30 --yes"),
             ],
             &[
+                "An environment is unused when no env use, exec or run has touched it within the threshold. Protected environments and environments whose background service is set to run are skipped; run service stop first, or use env destroy to remove an environment with its service.",
                 "Legacy roots or owned worktree cleanup containing another registered environment or its required links block preview and apply. Remove that environment separately first.",
                 "Active or unfinished source watches block removal; run dev stop for those envs first.",
                 "Cleanup preserves registered and active temporary dev sources and their required Git metadata.",
