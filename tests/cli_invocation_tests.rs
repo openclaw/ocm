@@ -120,8 +120,20 @@ fn env_run_reports_a_signal_killed_child_as_128_plus_the_signal() {
 
     // Launcher-bound runs go through `sh -lc`, which either reports the death
     // itself or replaces itself with the command; both must give 128 + N.
+    // When OCM reports it, it names the launcher, not the forwarded arguments.
     let launched = run_ocm(&cwd, &env, &["@launched", "--", "TERM"]);
     assert_eq!(launched.status.code(), Some(143), "{}", stderr(&launched));
+    for line in stderr(&launched)
+        .lines()
+        .filter(|line| line.starts_with("ocm:"))
+    {
+        assert_eq!(
+            line,
+            "ocm: launcher \"fakel\" was terminated by signal 15 (SIGTERM)",
+            "{}",
+            stderr(&launched)
+        );
+    }
 }
 
 #[test]

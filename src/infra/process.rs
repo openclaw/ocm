@@ -9,22 +9,28 @@ pub fn run_direct(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<i32, String> {
-    run_reporting_as(command, args, env, cwd, command)
+    run_reporting_as(command, args, env, cwd, &format!("\"{command}\""))
 }
 
-pub fn run_shell(command: &str, env: &BTreeMap<String, String>, cwd: &Path) -> Result<i32, String> {
+/// Run `command` through the platform shell. `subject` names what ran in a
+/// signal diagnostic, because the shell may replace itself with the command.
+pub fn run_shell(
+    command: &str,
+    subject: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<i32, String> {
     let (shell, flag) = if cfg!(windows) {
         ("cmd", "/C")
     } else {
         ("sh", "-lc")
     };
-    // A shell may replace itself with the command, so name the command, not the shell.
     run_reporting_as(
         shell,
         &[flag.to_string(), command.to_string()],
         env,
         cwd,
-        command,
+        subject,
     )
 }
 
@@ -33,7 +39,7 @@ fn run_reporting_as(
     args: &[String],
     env: &BTreeMap<String, String>,
     cwd: &Path,
-    display: &str,
+    subject: &str,
 ) -> Result<i32, String> {
     let status = Command::new(command)
         .args(args)
@@ -45,7 +51,7 @@ fn run_reporting_as(
         .current_dir(cwd)
         .status()
         .map_err(|error| format!("failed to run \"{command}\": {error}"))?;
-    if let Some(diagnostic) = signal_diagnostic(display, &status) {
+    if let Some(diagnostic) = signal_diagnostic(subject, &status) {
         let _ = writeln!(io::stderr().lock(), "{diagnostic}");
     }
     Ok(exit_status_code(&status))
@@ -64,7 +70,7 @@ fn exit_status_code(status: &ExitStatus) -> i32 {
 /// Describe a signal death on stderr, as a shell does. Like shells, stay quiet
 /// for SIGINT and SIGPIPE, which usually come from the terminal or the pipeline.
 #[cfg(unix)]
-fn signal_diagnostic(command: &str, status: &ExitStatus) -> Option<String> {
+fn signal_diagnostic(subject: &str, status: &ExitStatus) -> Option<String> {
     use std::os::unix::process::ExitStatusExt;
 
     let signal = status.signal()?;
@@ -80,12 +86,12 @@ fn signal_diagnostic(command: &str, status: &ExitStatus) -> Option<String> {
         ""
     };
     Some(format!(
-        "ocm: \"{command}\" was terminated by signal {signal}{name}{core}"
+        "ocm: {subject} was terminated by signal {signal}{name}{core}"
     ))
 }
 
 #[cfg(not(unix))]
-fn signal_diagnostic(_command: &str, _status: &ExitStatus) -> Option<String> {
+fn signal_diagnostic(_subject: &str, _status: &ExitStatus) -> Option<String> {
     None
 }
 
@@ -123,7 +129,7 @@ mod tests {
         for code in [0, 3, 42, 255] {
             let status = ExitStatus::from_raw(code << 8);
             assert_eq!(exit_status_code(&status), code);
-            assert_eq!(signal_diagnostic("openclaw", &status), None);
+            assert_eq!(signal_diagnostic("\"openclaw\"", &status), None);
         }
     }
 
@@ -144,25 +150,29 @@ mod tests {
     #[test]
     fn signal_deaths_are_described_except_terminal_and_pipeline_signals() {
         assert_eq!(
-            signal_diagnostic("openclaw", &ExitStatus::from_raw(libc::SIGKILL)).as_deref(),
+            signal_diagnostic("\"openclaw\"", &ExitStatus::from_raw(libc::SIGKILL)).as_deref(),
             Some(&*format!(
                 "ocm: \"openclaw\" was terminated by signal {} (SIGKILL)",
                 libc::SIGKILL
             ))
         );
         assert_eq!(
-            signal_diagnostic("node", &ExitStatus::from_raw(libc::SIGSEGV | 0x80)).as_deref(),
+            signal_diagnostic(
+                "launcher \"dev\"",
+                &ExitStatus::from_raw(libc::SIGSEGV | 0x80)
+            )
+            .as_deref(),
             Some(&*format!(
-                "ocm: \"node\" was terminated by signal {} (SIGSEGV) (core dumped)",
+                "ocm: launcher \"dev\" was terminated by signal {} (SIGSEGV) (core dumped)",
                 libc::SIGSEGV
             ))
         );
         assert_eq!(
-            signal_diagnostic("openclaw", &ExitStatus::from_raw(libc::SIGINT)),
+            signal_diagnostic("\"openclaw\"", &ExitStatus::from_raw(libc::SIGINT)),
             None
         );
         assert_eq!(
-            signal_diagnostic("openclaw", &ExitStatus::from_raw(libc::SIGPIPE)),
+            signal_diagnostic("\"openclaw\"", &ExitStatus::from_raw(libc::SIGPIPE)),
             None
         );
     }
