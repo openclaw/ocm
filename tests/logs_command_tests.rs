@@ -137,6 +137,127 @@ fn logs_fall_back_to_supervisor_logs_when_gateway_logs_are_missing() {
 }
 
 #[test]
+fn env_remove_and_destroy_delete_service_logs_so_a_recreated_env_starts_without_them() {
+    for removal in [
+        &["env", "remove", "demo"][..],
+        &["env", "destroy", "demo", "--yes"],
+    ] {
+        let root = TestDir::new("logs-removed-env-service-logs");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        setup_launcher_env(&cwd, &env);
+        let sibling = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "keep", "--launcher", "stable"],
+        );
+        assert!(sibling.status.success(), "{}", stderr(&sibling));
+
+        let logs_dir = root.child("ocm-home/supervisor/logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        for stream in ["stdout", "stderr"] {
+            fs::write(
+                logs_dir.join(format!("demo.{stream}.log")),
+                format!("removed env {stream}\n"),
+            )
+            .unwrap();
+            fs::write(
+                logs_dir.join(format!("keep.{stream}.log")),
+                format!("sibling {stream}\n"),
+            )
+            .unwrap();
+        }
+
+        let removed = run_ocm(&cwd, &env, removal);
+        assert!(
+            removed.status.success(),
+            "{removal:?}: {}",
+            stderr(&removed)
+        );
+        assert!(!logs_dir.join("demo.stdout.log").exists(), "{removal:?}");
+        assert!(!logs_dir.join("demo.stderr.log").exists(), "{removal:?}");
+
+        let recreated = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "demo", "--launcher", "stable"],
+        );
+        assert!(recreated.status.success(), "{}", stderr(&recreated));
+        let output = run_ocm(&cwd, &env, &["logs", "demo", "--json"]);
+        assert!(!output.status.success(), "{removal:?}: {}", stdout(&output));
+        assert!(
+            stderr(&output).contains("no logs exist for env \"demo\" across stdout or stderr"),
+            "{removal:?}: {}",
+            stderr(&output)
+        );
+
+        let sibling_logs = run_ocm(&cwd, &env, &["logs", "keep", "--json"]);
+        assert!(sibling_logs.status.success(), "{}", stderr(&sibling_logs));
+        let body: Value = serde_json::from_str(&stdout(&sibling_logs)).unwrap();
+        assert_eq!(body["sourceKind"], "service");
+        let content = body["content"].as_str().unwrap();
+        assert!(content.contains("sibling stdout"), "{content}");
+        assert!(content.contains("sibling stderr"), "{content}");
+    }
+}
+
+#[test]
+fn env_remove_keeps_the_env_when_its_service_log_cannot_be_deleted() {
+    let root = TestDir::new("logs-remove-undeletable");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    setup_launcher_env(&cwd, &env);
+
+    // A directory in place of the log file makes its deletion fail.
+    let blocked = root.child("ocm-home/supervisor/logs/demo.stdout.log");
+    fs::create_dir_all(blocked.join("nested")).unwrap();
+
+    let removed = run_ocm(&cwd, &env, &["env", "remove", "demo"]);
+    assert!(!removed.status.success());
+    assert!(
+        stderr(&removed).contains("failed removing service log"),
+        "{}",
+        stderr(&removed)
+    );
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    assert!(root.child("ocm-home/envs/demo").exists());
+}
+
+#[test]
+fn removing_an_env_named_daemon_keeps_the_supervisor_daemon_logs() {
+    let root = TestDir::new("logs-remove-daemon-name");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "daemon", "--launcher", "stable"],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+
+    let daemon_log = root.child("ocm-home/supervisor/logs/daemon.stdout.log");
+    fs::create_dir_all(daemon_log.parent().unwrap()).unwrap();
+    fs::write(&daemon_log, "supervisor daemon output\n").unwrap();
+
+    let removed = run_ocm(&cwd, &env, &["env", "remove", "daemon"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert_eq!(
+        fs::read_to_string(&daemon_log).unwrap(),
+        "supervisor daemon output\n"
+    );
+}
+
+#[test]
 fn logs_prefer_the_newer_service_log_when_gateway_log_is_stale() {
     let root = TestDir::new("logs-prefer-newer-service");
     let cwd = root.child("workspace");

@@ -29,7 +29,8 @@ use super::gateway_ports::{
 };
 use super::layout::{
     clean_path, default_env_root, derive_env_paths, display_path, env_registry_path,
-    resolve_absolute_path, resolve_store_paths, validate_name,
+    resolve_absolute_path, resolve_store_paths, supervisor_child_log_path, supervisor_logs_dir,
+    validate_name,
 };
 use super::now_utc;
 use super::openclaw_state::{
@@ -1678,6 +1679,8 @@ pub(crate) fn remove_environment_locked(
     // Preliminary cleanup shares this registry lock through final deletion.
     // It must not call back into registry-mutating operations.
     before_remove(&meta)?;
+    // Delete these before the root so a failure leaves the env registered.
+    remove_supervisor_child_logs(&meta.name, env, cwd)?;
 
     if let Some((repo_root, worktree_root)) = meta.dev.as_ref().and_then(|dev| dev.owned_worktree())
     {
@@ -1697,6 +1700,36 @@ pub(crate) fn remove_environment_locked(
     super::dev_ui_ports::remove(&meta, env, cwd)?;
 
     Ok(meta)
+}
+
+/// Delete the service output the supervisor captured for an environment.
+/// Those files are keyed only by name, so a later environment created under
+/// the same name would otherwise read them as its own service logs.
+fn remove_supervisor_child_logs(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(), String> {
+    // An env named "daemon" shares these paths with the supervisor daemon's
+    // own default daemon.stdout.log and daemon.stderr.log; keep those.
+    if name == "daemon" {
+        return Ok(());
+    }
+    let logs_dir = supervisor_logs_dir(env, cwd)?;
+    for stream in ["stdout", "stderr"] {
+        let path = supervisor_child_log_path(&logs_dir, name, stream);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed removing service log {}: {error}",
+                    display_path(&path)
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn with_locked_environments<T>(

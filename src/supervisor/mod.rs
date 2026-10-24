@@ -38,7 +38,8 @@ use crate::service::platform::{
 use crate::store::{
     display_path, ensure_dir, ensure_store, list_environments, lock_file, now_utc,
     openclaw_port_family_available, openclaw_port_family_range, read_json, resolve_ocm_home,
-    supervisor_logs_dir, supervisor_runtime_path, supervisor_state_path, write_json,
+    supervisor_child_log_path, supervisor_logs_dir, supervisor_runtime_path, supervisor_state_path,
+    write_json,
 };
 
 mod openclaw_handoff;
@@ -1057,12 +1058,16 @@ impl<'a> SupervisorService<'a> {
                         args,
                         run_dir: display_path(&process.run_dir),
                         child_port,
-                        stdout_path: display_path(
-                            &logs_dir.join(format!("{}.stdout.log", process.env_name)),
-                        ),
-                        stderr_path: display_path(
-                            &logs_dir.join(format!("{}.stderr.log", process.env_name)),
-                        ),
+                        stdout_path: display_path(&supervisor_child_log_path(
+                            &logs_dir,
+                            &process.env_name,
+                            "stdout",
+                        )),
+                        stderr_path: display_path(&supervisor_child_log_path(
+                            &logs_dir,
+                            &process.env_name,
+                            "stderr",
+                        )),
                         process_env,
                     });
                 }

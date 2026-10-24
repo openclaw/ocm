@@ -1569,6 +1569,12 @@ set to run, such as those started with `ocm start`, because their Gateway is in
 use without any of those commands. Run `ocm service stop <env>` first to make one
 eligible again, or use `ocm env destroy` to remove it with its service.
 
+Remove, destroy and prune also delete the service output the supervisor captured
+for the environment, `$OCM_HOME/supervisor/logs/<env>.stdout.log` and
+`<env>.stderr.log`. A later environment created with the same name starts
+without the removed environment's service logs. Copy those files first if you
+need them.
+
 For legacy layouts created before overlapping roots were rejected, removal refuses
 to delete another registered environment's root or a link needed to reach it,
 including through an owned development worktree or its Git registration directory.
