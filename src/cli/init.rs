@@ -9,7 +9,7 @@ impl Cli {
         args: Vec<String>,
     ) -> Result<i32, String> {
         let shell = if shell.is_empty() {
-            resolve_shell_name(None, &self.env)
+            resolve_shell_name(None, &self.env)?
         } else {
             shell.to_string()
         };

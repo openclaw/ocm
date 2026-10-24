@@ -1677,6 +1677,8 @@ The generated `ocm_use` helper keeps that selection for later activations,
 even when the inherited `SHELL` names a different shell. An explicit
 `ocm_use mira --shell bash` still overrides the activation format. Direct
 `ocm env use mira --shell bash` prints the script without evaluating it.
+`--shell` accepts only `zsh`, `bash`, `sh` or `fish`; any other value is
+rejected, as it is for `ocm init`.
 
 Activation preserves explicitly exported `OPENCLAW_INCLUDE_ROOTS`, so authorized
 shared configuration remains available after selecting an environment. It does
