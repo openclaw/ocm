@@ -1515,10 +1515,15 @@ impl Cli {
         match resolved {
             crate::env::ResolvedExecution::Launcher {
                 env,
+                launcher_name,
                 command,
                 run_dir,
-                ..
-            } => run_shell(&command, &build_openclaw_env(&env, &self.env), &run_dir),
+            } => run_shell(
+                &command,
+                &format!("launcher \"{launcher_name}\""),
+                &build_openclaw_env(&env, &self.env),
+                &run_dir,
+            ),
             crate::env::ResolvedExecution::Runtime {
                 env,
                 program,
