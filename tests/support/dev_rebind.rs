@@ -1,5 +1,11 @@
 use super::*;
 
+// Rebinding refuses while any port of the environment's retained Gateway
+// family is in use, and parallel fixture stores allocate and probe from 18789
+// upward. Tests that rebind therefore create their environment with this
+// family below that range; INITIAL_UI_TEST_LOCK keeps them from sharing it.
+const REBIND_GATEWAY_PORT: &str = "16789";
+
 fn rebind(
     cwd: &Path,
     env: &std::collections::BTreeMap<String, String>,
@@ -32,7 +38,13 @@ fn dev_rebind_preserves_state_and_routes_execution_after_old_source_disappears()
     let created = run_ocm(
         root.path(),
         &env,
-        &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+        &dev_plain(&[
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--port",
+            REBIND_GATEWAY_PORT,
+        ]),
     );
     assert!(created.status.success(), "{}", stderr(&created));
     let before = get_environment("demo", &env, root.path()).unwrap();
@@ -145,7 +157,13 @@ fn dev_rebind_refusals_preserve_the_binding_and_policy() {
     let created = run_ocm(
         root.path(),
         &env,
-        &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+        &dev_plain(&[
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--port",
+            REBIND_GATEWAY_PORT,
+        ]),
     );
     assert!(created.status.success(), "{}", stderr(&created));
     let original = get_environment("demo", &env, root.path()).unwrap();
@@ -246,7 +264,13 @@ fn dev_rebind_preserves_an_environment_named_rebind_and_exposes_help() {
     let mut env = service_env(&root);
     install_fake_dev_runners(&root, &mut env);
     for args in [
-        dev_plain(&["rebind", "--repo", &path_string(&repo)]),
+        dev_plain(&[
+            "rebind",
+            "--repo",
+            &path_string(&repo),
+            "--port",
+            REBIND_GATEWAY_PORT,
+        ]),
         dev_plain(&["rebind"]),
     ] {
         let output = run_ocm(root.path(), &env, &args);
@@ -272,7 +296,14 @@ fn dev_rebind_refuses_active_and_unfinished_foreground_ownership() {
         &root,
         root.path(),
         &env,
-        &dev_watch(&["demo", "--repo", &path_string(&repo), "--watch"]),
+        &dev_watch(&[
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--port",
+            REBIND_GATEWAY_PORT,
+            "--watch",
+        ]),
     );
     assert!(wait_for_path(&started, Duration::from_secs(10)));
     let registry = ocm::store::env_registry_path(&env, root.path()).unwrap();
@@ -345,7 +376,13 @@ fn dev_rebind_failed_registry_publication_preserves_previous_binding() {
     let created = run_ocm(
         root.path(),
         &env,
-        &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+        &dev_plain(&[
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--port",
+            REBIND_GATEWAY_PORT,
+        ]),
     );
     assert!(created.status.success(), "{}", stderr(&created));
     let target = root.child("next");
@@ -375,7 +412,15 @@ fn dev_rebind_rejects_old_service_plan_and_next_start_resolves_new_source() {
     let created = run_ocm(
         root.path(),
         &env,
-        &["dev", "demo", "--repo", &path_string(&repo), "--service"],
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            &path_string(&repo),
+            "--service",
+            "--port",
+            REBIND_GATEWAY_PORT,
+        ],
     );
     assert!(created.status.success(), "{}", stderr(&created));
     let state_path = ocm::store::supervisor_state_path(&env, root.path()).unwrap();
@@ -968,7 +1013,10 @@ fn dev_switches_a_stopped_borrower_to_the_selected_checkout_and_prepares_it() {
         let created = run_ocm(
             &workspace,
             &env,
-            &dev_mode(mode, &["demo", "--repo", &repo_arg]),
+            &dev_mode(
+                mode,
+                &["demo", "--repo", &repo_arg, "--port", REBIND_GATEWAY_PORT],
+            ),
         );
         assert!(created.status.success(), "{mode}: {}", stderr(&created));
         assert_eq!(installs_in(&root, &repo), 1, "{mode}");
@@ -1153,7 +1201,12 @@ fn dev_switch_refuses_active_and_unfinished_foreground_sessions() {
     let worktree = fs::canonicalize(worktree).unwrap();
     let mut env = service_env(&root);
     let (started, _, _) = install_blocking_fake_dev_runners(&root, &mut env);
-    let mut watch = DevWatchFixture::spawn(&root, &repo, &env, &dev_watch(&["demo", "--watch"]));
+    let mut watch = DevWatchFixture::spawn(
+        &root,
+        &repo,
+        &env,
+        &dev_watch(&["demo", "--port", REBIND_GATEWAY_PORT, "--watch"]),
+    );
     assert!(wait_for_path(&started, Duration::from_secs(10)));
     let registry = ocm::store::env_registry_path(&env, &repo).unwrap();
     let before = fs::read(&registry).unwrap();
@@ -1202,7 +1255,11 @@ fn dev_switch_keeps_the_repo_refusal_for_owned_runtime_and_launcher_envs() {
     let root = TestDir::new("dev-switch-unsupported");
     let (repo, worktree) = prepared_checkout_and_fresh_worktree(&root);
     let env = switch_env(&root);
-    let created = run_ocm(&repo, &env, &dev_plain(&["demo"]));
+    let created = run_ocm(
+        &repo,
+        &env,
+        &dev_plain(&["demo", "--port", REBIND_GATEWAY_PORT]),
+    );
     assert!(created.status.success(), "{}", stderr(&created));
     let original = get_environment("demo", &env, &repo).unwrap();
     let registry = ocm::store::env_registry_path(&env, &repo).unwrap();
@@ -1244,7 +1301,11 @@ fn dev_explicit_rebind_still_leaves_dependency_preparation_explicit() {
     let root = TestDir::new("dev-switch-explicit-rebind");
     let (repo, worktree) = prepared_checkout_and_fresh_worktree(&root);
     let env = switch_env(&root);
-    let created = run_ocm(&repo, &env, &dev_plain(&["demo"]));
+    let created = run_ocm(
+        &repo,
+        &env,
+        &dev_plain(&["demo", "--port", REBIND_GATEWAY_PORT]),
+    );
     assert!(created.status.success(), "{}", stderr(&created));
     let rebound = rebind(&repo, &env, &worktree);
     assert!(rebound.status.success(), "{}", stderr(&rebound));
@@ -1270,7 +1331,11 @@ fn dev_switch_restores_the_previous_source_after_failed_or_interrupted_preparati
     let root = TestDir::new("dev-switch-restore");
     let (repo, worktree) = prepared_checkout_and_fresh_worktree(&root);
     let mut env = switch_env(&root);
-    let created = run_ocm(&repo, &env, &dev_plain(&["demo"]));
+    let created = run_ocm(
+        &repo,
+        &env,
+        &dev_plain(&["demo", "--port", REBIND_GATEWAY_PORT]),
+    );
     assert!(created.status.success(), "{}", stderr(&created));
     let before = get_environment("demo", &env, &repo).unwrap();
     let repo_arg = path_string(&repo);
@@ -1415,7 +1480,11 @@ fn dev_switch_from_a_missing_checkout_keeps_the_selected_binding_when_preparatio
     let root = TestDir::new("dev-switch-missing-previous");
     let (repo, _) = prepared_checkout_and_fresh_worktree(&root);
     let mut env = switch_env(&root);
-    let created = run_ocm(&repo, &env, &dev_plain(&["demo"]));
+    let created = run_ocm(
+        &repo,
+        &env,
+        &dev_plain(&["demo", "--port", REBIND_GATEWAY_PORT]),
+    );
     assert!(created.status.success(), "{}", stderr(&created));
     let clone = |name: &str| {
         let path = root.child(name);
@@ -1491,7 +1560,11 @@ fn dev_switch_commits_once_prepared_even_if_the_gateway_fails_to_launch() {
     let root = TestDir::new("dev-switch-launch-failure");
     let (repo, worktree) = prepared_checkout_and_fresh_worktree(&root);
     let env = switch_env(&root);
-    let created = run_ocm(&repo, &env, &dev_plain(&["demo"]));
+    let created = run_ocm(
+        &repo,
+        &env,
+        &dev_plain(&["demo", "--port", REBIND_GATEWAY_PORT]),
+    );
     assert!(created.status.success(), "{}", stderr(&created));
     let meta = get_environment("demo", &env, &repo).unwrap();
     let gateway_log = ocm::store::derive_env_paths(Path::new(&meta.root))
