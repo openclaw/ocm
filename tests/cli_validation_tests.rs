@@ -638,15 +638,44 @@ fn env_run_rejects_global_daemon_install_during_onboarding() {
     );
     assert!(create.status.success(), "{}", stderr(&create));
 
-    let run = run_ocm(
-        &cwd,
-        &env,
+    let refused: [&[&str]; 4] = [
         &["env", "run", "demo", "--", "onboard", "--install-daemon"],
-    );
-    assert_eq!(run.status.code(), Some(1));
-    assert!(stderr(&run).contains(
-        "env onboarding cannot install the OpenClaw daemon because the daemon service is global",
-    ));
+        &[
+            "env",
+            "run",
+            "demo",
+            "--",
+            "--no-color",
+            "onboard",
+            "--install-daemon",
+        ],
+        &[
+            "@demo",
+            "--",
+            "--log-level",
+            "debug",
+            "onboard",
+            "--install-daemon",
+        ],
+        &[
+            "@demo",
+            "--",
+            "--log-level=debug",
+            "onboard",
+            "--install-daemon",
+        ],
+    ];
+    for args in refused {
+        let run = run_ocm(&cwd, &env, args);
+        assert_eq!(run.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr(&run).contains(
+                "env onboarding cannot install the OpenClaw daemon because the daemon service is global",
+            ),
+            "{args:?}: {}",
+            stderr(&run)
+        );
+    }
 }
 
 #[test]
