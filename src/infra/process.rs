@@ -67,14 +67,17 @@ fn run_reporting_as(
 pub(crate) fn set_terminal_foreground_process_group(
     process_group: libc::pid_t,
 ) -> Result<(), String> {
-    assign_terminal_foreground(process_group)
+    assign_terminal_foreground(libc::STDIN_FILENO, process_group)
         .map_err(|error| format!("failed assigning terminal ownership: {error}"))
 }
 
 /// Async-signal-safe: it does not allocate, so a child can call it between
 /// fork and exec.
 #[cfg(unix)]
-fn assign_terminal_foreground(process_group: libc::pid_t) -> std::io::Result<()> {
+fn assign_terminal_foreground(
+    terminal: libc::c_int,
+    process_group: libc::pid_t,
+) -> std::io::Result<()> {
     // A background process group may change the foreground group only while
     // SIGTTOU is blocked.
     let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
@@ -87,7 +90,7 @@ fn assign_terminal_foreground(process_group: libc::pid_t) -> std::io::Result<()>
     if masked != 0 {
         return Err(std::io::Error::from_raw_os_error(masked));
     }
-    let assigned = unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, process_group) };
+    let assigned = unsafe { libc::tcsetpgrp(terminal, process_group) };
     let error = (assigned == -1).then(std::io::Error::last_os_error);
     let restored =
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
@@ -164,21 +167,21 @@ mod foreground {
         let mut terminal = Terminal::observe();
         let isolate = !terminal.owned || alone_in_process_group();
         if isolate {
-            let take_terminal = terminal.owned;
+            let take_terminal = terminal.owned.then(|| terminal.fd()).flatten();
             unsafe {
                 process.pre_exec(move || {
                     if libc::setpgid(0, 0) == -1 {
                         return Err(io::Error::last_os_error());
                     }
-                    if take_terminal {
-                        super::assign_terminal_foreground(libc::getpid())?;
+                    if let Some(tty) = take_terminal {
+                        super::assign_terminal_foreground(tty, libc::getpid())?;
                     }
                     Ok(())
                 });
             }
             // The child can claim the terminal and still fail to exec, so
             // reclaim it on every path.
-            terminal.assigned = take_terminal;
+            terminal.assigned = take_terminal.is_some();
         }
         let mut child = match process.spawn() {
             Ok(child) => child,
@@ -331,6 +334,9 @@ mod foreground {
     }
 
     struct Terminal {
+        /// OCM's controlling terminal, found independently of redirected
+        /// standard streams.
+        tty: Option<std::fs::File>,
         /// OCM's process group was the terminal's foreground group.
         owned: bool,
         /// The child's group holds the terminal on OCM's behalf.
@@ -339,18 +345,42 @@ mod foreground {
 
     impl Terminal {
         fn observe() -> Self {
-            Self {
-                owned: in_terminal_foreground(),
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let tty = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open("/dev/tty")
+                .ok();
+            let mut terminal = Self {
+                tty,
+                owned: false,
                 assigned: false,
-            }
+            };
+            terminal.owned = terminal.in_foreground();
+            terminal
+        }
+
+        fn fd(&self) -> Option<libc::c_int> {
+            use std::os::fd::AsRawFd;
+
+            self.tty.as_ref().map(AsRawFd::as_raw_fd)
+        }
+
+        fn in_foreground(&self) -> bool {
+            self.fd()
+                .is_some_and(|tty| unsafe { libc::tcgetpgrp(tty) == libc::getpgrp() })
         }
 
         /// Job control stops the child's group without OCM. Stop OCM too so
         /// the shell regains the terminal, then resume the group with it.
         fn follow_stopped_child(&mut self, group: libc::pid_t) {
-            if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1
-                || !observe_process(group as u32)
-                    .is_ok_and(|process| process.is_some_and(|process| process.stopped))
+            let Some(tty) = self.fd() else {
+                return;
+            };
+            if !observe_process(group as u32)
+                .is_ok_and(|process| process.is_some_and(|process| process.stopped))
             {
                 return;
             }
@@ -358,8 +388,8 @@ mod foreground {
             unsafe {
                 libc::kill(libc::getpid(), libc::SIGSTOP);
             }
-            if in_terminal_foreground() {
-                self.assigned = super::assign_terminal_foreground(group).is_ok();
+            if self.in_foreground() {
+                self.assigned = super::assign_terminal_foreground(tty, group).is_ok();
             }
             unsafe {
                 libc::kill(-group, libc::SIGCONT);
@@ -369,16 +399,11 @@ mod foreground {
         /// Best effort: the command's result stands even if the terminal
         /// cannot be handed back.
         fn restore(&mut self) {
-            if std::mem::take(&mut self.assigned) {
-                let _ = super::assign_terminal_foreground(unsafe { libc::getpgrp() });
+            if std::mem::take(&mut self.assigned)
+                && let Some(tty) = self.fd()
+            {
+                let _ = super::assign_terminal_foreground(tty, unsafe { libc::getpgrp() });
             }
-        }
-    }
-
-    fn in_terminal_foreground() -> bool {
-        unsafe {
-            libc::isatty(libc::STDIN_FILENO) == 1
-                && libc::tcgetpgrp(libc::STDIN_FILENO) == libc::getpgrp()
         }
     }
 

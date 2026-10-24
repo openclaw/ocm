@@ -896,3 +896,37 @@ fn shared_job_passes_signals_sent_to_ocm_to_the_command() {
         assert!(!survived, "SIG{name}: the command outlived OCM");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn command_reads_the_terminal_when_stdin_is_redirected() {
+    use std::io::Write;
+
+    let fixture = SignalFixture::new("cli-foreground-terminal-redirected-stdin");
+    // OCM leads the terminal session with stdin from /dev/null; the command
+    // still asks the controlling terminal for input.
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            r#"exec "$0" env exec bound -- sh -c 'read answer </dev/tty; echo "command read $answer"' </dev/null"#,
+        ])
+        .arg(crate::support::ocm_test_binary_path())
+        .current_dir(&fixture.cwd)
+        .env_clear()
+        .envs(&fixture.env);
+    let mut terminal = OnTerminal::spawn(command);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    terminal.master.write_all(b"yes\n").unwrap();
+    let status = wait_with_deadline(&mut terminal.process);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !terminal.output().contains("command read yes") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{status:?}: {}",
+            terminal.output()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(status.success(), "{status:?}: {}", terminal.output());
+}
