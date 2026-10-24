@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::env::EnvMeta;
+use crate::infra::process_identity::parent_process_names;
 use crate::store::derive_env_paths;
 
 pub const OPENCLAW_NATIVE_SERVICE_IDENTITY_KEYS: [&str; 3] = [
@@ -61,14 +62,43 @@ pub fn resolve_shell_name(
     Ok(
         if env
             .get("SHELL")
-            .map(|value| value.contains("fish"))
-            .unwrap_or(false)
+            .and_then(|value| shell_dialect_for_process(value))
+            == Some("fish")
         {
             "fish".to_string()
         } else {
             "zsh".to_string()
         },
     )
+}
+
+/// Selects the dialect `ocm env use` prints. An explicit `--shell` wins.
+/// Otherwise the parent process decides when it is a recognized shell: it is
+/// the shell evaluating `eval "$(ocm env use ...)"` or `... | source`, while
+/// the inherited `SHELL` names the login shell, which can differ.
+pub fn resolve_activation_shell(
+    explicit: Option<&str>,
+    env: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    if explicit.is_none()
+        && let Some(shell) = parent_process_names()
+            .iter()
+            .find_map(|name| shell_dialect_for_process(name))
+    {
+        return Ok(shell.to_string());
+    }
+    resolve_shell_name(explicit, env)
+}
+
+fn shell_dialect_for_process(name: &str) -> Option<&'static str> {
+    let name = Path::new(name).file_name()?.to_str()?;
+    match name.trim_start_matches('-') {
+        "bash" => Some("bash"),
+        "fish" => Some("fish"),
+        "zsh" => Some("zsh"),
+        "sh" | "dash" | "ash" | "ksh" | "mksh" => Some("sh"),
+        _ => None,
+    }
 }
 
 pub fn build_openclaw_env(
@@ -571,6 +601,43 @@ mod tests {
         assert!(!plain.contains_key("OPENCLAW_NO_RESPAWN"));
         assert!(!plain.contains_key("OPENCLAW_DEV_SOURCE_ROOT"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recognizes_the_evaluating_shell_from_its_process_name() {
+        for (name, dialect) in [
+            ("/usr/bin/bash", Some("bash")),
+            ("/opt/homebrew/bin/fish", Some("fish")),
+            ("/bin/zsh", Some("zsh")),
+            ("-zsh", Some("zsh")),
+            ("bash", Some("bash")),
+            ("/usr/bin/dash", Some("sh")),
+            ("sh", Some("sh")),
+            ("/opt/fishery/bin/zsh", Some("zsh")),
+            ("/usr/bin/busybox", None),
+            ("python3", None),
+            ("shell_init_tests-0123", None),
+            ("", None),
+        ] {
+            assert_eq!(shell_dialect_for_process(name), dialect, "{name}");
+        }
+    }
+
+    #[test]
+    fn shell_hint_selects_fish_only_for_a_fish_executable() {
+        for (hint, shell) in [
+            (Some("/opt/homebrew/bin/fish"), "fish"),
+            (Some("/usr/bin/fish"), "fish"),
+            (Some("/opt/fishery/bin/zsh"), "zsh"),
+            (Some("/home/fisher/bin/bash"), "zsh"),
+            (Some("/bin/zsh"), "zsh"),
+            (None, "zsh"),
+        ] {
+            let env = hint
+                .map(|value| BTreeMap::from([("SHELL".to_string(), value.to_string())]))
+                .unwrap_or_default();
+            assert_eq!(resolve_shell_name(None, &env).unwrap(), shell, "{hint:?}");
+        }
     }
 
     #[test]
