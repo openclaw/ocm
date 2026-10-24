@@ -440,6 +440,9 @@ Runtime registrations and managed directories share a namespace: the registratio
 OCM refuses an installation that would replace another runtime's registration or payload, including with `--force`; choose another name when these paths conflict.
 Names ending in `.json` remain supported when their destinations are available, and `--force` still replaces an unbound runtime of the same name.
 
+Runtime installs unpack into a hidden staging directory and publish it only when they succeed.
+If OCM is interrupted or killed during an install, the next runtime installation of any name removes those staging directories once no OCM process is still installing that runtime.
+
 ### Package runtime Node.js selection
 
 Official package installation reads `engines.node` from the integrity-verified archive before invoking npm.
