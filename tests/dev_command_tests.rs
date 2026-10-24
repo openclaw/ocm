@@ -3259,15 +3259,28 @@ fn dev_borrowed_linked_checkout_uses_explicit_and_enclosing_source() {
     let resumed = run_ocm(&nested, &env, &dev_plain(&["demo"]));
     assert!(resumed.status.success(), "{}", stderr(&resumed));
     let node_before = fs::read(root.child("node.log")).unwrap();
-    let repo_arg = path_string(&repo);
-    for args in [
-        dev_plain(&["demo"]),
-        dev_plain(&["demo", "--repo", &repo_arg]),
+    // A stopped borrower follows the enclosing checkout, and an explicit
+    // --repo switches it back.
+    let main_arg = path_string(&fs::canonicalize(&repo).unwrap());
+    for (args, from, to) in [
+        (dev_plain(&["demo"]), &source_arg, &main_arg),
+        (
+            dev_plain(&["demo", "--repo", &source_arg]),
+            &main_arg,
+            &source_arg,
+        ),
     ] {
-        let changed = run_ocm(&repo, &env, &args);
-        assert!(!changed.status.success());
-        assert!(stderr(&changed).contains("cannot change the repo"));
+        let switched = run_ocm(&repo, &env, &args);
+        assert!(switched.status.success(), "{}", stderr(&switched));
+        assert!(
+            stderr(&switched).contains(&format!("Switched demo from {from} to {to}")),
+            "{}",
+            stderr(&switched)
+        );
+        let meta = get_environment("demo", &env, &repo).unwrap();
+        assert_eq!(meta.dev.unwrap().borrowed_source_root(), Some(to.as_str()));
     }
+    let node_after_switches = fs::read(root.child("node.log")).unwrap();
     let git_path = source.join(".git");
     let original_git = fs::read(&git_path).unwrap();
     fs::copy(repo.join(".worktrees/other/.git"), &git_path).unwrap();
@@ -3295,7 +3308,10 @@ fn dev_borrowed_linked_checkout_uses_explicit_and_enclosing_source() {
         "{}",
         stderr(&stale_slot)
     );
-    assert_eq!(fs::read(root.child("node.log")).unwrap(), node_before);
+    assert_eq!(
+        fs::read(root.child("node.log")).unwrap(),
+        node_after_switches
+    );
     let prefix = format!("{source_arg}|");
     assert!(
         String::from_utf8(node_before)

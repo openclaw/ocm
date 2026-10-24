@@ -206,6 +206,59 @@ struct ExistingEnvSourceWatchOptions {
     ui: bool,
 }
 
+/// A start that switched its borrowed source. Unless the start keeps it after
+/// preparing the selected checkout, dropping it restores the previous binding,
+/// so rerunning from the selected checkout switches and prepares it again.
+struct DevSourceSwitch<'a> {
+    cli: &'a Cli,
+    env_name: String,
+    previous: String,
+    selected: String,
+    kept: bool,
+}
+
+impl DevSourceSwitch<'_> {
+    fn keep(&mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for DevSourceSwitch<'_> {
+    fn drop(&mut self) {
+        if self.kept || thread::panicking() {
+            return;
+        }
+        let env_service = self.cli.environment_service();
+        let restored = env_service.rebind_dev_from(
+            &self.env_name,
+            Some(&self.selected),
+            Path::new(&self.previous),
+        );
+        let message = match restored {
+            Ok(_) => format!(
+                "Switched {} back to {} because {} was not prepared.",
+                self.env_name, self.previous, self.selected
+            ),
+            Err(error)
+                if env_service.get(&self.env_name).is_ok_and(|meta| {
+                    meta.dev.as_ref().and_then(EnvDevMeta::borrowed_source_root)
+                        == Some(self.selected.as_str())
+                }) =>
+            {
+                format!(
+                    "{} remains bound to {}; restoring {} failed: {error}. Its next start there will not install missing tooling; prepare it with `pnpm install --frozen-lockfile` first.",
+                    self.env_name, self.selected, self.previous
+                )
+            }
+            Err(error) => format!(
+                "{} was not switched back to {}: {error}",
+                self.env_name, self.previous
+            ),
+        };
+        self.cli.stderr_line(message);
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct DevStopSummary {
@@ -646,6 +699,7 @@ impl Cli {
         }
         let name = validate_name(name, "Environment name")?;
 
+        let mut switch_target = None;
         if let Some(existing) = self.environment_service().find(&name)? {
             if service_requested {
                 self.environment_service()
@@ -680,14 +734,35 @@ impl Cli {
                     },
                 );
             }
+            switch_target = self
+                .dev_source_switch_target(&existing, repo_root.as_deref())?
+                .map(|target| (existing, target));
         }
 
         // Reject an already incompatible daemon before creating a new env.
         // Lease admission rechecks after any concurrent daemon change.
         self.supervisor_service().preflight_source_watch_daemon()?;
+        let stderr_profile = self.dev_stderr_profile();
+        // A switch handles interrupts from before it publishes, so cancellation
+        // still reaches its restore.
+        let mut watch_stop = None;
+        // Declared before the lease so a failed start finishes its session
+        // before the previous source is restored.
+        let mut source_switch = match switch_target {
+            Some((existing, target)) => {
+                watch_stop = Some(install_source_watch_signal_handler()?);
+                Some(self.switch_dev_source(
+                    &existing,
+                    &target,
+                    root.as_deref(),
+                    gateway_port,
+                    stderr_profile,
+                )?)
+            }
+            None => None,
+        };
         let (meta, created) =
             self.ensure_dev_env(&name, repo_root.clone(), root.clone(), gateway_port)?;
-        let stderr_profile = self.dev_stderr_profile();
         if !watch && !service_requested && meta.service_running {
             return Err(format!(
                 "dev env {} is already running in the background; stop it first with {} service stop {}, inspect it with {} logs {} --follow, or rerun with --watch --force to take it over temporarily",
@@ -698,7 +773,10 @@ impl Cli {
                 meta.name
             ));
         }
-        let watch_stop = Some(install_source_watch_signal_handler()?);
+        let watch_stop = match watch_stop {
+            Some(stop) => Some(stop),
+            None => Some(install_source_watch_signal_handler()?),
+        };
         let mode = if service_requested {
             SourceWatchMode::ServicePreparation
         } else {
@@ -731,6 +809,10 @@ impl Cli {
                             watch_stop.as_deref(),
                         )?
                     {
+                        // A competing start already runs the selected source.
+                        if let Some(switch) = source_switch.as_mut() {
+                            switch.keep();
+                        }
                         return Ok(0);
                     }
                     return Err(error);
@@ -815,7 +897,7 @@ impl Cli {
         let preparation = self
             .prepare_dev_run(
                 &meta,
-                created,
+                created || source_switch.is_some(),
                 onboard,
                 source_watch_lease.as_mut(),
                 watch_stop.as_deref(),
@@ -842,6 +924,11 @@ impl Cli {
                 }
                 None => preparation.map_err(|error| error.message),
             };
+        }
+        // The switch commits once the selected checkout is prepared. A later
+        // launch failure leaves a checkout that its next start uses as is.
+        if let Some(switch) = source_switch.as_mut() {
+            switch.keep();
         }
 
         if service_requested {
@@ -1500,6 +1587,14 @@ impl Cli {
             ));
         }
         let expected_source = if let Some(dev) = &meta.dev {
+            if let Some(target) = self.dev_source_switch_target(meta, repo_root)? {
+                return Err(format!(
+                    "dev env {} is {state} from {}; stop it before switching to {}",
+                    meta.name,
+                    dev.source_root(),
+                    display_path(&target)
+                ));
+            }
             self.validate_existing_dev_request(meta, repo_root, root, None)?;
             PathBuf::from(dev.source_root())
         } else {
@@ -1616,6 +1711,86 @@ impl Cli {
         Ok(true)
     }
 
+    /// The different checkout a request selects for a borrowed dev env with no
+    /// runtime or launcher binding: `--repo`, else the enclosing checkout.
+    /// Other envs and unresolvable requests keep the existing validation.
+    fn dev_source_switch_target(
+        &self,
+        meta: &EnvMeta,
+        repo_root: Option<&str>,
+    ) -> Result<Option<PathBuf>, String> {
+        let Some(saved) = meta
+            .dev
+            .as_ref()
+            .and_then(EnvDevMeta::borrowed_source_root)
+            .filter(|_| meta.default_runtime.is_none() && meta.default_launcher.is_none())
+        else {
+            return Ok(None);
+        };
+        let requested = match repo_root {
+            Some(repo_root) => resolve_absolute_path(repo_root, &self.env, &self.cwd)?,
+            None => match discover_enclosing_openclaw_checkout(&self.cwd) {
+                Some(checkout) => checkout,
+                None => return Ok(None),
+            },
+        };
+        let Ok(requested) = fs::canonicalize(requested) else {
+            return Ok(None);
+        };
+        let saved = Path::new(saved);
+        if requested == saved || fs::canonicalize(saved).is_ok_and(|saved| saved == requested) {
+            return Ok(None);
+        }
+        Ok(Some(requested))
+    }
+
+    /// Switches a stopped borrowed dev env to `target` through rebind's
+    /// admission after validating the rest of the request against it.
+    fn switch_dev_source(
+        &self,
+        existing: &EnvMeta,
+        target: &Path,
+        root: Option<&str>,
+        gateway_port: Option<u32>,
+        profile: RenderProfile,
+    ) -> Result<DevSourceSwitch<'_>, String> {
+        let previous = existing
+            .dev
+            .as_ref()
+            .and_then(EnvDevMeta::borrowed_source_root)
+            .ok_or("dev source switch requires a borrowed dev environment")?;
+        let selected = display_path(target);
+        let mut candidate = existing.clone();
+        candidate.dev = Some(EnvDevMeta::Borrowed {
+            source_root: selected.clone(),
+        });
+        self.validate_existing_dev_request(&candidate, Some(&selected), root, gateway_port)?;
+        let summary = self
+            .environment_service()
+            .rebind_dev_from(&existing.name, Some(previous), target)
+            .map_err(|error| {
+                format!(
+                    "cannot switch dev env {} from {previous} to {selected}: {error}",
+                    existing.name
+                )
+            })?;
+        self.stderr_lines(render_dev_run_step(
+            "Switch",
+            format!(
+                "Switched {} from {} to {}",
+                summary.env_name, summary.previous_source_root, summary.source_root
+            ),
+            profile,
+        ));
+        Ok(DevSourceSwitch {
+            cli: self,
+            env_name: summary.env_name,
+            previous: summary.previous_source_root,
+            selected: summary.source_root,
+            kept: false,
+        })
+    }
+
     fn ensure_dev_env(
         &self,
         name: &str,
@@ -1692,7 +1867,7 @@ impl Cli {
     fn prepare_dev_run(
         &self,
         meta: &EnvMeta,
-        created: bool,
+        new_source: bool,
         onboard: bool,
         mut lease: Option<&mut SourceWatchLease>,
         stop: Option<&AtomicBool>,
@@ -1702,7 +1877,7 @@ impl Cli {
         {
             return Ok(130);
         }
-        let code = self.ensure_dev_dependencies(meta, created, lease.as_deref_mut(), stop)?;
+        let code = self.ensure_dev_dependencies(meta, new_source, lease.as_deref_mut(), stop)?;
         if code != 0 {
             return Ok(code);
         }
@@ -2005,10 +2180,12 @@ impl Cli {
         Ok(Some(output.stdout))
     }
 
+    /// `new_source` is true when this invocation created the env or switched
+    /// it to its borrowed checkout; only then may borrowed tooling be installed.
     fn ensure_dev_dependencies(
         &self,
         meta: &EnvMeta,
-        created: bool,
+        new_source: bool,
         mut lease: Option<&mut SourceWatchLease>,
         stop: Option<&AtomicBool>,
     ) -> SourceWatchResult<i32> {
@@ -2034,7 +2211,7 @@ impl Cli {
         let Some(issue) = inspected? else {
             return Ok(0);
         };
-        if dev.borrowed_source_root().is_some() && !created {
+        if dev.borrowed_source_root().is_some() && !new_source {
             return Err(source_dependency_preparation_error(source_root, &issue).into());
         }
         ensure_source_dependency_install_target(source_root, &process_env)?;
