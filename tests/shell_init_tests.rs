@@ -259,6 +259,69 @@ printf 'caller variables preserved\n'
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn posix_helper_discards_the_output_of_a_failed_activation() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let root = TestDir::new("shell-init-failed-activation");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let fake = root.child("failing-ocm");
+    fs::write(
+        &fake,
+        "#!/bin/sh\necho 'FAILED_STDOUT_RAN=1'\necho 'activation failed' >&2\nexit 9\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert("OCM_SELF".to_string(), fake.to_string_lossy().into_owned());
+
+    for (shell, init_shell) in [
+        ("bash", "bash"),
+        ("sh", "sh"),
+        ("zsh", "zsh"),
+        ("dash", "sh"),
+    ] {
+        if !matches!(shell, "bash" | "sh")
+            && Command::new(shell).arg("-c").arg(":").output().is_err()
+        {
+            continue;
+        }
+        let init = run_ocm(&cwd, &env, &["init", init_shell]);
+        assert!(init.status.success(), "{}", stderr(&init));
+        let script = format!(
+            r#"{}
+ocm_use demo
+result=$?
+[ "$result" = 9 ] || exit 10
+[ -z "${{FAILED_STDOUT_RAN+x}}" ] || exit 11
+ocm_use demo --shell=sh
+result=$?
+[ "$result" = 9 ] || exit 12
+[ -z "${{FAILED_STDOUT_RAN+x}}" ] || exit 13
+"#,
+            stdout(&init)
+        );
+        let output = Command::new(shell)
+            .args(["-c", &script])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "shell={shell}, status={}: {} {}",
+            output.status,
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(stderr(&output).contains("activation failed"), "{shell}");
+    }
+}
+
 #[test]
 fn activation_renders_explicit_include_roots_for_each_supported_shell() {
     let root = TestDir::new("shell-include-roots-render");
