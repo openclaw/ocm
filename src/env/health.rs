@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -104,40 +104,60 @@ impl<'a> EnvironmentService<'a> {
         let actions = cleanup_actions(&env, &doctor_before, &config_audit, &state_audit);
         let (config_repair, runtime_cleanup) = self.prepare_cleanup(&env, &actions)?;
 
-        for action in &actions {
-            match action.kind {
-                "clear-missing-runtime" => {
-                    env.default_runtime = None;
-                }
-                "clear-missing-launcher" => {
-                    env.default_launcher = None;
-                }
-                "repair-openclaw-config" => {
-                    if let Some(repair) = &config_repair {
-                        repair.apply()?;
-                    }
-                }
-                "reset-openclaw-runtime-state" => {
-                    if let Some(cleanup) = &runtime_cleanup {
-                        cleanup.apply()?;
-                    }
-                }
-                _ => {}
+        // Removed runtime state cannot be restored, so any later failure names it.
+        let root = PathBuf::from(&env.root);
+        let mut removed = Vec::new();
+        let disclose = |error: String, removed: &[PathBuf]| {
+            if removed.is_empty() {
+                return error;
             }
-        }
-
-        if actions.iter().any(|action| {
-            matches!(
-                action.kind,
-                "clear-missing-runtime" | "clear-missing-launcher"
+            let removed = removed
+                .iter()
+                .map(|path| relative_removal(&root, path))
+                .collect::<Vec<_>>();
+            format!(
+                "{error}; the runtime-state reset of env \"{name}\" already removed: {}",
+                removed.join(", ")
             )
-        }) {
-            env = save_environment(env, self.env, self.cwd)?;
-        } else {
-            env = self.get(name)?;
-        }
+        };
+        let applied = (|| {
+            for action in &actions {
+                match action.kind {
+                    "clear-missing-runtime" => {
+                        env.default_runtime = None;
+                    }
+                    "clear-missing-launcher" => {
+                        env.default_launcher = None;
+                    }
+                    "repair-openclaw-config" => {
+                        if let Some(repair) = &config_repair {
+                            repair.apply()?;
+                        }
+                    }
+                    "reset-openclaw-runtime-state" => {
+                        if let Some(cleanup) = &runtime_cleanup {
+                            cleanup.apply_recording(&mut removed)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
 
-        let doctor_after = self.doctor(name)?;
+            if actions.iter().any(|action| {
+                matches!(
+                    action.kind,
+                    "clear-missing-runtime" | "clear-missing-launcher"
+                )
+            }) {
+                save_environment(env, self.env, self.cwd)
+            } else {
+                self.get(name)
+            }
+        })();
+        let env = applied.map_err(|error| disclose(error, &removed))?;
+        let doctor_after = self
+            .doctor(name)
+            .map_err(|error| disclose(error, &removed))?;
         Ok(build_cleanup_summary(
             &env,
             doctor_before,
@@ -351,7 +371,8 @@ impl<'a> EnvironmentService<'a> {
 
         for env_name in env_names {
             let summary = if apply {
-                self.cleanup(&env_name)?
+                self.cleanup(&env_name)
+                    .map_err(|error| disclose_earlier_removals(error, &results))?
             } else {
                 self.cleanup_preview(&env_name)?
             };
@@ -366,6 +387,34 @@ impl<'a> EnvironmentService<'a> {
             results,
         })
     }
+}
+
+// Earlier environments are not rolled back, so a failed batch names what they lost.
+fn disclose_earlier_removals(error: String, results: &[EnvCleanupSummary]) -> String {
+    let earlier = results
+        .iter()
+        .filter_map(|result| {
+            let removed = result
+                .actions
+                .iter()
+                .flat_map(|action| &action.removals)
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            (!removed.is_empty())
+                .then(|| format!("env \"{}\" removed {}", result.env_name, removed.join(", ")))
+        })
+        .collect::<Vec<_>>();
+    if earlier.is_empty() {
+        return error;
+    }
+    format!(
+        "{error}; cleanup already applied to earlier environments: {}",
+        earlier.join("; ")
+    )
+}
+
+fn relative_removal(root: &Path, path: &Path) -> String {
+    display_path(path.strip_prefix(root).unwrap_or(path))
 }
 
 fn push_issue(issues: &mut Vec<String>, issue: String) {
@@ -438,7 +487,7 @@ fn build_cleanup_summary(
                 Some(cleanup) if action.kind == "reset-openclaw-runtime-state" => cleanup
                     .removals()
                     .iter()
-                    .map(|path| display_path(path.strip_prefix(root).unwrap_or(path)))
+                    .map(|path| relative_removal(root, path))
                     .collect(),
                 _ => Vec::new(),
             },

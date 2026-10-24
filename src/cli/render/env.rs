@@ -1316,14 +1316,80 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        RenderProfile, env_destroy_preview, env_destroyed, env_doctor, env_list, env_resolved,
-        env_show, env_snapshot_list_with_width, env_snapshot_prune_preview, env_snapshot_show,
-        env_status,
+        RenderProfile, env_cleanup, env_cleanup_batch, env_destroy_preview, env_destroyed,
+        env_doctor, env_list, env_resolved, env_show, env_snapshot_list_with_width,
+        env_snapshot_prune_preview, env_snapshot_show, env_status,
     };
     use crate::cli::env::{EnvDestroyStepSummary, EnvDestroySummary};
     use crate::env::{
-        EnvDoctorSummary, EnvSnapshotSummary, EnvStatusSummary, EnvSummary, ExecutionSummary,
+        EnvCleanupActionSummary, EnvCleanupBatchSummary, EnvCleanupSummary, EnvDoctorSummary,
+        EnvSnapshotSummary, EnvStatusSummary, EnvSummary, ExecutionSummary,
     };
+
+    fn cleanup_with_reset(apply: bool) -> EnvCleanupSummary {
+        EnvCleanupSummary {
+            env_name: "demo".to_string(),
+            root: "/tmp/demo".to_string(),
+            apply,
+            default_runtime: None,
+            default_launcher: None,
+            healthy_before: false,
+            healthy_after: apply.then_some(true),
+            actions: vec![EnvCleanupActionSummary {
+                kind: "reset-openclaw-runtime-state".to_string(),
+                description: "clear copied OpenClaw runtime state outside config and workspace"
+                    .to_string(),
+                applied: apply,
+                removals: vec![
+                    ".openclaw/credentials".to_string(),
+                    ".openclaw/logs".to_string(),
+                ],
+            }],
+            issues_before: Vec::new(),
+            issues_after: apply.then(Vec::new),
+        }
+    }
+
+    #[test]
+    fn env_cleanup_lists_each_runtime_state_removal() {
+        for apply in [false, true] {
+            let (card, verb) = if apply {
+                ("Removed", "removed")
+            } else {
+                ("Removes", "removes")
+            };
+            let cleanup = cleanup_with_reset(apply);
+            let pretty = env_cleanup(&cleanup, RenderProfile::pretty(false));
+            assert!(pretty.iter().any(|line| line.contains(card)), "{pretty:?}");
+            for path in [".openclaw/credentials", ".openclaw/logs"] {
+                assert!(pretty.iter().any(|line| line.contains(path)), "{pretty:?}");
+            }
+            let raw = env_cleanup(&cleanup, RenderProfile::raw());
+            assert!(
+                raw.contains(&format!("    {verb}: .openclaw/credentials")),
+                "{raw:?}"
+            );
+
+            let batch = EnvCleanupBatchSummary {
+                apply,
+                count: 1,
+                results: vec![cleanup],
+            };
+            let pretty = env_cleanup_batch(&batch, RenderProfile::pretty(false));
+            assert!(
+                pretty
+                    .iter()
+                    .any(|line| line.contains(&format!("{card} from demo"))),
+                "{pretty:?}"
+            );
+            assert!(pretty.iter().any(|line| line.contains(".openclaw/logs")));
+            let raw = env_cleanup_batch(&batch, RenderProfile::raw());
+            assert!(
+                raw.contains(&format!("      {verb}: .openclaw/logs")),
+                "{raw:?}"
+            );
+        }
+    }
 
     #[test]
     fn env_list_pretty_uses_a_table() {

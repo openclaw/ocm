@@ -133,10 +133,17 @@ impl OpenClawRuntimeStateCleanup {
     }
 
     pub(crate) fn apply(&self) -> Result<bool, String> {
+        self.apply_recording(&mut Vec::new())?;
+        Ok(!self.removals.is_empty())
+    }
+
+    /// Records each removal as it completes, so a failure can report what is already gone.
+    pub(crate) fn apply_recording(&self, removed: &mut Vec<PathBuf>) -> Result<(), String> {
         for path in &self.removals {
             remove_path(path)?;
+            removed.push(path.clone());
         }
-        Ok(!self.removals.is_empty())
+        Ok(())
     }
 }
 

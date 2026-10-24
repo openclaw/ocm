@@ -1493,8 +1493,10 @@ Runtime-state cleanup preserves configured agent directories inside the environm
 It also retains shared managed skills under `.openclaw/skills` and their global ClawHub tracking metadata under `.openclaw/.clawhub`.
 A runtime-state reset is planned only when a session transcript under `.openclaw/agents/<id>/sessions` records, in its header, a working directory under another environment's root or another `.openclaw` directory, as state copied from elsewhere does.
 Paths that are only mentioned in transcript messages, logs, notes, authored skills or installation records do not trigger it.
+State copied outside OCM without such a transcript is not detected, while a transcript left from a time when a workspace pointed into another environment still triggers a reset, so review the listed paths before applying.
 A reset removes stale sessions, logs and unselected generated files beside those directories, along with the other runtime state outside the config, workspaces, agent directories, shared skills and managed plugin roots, such as copied credentials and device identity.
 The preview lists each path the reset will remove, relative to the environment root, and the applied result lists what it removed; `--json` reports them as the action's `removals`.
+If the reset or a later step fails, the error names the paths that were already removed, and an `--all` failure also names what earlier environments' resets removed.
 Configuring an agent directory above `agents/<id>/sessions` preserves agent payload beside that subtree without hiding its stale sessions from cleanup.
 If an agent directory is exactly `agents/<id>/sessions`, cleanup preview and apply refuse the conflicting ownership before changing any configuration or data.
 Use a separate agent directory before retrying cleanup; `env doctor` reports the conflict.

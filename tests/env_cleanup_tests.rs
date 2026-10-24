@@ -329,6 +329,23 @@ fn env_cleanup_yes_clears_copied_openclaw_runtime_state() {
     for path in &disclosed {
         assert!(removals.iter().any(|removal| removal == path), "{preview}");
     }
+    let batch = run_ocm(&cwd, &env, &["env", "cleanup", "--all", "--json"]);
+    assert!(batch.status.success(), "{}", stderr(&batch));
+    let batch: Value = serde_json::from_str(&stdout(&batch)).unwrap();
+    let batch_removals = batch["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|result| result["envName"] == "target")
+        .flat_map(|result| result["actions"].as_array().unwrap())
+        .flat_map(|action| action["removals"].as_array().cloned().unwrap_or_default())
+        .collect::<Vec<_>>();
+    for path in &disclosed {
+        assert!(
+            batch_removals.iter().any(|removal| removal == path),
+            "{batch}"
+        );
+    }
     let preview = run_ocm(&cwd, &env, &["env", "cleanup", "target"]);
     assert!(preview.status.success(), "{}", stderr(&preview));
     for path in &disclosed {
@@ -485,7 +502,6 @@ fn env_cleanup_yes_clears_inferred_foreign_runtime_state_without_source_metadata
     assert!(!target_state.join("logs").exists());
 }
 
-#[cfg(any(unix, windows))]
 fn state_inventory(state: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn visit(state: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
         for entry in fs::read_dir(dir).unwrap() {
@@ -606,6 +622,57 @@ fn env_cleanup_keeps_live_state_that_only_mentions_other_env_paths() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn env_cleanup_names_removed_state_when_a_reset_fails_partway() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("env-cleanup-partial-reset-disclosure");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    for (name, port) in [("a", "19790"), ("b", "19791"), ("donor", "19792")] {
+        let create = run_ocm(&cwd, &env, &["env", "create", name, "--port", port]);
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
+    let header = serde_json::json!({"cwd": root.child("ocm-home/envs/donor/.openclaw/workspace")})
+        .to_string();
+    for name in ["a", "b"] {
+        let state = root.child(format!("ocm-home/envs/{name}/.openclaw"));
+        crate::support::write_text(&state.join("agents/main/sessions/copied.jsonl"), &header);
+        crate::support::write_text(&state.join("credentials/oauth.json"), "{}\n");
+    }
+    // Sorted removals reach logs last; a read-only child makes that removal fail.
+    let locked = root.child("ocm-home/envs/b/.openclaw/logs/locked");
+    crate::support::write_text(&locked.join("gateway.log"), "log\n");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let cleanup = run_ocm(&cwd, &env, &["env", "cleanup", "--all", "--yes"]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!cleanup.status.success(), "{}", stdout(&cleanup));
+    let error = stderr(&cleanup);
+    assert!(
+        error.contains(
+            "the runtime-state reset of env \"b\" already removed: .openclaw/agents, .openclaw/credentials"
+        ),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "cleanup already applied to earlier environments: env \"a\" removed .openclaw/agents, .openclaw/credentials"
+        ),
+        "{error}"
+    );
+    for name in ["a", "b"] {
+        assert!(
+            !root
+                .child(format!("ocm-home/envs/{name}/.openclaw/credentials"))
+                .exists()
+        );
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn fixture_path_spellings(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut paths = vec![path.to_path_buf(), fs::canonicalize(path).unwrap()];
     if cfg!(windows) {

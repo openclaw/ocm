@@ -1461,7 +1461,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             &[
                 "Only a narrow set of safe repairs is applied.",
                 "A runtime-state reset is planned only when a session transcript header records a working directory under another environment root or another .openclaw directory; paths mentioned in messages, logs or other files do not trigger it.",
-                "Preview and apply list each path a runtime-state reset removes, relative to the environment root.",
+                "Preview and apply list each path a runtime-state reset removes, relative to the environment root; a failed apply names the paths already removed.",
                 "Preview and apply refuse a runtime reset that would affect a registered or active temporary dev source or its required Git metadata, before changing this environment.",
                 "Remove the dependent dev environment or stop the identified temporary dev session before retrying. Sources outside the reset plan do not block cleanup.",
                 "For legacy overlapping roots, preview and apply also refuse a reset that would delete another registered environment root or a link needed to reach it. Preserve needed data and remove that environment separately before retrying. Roots outside the reset plan do not block cleanup.",
