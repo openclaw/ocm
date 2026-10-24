@@ -483,17 +483,27 @@ pub(crate) fn ensure_source_dependency_install_config(
         // pnpm links global virtual-store packages under `<store path>/links`.
         targets.push(clean_path(&repo_root.join(store)).join("links"));
     }
+    // The checkout has already been admitted by its canonical identity. A walk
+    // from a destination stops at the first physical directory that is the
+    // checkout or one of its ancestors, compared canonically, so a system link
+    // above both (such as macOS's /var or /tmp) is not mistaken for a borrowed
+    // destination while every link below that point is still refused.
+    let shared: BTreeSet<PathBuf> = fs::canonicalize(repo_root)
+        .unwrap_or_else(|_| repo_root.to_path_buf())
+        .ancestors()
+        .map(Path::to_path_buf)
+        .collect();
     let mut checked = BTreeSet::new();
     for target in targets {
-        // Check every traversed component below the common ancestor, including
-        // broken links and an absent target beneath an existing linked parent.
-        // The checkout itself has already been admitted by its canonical identity.
-        let common = repo_root
-            .ancestors()
-            .find(|ancestor| target.starts_with(ancestor));
-        for directory in target.ancestors().take_while(|path| Some(*path) != common) {
-            if checked.insert(directory.to_path_buf()) {
-                ensure_physical_dependency_directory(directory)?;
+        // Check every traversed component, including broken links and an absent
+        // target beneath an existing linked parent.
+        for directory in target.ancestors() {
+            if !checked.insert(directory.to_path_buf()) {
+                break;
+            }
+            ensure_physical_dependency_directory(directory)?;
+            if fs::canonicalize(directory).is_ok_and(|path| shared.contains(&path)) {
+                break;
             }
         }
     }
@@ -524,17 +534,24 @@ fn pnpm_destinations(repo_root: &Path, output: &[u8]) -> Result<PnpmDestinations
     let lockfile_root =
         clean_path(&repo_root.join(setting("lockfileDir", "lockfile-dir")?.unwrap_or(".")));
     let lockfile_modules = clean_path(&lockfile_root.join(modules_setting));
-    let global = match setting("virtualStoreType", "virtual-store-type")? {
-        Some("global") => true,
-        Some("project") => false,
-        None => match value("enableGlobalVirtualStore", "enable-global-virtual-store") {
-            None | Some(Value::Null) => false,
-            Some(Value::Bool(enabled)) => *enabled,
-            _ => {
-                return Err("pnpm returned an invalid enableGlobalVirtualStore setting".to_string());
-            }
-        },
+    let store_type = match setting("virtualStoreType", "virtual-store-type")? {
+        Some("global") => Some(true),
+        Some("project") => Some(false),
+        None => None,
         _ => return Err("pnpm returned an invalid virtualStoreType setting".to_string()),
+    };
+    let global_enabled = match value("enableGlobalVirtualStore", "enable-global-virtual-store") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(enabled)) => Some(*enabled),
+        _ => return Err("pnpm returned an invalid enableGlobalVirtualStore setting".to_string()),
+    };
+    // pnpm reconciles these two settings per configuration source, and its
+    // readback reports the result; should the merged values still disagree,
+    // check the destinations of both layouts rather than pick one.
+    let (global, project) = match (store_type, global_enabled) {
+        (Some(store_type), Some(enabled)) if store_type != enabled => (true, true),
+        (Some(global), _) | (None, Some(global)) => (global, !global),
+        (None, None) => (false, true),
     };
     // pnpm keeps per-project modules as well as lockfile-root installation
     // metadata, part of it always under the literal `node_modules` (for example
@@ -561,9 +578,20 @@ fn pnpm_destinations(repo_root: &Path, output: &[u8]) -> Result<PnpmDestinations
         return Err("refusing to install OpenClaw source dependencies with per-project pnpm lockfiles (sharedWorkspaceLockfile: false); prepare them explicitly".to_string());
     }
     let mut projects = BTreeSet::new();
-    for project in lockfile_projects(&lockfile_root)? {
+    // Other projects take only the last component of a multi-component or
+    // absolute modulesDir; check both forms.
+    let modules_name = Path::new(modules_setting).file_name();
+    let branch_lockfiles = match value("gitBranchLockfile", "git-branch-lockfile") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(enabled)) => *enabled,
+        _ => return Err("pnpm returned an invalid gitBranchLockfile setting".to_string()),
+    };
+    for project in lockfile_projects(&lockfile_root, branch_lockfiles)? {
         let project = clean_path(&lockfile_root.join(project));
         projects.insert(clean_path(&project.join(modules_setting)));
+        if let Some(name) = modules_name {
+            projects.insert(project.join(name));
+        }
         projects.insert(project);
     }
     targets.extend(projects);
@@ -576,7 +604,8 @@ fn pnpm_destinations(repo_root: &Path, output: &[u8]) -> Result<PnpmDestinations
             Some(directory) => targets.push(clean_path(&repo_root.join(directory))),
             None => implicit_global_store = true,
         }
-    } else {
+    }
+    if project {
         targets.push(match setting("virtualStoreDir", "virtual-store-dir")? {
             Some(value) => clean_path(&lockfile_root.join(value)),
             None => lockfile_modules.join(".pnpm"),
@@ -588,10 +617,12 @@ fn pnpm_destinations(repo_root: &Path, output: &[u8]) -> Result<PnpmDestinations
     })
 }
 
-/// The projects a frozen install links: the `importers` of every lockfile at the
-/// lockfile root (`pnpm-lock.yaml`, and `pnpm-lock.<branch>.yaml` for per-branch
-/// lockfiles), across all of a lockfile's YAML documents.
-fn lockfile_projects(lockfile_root: &Path) -> Result<Vec<String>, String> {
+/// The projects a frozen install links: the `importers` of the lockfiles pnpm
+/// reads at the lockfile root, across all of a lockfile's YAML documents. That is
+/// `pnpm-lock.yaml`, plus, with per-branch lockfiles enabled, every
+/// `pnpm-lock.<branch>.yaml` (a superset of the current branch's file, which
+/// pnpm names from Git state that admission does not reproduce).
+fn lockfile_projects(lockfile_root: &Path, branch_lockfiles: bool) -> Result<Vec<String>, String> {
     let entries = match fs::read_dir(lockfile_root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -615,7 +646,8 @@ fn lockfile_projects(lockfile_root: &Path) -> Result<Vec<String>, String> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !(name.starts_with("pnpm-lock.") && name.ends_with(".yaml")) {
+        let branch_lockfile = name.starts_with("pnpm-lock.") && name.ends_with(".yaml");
+        if !(name == "pnpm-lock.yaml" || (branch_lockfiles && branch_lockfile)) {
             continue;
         }
         let unreadable = || {
@@ -1704,6 +1736,8 @@ mod tests {
             serde_json::json!({"virtualStoreType": "global", "globalVirtualStoreDir": "linked-modules"}),
             serde_json::json!({"enable-global-virtual-store": true, "global-virtual-store-dir": "linked-modules"}),
             serde_json::json!({"lockfileDir": "lockfiles", "virtualStoreType": "global", "virtualStoreDir": "linked-modules"}),
+            // Disagreeing layout settings check both layouts.
+            serde_json::json!({"virtualStoreType": "project", "enableGlobalVirtualStore": true, "globalVirtualStoreDir": "linked-modules"}),
         ] {
             let error = super::ensure_source_dependency_install_config(
                 &repo,
@@ -1781,6 +1815,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn dependency_install_config_ignores_links_above_the_checkout() {
+        // Like macOS's /var -> /private/var: pnpm may report a destination through
+        // a system link above the checkout, whose recorded path is canonical.
+        let root = TempDir::new().unwrap();
+        let real = fs::canonicalize(root.path()).unwrap().join("real");
+        let alias = real.parent().unwrap().join("alias");
+        fs::create_dir_all(real.join("shared/repo")).unwrap();
+        fs::create_dir_all(real.join("shared/store/v11")).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let repo = real.join("shared/repo");
+        let implicit =
+            serde_json::to_vec(&serde_json::json!({"virtualStoreType": "global"})).unwrap();
+        let store = format!("{}\n", alias.join("shared/store/v11").display());
+        super::ensure_source_dependency_install_config(&repo, &implicit, Some(store.as_bytes()))
+            .unwrap();
+        // A link below the shared directory is still refused.
+        std::os::unix::fs::symlink(
+            real.join("shared/repo"),
+            real.join("shared/store/v11/links"),
+        )
+        .unwrap();
+        let error = super::ensure_source_dependency_install_config(
+            &repo,
+            &implicit,
+            Some(store.as_bytes()),
+        )
+        .unwrap_err();
+        assert!(error.contains("refusing to install"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dependency_install_config_checks_lockfile_projects() {
         let root = TempDir::new().unwrap();
         let repo = fs::canonicalize(root.path()).unwrap().join("repo");
@@ -1815,6 +1881,8 @@ mod tests {
         std::os::unix::fs::symlink(&borrowed, repo.join("ui/modules")).unwrap();
         check(serde_json::json!({})).unwrap();
         assert!(check(serde_json::json!({"modulesDir": "modules"})).is_err());
+        // Other projects use only the last component of a multi-component modulesDir.
+        assert!(check(serde_json::json!({"modulesDir": "nested/modules"})).is_err());
         fs::remove_file(repo.join("ui/modules")).unwrap();
         // pnpm writes through a linked project directory.
         fs::create_dir(repo.join("extensions")).unwrap();
@@ -1836,7 +1904,21 @@ mod tests {
         check(serde_json::json!({"sharedWorkspaceLockfile": false, "lockfileDir": "."})).unwrap();
         assert!(check(serde_json::json!({"sharedWorkspaceLockfile": "no"})).is_err());
 
+        // pnpm reads per-branch lockfiles only when they are enabled.
         fs::write(repo.join("pnpm-lock.main.yaml"), "importers: [unclosed\n").unwrap();
+        check(serde_json::json!({})).unwrap();
+        let error = check(serde_json::json!({"gitBranchLockfile": true})).unwrap_err();
+        assert!(error.contains("could not read the projects"), "{error}");
+        fs::write(
+            repo.join("pnpm-lock.main.yaml"),
+            "importers:\n  extensions/b: {}\n",
+        )
+        .unwrap();
+        fs::create_dir(repo.join("extensions/b")).unwrap();
+        std::os::unix::fs::symlink(&borrowed, repo.join("extensions/b/node_modules")).unwrap();
+        check(serde_json::json!({})).unwrap();
+        assert!(check(serde_json::json!({"gitBranchLockfile": true})).is_err());
+        fs::write(repo.join("pnpm-lock.yaml"), "importers: [unclosed\n").unwrap();
         let error = check(serde_json::json!({})).unwrap_err();
         assert!(error.contains("could not read the projects"), "{error}");
     }
