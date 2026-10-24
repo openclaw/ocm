@@ -556,9 +556,10 @@ When OCM shares its terminal job with other processes, for example in
 the foreground, the command stays in that job instead, so the pager or script
 keeps the terminal. Terminal keys then reach every process in the job, and the
 four signals above, sent to OCM, are passed on to the command itself, which may
-therefore see a terminal key twice. In that case processes started by a
-launcher's shell are only signalled if the shell replaces itself with the
-command; `dash`, the usual Linux `sh`, does not.
+therefore see a terminal key twice. For a launcher-bound environment that
+command is the shell running the launcher's recipe, which stays the parent of
+the processes it starts on every platform, so in a shared job a signal sent to
+OCM alone does not reach them.
 
 ### Export one bounded artifact
 
