@@ -441,7 +441,8 @@ OCM refuses an installation that would replace another runtime's registration or
 Names ending in `.json` remain supported when their destinations are available, and `--force` still replaces an unbound runtime of the same name.
 
 Runtime installs unpack into a hidden staging directory and publish it only when they succeed.
-If OCM is interrupted or killed during an install, the next runtime installation of any name removes those staging directories once no OCM process is still installing that runtime.
+If OCM is interrupted or killed during an install, a later install that prepares a new runtime, of any name, removes the leftover staging directory.
+A leftover is kept while another operation holds that runtime's lock and is removed by a later install after the lock is released; removal is best effort, like the cleanup of an ordinary failed install.
 
 ### Package runtime Node.js selection
 
