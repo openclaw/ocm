@@ -366,6 +366,38 @@ pub fn sync_supervisor_env_if_present(
     Ok(true)
 }
 
+/// Delete the service output captured under an environment name before that
+/// name is registered for a new environment. These files live outside the
+/// environment root and are keyed only by name, so they can hold output from an
+/// earlier environment of the same name, including one removed by an older OCM.
+pub(crate) fn discard_child_logs(
+    env_name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(), String> {
+    let logs_dir = supervisor_logs_dir(env, cwd)?;
+    // The daemon writes daemon.<stream>.log. With its default log directory
+    // those are also the child log paths of an env named "daemon"; keep them.
+    if env_name == "daemon" && SupervisorService::new(env, cwd).saved_daemon_logs_dir()? == logs_dir
+    {
+        return Ok(());
+    }
+    for stream in ["stdout", "stderr"] {
+        let path = supervisor_child_log_path(&logs_dir, env_name, stream);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed removing earlier service log {} for env \"{env_name}\": {error}",
+                    display_path(&path)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn sync_supervisor_binding_if_present(
     env: &BTreeMap<String, String>,
     cwd: &Path,
