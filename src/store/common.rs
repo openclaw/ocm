@@ -304,44 +304,75 @@ pub(crate) struct OpenClawDirectoryCopy<'a> {
     databases: HashSet<PathBuf>,
     namespace_links: BTreeMap<PathBuf, (PathBuf, PathBuf)>,
     internal_links: Option<InternalLinkRoots>,
+    copy_root: Option<(PathBuf, PathBuf)>,
 }
 
-// A migrated home must not keep writing into the home it came from. Absolute
-// links that resolve inside the source are re-targeted to the same place in
-// the destination, with the relative form the environment archive uses.
+// A migrated home must not keep reading or writing the home it came from.
+// Absolute links into the source home are re-targeted to the same place in
+// the copy, using the relative form the environment archive uses.
 struct InternalLinkRoots {
     source: PathBuf,
     destination: PathBuf,
 }
 
 impl InternalLinkRoots {
-    fn relocate(&self, target: &Path, destination_link: &Path) -> Option<(PathBuf, bool)> {
-        if !target.is_absolute() {
-            return None;
+    // Match the home prefix as spelled (including aliases of the home) so
+    // in-home link chains and links through in-home external links keep
+    // their meaning. Fall back to full resolution for external aliases.
+    fn source_relative(&self, target: &Path) -> Result<Option<PathBuf>, String> {
+        for ancestor in target.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            if !fs::canonicalize(ancestor).is_ok_and(|resolved| resolved == self.source) {
+                continue;
+            }
+            let remainder = target
+                .strip_prefix(ancestor)
+                .map_err(|error| error.to_string())?;
+            if remainder
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                return Ok(Some(remainder.to_path_buf()));
+            }
+            // Parent components follow links; only full resolution is exact.
+            let resolved = canonicalize_path_allow_missing(target).map_err(|error| {
+                format!(
+                    "cannot relocate a link into the source home: {}: {error}",
+                    target.display()
+                )
+            })?;
+            return Ok(resolved
+                .strip_prefix(&self.source)
+                .ok()
+                .map(Path::to_path_buf));
         }
-        let resolved = canonicalize_path_allow_missing(target).ok()?;
-        let inside = resolved.strip_prefix(&self.source).ok()?;
-        let parent = destination_link
-            .parent()?
-            .strip_prefix(&self.destination)
-            .ok()?;
-        let common = parent
-            .components()
-            .zip(inside.components())
-            .take_while(|(left, right)| left == right)
-            .count();
-        let mut relative = PathBuf::new();
-        for _ in parent.components().skip(common) {
-            relative.push("..");
-        }
-        for part in inside.components().skip(common) {
-            relative.push(part);
-        }
-        if relative.as_os_str().is_empty() {
-            relative.push(".");
-        }
-        Some((relative, resolved.is_dir()))
+        Ok(canonicalize_path_allow_missing(target)
+            .ok()
+            .and_then(|resolved| {
+                resolved
+                    .strip_prefix(&self.source)
+                    .ok()
+                    .map(Path::to_path_buf)
+            }))
     }
+}
+
+fn relative_link_target(link_parent: &Path, target: &Path) -> PathBuf {
+    let common = link_parent
+        .components()
+        .zip(target.components())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in link_parent.components().skip(common) {
+        relative.push("..");
+    }
+    for part in target.components().skip(common) {
+        relative.push(part);
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    relative
 }
 
 impl<'a> OpenClawDirectoryCopy<'a> {
@@ -355,6 +386,7 @@ impl<'a> OpenClawDirectoryCopy<'a> {
             databases: HashSet::new(),
             namespace_links: BTreeMap::new(),
             internal_links: None,
+            copy_root: None,
         })
     }
 
@@ -372,7 +404,69 @@ impl<'a> OpenClawDirectoryCopy<'a> {
 
     pub(crate) fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), String> {
         self.namespace_links = self.selection.namespace_link_targets(source)?;
+        self.copy_root = match self.internal_links {
+            Some(_) => Some((
+                fs::canonicalize(source).map_err(|error| error.to_string())?,
+                destination.to_path_buf(),
+            )),
+            None => None,
+        };
         copy_dir_recursive_inner(source, destination, Some(self), None, false)
+    }
+
+    // Returns the replacement target and whether it names a directory.
+    fn relocated_link_target(
+        &self,
+        source_link: &Path,
+        target: &Path,
+        destination_link: &Path,
+    ) -> Result<Option<(PathBuf, bool)>, String> {
+        let Some(roots) = self.internal_links.as_ref() else {
+            return Ok(None);
+        };
+        if !target.is_absolute() {
+            return Ok(None);
+        }
+        // Links inside protected history keep their authored targets.
+        let link_parent = source_link.parent().ok_or("copied link has no parent")?;
+        let link_location = fs::canonicalize(link_parent)
+            .map_err(|error| error.to_string())?
+            .join(source_link.file_name().ok_or("copied link has no name")?);
+        if link_location
+            .strip_prefix(&roots.source)
+            .is_ok_and(|relative| self.selection.preserves_history(relative))
+        {
+            return Ok(None);
+        }
+        let Some(inside) = roots.source_relative(target)? else {
+            return Ok(None);
+        };
+        // A copy that contains the target keeps its own copy self-contained,
+        // such as an enclosing workspace that holds the home; other copies
+        // point at the environment's state directory.
+        let physical = roots.source.join(&inside);
+        let (relative, base) = match self.copy_root.as_ref().and_then(|(source, destination)| {
+            physical
+                .strip_prefix(source)
+                .ok()
+                .map(|relative| (relative.to_path_buf(), destination))
+        }) {
+            Some(projection) => projection,
+            None => (inside, &roots.destination),
+        };
+        let parent = destination_link
+            .parent()
+            .and_then(|parent| parent.strip_prefix(base).ok())
+            .ok_or_else(|| {
+                format!(
+                    "cannot relocate a link into the source home: {}",
+                    source_link.display()
+                )
+            })?;
+        Ok(Some((
+            relative_link_target(parent, &relative),
+            physical.is_dir(),
+        )))
     }
 
     pub(crate) fn databases(&self) -> &HashSet<PathBuf> {
@@ -536,15 +630,12 @@ fn copy_path_inner(
         } else {
             directory_hint
         };
-        let internal_links = copying
-            .as_ref()
-            .and_then(|copying| copying.internal_links.as_ref());
         return copy_symlink(
             source,
             destination,
             directory_hint,
             namespace_target,
-            internal_links,
+            copying.as_deref(),
         );
     }
     if file_type.is_dir() {
@@ -573,7 +664,7 @@ fn copy_symlink(
     destination_path: &Path,
     _directory_hint: Option<bool>,
     namespace_target: Option<&(PathBuf, PathBuf)>,
-    internal_links: Option<&InternalLinkRoots>,
+    copying: Option<&OpenClawDirectoryCopy<'_>>,
 ) -> Result<(), String> {
     if let Some(parent) = destination_path.parent() {
         ensure_dir(parent)?;
@@ -584,9 +675,10 @@ fn copy_symlink(
             return Err("saved-skill namespace link changed during copying".into());
         }
         (projected.clone(), _directory_hint)
-    } else if let Some((relocated, is_directory)) =
-        internal_links.and_then(|roots| roots.relocate(&target, destination_path))
-    {
+    } else if let Some((relocated, is_directory)) = match copying {
+        Some(copying) => copying.relocated_link_target(source_path, &target, destination_path)?,
+        None => None,
+    } {
         (relocated, Some(is_directory))
     } else {
         (target, _directory_hint)

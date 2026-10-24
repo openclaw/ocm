@@ -2937,6 +2937,13 @@ impl<'a> OpenClawSqliteCopy<'a> {
         Ok(())
     }
 
+    // Takes a path relative to the copied state root.
+    pub(super) fn preserves_history(&self, relative: &Path) -> bool {
+        let path = self.state_root.join(relative);
+        is_integrity_protected_history_path(self.state_root, &path)
+            || self.history.roots.iter().any(|root| path.starts_with(root))
+    }
+
     pub(super) fn contains(&self, path: &Path) -> bool {
         if is_integrity_protected_history_path(self.state_root, path)
             || self.history.roots.iter().any(|root| path.starts_with(root))

@@ -1663,10 +1663,12 @@ fn adopt_import_copies_a_symlinked_external_workspace_into_the_disposable_enviro
 fn migration_retargets_absolute_links_inside_the_source_home_into_the_environment() {
     use std::os::unix::fs::symlink;
 
-    for adopt in [false, true] {
+    for (adopt, enclosing) in [(false, false), (true, false), (false, true), (true, true)] {
+        let scenario = format!("adopt={adopt} enclosing={enclosing}");
         let root = TestDir::new("migration-internal-absolute-links");
         let cwd = root.child("workspace");
-        let source = root.child("legacy-home/.openclaw");
+        let outer = root.child("legacy-home");
+        let source = outer.join(".openclaw");
         let alias = root.child("legacy-alias");
         let external = root.child("external-logs");
         fs::create_dir_all(&cwd).unwrap();
@@ -1674,26 +1676,38 @@ fn migration_retargets_absolute_links_inside_the_source_home_into_the_environmen
         fs::create_dir_all(source.join("data/logs")).unwrap();
         fs::create_dir_all(source.join("data/sessions")).unwrap();
         fs::create_dir_all(source.join("agents/main")).unwrap();
-        fs::create_dir_all(&external).unwrap();
-        fs::write(source.join("openclaw.json"), "{}").unwrap();
+        fs::create_dir_all(source.join("skill-workshop/bundles/demo")).unwrap();
+        fs::create_dir_all(external.join("sub")).unwrap();
+        let config = if enclosing {
+            serde_json::json!({"agents": {"defaults": {"workspace": &outer}}})
+        } else {
+            serde_json::json!({})
+        };
+        fs::write(source.join("openclaw.json"), config.to_string()).unwrap();
         fs::write(source.join("data/logs/gateway.log"), "old-log\n").unwrap();
         fs::write(source.join("data/sessions/s1.jsonl"), "{}\n").unwrap();
-        symlink(root.child("legacy-home"), &alias).unwrap();
+        symlink(&outer, &alias).unwrap();
         let links = [
             ("logs", source.join("data/logs")),
             ("agents/main/sessions", source.join("data/sessions")),
             ("agents/main/pending", source.join("data/pending")),
             ("aliased-sessions", alias.join(".openclaw/data/sessions")),
             ("home", source.clone()),
+            ("current", source.join("data/sessions")),
+            ("latest-sessions", source.join("current")),
+            ("external", external.clone()),
+            ("through-external", source.join("external/sub")),
+            ("loop", source.join("loop")),
+            ("skill-workshop/bundles/demo/link", source.join("data/logs")),
             (
                 "latest.log",
                 Path::new("data/logs/gateway.log").to_path_buf(),
             ),
-            ("external", external.clone()),
         ];
         for (link, target) in &links {
             symlink(target, source.join(link)).unwrap();
         }
+        symlink(source.join("data/logs"), outer.join("outer-logs")).unwrap();
         let mut env = ocm_env(&root);
         install_fake_openclaw_on_path(&root, &mut env);
 
@@ -1709,37 +1723,69 @@ fn migration_retargets_absolute_links_inside_the_source_home_into_the_environmen
             vec!["migrate", "mira", source.to_str().unwrap()]
         };
         let output = run_ocm(&cwd, &env, &args);
-        assert!(
-            output.status.success(),
-            "adopt={adopt}: {}",
-            stderr(&output)
-        );
+        assert!(output.status.success(), "{scenario}: {}", stderr(&output));
 
         let state = root.child("ocm-home/envs/mira/.openclaw");
+        let protected_target = source.join("data/logs");
         let expected = [
             ("logs", Path::new("data/logs")),
             ("agents/main/sessions", Path::new("../../data/sessions")),
             ("agents/main/pending", Path::new("../../data/pending")),
             ("aliased-sessions", Path::new("data/sessions")),
             ("home", Path::new(".")),
-            ("latest.log", Path::new("data/logs/gateway.log")),
+            ("current", Path::new("data/sessions")),
+            ("latest-sessions", Path::new("current")),
             ("external", external.as_path()),
+            ("through-external", Path::new("external/sub")),
+            ("loop", Path::new("loop")),
+            (
+                "skill-workshop/bundles/demo/link",
+                protected_target.as_path(),
+            ),
+            ("latest.log", Path::new("data/logs/gateway.log")),
         ];
-        for (link, target) in expected {
+        let mut copies = vec![state.clone()];
+        if enclosing {
+            let imported: serde_json::Value =
+                serde_json::from_slice(&fs::read(state.join("openclaw.json")).unwrap()).unwrap();
+            let outer_copy = Path::new(
+                imported["agents"]["defaults"]["workspace"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .to_path_buf();
+            // The enclosing workspace copy stays self-contained.
             assert_eq!(
-                fs::read_link(state.join(link)).unwrap(),
-                target,
-                "adopt={adopt} link={link}"
+                fs::read_link(outer_copy.join("outer-logs")).unwrap(),
+                Path::new(".openclaw/data/logs"),
+                "{scenario}"
             );
+            copies.push(outer_copy.join(".openclaw"));
         }
-        let canonical_state = fs::canonicalize(&state).unwrap();
-        for link in ["logs", "agents/main/sessions", "aliased-sessions"] {
-            assert!(
-                fs::canonicalize(state.join(link))
-                    .unwrap()
-                    .starts_with(&canonical_state),
-                "adopt={adopt} link={link}"
-            );
+        for copy in &copies {
+            for (link, target) in &expected {
+                assert_eq!(
+                    &fs::read_link(copy.join(link)).unwrap(),
+                    target,
+                    "{scenario} copy={} link={link}",
+                    copy.display()
+                );
+            }
+            let canonical_copy = fs::canonicalize(copy).unwrap();
+            for link in [
+                "logs",
+                "agents/main/sessions",
+                "aliased-sessions",
+                "latest-sessions",
+            ] {
+                assert!(
+                    fs::canonicalize(copy.join(link))
+                        .unwrap()
+                        .starts_with(&canonical_copy),
+                    "{scenario} copy={} link={link}",
+                    copy.display()
+                );
+            }
         }
         fs::write(state.join("logs/env.log"), "env\n").unwrap();
         fs::write(state.join("agents/main/sessions/env.jsonl"), "{}\n").unwrap();
