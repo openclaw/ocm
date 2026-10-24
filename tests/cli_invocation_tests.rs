@@ -306,10 +306,15 @@ fn reap_if_running(pid: libc::pid_t) -> bool {
     running
 }
 
-/// Send SIGTERM to the OCM process alone, as process managers and harnesses
+/// Send `signal` to the OCM process alone, as process managers and harnesses
 /// do, and require OCM to pass it on and outlive the command's shutdown.
 #[cfg(unix)]
-fn assert_command_receives_termination(fixture: &SignalFixture, label: &str, args: &[&str]) {
+fn assert_command_receives_signal(
+    fixture: &SignalFixture,
+    label: &str,
+    args: &[&str],
+    (signal, name): (libc::c_int, &str),
+) {
     use std::os::unix::process::ExitStatusExt;
 
     let marker = fixture.marker(label);
@@ -322,22 +327,22 @@ fn assert_command_receives_termination(fixture: &SignalFixture, label: &str, arg
         .unwrap();
     let command_pid = ready_pid(&marker);
     assert_eq!(
-        unsafe { libc::kill(process.id() as libc::pid_t, libc::SIGTERM) },
+        unsafe { libc::kill(process.id() as libc::pid_t, signal) },
         0
     );
     let status = wait_with_deadline(&mut process);
     let log = fs::read_to_string(&marker).unwrap();
     let survived = reap_if_running(command_pid);
     assert!(
-        log.contains("signal TERM") && log.ends_with("stopped\n"),
-        "{label}: OCM exited before its command received and finished handling SIGTERM ({status:?}): {log:?}"
+        log.contains(&format!("signal {name}")) && log.ends_with("stopped\n"),
+        "{label}: OCM exited before its command received and finished handling SIG{name} ({status:?}): {log:?}"
     );
     assert!(!survived, "{label}: the command outlived OCM");
     if label == "launcher" {
         // dash runs the recipe under a shell that SIGTERM ends, so OCM ends
         // by the same signal; shells that exec the recipe report its exit.
         assert!(
-            status.code() == Some(0) || status.signal() == Some(libc::SIGTERM),
+            status.code() == Some(0) || status.signal() == Some(signal),
             "{label}: {status:?}"
         );
     } else {
@@ -350,16 +355,87 @@ fn assert_command_receives_termination(fixture: &SignalFixture, label: &str, arg
 fn foreground_runs_relay_termination_to_their_child_and_wait_for_it() {
     let fixture = SignalFixture::new("cli-foreground-termination");
     let openclaw = fixture.openclaw.clone();
-    assert_command_receives_termination(&fixture, "runtime", &["@bound", "--", "gateway", "run"]);
-    assert_command_receives_termination(
+    let term = (libc::SIGTERM, "TERM");
+    assert_command_receives_signal(
+        &fixture,
+        "runtime",
+        &["@bound", "--", "gateway", "run"],
+        term,
+    );
+    assert_command_receives_signal(
         &fixture,
         "launcher",
         &["env", "run", "launched", "--", "gateway", "run"],
+        term,
     );
-    assert_command_receives_termination(
+    assert_command_receives_signal(
         &fixture,
         "exec",
         &["env", "exec", "bound", "--", &openclaw, "gateway", "run"],
+        term,
+    );
+    assert_command_receives_signal(
+        &fixture,
+        "interrupt",
+        &["@bound", "--", "gateway", "run"],
+        (libc::SIGINT, "INT"),
+    );
+    assert_command_receives_signal(
+        &fixture,
+        "hangup",
+        &["@bound", "--", "gateway", "run"],
+        (libc::SIGHUP, "HUP"),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_ignored_signal_stays_ignored_for_the_command() {
+    use std::os::unix::process::CommandExt;
+
+    let fixture = SignalFixture::new("cli-foreground-ignored-signal");
+    let marker = fixture.marker("ignored");
+    let mut command = fixture.command(
+        &[
+            "env",
+            "exec",
+            "bound",
+            "--",
+            "sh",
+            "-c",
+            r#"echo "ready $$" >> "$OCM_TEST_SIGNAL_MARKER"; exec sleep 30"#,
+        ],
+        &marker,
+    );
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // As under nohup.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut process = command.spawn().unwrap();
+    let command_pid = ready_pid(&marker);
+    unsafe {
+        libc::kill(process.id() as libc::pid_t, libc::SIGHUP);
+        libc::kill(command_pid, libc::SIGHUP);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let ocm_running = process.try_wait().unwrap().is_none();
+    let command_running = unsafe { libc::kill(command_pid, 0) } == 0;
+    unsafe {
+        libc::kill(process.id() as libc::pid_t, libc::SIGTERM);
+    }
+    wait_with_deadline(&mut process);
+    reap_if_running(command_pid);
+    assert!(ocm_running, "an ignored SIGHUP stopped OCM");
+    assert!(
+        command_running,
+        "the command lost the inherited SIGHUP ignore"
     );
 }
 
@@ -502,7 +578,7 @@ fn terminal_interrupt_reaches_the_command_once_and_ocm_waits_for_it() {
 fn failed_launch_returns_the_terminal_to_the_caller() {
     let fixture = SignalFixture::new("cli-foreground-terminal-launch-failure");
     // A non-job-control shell shares OCM's process group, so the terminal's
-    // foreground group must be its own again once OCM returns.
+    // foreground group must still be the shell's once OCM returns.
     let mut command = Command::new("sh");
     command
         .args([
@@ -545,4 +621,123 @@ fn failed_launch_returns_the_terminal_to_the_caller() {
         "the terminal's foreground group was not handed back: {}",
         terminal.output()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_partners_keep_the_terminal() {
+    use std::io::Write;
+
+    let fixture = SignalFixture::new("cli-foreground-terminal-pipeline");
+    // Like `ocm env exec ... | less`: the reader shares OCM's terminal job and,
+    // once the command is producing, reads a key from the terminal while the
+    // command fills the pipe.
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            r#""$0" env exec bound -- sh -c 'i=0; while [ "$i" -lt 20000 ]; do echo "line $i"; i=$((i + 1)); done' | { read first; read key </dev/tty; echo "pager read $key"; wc -l | tr -d ' ' | sed 's/^/pager counted /'; }"#,
+        ])
+        .arg(crate::support::ocm_test_binary_path())
+        .current_dir(&fixture.cwd)
+        .env_clear()
+        .envs(&fixture.env);
+    let mut terminal = OnTerminal::spawn(command);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    terminal.master.write_all(b"q\n").unwrap();
+    let status = wait_with_deadline(&mut terminal.process);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !terminal.output().contains("pager counted") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{status:?}: {}",
+            terminal.output()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = terminal.output();
+    assert!(output.contains("pager read q"), "{output}");
+    assert!(output.contains("pager counted 19999"), "{output}");
+    assert!(status.success(), "{status:?}: {output}");
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_job_control_suspends_and_resumes_ocm_with_its_command() {
+    use std::io::Write;
+
+    let fixture = SignalFixture::new("cli-foreground-job-control");
+    let marker = fixture.marker("job-control");
+    let mut command = Command::new("bash");
+    command
+        .args(["--norc", "--noprofile", "-i"])
+        .current_dir(&fixture.cwd)
+        .env_clear()
+        .envs(&fixture.env)
+        .env("PS1", "job-test$ ")
+        .env("OCM_TEST_SIGNAL_MARKER", &marker)
+        .env("OCM_BIN", crate::support::ocm_test_binary_path());
+    let mut terminal = OnTerminal::spawn(command);
+    let wait_for = |terminal: &OnTerminal, check: &dyn Fn(&str) -> bool, what: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !check(&terminal.output()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: {}",
+                terminal.output()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let state = |pid: libc::pid_t| {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    wait_for(&terminal, &|output| output.contains("job-test$ "), "prompt");
+    terminal
+        .master
+        .write_all(b"\"$OCM_BIN\" @bound -- gateway run\n")
+        .unwrap();
+    let command_pid = ready_pid(&marker);
+
+    terminal.master.write_all(b"\x1a").unwrap();
+    wait_for(
+        &terminal,
+        &|output| output.contains("Stopped"),
+        "Ctrl-Z did not stop the job",
+    );
+    assert!(
+        state(command_pid).starts_with('T'),
+        "{}",
+        state(command_pid)
+    );
+
+    terminal.master.write_all(b"fg\n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while state(command_pid).starts_with('T') {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fg did not resume the command"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    terminal.master.write_all(b"\x03").unwrap();
+    wait_for_marker(&marker, "stopped");
+    terminal.master.write_all(b"echo \"rc=$?\"\n").unwrap();
+    wait_for(
+        &terminal,
+        &|output| output.contains("rc=0"),
+        "OCM's exit status",
+    );
+    let log = fs::read_to_string(&marker).unwrap();
+    assert_eq!(log.matches("signal ").count(), 1, "{log:?}");
+    assert!(log.contains("signal INT"), "{log:?}");
+    terminal.master.write_all(b"exit\n").unwrap();
+    wait_with_deadline(&mut terminal.process);
+    assert!(!reap_if_running(command_pid), "the command outlived OCM");
 }

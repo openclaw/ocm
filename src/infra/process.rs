@@ -89,7 +89,9 @@ mod foreground {
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::Duration;
 
-    use crate::infra::process_identity::observe_process;
+    use crate::infra::process_identity::{
+        observe_process, process_group_has_live_members, process_group_members,
+    };
 
     /// Signals that ask a foreground command to stop. SIGKILL cannot be relayed.
     const RELAYED: [libc::c_int; 4] = [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
@@ -102,10 +104,12 @@ mod foreground {
     static OWNER: AtomicI32 = AtomicI32::new(0);
     static RECEIVED: AtomicU64 = AtomicU64::new(0);
 
-    /// The child leads its own process group, as a shell job does, so a stop
-    /// request reaches launcher shells and their descendants together. When
-    /// OCM owns the terminal, the group takes the terminal while it runs and
-    /// terminal keys reach it once, directly.
+    /// The child normally leads its own process group, as a shell job does,
+    /// so a stop request reaches launcher shells and their descendants
+    /// together. When OCM owns the terminal, that group takes the terminal
+    /// while it runs and terminal keys reach it once, directly. When OCM shares
+    /// its terminal job with other processes, such as a pager reading its
+    /// output, the child stays in that job so they all keep the terminal.
     pub(super) fn run(process: &mut Command) -> io::Result<ExitStatus> {
         let _ownership = OWNERSHIP
             .lock()
@@ -130,21 +134,24 @@ mod foreground {
 
     fn spawn_and_wait(process: &mut Command) -> io::Result<(ExitStatus, Option<libc::c_int>)> {
         let mut terminal = Terminal::observe();
-        let take_terminal = terminal.owned;
-        unsafe {
-            process.pre_exec(move || {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                if take_terminal {
-                    super::assign_terminal_foreground(libc::getpid())?;
-                }
-                Ok(())
-            });
+        let isolate = !terminal.owned || alone_in_process_group();
+        if isolate {
+            let take_terminal = terminal.owned;
+            unsafe {
+                process.pre_exec(move || {
+                    if libc::setpgid(0, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if take_terminal {
+                        super::assign_terminal_foreground(libc::getpid())?;
+                    }
+                    Ok(())
+                });
+            }
+            // The child can claim the terminal and still fail to exec, so
+            // reclaim it on every path.
+            terminal.assigned = take_terminal;
         }
-        // The child can claim the terminal and still fail to exec, so reclaim
-        // it on every path.
-        terminal.assigned = take_terminal;
         let mut child = match process.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -152,19 +159,35 @@ mod foreground {
                 return Err(error);
             }
         };
-        let group = child.id() as libc::pid_t;
+        let pid = child.id() as libc::pid_t;
+        let target = if isolate {
+            Target::Group(pid)
+        } else {
+            Target::SharedJob(pid)
+        };
 
         let mut relayed = 0_u64;
-        // Without an observer thread OCM can still wait, but not relay.
-        if let Ok(exited) = watch_exit(group) {
-            loop {
-                relayed |= relay_received(group);
-                match exited.recv_timeout(RELAY_INTERVAL) {
+        let exited = watch_exit(pid).ok();
+        loop {
+            relayed |= relay_received(target);
+            let done = match &exited {
+                Some(exited) => match exited.recv_timeout(RELAY_INTERVAL) {
                     // A failed observation also ends here; reaping below
                     // reports the same failure instead of hanging.
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                    Err(RecvTimeoutError::Timeout) => terminal.follow_stopped_child(group),
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => true,
+                    Err(RecvTimeoutError::Timeout) => false,
+                },
+                // No observer thread: poll instead.
+                None => {
+                    std::thread::sleep(RELAY_INTERVAL);
+                    has_exited(pid)
                 }
+            };
+            if done {
+                break;
+            }
+            if isolate {
+                terminal.follow_stopped_child(pid);
             }
         }
         let status = child.wait();
@@ -174,10 +197,11 @@ mod foreground {
             terminal.owned && matches!(death, Some(libc::SIGINT | libc::SIGQUIT | libc::SIGHUP));
         // A shell leader can exit before the processes it started finish
         // handling the same stop request. The group ID stays reserved while
-        // any member remains, so it is safe to probe after reaping.
-        if relayed != 0 || terminal_stop {
-            while unsafe { libc::kill(-group, 0) } == 0 {
-                relayed |= relay_received(group);
+        // any member remains. Waiting is best effort: an unreadable process
+        // list ends it.
+        if isolate && (relayed != 0 || terminal_stop) {
+            while process_group_has_live_members(pid as u32).unwrap_or(false) {
+                relayed |= relay_received(target);
                 std::thread::sleep(RELAY_INTERVAL);
             }
         }
@@ -188,6 +212,23 @@ mod foreground {
         Ok((status?, stop_request))
     }
 
+    #[derive(Clone, Copy)]
+    enum Target {
+        /// The command leads its own process group.
+        Group(libc::pid_t),
+        /// The command shares OCM's foreground terminal job.
+        SharedJob(libc::pid_t),
+    }
+
+    /// Whether OCM is the only process in its process group. Any doubt keeps
+    /// the command in OCM's job, the behavior OCM had before owning commands.
+    pub(super) fn alone_in_process_group() -> bool {
+        let pid = std::process::id();
+        let group = unsafe { libc::getpgrp() } as u32;
+        process_group_members(group)
+            .is_ok_and(|members| members.iter().all(|member| member.identity.pid == pid))
+    }
+
     /// Report when the leader exits, leaving it unreaped so its process group
     /// ID cannot be reused while OCM still signals that group.
     fn watch_exit(pid: libc::pid_t) -> io::Result<mpsc::Receiver<()>> {
@@ -195,31 +236,8 @@ mod foreground {
         std::thread::Builder::new()
             .name("ocm-foreground-wait".to_string())
             .spawn(move || {
-                loop {
-                    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-                    let waited = unsafe {
-                        libc::waitid(
-                            libc::P_PID,
-                            pid as libc::id_t,
-                            &mut info,
-                            libc::WEXITED | libc::WNOWAIT,
-                        )
-                    };
-                    if waited == -1 {
-                        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        break;
-                    }
+                while !wait_for_exit(pid, 0) {
                     // Darwin can report a stopped child despite WEXITED.
-                    if unsafe { info.si_pid() } == pid
-                        && matches!(
-                            info.si_code,
-                            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
-                        )
-                    {
-                        break;
-                    }
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 let _ = sender.send(());
@@ -227,18 +245,61 @@ mod foreground {
         Ok(receiver)
     }
 
-    fn relay_received(group: libc::pid_t) -> u64 {
+    fn has_exited(pid: libc::pid_t) -> bool {
+        wait_for_exit(pid, libc::WNOHANG)
+    }
+
+    /// Whether the leader has exited, without reaping it. An observation
+    /// failure also reports true, so the caller reaps and reports it.
+    fn wait_for_exit(pid: libc::pid_t, options: libc::c_int) -> bool {
+        loop {
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let waited = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | options,
+                )
+            };
+            if waited == -1 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return true;
+            }
+            return unsafe { info.si_pid() } == pid
+                && matches!(
+                    info.si_code,
+                    libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                );
+        }
+    }
+
+    fn relay_received(target: Target) -> u64 {
         let mut relayed = 0;
         for signal in take_received() {
-            unsafe {
-                libc::kill(-group, signal);
+            match target {
+                Target::Group(group) => unsafe {
+                    libc::kill(-group, signal);
+                },
+                // The terminal delivers SIGINT, SIGQUIT and SIGHUP to the
+                // whole job, command included; only SIGTERM needs passing on.
+                Target::SharedJob(pid) if signal == libc::SIGTERM => unsafe {
+                    libc::kill(pid, signal);
+                },
+                Target::SharedJob(_) => continue,
             }
             relayed |= signal_bit(signal);
         }
         if relayed != 0 {
-            // A stopped group could not act on the request.
+            // A stopped command could not act on the request.
+            let target = match target {
+                Target::Group(group) => -group,
+                Target::SharedJob(pid) => pid,
+            };
             unsafe {
-                libc::kill(-group, libc::SIGCONT);
+                libc::kill(target, libc::SIGCONT);
             }
         }
         relayed
@@ -371,5 +432,89 @@ mod foreground {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn failed_launch_returns_the_terminal_to_ocm() {
+        const CHILD: &str = "OCM_TEST_FOREGROUND_TERMINAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The check needs its own session and controlling terminal.
+            let (mut master, mut slave) = (-1, -1);
+            let opened = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut::<libc::c_char>(),
+                    std::ptr::null_mut::<libc::termios>(),
+                    std::ptr::null_mut::<libc::winsize>(),
+                )
+            };
+            assert_eq!(opened, 0, "{}", std::io::Error::last_os_error());
+            let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+            let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "infra::process::tests::failed_launch_returns_the_terminal_to_ocm",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave));
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1
+                        || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            drop(command);
+            let reader = std::thread::spawn(move || {
+                let mut output = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while let Ok(count) = master.read(&mut buffer) {
+                    if count == 0 {
+                        break;
+                    }
+                    output.extend_from_slice(&buffer[..count]);
+                }
+                String::from_utf8_lossy(&output).into_owned()
+            });
+            let status = child.wait().unwrap();
+            let output = reader.join().unwrap();
+            assert!(status.success(), "{output}");
+            return;
+        }
+        // As a session leader alone in its group, OCM hands the terminal to
+        // the command it starts.
+        assert!(super::foreground::alone_in_process_group());
+        let result = super::run_direct(
+            "definitely-not-a-real-command",
+            &[],
+            &BTreeMap::new(),
+            Path::new("/"),
+        );
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) },
+            unsafe { libc::getpgrp() },
+            "the terminal stayed with the command that failed to launch"
+        );
     }
 }

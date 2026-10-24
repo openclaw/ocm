@@ -33,9 +33,9 @@ use crate::env::{
 use crate::infra::process::run_direct;
 #[cfg(unix)]
 use crate::infra::process::set_terminal_foreground_process_group;
-#[cfg(unix)]
-use crate::infra::process_identity::process_group_members;
 use crate::infra::process_identity::{ProcessIdentity, observe_process, process_scope_id};
+#[cfg(unix)]
+use crate::infra::process_identity::{process_group_has_live_members, process_group_members};
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
 use crate::infra::terminal::{Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table};
 use crate::openclaw_repo::{
@@ -3758,7 +3758,7 @@ fn stop_source_watch_child(
 fn wait_for_unix_process_group_to_stop(process_group: u32) -> Result<(), String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
-        if !unix_process_group_has_live_members(process_group)? {
+        if !process_group_has_live_members(process_group)? {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
@@ -3768,86 +3768,6 @@ fn wait_for_unix_process_group_to_stop(process_group: u32) -> Result<(), String>
         }
         thread::sleep(Duration::from_millis(25));
     }
-}
-
-#[cfg(target_os = "linux")]
-fn unix_process_group_has_live_members(process_group: u32) -> Result<bool, String> {
-    for entry in fs::read_dir("/proc")
-        .map_err(|error| format!("failed reading /proc for source watch processes: {error}"))?
-    {
-        let entry = entry.map_err(|error| {
-            format!("failed reading /proc entry for source watch processes: {error}")
-        })?;
-        if !entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
-        {
-            continue;
-        }
-        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        let Some((_, fields)) = stat.rsplit_once(") ") else {
-            continue;
-        };
-        let fields = fields.split_whitespace().collect::<Vec<_>>();
-        let is_zombie = matches!(fields.first().copied(), Some("Z" | "X"));
-        let in_group =
-            fields.get(2).and_then(|value| value.parse::<u32>().ok()) == Some(process_group);
-        if in_group && !is_zombie {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(target_os = "macos")]
-fn unix_process_group_has_live_members(process_group: u32) -> Result<bool, String> {
-    let capacity = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    if capacity <= 0 {
-        return Err(format!(
-            "failed listing source watch processes: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let mut pids = vec![0_i32; capacity as usize];
-    let count = unsafe {
-        libc::proc_listallpids(
-            pids.as_mut_ptr().cast(),
-            (pids.len() * std::mem::size_of::<i32>()) as i32,
-        )
-    };
-    if count < 0 {
-        return Err(format!(
-            "failed reading source watch process list: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    for pid in pids.into_iter().take(count as usize).filter(|pid| *pid > 0) {
-        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
-        let read = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                std::ptr::from_mut(&mut info).cast(),
-                std::mem::size_of_val(&info) as i32,
-            )
-        };
-        if read == std::mem::size_of_val(&info) as i32
-            && info.pbi_pgid == process_group
-            && info.pbi_status != libc::SZOMB
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn unix_process_group_has_live_members(process_group: u32) -> Result<bool, String> {
-    signal_unix_process_group(process_group, 0)
 }
 
 #[cfg(unix)]
@@ -3864,7 +3784,7 @@ fn signal_unix_process_group(process_group: u32, signal: i32) -> Result<bool, St
 fn signal_unix_process_group_for_cleanup(process_group: u32, signal: i32) -> Result<bool, String> {
     match signal_unix_process_group(process_group, signal) {
         Ok(signaled) => Ok(signaled),
-        Err(signal_error) => match unix_process_group_has_live_members(process_group) {
+        Err(signal_error) => match process_group_has_live_members(process_group) {
             Ok(false) => Ok(false),
             Ok(true) => Err(signal_error),
             Err(verification_error) => Err(format!("{signal_error}; {verification_error}")),
