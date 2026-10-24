@@ -6,7 +6,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::host::{verify_official_openclaw_runtime_host, verify_package_runtime_host};
 use crate::infra::download::{
@@ -356,7 +356,17 @@ enum OfficialRuntimeInstallTarget {
 impl Drop for RuntimeInstallTarget {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.install_root);
+        live_runtime_stages().remove(&self.install_root);
     }
+}
+
+/// Stage roots of the `RuntimeInstallTarget`s alive in this process.
+static LIVE_RUNTIME_STAGES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+fn live_runtime_stages() -> MutexGuard<'static, BTreeSet<PathBuf>> {
+    LIVE_RUNTIME_STAGES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Clone, Copy)]
@@ -2626,12 +2636,14 @@ fn prepare_runtime_install_target_with_lock(
     if path_exists(&final_meta_path) && !replace_existing {
         return Err(format!("runtime \"{name}\" already exists"));
     }
+    reclaim_abandoned_runtime_stages(parent, &name, env, cwd);
     let install_root = parent.join(format!(
         ".{name}.stage-{}-{}",
         std::process::id(),
         now_utc().unix_timestamp_nanos()
     ));
     let _ = fs::remove_dir_all(&install_root);
+    live_runtime_stages().insert(install_root.clone());
     let install_files = install_root.join("files");
     Ok(RuntimeInstallTarget {
         name,
@@ -2641,6 +2653,69 @@ fn prepare_runtime_install_target_with_lock(
         install_files,
         _lock: lock,
     })
+}
+
+/// Returns the runtime name of a stage directory name created by
+/// `prepare_runtime_install_target_with_lock`.
+fn parse_runtime_stage_name(file_name: &str) -> Option<&str> {
+    let (name, suffix) = file_name.strip_prefix('.')?.rsplit_once(".stage-")?;
+    let (pid, nanos) = suffix.split_once('-')?;
+    let nanos = nanos.strip_prefix('-').unwrap_or(nanos);
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    (digits(pid) && digits(nanos)).then_some(name)
+}
+
+/// Removes stage directories whose install ended without dropping its
+/// `RuntimeInstallTarget`, such as an OCM process killed by a signal.
+///
+/// A stage is live only while its runtime's mutation lock is held. The caller
+/// holds `held`'s lock, so only this process's targets can own a live stage of
+/// it, and those are registered in `LIVE_RUNTIME_STAGES`. Any
+/// other runtime's stage is claimed only while this call holds that runtime's
+/// lock, by renaming it into `held`'s namespace, so removing a large tree does
+/// not keep that runtime busy for its bindings and installs.
+fn reclaim_abandoned_runtime_stages(
+    runtimes_dir: &Path,
+    held: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) {
+    let Ok(entries) = fs::read_dir(runtimes_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str().and_then(parse_runtime_stage_name) else {
+            continue;
+        };
+        let path = entry.path();
+        if validate_name(name, "Runtime name").ok().as_deref() != Some(name)
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            || live_runtime_stages().contains(&path)
+        {
+            continue;
+        }
+        if name == held {
+            let _ = fs::remove_dir_all(&path);
+            continue;
+        }
+        let Ok(lock_path) = runtime_lock_path(name, env, cwd) else {
+            continue;
+        };
+        let Ok(Some(owner)) = super::try_lock_file(&lock_path, "runtime mutation") else {
+            continue;
+        };
+        let claimed = runtimes_dir.join(format!(
+            ".{held}.stage-{}-{}",
+            std::process::id(),
+            now_utc().unix_timestamp_nanos()
+        ));
+        let moved = !path_exists(&claimed) && fs::rename(&path, &claimed).is_ok();
+        drop(owner);
+        if moved {
+            let _ = fs::remove_dir_all(&claimed);
+        }
+    }
 }
 
 fn prepare_official_runtime_install_target(
@@ -4042,6 +4117,106 @@ mod tests {
         )
         .unwrap();
         (root, env, binary)
+    }
+
+    #[test]
+    fn runtime_stage_names_parse_only_their_own_shape() {
+        for (file_name, parsed) in [
+            (".stable.stage-12-34", Some("stable")),
+            (".2026.3.21.stage-7--34", Some("2026.3.21")),
+            (".x.stage-1-2.stage-3-4", Some("x.stage-1-2")),
+            ("stable.stage-12-34", None),
+            (".stable.stage-12-", None),
+            (".stable.stage-+12-34", None),
+            (".stable.stage-12-34a", None),
+            (".stable.pack-12-34", None),
+            (".stable.backup-34", None),
+        ] {
+            assert_eq!(
+                super::parse_runtime_stage_name(file_name),
+                parsed,
+                "{file_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_install_preparation_reclaims_only_abandoned_stages() {
+        let (root, env, _) = binding_fixture();
+        let cwd = root.path();
+        let runtimes = root.path().join("store/runtimes");
+        let stage = |name: &str, pid: u32| {
+            let path = runtimes.join(format!(".{name}.stage-{pid}-1"));
+            std::fs::create_dir_all(path.join("files")).unwrap();
+            std::fs::write(path.join("files/payload"), "partial").unwrap();
+            path
+        };
+        let stages_of = |name: &str| {
+            let prefix = format!(".{name}.stage-");
+            let mut stages = std::fs::read_dir(&runtimes)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(&prefix)
+                })
+                .collect::<Vec<_>>();
+            stages.sort();
+            stages
+        };
+        // A killed earlier process may have had this process's id.
+        let reused_pid = stage("candidate", std::process::id());
+        let other_runtime = stage("other", std::process::id().wrapping_add(1));
+        let busy_guard = super::try_lock_runtime_mutation("busy", &env, cwd).unwrap();
+        let busy = stage("busy", 1);
+        let invalid_name = stage(".hidden", 1);
+        let not_directory = runtimes.join(".file.stage-1-2");
+        std::fs::write(&not_directory, "file").unwrap();
+
+        let guard =
+            std::sync::Arc::new(super::lock_runtime_mutation("candidate", &env, cwd).unwrap());
+        let context = super::InstallContext {
+            env: &env,
+            cwd,
+            runtime_guard: Some(&guard),
+        };
+        let live =
+            super::prepare_runtime_install_target("candidate".into(), false, context).unwrap();
+        std::fs::create_dir_all(&live.install_files).unwrap();
+        assert!(!reused_pid.exists());
+        assert!(!other_runtime.exists());
+        assert!(busy.join("files/payload").exists());
+        assert!(invalid_name.join("files/payload").exists());
+        assert!(not_directory.exists());
+
+        let next =
+            super::prepare_runtime_install_target("candidate".into(), false, context).unwrap();
+        assert_eq!(stages_of("candidate"), [live.install_root.clone()]);
+        drop(next);
+        let live_root = live.install_root.clone();
+        drop(live);
+        assert!(!live_root.exists());
+        drop(guard);
+        drop(busy_guard);
+
+        drop(
+            super::prepare_runtime_install_target(
+                "candidate".into(),
+                false,
+                super::InstallContext {
+                    env: &env,
+                    cwd,
+                    runtime_guard: None,
+                },
+            )
+            .unwrap(),
+        );
+        assert!(!busy.exists());
+        assert!(stages_of("candidate").is_empty());
+        assert!(stages_of("busy").is_empty());
     }
 
     #[test]

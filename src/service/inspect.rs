@@ -12,7 +12,7 @@ use super::platform::{
 use crate::cli::render::format_rfc3339;
 use crate::env::GatewayProcessSpec;
 use crate::env::{EnvMeta, EnvironmentService};
-use crate::store::{display_path, list_environments, supervisor_logs_dir};
+use crate::store::{display_path, gateway_url_for_launch, list_environments, supervisor_logs_dir};
 use crate::supervisor::{
     SupervisorChildSpec, SupervisorDaemonSummary, SupervisorInspection, SupervisorRuntimeChild,
     SupervisorRuntimeService, SupervisorService,
@@ -65,6 +65,9 @@ pub struct ServiceSummary {
     pub args: Vec<String>,
     pub run_dir: String,
     pub gateway_port: u32,
+    /// Only for formatted single-env status; the JSON status contract has no URL.
+    #[serde(skip)]
+    pub gateway_url: Option<String>,
     pub installed: bool,
     pub loaded: bool,
     pub running: bool,
@@ -139,6 +142,7 @@ pub fn list_services(
             env,
             cwd,
             &snapshot,
+            false,
         )?);
     }
 
@@ -162,11 +166,50 @@ pub fn service_status_fast(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<ServiceSummary, String> {
+    service_status_observation(name, env, cwd, false)
+}
+
+/// Status with the advertised Gateway URL, which reads the Gateway TLS setting.
+pub fn service_status_with_gateway_url(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<ServiceSummary, String> {
+    service_status_observation(name, env, cwd, true)
+}
+
+fn service_status_observation(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    include_gateway_url: bool,
+) -> Result<ServiceSummary, String> {
     let env_service = EnvironmentService::new(env, cwd);
     let meta = env_service.get(name)?;
     let snapshot = load_service_snapshot(env, cwd, false)?;
 
-    build_service_summary(&env_service, &meta, env, cwd, &snapshot)
+    let mut status = build_service_summary(
+        &env_service,
+        &meta,
+        env,
+        cwd,
+        &snapshot,
+        include_gateway_url,
+    )?;
+    if include_gateway_url {
+        // A running child uses the persisted plan the daemon launched, as
+        // readiness observes it, not the plan rebuilt from this caller. An
+        // unreadable plan keeps the current one rather than failing status.
+        if let Ok(Some(child)) = running_child_spec(name, env, cwd, &snapshot, &status) {
+            status.gateway_url = Some(gateway_url_for_launch(
+                &meta,
+                status.gateway_port,
+                Path::new(&child.run_dir),
+                &child.process_env,
+            ));
+        }
+    }
+    Ok(status)
 }
 
 pub(crate) fn service_status_for_readiness(
@@ -185,7 +228,18 @@ pub(super) fn service_readiness_observation(
     let env_service = EnvironmentService::new(env, cwd);
     let meta = env_service.get(name)?;
     let snapshot = load_service_snapshot(env, cwd, true)?;
-    let status = build_service_summary(&env_service, &meta, env, cwd, &snapshot)?;
+    let status = build_service_summary(&env_service, &meta, env, cwd, &snapshot, false)?;
+    let child = running_child_spec(name, env, cwd, &snapshot, &status)?;
+    Ok((status, child))
+}
+
+fn running_child_spec(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    snapshot: &ServiceSnapshot,
+    status: &ServiceSummary,
+) -> Result<Option<SupervisorChildSpec>, String> {
     // Informational plans are rebuilt from the caller environment. Readiness
     // needs the persisted plan actually consumed by the spawning daemon, which
     // self-update intentionally preserves across executable replacement.
@@ -194,7 +248,11 @@ pub(super) fn service_readiness_observation(
     } else {
         None
     };
-    let child = child.filter(|planned| {
+    // A new plan can be published before its replacement child starts. Never
+    // query the new configuration on behalf of the still-running old child.
+    // Older records have no spec hash and retain their authoritative observed
+    // child port, which may differ from the currently planned port.
+    Ok(child.filter(|planned| {
         snapshot.runtime_children.get(name).is_none_or(|running| {
             running.binding_kind == planned.binding_kind
                 && running.binding_name == planned.binding_name
@@ -203,12 +261,7 @@ pub(super) fn service_readiness_observation(
                     .as_ref()
                     .is_none_or(|hash| planned.launch_spec_sha256().as_ref() == Some(hash))
         })
-    });
-    // A new plan can be published before its replacement child starts. Never
-    // query the new configuration on behalf of the still-running old child.
-    // Older records have no spec hash and retain their authoritative observed
-    // child port, which may differ from the currently planned port.
-    Ok((status, child))
+    }))
 }
 
 fn load_service_snapshot(
@@ -262,6 +315,7 @@ fn build_service_summary(
     env: &BTreeMap<String, String>,
     cwd: &Path,
     snapshot: &ServiceSnapshot,
+    include_gateway_url: bool,
 ) -> Result<ServiceSummary, String> {
     let planned_child = snapshot.planned_children.get(&meta.name);
     let skipped_reason = snapshot.skipped_envs.get(&meta.name);
@@ -281,6 +335,25 @@ fn build_service_summary(
         .as_ref()
         .and_then(|result| result.as_ref().err().cloned());
     let resolved_process = resolved_process.and_then(Result::ok);
+    // Without a running child, use the planned or resolved launch context.
+    let gateway_url =
+        include_gateway_url.then(|| match (planned_child, resolved_process.as_ref()) {
+            (Some(child), _) => gateway_url_for_launch(
+                meta,
+                gateway_port,
+                Path::new(&child.run_dir),
+                &child.process_env,
+            ),
+            (None, Some(process)) => {
+                gateway_url_for_launch(meta, gateway_port, &process.run_dir, &process.process_env)
+            }
+            (None, None) => gateway_url_for_launch(
+                meta,
+                gateway_port,
+                Path::new(&meta.root),
+                &crate::infra::shell::build_openclaw_env(meta, env),
+            ),
+        });
     let logs_dir = supervisor_logs_dir(env, cwd)?;
     let fallback_stdout = display_path(&logs_dir.join(format!("{}.stdout.log", meta.name)));
     let fallback_stderr = display_path(&logs_dir.join(format!("{}.stderr.log", meta.name)));
@@ -395,6 +468,7 @@ fn build_service_summary(
             })
             .unwrap_or_else(|| meta.root.clone()),
         gateway_port,
+        gateway_url,
         installed,
         loaded,
         running,

@@ -134,6 +134,84 @@ fn env_export_excludes_its_output_inside_the_source() {
     }
 }
 
+#[test]
+fn export_excludes_its_output_inside_preserved_skill_namespaces() {
+    // Saved skill namespaces are preserved byte for byte by state-inclusive
+    // export, but the archive's own staging file is never part of it.
+    let mut locations = vec![
+        ("skill-workshop", ".openclaw/skill-workshop"),
+        ("skill-library", ".openclaw/skill-library/demo-skill"),
+    ];
+    #[cfg(unix)]
+    locations.push(("alias-target", ".openclaw/library-store"));
+    for (label, relative_cwd) in locations {
+        for include_state in [true, false] {
+            let root = TestDir::new("export-output-skill-namespace");
+            let env = ocm_env(&root);
+            let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source");
+            let library = if label == "alias-target" {
+                ".openclaw/library-store"
+            } else {
+                ".openclaw/skill-library"
+            };
+            let revision = format!("{library}/demo-skill/revisions/{}/SKILL.md", "a".repeat(64));
+            write_text(&source.join(&revision), "saved revision");
+            write_text(
+                &source.join(".openclaw/skill-workshop/proposals/demo/PROPOSAL.md"),
+                "proposal",
+            );
+            #[cfg(unix)]
+            if label == "alias-target" {
+                std::os::unix::fs::symlink("library-store", source.join(".openclaw/skill-library"))
+                    .unwrap();
+            }
+            let cwd = source.join(relative_cwd);
+            let mut args = vec!["env", "export", "source"];
+            if include_state {
+                args.push("--include-state");
+            }
+
+            let exported = run_ocm(&cwd, &env, &args);
+            assert!(exported.status.success(), "{}", stderr(&exported));
+            let output = cwd.join("source.ocm-env.tar");
+            let members = tar::Archive::new(fs::File::open(&output).unwrap())
+                .entries()
+                .unwrap()
+                .map(|entry| {
+                    entry
+                        .unwrap()
+                        .path()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>();
+            let own = members
+                .iter()
+                .filter(|member| {
+                    let name = member.rsplit('/').next().unwrap_or_default();
+                    name.starts_with(".ocm-export-") || name == "source.ocm-env.tar"
+                })
+                .collect::<Vec<_>>();
+            assert!(own.is_empty(), "{label}, state={include_state}: {own:?}");
+            if include_state {
+                assert!(
+                    members.contains(&format!("root/{revision}")),
+                    "{label}: saved revision missing from {members:?}"
+                );
+            }
+            let left = fs::read_dir(&cwd)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".ocm-export-"))
+                .collect::<Vec<_>>();
+            assert!(left.is_empty(), "{label}: staging left behind: {left:?}");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn default_export_selects_equivalent_workspace_root_spellings() {
@@ -1709,6 +1787,100 @@ fn env_default_import_preserves_non_directory_agent_payload() {
         fs::read(source.join("pending-agent")).unwrap(),
         b"preserved authored file"
     );
+}
+
+#[test]
+fn env_default_export_import_retains_shared_skills_and_clawhub_tracking() {
+    let root = TestDir::new("default-export-shared-skills");
+    let env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    let payloads = [
+        (
+            "skills/tide-tables/SKILL.md",
+            "---\nname: tide-tables\ndescription: Tide lookup\n---\nUse tides.sh.\n",
+        ),
+        ("skills/tide-tables/scripts/tides.sh", "#!/bin/sh\nexit 0\n"),
+        (
+            "skills/tide-tables/.clawhub/origin.json",
+            r#"{"version":1,"registry":"https://clawhub.ai","slug":"tide-tables","installedVersion":"1.0.0","installedAt":1}"#,
+        ),
+        (
+            ".clawhub/lock.json",
+            r#"{"version":1,"skills":{"tide-tables":{"version":"1.0.0","installedAt":1}}}"#,
+        ),
+        (
+            "skills/team-runbook/SKILL.md",
+            "---\nname: team-runbook\ndescription: Authored by hand\n---\nFollow steps.md.\n",
+        ),
+        ("skills/team-runbook/steps.md", "1. Check the gateway.\n"),
+        (
+            "workspace/skills/ws-skill/SKILL.md",
+            "---\nname: ws-skill\ndescription: Workspace skill\n---\n",
+        ),
+        (
+            "extensions/demo/openclaw.plugin.json",
+            "{\"id\":\"demo\"}\n",
+        ),
+    ];
+    for (path, contents) in payloads {
+        write_text(&source.join(path), contents);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            source.join("skills/tide-tables/scripts/tides.sh"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+    }
+
+    let archive = root.child("source.tar");
+    let exported = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let imported = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+
+    let target = root.child("ocm-home/envs/target/.openclaw");
+    for (path, contents) in payloads {
+        assert_eq!(
+            fs::read_to_string(target.join(path)).unwrap(),
+            contents,
+            "{path} should survive default export and import"
+        );
+        assert_eq!(fs::read_to_string(source.join(path)).unwrap(), contents);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(target.join("skills/tide-tables/scripts/tides.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o750);
+    }
 }
 
 #[cfg(unix)]

@@ -8,7 +8,9 @@ use crate::managed_node::{
     OPENCLAW_MIN_NODE_VERSION, OPENCLAW_NODE_VERSION_REQUIREMENT, managed_node_fallback_detail,
     managed_node_fallback_supported,
 };
-use crate::service::{ServiceManagerKind, service_manager_kind};
+use crate::service::{
+    ServiceManagerKind, service_backend_support_error, service_manager_binary, service_manager_kind,
+};
 use crate::store::resolve_user_home;
 
 const INTERNAL_NPM_BIN_ENV: &str = "OCM_INTERNAL_NPM_BIN";
@@ -700,77 +702,68 @@ fn chrome_check(env: &BTreeMap<String, String>) -> HostCheckSummary {
 }
 
 fn service_manager_check(env: &BTreeMap<String, String>) -> HostCheckSummary {
-    match service_manager_kind(env) {
-        ServiceManagerKind::Launchd => match tool_version("launchctl", &["help"]) {
-            Ok(_) => check(
-                "background-services",
-                "launchd",
-                "Keep envs running in the background",
-                HostCheckLevel::Recommended,
-                HostCheckStatus::Ok,
-                HostCheckNotes::new(None, Some("launchd is available".to_string()), None),
-            ),
-            Err(detail) => check(
-                "background-services",
-                "launchd",
-                "Keep envs running in the background",
-                HostCheckLevel::Recommended,
-                HostCheckStatus::Missing,
-                HostCheckNotes::new(
-                    None,
-                    Some(detail),
-                    Some(
-                        "Use --no-service or make sure launchd is available on this machine."
-                            .to_string(),
-                    ),
-                ),
-            ),
-        },
-        ServiceManagerKind::SystemdUser => match tool_version("systemctl", &["--version"]) {
-            Ok(summary) => check(
-                "background-services",
-                "systemd --user",
-                "Keep envs running in the background",
-                HostCheckLevel::Recommended,
-                HostCheckStatus::Ok,
-                HostCheckNotes::new(
-                    Some(summary.version),
-                    Some("systemd --user service support is available".to_string()),
-                    None,
-                ),
-            ),
-            Err(detail) => check(
-                "background-services",
-                "systemd --user",
-                "Keep envs running in the background",
-                HostCheckLevel::Recommended,
-                HostCheckStatus::Missing,
-                HostCheckNotes::new(
-                    None,
-                    Some(detail),
-                    Some(
-                        "Use --no-service or install systemd user services on this machine."
-                            .to_string(),
-                    ),
-                ),
-            ),
-        },
-        ServiceManagerKind::Unsupported => check(
-            "background-services",
-            "managed services",
-            "Keep envs running in the background",
-            HostCheckLevel::Recommended,
-            HostCheckStatus::Missing,
-            HostCheckNotes::new(
-                None,
-                Some("managed services are not supported on this platform yet".to_string()),
-                Some(
-                    "Use --no-service and run OpenClaw directly inside the env for now."
-                        .to_string(),
-                ),
-            ),
+    // Probe the same binary the service gate below uses.
+    let kind = service_manager_kind(env);
+    let binary = service_manager_binary(env, kind);
+    let (name, probe, available_detail, missing_suggestion, session_suggestion) = match kind {
+        ServiceManagerKind::Launchd => (
+            "launchd",
+            tool_version(binary, &["help"]).map(|_| None),
+            "launchd is available",
+            "Use --no-service or make sure launchd is available on this machine.",
+            "Use --no-service, or run OCM in the logged-in user's session so launchctl can reach its launchd domain.",
         ),
-    }
+        ServiceManagerKind::SystemdUser => (
+            "systemd --user",
+            tool_version(binary, &["--version"]).map(|summary| Some(summary.version)),
+            "systemd --user service support is available",
+            "Use --no-service or install systemd user services on this machine.",
+            "Use --no-service, or run OCM in a login session that can reach the systemd user manager (sudo, su and cron shells usually cannot).",
+        ),
+        ServiceManagerKind::Unsupported => {
+            return check(
+                "background-services",
+                "managed services",
+                "Keep envs running in the background",
+                HostCheckLevel::Recommended,
+                HostCheckStatus::Missing,
+                HostCheckNotes::new(
+                    None,
+                    Some("managed services are not supported on this platform yet".to_string()),
+                    Some(
+                        "Use --no-service and run OpenClaw directly inside the env for now."
+                            .to_string(),
+                    ),
+                ),
+            );
+        }
+    };
+    let (status, notes) = match probe {
+        Err(detail) => (
+            HostCheckStatus::Missing,
+            HostCheckNotes::new(None, Some(detail), Some(missing_suggestion.to_string())),
+        ),
+        // Report the same session check that start, setup, service and dev --service
+        // apply before they use the service manager.
+        Ok(version) => match service_backend_support_error(env) {
+            None => (
+                HostCheckStatus::Ok,
+                HostCheckNotes::new(version, Some(available_detail.to_string()), None),
+            ),
+            Some(detail) => (
+                HostCheckStatus::Missing,
+                HostCheckNotes::new(version, Some(detail), Some(session_suggestion.to_string())),
+            ),
+        },
+    };
+    check(
+        "background-services",
+        name,
+        "Keep envs running in the background",
+        HostCheckLevel::Recommended,
+        status,
+        notes,
+    )
 }
 
 fn tool_check(

@@ -1214,6 +1214,24 @@ pub(crate) fn gateway_readiness_host(
     Ok(GatewayReadinessHost::Address(std::net::Ipv4Addr::LOCALHOST))
 }
 
+/// Loopback Gateway URL for a launch context, using readiness's TLS decision.
+/// Display callers never run native config lookups; observed TLS selects HTTPS.
+pub(crate) fn gateway_url_for_launch(
+    meta: &EnvMeta,
+    port: u32,
+    run_dir: &Path,
+    env: &BTreeMap<String, String>,
+) -> String {
+    let mut tls = false;
+    // The certificate is irrelevant here; only the transport decision is used.
+    let _ = gateway_readiness_certificate(meta, port, run_dir, env, &mut tls, || Ok(None));
+    loopback_gateway_url(port, tls)
+}
+
+pub(crate) fn loopback_gateway_url(port: u32, tls: bool) -> String {
+    format!("{}://127.0.0.1:{port}", if tls { "https" } else { "http" })
+}
+
 /// Resolve only public TLS material; the Gateway owns key loading and generation.
 pub(crate) fn gateway_readiness_certificate(
     meta: &EnvMeta,
@@ -2633,6 +2651,48 @@ mod tests {
         );
         assert_eq!(fs::read(&paths.config_path).unwrap(), original);
         assert!(!paths.state_dir.join("gateway/tls/gateway-key.pem").exists());
+    }
+
+    #[test]
+    fn gateway_url_for_launch_uses_the_readiness_tls_decision() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = derive_env_paths(&root.path().join("environment"));
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        let meta = meta("demo", paths.root.to_str().unwrap(), Some(18789));
+        let env = BTreeMap::new();
+        let url = |config: Value| {
+            fs::write(&paths.config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            gateway_url_for_launch(&meta, 18789, root.path(), &env)
+        };
+        assert_eq!(url(json!({"gateway":{}})), "http://127.0.0.1:18789");
+        assert_eq!(
+            url(json!({"gateway":{"tls":{"enabled":false}}})),
+            "http://127.0.0.1:18789"
+        );
+        // The transport does not depend on a readable certificate or on a
+        // native lookup of a templated certificate path.
+        assert_eq!(
+            url(json!({"gateway":{"tls":{"enabled":true}}})),
+            "https://127.0.0.1:18789"
+        );
+        assert_eq!(
+            url(json!({"gateway":{"tls":{"enabled":true,"certPath":"${UNSET_CERT}"}}})),
+            "https://127.0.0.1:18789"
+        );
+        // TLS observed before an unreadable include is still TLS evidence.
+        let known = paths.config_path.with_file_name("known-tls.json");
+        fs::write(&known, r#"{"gateway":{"tls":{"enabled":true}}}"#).unwrap();
+        let outside = root.path().join("shared.json");
+        fs::write(&outside, "{}").unwrap();
+        assert_eq!(
+            url(json!({"$include": [known, outside]})),
+            "https://127.0.0.1:18789"
+        );
+        // An invalid setting is not TLS evidence.
+        assert_eq!(
+            url(json!({"gateway":{"tls":{"enabled":"yes"}}})),
+            "http://127.0.0.1:18789"
+        );
     }
 
     #[test]

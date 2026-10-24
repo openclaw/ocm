@@ -27,10 +27,14 @@ use crate::env::{
     RestoreEnvSnapshotOptions, resolve_runtime_run_dir,
 };
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
-use crate::openclaw_repo::detect_openclaw_checkout;
+use crate::openclaw_repo::{
+    detect_openclaw_checkout, ensure_source_dependency_install_config,
+    ensure_source_dependency_install_target, source_dependency_install_needs_store_path,
+};
 use crate::runtime::releases::{
     OpenClawRelease, compare_runtime_release_versions, is_official_openclaw_releases_url,
     normalize_openclaw_channel_selector, official_openclaw_releases_url,
+    select_official_openclaw_release_by_channel,
 };
 use crate::runtime::{
     InstallRuntimeFromOfficialReleaseOptions, OfficialRuntimePrepareAction, RuntimeMeta,
@@ -709,12 +713,7 @@ impl Cli {
                     .count(),
                 skipped: results
                     .iter()
-                    .filter(|summary| {
-                        matches!(
-                            summary.outcome.as_str(),
-                            "pinned" | "local-command" | "manual-runtime"
-                        )
-                    })
+                    .filter(|summary| is_skipped_upgrade_outcome(&summary.outcome))
                     .count(),
                 restarted: results
                     .iter()
@@ -2115,16 +2114,11 @@ impl Cli {
                 }
             }
             (None, Some(channel)) => {
-                if releases
-                    .iter()
-                    .any(|release| release.channel.as_deref() == Some(channel))
-                {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "OpenClaw release channel \"{channel}\" was not found; simulation did not create any scenario envs"
-                    ))
-                }
+                select_official_openclaw_release_by_channel(&releases, channel)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        format!("{error}; simulation did not create any scenario envs")
+                    })
             }
             _ => Err(
                 "upgrade simulate requires a published version, channel, or local repo path"
@@ -2259,10 +2253,32 @@ impl Cli {
             return Ok(());
         }
 
+        // Admit the install the way `ocm dev` does before any write: inherited
+        // pnpm settings can send it to another checkout or through a link.
+        let process_env = build_openclaw_env(meta, &self.env);
+        ensure_source_dependency_install_target(worktree_root, &process_env)?;
+        let config = read_simulation_pnpm_destinations(
+            worktree_root,
+            &process_env,
+            &["config", "list", "--json"],
+        )?;
+        let store = if source_dependency_install_needs_store_path(worktree_root, &config)? {
+            Some(read_simulation_pnpm_destinations(
+                worktree_root,
+                &process_env,
+                &["store", "path"],
+            )?)
+        } else {
+            None
+        };
+        ensure_source_dependency_install_config(worktree_root, &config, store.as_deref())?;
+
+        // Admission checks the projects in the checkout's lockfile, so the
+        // install must not add others.
         let output = Command::new("pnpm")
-            .arg("install")
+            .args(["install", "--frozen-lockfile"])
             .env_clear()
-            .envs(build_openclaw_env(meta, &self.env))
+            .envs(&process_env)
             .current_dir(worktree_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2573,11 +2589,22 @@ impl Cli {
             target_runtime: None,
         };
         let operation_lock = &command_locks;
+        let env = self.environment_service().get(name)?;
+
+        // A dev env runs its checkout, which OCM never updates. Report it before
+        // the dev-session mutation guard because the skip changes nothing.
+        if env.default_runtime.is_none()
+            && env.default_launcher.is_none()
+            && env.dev.is_some()
+            && !target.is_explicit()
+        {
+            return Ok(dev_checkout_summary(name));
+        }
+
         if !options.dry_run {
             self.environment_service()
                 .ensure_source_watch_allows_state_mutation_locked(name)?;
         }
-        let env = self.environment_service().get(name)?;
 
         if let Some(runtime_name) = env.default_runtime.as_deref() {
             return self.upgrade_runtime_bound_env(
@@ -6367,6 +6394,32 @@ fn release_version_from_output(actual: &str, hint: Option<&str>) -> Option<Strin
         .map(str::to_string)
 }
 
+/// Reads pnpm's reported dependency destinations without echoing the output,
+/// which may contain private configuration values.
+fn read_simulation_pnpm_destinations(
+    source_root: &Path,
+    process_env: &BTreeMap<String, String>,
+    args: &[&str],
+) -> Result<Vec<u8>, String> {
+    let output = Command::new("pnpm")
+        .args(args)
+        .env_clear()
+        .envs(process_env)
+        .current_dir(source_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("failed reading pnpm dependency destinations: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read pnpm dependency destinations; inspect `pnpm {}` in the selected checkout before retrying the simulation",
+            args.join(" ")
+        ));
+    }
+    Ok(output.stdout)
+}
+
 fn simulation_env_name(source_name: &str, scenario: &str) -> String {
     format!(
         "{}-{}-sim-{}",
@@ -6627,6 +6680,31 @@ fn is_changed_upgrade_outcome(outcome: &str) -> bool {
 
 fn is_failed_upgrade_outcome(outcome: &str) -> bool {
     matches!(outcome, "failed" | "rolled-back" | "rollback-failed")
+}
+
+pub(crate) fn is_skipped_upgrade_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "pinned" | "local-command" | "manual-runtime" | "dev-checkout"
+    )
+}
+
+fn dev_checkout_summary(env_name: &str) -> UpgradeEnvSummary {
+    UpgradeEnvSummary {
+        source: None,
+        env_name: env_name.to_string(),
+        previous_binding_kind: "dev".to_string(),
+        previous_binding_name: "dev".to_string(),
+        binding_kind: "dev".to_string(),
+        binding_name: "dev".to_string(),
+        outcome: "dev-checkout".to_string(),
+        runtime_release_version: None,
+        runtime_release_channel: None,
+        service_action: None,
+        snapshot_id: None,
+        rollback: None,
+        note: Some("this env runs its dev checkout; update that checkout outside ocm".to_string()),
+    }
 }
 
 fn outcome_for_official_prepare_action(action: &OfficialRuntimePrepareAction) -> String {

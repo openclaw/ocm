@@ -17,6 +17,7 @@ use crate::env::{
     CloneEnvironmentOptions, CreateEnvSnapshotOptions, CreateEnvironmentOptions, EnvMeta,
     EnvSnapshotSummary, EnvSummary, ExportEnvironmentOptions, ImportEnvironmentOptions,
     RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions, SourceWatchSession, SourceWatchState,
+    openclaw_command_words,
 };
 use crate::infra::process::{run_direct, run_shell};
 use crate::infra::process_identity::ProcessIdentity;
@@ -30,28 +31,6 @@ use crate::store::{
     clear_skip_bootstrap_for_openclaw_onboarding, derive_env_paths, summarize_env, validate_name,
 };
 
-fn is_openclaw_root_option_value(value: &str) -> bool {
-    if value.is_empty() || value == "--" {
-        return false;
-    }
-    if !value.starts_with('-') {
-        return true;
-    }
-    let Some(number) = value.strip_prefix('-') else {
-        return false;
-    };
-    let mut parts = number.split('.');
-    let Some(integer) = parts.next() else {
-        return false;
-    };
-    !integer.is_empty()
-        && integer.chars().all(|ch| ch.is_ascii_digit())
-        && parts.next().is_none_or(|fraction| {
-            !fraction.is_empty() && fraction.chars().all(|ch| ch.is_ascii_digit())
-        })
-        && parts.next().is_none()
-}
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EnvDestroyStepSummary {
@@ -62,50 +41,9 @@ pub(crate) struct EnvDestroyStepSummary {
 pub(crate) type EnvDestroyProcessIdentity = ProcessIdentity;
 
 fn managed_gateway_lifecycle_action(args: &[String]) -> Option<&str> {
-    let mut command = None;
-    let mut action = None;
-    let mut index = 0;
-    while index < args.len() && action.is_none() {
-        let arg = args.get(index)?.as_str();
-        if arg == "--" {
-            break;
-        }
-        let consumed = match arg {
-            "--dev" | "--no-color" => 1,
-            "--profile" | "--log-level" | "--container" => {
-                if args
-                    .get(index + 1)
-                    .is_some_and(|value| is_openclaw_root_option_value(value))
-                {
-                    2
-                } else {
-                    1
-                }
-            }
-            _ if arg.starts_with("--profile=")
-                || arg.starts_with("--log-level=")
-                || arg.starts_with("--container=") =>
-            {
-                1
-            }
-            _ => 0,
-        };
-        if consumed > 0 {
-            index += consumed;
-            continue;
-        }
-        if !arg.starts_with('-') {
-            if command.is_none() {
-                command = Some(arg);
-            } else {
-                action = Some(arg);
-            }
-        }
-        index += 1;
-    }
-
-    let command = command?;
-    let action = action?;
+    let mut words = openclaw_command_words(args);
+    let command = words.next()?;
+    let action = words.next()?;
     if !matches!(command, "gateway" | "daemon") {
         return None;
     }
@@ -170,7 +108,10 @@ struct EnvDestroyState<'a> {
 }
 
 fn should_clear_skip_bootstrap_for_openclaw_args(args: &[String]) -> bool {
-    if !matches!(args.first().map(String::as_str), Some("onboard" | "setup")) {
+    if !matches!(
+        openclaw_command_words(args).next(),
+        Some("onboard" | "setup")
+    ) {
         return false;
     }
 
@@ -1429,11 +1370,11 @@ impl Cli {
             return Err("environment name is required".to_string());
         };
         Self::assert_no_extra_args(&args[1..])?;
+        let shell = resolve_shell_name(shell_name.as_deref(), &self.env)?;
 
         let meta = self
             .environment_service()
             .apply_effective_gateway_port(self.environment_service().touch(name)?)?;
-        let shell = resolve_shell_name(shell_name.as_deref(), &self.env);
         self.stdout_text(&render_use_script(&meta, &shell, &self.env))?;
         Ok(0)
     }
@@ -1574,10 +1515,15 @@ impl Cli {
         match resolved {
             crate::env::ResolvedExecution::Launcher {
                 env,
+                launcher_name,
                 command,
                 run_dir,
-                ..
-            } => run_shell(&command, &build_openclaw_env(&env, &self.env), &run_dir),
+            } => run_shell(
+                &command,
+                &format!("launcher \"{launcher_name}\""),
+                &build_openclaw_env(&env, &self.env),
+                &run_dir,
+            ),
             crate::env::ResolvedExecution::Runtime {
                 env,
                 program,

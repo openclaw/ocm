@@ -997,7 +997,22 @@ fn install_fake_simulation_pnpm(
     fs::create_dir_all(&bin_dir).unwrap();
     let pnpm = r#"#!/bin/sh
 case "$1" in
+  config)
+    if [ -n "${OCM_TEST_PNPM_CONFIG_EXIT:-}" ]; then
+      printf 'private configuration diagnostic\n' >&2
+      exit "$OCM_TEST_PNPM_CONFIG_EXIT"
+    fi
+    if [ -n "${OCM_TEST_PNPM_CONFIG:-}" ]; then
+      printf '%s\n' "$OCM_TEST_PNPM_CONFIG"
+    else
+      printf '{}\n'
+    fi
+    exit 0
+    ;;
   install)
+    if [ -n "${OCM_TEST_PNPM_INSTALL_LOG:-}" ]; then
+      printf '%s\n' "$*" >> "$OCM_TEST_PNPM_INSTALL_LOG"
+    fi
     mkdir -p node_modules/.pnpm node_modules/.bin
     touch node_modules/.bin/tsx
     exit 0
@@ -3498,6 +3513,169 @@ fn upgrade_simulate_errors_before_cloning_when_published_target_is_missing() {
     assert_eq!(envs[0]["name"], "demo");
 }
 
+#[cfg(unix)]
+struct ChannelSimulation {
+    _root: TestDir,
+    cwd: PathBuf,
+    env: BTreeMap<String, String>,
+    output: std::process::Output,
+}
+
+#[cfg(unix)]
+fn simulate_published_channel(label: &str, dist_tags: &str, channel: &str) -> ChannelSimulation {
+    let root = TestDir::new(label);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let versions = ["2026.3.24", "2026.3.25-beta.1", "2026.3.25"];
+    let mut tarball_servers = Vec::new();
+    let mut version_entries = Vec::new();
+    for version in versions {
+        let tarball = openclaw_package_tarball(&recording_openclaw_script(version), version);
+        let integrity = sha512_integrity(&tarball);
+        let server = TestHttpServer::serve_bytes_times(
+            &format!("/openclaw-{version}.tgz"),
+            "application/octet-stream",
+            &tarball,
+            10,
+        );
+        version_entries.push(format!(
+            "\"{version}\":{{\"version\":\"{version}\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{integrity}\"}}}}",
+            server.url()
+        ));
+        tarball_servers.push(server);
+    }
+    let packument = format!(
+        "{{\"dist-tags\":{dist_tags},\"versions\":{{{}}},\"time\":{{\"2026.3.24\":\"2026-03-25T16:35:52.000Z\",\"2026.3.25-beta.1\":\"2026-03-26T09:00:00.000Z\",\"2026.3.25\":\"2026-03-27T09:00:00.000Z\"}}}}",
+        version_entries.join(",")
+    );
+    let packument_server = TestHttpServer::serve_bytes_times(
+        "/openclaw",
+        "application/json",
+        packument.as_bytes(),
+        12,
+    );
+
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
+        packument_server.url(),
+    );
+
+    let start = run_ocm(
+        &cwd,
+        &env,
+        &["start", "demo", "--version", "2026.3.24", "--no-service"],
+    );
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    let output = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "simulate",
+            "demo",
+            "--to",
+            channel,
+            "--keep-simulations",
+            "--json",
+        ],
+    );
+    ChannelSimulation {
+        _root: root,
+        cwd,
+        env,
+        output,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_simulate_accepts_channels_that_share_a_version_with_a_higher_priority_tag() {
+    for (label, dist_tags, channel, version) in [
+        (
+            "upgrade-simulate-beta-overlap",
+            "{\"latest\":\"2026.3.25\",\"beta\":\"2026.3.25\"}",
+            "beta",
+            "2026.3.25",
+        ),
+        (
+            "upgrade-simulate-dev-overlap",
+            "{\"latest\":\"2026.3.24\",\"beta\":\"2026.3.25-beta.1\",\"dev\":\"2026.3.25-beta.1\"}",
+            "dev",
+            "2026.3.25-beta.1",
+        ),
+    ] {
+        let simulation = simulate_published_channel(label, dist_tags, channel);
+        let simulate = &simulation.output;
+        assert!(
+            simulate.status.success(),
+            "{channel}\nstdout:\n{}\nstderr:\n{}",
+            stdout(simulate),
+            stderr(simulate)
+        );
+        let json: Value = serde_json::from_str(&stdout(simulate)).unwrap();
+        assert_eq!(json["sourceEnv"], "demo");
+        assert_eq!(json["outcome"], "passed", "{json:#}");
+
+        let sim_name = json["simulationEnv"].as_str().unwrap();
+        let shown = run_ocm(
+            &simulation.cwd,
+            &simulation.env,
+            &["env", "show", sim_name, "--json"],
+        );
+        assert!(shown.status.success(), "{}", stderr(&shown));
+        let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+        let sim_root = Path::new(shown["root"].as_str().unwrap());
+        let command_log = fs::read_to_string(sim_root.join("sim-commands.log")).unwrap();
+        assert!(
+            command_log.contains(&format!(
+                "update --dry-run --json --no-restart --yes --channel {channel}"
+            )),
+            "{command_log}"
+        );
+
+        let runtime_name = json["toBindingName"].as_str().unwrap();
+        let runtime = run_ocm(
+            &simulation.cwd,
+            &simulation.env,
+            &["runtime", "show", runtime_name, "--json"],
+        );
+        assert!(runtime.status.success(), "{}", stderr(&runtime));
+        let runtime: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
+        assert_eq!(runtime["releaseVersion"], version, "{runtime:#}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_simulate_errors_before_cloning_when_published_channel_is_missing() {
+    let simulation = simulate_published_channel(
+        "upgrade-simulate-missing-channel",
+        "{\"latest\":\"2026.3.25\",\"beta\":\"2026.3.25\"}",
+        "dev",
+    );
+    let simulate = &simulation.output;
+    assert!(!simulate.status.success(), "{}", stdout(simulate));
+    assert!(stdout(simulate).is_empty(), "{}", stdout(simulate));
+    let error = stderr(simulate);
+    assert!(
+        error.contains(
+            "OpenClaw release channel \"dev\" was not found; simulation did not create any scenario envs"
+        ),
+        "{error}"
+    );
+
+    let list = run_ocm(&simulation.cwd, &simulation.env, &["env", "list", "--json"]);
+    assert!(list.status.success(), "{}", stderr(&list));
+    let envs: Value = serde_json::from_str(&stdout(&list)).unwrap();
+    let envs = envs.as_array().unwrap();
+    assert_eq!(envs.len(), 1, "{envs:#?}");
+    assert_eq!(envs[0]["name"], "demo");
+}
+
 #[test]
 fn upgrade_simulate_runs_openclaw_update_contract_checks_for_published_targets() {
     let root = TestDir::new("upgrade-simulate-contract");
@@ -3935,6 +4113,140 @@ fi
                     .is_file()
             );
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_simulate_admits_pnpm_destinations_before_installing() {
+    for case in [
+        "physical",
+        "modules-inside-checkout",
+        "modules-outside-checkout",
+        "workspace-override",
+        "linked-store",
+        "failed-config",
+    ] {
+        let root = TestDir::new(&format!("upgrade-simulate-pnpm-destinations-{case}"));
+        let cwd = root.path();
+        let repo = init_openclaw_repo(&root);
+        let mut env = ocm_env(&root);
+        install_fake_node_and_npm(&root, &mut env, "22.22.3");
+        install_fake_simulation_pnpm(&root, &mut env);
+        env.insert("OCM_TEST_SIMULATION_DOCTOR_OK".to_string(), "1".to_string());
+        let install_log = root.child("pnpm-install.log");
+        env.insert(
+            "OCM_TEST_PNPM_INSTALL_LOG".to_string(),
+            path_string(&install_log),
+        );
+        // Another owner's dependency tree, which inherited pnpm settings name.
+        let borrowed = root.child("borrowed-store");
+        fs::create_dir_all(&borrowed).unwrap();
+        fs::write(borrowed.join("lock.yaml"), "existing borrowed lock\n").unwrap();
+        let started = run_ocm(
+            cwd,
+            &env,
+            &[
+                "start",
+                "demo",
+                "--command",
+                "pnpm openclaw",
+                "--cwd",
+                &path_string(&repo),
+                "--no-service",
+            ],
+        );
+        assert!(started.status.success(), "{}", stderr(&started));
+        match case {
+            "modules-inside-checkout" => {
+                env.insert(
+                    "PNPM_CONFIG_MODULES_DIR".to_string(),
+                    "installed-modules".to_string(),
+                );
+            }
+            "modules-outside-checkout" => {
+                env.insert(
+                    "PNPM_CONFIG_MODULES_DIR".to_string(),
+                    path_string(&borrowed),
+                );
+            }
+            "workspace-override" => {
+                env.insert(
+                    "PNPM_CONFIG_WORKSPACE_DIR".to_string(),
+                    path_string(&borrowed),
+                );
+            }
+            "linked-store" => {
+                let link = root.child("linked-store");
+                std::os::unix::fs::symlink(&borrowed, &link).unwrap();
+                env.insert(
+                    "OCM_TEST_PNPM_CONFIG".to_string(),
+                    serde_json::json!({
+                        "virtualStoreDir": path_string(&link),
+                        "unrelatedPrivateValue": "do-not-render",
+                    })
+                    .to_string(),
+                );
+            }
+            "failed-config" => {
+                env.insert("OCM_TEST_PNPM_CONFIG_EXIT".to_string(), "1".to_string());
+            }
+            _ => {}
+        }
+
+        let simulated = run_ocm(
+            cwd,
+            &env,
+            &[
+                "upgrade",
+                "simulate",
+                "demo",
+                "--to",
+                &path_string(&repo),
+                "--json",
+            ],
+        );
+        let result: Value = serde_json::from_str(&stdout(&simulated)).unwrap();
+        let prepare = result["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "prepare target")
+            .unwrap_or_else(|| panic!("{case}: {result:#}"));
+        let rendered = format!("{}{}", stdout(&simulated), stderr(&simulated));
+        assert!(!rendered.contains("do-not-render"), "{case}");
+        assert!(
+            !rendered.contains("private configuration diagnostic"),
+            "{case}"
+        );
+        assert_eq!(
+            fs::read_to_string(borrowed.join("lock.yaml")).unwrap(),
+            "existing borrowed lock\n",
+            "{case}"
+        );
+        assert_eq!(fs::read_dir(&borrowed).unwrap().count(), 1, "{case}");
+        if matches!(case, "physical" | "modules-inside-checkout") {
+            assert_eq!(prepare["status"], "passed", "{case}: {result:#}");
+            assert_eq!(result["outcome"], "passed", "{case}: {result:#}");
+            assert_eq!(
+                fs::read_to_string(&install_log).unwrap(),
+                "install --frozen-lockfile\n",
+                "{case}"
+            );
+            continue;
+        }
+        assert!(!simulated.status.success(), "{case}: {result:#}");
+        assert_eq!(prepare["status"], "failed", "{case}: {result:#}");
+        assert!(!install_log.exists(), "{case}");
+        let note = prepare["note"].as_str().unwrap();
+        let expected = match case {
+            "modules-outside-checkout" => "resolves outside the selected checkout",
+            "workspace-override" => "selects the pnpm workspace",
+            "linked-store" => "refusing to install OpenClaw source dependencies through",
+            _ => "could not read pnpm dependency destinations",
+        };
+        assert!(note.contains(expected), "{case}: {note}");
+        assert_eq!(result["cleanup"], "cleaned", "{case}: {result:#}");
     }
 }
 
@@ -8973,6 +9285,206 @@ fn upgrade_all_updates_safe_envs_and_skips_local_or_pinned_ones() {
     assert_eq!(json["current"], 0);
     assert_eq!(json["skipped"], 2);
     assert_eq!(json["failed"], 0);
+}
+
+const DEV_CHECKOUT_NOTE: &str = "this env runs its dev checkout; update that checkout outside ocm";
+
+fn create_borrowed_dev_env(
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    name: &str,
+    checkout: &Path,
+) -> PathBuf {
+    write_text(&checkout.join("package.json"), "{\"name\":\"openclaw\"}\n");
+    write_text(&checkout.join("scripts/run-node.mjs"), "");
+    let initialized = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(checkout)
+        .output()
+        .unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let checkout = fs::canonicalize(checkout).unwrap();
+    ocm::env::EnvironmentService::new(env, cwd)
+        .create(ocm::env::CreateEnvironmentOptions {
+            name: name.to_string(),
+            root: None,
+            gateway_port: None,
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: None,
+            dev: Some(ocm::env::EnvDevMeta::Borrowed {
+                source_root: path_string(&checkout),
+            }),
+            protected: false,
+        })
+        .unwrap();
+    checkout
+}
+
+fn assert_dev_checkout_skip(result: &Value, name: &str) {
+    assert_eq!(result["envName"], name, "{result}");
+    assert_eq!(result["outcome"], "dev-checkout", "{result}");
+    assert_eq!(result["previousBindingKind"], "dev", "{result}");
+    assert_eq!(result["previousBindingName"], "dev", "{result}");
+    assert_eq!(result["bindingKind"], "dev", "{result}");
+    assert_eq!(result["bindingName"], "dev", "{result}");
+    assert_eq!(result["note"], DEV_CHECKOUT_NOTE, "{result}");
+    assert!(result["snapshotId"].is_null(), "{result}");
+}
+
+fn batch_result<'a>(json: &'a Value, name: &str) -> &'a Value {
+    json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["envName"] == name)
+        .unwrap_or_else(|| panic!("missing {name}: {json}"))
+}
+
+#[test]
+fn upgrade_all_reports_dev_envs_as_skipped_without_rebinding_them() {
+    let root = TestDir::new("upgrade-all-dev-envs");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let manual = root.child("manual-openclaw");
+    write_executable_script(&manual, &recording_openclaw_script("2026.3.24"));
+    let added = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "manual", "--path", &path_string(&manual)],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "manual-env", "--runtime", "manual"],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+
+    let control = run_ocm(&cwd, &env, &["upgrade", "--all", "--json"]);
+    assert!(control.status.success(), "{}", stderr(&control));
+    let control: Value = serde_json::from_str(&stdout(&control)).unwrap();
+    assert_eq!(control["count"], 1);
+    assert_eq!(control["skipped"], 1);
+    assert_eq!(control["failed"], 0);
+
+    create_borrowed_dev_env(&env, &cwd, "luna", &root.child("luna-checkout"));
+    let repo = root.child("repo");
+    let worktree = repo.join(".worktrees/sol");
+    fs::create_dir_all(&worktree).unwrap();
+    support::register_owned_dev_env(&repo, &worktree, "sol", &env, &cwd);
+    let registry = env_registry_path(&env, &cwd).unwrap();
+    let registry_before = fs::read(&registry).unwrap();
+
+    for args in [
+        vec!["upgrade", "--all", "--dry-run", "--json"],
+        vec!["upgrade", "--all", "--json"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(
+            output.status.success(),
+            "{args:?}: stderr:\n{}\nstdout:\n{}",
+            stderr(&output),
+            stdout(&output)
+        );
+        let json: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(json["count"], 3, "{args:?}: {json}");
+        assert_eq!(json["changed"], 0, "{args:?}: {json}");
+        assert_eq!(json["skipped"], 3, "{args:?}: {json}");
+        assert_eq!(json["failed"], 0, "{args:?}: {json}");
+        assert_eq!(
+            batch_result(&json, "manual-env")["outcome"],
+            "manual-runtime"
+        );
+        assert_dev_checkout_skip(batch_result(&json, "luna"), "luna");
+        assert_dev_checkout_skip(batch_result(&json, "sol"), "sol");
+        assert_eq!(fs::read(&registry).unwrap(), registry_before, "{args:?}");
+    }
+
+    let text = run_ocm(&cwd, &env, &["upgrade", "--all"]);
+    assert!(text.status.success(), "{}", stderr(&text));
+    let text = stdout(&text);
+    assert!(text.contains("dev-checkout"), "{text}");
+    assert!(text.contains("dev:dev"), "{text}");
+    assert!(!text.contains("unknown"), "{text}");
+    assert!(!text.contains("set-runtime"), "{text}");
+
+    let single = run_ocm(&cwd, &env, &["upgrade", "luna", "--json"]);
+    assert!(single.status.success(), "{}", stderr(&single));
+    assert_dev_checkout_skip(&serde_json::from_str(&stdout(&single)).unwrap(), "luna");
+
+    // Moving a dev env to a release is an explicit choice that stays refused here.
+    let explicit = run_ocm(&cwd, &env, &["upgrade", "luna", "--runtime", "manual"]);
+    assert!(!explicit.status.success(), "{}", stdout(&explicit));
+    assert!(
+        stderr(&explicit).contains("does not have a runtime or launcher binding"),
+        "{}",
+        stderr(&explicit)
+    );
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_all_skips_a_dev_env_while_its_dev_session_is_active() {
+    use fs2::FileExt;
+
+    let root = TestDir::new("upgrade-all-active-dev");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let checkout = create_borrowed_dev_env(&env, &cwd, "luna", &root.child("luna-checkout"));
+    fs::create_dir_all(checkout.join("extensions")).unwrap();
+    write_text(&checkout.join("openclaw.mjs"), "console.log('dev');\n");
+    let watch = ocm::store::source_watch_override_path("luna", &env, &cwd).unwrap();
+    fs::create_dir_all(watch.parent().unwrap()).unwrap();
+    let mut lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(watch.with_extension("lock"))
+        .unwrap();
+    lease.lock_exclusive().unwrap();
+    writeln!(lease, "upgrade-all-dev").unwrap();
+    let watch_bytes = serde_json::to_vec(&serde_json::json!({
+        "kind": "ocm-source-watch-override", "envName": "luna", "repoRoot": checkout,
+        "watchPid": std::process::id(), "token": "lease:upgrade-all-dev:fixture",
+        "startedAt": "2026-06-17T00:00:00Z"
+    }))
+    .unwrap();
+    fs::write(&watch, &watch_bytes).unwrap();
+    let registry = env_registry_path(&env, &cwd).unwrap();
+    let registry_before = fs::read(&registry).unwrap();
+
+    // The guard still refuses explicit changes to the watched env.
+    let explicit = run_ocm(&cwd, &env, &["upgrade", "luna", "--version", "2026.3.24"]);
+    assert!(!explicit.status.success(), "{}", stdout(&explicit));
+    assert!(
+        stderr(&explicit).contains("dev session is active"),
+        "{}",
+        stderr(&explicit)
+    );
+
+    let output = run_ocm(&cwd, &env, &["upgrade", "--all", "--json"]);
+    assert!(
+        output.status.success(),
+        "stderr:\n{}\nstdout:\n{}",
+        stderr(&output),
+        stdout(&output)
+    );
+    let json: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(json["count"], 1);
+    assert_eq!(json["skipped"], 1);
+    assert_eq!(json["failed"], 0);
+    assert_dev_checkout_skip(batch_result(&json, "luna"), "luna");
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
+    assert_eq!(fs::read(&watch).unwrap(), watch_bytes);
 }
 
 #[test]

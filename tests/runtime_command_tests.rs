@@ -6099,6 +6099,63 @@ fn runtime_install_force_preserves_existing_runtime_when_replacement_fails() {
 }
 
 #[test]
+fn runtime_install_reclaims_stages_abandoned_by_killed_installs() {
+    let root = TestDir::new("runtime-install-abandoned-stages");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    write_executable_script(&cwd.join("openclaw"), "#!/bin/sh\nexit 0\n");
+    let env = ocm_env(&root);
+    let runtimes = root.child("ocm-home/runtimes");
+    // A killed install leaves its stage behind with no process holding its lock.
+    let stage = |name: &str| {
+        let path = runtimes.join(format!(".{name}.stage-{}-1", u32::MAX));
+        fs::create_dir_all(path.join("files/node_modules")).unwrap();
+        fs::write(path.join("files/node_modules/payload"), "partial").unwrap();
+        path
+    };
+    let retried = stage("stable");
+    let other = stage("2026.3.21");
+    let live = stage("busy");
+    let live_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(runtimes.join(".busy.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&live_lock).unwrap();
+    let unrelated = runtimes.join(".stable.pack-1-2");
+    fs::create_dir_all(&unrelated).unwrap();
+
+    let install = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "install", "stable", "--path", "./openclaw"],
+    );
+    assert!(install.status.success(), "{}", stderr(&install));
+    assert!(!retried.exists());
+    assert!(!other.exists());
+    assert!(live.join("files/node_modules/payload").exists());
+    assert!(unrelated.exists());
+
+    fs2::FileExt::unlock(&live_lock).unwrap();
+    drop(live_lock);
+    let install = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "install", "next", "--path", "./openclaw"],
+    );
+    assert!(install.status.success(), "{}", stderr(&install));
+    let residues = fs::read_dir(&runtimes)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".stage-"))
+        .collect::<Vec<_>>();
+    assert!(residues.is_empty(), "{residues:?}");
+}
+
+#[test]
 fn runtime_releases_lists_manifest_entries() {
     let root = TestDir::new("runtime-releases");
     let cwd = root.child("workspace");

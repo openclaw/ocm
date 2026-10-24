@@ -97,10 +97,6 @@ fn gateway_state(summary: &ServiceSummary) -> &str {
     service_state(summary)
 }
 
-fn gateway_url(port: u32) -> String {
-    format!("http://127.0.0.1:{port}")
-}
-
 fn ocm_background_service_state(summary: &ServiceSummary) -> &'static str {
     ocm_service_state(
         summary.ocm_service_installed,
@@ -304,8 +300,10 @@ pub fn service_status(
         ),
         KeyValueRow::plain("Binding", binding_label(summary)),
         KeyValueRow::accent("Port", summary.gateway_port.to_string()),
-        KeyValueRow::plain("URL", gateway_url(summary.gateway_port)),
     ];
+    if let Some(url) = &summary.gateway_url {
+        summary_rows.push(KeyValueRow::plain("URL", url.clone()));
+    }
     if let Some(runtime) = compact_runtime_label(summary) {
         summary_rows.push(KeyValueRow::plain("Runtime", runtime));
     }
@@ -786,6 +784,7 @@ mod tests {
             args: vec!["gateway".to_string()],
             run_dir: "/tmp/demo".to_string(),
             gateway_port: 18789,
+            gateway_url: Some("http://127.0.0.1:18789".to_string()),
             installed: true,
             loaded: true,
             running: true,

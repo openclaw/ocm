@@ -423,10 +423,14 @@ published targets it first validates that the target exists, then runs OpenClaw'
 `update --dry-run --json` plan against the clone, switches the clone, and runs
 update-mode doctor, plugin update dry-run, and gateway status checks. For local
 repos it validates the checkout with dependency/build checks before running the
-same post-update checks. Use `--scenario all` to test the current env config
-plus built-in clean minimum and Telegram-configured env shapes. Use
-`--keep-simulations` only when you need retained simulation envs and temporary
-runtimes for debugging.
+same post-update checks. Its dependency setup runs `pnpm install
+--frozen-lockfile` in the simulation's own worktree only after the same
+destination checks `dev` applies: a linked destination, a modules-directory
+override outside the worktree or a workspace-directory override naming another
+directory fails the simulation before anything is installed. Use
+`--scenario all` to test the current env config plus built-in clean minimum and
+Telegram-configured env shapes. Use `--keep-simulations` only when you need
+retained simulation envs and temporary runtimes for debugging.
 
 ### Use a local checkout or dev build
 
@@ -437,7 +441,7 @@ ocm dev luna --no-ui
 ocm dev existing-env --repo ~/src/openclaw --watch --force
 ```
 
-Use `ocm dev` when you want to run your checkout with separate environment state and a gateway port, or when you want to temporarily run source against an existing env in watch mode without rebinding it. While a foreground dev session is running, OCM's OpenClaw-running commands for that env resolve to that source checkout, so one-shot checks use its built `openclaw.mjs`. OCM refuses background service installation, start, and restart for that env until the foreground session exits; a running service taken over with `--watch --force` is restored by the watch session after its source processes stop only if its service policy has not been superseded. Foreground output is saved under that env's `.openclaw/logs/` directory, so `ocm logs <env>` remains useful while the foreground Gateway is running. If you are already inside an OpenClaw checkout, `ocm setup` can detect that and suggest a local path automatically.
+Use `ocm dev` when you want to run your checkout with separate environment state and a gateway port, or when you want to temporarily run source against an existing env in watch mode without rebinding it. While a foreground dev session is running, OCM's OpenClaw-running commands for that env resolve to that source checkout, so one-shot checks use its built `openclaw.mjs`. OCM refuses background service installation, start, and restart for that env until the foreground session exits, so `ocm env status <env>` reports OpenClaw as `running` once the session's Gateway port accepts connections (`pending` before then) and points to `ocm dev status <env>` for its Gateway health instead of suggesting a service command; a running service taken over with `--watch --force` is restored by the watch session after its source processes stop only if its service policy has not been superseded. Foreground output is saved under that env's `.openclaw/logs/` directory, so `ocm logs <env>` remains useful while the foreground Gateway is running. If you are already inside an OpenClaw checkout, `ocm setup` can detect that and suggest a local path automatically.
 
 On Unix, foreground Node commands wait until OCM records their process ownership before executing source or `NODE_OPTIONS` preload hooks. The gate preserves the command arguments, terminal input, and configured Node options after release.
 
@@ -607,10 +611,10 @@ import clear legacy file-based sessions, logs, backups, and process residue so t
 environment does not share active runtime state with its source. Default export
 omits the legacy `credentials`, `identity`, `devices`, `cron`, and `memory` file
 stores that this cleanup removes, apart from Git repositories and selected Git
-configuration there; `--include-state` keeps them. New clones also
-retain shared managed skills under `.openclaw/skills` and their global ClawHub
-tracking metadata under `.openclaw/.clawhub`; ordinary runtime-state cleanup retains
-these roots too. Clones also clear copied agent database process leases while keeping the state database,
+configuration there; `--include-state` keeps them. Clones and
+default export/import also retain shared managed skills under `.openclaw/skills`
+and their global ClawHub tracking metadata under `.openclaw/.clawhub`; ordinary
+runtime-state cleanup retains these roots too. Clones also clear copied agent database process leases while keeping the state database,
 durable rows, and source leases unchanged.
 Default import refuses configured active databases inside protected history and removes the partial target before registration, including for archives without source-root metadata.
 

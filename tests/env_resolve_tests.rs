@@ -152,6 +152,80 @@ fn env_resolve_json_reports_runtime_resolution_shape() {
 }
 
 #[test]
+fn env_resolve_normalizes_onboard_after_openclaw_root_options() {
+    let root = TestDir::new("env-resolve-onboard-root-options");
+    let cwd = root.child("workspace");
+    let bin_dir = cwd.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_executable_script(&bin_dir.join("stable"), "#!/bin/sh\nexit 0\n");
+    let env = ocm_env(&root);
+
+    let add_runtime = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "stable", "--path", "./bin/stable"],
+    );
+    assert!(add_runtime.status.success(), "{}", stderr(&add_runtime));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--runtime", "stable"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+
+    let cases: [(&[&str], &[&str]); 3] = [
+        (
+            &["--log-level", "debug", "onboard"],
+            &["--log-level", "debug", "onboard", "--no-install-daemon"],
+        ),
+        (
+            &[
+                "--no-color",
+                "--profile",
+                "work",
+                "onboard",
+                "--skip-daemon",
+            ],
+            &[
+                "--no-color",
+                "--profile",
+                "work",
+                "onboard",
+                "--skip-daemon",
+            ],
+        ),
+        (
+            &["--log-level=debug", "status"],
+            &["--log-level=debug", "status"],
+        ),
+    ];
+    for (forwarded, expected) in cases {
+        let mut args = vec!["env", "resolve", "demo", "--json", "--"];
+        args.extend_from_slice(forwarded);
+        let resolve = run_ocm(&cwd, &env, &args);
+        assert!(resolve.status.success(), "{}", stderr(&resolve));
+        let resolved: Value = serde_json::from_str(&stdout(&resolve)).unwrap();
+        assert_eq!(resolved["forwardedArgs"], serde_json::json!(expected));
+    }
+
+    let refused = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "resolve",
+            "demo",
+            "--",
+            "--no-color",
+            "onboard",
+            "--install-daemon",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr(&refused).contains("the daemon service is global"));
+}
+
+#[test]
 fn env_resolve_reports_release_backed_runtime_provenance() {
     let root = TestDir::new("env-resolve-release-runtime");
     let cwd = root.child("workspace");

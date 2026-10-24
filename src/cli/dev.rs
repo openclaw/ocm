@@ -984,6 +984,7 @@ impl Cli {
                 .ensure_gateway_ready()?;
             self.stdout_lines(render_dev_service_started(
                 &current,
+                &self.dev_service_gateway_url(&current),
                 &self.command_example(),
                 self.dev_stdout_profile(),
             ));
@@ -1047,6 +1048,7 @@ impl Cli {
                         if restored {
                             self.stdout_lines(render_dev_service_restored(
                                 &meta,
+                                &self.dev_service_gateway_url(&meta),
                                 &self.command_example(),
                                 self.dev_stdout_profile(),
                             ));
@@ -1285,6 +1287,7 @@ impl Cli {
                         self.stdout_lines(render_source_watch_service_restored(
                             &meta,
                             &repo_root,
+                            &self.dev_service_gateway_url(&meta),
                             &self.command_example(),
                             self.dev_stdout_profile(),
                         ));
@@ -1595,7 +1598,14 @@ impl Cli {
                     display_path(&target)
                 ));
             }
-            self.validate_existing_dev_request(meta, repo_root, root, None)?;
+            // An active session is checked against its launch endpoint below.
+            // A starting or restoring session has no endpoint yet, so check
+            // the recorded port before reporting the session as kept.
+            let unlaunched_port = match &observation {
+                SourceWatchState::Active(_) => None,
+                _ => gateway_port,
+            };
+            self.validate_existing_dev_request(meta, repo_root, root, unlaunched_port)?;
             PathBuf::from(dev.source_root())
         } else {
             if root.is_some() {
@@ -2286,6 +2296,24 @@ impl Cli {
         }
     }
 
+    /// The Gateway URL `service status` advertises for the started or restored
+    /// service, in that service's own launch context and binding.
+    fn dev_service_gateway_url(&self, meta: &EnvMeta) -> String {
+        self.service_service()
+            .status_with_gateway_url(&meta.name)
+            .ok()
+            .and_then(|status| status.gateway_url)
+            .unwrap_or_else(|| {
+                // An unreadable status still reads the environment's own config.
+                crate::store::gateway_url_for_launch(
+                    meta,
+                    meta.gateway_port.unwrap_or_default(),
+                    Path::new(&meta.root),
+                    &build_openclaw_env(meta, &self.env),
+                )
+            })
+    }
+
     fn dev_stdout_profile(&self) -> RenderProfile {
         let color_mode = self.color_mode();
         let pretty_enabled =
@@ -2745,10 +2773,7 @@ impl Cli {
                 .or_else(|| active_source.clone()),
             worktree_root: active_source.or_else(|| dev.map(|dev| dev.source_root().to_string())),
             gateway_port,
-            gateway_url: format!(
-                "{}://127.0.0.1:{gateway_port}",
-                if tls { "https" } else { "http" },
-            ),
+            gateway_url: crate::store::loopback_gateway_url(gateway_port, tls),
             gateway_port_reachable: crate::service::inspect::tcp_port_reachable(gateway_port),
             gateway_health_ready,
             ui_url,
@@ -4276,6 +4301,7 @@ fn render_dev_run_summary(
 
 fn render_dev_service_started(
     meta: &EnvMeta,
+    gateway_url: &str,
     command_example: &str,
     profile: RenderProfile,
 ) -> Vec<String> {
@@ -4288,10 +4314,7 @@ fn render_dev_service_started(
         return vec![
             format!("service started for {}", meta.name),
             format!("port={}", meta.gateway_port.unwrap_or_default()),
-            format!(
-                "url={}",
-                dev_gateway_url(meta.gateway_port.unwrap_or_default())
-            ),
+            format!("url={gateway_url}"),
             format!("repo={}", dev.repo_root()),
             format!("{source_key}={}", dev.source_root()),
             format!("status={} service status {}", command_example, meta.name),
@@ -4309,10 +4332,7 @@ fn render_dev_service_started(
         &[
             KeyValueRow::success("State", "running"),
             KeyValueRow::accent("Port", meta.gateway_port.unwrap_or_default().to_string()),
-            KeyValueRow::plain(
-                "URL",
-                dev_gateway_url(meta.gateway_port.unwrap_or_default()),
-            ),
+            KeyValueRow::plain("URL", gateway_url),
             KeyValueRow::plain("Env", meta.name.clone()),
         ],
         profile.color,
@@ -4348,6 +4368,7 @@ fn render_dev_service_started(
 
 fn render_dev_service_restored(
     meta: &EnvMeta,
+    gateway_url: &str,
     command_example: &str,
     profile: RenderProfile,
 ) -> Vec<String> {
@@ -4360,10 +4381,7 @@ fn render_dev_service_restored(
         return vec![
             format!("service restored for {}", meta.name),
             format!("port={}", meta.gateway_port.unwrap_or_default()),
-            format!(
-                "url={}",
-                dev_gateway_url(meta.gateway_port.unwrap_or_default())
-            ),
+            format!("url={gateway_url}"),
             format!("repo={}", dev.repo_root()),
             format!("{source_key}={}", dev.source_root()),
             format!("status={} service status {}", command_example, meta.name),
@@ -4381,10 +4399,7 @@ fn render_dev_service_restored(
         &[
             KeyValueRow::success("State", "restored"),
             KeyValueRow::accent("Port", meta.gateway_port.unwrap_or_default().to_string()),
-            KeyValueRow::plain(
-                "URL",
-                dev_gateway_url(meta.gateway_port.unwrap_or_default()),
-            ),
+            KeyValueRow::plain("URL", gateway_url),
         ],
         profile.color,
     ));
@@ -4403,10 +4418,6 @@ fn render_dev_service_restored(
         profile.color,
     ));
     lines
-}
-
-fn dev_gateway_url(port: u32) -> String {
-    format!("http://127.0.0.1:{port}")
 }
 
 fn render_dev_run_step(title: &str, detail: String, profile: RenderProfile) -> Vec<String> {
@@ -4593,6 +4604,7 @@ fn read_json_string_at_path(path: &Path, keys: &[&str]) -> Option<String> {
 fn render_source_watch_service_restored(
     meta: &EnvMeta,
     repo_root: &Path,
+    gateway_url: &str,
     command_example: &str,
     profile: RenderProfile,
 ) -> Vec<String> {
@@ -4600,10 +4612,7 @@ fn render_source_watch_service_restored(
         return vec![
             format!("service restored for {}", meta.name),
             format!("port={}", meta.gateway_port.unwrap_or_default()),
-            format!(
-                "url={}",
-                dev_gateway_url(meta.gateway_port.unwrap_or_default())
-            ),
+            format!("url={gateway_url}"),
             format!("repo={}", display_path(repo_root)),
             "binding=unchanged".to_string(),
             format!("status={} service status {}", command_example, meta.name),
@@ -4621,10 +4630,7 @@ fn render_source_watch_service_restored(
         &[
             KeyValueRow::success("State", "restored"),
             KeyValueRow::accent("Port", meta.gateway_port.unwrap_or_default().to_string()),
-            KeyValueRow::plain(
-                "URL",
-                dev_gateway_url(meta.gateway_port.unwrap_or_default()),
-            ),
+            KeyValueRow::plain("URL", gateway_url),
             KeyValueRow::plain("Binding", "unchanged"),
         ],
         profile.color,

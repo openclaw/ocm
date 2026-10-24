@@ -296,10 +296,17 @@ pub(crate) struct ImportEnvironmentResult {
     pub sandbox_port: Option<u32>,
 }
 
+/// The background service keeps this environment's Gateway running, so the
+/// environment is in use even when no command has recorded a use.
+fn service_keeps_gateway_running(meta: &EnvMeta) -> bool {
+    meta.service_enabled && meta.service_running
+}
+
 pub fn select_prune_candidates(envs: &[EnvMeta], older_than_days: i64) -> Vec<EnvMeta> {
     let cutoff = now_utc() - Duration::days(older_than_days);
     envs.iter()
         .filter(|meta| !meta.protected)
+        .filter(|meta| !service_keeps_gateway_running(meta))
         .filter(|meta| meta.last_used_at.unwrap_or(meta.created_at) < cutoff)
         .cloned()
         .collect()
@@ -543,11 +550,13 @@ impl<'a> EnvironmentService<'a> {
         for meta in candidates {
             let _lock = self.lock_operation(&meta.name)?;
             let current = self.get(&meta.name)?;
-            // Waiting for an earlier candidate can outlive use or replacement
-            // of this name. Keep admission and removal under the same lock.
+            // Waiting for an earlier candidate can outlive use, replacement or
+            // a service start for this name. Service commands take this lock,
+            // so admission and removal see the same policy.
             if current.root != meta.root
                 || current.created_at != meta.created_at
                 || current.last_used_at.unwrap_or(current.created_at) >= cutoff
+                || service_keeps_gateway_running(&current)
             {
                 continue;
             }

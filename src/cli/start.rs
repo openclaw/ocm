@@ -6,7 +6,7 @@ use super::Cli;
 use crate::env::{CreateEnvironmentOptions, EnvMeta};
 use crate::infra::terminal::{KeyValueRow, Tone, paint, render_key_value_card};
 use crate::launcher::AddLauncherOptions;
-use crate::migrate::inspect_migration_source;
+use crate::migrate::{inspect_migration_source, with_rollback_error};
 use crate::service::service_backend_support_error;
 use crate::store::{
     MinimumLocalConfig, derive_env_paths, display_path, prepare_minimum_local_openclaw_config,
@@ -176,7 +176,7 @@ impl Cli {
             )?;
         }
 
-        let desired_binding = self.resolve_start_binding(
+        let (desired_binding, created_launcher) = self.resolve_start_binding(
             &request.name,
             existing.as_ref(),
             request.runtime_name.clone(),
@@ -186,11 +186,16 @@ impl Cli {
             request.command.clone(),
             request.cwd.clone(),
         )?;
+        // Until the env is created or rebound, a refusal must not leave behind
+        // the launcher this start created.
+        let discard_launcher = |error: String| {
+            self.discard_unbound_start_launcher(&request.name, created_launcher.as_deref(), error)
+        };
 
         if request.service_requested
             && let Some(error) = service_backend_support_error(&self.env)
         {
-            return Err(error);
+            return Err(discard_launcher(error));
         }
 
         // Resolve required settings before a binding update can synchronize a
@@ -216,7 +221,8 @@ impl Cli {
                         .resolve_effective_gateway_port(&prospective)?;
                     self.prepare_minimum_local_config(&prospective, port)
                 })
-                .transpose()?
+                .transpose()
+                .map_err(&discard_launcher)?
         } else {
             None
         };
@@ -240,10 +246,11 @@ impl Cli {
                     },
                     dev: None,
                     protected: request.protect,
-                })?,
-            Some(existing) => {
-                self.apply_start_to_existing(existing, desired_binding.as_ref(), request.protect)?
-            }
+                })
+                .map_err(&discard_launcher)?,
+            Some(existing) => self
+                .apply_start_to_existing(existing, desired_binding.as_ref(), request.protect)
+                .map_err(&discard_launcher)?,
         };
 
         meta = self
@@ -329,9 +336,9 @@ impl Cli {
         }
 
         if request.service_requested {
-            self.with_progress(format!("Installing service for {}", request.name), || {
-                self.service_service().install(&request.name)
-            })?;
+            // Start enables the service and installs an absent daemon itself.
+            // Install first would publish stopped intent that the daemon can
+            // act on, replacing a Gateway that is already running.
             self.with_progress(format!("Starting service for {}", request.name), || {
                 self.service_service().start(&request.name)
             })?;
@@ -428,7 +435,7 @@ impl Cli {
         channel: Option<String>,
         command: Option<String>,
         cwd: Option<String>,
-    ) -> Result<Option<StartBinding>, String> {
+    ) -> Result<(Option<StartBinding>, Option<String>), String> {
         if let Some(runtime_name) = runtime_name {
             let runtime_name = self
                 .environment_service()
@@ -439,18 +446,23 @@ impl Cli {
                     "start",
                 )?
                 .expect("validated runtime binding request must resolve");
-            return Ok(Some(StartBinding::Runtime(runtime_name)));
+            return Ok((Some(StartBinding::Runtime(runtime_name)), None));
         }
 
         if let Some(launcher_name) = launcher_name {
             let launcher_name = validate_name(&launcher_name, "Launcher name")?;
             self.launcher_service().show(&launcher_name)?;
-            return Ok(Some(StartBinding::Launcher(launcher_name)));
+            return Ok((Some(StartBinding::Launcher(launcher_name)), None));
         }
 
         if let Some(command) = command {
-            let launcher_name = self.ensure_start_launcher(env_name, &command, cwd.as_deref())?;
-            return Ok(Some(StartBinding::Launcher(launcher_name)));
+            let (launcher_name, created) =
+                self.ensure_start_launcher(env_name, &command, cwd.as_deref())?;
+            let created_launcher = created.then(|| launcher_name.clone());
+            return Ok((
+                Some(StartBinding::Launcher(launcher_name)),
+                created_launcher,
+            ));
         }
 
         if version.is_some() || channel.is_some() {
@@ -459,13 +471,13 @@ impl Cli {
                     self.environment_service()
                         .resolve_runtime_binding_request(None, version, channel, "start")
                 })?;
-            return Ok(runtime_name.map(StartBinding::Runtime));
+            return Ok((runtime_name.map(StartBinding::Runtime), None));
         }
 
         if let Some(existing) = existing
             && (existing.default_runtime.is_some() || existing.default_launcher.is_some())
         {
-            return Ok(None);
+            return Ok((None, None));
         }
 
         let runtime_name = self.with_progress(
@@ -479,15 +491,16 @@ impl Cli {
                 )
             },
         )?;
-        Ok(runtime_name.map(StartBinding::Runtime))
+        Ok((runtime_name.map(StartBinding::Runtime), None))
     }
 
+    /// Returns the launcher name and whether this call created it.
     fn ensure_start_launcher(
         &self,
         env_name: &str,
         command: &str,
         cwd: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, bool), String> {
         let launcher_name = format!("{env_name}.local");
         let desired_cwd = cwd
             .map(|raw| {
@@ -497,7 +510,7 @@ impl Cli {
         match self.launcher_service().show(&launcher_name) {
             Ok(existing) => {
                 if existing.command == command && existing.cwd == desired_cwd {
-                    Ok(launcher_name)
+                    Ok((launcher_name, false))
                 } else {
                     Err(format!(
                         "launcher \"{launcher_name}\" already exists with different settings; use \"{} launcher add\" or choose another env name",
@@ -512,10 +525,31 @@ impl Cli {
                     cwd: cwd.map(str::to_string),
                     description: Some(format!("Local command for env {env_name}")),
                 })?;
-                Ok(launcher_name)
+                Ok((launcher_name, true))
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Removes the launcher this start created unless the env is already bound
+    /// to it, and returns the start error with any rollback failure appended.
+    fn discard_unbound_start_launcher(
+        &self,
+        env_name: &str,
+        created_launcher: Option<&str>,
+        error: String,
+    ) -> String {
+        let Some(launcher_name) = created_launcher else {
+            return error;
+        };
+        // A failure after the env was created or rebound keeps its launcher.
+        if let Ok(Some(meta)) = self.environment_service().find(env_name)
+            && meta.default_launcher.as_deref() == Some(launcher_name)
+        {
+            return error;
+        }
+        let rollback = self.launcher_service().remove(launcher_name).map(|_| ());
+        with_rollback_error(error, "removing the start launcher", rollback)
     }
 
     fn start_summary_lines(&self, summary: &StartSummary) -> Vec<String> {

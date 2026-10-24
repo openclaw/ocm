@@ -3139,6 +3139,13 @@ impl<'a> OpenClawSqliteCopy<'a> {
         Ok(())
     }
 
+    // Takes a path relative to the copied state root.
+    pub(super) fn preserves_history(&self, relative: &Path) -> bool {
+        let path = self.state_root.join(relative);
+        is_integrity_protected_history_path(self.state_root, &path)
+            || self.history.roots.iter().any(|root| path.starts_with(root))
+    }
+
     pub(super) fn contains(&self, path: &Path) -> bool {
         if is_integrity_protected_history_path(self.state_root, path)
             || self.history.roots.iter().any(|root| path.starts_with(root))
@@ -3375,6 +3382,9 @@ fn is_durable_openclaw_archive_path(components: &[&str]) -> bool {
             | [".openclaw", "extensions", ..]
             | [".openclaw", "npm", ..]
             | [".openclaw", "git", ..]
+    ) || matches!(
+        components,
+        [".openclaw", root, ..] if is_shared_skill_state_root(OsStr::new(root))
     )
 }
 
@@ -4647,6 +4657,9 @@ mod tests {
             ".openclaw/npm/projects/demo/node_modules/demo/index.js",
             ".openclaw/git/git-demo/repo/.git/HEAD",
             ".openclaw/git/git-demo/repo/openclaw.plugin.json",
+            ".openclaw/skills/shared/SKILL.md",
+            ".openclaw/skills/shared/.clawhub/origin.json",
+            ".openclaw/.clawhub/lock.json",
         ] {
             assert!(
                 !should_skip_openclaw_env_archive_path(Path::new(path), EnvArchiveEntryKind::File),

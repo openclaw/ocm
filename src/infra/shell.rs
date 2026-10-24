@@ -32,7 +32,9 @@ fn render_assignment(shell: &str, key: &str, value: &str) -> String {
 fn render_unset(shell: &str, key: &str) -> String {
     debug_assert!(is_shell_identifier(key));
     if shell == "fish" {
-        format!("set -e {key};")
+        // `set -e` on a missing variable leaves status 4, which would become the
+        // status of a successful activation.
+        format!("if set -q {key}; set -e {key}; end;")
     } else {
         format!("unset {key}")
     }
@@ -44,23 +46,29 @@ fn is_shell_identifier(key: &str) -> bool {
         && chars.all(|ch| matches!(ch, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
 }
 
-pub fn resolve_shell_name(explicit: Option<&str>, env: &BTreeMap<String, String>) -> String {
+pub fn resolve_shell_name(
+    explicit: Option<&str>,
+    env: &BTreeMap<String, String>,
+) -> Result<String, String> {
     if let Some(shell) = explicit {
-        match shell.trim().to_ascii_lowercase().as_str() {
-            "bash" | "fish" | "sh" | "zsh" => return shell.trim().to_ascii_lowercase(),
-            _ => {}
-        }
+        let name = shell.trim().to_ascii_lowercase();
+        return match name.as_str() {
+            "bash" | "fish" | "sh" | "zsh" => Ok(name),
+            _ => Err(format!("unsupported shell: {shell}")),
+        };
     }
 
-    if env
-        .get("SHELL")
-        .map(|value| value.contains("fish"))
-        .unwrap_or(false)
-    {
-        "fish".to_string()
-    } else {
-        "zsh".to_string()
-    }
+    Ok(
+        if env
+            .get("SHELL")
+            .map(|value| value.contains("fish"))
+            .unwrap_or(false)
+        {
+            "fish".to_string()
+        } else {
+            "zsh".to_string()
+        },
+    )
 }
 
 pub fn build_openclaw_env(
@@ -270,19 +278,36 @@ pub fn render_use_script(
     format!("{}\n", lines.join("\n"))
 }
 
+// The helper runs in the caller's shell, so it assigns nothing there: the loop variable
+// and the captured activation text live in the command substitution's subshell (the text in
+// its positional parameters), and a failed `env use` is relayed as a `return` for the eval,
+// discarding its output, so the caller sees the status and no capture variable can collide
+// with a caller's own.
 fn render_init_posix(command: &str, shell: &str) -> String {
     let command = quote_posix(command);
+    let relay = |indent: &str, suffix: &str| {
+        format!(
+            r#"{indent}set -- "$(if command {command} env use "$@"{suffix}; then echo " 0"; else echo " $?"; fi)"
+{indent}case "${{1##* }}" in
+{indent}  (0) printf '%s\n' "${{1% *}}" ;;
+{indent}  (*) printf 'return %s\n' "${{1##* }}" ;;
+{indent}esac"#
+        )
+    };
+    let explicit = relay("          ", "");
+    let implicit = relay("    ", &format!(" --shell {shell}"));
     format!(
         r#"ocm_use() {{
-  script="$(
+  eval "$(
     for _ocm_arg in "$@"; do
       case "$_ocm_arg" in
-        (--shell|--shell=*) command {command} env use "$@"; exit $? ;;
+        (--shell|--shell=*)
+{explicit}
+          exit ;;
       esac
     done
-    command {command} env use "$@" --shell {shell}
-  )" || return $?
-  eval "$script"
+{implicit}
+  )"
 }}
 "#
     )
@@ -569,5 +594,37 @@ mod tests {
         assert!(!script.contains("unset OPENCLAW_DIAGNOSTICS"));
         assert!(!script.contains("touch /tmp/pwn"));
         assert!(script.contains("export OPENCLAW_HOME='/tmp/ocm/envs/demo'"));
+    }
+
+    #[test]
+    fn fish_use_script_only_erases_variables_that_exist() {
+        let meta = EnvMeta {
+            upgrade_independent_paths: Vec::new(),
+            kind: "ocm-env".to_string(),
+            name: "demo".to_string(),
+            root: "/tmp/ocm/envs/demo".to_string(),
+            gateway_port: None,
+            gateway_port_auto_assigned: false,
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: None,
+            dev: None,
+            dev_ui_port: None,
+            protected: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_used_at: None,
+        };
+
+        let script = render_use_script(&meta, "fish", &BTreeMap::new());
+
+        assert!(
+            script.contains("if set -q OPENCLAW_PROFILE; set -e OPENCLAW_PROFILE; end;"),
+            "{script}"
+        );
+        for line in script.lines().filter(|line| line.contains("set -e")) {
+            assert!(line.starts_with("if set -q "), "{line}");
+        }
     }
 }

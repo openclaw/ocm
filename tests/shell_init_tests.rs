@@ -2,6 +2,8 @@ mod support;
 
 use std::fs;
 
+use ocm::store::get_environment;
+
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout};
 
 #[test]
@@ -17,7 +19,7 @@ fn init_zsh_prints_an_ocm_use_helper() {
     assert!(output.contains("ocm_use() {"));
     assert!(output.contains("--shell zsh"));
     assert!(output.contains("'ocm' env use \"$@\""));
-    assert!(output.contains("eval \"$script\""));
+    assert!(output.contains("eval \"$("));
 }
 
 #[test]
@@ -34,7 +36,7 @@ fn init_bash_and_sh_print_shell_specific_posix_helpers() {
         assert!(output.contains("ocm_use() {"), "{shell}");
         assert!(output.contains(&format!("--shell {shell}")), "{shell}");
         assert!(output.contains("'ocm' env use \"$@\""), "{shell}");
-        assert!(output.contains("eval \"$script\""), "{shell}");
+        assert!(output.contains("eval \"$("), "{shell}");
     }
 }
 
@@ -83,6 +85,104 @@ fn init_defaults_to_fish_when_shell_env_points_to_fish() {
     assert!(output.contains("function ocm_use"));
     assert!(output.contains("set -l shell_args --shell fish"));
     assert!(output.contains("'ocm' env use $argv $shell_args"));
+}
+
+#[cfg(unix)]
+#[test]
+fn fish_helper_returns_the_activation_status() {
+    use std::process::Command;
+
+    use crate::support::ocm_test_binary_path;
+
+    if Command::new("fish").arg("--version").output().is_err() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "fish must be installed when CI is set"
+        );
+        eprintln!("skipping: fish is not installed");
+        return;
+    }
+
+    let root = TestDir::new("shell-init-fish-executed");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let binary = ocm_test_binary_path();
+    env.insert(
+        "OCM_SELF".to_string(),
+        binary.to_string_lossy().into_owned(),
+    );
+    let mut paths = vec![binary.parent().unwrap().to_path_buf()];
+    paths.extend(std::env::split_paths(env.get("PATH").unwrap()));
+    env.insert(
+        "PATH".to_string(),
+        std::env::join_paths(paths)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let init = run_ocm(&cwd, &env, &["init", "fish"]);
+    assert!(init.status.success(), "{}", stderr(&init));
+    let helper = stdout(&init);
+
+    let controls = [
+        "OPENCLAW_PROFILE",
+        "OPENCLAW_GATEWAY_PORT",
+        "OPENCLAW_DEV_SOURCE_ROOT",
+        "OPENCLAW_BUNDLED_PLUGINS_DIR",
+        "OPENCLAW_SERVICE_MARKER",
+        "OPENCLAW_SERVICE_KIND",
+        "OPENCLAW_SUPERVISOR_MODE",
+        "OPENCLAW_NO_RESPAWN",
+        "OPENCLAW_LAUNCHD_LABEL",
+        "OPENCLAW_SYSTEMD_UNIT",
+        "OPENCLAW_WINDOWS_TASK_NAME",
+    ];
+    let preset = controls
+        .iter()
+        .map(|key| format!("set -gx {key} stale"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let erased = controls
+        .iter()
+        .map(|key| format!("test \"${key}\" != stale; or exit 15"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (label, prelude) in [("fresh", ""), ("controls already set", preset.as_str())] {
+        let script = format!(
+            r#"{prelude}
+{helper}
+ocm_use demo
+set result $status
+test $result -eq 0; or begin; echo "{label}: status $result"; exit 10; end
+test "$OCM_ACTIVE_ENV" = demo; or exit 11
+{erased}
+ocm_use demo; and echo chained
+ocm env use demo --shell fish | source
+test $status -eq 0; or exit 12
+ocm_use missing 2>/dev/null
+test $status -eq 1; or exit 13
+test "$OCM_ACTIVE_ENV" = demo; or exit 14
+"#
+        );
+        let output = Command::new("fish")
+            .args(["--no-config", "-c", &script])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{label}: status={}: {} {}",
+            output.status,
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(stdout(&output).contains("chained"), "{label}");
+    }
 }
 
 #[cfg(unix)]
@@ -170,6 +270,158 @@ printf 'activation and caller controls passed\n'
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn posix_helper_leaves_caller_variables_unchanged() {
+    use std::process::Command;
+
+    use crate::support::ocm_test_binary_path;
+
+    let root = TestDir::new("shell-init-caller-variables");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let binary = ocm_test_binary_path();
+    let mut paths = vec![binary.parent().unwrap().to_path_buf()];
+    paths.extend(std::env::split_paths(env.get("PATH").unwrap()));
+    env.insert(
+        "PATH".to_string(),
+        std::env::join_paths(paths)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    for name in ["demo", "other"] {
+        let created = run_ocm(&cwd, &env, &["env", "create", name]);
+        assert!(created.status.success(), "{}", stderr(&created));
+    }
+
+    for (shell, init_shell) in [
+        ("bash", "bash"),
+        ("sh", "sh"),
+        ("zsh", "zsh"),
+        ("dash", "sh"),
+    ] {
+        if !matches!(shell, "bash" | "sh")
+            && Command::new(shell).arg("-c").arg(":").output().is_err()
+        {
+            continue;
+        }
+        let init = run_ocm(&cwd, &env, &["init", init_shell]);
+        assert!(init.status.success(), "{}", stderr(&init));
+        let script = format!(
+            r#"{}
+script=mine
+_ocm_script=mine_too
+_ocm_arg=mine_three
+other=keep
+ocm_use demo || exit 10
+[ "$OCM_ACTIVE_ENV" = demo ] || exit 11
+[ "$script" = mine ] && [ "$_ocm_script" = mine_too ] && [ "$_ocm_arg" = mine_three ] || exit 12
+[ "$other" = keep ] || exit 13
+ocm_use missing 2>/dev/null
+result=$?
+[ "$result" = 1 ] || exit 14
+[ "$script" = mine ] && [ "$_ocm_script" = mine_too ] && [ "$_ocm_arg" = mine_three ] || exit 15
+ocm_use demo --shell=sh || exit 16
+[ "$script" = mine ] || exit 17
+unset script _ocm_script _ocm_arg
+ocm_use demo || exit 18
+[ -z "${{script+x}}" ] && [ -z "${{_ocm_script+x}}" ] && [ -z "${{_ocm_arg+x}}" ] || exit 19
+readonly _ocm_script=ro script=ro2
+ocm_use other || exit 20
+[ "$OCM_ACTIVE_ENV" = other ] || exit 21
+ocm_use missing 2>/dev/null
+result=$?
+[ "$result" = 1 ] || exit 22
+[ "$script" = ro2 ] && [ "$_ocm_script" = ro ] || exit 23
+ocm_use demo --shell=sh || exit 24
+[ "$OCM_ACTIVE_ENV" = demo ] || exit 25
+printf 'caller variables preserved\n'
+"#,
+            stdout(&init)
+        );
+        let output = Command::new(shell)
+            .args(["-c", &script])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "shell={shell}, status={}: {} {}",
+            output.status,
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(stdout(&output).contains("caller variables preserved"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_helper_discards_the_output_of_a_failed_activation() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let root = TestDir::new("shell-init-failed-activation");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let fake = root.child("failing-ocm");
+    fs::write(
+        &fake,
+        "#!/bin/sh\necho 'FAILED_STDOUT_RAN=1'\necho 'activation failed' >&2\nexit 9\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert("OCM_SELF".to_string(), fake.to_string_lossy().into_owned());
+
+    for (shell, init_shell) in [
+        ("bash", "bash"),
+        ("sh", "sh"),
+        ("zsh", "zsh"),
+        ("dash", "sh"),
+    ] {
+        if !matches!(shell, "bash" | "sh")
+            && Command::new(shell).arg("-c").arg(":").output().is_err()
+        {
+            continue;
+        }
+        let init = run_ocm(&cwd, &env, &["init", init_shell]);
+        assert!(init.status.success(), "{}", stderr(&init));
+        let script = format!(
+            r#"{}
+ocm_use demo
+result=$?
+[ "$result" = 9 ] || exit 10
+[ -z "${{FAILED_STDOUT_RAN+x}}" ] || exit 11
+ocm_use demo --shell=sh
+result=$?
+[ "$result" = 9 ] || exit 12
+[ -z "${{FAILED_STDOUT_RAN+x}}" ] || exit 13
+"#,
+            stdout(&init)
+        );
+        let output = Command::new(shell)
+            .args(["-c", &script])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "shell={shell}, status={}: {} {}",
+            output.status,
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(stderr(&output).contains("activation failed"), "{shell}");
+    }
+}
+
 #[test]
 fn activation_renders_explicit_include_roots_for_each_supported_shell() {
     let root = TestDir::new("shell-include-roots-render");
@@ -198,6 +450,57 @@ fn activation_renders_explicit_include_roots_for_each_supported_shell() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn env_use_rejects_unsupported_shells_like_init() {
+    let root = TestDir::new("shell-use-unsupported");
+    let mut env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "demo"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let before = get_environment("demo", &env, root.path()).unwrap();
+
+    for hint in ["/usr/bin/fish", "/bin/zsh"] {
+        env.insert("SHELL".to_string(), hint.to_string());
+        for shell in ["pwsh", "powershell", "csh", "nu", "bogus", ""] {
+            let inline = format!("--shell={shell}");
+            for args in [
+                vec!["env", "use", "demo", "--shell", shell],
+                vec!["env", "use", "demo", inline.as_str()],
+            ] {
+                let output = run_ocm(root.path(), &env, &args);
+                assert_eq!(output.status.code(), Some(1), "{hint} {args:?}");
+                assert!(stdout(&output).is_empty(), "{hint} {args:?}");
+                assert!(
+                    stderr(&output).contains(&format!("ocm: unsupported shell: {shell}\n")),
+                    "{hint} {args:?}: {}",
+                    stderr(&output)
+                );
+            }
+        }
+    }
+    assert_eq!(
+        get_environment("demo", &env, root.path())
+            .unwrap()
+            .last_used_at,
+        before.last_used_at,
+        "a rejected shell must not mark the environment used"
+    );
+
+    for shell in ["pwsh", "powershell"] {
+        let output = run_ocm(root.path(), &env, &["init", shell]);
+        assert_eq!(output.status.code(), Some(1), "{shell}");
+        assert!(
+            stderr(&output).contains(&format!("unsupported init shell: {shell}")),
+            "{shell}"
+        );
+    }
+
+    for shell in ["bash", "sh", "zsh", "fish", " BASH "] {
+        let output = run_ocm(root.path(), &env, &["env", "use", "demo", "--shell", shell]);
+        assert!(output.status.success(), "{shell}: {}", stderr(&output));
+        assert!(stdout(&output).contains("OCM_ACTIVE_ENV"), "{shell}");
     }
 }
 

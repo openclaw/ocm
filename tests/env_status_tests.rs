@@ -157,6 +157,48 @@ fn env_status_preserves_retained_ownership_and_prioritizes_inspection() {
             assert_eq!(after.service_enabled, desired);
         }
     }
+    // An active foreground session does not hide unresolved service ownership.
+    {
+        use fs2::FileExt;
+        use std::io::Write;
+        let source_repo = root.child("source/openclaw");
+        fs::create_dir_all(source_repo.join("extensions")).unwrap();
+        fs::write(source_repo.join("openclaw.mjs"), "").unwrap();
+        let watch_dir = root.child("ocm-home/source-watch");
+        fs::create_dir_all(&watch_dir).unwrap();
+        let mut lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(watch_dir.join("demo.lock"))
+            .unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+        writeln!(lock).unwrap();
+        let override_path = watch_dir.join("demo.json");
+        fs::write(
+            &override_path,
+            json!({
+                "kind": "ocm-source-watch-override", "envName": "demo",
+                "repoRoot": source_repo.display().to_string(),
+                "watchPid": std::process::id(), "token": "retained-status-watch",
+                "startedAt": "2026-06-17T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let status = run_ocm(&cwd, &env, &["env", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["resolvedKind"], "source-watch");
+        assert_eq!(status["openclawState"], "unknown");
+        let card = run_ocm(&cwd, &env, &["env", "status", "demo", "--color=always"]);
+        let card = stdout(&card);
+        assert!(card.contains("ocm service recover demo"), "{card}");
+        assert!(!card.contains("ocm dev status demo"), "{card}");
+        FileExt::unlock(&lock).unwrap();
+        fs::remove_file(override_path).unwrap();
+    }
     // A sibling claim must not make this target unknown; ordinary intent still projects as before.
     runtime["services"][0]["envName"] = json!("sibling");
     runtime["retainedOwnership"][0]["envName"] = json!("sibling");

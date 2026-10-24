@@ -93,6 +93,7 @@ fn logs_help_is_available_from_help_and_flag() {
     assert!(output.contains("ocm logs mira -f"));
     assert!(output.contains("ocm logs mira --stream error --follow"));
     assert!(output.contains("By default OCM shows both stdout and stderr together in time order."));
+    assert!(output.contains("untimestamped output at the end of a log, such as a startup error, is placed at that file's last write."));
     assert!(output.contains("Default output shows the last 50 lines."));
 }
 
