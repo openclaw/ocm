@@ -1370,11 +1370,11 @@ impl Cli {
             return Err("environment name is required".to_string());
         };
         Self::assert_no_extra_args(&args[1..])?;
+        let shell = resolve_shell_name(shell_name.as_deref(), &self.env)?;
 
         let meta = self
             .environment_service()
             .apply_effective_gateway_port(self.environment_service().touch(name)?)?;
-        let shell = resolve_shell_name(shell_name.as_deref(), &self.env);
         self.stdout_text(&render_use_script(&meta, &shell, &self.env))?;
         Ok(0)
     }

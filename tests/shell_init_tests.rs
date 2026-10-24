@@ -2,6 +2,8 @@ mod support;
 
 use std::fs;
 
+use ocm::store::get_environment;
+
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout};
 
 #[test]
@@ -296,6 +298,57 @@ fn activation_renders_explicit_include_roots_for_each_supported_shell() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn env_use_rejects_unsupported_shells_like_init() {
+    let root = TestDir::new("shell-use-unsupported");
+    let mut env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "demo"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let before = get_environment("demo", &env, root.path()).unwrap();
+
+    for hint in ["/usr/bin/fish", "/bin/zsh"] {
+        env.insert("SHELL".to_string(), hint.to_string());
+        for shell in ["pwsh", "powershell", "csh", "nu", "bogus", ""] {
+            let inline = format!("--shell={shell}");
+            for args in [
+                vec!["env", "use", "demo", "--shell", shell],
+                vec!["env", "use", "demo", inline.as_str()],
+            ] {
+                let output = run_ocm(root.path(), &env, &args);
+                assert_eq!(output.status.code(), Some(1), "{hint} {args:?}");
+                assert!(stdout(&output).is_empty(), "{hint} {args:?}");
+                assert!(
+                    stderr(&output).contains(&format!("ocm: unsupported shell: {shell}\n")),
+                    "{hint} {args:?}: {}",
+                    stderr(&output)
+                );
+            }
+        }
+    }
+    assert_eq!(
+        get_environment("demo", &env, root.path())
+            .unwrap()
+            .last_used_at,
+        before.last_used_at,
+        "a rejected shell must not mark the environment used"
+    );
+
+    for shell in ["pwsh", "powershell"] {
+        let output = run_ocm(root.path(), &env, &["init", shell]);
+        assert_eq!(output.status.code(), Some(1), "{shell}");
+        assert!(
+            stderr(&output).contains(&format!("unsupported init shell: {shell}")),
+            "{shell}"
+        );
+    }
+
+    for shell in ["bash", "sh", "zsh", "fish", " BASH "] {
+        let output = run_ocm(root.path(), &env, &["env", "use", "demo", "--shell", shell]);
+        assert!(output.status.success(), "{shell}: {}", stderr(&output));
+        assert!(stdout(&output).contains("OCM_ACTIVE_ENV"), "{shell}");
     }
 }
 

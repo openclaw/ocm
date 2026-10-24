@@ -46,23 +46,29 @@ fn is_shell_identifier(key: &str) -> bool {
         && chars.all(|ch| matches!(ch, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
 }
 
-pub fn resolve_shell_name(explicit: Option<&str>, env: &BTreeMap<String, String>) -> String {
+pub fn resolve_shell_name(
+    explicit: Option<&str>,
+    env: &BTreeMap<String, String>,
+) -> Result<String, String> {
     if let Some(shell) = explicit {
-        match shell.trim().to_ascii_lowercase().as_str() {
-            "bash" | "fish" | "sh" | "zsh" => return shell.trim().to_ascii_lowercase(),
-            _ => {}
-        }
+        let name = shell.trim().to_ascii_lowercase();
+        return match name.as_str() {
+            "bash" | "fish" | "sh" | "zsh" => Ok(name),
+            _ => Err(format!("unsupported shell: {shell}")),
+        };
     }
 
-    if env
-        .get("SHELL")
-        .map(|value| value.contains("fish"))
-        .unwrap_or(false)
-    {
-        "fish".to_string()
-    } else {
-        "zsh".to_string()
-    }
+    Ok(
+        if env
+            .get("SHELL")
+            .map(|value| value.contains("fish"))
+            .unwrap_or(false)
+        {
+            "fish".to_string()
+        } else {
+            "zsh".to_string()
+        },
+    )
 }
 
 pub fn build_openclaw_env(
