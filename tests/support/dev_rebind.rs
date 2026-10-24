@@ -1405,3 +1405,79 @@ fn dev_switch_restores_the_previous_source_after_failed_or_interrupted_preparati
         Some(worktree_arg.as_str())
     );
 }
+
+#[test]
+fn dev_switch_from_a_missing_checkout_keeps_the_selected_binding_when_preparation_fails() {
+    #[cfg(unix)]
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = TestDir::new("dev-switch-missing-previous");
+    let (repo, _) = prepared_checkout_and_fresh_worktree(&root);
+    let mut env = switch_env(&root);
+    let created = run_ocm(&repo, &env, &dev_plain(&["demo"]));
+    assert!(created.status.success(), "{}", stderr(&created));
+    let clone = |name: &str| {
+        let path = root.child(name);
+        let cloned = Command::new("git")
+            .arg("clone")
+            .arg(&repo)
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(cloned.status.success(), "{}", stderr(&cloned));
+        fs::canonicalize(path).unwrap()
+    };
+    let (next, last) = (clone("next-clone"), clone("last-clone"));
+    let repo_arg = path_string(&repo);
+    let next_arg = path_string(&next);
+    fs::rename(&repo, root.child("moved-away")).unwrap();
+
+    // The forward switch does not need the previous checkout; its restore does.
+    env.insert("OCM_TEST_INSTALL_EXIT_CODE".to_string(), "42".to_string());
+    let failed = run_ocm(&next, &env, &dev_plain(&["demo"]));
+    assert_eq!(failed.status.code(), Some(42), "{}", stderr(&failed));
+    assert!(
+        stderr(&failed).contains(&format!("Switched demo from {repo_arg} to {next_arg}")),
+        "{}",
+        stderr(&failed)
+    );
+    assert!(
+        stderr(&failed).contains(&format!(
+            "demo remains bound to {next_arg}; restoring {repo_arg} failed:"
+        )),
+        "{}",
+        stderr(&failed)
+    );
+    assert!(
+        stderr(&failed).contains("prepare it with `pnpm install --frozen-lockfile` first"),
+        "{}",
+        stderr(&failed)
+    );
+    let bound = |env: &std::collections::BTreeMap<String, String>| {
+        get_environment("demo", env, &next)
+            .unwrap()
+            .dev
+            .unwrap()
+            .borrowed_source_root()
+            .map(str::to_string)
+    };
+    assert_eq!(bound(&env), Some(next_arg.clone()));
+    env.remove("OCM_TEST_INSTALL_EXIT_CODE");
+
+    // An ordinary resume of the kept binding leaves preparation explicit.
+    let resumed = run_ocm(&next, &env, &dev_plain(&["demo"]));
+    assert!(!resumed.status.success());
+    assert!(
+        stderr(&resumed).contains("pnpm install --frozen-lockfile"),
+        "{}",
+        stderr(&resumed)
+    );
+    assert!(!stderr(&resumed).contains("Switched demo"));
+    assert_eq!(installs_in(&root, &next), 1);
+
+    let switched = run_ocm(&last, &env, &dev_plain(&["demo"]));
+    assert!(switched.status.success(), "{}", stderr(&switched));
+    assert_eq!(installs_in(&root, &last), 1);
+    assert_eq!(bound(&env), Some(path_string(&last)));
+}

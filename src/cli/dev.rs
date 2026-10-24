@@ -227,21 +227,34 @@ impl Drop for DevSourceSwitch<'_> {
         if self.kept || thread::panicking() {
             return;
         }
-        let restored = self.cli.environment_service().rebind_dev_from(
+        let env_service = self.cli.environment_service();
+        let restored = env_service.rebind_dev_from(
             &self.env_name,
             Some(&self.selected),
             Path::new(&self.previous),
         );
-        self.cli.stderr_line(match restored {
+        let message = match restored {
             Ok(_) => format!(
                 "Switched {} back to {} because it did not start from {}.",
                 self.env_name, self.previous, self.selected
             ),
+            Err(error)
+                if env_service.get(&self.env_name).is_ok_and(|meta| {
+                    meta.dev.as_ref().and_then(EnvDevMeta::borrowed_source_root)
+                        == Some(self.selected.as_str())
+                }) =>
+            {
+                format!(
+                    "{} remains bound to {}; restoring {} failed: {error}. Its next start there will not install missing tooling; prepare it with `pnpm install --frozen-lockfile` first.",
+                    self.env_name, self.selected, self.previous
+                )
+            }
             Err(error) => format!(
-                "{} remains bound to {}; restoring {} failed: {error}",
-                self.env_name, self.selected, self.previous
+                "{} was not switched back to {}: {error}",
+                self.env_name, self.previous
             ),
-        });
+        };
+        self.cli.stderr_line(message);
     }
 }
 
@@ -729,16 +742,22 @@ impl Cli {
         // Lease admission rechecks after any concurrent daemon change.
         self.supervisor_service().preflight_source_watch_daemon()?;
         let stderr_profile = self.dev_stderr_profile();
+        // A switch handles interrupts from before it publishes, so cancellation
+        // still reaches its restore.
+        let mut watch_stop = None;
         // Declared before the lease so a failed start finishes its session
         // before the previous source is restored.
         let mut source_switch = match switch_target {
-            Some((existing, target)) => Some(self.switch_dev_source(
-                &existing,
-                &target,
-                root.as_deref(),
-                gateway_port,
-                stderr_profile,
-            )?),
+            Some((existing, target)) => {
+                watch_stop = Some(install_source_watch_signal_handler()?);
+                Some(self.switch_dev_source(
+                    &existing,
+                    &target,
+                    root.as_deref(),
+                    gateway_port,
+                    stderr_profile,
+                )?)
+            }
             None => None,
         };
         let (meta, created) =
@@ -753,7 +772,10 @@ impl Cli {
                 meta.name
             ));
         }
-        let watch_stop = Some(install_source_watch_signal_handler()?);
+        let watch_stop = match watch_stop {
+            Some(stop) => Some(stop),
+            None => Some(install_source_watch_signal_handler()?),
+        };
         let mode = if service_requested {
             SourceWatchMode::ServicePreparation
         } else {

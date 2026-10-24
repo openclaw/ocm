@@ -137,13 +137,15 @@ environments retain their recorded sources and original repository selection.
 
 New borrowers, and borrowers just switched to another checkout, may prepare
 missing tooling with `pnpm install --frozen-lockfile`. If a switched start fails
-or is cancelled before its Gateway starts and its processes are verified
-stopped, OCM switches the environment back, so the next start from the selected
-checkout switches and prepares it again. An installer stopped by a signal leaves
-cleanup unverified; OCM then keeps the session ownership and the new binding for
-recovery, after which missing tooling there needs explicit preparation. Other
-resumed borrowers report missing tooling for explicit preparation; they do not
-reinstall dependencies. Removing a borrower preserves source files, dependencies,
+or is cancelled before its Gateway starts, its processes are verified stopped
+and the previous checkout is still valid, OCM switches the environment back, so
+the next start from the selected checkout switches and prepares it again.
+Otherwise the new binding stays and OCM says so: an installer stopped by a
+signal leaves cleanup unverified, so its session ownership is kept for recovery,
+and a missing previous checkout cannot be restored. Missing tooling in the
+selected checkout then needs explicit preparation. Other resumed borrowers
+report missing tooling for explicit preparation; they do not reinstall
+dependencies. Removing a borrower preserves source files, dependencies,
 generated output, and unrelated source processes. Older OCM readers refuse the
 new binding records. Refresh an incompatible running daemon with
 `ocm service refresh-daemon --acknowledge-gateway-restarts` before registration.
