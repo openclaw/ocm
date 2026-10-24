@@ -80,8 +80,21 @@ pub fn resolve_activation_shell(
     explicit: Option<&str>,
     env: &BTreeMap<String, String>,
 ) -> Result<String, String> {
+    let parent_names = if explicit.is_none() {
+        parent_process_names()
+    } else {
+        Vec::new()
+    };
+    activation_shell(explicit, &parent_names, env)
+}
+
+fn activation_shell(
+    explicit: Option<&str>,
+    parent_names: &[String],
+    env: &BTreeMap<String, String>,
+) -> Result<String, String> {
     if explicit.is_none()
-        && let Some(shell) = parent_process_names()
+        && let Some(shell) = parent_names
             .iter()
             .find_map(|name| shell_dialect_for_process(name))
     {
@@ -92,7 +105,8 @@ pub fn resolve_activation_shell(
 
 fn shell_dialect_for_process(name: &str) -> Option<&'static str> {
     let name = Path::new(name).file_name()?.to_str()?;
-    match name.trim_start_matches('-') {
+    let name = name.trim_start_matches('-').to_ascii_lowercase();
+    match name.strip_suffix(".exe").unwrap_or(&name) {
         "bash" => Some("bash"),
         "fish" => Some("fish"),
         "zsh" => Some("zsh"),
@@ -614,6 +628,8 @@ mod tests {
             ("/usr/bin/dash", Some("sh")),
             ("sh", Some("sh")),
             ("/opt/fishery/bin/zsh", Some("zsh")),
+            ("/usr/bin/fish.exe", Some("fish")),
+            ("bash.EXE", Some("bash")),
             ("/usr/bin/busybox", None),
             ("python3", None),
             ("shell_init_tests-0123", None),
@@ -624,6 +640,44 @@ mod tests {
     }
 
     #[test]
+    fn activation_prefers_explicit_shell_then_shell_parent_then_shell_hint() {
+        let fish_hint = BTreeMap::from([("SHELL".to_string(), "/usr/bin/fish".to_string())]);
+        let zsh_hint = BTreeMap::from([("SHELL".to_string(), "/bin/zsh".to_string())]);
+        let names = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            activation_shell(None, &names(&["/usr/bin/bash", "bash"]), &fish_hint).unwrap(),
+            "bash"
+        );
+        assert_eq!(
+            activation_shell(None, &names(&["/usr/bin/fish", "fish"]), &zsh_hint).unwrap(),
+            "fish"
+        );
+        assert_eq!(
+            activation_shell(None, &names(&["/usr/bin/busybox", "ash"]), &fish_hint).unwrap(),
+            "sh"
+        );
+        assert_eq!(
+            activation_shell(None, &names(&["/usr/bin/python3", "python3"]), &fish_hint).unwrap(),
+            "fish"
+        );
+        assert_eq!(activation_shell(None, &[], &zsh_hint).unwrap(), "zsh");
+        assert_eq!(
+            activation_shell(Some("fish"), &names(&["/usr/bin/bash"]), &zsh_hint).unwrap(),
+            "fish"
+        );
+        assert_eq!(
+            activation_shell(Some("sh"), &names(&["/usr/bin/fish"]), &fish_hint).unwrap(),
+            "sh"
+        );
+    }
+
+    #[test]
     fn shell_hint_selects_fish_only_for_a_fish_executable() {
         for (hint, shell) in [
             (Some("/opt/homebrew/bin/fish"), "fish"),
@@ -631,6 +685,7 @@ mod tests {
             (Some("/opt/fishery/bin/zsh"), "zsh"),
             (Some("/home/fisher/bin/bash"), "zsh"),
             (Some("/bin/zsh"), "zsh"),
+            (Some("/usr/bin/fish.exe"), "fish"),
             (None, "zsh"),
         ] {
             let env = hint
