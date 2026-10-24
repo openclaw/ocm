@@ -318,7 +318,7 @@ fn env_run_onboard_clears_legacy_skip_bootstrap_by_default() {
         &["env", "run", "demo", "--", "--no-color", "onboard"],
         &["@demo", "--", "--log-level", "debug", "onboard"],
         &["@demo", "--", "--log-level=debug", "setup"],
-        &["@demo", "--", "--log-level", "debug", "--", "onboard"],
+        &["@demo", "--", "--log-level", "debug", "--", "setup"],
     ];
     for command in commands {
         write_text(

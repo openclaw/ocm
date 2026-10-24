@@ -677,6 +677,18 @@ fn env_run_rejects_global_daemon_install_during_onboarding() {
             stderr(&run)
         );
     }
+
+    let terminated = run_ocm(
+        &cwd,
+        &env,
+        &["@demo", "--", "--log-level", "debug", "--", "onboard"],
+    );
+    assert_eq!(terminated.status.code(), Some(1));
+    assert!(
+        stderr(&terminated).contains("when \"--\" comes before onboard"),
+        "{}",
+        stderr(&terminated)
+    );
 }
 
 #[test]

@@ -254,6 +254,13 @@ pub fn resolve_gateway_process_spec(
 /// are skipped, a leading `--` makes the following tokens literal words, and a
 /// `--` after a command word ends the command.
 pub(crate) fn openclaw_command_words(args: &[String]) -> impl Iterator<Item = &str> {
+    openclaw_command_path(args).map(|(word, _)| word)
+}
+
+/// Like `openclaw_command_words`, also telling whether each word follows a
+/// leading `--`, where OpenClaw passes the remaining tokens as operands rather
+/// than options.
+fn openclaw_command_path(args: &[String]) -> impl Iterator<Item = (&str, bool)> {
     let mut index = 0;
     let mut literal = false;
     let mut found = false;
@@ -279,16 +286,16 @@ pub(crate) fn openclaw_command_words(args: &[String]) -> impl Iterator<Item = &s
                 }
             }
             found = true;
-            return Some(arg);
+            return Some((arg, literal));
         }
         None
     })
 }
 
 fn normalize_openclaw_args_for_env(args: &[String]) -> Result<Vec<String>, String> {
-    if openclaw_command_words(args).next() != Some("onboard") {
+    let Some(("onboard", after_terminator)) = openclaw_command_path(args).next() else {
         return Ok(args.to_vec());
-    }
+    };
 
     if args.iter().any(|arg| arg == "--install-daemon") {
         return Err(
@@ -301,6 +308,12 @@ fn normalize_openclaw_args_for_env(args: &[String]) -> Result<Vec<String>, Strin
         .any(|arg| arg == "--no-install-daemon" || arg == "--skip-daemon")
     {
         return Ok(args.to_vec());
+    }
+
+    if after_terminator {
+        return Err(
+            "env onboarding cannot add --no-install-daemon when \"--\" comes before onboard, because OpenClaw then reads it as an argument; remove that \"--\" or run onboard outside OCM".to_string(),
+        );
     }
 
     let mut normalized = args.to_vec();
@@ -725,9 +738,19 @@ mod tests {
             args(&["--no-color", "onboard", "--skip-daemon"])
         );
         assert_eq!(
-            normalize_openclaw_args_for_env(&args(&["--", "onboard"])).unwrap(),
-            args(&["--", "onboard", "--no-install-daemon"])
+            normalize_openclaw_args_for_env(&args(&["--profile", "--", "onboard"])).unwrap(),
+            args(&["--profile", "--", "onboard", "--no-install-daemon"])
         );
+        for forwarded in [
+            &["--", "onboard"][..],
+            &["--log-level", "debug", "--", "onboard"],
+        ] {
+            let error = normalize_openclaw_args_for_env(&args(forwarded)).unwrap_err();
+            assert!(
+                error.contains("when \"--\" comes before onboard"),
+                "{forwarded:?}: {error}"
+            );
+        }
         let refused: [&[&str]; 5] = [
             &["--no-color", "onboard", "--install-daemon"],
             &["--", "onboard", "--install-daemon"],
