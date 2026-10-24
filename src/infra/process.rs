@@ -82,17 +82,20 @@ fn run_foreground(process: &mut Command) -> std::io::Result<ExitStatus> {
 #[cfg(unix)]
 mod foreground {
     use std::io;
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::{Command, ExitStatus};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::Duration;
 
-    use crate::infra::process_identity::{observe_process, process_group_members};
+    use crate::infra::process_identity::observe_process;
 
     /// Signals that ask a foreground command to stop. SIGKILL cannot be relayed.
     const RELAYED: [libc::c_int; 4] = [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
-    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    /// The longest a received signal waits before OCM passes it on. The
+    /// command's exit wakes OCM immediately.
+    const RELAY_INTERVAL: Duration = Duration::from_millis(100);
 
     // Signal dispositions are process-wide, so one foreground child is owned at a time.
     static OWNERSHIP: Mutex<()> = Mutex::new(());
@@ -112,16 +115,20 @@ mod foreground {
         let relay = Relay::install()?;
         let result = spawn_and_wait(process);
         drop(relay);
-        // What arrived after the command finished was meant for OCM itself.
-        for signal in take_received() {
+        // When a stop request ended the command, OCM ends the same way, as a
+        // shell job would; its caller then sees the interruption, not an exit
+        // code. Signals that arrived with no command to receive them were
+        // meant for OCM itself.
+        let stop_request = result.as_ref().ok().and_then(|(_, signal)| *signal);
+        for signal in stop_request.into_iter().chain(take_received()) {
             unsafe {
                 libc::raise(signal);
             }
         }
-        result
+        result.map(|(status, _)| status)
     }
 
-    fn spawn_and_wait(process: &mut Command) -> io::Result<ExitStatus> {
+    fn spawn_and_wait(process: &mut Command) -> io::Result<(ExitStatus, Option<libc::c_int>)> {
         let mut terminal = Terminal::observe();
         let take_terminal = terminal.owned;
         unsafe {
@@ -135,90 +142,110 @@ mod foreground {
                 Ok(())
             });
         }
-        let mut child = process.spawn()?;
-        let group = child.id() as libc::pid_t;
+        // The child can claim the terminal and still fail to exec, so reclaim
+        // it on every path.
         terminal.assigned = take_terminal;
-        // Also set it here so a relay cannot precede the child's own setpgid;
-        // the child may already have done so and exec'd.
-        unsafe {
-            libc::setpgid(group, group);
-        }
+        let mut child = match process.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                terminal.restore();
+                return Err(error);
+            }
+        };
+        let group = child.id() as libc::pid_t;
 
-        let mut relayed = false;
-        let mut outcome = Ok(());
-        loop {
-            relayed |= relay_received(group);
-            // The exited leader stays unreaped until relaying stops, so its
-            // process group ID cannot be reused by an unrelated process.
-            match has_exited(group) {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => {
-                    outcome = Err(error);
-                    break;
+        let mut relayed = 0_u64;
+        // Without an observer thread OCM can still wait, but not relay.
+        if let Ok(exited) = watch_exit(group) {
+            loop {
+                relayed |= relay_received(group);
+                match exited.recv_timeout(RELAY_INTERVAL) {
+                    // A failed observation also ends here; reaping below
+                    // reports the same failure instead of hanging.
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => terminal.follow_stopped_child(group),
                 }
-            }
-            if let Err(error) = terminal.follow_stopped_child(group) {
-                outcome = Err(error);
-                break;
-            }
-            std::thread::sleep(POLL_INTERVAL);
-        }
-        let restored = terminal.restore();
-        // A shell that exits on a relayed signal can leave the processes it
-        // started still shutting down; they were signalled with it.
-        while outcome.is_ok() && relayed {
-            relay_received(group);
-            match process_group_members(group as u32) {
-                Ok(members) if members.is_empty() => break,
-                Ok(_) => std::thread::sleep(POLL_INTERVAL),
-                Err(error) => outcome = Err(io::Error::other(error)),
             }
         }
         let status = child.wait();
-        outcome?;
-        restored?;
-        status
+        terminal.restore();
+        let death = status.as_ref().ok().and_then(ExitStatusExt::signal);
+        let terminal_stop =
+            terminal.owned && matches!(death, Some(libc::SIGINT | libc::SIGQUIT | libc::SIGHUP));
+        // A shell leader can exit before the processes it started finish
+        // handling the same stop request. The group ID stays reserved while
+        // any member remains, so it is safe to probe after reaping.
+        if relayed != 0 || terminal_stop {
+            while unsafe { libc::kill(-group, 0) } == 0 {
+                relayed |= relay_received(group);
+                std::thread::sleep(RELAY_INTERVAL);
+            }
+        }
+        let stop_request = death.filter(|signal| {
+            matches!(*signal, libc::SIGHUP | libc::SIGINT | libc::SIGTERM)
+                && (relayed & signal_bit(*signal) != 0 || terminal_stop)
+        });
+        Ok((status?, stop_request))
     }
 
-    fn relay_received(group: libc::pid_t) -> bool {
-        let mut relayed = false;
+    /// Report when the leader exits, leaving it unreaped so its process group
+    /// ID cannot be reused while OCM still signals that group.
+    fn watch_exit(pid: libc::pid_t) -> io::Result<mpsc::Receiver<()>> {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("ocm-foreground-wait".to_string())
+            .spawn(move || {
+                loop {
+                    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+                    let waited = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            pid as libc::id_t,
+                            &mut info,
+                            libc::WEXITED | libc::WNOWAIT,
+                        )
+                    };
+                    if waited == -1 {
+                        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        break;
+                    }
+                    // Darwin can report a stopped child despite WEXITED.
+                    if unsafe { info.si_pid() } == pid
+                        && matches!(
+                            info.si_code,
+                            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                        )
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let _ = sender.send(());
+            })?;
+        Ok(receiver)
+    }
+
+    fn relay_received(group: libc::pid_t) -> u64 {
+        let mut relayed = 0;
         for signal in take_received() {
             unsafe {
                 libc::kill(-group, signal);
             }
-            relayed = true;
+            relayed |= signal_bit(signal);
+        }
+        if relayed != 0 {
+            // A stopped group could not act on the request.
+            unsafe {
+                libc::kill(-group, libc::SIGCONT);
+            }
         }
         relayed
     }
 
-    fn has_exited(pid: libc::pid_t) -> io::Result<bool> {
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        let waited = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if waited == -1 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                return Ok(false);
-            }
-            return Err(error);
-        }
-        // Darwin can report a stopped child despite WEXITED.
-        Ok(unsafe { info.si_pid() } == pid
-            && matches!(
-                info.si_code,
-                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
-            ))
-    }
-
     struct Terminal {
-        /// OCM's process group is the terminal's foreground group.
+        /// OCM's process group was the terminal's foreground group.
         owned: bool,
         /// The child's group holds the terminal on OCM's behalf.
         assigned: bool,
@@ -234,32 +261,31 @@ mod foreground {
 
         /// Job control stops the child's group without OCM. Stop OCM too so
         /// the shell regains the terminal, then resume the group with it.
-        fn follow_stopped_child(&mut self, group: libc::pid_t) -> io::Result<()> {
-            let stopped = observe_process(group as u32)
-                .map_err(io::Error::other)?
-                .is_some_and(|process| process.stopped);
-            if !stopped || unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
-                return Ok(());
+        fn follow_stopped_child(&mut self, group: libc::pid_t) {
+            if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1
+                || !observe_process(group as u32)
+                    .is_ok_and(|process| process.is_some_and(|process| process.stopped))
+            {
+                return;
             }
-            self.restore()?;
-            if unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) } == -1 {
-                return Err(io::Error::last_os_error());
+            self.restore();
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGSTOP);
             }
             if in_terminal_foreground() {
-                super::assign_terminal_foreground(group)?;
-                self.assigned = true;
+                self.assigned = super::assign_terminal_foreground(group).is_ok();
             }
             unsafe {
                 libc::kill(-group, libc::SIGCONT);
             }
-            Ok(())
         }
 
-        fn restore(&mut self) -> io::Result<()> {
+        /// Best effort: the command's result stands even if the terminal
+        /// cannot be handed back.
+        fn restore(&mut self) {
             if std::mem::take(&mut self.assigned) {
-                super::assign_terminal_foreground(unsafe { libc::getpgrp() })?;
+                let _ = super::assign_terminal_foreground(unsafe { libc::getpgrp() });
             }
-            Ok(())
         }
     }
 
@@ -270,11 +296,15 @@ mod foreground {
         }
     }
 
+    fn signal_bit(signal: libc::c_int) -> u64 {
+        1 << signal
+    }
+
     fn take_received() -> impl Iterator<Item = libc::c_int> {
         let received = RECEIVED.swap(0, Ordering::SeqCst);
         RELAYED
             .into_iter()
-            .filter(move |signal| received & (1 << signal) != 0)
+            .filter(move |signal| received & signal_bit(*signal) != 0)
     }
 
     extern "C" fn record(signal: libc::c_int) {
@@ -287,7 +317,7 @@ mod foreground {
             }
             return;
         }
-        RECEIVED.fetch_or(1 << signal, Ordering::SeqCst);
+        RECEIVED.fetch_or(signal_bit(signal), Ordering::SeqCst);
     }
 
     struct Relay {

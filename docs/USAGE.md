@@ -528,10 +528,13 @@ On Unix, `ocm @<env> --`, `ocm env run` and `ocm env exec` start the command
 in its own process group and return only after it has exited. A SIGTERM,
 SIGINT, SIGQUIT or SIGHUP sent to the OCM process is passed on to that group,
 including processes started by a launcher's shell, so `kill <ocm pid>` also
-stops a foreground Gateway; OCM then waits for the rest of the group too. In a
-terminal, the command's group holds the foreground while it runs, so Ctrl-C
-reaches it once, directly, and Ctrl-Z suspends OCM along with it. SIGKILL
-cannot be passed on: it stops OCM alone.
+stops a foreground Gateway. In a terminal, the command's group holds the
+foreground while it runs, so Ctrl-C reaches it once, directly, and Ctrl-Z
+suspends OCM along with it. After passing a signal on, or after Ctrl-C or a
+hangup ends the command, OCM also waits for the rest of its process group. If
+the command was ended by that SIGTERM, SIGINT or SIGHUP, OCM then exits by the
+same signal, so a calling shell or supervisor sees the interruption. SIGKILL
+cannot be passed on: sent to OCM or its process group, it stops OCM alone.
 
 ### Export one bounded artifact
 
