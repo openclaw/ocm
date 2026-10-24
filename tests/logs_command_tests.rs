@@ -238,6 +238,24 @@ fn a_new_env_does_not_inherit_service_logs_left_under_its_name() {
 }
 
 #[test]
+fn a_rejected_create_keeps_the_earlier_service_logs() {
+    let root = TestDir::new("logs-rejected-create-keeps-logs");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let logs_dir = write_service_logs(&root, "demo", "removed env");
+
+    let rejected = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--launcher", "missing"],
+    );
+    assert!(!rejected.status.success());
+    assert!(logs_dir.join("demo.stdout.log").exists());
+    assert!(logs_dir.join("demo.stderr.log").exists());
+}
+
+#[test]
 fn updating_a_registered_env_keeps_its_service_logs() {
     let root = TestDir::new("logs-update-keeps-service-logs");
     let cwd = root.child("workspace");

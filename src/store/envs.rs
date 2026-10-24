@@ -601,14 +601,6 @@ fn create_environment_with_runtime_validation(
     if find_environment(&registry, &name).is_some() {
         return Err(format!("environment \"{name}\" already exists"));
     }
-    // Registration repeats this; doing it before any root is written lets a
-    // failure leave nothing behind.
-    crate::supervisor::discard_child_logs(
-        &name,
-        registry.envs.iter().map(|current| current.name.as_str()),
-        env,
-        cwd,
-    )?;
     registration.recheck(&name, options.dev.as_ref(), &registry.envs)?;
     let _runtime_admission = admit_runtime_binding(
         &registry,
@@ -672,6 +664,15 @@ fn create_environment_with_runtime_validation(
         None => choose_available_gateway_port(DEFAULT_GATEWAY_PORT, &registry.envs, env)?,
     });
 
+    // Registration repeats this. Doing it after validation keeps the earlier
+    // logs when creation is rejected, and before the root is written so a
+    // failure here leaves nothing behind.
+    crate::supervisor::discard_child_logs(
+        &name,
+        registry.envs.iter().map(|current| current.name.as_str()),
+        env,
+        cwd,
+    )?;
     ensure_dir(&paths.root)?;
     ensure_dir(&paths.state_dir)?;
     ensure_dir(&paths.workspace_dir)?;
