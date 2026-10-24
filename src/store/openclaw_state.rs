@@ -187,13 +187,340 @@ pub(crate) fn openclaw_env_archive_options(
         &BTreeSet::new(),
         excluded_path_roots,
     )?;
-    Ok(EnvArchiveOptions {
+    let mut options = EnvArchiveOptions {
         should_skip_path: should_skip_openclaw_env_archive_path,
         included_path_roots,
         excluded_path_roots,
         snapshot_sqlite_files: true,
         ..EnvArchiveOptions::default()
-    })
+    };
+    let git_paths = archived_git_paths_in_import_removed_roots(paths, &options)?;
+    options.included_path_roots.extend(git_paths);
+    Ok(options)
+}
+
+/// Legacy file stores that default import, like clone, removes. The default
+/// archive omits them so it does not carry credentials or identity that no
+/// default import restores.
+const IMPORT_REMOVED_STATE_ROOTS: [&str; 5] =
+    ["credentials", "cron", "devices", "identity", "memory"];
+
+/// Default import retains Git repositories found in the archive, their storage,
+/// and the configuration files they select, wherever they are copied. Keep the
+/// ones inside the omitted legacy stores, using import's repository recognition
+/// and configuration selection; without path mappings the selection edits
+/// nothing. Includes are selected where the repository is now, so a condition
+/// that depends on its location (such as `gitdir:`) is evaluated at the source.
+fn archived_git_paths_in_import_removed_roots(
+    paths: &EnvPaths,
+    options: &EnvArchiveOptions,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let removed_roots = IMPORT_REMOVED_STATE_ROOTS
+        .iter()
+        .map(|name| paths.state_dir.join(name))
+        // A store can also be an alias that selected Git configuration is
+        // reached through; the walk below still never follows links.
+        .filter(|path| fs::symlink_metadata(path).is_ok())
+        .collect::<Vec<_>>();
+    if removed_roots.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let canonical_root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
+    let history = IntegrityProtectedLibraryPaths::new(&paths.state_dir)?;
+    // The archive's excluded roots win over the store search, as they do
+    // over every other selection.
+    let excluded = |path: &Path| {
+        path.strip_prefix(&paths.root).is_ok_and(|relative| {
+            options
+                .excluded_path_roots
+                .iter()
+                .any(|root| relative.starts_with(root))
+        })
+    };
+    let in_removed_root =
+        |path: &Path| removed_roots.iter().any(|root| path.starts_with(root)) && !excluded(path);
+    let mut contexts = Vec::new();
+    let mut directories = vec![paths.root.clone()];
+    while let Some(directory) = directories.pop() {
+        let (mut git_entry, mut head, mut objects) = (false, false, false);
+        let mut children = Vec::new();
+        // The archive writer tolerates entries that disappear while a live
+        // environment is exported; so does this selection.
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            git_entry |= name == ".git";
+            head |= name == "HEAD";
+            objects |= name == "objects";
+            let path = entry.path();
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            if name == ".git"
+                || !kind.is_dir()
+                || is_integrity_protected_history_path(&paths.state_dir, &path)
+                || history.roots.iter().any(|root| path.starts_with(root))
+            {
+                continue;
+            }
+            // Only archived directories reach import; the omitted stores are
+            // searched because this selection may keep repositories there.
+            let relative = path
+                .strip_prefix(&paths.root)
+                .map_err(|error| error.to_string())?;
+            if in_removed_root(&path)
+                || !options.should_skip(relative, EnvArchiveEntryKind::Directory)
+            {
+                children.push(path);
+            }
+        }
+        // The listing supplies the repository markers that import's
+        // recognition checks, so most directories need no further lookups.
+        // Import sees a repository only when its markers are archived: a
+        // checkout's `.git` entry, or a bare repository's HEAD and objects.
+        // Otherwise keep searching inside it like any other directory.
+        let relative = directory
+            .strip_prefix(&paths.root)
+            .map_err(|error| error.to_string())?;
+        let archived = |name: &str, kind| !options.should_skip(&relative.join(name), kind);
+        let visible = in_removed_root(&directory)
+            || if git_entry {
+                archived(".git", EnvArchiveEntryKind::Directory)
+            } else {
+                archived("HEAD", EnvArchiveEntryKind::File)
+                    && archived("objects", EnvArchiveEntryKind::Directory)
+            };
+        if (git_entry || (head && objects))
+            && visible
+            && let Some(context) =
+                git_config::copied_destination_git_context(&canonical_root, &directory)
+                    .map_err(|error| export_git_selection_error(&directory, error))?
+        {
+            contexts.push((context, !git_entry));
+            if !git_entry {
+                continue; // Do not scan a native bare repository's administrative storage.
+            }
+        }
+        directories.extend(children);
+    }
+
+    let mut archived = BTreeSet::new();
+    let mut archive_relative = |relative: &Path| {
+        // A checkout at the environment root makes import retain the whole
+        // state directory, including these stores.
+        if relative.as_os_str().is_empty() {
+            archived.extend(
+                removed_roots
+                    .iter()
+                    .filter_map(|root| root.strip_prefix(&paths.root).ok())
+                    .map(Path::to_path_buf),
+            );
+        } else if matches!(
+            path_components(relative).as_slice(),
+            [".openclaw", name, ..] if IMPORT_REMOVED_STATE_ROOTS.contains(name)
+        ) {
+            archived.insert(relative.to_path_buf());
+        }
+    };
+    for (context, bare) in &contexts {
+        // Retained configuration paths include the alias links needed to
+        // reach them, so they are matched as returned, not resolved.
+        for path in
+            git_config::relocate_copied_git_config(&paths.root, &[], std::slice::from_ref(context))
+                .map_err(|error| export_git_selection_error(&context.checkout, error))?
+        {
+            if let Ok(relative) = path.strip_prefix(&paths.root) {
+                archive_relative(relative);
+            }
+        }
+        // Import keeps a standalone bare repository's directory and selected
+        // configuration only; it inspects the storage of checkouts.
+        let mut storage = vec![context.checkout.clone()];
+        if !*bare {
+            storage.extend(checkout_storage_paths(context, &canonical_root));
+        }
+        for path in storage {
+            // Import resolves storage through the recorded spelling, so keep
+            // the alias links on the way as well as the storage itself.
+            let entries =
+                crate::store::dev_sources::existing_source_path_entries(&path).unwrap_or_default();
+            for entry in entries {
+                if !fs::symlink_metadata(&entry).is_ok_and(|meta| meta.is_symlink()) {
+                    continue;
+                }
+                let (Some(parent), Some(name)) = (entry.parent(), entry.file_name()) else {
+                    continue;
+                };
+                if let Ok(parent) = fs::canonicalize(parent) {
+                    let alias = parent.join(name);
+                    if let Ok(relative) = alias.strip_prefix(&canonical_root) {
+                        archive_relative(relative);
+                    }
+                }
+            }
+            if let Ok(resolved) = fs::canonicalize(&path)
+                && let Ok(relative) = resolved.strip_prefix(&canonical_root)
+            {
+                archive_relative(relative);
+            }
+        }
+    }
+    Ok(archived)
+}
+
+/// Alternate object directories named by `objects/info/alternates`, read as
+/// import's Git graph reads them: C-quoted or literal lines, relative to
+/// `objects`, ignoring comments and anything after a NUL byte.
+fn git_alternate_object_dirs(objects: &Path) -> Vec<PathBuf> {
+    let Ok(original) = fs::read(objects.join("info/alternates")) else {
+        return Vec::new();
+    };
+    let body_end = original
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(original.len());
+    let mut remaining = &original[..body_end];
+    let mut alternates = Vec::new();
+    while !remaining.is_empty() {
+        let end = remaining
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(remaining.len());
+        if end == 0 || remaining[0] == b'#' {
+            remaining = &remaining[(end + 1).min(remaining.len())..];
+            continue;
+        }
+        let (raw, consumed) = crate::openclaw_repo::unquote_git_path(remaining)
+            .unwrap_or_else(|| (remaining[..end].to_vec(), end));
+        remaining = &remaining[(consumed + 1).min(remaining.len())..];
+        let raw = raw.split(|byte| *byte == 0).next().unwrap_or_default();
+        if raw.is_empty() {
+            continue;
+        }
+        #[cfg(unix)]
+        let path = {
+            use std::os::unix::ffi::OsStrExt;
+            PathBuf::from(OsStr::from_bytes(raw))
+        };
+        #[cfg(not(unix))]
+        let Ok(path) = std::str::from_utf8(raw).map(PathBuf::from) else {
+            continue;
+        };
+        alternates.push(objects.join(path));
+    }
+    alternates
+}
+
+/// Storage that import resolves for a checkout: Git pointers in their recorded
+/// spelling, the links inside its administrative directories (as import's
+/// metadata inspection walks them) and every object store with the
+/// alternates files naming them, including the `.git` and `.gitmodules`
+/// entries themselves.
+fn checkout_storage_paths(
+    context: &git_config::CopiedGitConfigContext,
+    canonical_root: &Path,
+) -> Vec<PathBuf> {
+    let mut storage = vec![
+        context.private_dir.clone(),
+        context.common_dir.clone(),
+        context.checkout.join(".git"),
+        context.checkout.join(".gitmodules"),
+    ];
+    // Import resolves Git pointers in their recorded spelling, and every
+    // link inside the repository's administrative directories.
+    for (file, base, prefix) in [
+        (
+            context.checkout.join(".git"),
+            &context.checkout,
+            &b"gitdir: "[..],
+        ),
+        (
+            context.private_dir.join("commondir"),
+            &context.private_dir,
+            b"",
+        ),
+        (
+            context.private_dir.join("gitdir"),
+            &context.private_dir,
+            b"",
+        ),
+    ] {
+        if fs::symlink_metadata(&file).is_ok_and(|meta| !meta.is_dir())
+            && let Ok(Some(target)) = crate::openclaw_repo::read_git_pointer(&file, base, prefix)
+        {
+            storage.push(target);
+        }
+    }
+    // Mirror import's metadata inspection: it resolves every entry,
+    // follows linked directories, and skips hooks outside refs because
+    // they are authored configuration rather than Git storage.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Scope {
+        Root,
+        Refs,
+        Other,
+    }
+    let mut metadata = vec![
+        (context.private_dir.clone(), Scope::Root),
+        (context.common_dir.clone(), Scope::Root),
+    ];
+    let mut visited = BTreeSet::new();
+    while let Some((directory, scope)) = metadata.pop() {
+        let Ok(directory) = fs::canonicalize(&directory) else {
+            continue;
+        };
+        // Import rejects metadata outside the environment; never read it.
+        if !directory.starts_with(canonical_root) || !visited.insert((directory.clone(), scope)) {
+            continue;
+        }
+        for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            if scope != Scope::Refs && name == OsStr::new("hooks") {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                storage.push(path.clone());
+            }
+            if fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                let child = match scope {
+                    Scope::Root if name == OsStr::new("refs") => Scope::Refs,
+                    Scope::Refs => Scope::Refs,
+                    _ => Scope::Other,
+                };
+                metadata.push((path, child));
+            }
+        }
+    }
+    // Import also requires every object store a repository uses and the
+    // alternates files naming them, following the whole chain once.
+    let mut object_dirs = vec![context.common_dir.join("objects")];
+    let mut seen_object_dirs = BTreeSet::new();
+    while let Some(objects) = object_dirs.pop() {
+        // Every listed spelling is resolved by import, even when another
+        // spelling of the same store was already followed.
+        storage.push(objects.join("info/alternates"));
+        storage.push(objects.clone());
+        let identity = fs::canonicalize(&objects).unwrap_or_else(|_| objects.clone());
+        if seen_object_dirs.insert(identity) {
+            object_dirs.extend(git_alternate_object_dirs(&objects));
+        }
+    }
+    storage
+}
+
+fn export_git_selection_error(repository: &Path, error: String) -> String {
+    format!(
+        "cannot select the Git files that import keeps for the repository at {}: {error}",
+        display_path(repository)
+    )
 }
 
 pub(crate) fn openclaw_env_state_archive_options(
@@ -3175,11 +3502,6 @@ fn is_durable_openclaw_archive_path(components: &[&str]) -> bool {
             | [".openclaw", "workspace", ..]
             | [".openclaw", "openclaw.json"]
             | [".openclaw", "agents", ..]
-            | [".openclaw", "credentials", ..]
-            | [".openclaw", "cron", ..]
-            | [".openclaw", "devices", ..]
-            | [".openclaw", "identity", ..]
-            | [".openclaw", "memory", ..]
             | [".openclaw", "plugins", ..]
             | [".openclaw", "extensions", ..]
             | [".openclaw", "npm", ..]
@@ -4556,6 +4878,11 @@ mod tests {
             );
         }
         for path in [
+            ".openclaw/credentials/oauth.json",
+            ".openclaw/cron/jobs.json",
+            ".openclaw/devices/paired.json",
+            ".openclaw/identity/device.json",
+            ".openclaw/memory/notes.md",
             ".openclaw/plugin-runtime-deps/node_modules/demo/index.js",
             ".openclaw/bundled-plugin-runtime-deps/node_modules/demo/index.js",
             ".openclaw/.openclaw-pnpm-store/v3/files/cache",

@@ -1973,3 +1973,817 @@ fn env_export_retains_agent_payload_under_equivalent_root_spellings() {
         );
     }
 }
+
+fn export_git_argument(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(path) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{path}");
+        }
+        if let Some(path) = value.strip_prefix(r"\\?\") {
+            return path.to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn export_git(
+    path: &std::path::Path,
+    env: &std::collections::BTreeMap<String, String>,
+    args: &[&str],
+) -> String {
+    let result = std::process::Command::new("git")
+        .arg("-C")
+        .arg(export_git_argument(&path.to_string_lossy()))
+        .args(args.iter().map(|value| export_git_argument(value)))
+        .env_clear()
+        .envs(env)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", stderr(&result));
+    stdout(&result).trim().to_string()
+}
+
+#[test]
+fn default_export_omits_legacy_stores_that_default_import_removes() {
+    assert_default_export_omits_legacy_stores(false);
+    #[cfg(unix)]
+    assert_default_export_omits_legacy_stores(true);
+}
+
+fn archived_state_paths(
+    archive: &std::path::Path,
+) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut archived = std::collections::BTreeSet::new();
+    for entry in tar::Archive::new(fs::File::open(archive).unwrap())
+        .entries()
+        .unwrap()
+    {
+        let path = entry.unwrap().path().unwrap().into_owned();
+        if let Ok(relative) = path.strip_prefix("root/.openclaw") {
+            archived.insert(relative.to_path_buf());
+        }
+    }
+    archived
+}
+
+fn assert_default_export_omits_legacy_stores(aliased_root: bool) {
+    let fixture = TestDir::new("export-legacy-stores");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let parent = root.join("real");
+    fs::create_dir_all(&parent).unwrap();
+    // The source is created and exported through an aliased root spelling too.
+    let parent = if aliased_root {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&parent, root.join("alias")).unwrap();
+        root.join("alias")
+    } else {
+        parent
+    };
+    let source = parent.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    let removed = [
+        "credentials/oauth.json",
+        "credentials/whatsapp/default/creds.json",
+        "identity/device.json",
+        "devices/paired.json",
+        "cron/jobs.json",
+        "memory/notes.md",
+    ];
+    for relative in removed {
+        write_text(&state.join(relative), "synthetic secret\n");
+    }
+    let kept = [
+        "agents/main/agent/auth-profiles.json",
+        "workspace/AGENTS.md",
+        "plugins/installs.json",
+        "extensions/demo/package.json",
+    ];
+    for relative in kept {
+        write_text(&state.join(relative), "{}\n");
+    }
+
+    // Import keeps Git configuration and storage inside those stores.
+    let git = |path: &std::path::Path, args: &[&str]| export_git(path, &env, args);
+    let repository = source.join("projects/repository");
+    fs::create_dir_all(&repository).unwrap();
+    git(&repository, &["init", "-q"]);
+    write_text(&repository.join("authored.txt"), "authored\n");
+    git(&repository, &["add", "authored.txt"]);
+    git(
+        &repository,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    );
+    let included = state.join("credentials/shared.gitconfig");
+    let inactive = state.join("credentials/inactive.gitconfig");
+    let relative_include = state.join("credentials/relative.gitconfig");
+    write_text(&included, "[fixture]\n\tretained = selected\n");
+    write_text(&inactive, "inactive malformed [configuration");
+    write_text(&relative_include, "[fixture]\n\trelative = selected\n");
+    let quote = |path: &std::path::Path| {
+        serde_json::to_string(&export_git_argument(&path.to_string_lossy())).unwrap()
+    };
+    let mut config = fs::read_to_string(repository.join(".git/config")).unwrap();
+    config.push_str(&format!(
+        "[include]\n\tpath = {}\n[includeIf \"onbranch:never-selected\"]\n\tpath = {}\n[include]\n\tpath = ../../../.openclaw/credentials/relative.gitconfig\n",
+        quote(&included),
+        quote(&inactive)
+    ));
+    fs::write(repository.join(".git/config"), config).unwrap();
+    assert_eq!(
+        git(&repository, &["config", "--get", "fixture.retained"]),
+        "selected"
+    );
+    // An alternate object store that names another one, C-quoted as import
+    // writes it.
+    let alternate = state.join("memory/object-store/objects");
+    let nested_alternate = state.join("cron/object-store/objects");
+    fs::create_dir_all(nested_alternate.join("info")).unwrap();
+    write_text(&nested_alternate.join("info/keep"), "");
+    write_text(
+        &alternate.join("info/alternates"),
+        &format!("{}\n", quote(&nested_alternate)),
+    );
+    write_text(
+        &repository.join(".git/objects/info/alternates"),
+        &format!("{}\n", export_git_argument(&alternate.to_string_lossy())),
+    );
+    let bare = state.join("memory/notes.git");
+    fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "-q", "--bare"]);
+    let source_git = [
+        repository.join(".git/config"),
+        repository.join(".git/HEAD"),
+        repository.join(".git/objects/info/alternates"),
+        bare.join("config"),
+        alternate.join("info/alternates"),
+        included.clone(),
+        inactive.clone(),
+        relative_include.clone(),
+    ]
+    .map(|path| (fs::read(&path).unwrap(), path));
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    // Selecting what import keeps leaves the source Git data unchanged.
+    for (bytes, path) in &source_git {
+        assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
+    }
+    let archived = archived_state_paths(&archive);
+    for relative in removed {
+        assert!(
+            !archived.contains(std::path::Path::new(relative)),
+            "{relative} should not be archived"
+        );
+    }
+    for relative in kept.iter().chain(&[
+        "credentials/shared.gitconfig",
+        "credentials/inactive.gitconfig",
+        "credentials/relative.gitconfig",
+        "memory/notes.git/HEAD",
+        "memory/object-store/objects/info/alternates",
+        "cron/object-store/objects/info/keep",
+    ]) {
+        assert!(
+            archived.contains(std::path::Path::new(relative)),
+            "{relative} should be archived"
+        );
+    }
+
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    let target_state = target.join(".openclaw");
+    for relative in removed {
+        assert!(!target_state.join(relative).exists(), "{relative}");
+    }
+    for relative in kept {
+        assert!(target_state.join(relative).is_file(), "{relative}");
+    }
+    assert_eq!(
+        fs::read_to_string(target_state.join("credentials/shared.gitconfig")).unwrap(),
+        "[fixture]\n\tretained = selected\n"
+    );
+    assert_eq!(
+        fs::read_to_string(target_state.join("credentials/inactive.gitconfig")).unwrap(),
+        "inactive malformed [configuration"
+    );
+    let target_repository = target.join("projects/repository");
+    assert_eq!(
+        fs::canonicalize(
+            git(&target_repository, &["config", "--get-all", "include.path"])
+                .lines()
+                .next()
+                .unwrap()
+        )
+        .unwrap(),
+        fs::canonicalize(target_state.join("credentials/shared.gitconfig")).unwrap()
+    );
+    assert_eq!(
+        git(&target_repository, &["config", "--get", "fixture.retained"]),
+        "selected"
+    );
+    assert_eq!(
+        git(&target_repository, &["config", "--get", "fixture.relative"]),
+        "selected"
+    );
+    assert!(target_state.join("memory/notes.git/HEAD").is_file());
+    assert!(target_state.join("memory/object-store/objects").is_dir());
+    assert!(target_state.join("cron/object-store/objects").is_dir());
+}
+
+#[test]
+fn default_export_keeps_legacy_stores_of_an_environment_root_checkout() {
+    // Import retains everything inside a checkout at the environment root.
+    let fixture = TestDir::new("export-legacy-stores-root-checkout");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    export_git(&source, &env, &["init", "-q"]);
+    let state = source.join(".openclaw");
+    write_text(&state.join("credentials/oauth.json"), "kept\n");
+    write_text(&state.join("memory/notes.md"), "kept\n");
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let archived = archived_state_paths(&archive);
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    for relative in ["credentials/oauth.json", "memory/notes.md"] {
+        assert!(
+            archived.contains(std::path::Path::new(relative)),
+            "{relative}"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join(".openclaw").join(relative)).unwrap(),
+            "kept\n"
+        );
+    }
+}
+
+#[test]
+fn default_export_omits_legacy_stores_under_a_state_directory_checkout() {
+    // Import cannot see a checkout whose .git entry the archive omits, so
+    // it removes these stores and export must leave them out.
+    let fixture = TestDir::new("export-legacy-stores-state-checkout");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    export_git(&state, &env, &["init", "-q"]);
+    write_text(&state.join("credentials/oauth.json"), "synthetic secret\n");
+    // Its configuration selects a file in a store, which import never sees.
+    write_text(
+        &state.join("credentials/state.gitconfig"),
+        "[fixture]\n\tunseen = selected\n",
+    );
+    export_git(
+        &state,
+        &env,
+        &["config", "include.path", "../credentials/state.gitconfig"],
+    );
+    assert_eq!(
+        export_git(&state, &env, &["config", "--get", "fixture.unseen"]),
+        "selected"
+    );
+    write_text(&state.join("memory/notes.md"), "synthetic secret\n");
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let archived = archived_state_paths(&archive);
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    for relative in [
+        "credentials/oauth.json",
+        "credentials/state.gitconfig",
+        "memory/notes.md",
+    ] {
+        assert!(
+            !archived.contains(std::path::Path::new(relative)),
+            "{relative} should not be archived"
+        );
+        assert!(
+            !target.join(".openclaw").join(relative).exists(),
+            "{relative}"
+        );
+    }
+}
+
+#[test]
+fn default_export_searches_inside_a_state_directory_bare_repository() {
+    // A bare repository whose HEAD and objects the archive omits is invisible
+    // to import: its include target stays out, and repositories inside the
+    // stores it contains are still found and kept.
+    let fixture = TestDir::new("export-legacy-stores-state-bare");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    export_git(&state, &env, &["init", "-q", "--bare"]);
+    write_text(
+        &state.join("credentials/state.gitconfig"),
+        "[fixture]\n\tunseen = selected\n",
+    );
+    export_git(
+        &state,
+        &env,
+        &["config", "include.path", "credentials/state.gitconfig"],
+    );
+    let notes = state.join("memory/notes.git");
+    fs::create_dir_all(&notes).unwrap();
+    export_git(&notes, &env, &["init", "-q", "--bare"]);
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let archived = archived_state_paths(&archive);
+    assert!(
+        !archived.contains(std::path::Path::new("credentials/state.gitconfig")),
+        "an include of an unarchived repository should not be archived"
+    );
+    assert!(archived.contains(std::path::Path::new("memory/notes.git/HEAD")));
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert!(target.join(".openclaw/memory/notes.git/HEAD").is_file());
+    assert!(
+        !target
+            .join(".openclaw/credentials/state.gitconfig")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_uses() {
+    // Import retains the alias links on the way to selected configuration.
+    let fixture = TestDir::new("export-legacy-store-alias");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    write_text(
+        &source.join("projects/git-settings/selected.conf"),
+        "[fixture]\n\taliased = selected\n",
+    );
+    std::os::unix::fs::symlink("../projects/git-settings", state.join("credentials")).unwrap();
+    let repository = source.join("projects/repository");
+    fs::create_dir_all(&repository).unwrap();
+    export_git(&repository, &env, &["init", "-q"]);
+    export_git(
+        &repository,
+        &env,
+        &[
+            "config",
+            "include.path",
+            state.join("credentials/selected.conf").to_str().unwrap(),
+        ],
+    );
+    // Its alternate object store is reached through another store alias.
+    write_text(&source.join("projects/object-store/objects/info/keep"), "");
+    std::os::unix::fs::symlink("../projects/object-store", state.join("memory")).unwrap();
+    write_text(
+        &repository.join(".git/objects/info/alternates"),
+        &format!("{}\n", state.join("memory/objects").display()),
+    );
+    // Git metadata that is itself a link into a store.
+    write_text(&state.join("cron/exclude"), "ignored.txt\n");
+    fs::remove_file(repository.join(".git/info/exclude")).ok();
+    std::os::unix::fs::symlink(
+        state.join("cron/exclude"),
+        repository.join(".git/info/exclude"),
+    )
+    .unwrap();
+    // A .gitmodules link into a store is resolved by import too.
+    write_text(&state.join("identity/gitmodules"), "");
+    std::os::unix::fs::symlink(
+        state.join("identity/gitmodules"),
+        repository.join(".gitmodules"),
+    )
+    .unwrap();
+    // A hook link is authored configuration that import neither inspects
+    // nor keeps, so its target in a store stays out.
+    write_text(&state.join("devices/pre-commit"), "#!/bin/sh\n");
+    fs::create_dir_all(repository.join(".git/hooks")).unwrap();
+    std::os::unix::fs::symlink(
+        state.join("devices/pre-commit"),
+        repository.join(".git/hooks/pre-commit"),
+    )
+    .unwrap();
+    // Links inside a linked metadata directory are inspected too.
+    write_text(&state.join("identity/description"), "described\n");
+    fs::create_dir_all(source.join("projects/linked-logs")).unwrap();
+    std::os::unix::fs::symlink(
+        state.join("identity/description"),
+        source.join("projects/linked-logs/description"),
+    )
+    .unwrap();
+    fs::remove_dir_all(repository.join(".git/logs")).ok();
+    std::os::unix::fs::symlink(
+        source.join("projects/linked-logs"),
+        repository.join(".git/logs"),
+    )
+    .unwrap();
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let archived = archived_state_paths(&archive);
+    assert!(archived.contains(std::path::Path::new("credentials")));
+    assert!(archived.contains(std::path::Path::new("memory")));
+    assert!(archived.contains(std::path::Path::new("cron/exclude")));
+    assert!(archived.contains(std::path::Path::new("identity/description")));
+    assert!(archived.contains(std::path::Path::new("identity/gitmodules")));
+    assert!(!archived.contains(std::path::Path::new("devices/pre-commit")));
+    // The source is unavailable while importing.
+    fs::rename(&source, root.join("offline")).unwrap();
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert!(
+        fs::symlink_metadata(target.join(".openclaw/credentials"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    // Import resolves the alternate through the archived alias, then records
+    // the store's location inside the target.
+    let alternate =
+        fs::read_to_string(target.join("projects/repository/.git/objects/info/alternates"))
+            .unwrap();
+    let alternate = fs::canonicalize(alternate.trim().trim_matches('"')).unwrap();
+    assert!(alternate.is_dir());
+    assert!(alternate.starts_with(fs::canonicalize(&target).unwrap()));
+    assert_eq!(
+        fs::read_to_string(target.join("projects/repository/.git/info/exclude")).unwrap(),
+        "ignored.txt\n"
+    );
+    assert_eq!(
+        export_git(
+            &target.join("projects/repository"),
+            &env,
+            &["config", "--get", "fixture.aliased"]
+        ),
+        "selected"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn default_export_keeps_every_alternate_object_store_import_requires() {
+    // Import follows the whole alternates chain and resolves each list file.
+    let fixture = TestDir::new("export-legacy-store-alternates");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    let repository = source.join("projects/repository");
+    fs::create_dir_all(&repository).unwrap();
+    export_git(&repository, &env, &["init", "-q"]);
+    let stores = (1..=6)
+        .map(|index| state.join(format!("memory/a{index}/objects")))
+        .collect::<Vec<_>>();
+    for store in &stores {
+        write_text(&store.join("pack/keep"), "");
+    }
+    // Two store aliases of the same shared store are both listed.
+    write_text(&source.join("projects/shared-store/objects/pack/keep"), "");
+    for alias in ["identity", "devices"] {
+        std::os::unix::fs::symlink(
+            source.join("projects/shared-store/objects"),
+            state.join(alias),
+        )
+        .unwrap();
+    }
+    write_text(
+        &repository.join(".git/objects/info/alternates"),
+        &format!(
+            "{}\n{}\n{}\n",
+            stores[0].display(),
+            state.join("identity").display(),
+            state.join("devices").display()
+        ),
+    );
+    for pair in stores.windows(2) {
+        write_text(
+            &pair[0].join("info/alternates"),
+            &format!("{}\n", pair[1].display()),
+        );
+    }
+    // The last store's alternates list is itself a link into another store.
+    write_text(&state.join("credentials/alternate-list"), "");
+    fs::create_dir_all(stores[5].join("info")).unwrap();
+    std::os::unix::fs::symlink(
+        state.join("credentials/alternate-list"),
+        stores[5].join("info/alternates"),
+    )
+    .unwrap();
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let archived = archived_state_paths(&archive);
+    for index in 1..=6 {
+        let relative = format!("memory/a{index}/objects/pack/keep");
+        assert!(
+            archived.contains(std::path::Path::new(&relative)),
+            "{relative}"
+        );
+    }
+    assert!(archived.contains(std::path::Path::new("credentials/alternate-list")));
+    for alias in ["identity", "devices"] {
+        assert!(archived.contains(std::path::Path::new(alias)), "{alias}");
+    }
+    fs::rename(&source, root.join("offline")).unwrap();
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert!(target.join(".openclaw/memory/a6/objects").is_dir());
+}
+
+#[test]
+fn default_export_omits_storage_of_a_standalone_bare_repository() {
+    // Import keeps a standalone bare repository and its configuration but not
+    // the stores its alternates name, so export leaves those stores out.
+    let fixture = TestDir::new("export-legacy-store-bare-alternates");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    let mirror = source.join("projects/mirror.git");
+    fs::create_dir_all(&mirror).unwrap();
+    export_git(&mirror, &env, &["init", "-q", "--bare"]);
+    write_text(&state.join("cron/objects/pack/keep"), "");
+    write_text(
+        &mirror.join("objects/info/alternates"),
+        &format!(
+            "{}\n",
+            export_git_argument(&state.join("cron/objects").to_string_lossy())
+        ),
+    );
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    assert!(
+        !archived_state_paths(&archive).contains(std::path::Path::new("cron/objects/pack/keep"))
+    );
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert!(target.join("projects/mirror.git/HEAD").is_file());
+    assert!(!target.join(".openclaw/cron").exists());
+}

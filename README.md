@@ -608,7 +608,10 @@ Keep the original home and linked external data intact; do not remove the link's
 Environment clone, export, and import flows preserve managed OpenClaw plugin
 payloads under the legacy, extension, npm, and Git install roots. Clone and default archive
 import clear legacy file-based sessions, logs, backups, and process residue so the new
-environment does not share active runtime state with its source. Clones and
+environment does not share active runtime state with its source. Default export
+omits the legacy `credentials`, `identity`, `devices`, `cron`, and `memory` file
+stores that this cleanup removes, apart from Git repositories and selected Git
+configuration there; `--include-state` keeps them. Clones and
 default export/import also retain shared managed skills under `.openclaw/skills`
 and their global ClawHub tracking metadata under `.openclaw/.clawhub`; ordinary
 runtime-state cleanup retains these roots too. Clones also clear copied agent database process leases while keeping the state database,
