@@ -1729,6 +1729,19 @@ impl ImportStaging {
     fn create(env: &BTreeMap<String, String>, cwd: &Path) -> Result<Self, String> {
         let parent = resolve_store_paths(env, cwd)?.home.join(IMPORT_STAGING_DIR);
         super::common::ensure_private_dir(&parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::symlink_metadata(&parent).map_err(|error| error.to_string())?;
+            // A privileged import must not stage where another user controls entries.
+            // SAFETY: geteuid has no preconditions.
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(format!(
+                    "import staging directory is not owned by the current user: {}",
+                    display_path(&parent)
+                ));
+            }
+        }
         // Serializes sweeping with creation, so a leaf is locked before any
         // other import can consider it abandoned.
         let _creation =
