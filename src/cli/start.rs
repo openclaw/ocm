@@ -260,7 +260,9 @@ impl Cli {
                     .environment_service()
                     .get(&request.name)
                     .map_err(&discard_launcher)?;
-                if current.root != existing.root {
+                // A same-name env created after a removal is a different env;
+                // the prepared config belongs to the one start read first.
+                if current.root != existing.root || current.created_at != existing.created_at {
                     return Err(discard_launcher(format!(
                         "environment \"{}\" changed while start was preparing it; retry",
                         request.name

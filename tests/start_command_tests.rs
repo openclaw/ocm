@@ -720,6 +720,91 @@ fn start_does_not_recreate_an_env_removed_while_it_waits_for_the_operation_lock(
 }
 
 #[test]
+fn start_refuses_an_env_recreated_while_it_waits_for_the_operation_lock() {
+    let root = TestDir::new("start-recreated-env");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--launcher", "stable"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let first = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    let env_root = PathBuf::from(&first.root);
+    let config = env_root.join(".openclaw/openclaw.json");
+    let registry = ocm::store::env_registry_path(&env, &cwd).unwrap();
+
+    let operation = hold_environment_operation(&root, "demo");
+    let mut start = Command::new(ocm_test_binary_path())
+        .current_dir(&cwd)
+        .args(["start", "demo", "--no-service"])
+        .env_clear()
+        .envs(&env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        assert!(
+            start.try_wait().unwrap().is_none(),
+            "start finished while the environment operation lock was held"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Remove the env as `env remove` does under the lock, then create a new
+    // env with the same name and root (create does not take this lock).
+    let mut registry_value: Value =
+        serde_json::from_str(&fs::read_to_string(&registry).unwrap()).unwrap();
+    registry_value["envs"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|meta| meta["name"] != "demo");
+    fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&registry_value).unwrap(),
+    )
+    .unwrap();
+    fs::remove_dir_all(&env_root).unwrap();
+    let recreate = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--launcher", "stable"],
+    );
+    assert!(recreate.status.success(), "{}", stderr(&recreate));
+    let second = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    assert_eq!(second.root, first.root);
+    assert_ne!(second.created_at, first.created_at);
+    drop(operation);
+
+    let output = start.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "start reported success for a replaced env: {}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("changed while start was preparing it"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !config.exists(),
+        "start wrote the earlier env's config into the replacement"
+    );
+}
+
+#[test]
 fn start_preserves_included_settings_and_exported_workspace() {
     for shape in ["root-include", "inline", "root-siblings"] {
         let root = TestDir::new(shape);
