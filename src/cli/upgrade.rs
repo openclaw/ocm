@@ -713,12 +713,7 @@ impl Cli {
                     .count(),
                 skipped: results
                     .iter()
-                    .filter(|summary| {
-                        matches!(
-                            summary.outcome.as_str(),
-                            "pinned" | "local-command" | "manual-runtime"
-                        )
-                    })
+                    .filter(|summary| is_skipped_upgrade_outcome(&summary.outcome))
                     .count(),
                 restarted: results
                     .iter()
@@ -2594,11 +2589,22 @@ impl Cli {
             target_runtime: None,
         };
         let operation_lock = &command_locks;
+        let env = self.environment_service().get(name)?;
+
+        // A dev env runs its checkout, which OCM never updates. Report it before
+        // the dev-session mutation guard because the skip changes nothing.
+        if env.default_runtime.is_none()
+            && env.default_launcher.is_none()
+            && env.dev.is_some()
+            && !target.is_explicit()
+        {
+            return Ok(dev_checkout_summary(name));
+        }
+
         if !options.dry_run {
             self.environment_service()
                 .ensure_source_watch_allows_state_mutation_locked(name)?;
         }
-        let env = self.environment_service().get(name)?;
 
         if let Some(runtime_name) = env.default_runtime.as_deref() {
             return self.upgrade_runtime_bound_env(
@@ -6674,6 +6680,31 @@ fn is_changed_upgrade_outcome(outcome: &str) -> bool {
 
 fn is_failed_upgrade_outcome(outcome: &str) -> bool {
     matches!(outcome, "failed" | "rolled-back" | "rollback-failed")
+}
+
+pub(crate) fn is_skipped_upgrade_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "pinned" | "local-command" | "manual-runtime" | "dev-checkout"
+    )
+}
+
+fn dev_checkout_summary(env_name: &str) -> UpgradeEnvSummary {
+    UpgradeEnvSummary {
+        source: None,
+        env_name: env_name.to_string(),
+        previous_binding_kind: "dev".to_string(),
+        previous_binding_name: "dev".to_string(),
+        binding_kind: "dev".to_string(),
+        binding_name: "dev".to_string(),
+        outcome: "dev-checkout".to_string(),
+        runtime_release_version: None,
+        runtime_release_channel: None,
+        service_action: None,
+        snapshot_id: None,
+        rollback: None,
+        note: Some("this env runs its dev checkout; update that checkout outside ocm".to_string()),
+    }
 }
 
 fn outcome_for_official_prepare_action(action: &OfficialRuntimePrepareAction) -> String {

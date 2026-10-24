@@ -1,6 +1,7 @@
 use crate::cli::upgrade::{
     UPGRADE_DRY_RUN_NOTES, UpgradeBatchSummary, UpgradeEnvSummary, UpgradeFleetBatchSummary,
     UpgradeRollbackSummary, UpgradeSimulationBatchSummary, UpgradeSimulationSummary,
+    is_skipped_upgrade_outcome,
 };
 use crate::infra::terminal::{
     Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table, terminal_width,
@@ -148,10 +149,7 @@ pub fn upgrade_env(
                 profile.color,
             ));
         }
-    } else if matches!(
-        summary.outcome.as_str(),
-        "pinned" | "local-command" | "manual-runtime"
-    ) {
+    } else if is_skipped_upgrade_outcome(&summary.outcome) {
         lines.push(String::new());
         lines.extend(render_key_value_card(
             "Next",
@@ -915,8 +913,8 @@ fn outcome_tone(outcome: &str) -> Tone {
         "updated" | "source-updated" | "switched" => Tone::Success,
         "would-update" | "would-switch" => Tone::Accent,
         "up-to-date" => Tone::Accent,
-        "pinned" | "local-command" | "manual-runtime" => Tone::Warning,
         "rolled-back" | "rollback-failed" | "failed" => Tone::Danger,
+        outcome if is_skipped_upgrade_outcome(outcome) => Tone::Warning,
         _ => Tone::Plain,
     }
 }

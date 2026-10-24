@@ -9287,6 +9287,206 @@ fn upgrade_all_updates_safe_envs_and_skips_local_or_pinned_ones() {
     assert_eq!(json["failed"], 0);
 }
 
+const DEV_CHECKOUT_NOTE: &str = "this env runs its dev checkout; update that checkout outside ocm";
+
+fn create_borrowed_dev_env(
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    name: &str,
+    checkout: &Path,
+) -> PathBuf {
+    write_text(&checkout.join("package.json"), "{\"name\":\"openclaw\"}\n");
+    write_text(&checkout.join("scripts/run-node.mjs"), "");
+    let initialized = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(checkout)
+        .output()
+        .unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let checkout = fs::canonicalize(checkout).unwrap();
+    ocm::env::EnvironmentService::new(env, cwd)
+        .create(ocm::env::CreateEnvironmentOptions {
+            name: name.to_string(),
+            root: None,
+            gateway_port: None,
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: None,
+            dev: Some(ocm::env::EnvDevMeta::Borrowed {
+                source_root: path_string(&checkout),
+            }),
+            protected: false,
+        })
+        .unwrap();
+    checkout
+}
+
+fn assert_dev_checkout_skip(result: &Value, name: &str) {
+    assert_eq!(result["envName"], name, "{result}");
+    assert_eq!(result["outcome"], "dev-checkout", "{result}");
+    assert_eq!(result["previousBindingKind"], "dev", "{result}");
+    assert_eq!(result["previousBindingName"], "dev", "{result}");
+    assert_eq!(result["bindingKind"], "dev", "{result}");
+    assert_eq!(result["bindingName"], "dev", "{result}");
+    assert_eq!(result["note"], DEV_CHECKOUT_NOTE, "{result}");
+    assert!(result["snapshotId"].is_null(), "{result}");
+}
+
+fn batch_result<'a>(json: &'a Value, name: &str) -> &'a Value {
+    json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["envName"] == name)
+        .unwrap_or_else(|| panic!("missing {name}: {json}"))
+}
+
+#[test]
+fn upgrade_all_reports_dev_envs_as_skipped_without_rebinding_them() {
+    let root = TestDir::new("upgrade-all-dev-envs");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let manual = root.child("manual-openclaw");
+    write_executable_script(&manual, &recording_openclaw_script("2026.3.24"));
+    let added = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "manual", "--path", &path_string(&manual)],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "manual-env", "--runtime", "manual"],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+
+    let control = run_ocm(&cwd, &env, &["upgrade", "--all", "--json"]);
+    assert!(control.status.success(), "{}", stderr(&control));
+    let control: Value = serde_json::from_str(&stdout(&control)).unwrap();
+    assert_eq!(control["count"], 1);
+    assert_eq!(control["skipped"], 1);
+    assert_eq!(control["failed"], 0);
+
+    create_borrowed_dev_env(&env, &cwd, "luna", &root.child("luna-checkout"));
+    let repo = root.child("repo");
+    let worktree = repo.join(".worktrees/sol");
+    fs::create_dir_all(&worktree).unwrap();
+    support::register_owned_dev_env(&repo, &worktree, "sol", &env, &cwd);
+    let registry = env_registry_path(&env, &cwd).unwrap();
+    let registry_before = fs::read(&registry).unwrap();
+
+    for args in [
+        vec!["upgrade", "--all", "--dry-run", "--json"],
+        vec!["upgrade", "--all", "--json"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(
+            output.status.success(),
+            "{args:?}: stderr:\n{}\nstdout:\n{}",
+            stderr(&output),
+            stdout(&output)
+        );
+        let json: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(json["count"], 3, "{args:?}: {json}");
+        assert_eq!(json["changed"], 0, "{args:?}: {json}");
+        assert_eq!(json["skipped"], 3, "{args:?}: {json}");
+        assert_eq!(json["failed"], 0, "{args:?}: {json}");
+        assert_eq!(
+            batch_result(&json, "manual-env")["outcome"],
+            "manual-runtime"
+        );
+        assert_dev_checkout_skip(batch_result(&json, "luna"), "luna");
+        assert_dev_checkout_skip(batch_result(&json, "sol"), "sol");
+        assert_eq!(fs::read(&registry).unwrap(), registry_before, "{args:?}");
+    }
+
+    let text = run_ocm(&cwd, &env, &["upgrade", "--all"]);
+    assert!(text.status.success(), "{}", stderr(&text));
+    let text = stdout(&text);
+    assert!(text.contains("dev-checkout"), "{text}");
+    assert!(text.contains("dev:dev"), "{text}");
+    assert!(!text.contains("unknown"), "{text}");
+    assert!(!text.contains("set-runtime"), "{text}");
+
+    let single = run_ocm(&cwd, &env, &["upgrade", "luna", "--json"]);
+    assert!(single.status.success(), "{}", stderr(&single));
+    assert_dev_checkout_skip(&serde_json::from_str(&stdout(&single)).unwrap(), "luna");
+
+    // Moving a dev env to a release is an explicit choice that stays refused here.
+    let explicit = run_ocm(&cwd, &env, &["upgrade", "luna", "--runtime", "manual"]);
+    assert!(!explicit.status.success(), "{}", stdout(&explicit));
+    assert!(
+        stderr(&explicit).contains("does not have a runtime or launcher binding"),
+        "{}",
+        stderr(&explicit)
+    );
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_all_skips_a_dev_env_while_its_dev_session_is_active() {
+    use fs2::FileExt;
+
+    let root = TestDir::new("upgrade-all-active-dev");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let checkout = create_borrowed_dev_env(&env, &cwd, "luna", &root.child("luna-checkout"));
+    fs::create_dir_all(checkout.join("extensions")).unwrap();
+    write_text(&checkout.join("openclaw.mjs"), "console.log('dev');\n");
+    let watch = ocm::store::source_watch_override_path("luna", &env, &cwd).unwrap();
+    fs::create_dir_all(watch.parent().unwrap()).unwrap();
+    let mut lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(watch.with_extension("lock"))
+        .unwrap();
+    lease.lock_exclusive().unwrap();
+    writeln!(lease, "upgrade-all-dev").unwrap();
+    let watch_bytes = serde_json::to_vec(&serde_json::json!({
+        "kind": "ocm-source-watch-override", "envName": "luna", "repoRoot": checkout,
+        "watchPid": std::process::id(), "token": "lease:upgrade-all-dev:fixture",
+        "startedAt": "2026-06-17T00:00:00Z"
+    }))
+    .unwrap();
+    fs::write(&watch, &watch_bytes).unwrap();
+    let registry = env_registry_path(&env, &cwd).unwrap();
+    let registry_before = fs::read(&registry).unwrap();
+
+    // The guard still refuses explicit changes to the watched env.
+    let explicit = run_ocm(&cwd, &env, &["upgrade", "luna", "--version", "2026.3.24"]);
+    assert!(!explicit.status.success(), "{}", stdout(&explicit));
+    assert!(
+        stderr(&explicit).contains("dev session is active"),
+        "{}",
+        stderr(&explicit)
+    );
+
+    let output = run_ocm(&cwd, &env, &["upgrade", "--all", "--json"]);
+    assert!(
+        output.status.success(),
+        "stderr:\n{}\nstdout:\n{}",
+        stderr(&output),
+        stdout(&output)
+    );
+    let json: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(json["count"], 1);
+    assert_eq!(json["skipped"], 1);
+    assert_eq!(json["failed"], 0);
+    assert_dev_checkout_skip(batch_result(&json, "luna"), "luna");
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
+    assert_eq!(fs::read(&watch).unwrap(), watch_bytes);
+}
+
 #[test]
 fn upgrade_all_json_exits_failed_when_any_env_fails() {
     let root = TestDir::new("upgrade-all-json-failed");
