@@ -240,8 +240,7 @@ pub fn render_env_scoped_login_command(command: &str, env: &BTreeMap<String, Str
   ocm_key=${{ocm_key%%=*}}
   case $ocm_key in
     {passthrough}|*[!{IDENTIFIER_CHARS}]*) ;;
-    OPENCLAW_*|OCM_ACTIVE_ENV|OCM_ACTIVE_ENV_ROOT) printf 'unset %s
-' "$ocm_key" ;;
+    OPENCLAW_*|OCM_ACTIVE_ENV|OCM_ACTIVE_ENV_ROOT) printf 'unset %s\n' "$ocm_key" ;;
   esac
 done)"
 "#
