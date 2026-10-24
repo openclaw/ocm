@@ -366,7 +366,10 @@ fn archived_git_paths_in_import_removed_roots(
             let Ok(directory) = fs::canonicalize(&directory) else {
                 continue;
             };
-            if !visited.insert((directory.clone(), scope)) {
+            // Import rejects metadata outside the environment; never read it.
+            if !directory.starts_with(&canonical_root)
+                || !visited.insert((directory.clone(), scope))
+            {
                 continue;
             }
             for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
