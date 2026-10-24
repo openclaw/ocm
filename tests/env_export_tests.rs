@@ -1926,14 +1926,16 @@ fn assert_default_export_omits_legacy_stores(aliased_root: bool) {
     );
     let included = state.join("credentials/shared.gitconfig");
     let inactive = state.join("credentials/inactive.gitconfig");
+    let relative_include = state.join("credentials/relative.gitconfig");
     write_text(&included, "[fixture]\n\tretained = selected\n");
     write_text(&inactive, "inactive malformed [configuration");
+    write_text(&relative_include, "[fixture]\n\trelative = selected\n");
     let quote = |path: &std::path::Path| {
         serde_json::to_string(&export_git_argument(&path.to_string_lossy())).unwrap()
     };
     let mut config = fs::read_to_string(repository.join(".git/config")).unwrap();
     config.push_str(&format!(
-        "[include]\n\tpath = {}\n[includeIf \"onbranch:never-selected\"]\n\tpath = {}\n",
+        "[include]\n\tpath = {}\n[includeIf \"onbranch:never-selected\"]\n\tpath = {}\n[include]\n\tpath = ../../../.openclaw/credentials/relative.gitconfig\n",
         quote(&included),
         quote(&inactive)
     ));
@@ -1942,9 +1944,18 @@ fn assert_default_export_omits_legacy_stores(aliased_root: bool) {
         git(&repository, &["config", "--get", "fixture.retained"]),
         "selected"
     );
+    // An alternate object store that names another one.
     let alternate = state.join("memory/object-store/objects");
-    fs::create_dir_all(alternate.join("info")).unwrap();
-    write_text(&alternate.join("info/keep"), "");
+    let nested_alternate = state.join("cron/object-store/objects");
+    fs::create_dir_all(nested_alternate.join("info")).unwrap();
+    write_text(&nested_alternate.join("info/keep"), "");
+    write_text(
+        &alternate.join("info/alternates"),
+        &format!(
+            "{}\n",
+            export_git_argument(&nested_alternate.to_string_lossy())
+        ),
+    );
     write_text(
         &repository.join(".git/objects/info/alternates"),
         &format!("{}\n", export_git_argument(&alternate.to_string_lossy())),
@@ -1957,8 +1968,10 @@ fn assert_default_export_omits_legacy_stores(aliased_root: bool) {
         repository.join(".git/HEAD"),
         repository.join(".git/objects/info/alternates"),
         bare.join("config"),
+        alternate.join("info/alternates"),
         included.clone(),
         inactive.clone(),
+        relative_include.clone(),
     ]
     .map(|path| (fs::read(&path).unwrap(), path));
 
@@ -1989,8 +2002,10 @@ fn assert_default_export_omits_legacy_stores(aliased_root: bool) {
     for relative in kept.iter().chain(&[
         "credentials/shared.gitconfig",
         "credentials/inactive.gitconfig",
+        "credentials/relative.gitconfig",
         "memory/notes.git/HEAD",
-        "memory/object-store/objects/info/keep",
+        "memory/object-store/objects/info/alternates",
+        "cron/object-store/objects/info/keep",
     ]) {
         assert!(
             archived.contains(std::path::Path::new(relative)),
@@ -2030,10 +2045,12 @@ fn assert_default_export_omits_legacy_stores(aliased_root: bool) {
     );
     let target_repository = target.join("projects/repository");
     assert_eq!(
-        fs::canonicalize(git(
-            &target_repository,
-            &["config", "--get", "include.path"]
-        ))
+        fs::canonicalize(
+            git(&target_repository, &["config", "--get-all", "include.path"])
+                .lines()
+                .next()
+                .unwrap()
+        )
         .unwrap(),
         fs::canonicalize(target_state.join("credentials/shared.gitconfig")).unwrap()
     );
@@ -2041,8 +2058,13 @@ fn assert_default_export_omits_legacy_stores(aliased_root: bool) {
         git(&target_repository, &["config", "--get", "fixture.retained"]),
         "selected"
     );
+    assert_eq!(
+        git(&target_repository, &["config", "--get", "fixture.relative"]),
+        "selected"
+    );
     assert!(target_state.join("memory/notes.git/HEAD").is_file());
     assert!(target_state.join("memory/object-store/objects").is_dir());
+    assert!(target_state.join("cron/object-store/objects").is_dir());
 }
 
 #[test]
@@ -2106,6 +2128,72 @@ fn default_export_keeps_legacy_stores_of_an_environment_root_checkout() {
         assert_eq!(
             fs::read_to_string(target.join(".openclaw").join(relative)).unwrap(),
             "kept\n"
+        );
+    }
+}
+
+#[test]
+fn default_export_omits_legacy_stores_under_a_state_directory_checkout() {
+    // Import cannot see a checkout whose .git entry the archive omits, so
+    // it removes these stores and export must leave them out.
+    let fixture = TestDir::new("export-legacy-stores-state-checkout");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    export_git(&state, &env, &["init", "-q"]);
+    write_text(&state.join("credentials/oauth.json"), "synthetic secret\n");
+    write_text(&state.join("memory/notes.md"), "synthetic secret\n");
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let archived = archived_state_paths(&archive);
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    for relative in ["credentials/oauth.json", "memory/notes.md"] {
+        assert!(
+            !archived.contains(std::path::Path::new(relative)),
+            "{relative} should not be archived"
+        );
+        assert!(
+            !target.join(".openclaw").join(relative).exists(),
+            "{relative}"
         );
     }
 }

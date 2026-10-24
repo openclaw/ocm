@@ -280,19 +280,20 @@ fn archived_git_paths_in_import_removed_roots(
 
     let mut archived = BTreeSet::new();
     let mut archive_relative = |relative: &Path| {
-        match path_components(relative).as_slice() {
-            // A checkout at the environment root makes import retain the
-            // whole state directory, including these stores.
-            [] => archived.extend(
+        // A checkout at the environment root makes import retain the whole
+        // state directory, including these stores.
+        if relative.as_os_str().is_empty() {
+            archived.extend(
                 removed_roots
                     .iter()
                     .filter_map(|root| root.strip_prefix(&paths.root).ok())
                     .map(Path::to_path_buf),
-            ),
-            [".openclaw", name, ..] if IMPORT_REMOVED_STATE_ROOTS.contains(name) => {
-                archived.insert(relative.to_path_buf());
-            }
-            _ => {}
+            );
+        } else if matches!(
+            path_components(relative).as_slice(),
+            [".openclaw", name, ..] if IMPORT_REMOVED_STATE_ROOTS.contains(name)
+        ) {
+            archived.insert(relative.to_path_buf());
         }
     };
     for context in &contexts {
@@ -306,22 +307,27 @@ fn archived_git_paths_in_import_removed_roots(
                 archive_relative(relative);
             }
         }
-        let objects = context.common_dir.join("objects");
         let mut storage = vec![
             context.checkout.clone(),
             context.private_dir.clone(),
             context.common_dir.clone(),
-            objects.clone(),
         ];
-        // Import also requires the alternate object stores a repository names.
-        if let Ok(alternates) = fs::read_to_string(objects.join("info/alternates")) {
-            storage.extend(
-                alternates
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                    .map(|line| objects.join(line)),
-            );
+        // Import also requires the object stores a repository uses, including
+        // alternates that other alternates name (Git follows five levels).
+        let mut object_dirs = vec![(context.common_dir.join("objects"), 0)];
+        while let Some((objects, depth)) = object_dirs.pop() {
+            if depth < 5
+                && let Ok(alternates) = fs::read_to_string(objects.join("info/alternates"))
+            {
+                object_dirs.extend(
+                    alternates
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                        .map(|line| (objects.join(line), depth + 1)),
+                );
+            }
+            storage.push(objects);
         }
         for path in storage {
             if let Ok(resolved) = fs::canonicalize(&path)
