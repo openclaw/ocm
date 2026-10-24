@@ -216,3 +216,123 @@ fn logs_follow_streams_new_lines() {
     assert!(lines.iter().any(|line| line == "first line"));
     assert!(lines.iter().any(|line| line == "second line"));
 }
+
+fn spawn_follow(
+    cwd: &std::path::Path,
+    env: &std::collections::BTreeMap<String, String>,
+    args: &[&str],
+) -> (std::process::Child, mpsc::Receiver<String>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ocm"))
+        .current_dir(cwd)
+        .args(args)
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    (child, receiver)
+}
+
+fn strip_ansi(line: &str) -> String {
+    let mut plain = String::new();
+    let mut chars = line.chars();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            for code in chars.by_ref() {
+                if code.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(character);
+        }
+    }
+    plain
+}
+
+fn receive_line_containing(receiver: &mpsc::Receiver<String>, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let line = receiver
+            .recv_timeout(remaining)
+            .unwrap_or_else(|_| panic!("follow did not print a line containing {needle:?}"));
+        if line.contains(needle) {
+            return line;
+        }
+    }
+}
+
+#[test]
+fn logs_follow_started_before_any_log_attaches_to_the_service_log() {
+    let root = TestDir::new("logs-follow-pending-service");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    setup_launcher_env(&cwd, &env);
+
+    let (mut child, receiver) = spawn_follow(
+        &cwd,
+        &env,
+        &["logs", "demo", "--stream", "error", "--follow", "--raw"],
+    );
+    // Let the follower start and poll while neither log file exists.
+    thread::sleep(Duration::from_millis(600));
+    let service_path = root.child("ocm-home/supervisor/logs/demo.stderr.log");
+    fs::create_dir_all(service_path.parent().unwrap()).unwrap();
+    fs::write(&service_path, "service error one\n").unwrap();
+    receive_line_containing(&receiver, "service error one");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&service_path)
+        .unwrap()
+        .write_all(b"service error two\n")
+        .unwrap();
+    receive_line_containing(&receiver, "service error two");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn logs_follow_header_reports_a_pending_source_before_any_log_exists() {
+    let root = TestDir::new("logs-follow-pending-header");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    setup_launcher_env(&cwd, &env);
+
+    let (mut child, receiver) = spawn_follow(
+        &cwd,
+        &env,
+        &[
+            "logs", "demo", "--stream", "error", "--follow", "--color", "always",
+        ],
+    );
+    receive_line_containing(&receiver, "pending");
+    let path_line = strip_ansi(&receive_line_containing(&receiver, "gateway.err.log"));
+    let (_, gateway_path) = gateway_log_paths(&root);
+    let service_path = root.child("ocm-home/supervisor/logs/demo.stderr.log");
+    assert!(
+        path_line.contains(&format!(
+            "{} or {}",
+            path_string(&gateway_path),
+            path_string(&service_path)
+        )),
+        "{path_line}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

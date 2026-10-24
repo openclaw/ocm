@@ -671,6 +671,12 @@ ocm logs mira --stream error
 ocm logs mira --follow
 ```
 
+`logs` reads the newer of the env's own Gateway log and the background service
+child log. A single-stream follow such as `ocm logs mira --stream error --follow`
+started before either file exists waits for both and follows whichever appears
+first, so it shows the service output after a later `ocm service start mira`.
+Once attached, it stays on that file like `tail -f`.
+
 ### Start, stop, restart
 
 ```bash

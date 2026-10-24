@@ -2,7 +2,6 @@ use std::io::{self, Write};
 
 use super::render::RenderProfile;
 use super::{Cli, render};
-use crate::logs::LogComponentSummary;
 
 struct PrettyLogWriter<'a, W: Write> {
     inner: &'a mut W,
@@ -92,7 +91,7 @@ impl Cli {
             if profile.pretty {
                 self.stdout_lines(render::logs::log_header(
                     name,
-                    &follow_components(self.log_service().targets(name, stream)?),
+                    &self.log_service().follow_components(name, stream)?,
                     tail_lines,
                     true,
                     profile,
@@ -141,17 +140,6 @@ impl Cli {
             .map_err(|error| error.to_string())?;
         Ok(0)
     }
-}
-
-fn follow_components(targets: Vec<crate::logs::LogTarget>) -> Vec<LogComponentSummary> {
-    targets
-        .into_iter()
-        .map(|target| LogComponentSummary {
-            stream: target.stream,
-            source_kind: target.source_kind,
-            path: target.path.to_string_lossy().into_owned(),
-        })
-        .collect()
 }
 
 #[cfg(test)]
