@@ -322,6 +322,46 @@ fn archived_git_paths_in_import_removed_roots(
             context.private_dir.clone(),
             context.common_dir.clone(),
         ];
+        // Import resolves Git pointers in their recorded spelling, and every
+        // link inside the repository's administrative directories.
+        for (file, base, prefix) in [
+            (
+                context.checkout.join(".git"),
+                &context.checkout,
+                &b"gitdir: "[..],
+            ),
+            (
+                context.private_dir.join("commondir"),
+                &context.private_dir,
+                b"",
+            ),
+            (
+                context.private_dir.join("gitdir"),
+                &context.private_dir,
+                b"",
+            ),
+        ] {
+            if fs::symlink_metadata(&file).is_ok_and(|meta| !meta.is_dir())
+                && let Ok(Some(target)) =
+                    crate::openclaw_repo::read_git_pointer(&file, base, prefix)
+            {
+                storage.push(target);
+            }
+        }
+        let mut metadata = vec![context.private_dir.clone(), context.common_dir.clone()];
+        let mut visited = BTreeSet::new();
+        while let Some(directory) = metadata.pop() {
+            if !visited.insert(directory.clone()) {
+                continue;
+            }
+            for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
+                match entry.file_type() {
+                    Ok(kind) if kind.is_symlink() => storage.push(entry.path()),
+                    Ok(kind) if kind.is_dir() => metadata.push(entry.path()),
+                    _ => {}
+                }
+            }
+        }
         // Import also requires the object stores a repository uses, including
         // alternates that other alternates name (Git follows five levels).
         let mut object_dirs = vec![(context.common_dir.join("objects"), 0)];

@@ -2509,6 +2509,14 @@ fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_use
         &repository.join(".git/objects/info/alternates"),
         &format!("{}\n", state.join("memory/objects").display()),
     );
+    // Git metadata that is itself a link into a store.
+    write_text(&state.join("cron/exclude"), "ignored.txt\n");
+    fs::remove_file(repository.join(".git/info/exclude")).ok();
+    std::os::unix::fs::symlink(
+        state.join("cron/exclude"),
+        repository.join(".git/info/exclude"),
+    )
+    .unwrap();
 
     let archive = root.join("source.tar");
     let exported = run_ocm(
@@ -2526,6 +2534,7 @@ fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_use
     let archived = archived_state_paths(&archive);
     assert!(archived.contains(std::path::Path::new("credentials")));
     assert!(archived.contains(std::path::Path::new("memory")));
+    assert!(archived.contains(std::path::Path::new("cron/exclude")));
     // The source is unavailable while importing.
     fs::rename(&source, root.join("offline")).unwrap();
     let target = root.join("target");
@@ -2557,6 +2566,10 @@ fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_use
     let alternate = fs::canonicalize(alternate.trim().trim_matches('"')).unwrap();
     assert!(alternate.is_dir());
     assert!(alternate.starts_with(fs::canonicalize(&target).unwrap()));
+    assert_eq!(
+        fs::read_to_string(target.join("projects/repository/.git/info/exclude")).unwrap(),
+        "ignored.txt\n"
+    );
     assert_eq!(
         export_git(
             &target.join("projects/repository"),
