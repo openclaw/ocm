@@ -678,6 +678,12 @@ started before either file exists waits for both and follows whichever appears
 first, so it shows the service output after a later `ocm service start mira`.
 Once attached, it stays on that file like `tail -f`.
 
+By default, `ocm logs` merges stdout and stderr in timestamp order and shows the
+last 50 lines. A line without a timestamp stays after the timestamped line
+before it. Untimestamped output at the end of a log, such as the error a Gateway
+prints when it fails to start, is placed at the time that file was last written,
+so the newest failure remains at the end of the merged view.
+
 ### Start, stop, restart
 
 ```bash
