@@ -37,6 +37,9 @@ pub struct EnvCleanupActionSummary {
     pub kind: String,
     pub description: String,
     pub applied: bool,
+    /// Paths this action removes (preview) or removed (apply), relative to the env root.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removals: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -78,8 +81,15 @@ impl<'a> EnvironmentService<'a> {
         }
         let doctor = self.doctor(name)?;
         let actions = cleanup_actions(&env, &doctor, &config_audit, &state_audit);
-        self.prepare_cleanup(&env, &actions)?;
-        Ok(build_cleanup_summary(&env, doctor, false, actions, None))
+        let (_, runtime_cleanup) = self.prepare_cleanup(&env, &actions)?;
+        Ok(build_cleanup_summary(
+            &env,
+            doctor,
+            false,
+            actions,
+            runtime_cleanup.as_ref(),
+            None,
+        ))
     }
 
     pub fn cleanup(&self, name: &str) -> Result<EnvCleanupSummary, String> {
@@ -133,6 +143,7 @@ impl<'a> EnvironmentService<'a> {
             doctor_before,
             true,
             actions,
+            runtime_cleanup.as_ref(),
             Some(doctor_after),
         ))
     }
@@ -416,11 +427,21 @@ fn build_cleanup_summary(
     doctor_before: EnvDoctorSummary,
     apply: bool,
     actions: Vec<PlannedCleanupAction>,
+    runtime_cleanup: Option<&OpenClawRuntimeStateCleanup>,
     doctor_after: Option<EnvDoctorSummary>,
 ) -> EnvCleanupSummary {
+    let root = Path::new(&env.root);
     let actions = actions
         .into_iter()
         .map(|action| EnvCleanupActionSummary {
+            removals: match runtime_cleanup {
+                Some(cleanup) if action.kind == "reset-openclaw-runtime-state" => cleanup
+                    .removals()
+                    .iter()
+                    .map(|path| display_path(path.strip_prefix(root).unwrap_or(path)))
+                    .collect(),
+                _ => Vec::new(),
+            },
             kind: action.kind.to_string(),
             description: action.description,
             applied: apply,

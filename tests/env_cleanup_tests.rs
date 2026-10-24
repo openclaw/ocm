@@ -1,6 +1,8 @@
 mod support;
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
@@ -8,7 +10,7 @@ use std::time::Duration;
 use fs2::FileExt;
 use serde_json::Value;
 
-use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout};
+use crate::support::{TestDir, ocm_env, path_string, run_ocm, stderr, stdout};
 
 #[test]
 fn env_cleanup_yes_repairs_env_scoped_config_drift() {
@@ -238,6 +240,14 @@ fn env_cleanup_yes_clears_copied_openclaw_runtime_state() {
         format!("root={}\n", source_root.display()),
     )
     .unwrap();
+    crate::support::write_text(
+        &target_state.join("credentials/oauth.json"),
+        "{\"token\":\"copied\"}\n",
+    );
+    crate::support::write_text(
+        &target_state.join("identity/device.json"),
+        "{\"deviceId\":\"copied\"}\n",
+    );
     let workshop_content = format!("Reviewed content from {}\n", source_root.display());
     let workshop_artifacts = [
         "skill-workshop/proposals/example/PROPOSAL.md",
@@ -298,12 +308,47 @@ fn env_cleanup_yes_clears_copied_openclaw_runtime_state() {
         issue.contains("OpenClaw runtime state contains") && issue.contains("env \"source\" root")
     }));
 
+    // Every path the reset deletes is named before and after it runs.
+    let disclosed = ["agents/main/sessions", "logs", "credentials", "identity"].map(|relative| {
+        path_string(
+            &relative
+                .split('/')
+                .fold(PathBuf::from(".openclaw"), |path, part| path.join(part)),
+        )
+    });
+    let preview = run_ocm(&cwd, &env, &["env", "cleanup", "target", "--json"]);
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    let preview: Value = serde_json::from_str(&stdout(&preview)).unwrap();
+    let reset = preview["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["kind"] == "reset-openclaw-runtime-state")
+        .unwrap_or_else(|| panic!("{preview}"));
+    let removals = reset["removals"].as_array().unwrap();
+    for path in &disclosed {
+        assert!(removals.iter().any(|removal| removal == path), "{preview}");
+    }
+    let preview = run_ocm(&cwd, &env, &["env", "cleanup", "target"]);
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    for path in &disclosed {
+        assert!(
+            stdout(&preview).contains(&format!("removes: {path}")),
+            "{}",
+            stdout(&preview)
+        );
+    }
+    assert!(target_state.join("credentials/oauth.json").exists());
+
     let cleanup = run_ocm(&cwd, &env, &["env", "cleanup", "target", "--yes"]);
     assert!(cleanup.status.success(), "{}", stderr(&cleanup));
     let output = stdout(&cleanup);
     assert!(output.contains(
         "reset-openclaw-runtime-state: clear copied OpenClaw runtime state outside config and workspace"
     ));
+    for path in &disclosed {
+        assert!(output.contains(&format!("removed: {path}")), "{output}");
+    }
 
     assert!(
         target_state
@@ -312,6 +357,8 @@ fn env_cleanup_yes_clears_copied_openclaw_runtime_state() {
     );
     assert!(!target_state.join("agents/main/sessions").exists());
     assert!(!target_state.join("logs").exists());
+    assert!(!target_state.join("credentials").exists());
+    assert!(!target_state.join("identity").exists());
     for relative in workshop_artifacts {
         assert_eq!(
             fs::read_to_string(target_state.join(relative)).unwrap_or_else(|error| panic!(
@@ -439,6 +486,126 @@ fn env_cleanup_yes_clears_inferred_foreign_runtime_state_without_source_metadata
 }
 
 #[cfg(any(unix, windows))]
+fn state_inventory(state: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(state: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(state, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(state).unwrap().to_path_buf(),
+                    fs::read(&path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    visit(state, state, &mut files);
+    files
+}
+
+#[test]
+fn env_cleanup_keeps_live_state_that_only_mentions_other_env_paths() {
+    let root = TestDir::new("env-cleanup-live-path-mentions");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    for (name, port) in [("live", "19790"), ("other", "19791")] {
+        let create = run_ocm(&cwd, &env, &["env", "create", name, "--port", port]);
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
+    let other = run_ocm(&cwd, &env, &["env", "show", "other", "--raw"]);
+    assert!(other.status.success(), "{}", stderr(&other));
+    let other_root = root.child("ocm-home/envs/other");
+    assert!(stdout(&other).contains(&path_string(&other_root)));
+
+    let state = root.child("ocm-home/envs/live/.openclaw");
+    let message = |text: &str| {
+        serde_json::json!({"type": "message", "message": {"role": "toolResult",
+            "content": [{"type": "text", "text": text}]}})
+        .to_string()
+    };
+    let header = serde_json::json!({"type": "session", "id": "s1", "cwd": state.join("workspace")})
+        .to_string();
+    let files = [
+        (".env", "OPENAI_API_KEY=synthetic\n".to_string()),
+        (
+            "credentials/oauth.json",
+            "{\"token\":\"live\"}\n".to_string(),
+        ),
+        (
+            "credentials/whatsapp/default/creds.json",
+            "{}\n".to_string(),
+        ),
+        (
+            "identity/device.json",
+            "{\"deviceId\":\"live\"}\n".to_string(),
+        ),
+        ("devices/paired.json", "{\"paired\":[]}\n".to_string()),
+        ("cron/jobs.json", "{\"jobs\":[]}\n".to_string()),
+        (
+            "memory/notes.md",
+            "Config example: /home/someone/.openclaw/openclaw.json\n".to_string(),
+        ),
+        ("hooks/h1/HOOK.md", "# hook\n".to_string()),
+        ("secrets.json", "{}\n".to_string()),
+        ("exec-approvals.json", "{}\n".to_string()),
+        ("agents/main/agent/auth-profiles.json", "{}\n".to_string()),
+        (
+            "agents/main/sessions/s1.jsonl",
+            format!(
+                "{header}\n{}\n{}\n",
+                message(&format!("$ ocm env show other\n{}", stdout(&other))),
+                message("see /home/someone/.openclaw/openclaw.json"),
+            ),
+        ),
+        (
+            "agents/main/sessions/s2.jsonl",
+            format!("{}\n", message(&path_string(&other_root))),
+        ),
+        (
+            "logs/gateway.log",
+            format!(
+                "[tool exec] ls {}\n",
+                path_string(&other_root.join(".openclaw/workspace"))
+            ),
+        ),
+    ];
+    for (relative, content) in &files {
+        crate::support::write_text(&state.join(relative), content);
+    }
+    let before = state_inventory(&state);
+
+    let doctor = run_ocm(&cwd, &env, &["env", "doctor", "live", "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let doctor: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert!(
+        !doctor["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue
+                .as_str()
+                .unwrap()
+                .contains("OpenClaw runtime state contains")),
+        "{doctor}"
+    );
+
+    for args in [
+        vec!["env", "cleanup", "live", "--json"],
+        vec!["env", "cleanup", "live", "--yes", "--json"],
+        vec!["env", "cleanup", "--all", "--yes", "--json"],
+    ] {
+        let cleanup = run_ocm(&cwd, &env, &args);
+        assert!(cleanup.status.success(), "{}", stderr(&cleanup));
+        let output = stdout(&cleanup);
+        assert!(!output.contains("reset-openclaw-runtime-state"), "{output}");
+        assert_eq!(state_inventory(&state), before, "{args:?}");
+    }
+}
+
 fn fixture_path_spellings(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut paths = vec![path.to_path_buf(), fs::canonicalize(path).unwrap()];
     if cfg!(windows) {

@@ -1491,8 +1491,10 @@ ocm env repair-marker mira
 
 Runtime-state cleanup preserves configured agent directories inside the environment, including their authentication and state files beneath generated plugin dependencies.
 It also retains shared managed skills under `.openclaw/skills` and their global ClawHub tracking metadata under `.openclaw/.clawhub`.
-References in these authored skills and installation records do not trigger a runtime-state reset; stale session references still do.
-It still removes stale sessions and unselected generated files beside those directories.
+A runtime-state reset is planned only when a session transcript under `.openclaw/agents/<id>/sessions` records, in its header, a working directory under another environment's root or another `.openclaw` directory, as state copied from elsewhere does.
+Paths that are only mentioned in transcript messages, logs, notes, authored skills or installation records do not trigger it.
+A reset removes stale sessions, logs and unselected generated files beside those directories, along with the other runtime state outside the config, workspaces, agent directories, shared skills and managed plugin roots, such as copied credentials and device identity.
+The preview lists each path the reset will remove, relative to the environment root, and the applied result lists what it removed; `--json` reports them as the action's `removals`.
 Configuring an agent directory above `agents/<id>/sessions` preserves agent payload beside that subtree without hiding its stale sessions from cleanup.
 If an agent directory is exactly `agents/<id>/sessions`, cleanup preview and apply refuse the conflicting ownership before changing any configuration or data.
 Use a separate agent directory before retrying cleanup; `env doctor` reports the conflict.
