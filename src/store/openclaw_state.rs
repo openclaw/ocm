@@ -336,6 +336,24 @@ fn archived_git_paths_in_import_removed_roots(
             storage.push(objects);
         }
         for path in storage {
+            // Import resolves storage through the recorded spelling, so keep
+            // the alias links on the way as well as the storage itself.
+            let entries =
+                crate::store::dev_sources::existing_source_path_entries(&path).unwrap_or_default();
+            for entry in entries {
+                if !fs::symlink_metadata(&entry).is_ok_and(|meta| meta.is_symlink()) {
+                    continue;
+                }
+                let (Some(parent), Some(name)) = (entry.parent(), entry.file_name()) else {
+                    continue;
+                };
+                if let Ok(parent) = fs::canonicalize(parent) {
+                    let alias = parent.join(name);
+                    if let Ok(relative) = alias.strip_prefix(&canonical_root) {
+                        archive_relative(relative);
+                    }
+                }
+            }
             if let Ok(resolved) = fs::canonicalize(&path)
                 && let Ok(relative) = resolved.strip_prefix(&canonical_root)
             {

@@ -2502,6 +2502,13 @@ fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_use
             state.join("credentials/selected.conf").to_str().unwrap(),
         ],
     );
+    // Its alternate object store is reached through another store alias.
+    write_text(&source.join("projects/object-store/objects/info/keep"), "");
+    std::os::unix::fs::symlink("../projects/object-store", state.join("memory")).unwrap();
+    write_text(
+        &repository.join(".git/objects/info/alternates"),
+        &format!("{}\n", state.join("memory/objects").display()),
+    );
 
     let archive = root.join("source.tar");
     let exported = run_ocm(
@@ -2516,7 +2523,9 @@ fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_use
         ],
     );
     assert!(exported.status.success(), "{}", stderr(&exported));
-    assert!(archived_state_paths(&archive).contains(std::path::Path::new("credentials")));
+    let archived = archived_state_paths(&archive);
+    assert!(archived.contains(std::path::Path::new("credentials")));
+    assert!(archived.contains(std::path::Path::new("memory")));
     // The source is unavailable while importing.
     fs::rename(&source, root.join("offline")).unwrap();
     let target = root.join("target");
@@ -2540,6 +2549,14 @@ fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_use
             .file_type()
             .is_symlink()
     );
+    // Import resolves the alternate through the archived alias, then records
+    // the store's location inside the target.
+    let alternate =
+        fs::read_to_string(target.join("projects/repository/.git/objects/info/alternates"))
+            .unwrap();
+    let alternate = fs::canonicalize(alternate.trim().trim_matches('"')).unwrap();
+    assert!(alternate.is_dir());
+    assert!(alternate.starts_with(fs::canonicalize(&target).unwrap()));
     assert_eq!(
         export_git(
             &target.join("projects/repository"),
