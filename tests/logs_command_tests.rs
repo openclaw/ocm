@@ -257,6 +257,47 @@ fn updating_a_registered_env_keeps_its_service_logs() {
 }
 
 #[test]
+fn creating_a_case_variant_name_keeps_the_registered_envs_logs() {
+    let root = TestDir::new("logs-case-variant-name");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    setup_launcher_env(&cwd, &env);
+    let logs_dir = write_service_logs(&root, "demo", "current");
+    // On a case-insensitive filesystem Demo.stdout.log is demo's own file; a
+    // hard link gives the same aliasing here.
+    if let Err(error) = fs::hard_link(
+        logs_dir.join("demo.stdout.log"),
+        logs_dir.join("Demo.stdout.log"),
+    ) {
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    let other_root = root.child("other-root");
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "Demo",
+            "--launcher",
+            "stable",
+            "--root",
+            &path_string(&other_root),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    assert!(logs_dir.join("Demo.stdout.log").exists());
+    let output = run_ocm(&cwd, &env, &["logs", "demo", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let body: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let content = body["content"].as_str().unwrap();
+    assert!(content.contains("current stdout"), "{content}");
+    assert!(content.contains("current stderr"), "{content}");
+}
+
+#[test]
 fn env_create_fails_when_an_earlier_service_log_cannot_be_deleted() {
     let root = TestDir::new("logs-create-undeletable");
     let cwd = root.child("workspace");

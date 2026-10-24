@@ -370,24 +370,31 @@ pub fn sync_supervisor_env_if_present(
 /// name is registered for a new environment. These files live outside the
 /// environment root and are keyed only by name, so they can hold output from an
 /// earlier environment of the same name, including one removed by an older OCM.
-pub(crate) fn discard_child_logs(
+///
+/// On a case-insensitive filesystem the path can also resolve to a file that
+/// still belongs to someone else: a registered env whose name differs only in
+/// case, or the daemon's own daemon.<stream>.log. Those files are kept.
+pub(crate) fn discard_child_logs<'n>(
     env_name: &str,
+    registered: impl IntoIterator<Item = &'n str>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<(), String> {
     let logs_dir = supervisor_logs_dir(env, cwd)?;
-    // The daemon writes daemon.<stream>.log, by default in this directory. An
-    // env named "daemon" (in any case, on a case-insensitive filesystem) can
-    // resolve to those same files; never delete the daemon's own logs.
-    let daemon_logs_dir = if env_name.eq_ignore_ascii_case("daemon") {
-        Some(SupervisorService::new(env, cwd).saved_daemon_logs_dir()?)
-    } else {
-        None
-    };
+    let mut owners = registered
+        .into_iter()
+        .filter(|name| *name != env_name)
+        .map(|name| (logs_dir.clone(), name.to_string()))
+        .collect::<Vec<_>>();
+    if env_name.eq_ignore_ascii_case("daemon") {
+        let daemon_logs_dir = SupervisorService::new(env, cwd).saved_daemon_logs_dir()?;
+        owners.push((daemon_logs_dir, "daemon".to_string()));
+    }
     for stream in ["stdout", "stderr"] {
         let path = supervisor_child_log_path(&logs_dir, env_name, stream);
-        if let Some(daemon_logs_dir) = &daemon_logs_dir
-            && is_same_file(&path, &daemon_logs_dir.join(format!("daemon.{stream}.log")))
+        if owners
+            .iter()
+            .any(|(dir, owner)| is_same_file(&path, &supervisor_child_log_path(dir, owner, stream)))
         {
             continue;
         }

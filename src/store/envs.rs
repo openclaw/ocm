@@ -209,7 +209,12 @@ fn upsert_environment(
     {
         // A newly registered name must not inherit service output captured
         // for an earlier environment of the same name.
-        crate::supervisor::discard_child_logs(&meta.name, env, cwd)?;
+        crate::supervisor::discard_child_logs(
+            &meta.name,
+            registry.envs.iter().map(|current| current.name.as_str()),
+            env,
+            cwd,
+        )?;
     }
     registry.envs.retain(|entry| entry.name != meta.name);
     registry.envs.push(meta.clone());
@@ -598,7 +603,12 @@ fn create_environment_with_runtime_validation(
     }
     // Registration repeats this; doing it before any root is written lets a
     // failure leave nothing behind.
-    crate::supervisor::discard_child_logs(&name, env, cwd)?;
+    crate::supervisor::discard_child_logs(
+        &name,
+        registry.envs.iter().map(|current| current.name.as_str()),
+        env,
+        cwd,
+    )?;
     registration.recheck(&name, options.dev.as_ref(), &registry.envs)?;
     let _runtime_admission = admit_runtime_binding(
         &registry,
