@@ -20,6 +20,17 @@ pub(crate) struct DevRebindSummary {
 
 impl<'a> EnvironmentService<'a> {
     pub(crate) fn rebind_dev(&self, name: &str, source: &Path) -> Result<DevRebindSummary, String> {
+        self.rebind_dev_from(name, None, source)
+    }
+
+    /// Rebinds like `dev rebind`, but only while the environment still uses
+    /// `expected`, so an implicit switch never overwrites a concurrent rebind.
+    pub(crate) fn rebind_dev_from(
+        &self,
+        name: &str,
+        expected: Option<&str>,
+        source: &Path,
+    ) -> Result<DevRebindSummary, String> {
         let _operation = crate::store::try_lock_environment_operation(name, self.env, self.cwd)?
             .ok_or_else(|| {
                 format!("environment {name} has an operation in progress; retry after it finishes")
@@ -28,6 +39,11 @@ impl<'a> EnvironmentService<'a> {
         let previous = meta.dev.as_ref().and_then(EnvDevMeta::borrowed_source_root)
             .filter(|_| meta.default_runtime.is_none() && meta.default_launcher.is_none())
             .ok_or("dev rebind requires an existing borrowed dev environment without a runtime or launcher binding")?;
+        if expected.is_some_and(|expected| expected != previous) {
+            return Err(format!(
+                "environment {name} is now bound to {previous}; its binding was kept"
+            ));
+        }
         let source = std::fs::canonicalize(source).map_err(|error| {
             format!(
                 "failed to resolve selected OpenClaw checkout {}: {error}",

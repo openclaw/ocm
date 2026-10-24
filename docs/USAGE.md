@@ -127,12 +127,22 @@ Use `ocm dev luna --repo /path/to/openclaw` to run that exact checkout with sepa
 environment state. New dev environments borrow main or registered linked
 checkouts without creating a Git worktree. Outside a checkout, pass `--repo`;
 otherwise OCM can use the checkout enclosing the current directory. A resumed
-borrower keeps its canonical source path and refuses a different explicit or
-enclosing checkout. Existing OCM-owned environments retain their recorded
-worktrees and original repository selection.
+borrower keeps its canonical source path. Starting a stopped borrower with a
+different explicit or enclosing checkout switches it there under the checks of
+`ocm dev rebind`, preserving its state, prints the previous and selected
+checkouts, and continues the start. A running, starting, unfinished or busy
+borrower, or one whose Gateway ports are occupied, is refused with its binding
+unchanged. Borrowers with a runtime or launcher binding and existing OCM-owned
+environments retain their recorded sources and original repository selection.
 
-New borrowers may prepare missing tooling with `pnpm install --frozen-lockfile`.
-Resumed borrowers report missing tooling for explicit preparation; they do not
+New borrowers, and borrowers just switched to another checkout, may prepare
+missing tooling with `pnpm install --frozen-lockfile`. If a switched start fails
+or is cancelled before its Gateway starts and its processes are verified
+stopped, OCM switches the environment back, so the next start from the selected
+checkout switches and prepares it again. An installer stopped by a signal leaves
+cleanup unverified; OCM then keeps the session ownership and the new binding for
+recovery, after which missing tooling there needs explicit preparation. Other
+resumed borrowers report missing tooling for explicit preparation; they do not
 reinstall dependencies. Removing a borrower preserves source files, dependencies,
 generated output, and unrelated source processes. Older OCM readers refuse the
 new binding records. Refresh an incompatible running daemon with
@@ -1443,9 +1453,10 @@ and runtime or launcher environments cannot be converted by this command.
 Repeating the same canonical target validates ownership and checkout identity
 but leaves registry bytes unchanged and returns `changed: false`. A validation
 or atomic-publication failure preserves the previous binding. Ordinary `dev`
-and `--force` never switch sources. One-shot execution and status use the new
-binding immediately; the next explicit service start rebuilds its launch plan,
-and admission rejects a saved plan that still names the old source.
+applies these checks when a stopped borrower is started from another checkout;
+`--force` never switches a running environment. One-shot execution and status
+use the new binding immediately; the next explicit service start rebuilds its
+launch plan, and admission rejects a saved plan that still names the old source.
 
 ### Inspect and repair
 
