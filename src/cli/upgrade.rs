@@ -27,7 +27,10 @@ use crate::env::{
     RestoreEnvSnapshotOptions, resolve_runtime_run_dir,
 };
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
-use crate::openclaw_repo::detect_openclaw_checkout;
+use crate::openclaw_repo::{
+    detect_openclaw_checkout, ensure_source_dependency_install_config,
+    ensure_source_dependency_install_target, source_dependency_install_needs_store_path,
+};
 use crate::runtime::releases::{
     OpenClawRelease, compare_runtime_release_versions, is_official_openclaw_releases_url,
     normalize_openclaw_channel_selector, official_openclaw_releases_url,
@@ -2259,10 +2262,32 @@ impl Cli {
             return Ok(());
         }
 
+        // Admit the install the way `ocm dev` does before any write: inherited
+        // pnpm settings can send it to another checkout or through a link.
+        let process_env = build_openclaw_env(meta, &self.env);
+        ensure_source_dependency_install_target(worktree_root, &process_env)?;
+        let config = read_simulation_pnpm_destinations(
+            worktree_root,
+            &process_env,
+            &["config", "list", "--json"],
+        )?;
+        let store = if source_dependency_install_needs_store_path(worktree_root, &config)? {
+            Some(read_simulation_pnpm_destinations(
+                worktree_root,
+                &process_env,
+                &["store", "path"],
+            )?)
+        } else {
+            None
+        };
+        ensure_source_dependency_install_config(worktree_root, &config, store.as_deref())?;
+
+        // Admission checks the projects in the checkout's lockfile, so the
+        // install must not add others.
         let output = Command::new("pnpm")
-            .arg("install")
+            .args(["install", "--frozen-lockfile"])
             .env_clear()
-            .envs(build_openclaw_env(meta, &self.env))
+            .envs(&process_env)
             .current_dir(worktree_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -6365,6 +6390,32 @@ fn release_version_from_output(actual: &str, hint: Option<&str>) -> Option<Strin
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+'))
         .find(|token| !token.is_empty() && compare_runtime_release_versions(token, token).is_some())
         .map(str::to_string)
+}
+
+/// Reads pnpm's reported dependency destinations without echoing the output,
+/// which may contain private configuration values.
+fn read_simulation_pnpm_destinations(
+    source_root: &Path,
+    process_env: &BTreeMap<String, String>,
+    args: &[&str],
+) -> Result<Vec<u8>, String> {
+    let output = Command::new("pnpm")
+        .args(args)
+        .env_clear()
+        .envs(process_env)
+        .current_dir(source_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("failed reading pnpm dependency destinations: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read pnpm dependency destinations; inspect `pnpm {}` in the selected checkout before retrying the simulation",
+            args.join(" ")
+        ));
+    }
+    Ok(output.stdout)
 }
 
 fn simulation_env_name(source_name: &str, scenario: &str) -> String {
