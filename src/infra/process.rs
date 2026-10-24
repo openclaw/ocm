@@ -20,18 +20,16 @@ pub fn run_shell(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<i32, String> {
-    let (shell, flag) = if cfg!(windows) {
-        ("cmd", "/C")
+    let (shell, flag, script) = if cfg!(windows) {
+        ("cmd", "/C", command.to_string())
     } else {
-        ("sh", "-lc")
+        (
+            "sh",
+            "-lc",
+            crate::infra::shell::render_env_scoped_login_command(command, env),
+        )
     };
-    run_reporting_as(
-        shell,
-        &[flag.to_string(), command.to_string()],
-        env,
-        cwd,
-        subject,
-    )
+    run_reporting_as(shell, &[flag.to_string(), script], env, cwd, subject)
 }
 
 fn run_reporting_as(

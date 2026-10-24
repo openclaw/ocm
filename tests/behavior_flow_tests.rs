@@ -483,6 +483,84 @@ fn env_run_overrides_parent_openclaw_environment_state() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn launcher_env_run_keeps_env_paths_when_the_login_profile_exports_others() {
+    let root = TestDir::new("behavior-env-run-login-profile");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let home = root.child("home");
+    let profile_bin = home.join("profile-bin");
+    let other_root = clean_path(&root.child("ocm-home/envs/other"));
+
+    // The launcher resolves only through the profile's PATH entry.
+    write_executable_script(
+        &profile_bin.join("profile-openclaw"),
+        "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$OPENCLAW_HOME\" \"$OPENCLAW_STATE_DIR\" \"$OPENCLAW_CONFIG_PATH\" \"${OPENCLAW_GATEWAY_PORT:-unset}\" \"$OCM_ACTIVE_ENV\" \"$OCM_ACTIVE_ENV_ROOT\" \"${OPENCLAW_PROFILE:-unset}\" \"$PROFILE_TOOL\"\nprintf '%s\\n' \"$*\"\n",
+    );
+    write_text(
+        &home.join(".profile"),
+        &format!(
+            "export OPENCLAW_STATE_DIR=\"$HOME/.openclaw-native\"\n\
+             export OPENCLAW_CONFIG_PATH=\"$OPENCLAW_STATE_DIR/openclaw.json\"\n\
+             export OPENCLAW_HOME=\"$HOME\"\n\
+             export OPENCLAW_GATEWAY_PORT=1\n\
+             export OPENCLAW_PROFILE=work\n\
+             export OCM_ACTIVE_ENV=other\n\
+             export OCM_ACTIVE_ENV_ROOT='{}'\n\
+             export PROFILE_TOOL=from-profile\n\
+             PATH=\"$HOME/profile-bin:$PATH\"; export PATH\n",
+            other_root.display()
+        ),
+    );
+
+    let add_launcher = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "profiled",
+            "--command",
+            "profile-openclaw",
+        ],
+    );
+    assert!(add_launcher.status.success(), "{}", stderr(&add_launcher));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--launcher", "profiled"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let shown: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    let port = match &shown["gatewayPort"] {
+        Value::Number(port) => port.to_string(),
+        Value::String(port) => port.clone(),
+        other => panic!("env show must report the gateway port: {other}"),
+    };
+
+    let demo_root = clean_path(&root.child("ocm-home/envs/demo"));
+    let expected = format!(
+        "{}|{}|{}|{}|demo|{}|unset|from-profile\nconfig file\n",
+        demo_root.display(),
+        demo_root.join(".openclaw").display(),
+        demo_root.join(".openclaw/openclaw.json").display(),
+        port,
+        demo_root.display(),
+    );
+    for args in [
+        &["env", "run", "demo", "--", "config", "file"][..],
+        &["@demo", "--", "config", "file"][..],
+    ] {
+        let output = run_ocm(&cwd, &env, args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+}
+
 #[test]
 fn root_double_dash_runs_openclaw_in_the_active_environment() {
     let root = TestDir::new("behavior-root-double-dash");
