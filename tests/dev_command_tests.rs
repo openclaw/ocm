@@ -7867,6 +7867,84 @@ fn dev_service_preparation_cancellation_preserves_its_running_service() {
 
 #[cfg(unix)]
 #[test]
+fn dev_reuse_refuses_a_different_port_while_the_session_is_starting() {
+    let root = TestDir::new("dev-reuse-starting-port");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = service_env_with_gateway_admission(&root);
+    install_probe_aware_fake_dev_runners(&root, &mut env);
+    create_owned_dev_env(&repo, "demo", &env, &cwd);
+    let prepare = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+    );
+    assert!(prepare.status.success(), "{}", stderr(&prepare));
+    let meta = get_environment("demo", &env, &cwd).unwrap();
+    declare_source_tooling(Path::new(meta.dev.as_ref().unwrap().source_root()));
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let port = serde_json::from_str::<Value>(&stdout(&show)).unwrap()["gatewayPort"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let other_port = (port.parse::<u32>().unwrap() + 1).to_string();
+
+    // Hold the dependency probe so the first session stays in preparation.
+    let started = root.child("preparation.started");
+    let release = root.child("source-watch.release");
+    write_fake_dev_node(
+        &root,
+        &format!(
+            "#!/bin/sh\nprintf 'ready\\n' > '{}'\nwhile [ ! -f '{}' ]; do /bin/sleep 0.05; done\nprintf '[]\\n'\n",
+            path_string(&started),
+            path_string(&release),
+        ),
+    );
+    let watch = DevWatchFixture::spawn(&root, &cwd, &env, &dev_plain(&["demo"]));
+    assert!(wait_for_path(&started, Duration::from_secs(30)));
+    let status = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&status)).unwrap()["sourceWatch"]["state"],
+        "starting"
+    );
+    let session = read_source_watch_session(&root);
+
+    let changed = run_ocm(&cwd, &env, &dev_plain(&["demo", "--port", &other_port]));
+    assert!(!changed.status.success(), "{}", stdout(&changed));
+    assert!(
+        stderr(&changed).contains(&format!(
+            "dev cannot change the port for existing env demo; current port is {port}"
+        )),
+        "{}",
+        stderr(&changed)
+    );
+    assert!(!stderr(&changed).contains("keeping the existing session"));
+    assert_eq!(read_source_watch_session(&root), session);
+
+    let same = run_ocm(&cwd, &env, &dev_plain(&["demo", "--port", &port]));
+    assert!(same.status.success(), "{}", stderr(&same));
+    assert!(stderr(&same).contains("is starting; keeping the existing session"));
+
+    let stopped = run_dev_stop(&cwd, &env);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let watched = watch.finish();
+    assert_eq!(watched.status.code(), Some(130), "{}", stderr(&watched));
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&show)).unwrap()["gatewayPort"]
+            .as_u64()
+            .unwrap()
+            .to_string(),
+        port
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_stop_cancels_owned_preparation_before_gateway_start() {
     for (phase, mode) in [
         ("configuration", "watch"),
