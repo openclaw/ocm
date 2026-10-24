@@ -461,7 +461,7 @@ eval "$(ocm env use demo)" || exit 10
 [ -z "${OPENCLAW_PROFILE+x}" ] || exit 13
 [ "$-" = "$before_options" ] || exit 14
 [ "$#" = 2 ] && [ "$1" = 'caller one' ] && [ "$2" = 'caller two' ] || exit 15
-case "$(ocm env use demo --shell fish)" in "set -e "*) ;; *) exit 16 ;; esac
+case "$(ocm env use demo --shell fish)" in *"set -gx OCM_ACTIVE_ENV 'demo';"*) ;; *) exit 16 ;; esac
 printf 'activated\n'
 "#;
     let fish = r#"ocm env use demo | source
