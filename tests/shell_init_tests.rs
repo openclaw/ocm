@@ -17,7 +17,7 @@ fn init_zsh_prints_an_ocm_use_helper() {
     assert!(output.contains("ocm_use() {"));
     assert!(output.contains("--shell zsh"));
     assert!(output.contains("'ocm' env use \"$@\""));
-    assert!(output.contains("eval \"$script\""));
+    assert!(output.contains("eval \"$("));
 }
 
 #[test]
@@ -34,7 +34,7 @@ fn init_bash_and_sh_print_shell_specific_posix_helpers() {
         assert!(output.contains("ocm_use() {"), "{shell}");
         assert!(output.contains(&format!("--shell {shell}")), "{shell}");
         assert!(output.contains("'ocm' env use \"$@\""), "{shell}");
-        assert!(output.contains("eval \"$script\""), "{shell}");
+        assert!(output.contains("eval \"$("), "{shell}");
     }
 }
 
@@ -167,6 +167,84 @@ printf 'activation and caller controls passed\n'
             );
             assert!(stdout(&output).contains("activation and caller controls passed"));
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_helper_leaves_caller_variables_unchanged() {
+    use std::process::Command;
+
+    use crate::support::ocm_test_binary_path;
+
+    let root = TestDir::new("shell-init-caller-variables");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let binary = ocm_test_binary_path();
+    let mut paths = vec![binary.parent().unwrap().to_path_buf()];
+    paths.extend(std::env::split_paths(env.get("PATH").unwrap()));
+    env.insert(
+        "PATH".to_string(),
+        std::env::join_paths(paths)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+
+    for (shell, init_shell) in [
+        ("bash", "bash"),
+        ("sh", "sh"),
+        ("zsh", "zsh"),
+        ("dash", "sh"),
+    ] {
+        if !matches!(shell, "bash" | "sh")
+            && Command::new(shell).arg("-c").arg(":").output().is_err()
+        {
+            continue;
+        }
+        let init = run_ocm(&cwd, &env, &["init", init_shell]);
+        assert!(init.status.success(), "{}", stderr(&init));
+        let script = format!(
+            r#"{}
+script=mine
+_ocm_script=mine_too
+_ocm_arg=mine_three
+other=keep
+ocm_use demo || exit 10
+[ "$OCM_ACTIVE_ENV" = demo ] || exit 11
+[ "$script" = mine ] && [ "$_ocm_script" = mine_too ] && [ "$_ocm_arg" = mine_three ] || exit 12
+[ "$other" = keep ] || exit 13
+ocm_use missing 2>/dev/null
+result=$?
+[ "$result" = 1 ] || exit 14
+[ "$script" = mine ] && [ "$_ocm_script" = mine_too ] && [ "$_ocm_arg" = mine_three ] || exit 15
+ocm_use demo --shell=sh || exit 16
+[ "$script" = mine ] || exit 17
+unset script _ocm_script _ocm_arg
+ocm_use demo || exit 18
+[ -z "${{script+x}}" ] && [ -z "${{_ocm_script+x}}" ] && [ -z "${{_ocm_arg+x}}" ] || exit 19
+printf 'caller variables preserved\n'
+"#,
+            stdout(&init)
+        );
+        let output = Command::new(shell)
+            .args(["-c", &script])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "shell={shell}, status={}: {} {}",
+            output.status,
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(stdout(&output).contains("caller variables preserved"));
     }
 }
 

@@ -270,19 +270,23 @@ pub fn render_use_script(
     format!("{}\n", lines.join("\n"))
 }
 
+// The helper runs in the caller's shell, so its working variables live inside the
+// command substitution's subshell and nothing it assigns is visible to the caller.
 fn render_init_posix(command: &str, shell: &str) -> String {
     let command = quote_posix(command);
     format!(
         r#"ocm_use() {{
-  script="$(
-    for _ocm_arg in "$@"; do
-      case "$_ocm_arg" in
-        (--shell|--shell=*) command {command} env use "$@"; exit $? ;;
-      esac
-    done
-    command {command} env use "$@" --shell {shell}
-  )" || return $?
-  eval "$script"
+  eval "$(
+    _ocm_script="$(
+      for _ocm_arg in "$@"; do
+        case "$_ocm_arg" in
+          (--shell|--shell=*) command {command} env use "$@"; exit $? ;;
+        esac
+      done
+      command {command} env use "$@" --shell {shell}
+    )" || {{ printf 'return %s\n' "$?"; exit 0; }}
+    printf '%s\n' "$_ocm_script"
+  )"
 }}
 "#
     )
