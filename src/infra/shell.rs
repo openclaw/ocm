@@ -32,7 +32,9 @@ fn render_assignment(shell: &str, key: &str, value: &str) -> String {
 fn render_unset(shell: &str, key: &str) -> String {
     debug_assert!(is_shell_identifier(key));
     if shell == "fish" {
-        format!("set -e {key};")
+        // `set -e` on a missing variable leaves status 4, which would become the
+        // status of a successful activation.
+        format!("if set -q {key}; set -e {key}; end;")
     } else {
         format!("unset {key}")
     }
@@ -569,5 +571,37 @@ mod tests {
         assert!(!script.contains("unset OPENCLAW_DIAGNOSTICS"));
         assert!(!script.contains("touch /tmp/pwn"));
         assert!(script.contains("export OPENCLAW_HOME='/tmp/ocm/envs/demo'"));
+    }
+
+    #[test]
+    fn fish_use_script_only_erases_variables_that_exist() {
+        let meta = EnvMeta {
+            upgrade_independent_paths: Vec::new(),
+            kind: "ocm-env".to_string(),
+            name: "demo".to_string(),
+            root: "/tmp/ocm/envs/demo".to_string(),
+            gateway_port: None,
+            gateway_port_auto_assigned: false,
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: None,
+            dev: None,
+            dev_ui_port: None,
+            protected: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_used_at: None,
+        };
+
+        let script = render_use_script(&meta, "fish", &BTreeMap::new());
+
+        assert!(
+            script.contains("if set -q OPENCLAW_PROFILE; set -e OPENCLAW_PROFILE; end;"),
+            "{script}"
+        );
+        for line in script.lines().filter(|line| line.contains("set -e")) {
+            assert!(line.starts_with("if set -q "), "{line}");
+        }
     }
 }
