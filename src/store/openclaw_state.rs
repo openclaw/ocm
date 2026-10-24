@@ -382,12 +382,7 @@ pub(crate) fn prepare_migrated_runtime_state(
         rewritten_roots.insert(source_root);
     }
     IntegrityProtectedLibraryPaths::new(&paths.state_dir)?.preserve_in(&mut workspaces);
-    changed |= clear_volatile_runtime_state(
-        &paths.state_dir,
-        &paths.state_dir,
-        &paths.config_path,
-        &workspaces,
-    )?;
+    changed |= clear_volatile_runtime_state(&paths.state_dir, &paths.config_path, &workspaces)?;
     managed_worktrees.finish(paths)?;
     Ok(MigratedRuntimeStateResult {
         changed,
@@ -2979,51 +2974,39 @@ pub(super) fn is_sqlite_database(path: &Path) -> Result<bool, String> {
     Ok(file.read_exact(&mut magic).is_ok() && &magic == b"SQLite format 3\0")
 }
 
+// Live process residue (pid files, sockets, OpenClaw's tmp/ and locks/ lock
+// directories) sits directly under the state root. Deeper entries belong to
+// plugin installs, Git checkouts, skills and other copied content whose own
+// files may be named like residue (Cargo.lock, a `tmp` package), so they stay
+// as copied, matching state-inclusive archive import.
 fn clear_volatile_runtime_state(
     state_root: &Path,
-    root: &Path,
     config_path: &Path,
     workspaces: &OpenClawWorkspaceInventory,
 ) -> Result<bool, String> {
-    if !path_exists(root) {
+    if !path_exists(state_root) {
         return Ok(false);
     }
 
     let mut changed = false;
-    let entries = fs::read_dir(root).map_err(|error| error.to_string())?;
+    let entries = fs::read_dir(state_root).map_err(|error| error.to_string())?;
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
-        let file_name = entry.file_name();
-        // Durable roots hold plugin payloads, Git checkouts and shared skills,
-        // whose own files may be named like residue (Cargo.lock, a `tmp`
-        // package). Clone and archive import keep these roots verbatim.
-        if path == config_path
-            || workspaces.contains(&path)
-            || is_integrity_protected_history_path(state_root, &path)
-            || (root == state_root && is_durable_openclaw_state_root(&file_name))
-        {
+        if path == config_path || workspaces.contains(&path) {
             continue;
         }
 
         let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-        if metadata.is_dir() && workspaces.has_descendant(&path) {
-            changed |= if should_remove_volatile_runtime_path(&file_name, true) {
-                clear_parent_preserving_workspaces(&path, workspaces)?
-            } else {
-                clear_volatile_runtime_state(state_root, &path, config_path, workspaces)?
-            };
+        if !should_remove_volatile_runtime_path(&entry.file_name(), metadata.is_dir()) {
             continue;
         }
-        if should_remove_volatile_runtime_path(&file_name, metadata.is_dir()) {
+        changed |= if metadata.is_dir() && workspaces.has_descendant(&path) {
+            clear_parent_preserving_workspaces(&path, workspaces)?
+        } else {
             remove_path(&path)?;
-            changed = true;
-            continue;
-        }
-
-        if metadata.is_dir() {
-            changed |= clear_volatile_runtime_state(state_root, &path, config_path, workspaces)?;
-        }
+            true
+        };
     }
 
     Ok(changed)

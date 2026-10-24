@@ -424,21 +424,28 @@ fn seed_plain_openclaw_home(source_home: &std::path::Path) {
     .unwrap();
     fs::write(source_home.join("gateway.pid"), "4242\n").unwrap();
     fs::write(source_home.join("run/live.sock"), "sock\n").unwrap();
-    fs::write(
-        source_home.join("agents/main/sessions/main.jsonl.lock"),
-        "4242\n",
-    )
-    .unwrap();
-    for relative in DURABLE_PAYLOADS_NAMED_LIKE_RESIDUE {
+    for relative in TOP_LEVEL_OPENCLAW_LOCKS {
+        let path = source_home.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "4242\n").unwrap();
+    }
+    for relative in NESTED_CONTENT_NAMED_LIKE_RESIDUE {
         let path = source_home.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, format!("durable {relative}\n")).unwrap();
     }
 }
 
-// Plugin payloads, Git plugin checkouts and shared skills may legitimately
-// contain names that match process residue.
-const DURABLE_PAYLOADS_NAMED_LIKE_RESIDUE: &[&str] = &[
+// OpenClaw keeps live Gateway and state-owner locks under these top-level
+// directories of its state root.
+const TOP_LEVEL_OPENCLAW_LOCKS: &[&str] = &[
+    "tmp/openclaw-1000/gateway.state.lock",
+    "locks/provider-auth-persistence/lock-demo",
+];
+
+// Plugin payloads, Git plugin checkouts, shared skills and sandbox workspace
+// copies may legitimately contain names that match process residue.
+const NESTED_CONTENT_NAMED_LIKE_RESIDUE: &[&str] = &[
     "plugins/legacy-demo/yarn.lock",
     "extensions/demo-plugin/node_modules/tmp/index.js",
     "extensions/demo-plugin/node_modules/temp/index.js",
@@ -448,6 +455,9 @@ const DURABLE_PAYLOADS_NAMED_LIKE_RESIDUE: &[&str] = &[
     "skills/demo-skill/scripts/bun.lock",
     "skills/demo-skill/tmp/template.txt",
     "skills/demo-skill/run/entry.sh",
+    "state/plugins/demo/run/notes.md",
+    "sandboxes/main/project/Cargo.lock",
+    "sandboxes/main/project/tmp/fixture.txt",
 ];
 
 fn seed_installed_plugin_index(source_home: &std::path::Path, records: serde_json::Value) {
@@ -508,12 +518,9 @@ fn assert_imported_plain_openclaw_home(
     assert!(imported_state.join("openclaw.json.bak").exists());
     assert!(!imported_state.join("gateway.pid").exists());
     assert!(!imported_state.join("run/live.sock").exists());
-    assert!(
-        !imported_state
-            .join("agents/main/sessions/main.jsonl.lock")
-            .exists()
-    );
-    for relative in DURABLE_PAYLOADS_NAMED_LIKE_RESIDUE {
+    assert!(!imported_state.join("tmp").exists());
+    assert!(!imported_state.join("locks").exists());
+    for relative in NESTED_CONTENT_NAMED_LIKE_RESIDUE {
         assert_eq!(
             fs::read_to_string(imported_state.join(relative)).ok(),
             Some(format!("durable {relative}\n")),
