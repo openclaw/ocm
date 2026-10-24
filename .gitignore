@@ -2,3 +2,4 @@
 ocm
 target
 dist/
+.artifacts/
