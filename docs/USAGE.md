@@ -1401,7 +1401,8 @@ files there that archived repositories select, are still archived because
 import retains them. When the environment root is itself a Git checkout,
 import retains its whole state directory, so the stores are archived too.
 Include conditions that depend on location, such as `gitdir:`, are evaluated
-where the repository is when exporting. Selecting these Git files runs `git`
+where the repository is when exporting, with the exporting user's own Git
+configuration. Selecting these Git files runs `git`
 when one of those stores and a Git repository both exist.
 
 `--include-state` means "export this

@@ -2517,6 +2517,13 @@ fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_use
         repository.join(".git/info/exclude"),
     )
     .unwrap();
+    // A .gitmodules link into a store is resolved by import too.
+    write_text(&state.join("identity/gitmodules"), "");
+    std::os::unix::fs::symlink(
+        state.join("identity/gitmodules"),
+        repository.join(".gitmodules"),
+    )
+    .unwrap();
     // A hook link is authored configuration that import neither inspects
     // nor keeps, so its target in a store stays out.
     write_text(&state.join("devices/pre-commit"), "#!/bin/sh\n");
@@ -2559,6 +2566,7 @@ fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_use
     assert!(archived.contains(std::path::Path::new("memory")));
     assert!(archived.contains(std::path::Path::new("cron/exclude")));
     assert!(archived.contains(std::path::Path::new("identity/description")));
+    assert!(archived.contains(std::path::Path::new("identity/gitmodules")));
     assert!(!archived.contains(std::path::Path::new("devices/pre-commit")));
     // The source is unavailable while importing.
     fs::rename(&source, root.join("offline")).unwrap();
@@ -2693,4 +2701,72 @@ fn default_export_keeps_every_alternate_object_store_import_requires() {
     );
     assert!(imported.status.success(), "{}", stderr(&imported));
     assert!(target.join(".openclaw/memory/a6/objects").is_dir());
+}
+
+#[test]
+fn default_export_omits_storage_of_a_standalone_bare_repository() {
+    // Import keeps a standalone bare repository and its configuration but not
+    // the stores its alternates name, so export leaves those stores out.
+    let fixture = TestDir::new("export-legacy-store-bare-alternates");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    let mirror = source.join("projects/mirror.git");
+    fs::create_dir_all(&mirror).unwrap();
+    export_git(&mirror, &env, &["init", "-q", "--bare"]);
+    write_text(&state.join("cron/objects/pack/keep"), "");
+    write_text(
+        &mirror.join("objects/info/alternates"),
+        &format!(
+            "{}\n",
+            export_git_argument(&state.join("cron/objects").to_string_lossy())
+        ),
+    );
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    assert!(
+        !archived_state_paths(&archive).contains(std::path::Path::new("cron/objects/pack/keep"))
+    );
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert!(target.join("projects/mirror.git/HEAD").is_file());
+    assert!(!target.join(".openclaw/cron").exists());
 }
