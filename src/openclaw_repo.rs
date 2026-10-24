@@ -592,15 +592,37 @@ fn pnpm_destinations(repo_root: &Path, output: &[u8]) -> Result<PnpmDestinations
         Some(Value::Bool(enabled)) => Ok(*enabled),
         _ => Err(format!("pnpm returned an invalid {camel} setting")),
     };
-    // Branch lockfiles are read for per-branch lockfiles and when merging them.
-    let branch_lockfiles = flag("gitBranchLockfile", "git-branch-lockfile")?
-        || flag("mergeGitBranchLockfiles", "merge-git-branch-lockfiles")?
-        || value(
-            "mergeGitBranchLockfilesBranchPattern",
-            "merge-git-branch-lockfiles-branch-pattern",
-        )
-        .is_some_and(|pattern| !pattern.is_null());
-    for project in lockfile_projects(&lockfile_root, branch_lockfiles)? {
+    let merge_setting = match value("mergeGitBranchLockfiles", "merge-git-branch-lockfiles") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(merge)) => Some(*merge),
+        _ => return Err("pnpm returned an invalid mergeGitBranchLockfiles setting".to_string()),
+    };
+    let merge_pattern = match value(
+        "mergeGitBranchLockfilesBranchPattern",
+        "merge-git-branch-lockfiles-branch-pattern",
+    ) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(pattern)) => vec![pattern.clone()],
+        Some(Value::Array(patterns)) => patterns
+            .iter()
+            .map(|pattern| pattern.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                "pnpm returned an invalid mergeGitBranchLockfilesBranchPattern setting".to_string()
+            })?,
+        _ => {
+            return Err(
+                "pnpm returned an invalid mergeGitBranchLockfilesBranchPattern setting".to_string(),
+            );
+        }
+    };
+    let selection = lockfile_selection(
+        repo_root,
+        flag("gitBranchLockfile", "git-branch-lockfile")?,
+        merge_setting,
+        &merge_pattern,
+    );
+    for project in lockfile_projects(&lockfile_root, &selection)? {
         let project = clean_path(&lockfile_root.join(project));
         projects.insert(clean_path(&project.join(modules_setting)));
         if let Some(name) = modules_name {
@@ -631,37 +653,201 @@ fn pnpm_destinations(repo_root: &Path, output: &[u8]) -> Result<PnpmDestinations
     })
 }
 
+/// Which lockfiles a frozen install reads, following pnpm 12.15's selection.
+enum LockfileSelection {
+    /// The first of these branch lockfiles that exists, else `pnpm-lock.yaml`.
+    Branch(Vec<String>),
+    /// `pnpm-lock.yaml` and every branch lockfile, merged.
+    Merge,
+}
+
+fn lockfile_selection(
+    repo_root: &Path,
+    branch_lockfile: bool,
+    merge_setting: Option<bool>,
+    merge_pattern: &[String],
+) -> LockfileSelection {
+    // An explicit mergeGitBranchLockfiles settles merging; otherwise a pattern
+    // decides it for the current branch. pnpm reads the branch from the working
+    // directory of the install, which is the checkout.
+    let pattern_decides = merge_setting.is_none() && !merge_pattern.is_empty();
+    let mut merge = merge_setting.unwrap_or(false);
+    let mut candidates = Vec::new();
+    if branch_lockfile || pattern_decides {
+        match current_git_branch(repo_root) {
+            Some(branch) => {
+                if pattern_decides {
+                    merge = pnpm_pattern_matches(merge_pattern, &branch);
+                }
+                if branch_lockfile {
+                    candidates.push(git_branch_lockfile_name(&branch));
+                }
+            }
+            None if branch_lockfile && !merge => {
+                // A detached HEAD reads the files of the branches containing it.
+                candidates.extend(
+                    git_branches_containing_head(repo_root)
+                        .iter()
+                        .map(|branch| git_branch_lockfile_name(branch))
+                        .filter(|name| name.len() <= 255),
+                );
+            }
+            None => {}
+        }
+    }
+    if merge {
+        LockfileSelection::Merge
+    } else {
+        LockfileSelection::Branch(candidates)
+    }
+}
+
+fn current_git_branch(repo_root: &Path) -> Option<String> {
+    let output = git_command()
+        .arg("-C")
+        .arg(repo_root)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let branch = branch.trim();
+    (output.status.success() && !branch.is_empty()).then(|| branch.to_string())
+}
+
+fn git_branches_containing_head(repo_root: &Path) -> Vec<String> {
+    git_command()
+        .arg("-C")
+        .arg(repo_root)
+        .args(["branch", "--contains", "HEAD", "--format=%(refname:short)"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('('))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// pnpm's `pnpm-lock.<branch>.yaml` name: ASCII letters, digits, `_`, `.` and
+/// `-` kept in lower case, and one `!` per UTF-16 unit of anything else.
+fn git_branch_lockfile_name(branch: &str) -> String {
+    let mut name = String::from("pnpm-lock.");
+    for character in branch.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-') {
+            name.push(character.to_ascii_lowercase());
+        } else {
+            name.extend(std::iter::repeat_n('!', character.len_utf16()));
+        }
+    }
+    name.push_str(".yaml");
+    name
+}
+
+fn is_git_branch_lockfile_name(name: &str) -> bool {
+    name.strip_prefix("pnpm-lock.")
+        .and_then(|rest| rest.strip_suffix(".yaml"))
+        .is_some_and(|branch| !branch.is_empty())
+}
+
+/// pnpm's branch-pattern matcher: `*` and `?` wildcards, `!` negation; one
+/// pattern, all includes, all negations, or the last matching verdict.
+fn pnpm_pattern_matches(patterns: &[String], input: &str) -> bool {
+    fn wildcard(pattern: &[char], input: &[char]) -> bool {
+        match (pattern.first(), input.first()) {
+            (None, None) => true,
+            (Some('*'), _) => {
+                wildcard(&pattern[1..], input)
+                    || (!input.is_empty() && wildcard(pattern, &input[1..]))
+            }
+            (Some('?'), Some(_)) => wildcard(&pattern[1..], &input[1..]),
+            (Some(expected), Some(actual)) if expected == actual => {
+                wildcard(&pattern[1..], &input[1..])
+            }
+            _ => false,
+        }
+    }
+    let input: Vec<char> = input.chars().collect();
+    let compiled: Vec<(bool, Vec<char>)> = patterns
+        .iter()
+        .map(|pattern| match pattern.strip_prefix('!') {
+            Some(rest) => (true, rest.chars().collect()),
+            None => (false, pattern.chars().collect()),
+        })
+        .collect();
+    let matches = |glob: &Vec<char>| wildcard(glob, &input);
+    match compiled.as_slice() {
+        [] => false,
+        [(ignore, glob)] => matches(glob) != *ignore,
+        _ if compiled.iter().all(|(ignore, _)| !ignore) => {
+            compiled.iter().any(|(_, glob)| matches(glob))
+        }
+        _ if compiled.iter().all(|(ignore, _)| *ignore) => {
+            !compiled.iter().any(|(_, glob)| matches(glob))
+        }
+        _ => {
+            let mut included = false;
+            for (ignore, glob) in &compiled {
+                if matches(glob) {
+                    included = !ignore;
+                }
+            }
+            included
+        }
+    }
+}
+
 /// The projects a frozen install links: the `importers` of the lockfiles pnpm
-/// reads at the lockfile root, across all of a lockfile's YAML documents. That is
-/// `pnpm-lock.yaml`, plus, with per-branch lockfiles enabled, every
-/// `pnpm-lock.<branch>.yaml` (a superset of the current branch's file, which
-/// pnpm names from Git state that admission does not reproduce).
-fn lockfile_projects(lockfile_root: &Path, branch_lockfiles: bool) -> Result<Vec<String>, String> {
-    let entries = match fs::read_dir(lockfile_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(format!(
-                "failed inspecting pnpm lockfiles in {}: {error}",
-                display_path(lockfile_root)
-            ));
+/// reads at the lockfile root, across all of a lockfile's YAML documents.
+fn lockfile_projects(
+    lockfile_root: &Path,
+    selection: &LockfileSelection,
+) -> Result<Vec<String>, String> {
+    let names: Vec<String> = match selection {
+        LockfileSelection::Branch(candidates) => vec![
+            candidates
+                .iter()
+                .find(|name| lockfile_root.join(name).is_file())
+                .cloned()
+                .unwrap_or_else(|| "pnpm-lock.yaml".to_string()),
+        ],
+        LockfileSelection::Merge => {
+            let mut names = vec!["pnpm-lock.yaml".to_string()];
+            match fs::read_dir(lockfile_root) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry.map_err(|error| {
+                            format!(
+                                "failed inspecting pnpm lockfiles in {}: {error}",
+                                display_path(lockfile_root)
+                            )
+                        })?;
+                        if let Some(name) = entry.file_name().to_str()
+                            && is_git_branch_lockfile_name(name)
+                        {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "failed inspecting pnpm lockfiles in {}: {error}",
+                        display_path(lockfile_root)
+                    ));
+                }
+            }
+            names
         }
     };
     let mut projects = Vec::new();
-    for entry in entries {
-        let path = entry
-            .map_err(|error| {
-                format!(
-                    "failed inspecting pnpm lockfiles in {}: {error}",
-                    display_path(lockfile_root)
-                )
-            })?
-            .path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let branch_lockfile = name.starts_with("pnpm-lock.") && name.ends_with(".yaml");
-        if !(name == "pnpm-lock.yaml" || (branch_lockfiles && branch_lockfile)) {
+    for name in names {
+        let path = lockfile_root.join(&name);
+        if !path.exists() {
             continue;
         }
         let unreadable = || {
@@ -1920,11 +2106,12 @@ mod tests {
         check(serde_json::json!({"sharedWorkspaceLockfile": false, "lockfileDir": "."})).unwrap();
         assert!(check(serde_json::json!({"sharedWorkspaceLockfile": "no"})).is_err());
 
-        // pnpm reads per-branch lockfiles only when they are enabled.
-        fs::write(repo.join("pnpm-lock.main.yaml"), "importers: [unclosed\n").unwrap();
+        // pnpm reads per-branch lockfiles only as it selects them: the current
+        // branch's file (else the shared one), or every branch file when merging.
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("pnpm-lock.old.yaml"), "importers: [unclosed\n").unwrap();
         check(serde_json::json!({})).unwrap();
-        let error = check(serde_json::json!({"gitBranchLockfile": true})).unwrap_err();
-        assert!(error.contains("could not read the projects"), "{error}");
+        check(serde_json::json!({"gitBranchLockfile": true})).unwrap();
         fs::write(
             repo.join("pnpm-lock.main.yaml"),
             "importers:\n  extensions/b: {}\n",
@@ -1934,14 +2121,60 @@ mod tests {
         std::os::unix::fs::symlink(&borrowed, repo.join("extensions/b/node_modules")).unwrap();
         check(serde_json::json!({})).unwrap();
         assert!(check(serde_json::json!({"gitBranchLockfile": true})).is_err());
-        // Merging branch lockfiles reads them too.
-        assert!(check(serde_json::json!({"mergeGitBranchLockfiles": true})).is_err());
+        let error = check(serde_json::json!({"mergeGitBranchLockfiles": true})).unwrap_err();
+        assert!(error.contains("pnpm-lock.old.yaml"), "{error}");
         assert!(
-            check(serde_json::json!({"mergeGitBranchLockfilesBranchPattern": ["main"]})).is_err()
+            check(serde_json::json!({"mergeGitBranchLockfilesBranchPattern": ["ma?n"]})).is_err()
         );
+        check(serde_json::json!({"mergeGitBranchLockfilesBranchPattern": ["release/*"]})).unwrap();
+        check(serde_json::json!({
+            "mergeGitBranchLockfiles": false, "mergeGitBranchLockfilesBranchPattern": ["*"],
+        }))
+        .unwrap();
+        fs::write(repo.join("pnpm-lock.main.yaml"), "importers: [unclosed\n").unwrap();
+        let error = check(serde_json::json!({"gitBranchLockfile": true})).unwrap_err();
+        assert!(error.contains("pnpm-lock.main.yaml"), "{error}");
         fs::write(repo.join("pnpm-lock.yaml"), "importers: [unclosed\n").unwrap();
         let error = check(serde_json::json!({})).unwrap_err();
         assert!(error.contains("could not read the projects"), "{error}");
+    }
+
+    #[test]
+    fn pnpm_branch_lockfile_selection_matches_pnpm() {
+        assert_eq!(
+            super::git_branch_lockfile_name("main"),
+            "pnpm-lock.main.yaml"
+        );
+        assert_eq!(
+            super::git_branch_lockfile_name("Feature/Äb_1.x-y"),
+            "pnpm-lock.feature!!b_1.x-y.yaml"
+        );
+        assert!(super::is_git_branch_lockfile_name("pnpm-lock.main.yaml"));
+        assert!(!super::is_git_branch_lockfile_name("pnpm-lock.yaml"));
+        assert!(!super::is_git_branch_lockfile_name("pnpm-lock..yaml"));
+        let patterns = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert!(super::pnpm_pattern_matches(&patterns(&["main"]), "main"));
+        assert!(super::pnpm_pattern_matches(
+            &patterns(&["release/*"]),
+            "release/1.0"
+        ));
+        assert!(super::pnpm_pattern_matches(&patterns(&["fe?t"]), "feat"));
+        assert!(!super::pnpm_pattern_matches(&patterns(&["!main"]), "main"));
+        assert!(super::pnpm_pattern_matches(&patterns(&["!main"]), "dev"));
+        assert!(!super::pnpm_pattern_matches(&patterns(&["!a", "!b"]), "b"));
+        assert!(super::pnpm_pattern_matches(
+            &patterns(&["*", "!wip/*"]),
+            "main"
+        ));
+        assert!(!super::pnpm_pattern_matches(
+            &patterns(&["*", "!wip/*"]),
+            "wip/x"
+        ));
+        assert!(super::pnpm_pattern_matches(
+            &patterns(&["*", "!wip/*", "wip/keep"]),
+            "wip/keep"
+        ));
+        assert!(!super::pnpm_pattern_matches(&[], "main"));
     }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
