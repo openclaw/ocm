@@ -1660,6 +1660,101 @@ fn adopt_import_copies_a_symlinked_external_workspace_into_the_disposable_enviro
 
 #[cfg(unix)]
 #[test]
+fn migration_retargets_absolute_links_inside_the_source_home_into_the_environment() {
+    use std::os::unix::fs::symlink;
+
+    for adopt in [false, true] {
+        let root = TestDir::new("migration-internal-absolute-links");
+        let cwd = root.child("workspace");
+        let source = root.child("legacy-home/.openclaw");
+        let alias = root.child("legacy-alias");
+        let external = root.child("external-logs");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(source.join("workspace")).unwrap();
+        fs::create_dir_all(source.join("data/logs")).unwrap();
+        fs::create_dir_all(source.join("data/sessions")).unwrap();
+        fs::create_dir_all(source.join("agents/main")).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(source.join("openclaw.json"), "{}").unwrap();
+        fs::write(source.join("data/logs/gateway.log"), "old-log\n").unwrap();
+        fs::write(source.join("data/sessions/s1.jsonl"), "{}\n").unwrap();
+        symlink(root.child("legacy-home"), &alias).unwrap();
+        let links = [
+            ("logs", source.join("data/logs")),
+            ("agents/main/sessions", source.join("data/sessions")),
+            ("agents/main/pending", source.join("data/pending")),
+            ("aliased-sessions", alias.join(".openclaw/data/sessions")),
+            ("home", source.clone()),
+            (
+                "latest.log",
+                Path::new("data/logs/gateway.log").to_path_buf(),
+            ),
+            ("external", external.clone()),
+        ];
+        for (link, target) in &links {
+            symlink(target, source.join(link)).unwrap();
+        }
+        let mut env = ocm_env(&root);
+        install_fake_openclaw_on_path(&root, &mut env);
+
+        let args = if adopt {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "mira",
+                source.to_str().unwrap(),
+            ]
+        } else {
+            vec!["migrate", "mira", source.to_str().unwrap()]
+        };
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(
+            output.status.success(),
+            "adopt={adopt}: {}",
+            stderr(&output)
+        );
+
+        let state = root.child("ocm-home/envs/mira/.openclaw");
+        let expected = [
+            ("logs", Path::new("data/logs")),
+            ("agents/main/sessions", Path::new("../../data/sessions")),
+            ("agents/main/pending", Path::new("../../data/pending")),
+            ("aliased-sessions", Path::new("data/sessions")),
+            ("home", Path::new(".")),
+            ("latest.log", Path::new("data/logs/gateway.log")),
+            ("external", external.as_path()),
+        ];
+        for (link, target) in expected {
+            assert_eq!(
+                fs::read_link(state.join(link)).unwrap(),
+                target,
+                "adopt={adopt} link={link}"
+            );
+        }
+        let canonical_state = fs::canonicalize(&state).unwrap();
+        for link in ["logs", "agents/main/sessions", "aliased-sessions"] {
+            assert!(
+                fs::canonicalize(state.join(link))
+                    .unwrap()
+                    .starts_with(&canonical_state),
+                "adopt={adopt} link={link}"
+            );
+        }
+        fs::write(state.join("logs/env.log"), "env\n").unwrap();
+        fs::write(state.join("agents/main/sessions/env.jsonl"), "{}\n").unwrap();
+        assert!(state.join("data/logs/env.log").is_file());
+        assert!(state.join("data/sessions/env.jsonl").is_file());
+        assert!(!source.join("data/logs/env.log").exists());
+        assert!(!source.join("data/sessions/env.jsonl").exists());
+        for (link, target) in &links {
+            assert_eq!(&fs::read_link(source.join(link)).unwrap(), target);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn migrate_materializes_a_config_symlink_without_rewriting_its_target() {
     let root = TestDir::new("migrate-config-symlink");
     let cwd = root.child("workspace");
@@ -2110,6 +2205,7 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                 "mixed-link",
                 "target-record",
                 "target-link",
+                "target-escape",
                 "config-alias",
                 "config-include",
                 "config-shared",
@@ -2141,7 +2237,9 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                     "internal-link" | "mixed-link" | "config-alias" | "config-include"
                     | "config-shared" => source.join("linked-plugin"),
                     "target-record" => root.child("ocm-home/envs/copied/.openclaw/extensions/demo"),
+                    // The copied absolute link is re-targeted inside the environment.
                     "target-link" => root.child("ocm-home/envs/copied/.openclaw/linked-plugin"),
+                    "target-escape" => root.child("ocm-home/envs/copied/.openclaw/escape"),
                     _ => plugin.clone(),
                 };
                 let source_recorded = match case {
@@ -2216,7 +2314,7 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                 let target = root.child("ocm-home/envs/copied/.openclaw");
                 if matches!(
                     case,
-                    "external" | "escape" | "target-link" | "config-shared"
+                    "external" | "escape" | "target-escape" | "config-shared"
                 ) {
                     assert!(!output.status.success(), "{case}: {}", stdout(&output));
                     assert!(
@@ -2256,11 +2354,14 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                 } else {
                     read_imported_plugin_install_records(&root, "copied")
                 };
+                // An already-target spelling is kept; it now resolves to the copy.
+                let spelled = if case == "target-link" {
+                    target.join("linked-plugin")
+                } else {
+                    target.join("extensions/demo")
+                };
                 for field in ["installPath", "sourcePath"] {
-                    assert_eq!(
-                        rewritten["demo"][field],
-                        target.join("extensions/demo").to_str().unwrap()
-                    );
+                    assert_eq!(rewritten["demo"][field], spelled.to_str().unwrap());
                     assert_eq!(
                         fs::canonicalize(rewritten["demo"][field].as_str().unwrap()).unwrap(),
                         fs::canonicalize(target.join("extensions/demo")).unwrap()
@@ -2279,7 +2380,7 @@ fn migrate_and_adopt_relocate_plugin_records_through_admitted_home_aliases() {
                 } else {
                     config["plugins"]["load"]["paths"][0].clone()
                 };
-                assert_eq!(loaded, target.join("extensions/demo").to_str().unwrap());
+                assert_eq!(loaded, spelled.to_str().unwrap());
                 assert_eq!(
                     fs::canonicalize(loaded.as_str().unwrap()).unwrap(),
                     fs::canonicalize(target.join("extensions/demo")).unwrap()

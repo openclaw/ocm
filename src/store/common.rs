@@ -10,6 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::openclaw_state::{OpenClawSqliteCopy, is_sqlite_database};
+use super::openclaw_workspaces::canonicalize_path_allow_missing;
 use crate::infra::sqlite_snapshot::create_sqlite_snapshot;
 
 #[cfg(unix)]
@@ -302,6 +303,45 @@ pub(crate) struct OpenClawDirectoryCopy<'a> {
     selection: OpenClawSqliteCopy<'a>,
     databases: HashSet<PathBuf>,
     namespace_links: BTreeMap<PathBuf, (PathBuf, PathBuf)>,
+    internal_links: Option<InternalLinkRoots>,
+}
+
+// A migrated home must not keep writing into the home it came from. Absolute
+// links that resolve inside the source are re-targeted to the same place in
+// the destination, with the relative form the environment archive uses.
+struct InternalLinkRoots {
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+impl InternalLinkRoots {
+    fn relocate(&self, target: &Path, destination_link: &Path) -> Option<(PathBuf, bool)> {
+        if !target.is_absolute() {
+            return None;
+        }
+        let resolved = canonicalize_path_allow_missing(target).ok()?;
+        let inside = resolved.strip_prefix(&self.source).ok()?;
+        let parent = destination_link
+            .parent()?
+            .strip_prefix(&self.destination)
+            .ok()?;
+        let common = parent
+            .components()
+            .zip(inside.components())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let mut relative = PathBuf::new();
+        for _ in parent.components().skip(common) {
+            relative.push("..");
+        }
+        for part in inside.components().skip(common) {
+            relative.push(part);
+        }
+        if relative.as_os_str().is_empty() {
+            relative.push(".");
+        }
+        Some((relative, resolved.is_dir()))
+    }
 }
 
 impl<'a> OpenClawDirectoryCopy<'a> {
@@ -314,7 +354,20 @@ impl<'a> OpenClawDirectoryCopy<'a> {
             selection,
             databases: HashSet::new(),
             namespace_links: BTreeMap::new(),
+            internal_links: None,
         })
+    }
+
+    pub(crate) fn relocate_internal_links(
+        &mut self,
+        source_root: &Path,
+        destination_root: &Path,
+    ) -> Result<(), String> {
+        self.internal_links = Some(InternalLinkRoots {
+            source: fs::canonicalize(source_root).map_err(|error| error.to_string())?,
+            destination: destination_root.to_path_buf(),
+        });
+        Ok(())
     }
 
     pub(crate) fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), String> {
@@ -483,7 +536,16 @@ fn copy_path_inner(
         } else {
             directory_hint
         };
-        return copy_symlink(source, destination, directory_hint, namespace_target);
+        let internal_links = copying
+            .as_ref()
+            .and_then(|copying| copying.internal_links.as_ref());
+        return copy_symlink(
+            source,
+            destination,
+            directory_hint,
+            namespace_target,
+            internal_links,
+        );
     }
     if file_type.is_dir() {
         return copy_dir_recursive_inner(
@@ -511,17 +573,24 @@ fn copy_symlink(
     destination_path: &Path,
     _directory_hint: Option<bool>,
     namespace_target: Option<&(PathBuf, PathBuf)>,
+    internal_links: Option<&InternalLinkRoots>,
 ) -> Result<(), String> {
     if let Some(parent) = destination_path.parent() {
         ensure_dir(parent)?;
     }
-    let mut target = fs::read_link(source_path).map_err(|error| error.to_string())?;
-    if let Some((expected, projected)) = namespace_target {
+    let target = fs::read_link(source_path).map_err(|error| error.to_string())?;
+    let (target, _directory_hint) = if let Some((expected, projected)) = namespace_target {
         if &target != expected {
             return Err("saved-skill namespace link changed during copying".into());
         }
-        target = projected.clone();
-    }
+        (projected.clone(), _directory_hint)
+    } else if let Some((relocated, is_directory)) =
+        internal_links.and_then(|roots| roots.relocate(&target, destination_path))
+    {
+        (relocated, Some(is_directory))
+    } else {
+        (target, _directory_hint)
+    };
 
     #[cfg(unix)]
     {

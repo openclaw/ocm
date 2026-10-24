@@ -1045,6 +1045,7 @@ Session locations follow the actual shared workspace projection, while in-home d
 When a configured workspace contains the original home, its workspace locations select the enclosing workspace copy; active runtime databases still use the new `.openclaw` state directory.
 Recognized legacy session headers with an in-home `cwd` follow the same workspace projection; other legacy text and external references keep their existing relocation policy.
 It maps resolved locations so internal links do not leave retained sessions pointing back at the source; references outside the copied roots and unresolved links remain unchanged.
+Symlinks in the copied home keep their targets, except that an absolute link resolving inside the original home (for example `logs` or `agents/<id>/sessions` linked to another directory in the same home) is recreated as a relative link to the same location in the new state directory, so the environment does not keep writing into the source home; relative links and links outside the home are copied unchanged.
 It uses the copy operation's recorded database destinations, including registered databases already copied from external workspaces, without copying additional external contents.
 Authored database payloads, approval and integrity metadata, and protected history remain unchanged; the source databases are never rewritten.
 The original home's history protection also applies when those files are carried into an enclosing workspace copy.
