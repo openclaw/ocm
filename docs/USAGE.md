@@ -145,9 +145,22 @@ Gateway then fails to start; the next start there needs no preparation.
 Otherwise the new binding stays and OCM says so: an installer stopped by a
 signal leaves cleanup unverified, so its session ownership is kept for recovery,
 and a missing previous checkout cannot be restored. Missing tooling in the
-selected checkout then needs explicit preparation. Other resumed borrowers
-report missing tooling for explicit preparation; they do not reinstall
-dependencies. Removing a borrower preserves source files, dependencies,
+selected checkout then needs explicit preparation.
+Before automatic installation, OCM reads the configuration the selected pnpm
+reports (such as `pnpm-workspace.yaml`, pnpm's global `config.yaml` and
+`PNPM_CONFIG_*` settings) and refuses linked modules or virtual-store
+destinations: each lockfile project's modules directory, the lockfile root's
+modules and installation state, custom project and global stores, a global
+store kept under pnpm's store directory, and linked parents. It also refuses a
+pnpm workspace-directory override (`PNPM_CONFIG_WORKSPACE_DIR`,
+`NPM_CONFIG_WORKSPACE_DIR` or their lowercase spellings) that names another
+directory, and per-project pnpm lockfiles. Failed configuration readback also
+requires explicit preparation; physical default and custom destinations remain
+supported. Destinations chosen by a checkout's pnpmfile hooks or configuration
+plugins during installation are not checked, because pnpm applies them only
+while installing.
+Other resumed borrowers report missing tooling for explicit preparation; they do
+not reinstall dependencies. Removing a borrower preserves source files, dependencies,
 generated output, and unrelated source processes. Older OCM readers refuse the
 new binding records. Refresh an incompatible running daemon with
 `ocm service refresh-daemon --acknowledge-gateway-restarts` before registration.

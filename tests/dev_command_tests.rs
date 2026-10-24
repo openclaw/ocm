@@ -297,9 +297,34 @@ fn install_fake_dev_runners(root: &TestDir, env: &mut std::collections::BTreeMap
         "#!/bin/sh\nlogged_args=$(printf '%s' \"$*\" | tr '\\n' ' ')\nprintf '%s|%s|%s|%s|bundled=%s|devroot=%s\\n' \"$PWD\" \"$OPENCLAW_CONFIG_PATH\" \"$OPENCLAW_GATEWAY_PORT\" \"$logged_args\" \"$OPENCLAW_BUNDLED_PLUGINS_DIR\" \"$OPENCLAW_DEV_SOURCE_ROOT\" >> \"{}\"\nif [ -n \"$OCM_TEST_NODE_STDOUT\" ]; then printf '%s\\n' \"$OCM_TEST_NODE_STDOUT\"; fi\nif [ -n \"$OCM_TEST_NODE_STDERR\" ]; then printf '%s\\n' \"$OCM_TEST_NODE_STDERR\" >&2; fi\n",
         path_string(&node_log)
     );
-    write_executable_script(&bin_dir.join("pnpm"), &pnpm);
+    write_fake_dev_pnpm(root, &pnpm);
     write_fake_dev_node(root, &node);
     prepend_fake_bin(env, &bin_dir);
+}
+
+fn write_fake_dev_pnpm(root: &TestDir, script: &str) {
+    let config = r#"#!/bin/sh
+if [ "$1" = config ]; then
+  if [ -n "$OCM_TEST_PNPM_CONFIG_EXIT" ]; then
+    printf 'private configuration diagnostic\n' >&2
+    exit "$OCM_TEST_PNPM_CONFIG_EXIT"
+  fi
+  if [ -n "$OCM_TEST_PNPM_CONFIG" ]; then
+    printf '%s\n' "$OCM_TEST_PNPM_CONFIG"
+  else
+    printf '{}\n'
+  fi
+  exit 0
+fi
+if [ "$1" = store ]; then
+  printf '%s\n' "$OCM_TEST_PNPM_STORE_PATH"
+  exit 0
+fi
+"#;
+    write_executable_script(
+        &root.child("fake-dev-bin/pnpm"),
+        &script.replacen("#!/bin/sh\n", config, 1),
+    );
 }
 
 fn write_fake_dev_node(root: &TestDir, script: &str) {
@@ -410,7 +435,7 @@ chmod +x "$modules_dir/.bin/tsdown"
 "#,
         path_string(&root.child("pnpm.log"))
     );
-    write_executable_script(&root.child("fake-dev-bin/pnpm"), &script);
+    write_fake_dev_pnpm(root, &script);
 }
 
 fn source_watch_override_path(root: &TestDir, name: &str) -> PathBuf {
@@ -3777,8 +3802,8 @@ fn dev_dependencies_preserve_reported_lifecycle_uncertainty() {
             .into_iter()
             .map(|line| format!("printf '%s\\n' '{line}' >&2\n"))
             .collect::<String>();
-        write_executable_script(
-            &root.child("fake-dev-bin/pnpm"),
+        write_fake_dev_pnpm(
+            &root,
             &format!("#!/bin/sh\n{output}exit {installer_exit}\n"),
         );
         let failed = run_ocm(&cwd, &env, &dev_watch(&["demo", "--watch"]));
@@ -4041,6 +4066,175 @@ fn dev_dependencies_do_not_repair_through_linked_install_targets() {
         assert_eq!(fs::read_link(&link).unwrap(), target);
         assert!(!root.child("pnpm.log").exists());
         assert!(!root.child("node.log").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
+    for case in [
+        "physical",
+        "linked-store",
+        "linked-parent",
+        "linked-global-store",
+        "linked-lockfile-modules",
+        "invalid-config",
+        "failed-config",
+        "workspace-override",
+        "workspace-self",
+        "implicit-global-store",
+        "linked-implicit-global-store",
+        "linked-workspace-project-modules",
+    ] {
+        let root = TestDir::new("dev-effective-pnpm-destinations");
+        let repo = init_openclaw_repo(&root);
+        declare_source_tooling(&repo);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_probe_aware_fake_dev_runners(&root, &mut env);
+        install_frozen_source_dependency_runner(&root);
+        let borrowed = root.child("borrowed-store");
+        fs::create_dir_all(&borrowed).unwrap();
+        fs::write(borrowed.join("lock.yaml"), "existing borrowed lock\n").unwrap();
+        let virtual_store = if case == "linked-parent" {
+            "custom-store/absent"
+        } else {
+            "custom-store"
+        };
+        env.insert(
+            "OCM_TEST_PNPM_CONFIG".to_string(),
+            serde_json::json!({
+                "modulesDir": "node_modules", "virtualStoreDir": virtual_store,
+                "unrelatedPrivateValue": "do-not-render",
+            })
+            .to_string(),
+        );
+        let link =
+            if case == "linked-lockfile-modules" {
+                env.insert("OCM_TEST_PNPM_CONFIG".to_string(), serde_json::json!({
+                "lockfileDir": "lockfiles", "modulesDir": "modules", "virtualStoreDir": "store",
+            }).to_string());
+                fs::create_dir(repo.join("lockfiles")).unwrap();
+                repo.join("lockfiles/modules")
+            } else {
+                if case.ends_with("implicit-global-store") {
+                    // No explicit directory: pnpm links packages under its store.
+                    env.insert(
+                        "OCM_TEST_PNPM_CONFIG".to_string(),
+                        serde_json::json!({"virtualStoreType": "global"}).to_string(),
+                    );
+                    env.insert(
+                        "OCM_TEST_PNPM_STORE_PATH".to_string(),
+                        path_string(&root.child("pnpm-store/v11")),
+                    );
+                    fs::create_dir_all(root.child("pnpm-store/v11")).unwrap();
+                }
+                if case == "linked-global-store" {
+                    env.insert(
+                        "OCM_TEST_PNPM_CONFIG".to_string(),
+                        serde_json::json!({
+                            "virtualStoreType": "global", "globalVirtualStoreDir": "custom-store",
+                        })
+                        .to_string(),
+                    );
+                }
+                repo.join("custom-store")
+            };
+        match case {
+            "linked-store"
+            | "linked-parent"
+            | "linked-global-store"
+            | "linked-lockfile-modules" => {
+                std::os::unix::fs::symlink(&borrowed, &link).unwrap();
+            }
+            "linked-implicit-global-store" => {
+                std::os::unix::fs::symlink(&borrowed, root.child("pnpm-store/v11/links")).unwrap();
+            }
+            "linked-workspace-project-modules" => {
+                // A frozen install links each lockfile project into its own modules.
+                fs::create_dir(repo.join("custom-store")).unwrap();
+                fs::create_dir(repo.join("ui")).unwrap();
+                fs::write(
+                    repo.join("pnpm-lock.yaml"),
+                    "lockfileVersion: '9.0'\nimporters:\n  .: {}\n  ui: {}\n",
+                )
+                .unwrap();
+                std::os::unix::fs::symlink(&borrowed, repo.join("ui/node_modules")).unwrap();
+            }
+            "implicit-global-store" => {
+                fs::create_dir(root.child("pnpm-store/v11/links")).unwrap();
+            }
+            "invalid-config" => {
+                env.insert(
+                    "OCM_TEST_PNPM_CONFIG".to_string(),
+                    "do-not-render".to_string(),
+                );
+            }
+            "failed-config" => {
+                env.insert("OCM_TEST_PNPM_CONFIG_EXIT".to_string(), "1".to_string());
+            }
+            _ => {
+                fs::create_dir(repo.join("custom-store")).unwrap();
+            }
+        }
+        // pnpm installs the workspace these name instead of the checkout's own.
+        if case == "workspace-override" {
+            env.insert(
+                "PNPM_CONFIG_WORKSPACE_DIR".to_string(),
+                path_string(&borrowed),
+            );
+        } else if case == "workspace-self" {
+            env.insert("PNPM_CONFIG_WORKSPACE_DIR".to_string(), String::new());
+            env.insert("npm_config_workspace_dir".to_string(), path_string(&repo));
+        }
+        let admitted = matches!(
+            case,
+            "physical" | "workspace-self" | "implicit-global-store"
+        );
+        let result = run_ocm(
+            &cwd,
+            &env,
+            &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+        );
+        assert_eq!(
+            result.status.success(),
+            admitted,
+            "{case}: {}",
+            stderr(&result)
+        );
+        let rendered = format!("{}{}", stdout(&result), stderr(&result));
+        assert!(!rendered.contains("do-not-render"), "{case}");
+        assert!(
+            !rendered.contains("private configuration diagnostic"),
+            "{case}"
+        );
+        assert_eq!(
+            fs::read_to_string(borrowed.join("lock.yaml")).unwrap(),
+            "existing borrowed lock\n"
+        );
+        assert_eq!(fs::read_dir(&borrowed).unwrap().count(), 1);
+        if !admitted {
+            assert!(!root.child("pnpm.log").exists(), "{case}");
+            assert!(!root.child("node.log").exists(), "{case}");
+        }
+        if case.starts_with("linked-") {
+            assert!(stderr(&result).contains("refusing to install"), "{case}");
+            let link = match case {
+                "linked-implicit-global-store" => root.child("pnpm-store/v11/links"),
+                "linked-workspace-project-modules" => repo.join("ui/node_modules"),
+                _ => link,
+            };
+            assert_eq!(fs::read_link(&link).unwrap(), borrowed);
+        }
+        if case == "workspace-override" {
+            assert!(
+                stderr(&result).contains("refusing to install")
+                    && stderr(&result).contains("PNPM_CONFIG_WORKSPACE_DIR"),
+                "{}",
+                stderr(&result)
+            );
+        }
     }
 }
 
@@ -7675,13 +7869,16 @@ fn dev_service_preparation_cancellation_preserves_its_running_service() {
 #[test]
 fn dev_stop_cancels_owned_preparation_before_gateway_start() {
     for (phase, mode) in [
+        ("configuration", "watch"),
         ("dependencies", "watch"),
         ("probe", "watch"),
         ("onboard", "watch"),
         ("dependencies", "plain"),
+        ("configuration", "plain"),
         ("probe", "plain"),
         ("onboard", "plain"),
         ("dependencies", "service"),
+        ("configuration", "service"),
         ("probe", "service"),
         ("onboard", "service"),
     ] {
@@ -7717,10 +7914,12 @@ fn dev_stop_cancels_owned_preparation_before_gateway_start() {
             path_string(&started),
             path_string(&release),
         );
-        if phase != "dependencies" {
+        if phase == "configuration" {
+            write_executable_script(&root.child("fake-dev-bin/pnpm"), &script);
+        } else if phase != "dependencies" {
             write_fake_dev_node(&root, &script);
         } else {
-            write_executable_script(&root.child("fake-dev-bin/pnpm"), &script);
+            write_fake_dev_pnpm(&root, &script);
         }
         let mut args = match mode {
             "watch" => dev_watch(&["demo", "--watch"]),

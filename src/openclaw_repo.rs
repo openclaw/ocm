@@ -370,11 +370,52 @@ pub(crate) fn source_modules_override(
     Ok(Some(configured))
 }
 
+/// pnpm reads these in order, using the first non-empty one, instead of looking
+/// for the `pnpm-workspace.yaml` around the working directory.
+const PNPM_WORKSPACE_DIR_VARIABLES: [&str; 4] = [
+    "PNPM_CONFIG_WORKSPACE_DIR",
+    "pnpm_config_workspace_dir",
+    "NPM_CONFIG_WORKSPACE_DIR",
+    "npm_config_workspace_dir",
+];
+
+fn ensure_source_workspace_root(
+    repo_root: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    // With this override pnpm installs the named workspace, and its configuration
+    // readback reports that workspace's settings without its root. Admit only an
+    // override that names the selected checkout, so the destinations checked
+    // later are the ones pnpm will write.
+    let Some((key, value)) = PNPM_WORKSPACE_DIR_VARIABLES.iter().find_map(|name| {
+        env.iter().find(|(key, value)| {
+            !value.is_empty()
+                && if cfg!(windows) {
+                    key.eq_ignore_ascii_case(name)
+                } else {
+                    key.as_str() == *name
+                }
+        })
+    }) else {
+        return Ok(());
+    };
+    let selected = clean_path(&repo_root.join(value));
+    match (fs::canonicalize(&selected), fs::canonicalize(repo_root)) {
+        (Ok(selected), Ok(repo)) if selected == repo => Ok(()),
+        _ => Err(format!(
+            "refusing to install OpenClaw source dependencies: {key} selects the pnpm workspace {}, not the selected checkout {}; unset it or point it at that checkout",
+            display_path(&selected),
+            display_path(repo_root)
+        )),
+    }
+}
+
 pub(crate) fn ensure_source_dependency_install_target(
     repo_root: &Path,
     env: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     ensure_checkout_owned_dependencies(repo_root)?;
+    ensure_source_workspace_root(repo_root, env)?;
     let mut modules = vec![repo_root.join("node_modules")];
     if let Some(configured) = source_modules_override(repo_root, env)?
         && !modules.contains(&configured)
@@ -385,24 +426,525 @@ pub(crate) fn ensure_source_dependency_install_target(
         .into_iter()
         .flat_map(|root| [root.clone(), root.join(".pnpm")])
     {
-        match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(format!(
-                    "refusing to install OpenClaw source dependencies through {}; preserve the linked or invalid dependency tree and prepare it explicitly",
-                    display_path(&directory)
-                ));
+        ensure_physical_dependency_directory(&directory)?;
+    }
+    Ok(())
+}
+
+fn ensure_physical_dependency_directory(directory: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(format!(
+            "refusing to install OpenClaw source dependencies through {}; preserve the linked or invalid dependency tree and prepare it explicitly",
+            display_path(directory)
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed inspecting OpenClaw dependency install target {}: {error}",
+            display_path(directory)
+        )),
+    }
+}
+
+struct PnpmDestinations {
+    targets: Vec<PathBuf>,
+    // A global virtual store without an explicit directory lives under pnpm's
+    // resolved store, which `pnpm config list` does not report.
+    implicit_global_store: bool,
+}
+
+/// Whether admission also needs the output of `pnpm store path`.
+pub(crate) fn source_dependency_install_needs_store_path(
+    repo_root: &Path,
+    output: &[u8],
+) -> Result<bool, String> {
+    Ok(pnpm_destinations(repo_root, output)?.implicit_global_store)
+}
+
+pub(crate) fn ensure_source_dependency_install_config(
+    repo_root: &Path,
+    output: &[u8],
+    store_path: Option<&[u8]>,
+) -> Result<(), String> {
+    let PnpmDestinations {
+        mut targets,
+        implicit_global_store,
+    } = pnpm_destinations(repo_root, output)?;
+    if implicit_global_store {
+        let mut lines = store_path
+            .and_then(|output| std::str::from_utf8(output).ok())
+            .into_iter()
+            .flat_map(str::lines)
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
+        let (Some(store), None) = (lines.next(), lines.next()) else {
+            return Err("pnpm returned an invalid store directory".to_string());
+        };
+        // pnpm links global virtual-store packages under `<store path>/links`.
+        targets.push(clean_path(&repo_root.join(store)).join("links"));
+    }
+    // The checkout has already been admitted by its canonical identity. A walk
+    // from a destination stops at the first physical directory that is the
+    // checkout or one of its ancestors, compared canonically, so a system link
+    // above both (such as macOS's /var or /tmp) is not mistaken for a borrowed
+    // destination while every link below that point is still refused.
+    let shared: BTreeSet<PathBuf> = fs::canonicalize(repo_root)
+        .unwrap_or_else(|_| repo_root.to_path_buf())
+        .ancestors()
+        .map(Path::to_path_buf)
+        .collect();
+    let mut checked = BTreeSet::new();
+    for target in targets {
+        // Check every traversed component, including broken links and an absent
+        // target beneath an existing linked parent.
+        for directory in target.ancestors() {
+            if !checked.insert(directory.to_path_buf()) {
+                break;
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "failed inspecting OpenClaw dependency install target {}: {error}",
-                    display_path(&directory)
-                ));
+            ensure_physical_dependency_directory(directory)?;
+            if fs::canonicalize(directory).is_ok_and(|path| shared.contains(&path)) {
+                break;
             }
         }
     }
     Ok(())
+}
+
+fn pnpm_destinations(repo_root: &Path, output: &[u8]) -> Result<PnpmDestinations, String> {
+    // Ask the selected pnpm to merge its own supported configuration sources.
+    // Do not reproduce its YAML/npmrc/environment precedence in OCM, or include
+    // the returned configuration (which may contain private values) in errors.
+    let config: Value = serde_json::from_slice(output)
+        .map_err(|_| "pnpm returned invalid dependency destination configuration".to_string())?;
+    let config = config
+        .as_object()
+        .ok_or_else(|| "pnpm returned invalid dependency destination configuration".to_string())?;
+    let value = |camel: &str, kebab: &str| config.get(camel).or_else(|| config.get(kebab));
+    let setting = |camel: &str, kebab: &str| -> Result<Option<&str>, String> {
+        match value(camel, kebab) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
+            _ => Err(format!(
+                "pnpm returned an invalid {camel} dependency destination"
+            )),
+        }
+    };
+    let modules_setting = setting("modulesDir", "modules-dir")?.unwrap_or("node_modules");
+    let modules = clean_path(&repo_root.join(modules_setting));
+    let lockfile_root =
+        clean_path(&repo_root.join(setting("lockfileDir", "lockfile-dir")?.unwrap_or(".")));
+    let lockfile_modules = clean_path(&lockfile_root.join(modules_setting));
+    let store_type = match setting("virtualStoreType", "virtual-store-type")? {
+        Some("global") => Some(true),
+        Some("project") => Some(false),
+        None => None,
+        _ => return Err("pnpm returned an invalid virtualStoreType setting".to_string()),
+    };
+    let global_enabled = match value("enableGlobalVirtualStore", "enable-global-virtual-store") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(enabled)) => Some(*enabled),
+        _ => return Err("pnpm returned an invalid enableGlobalVirtualStore setting".to_string()),
+    };
+    // pnpm reconciles these two settings per configuration source, and its
+    // readback reports the result; should the merged values still disagree,
+    // check the destinations of both layouts rather than pick one.
+    let (global, project) = match (store_type, global_enabled) {
+        (Some(store_type), Some(enabled)) if store_type != enabled => (true, true),
+        (Some(global), _) | (None, Some(global)) => (global, !global),
+        (None, None) => (false, true),
+    };
+    // pnpm keeps per-project modules as well as lockfile-root installation
+    // metadata, part of it always under the literal `node_modules` (for example
+    // `.pnpm-workspace-state-v1.json`). Global stores retain that metadata in
+    // the lockfile-root modules' .pnpm.
+    let mut targets = vec![
+        modules,
+        lockfile_modules.clone(),
+        lockfile_root.join("node_modules"),
+    ];
+    // A frozen install links every project its shared lockfile lists into that
+    // project's own modules directory, and writes through a linked project
+    // directory. Per-project lockfiles (and the per-project settings pnpm applies
+    // only to them) are not inspected, so admission does not guess their layout.
+    let shared_lockfile = setting("lockfileDir", "lockfile-dir")?.is_some()
+        || match value("sharedWorkspaceLockfile", "shared-workspace-lockfile") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(shared)) => *shared,
+            _ => {
+                return Err("pnpm returned an invalid sharedWorkspaceLockfile setting".to_string());
+            }
+        };
+    if !shared_lockfile {
+        return Err("refusing to install OpenClaw source dependencies with per-project pnpm lockfiles (sharedWorkspaceLockfile: false); prepare them explicitly".to_string());
+    }
+    let mut projects = BTreeSet::new();
+    // pnpm reduces an absolute modulesDir, or one that climbs with `..`, to its
+    // last component for workspace projects; check both forms then.
+    let modules_path = Path::new(modules_setting);
+    let modules_name = (modules_path.is_absolute()
+        || modules_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir)))
+    .then(|| modules_path.file_name())
+    .flatten();
+    let flag = |camel: &str, kebab: &str| match value(camel, kebab) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        _ => Err(format!("pnpm returned an invalid {camel} setting")),
+    };
+    let merge_setting = match value("mergeGitBranchLockfiles", "merge-git-branch-lockfiles") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(merge)) => Some(*merge),
+        _ => return Err("pnpm returned an invalid mergeGitBranchLockfiles setting".to_string()),
+    };
+    let merge_pattern = match value(
+        "mergeGitBranchLockfilesBranchPattern",
+        "merge-git-branch-lockfiles-branch-pattern",
+    ) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(pattern)) => vec![pattern.clone()],
+        Some(Value::Array(patterns)) => patterns
+            .iter()
+            .map(|pattern| pattern.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                "pnpm returned an invalid mergeGitBranchLockfilesBranchPattern setting".to_string()
+            })?,
+        _ => {
+            return Err(
+                "pnpm returned an invalid mergeGitBranchLockfilesBranchPattern setting".to_string(),
+            );
+        }
+    };
+    let selection = lockfile_selection(
+        repo_root,
+        flag("gitBranchLockfile", "git-branch-lockfile")?,
+        merge_setting,
+        &merge_pattern,
+    );
+    for project in lockfile_projects(&lockfile_root, &selection)? {
+        let project = clean_path(&lockfile_root.join(project));
+        projects.insert(clean_path(&project.join(modules_setting)));
+        if let Some(name) = modules_name {
+            projects.insert(project.join(name));
+        }
+        projects.insert(project);
+    }
+    targets.extend(projects);
+    let mut implicit_global_store = false;
+    if global {
+        targets.push(lockfile_modules.join(".pnpm"));
+        match setting("globalVirtualStoreDir", "global-virtual-store-dir")?
+            .or(setting("virtualStoreDir", "virtual-store-dir")?)
+        {
+            Some(directory) => targets.push(clean_path(&repo_root.join(directory))),
+            None => implicit_global_store = true,
+        }
+    }
+    if project {
+        targets.push(match setting("virtualStoreDir", "virtual-store-dir")? {
+            Some(value) => clean_path(&lockfile_root.join(value)),
+            None => lockfile_modules.join(".pnpm"),
+        });
+    }
+    Ok(PnpmDestinations {
+        targets,
+        implicit_global_store,
+    })
+}
+
+/// Which lockfiles a frozen install reads, following pnpm 12.15's selection.
+enum LockfileSelection {
+    /// The first of these branch lockfiles pnpm can load, else `pnpm-lock.yaml`.
+    Branch(Vec<String>),
+    /// `pnpm-lock.yaml` and every branch lockfile, merged.
+    Merge,
+}
+
+fn lockfile_selection(
+    repo_root: &Path,
+    branch_lockfile: bool,
+    merge_setting: Option<bool>,
+    merge_pattern: &[String],
+) -> LockfileSelection {
+    // An explicit mergeGitBranchLockfiles settles merging; otherwise a pattern
+    // decides it for the current branch. pnpm reads the branch from the working
+    // directory of the install, which is the checkout.
+    let pattern_decides = merge_setting.is_none() && !merge_pattern.is_empty();
+    let mut merge = merge_setting.unwrap_or(false);
+    let mut candidates = Vec::new();
+    if branch_lockfile || pattern_decides {
+        match current_git_branch(repo_root) {
+            Some(branch) => {
+                if pattern_decides {
+                    merge = pnpm_pattern_matches(merge_pattern, &branch);
+                }
+                if branch_lockfile {
+                    candidates.push(git_branch_lockfile_name(&branch));
+                }
+            }
+            None if branch_lockfile && !merge => {
+                // A detached HEAD reads the files of the branches containing it.
+                candidates.extend(
+                    git_branches_containing_head(repo_root)
+                        .iter()
+                        .map(|branch| git_branch_lockfile_name(branch))
+                        .filter(|name| name.len() <= 255),
+                );
+            }
+            None => {}
+        }
+    }
+    if merge {
+        LockfileSelection::Merge
+    } else {
+        LockfileSelection::Branch(candidates)
+    }
+}
+
+fn current_git_branch(repo_root: &Path) -> Option<String> {
+    let output = git_command()
+        .arg("-C")
+        .arg(repo_root)
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .output()
+        .ok()?;
+    // The full ref: `--short` disambiguates a branch that shares a tag's name
+    // as `heads/<branch>`, while pnpm names the branch itself.
+    let reference = String::from_utf8(output.stdout).ok()?;
+    let branch = reference.trim().strip_prefix("refs/heads/")?;
+    (output.status.success() && !branch.is_empty()).then(|| branch.to_string())
+}
+
+/// The branches containing HEAD, as pnpm lists them: local and remote-tracking
+/// branches (the latter under their name without the remote), symbolic refs
+/// skipped, sorted and deduplicated.
+fn git_branches_containing_head(repo_root: &Path) -> Vec<String> {
+    let Some(text) = git_command()
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "for-each-ref",
+            "refs/heads",
+            "refs/remotes",
+            "--contains",
+            "HEAD",
+            "--format=%(refname) %(symref)",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+    else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (name, symref) = line.split_once(' ')?;
+            if !symref.trim().is_empty() {
+                return None;
+            }
+            name.strip_prefix("refs/heads/").or_else(|| {
+                name.strip_prefix("refs/remotes/")?
+                    .split_once('/')
+                    .map(|(_, branch)| branch)
+            })
+        })
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// pnpm's `pnpm-lock.<branch>.yaml` name: ASCII letters, digits, `_`, `.` and
+/// `-` kept in lower case, and one `!` per UTF-16 unit of anything else.
+fn git_branch_lockfile_name(branch: &str) -> String {
+    let mut name = String::from("pnpm-lock.");
+    for character in branch.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-') {
+            name.push(character.to_ascii_lowercase());
+        } else {
+            name.extend(std::iter::repeat_n('!', character.len_utf16()));
+        }
+    }
+    name.push_str(".yaml");
+    name
+}
+
+fn is_git_branch_lockfile_name(name: &str) -> bool {
+    name.strip_prefix("pnpm-lock.")
+        .and_then(|rest| rest.strip_suffix(".yaml"))
+        .is_some_and(|branch| !branch.is_empty())
+}
+
+/// pnpm's branch-pattern matcher: `*` and `?` wildcards, `!` negation; one
+/// pattern, all includes, all negations, or the last matching verdict.
+fn pnpm_pattern_matches(patterns: &[String], input: &str) -> bool {
+    // Anchored `*`/`?` matching with one backtrack point per `*`: O(pattern x
+    // input), so a pattern that cannot match fails quickly.
+    fn wildcard(pattern: &[char], input: &[char]) -> bool {
+        let (mut p, mut i) = (0, 0);
+        let mut star: Option<(usize, usize)> = None;
+        while i < input.len() {
+            match pattern.get(p) {
+                Some('*') => {
+                    star = Some((p, i));
+                    p += 1;
+                }
+                Some('?') => {
+                    p += 1;
+                    i += 1;
+                }
+                Some(expected) if *expected == input[i] => {
+                    p += 1;
+                    i += 1;
+                }
+                _ => match star {
+                    Some((star_p, star_i)) => {
+                        p = star_p + 1;
+                        i = star_i + 1;
+                        star = Some((star_p, star_i + 1));
+                    }
+                    None => return false,
+                },
+            }
+        }
+        pattern[p..].iter().all(|character| *character == '*')
+    }
+    let input: Vec<char> = input.chars().collect();
+    let compiled: Vec<(bool, Vec<char>)> = patterns
+        .iter()
+        .map(|pattern| match pattern.strip_prefix('!') {
+            Some(rest) => (true, rest.chars().collect()),
+            None => (false, pattern.chars().collect()),
+        })
+        .collect();
+    let matches = |glob: &Vec<char>| wildcard(glob, &input);
+    match compiled.as_slice() {
+        [] => false,
+        [(ignore, glob)] => matches(glob) != *ignore,
+        _ if compiled.iter().all(|(ignore, _)| !ignore) => {
+            compiled.iter().any(|(_, glob)| matches(glob))
+        }
+        _ if compiled.iter().all(|(ignore, _)| *ignore) => {
+            !compiled.iter().any(|(_, glob)| matches(glob))
+        }
+        _ => {
+            let mut included = false;
+            for (ignore, glob) in &compiled {
+                if matches(glob) {
+                    included = !ignore;
+                }
+            }
+            included
+        }
+    }
+}
+
+/// The projects a frozen install links: the `importers` of the lockfile pnpm
+/// loads, read as pnpm 12.15 reads it. The read order is the selection's
+/// candidates, then `pnpm-lock.yaml`; the first file whose main document is not
+/// empty is used (a missing, empty or environment-only file is skipped). When
+/// merging, every effective branch lockfile is folded in as well.
+fn lockfile_projects(
+    lockfile_root: &Path,
+    selection: &LockfileSelection,
+) -> Result<Vec<String>, String> {
+    let mut projects = Vec::new();
+    let read_order: Vec<String> = match selection {
+        LockfileSelection::Branch(candidates) => candidates
+            .iter()
+            .cloned()
+            .chain(["pnpm-lock.yaml".to_string()])
+            .collect(),
+        LockfileSelection::Merge => vec!["pnpm-lock.yaml".to_string()],
+    };
+    let mut loaded = false;
+    for name in read_order {
+        if lockfile_importers(&lockfile_root.join(name), &mut projects)? {
+            loaded = true;
+            break;
+        }
+    }
+    if loaded && matches!(selection, LockfileSelection::Merge) {
+        let entries = match fs::read_dir(lockfile_root) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return Err(format!(
+                    "failed inspecting pnpm lockfiles in {}: {error}",
+                    display_path(lockfile_root)
+                ));
+            }
+        };
+        let mut branch_files = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "failed inspecting pnpm lockfiles in {}: {error}",
+                    display_path(lockfile_root)
+                )
+            })?;
+            if let Some(name) = entry.file_name().to_str()
+                && is_git_branch_lockfile_name(name)
+            {
+                branch_files.push(entry.path());
+            }
+        }
+        branch_files.sort();
+        for path in branch_files {
+            lockfile_importers(&path, &mut projects)?;
+        }
+    }
+    Ok(projects)
+}
+
+/// Adds the importers of the lockfile at `path` and reports whether pnpm would
+/// load it: false for a missing file or an empty main document.
+fn lockfile_importers(path: &Path, projects: &mut Vec<String>) -> Result<bool, String> {
+    let unreadable = || {
+        format!(
+            "could not read the projects in {}; prepare the dependencies explicitly",
+            display_path(path)
+        )
+    };
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(unreadable()),
+    };
+    // pnpm strips a byte-order mark, normalizes CRLF and reads only the main
+    // document, the one after a leading environment document.
+    let text = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&text)
+        .replace("\r\n", "\n");
+    let main = match text.strip_prefix("---\n") {
+        Some(rest) => rest
+            .find("\n---\n")
+            .map_or("", |index| &rest[index + "\n---\n".len()..]),
+        None => text.as_str(),
+    };
+    if main.trim().is_empty() {
+        return Ok(false);
+    }
+    for document in serde_yaml::Deserializer::from_str(main) {
+        let document = <serde_yaml::Value as serde::Deserialize>::deserialize(document)
+            .map_err(|_| unreadable())?;
+        let Some(importers) = document
+            .get("importers")
+            .and_then(|value| value.as_mapping())
+        else {
+            continue;
+        };
+        for project in importers.keys() {
+            match project {
+                serde_yaml::Value::String(project) => projects.push(project.clone()),
+                serde_yaml::Value::Number(project) => projects.push(project.to_string()),
+                _ => return Err(unreadable()),
+            }
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn default_worktree_root(repo_root: &Path, env_name: &str) -> PathBuf {
@@ -1363,6 +1905,412 @@ mod tests {
         ensure_openclaw_worktree, parse_legacy_registered_worktree_paths,
         prepare_openclaw_simulation_worktree_cleanup, remove_openclaw_worktree,
     };
+
+    #[test]
+    fn dependency_install_target_admits_only_the_checkout_workspace() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        let other = root.path().join("other");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(&other).unwrap();
+        let env = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let repo_value = repo.to_string_lossy().into_owned();
+        let other_value = other.to_string_lossy().into_owned();
+        for admitted in [
+            env(&[]),
+            env(&[("PNPM_CONFIG_WORKSPACE_DIR", ".")]),
+            env(&[("npm_config_workspace_dir", &repo_value)]),
+            // An empty value is unset for pnpm, so the next spelling decides.
+            env(&[
+                ("PNPM_CONFIG_WORKSPACE_DIR", ""),
+                ("NPM_CONFIG_WORKSPACE_DIR", "../repo"),
+            ]),
+            // The first non-empty spelling wins, as in pnpm.
+            env(&[
+                ("PNPM_CONFIG_WORKSPACE_DIR", &repo_value),
+                ("npm_config_workspace_dir", &other_value),
+            ]),
+        ] {
+            super::ensure_source_dependency_install_target(&repo, &admitted).unwrap();
+        }
+        for refused in [
+            env(&[("PNPM_CONFIG_WORKSPACE_DIR", &other_value)]),
+            env(&[("NPM_CONFIG_WORKSPACE_DIR", "../other")]),
+            env(&[("npm_config_workspace_dir", "missing")]),
+            env(&[
+                ("PNPM_CONFIG_WORKSPACE_DIR", ""),
+                ("npm_config_workspace_dir", &other_value),
+            ]),
+        ] {
+            let error =
+                super::ensure_source_dependency_install_target(&repo, &refused).unwrap_err();
+            assert!(error.contains("refusing to install"), "{error}");
+            assert!(error.contains("WORKSPACE_DIR") || error.contains("workspace_dir"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_install_config_checks_native_path_layouts() {
+        let root = TempDir::new().unwrap();
+        let repo = fs::canonicalize(root.path()).unwrap();
+        fs::create_dir(repo.join("modules")).unwrap();
+        fs::create_dir(repo.join("lockfiles")).unwrap();
+        fs::create_dir(repo.join("physical-store")).unwrap();
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"modulesDir": "modules"}),
+            serde_json::json!({"virtualStoreDir": "physical-store"}),
+            serde_json::json!({"virtual-store-dir": repo.join("physical-store")}),
+        ] {
+            super::ensure_source_dependency_install_config(
+                &repo,
+                &serde_json::to_vec(&config).unwrap(),
+                None,
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(repo.join("physical-store"), repo.join("modules/.pnpm"))
+            .unwrap();
+        std::os::unix::fs::symlink(repo.join("absent"), repo.join("lockfiles/store")).unwrap();
+        std::os::unix::fs::symlink(repo.join("physical-store"), repo.join("linked-modules"))
+            .unwrap();
+        std::os::unix::fs::symlink(repo.join("physical-store"), repo.join("lockfiles/modules"))
+            .unwrap();
+        // An unused global-store setting must not reject an ordinary project install.
+        super::ensure_source_dependency_install_config(
+            &repo,
+            &serde_json::to_vec(&serde_json::json!({
+                "virtualStoreType": "project", "globalVirtualStoreDir": "linked-modules",
+            }))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        super::ensure_source_dependency_install_config(&repo, &serde_json::to_vec(&serde_json::json!({
+            "virtualStoreType": "global", "globalVirtualStoreDir": "physical-store", "virtualStoreDir": "linked-modules",
+        })).unwrap(), None).unwrap();
+        for config in [
+            serde_json::json!({"modulesDir": "modules"}),
+            serde_json::json!({"modules-dir": "modules"}),
+            serde_json::json!({"modulesDir": "linked-modules", "virtualStoreDir": "physical-store"}),
+            serde_json::json!({"lockfileDir": "lockfiles", "virtualStoreDir": "store"}),
+            serde_json::json!({"virtual-store-dir": repo.join("lockfiles/store")}),
+            serde_json::json!({"lockfileDir": "lockfiles", "modulesDir": "modules", "virtualStoreDir": "physical-store"}),
+            serde_json::json!({"virtualStoreType": "global", "globalVirtualStoreDir": "linked-modules"}),
+            serde_json::json!({"enable-global-virtual-store": true, "global-virtual-store-dir": "linked-modules"}),
+            serde_json::json!({"lockfileDir": "lockfiles", "virtualStoreType": "global", "virtualStoreDir": "linked-modules"}),
+            // Disagreeing layout settings check both layouts.
+            serde_json::json!({"virtualStoreType": "project", "enableGlobalVirtualStore": true, "globalVirtualStoreDir": "linked-modules"}),
+        ] {
+            let error = super::ensure_source_dependency_install_config(
+                &repo,
+                &serde_json::to_vec(&config).unwrap(),
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains("refusing to install"), "{error}");
+        }
+        for config in [
+            serde_json::json!([]),
+            serde_json::json!({"virtualStoreDir": false}),
+        ] {
+            assert!(
+                super::ensure_source_dependency_install_config(
+                    &repo,
+                    &serde_json::to_vec(&config).unwrap(),
+                    None,
+                )
+                .is_err()
+            );
+        }
+
+        // A global virtual store without an explicit directory lives under the
+        // store pnpm resolves, which only `pnpm store path` reports.
+        let implicit = serde_json::to_vec(&serde_json::json!({
+            "enableGlobalVirtualStore": true, "virtualStoreType": "global",
+        }))
+        .unwrap();
+        assert!(super::source_dependency_install_needs_store_path(&repo, &implicit).unwrap());
+        for explicit in [
+            serde_json::json!({}),
+            serde_json::json!({"virtualStoreType": "global", "globalVirtualStoreDir": "physical-store"}),
+        ] {
+            assert!(
+                !super::source_dependency_install_needs_store_path(
+                    &repo,
+                    &serde_json::to_vec(&explicit).unwrap()
+                )
+                .unwrap()
+            );
+        }
+        fs::create_dir_all(repo.join("store/v11/links")).unwrap();
+        fs::create_dir_all(repo.join("linked-store/v11")).unwrap();
+        std::os::unix::fs::symlink(
+            repo.join("physical-store"),
+            repo.join("linked-store/v11/links"),
+        )
+        .unwrap();
+        let physical = format!("{}\n", repo.join("store/v11").display());
+        super::ensure_source_dependency_install_config(&repo, &implicit, Some(physical.as_bytes()))
+            .unwrap();
+        // An absent links directory below a physical store is installed by pnpm itself.
+        super::ensure_source_dependency_install_config(&repo, &implicit, Some(b"absent-store/v11"))
+            .unwrap();
+        let linked = format!("{}\n", repo.join("linked-store/v11").display());
+        let error = super::ensure_source_dependency_install_config(
+            &repo,
+            &implicit,
+            Some(linked.as_bytes()),
+        )
+        .unwrap_err();
+        assert!(error.contains("refusing to install"), "{error}");
+        for invalid in [
+            None,
+            Some(&b""[..]),
+            Some(&b"one\ntwo\n"[..]),
+            Some(&[0xff][..]),
+        ] {
+            let error = super::ensure_source_dependency_install_config(&repo, &implicit, invalid)
+                .unwrap_err();
+            assert!(error.contains("invalid store directory"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_install_config_ignores_links_above_the_checkout() {
+        // Like macOS's /var -> /private/var: pnpm may report a destination through
+        // a system link above the checkout, whose recorded path is canonical.
+        let root = TempDir::new().unwrap();
+        let real = fs::canonicalize(root.path()).unwrap().join("real");
+        let alias = real.parent().unwrap().join("alias");
+        fs::create_dir_all(real.join("shared/repo")).unwrap();
+        fs::create_dir_all(real.join("shared/store/v11")).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let repo = real.join("shared/repo");
+        let implicit =
+            serde_json::to_vec(&serde_json::json!({"virtualStoreType": "global"})).unwrap();
+        let store = format!("{}\n", alias.join("shared/store/v11").display());
+        super::ensure_source_dependency_install_config(&repo, &implicit, Some(store.as_bytes()))
+            .unwrap();
+        // A link below the shared directory is still refused.
+        std::os::unix::fs::symlink(
+            real.join("shared/repo"),
+            real.join("shared/store/v11/links"),
+        )
+        .unwrap();
+        let error = super::ensure_source_dependency_install_config(
+            &repo,
+            &implicit,
+            Some(store.as_bytes()),
+        )
+        .unwrap_err();
+        assert!(error.contains("refusing to install"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_install_config_checks_lockfile_projects() {
+        let root = TempDir::new().unwrap();
+        let repo = fs::canonicalize(root.path()).unwrap().join("repo");
+        let borrowed = repo.parent().unwrap().join("borrowed");
+        fs::create_dir_all(repo.join("ui")).unwrap();
+        fs::create_dir_all(repo.join("lockfiles")).unwrap();
+        fs::create_dir(&borrowed).unwrap();
+        // pnpm writes an environment document before the main lockfile document.
+        fs::write(
+            repo.join("pnpm-lock.yaml"),
+            "---\nlockfileVersion: '9.0'\nimporters:\n  .:\n    configDependencies: {}\n---\nlockfileVersion: '9.0'\nimporters:\n  .: {}\n  ui: {}\n  extensions/a: {}\n",
+        )
+        .unwrap();
+        let check = |config: serde_json::Value| {
+            super::ensure_source_dependency_install_config(
+                &repo,
+                &serde_json::to_vec(&config).unwrap(),
+                None,
+            )
+        };
+        check(serde_json::json!({})).unwrap();
+        // Lockfiles other than pnpm's, and placeholder content, list no projects.
+        fs::write(repo.join("pnpm-lock.yaml.bak"), "not: [valid").unwrap();
+        fs::write(repo.join("lockfiles/pnpm-lock.yaml"), "frozen fixture\n").unwrap();
+        check(serde_json::json!({"lockfileDir": "lockfiles"})).unwrap();
+
+        std::os::unix::fs::symlink(&borrowed, repo.join("ui/node_modules")).unwrap();
+        let error = check(serde_json::json!({})).unwrap_err();
+        assert!(error.contains("ui/node_modules"), "{error}");
+        fs::remove_file(repo.join("ui/node_modules")).unwrap();
+        // A custom modules directory applies to every project.
+        std::os::unix::fs::symlink(&borrowed, repo.join("ui/modules")).unwrap();
+        check(serde_json::json!({})).unwrap();
+        assert!(check(serde_json::json!({"modulesDir": "modules"})).is_err());
+        // A relative multi-component modulesDir is kept whole for every project;
+        // one that climbs with `..` is reduced to its last component.
+        check(serde_json::json!({"modulesDir": "nested/modules"})).unwrap();
+        assert!(check(serde_json::json!({"modulesDir": "../outside/modules"})).is_err());
+        fs::remove_file(repo.join("ui/modules")).unwrap();
+        // pnpm writes through a linked project directory.
+        fs::create_dir(repo.join("extensions")).unwrap();
+        std::os::unix::fs::symlink(&borrowed, repo.join("extensions/a")).unwrap();
+        let error = check(serde_json::json!({})).unwrap_err();
+        assert!(error.contains("extensions/a"), "{error}");
+        fs::remove_file(repo.join("extensions/a")).unwrap();
+
+        // Installation state stays under the literal node_modules at the lockfile root.
+        std::os::unix::fs::symlink(&borrowed, repo.join("lockfiles/node_modules")).unwrap();
+        let error = check(serde_json::json!({"lockfileDir": "lockfiles", "modulesDir": "modules"}))
+            .unwrap_err();
+        assert!(error.contains("lockfiles/node_modules"), "{error}");
+        fs::remove_file(repo.join("lockfiles/node_modules")).unwrap();
+
+        // Per-project lockfiles are refused; an explicit lockfileDir shares one lockfile.
+        let error = check(serde_json::json!({"sharedWorkspaceLockfile": false})).unwrap_err();
+        assert!(error.contains("sharedWorkspaceLockfile"), "{error}");
+        check(serde_json::json!({"sharedWorkspaceLockfile": false, "lockfileDir": "."})).unwrap();
+        assert!(check(serde_json::json!({"sharedWorkspaceLockfile": "no"})).is_err());
+
+        // pnpm reads per-branch lockfiles only as it selects them: the current
+        // branch's file (else the shared one), or every branch file when merging.
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("pnpm-lock.old.yaml"), "importers: [unclosed\n").unwrap();
+        check(serde_json::json!({})).unwrap();
+        check(serde_json::json!({"gitBranchLockfile": true})).unwrap();
+        // An empty or environment-only branch lockfile falls back to the shared one.
+        std::os::unix::fs::symlink(&borrowed, repo.join("ui/node_modules")).unwrap();
+        for empty in [
+            "",
+            "---\nlockfileVersion: '9.0'\nimporters:\n  .:\n    configDependencies: {}\n",
+        ] {
+            fs::write(repo.join("pnpm-lock.main.yaml"), empty).unwrap();
+            let error = check(serde_json::json!({"gitBranchLockfile": true})).unwrap_err();
+            assert!(error.contains("ui/node_modules"), "{error}");
+        }
+        fs::remove_file(repo.join("ui/node_modules")).unwrap();
+        fs::remove_file(repo.join("pnpm-lock.main.yaml")).unwrap();
+        fs::write(
+            repo.join("pnpm-lock.main.yaml"),
+            "importers:\n  extensions/b: {}\n",
+        )
+        .unwrap();
+        fs::create_dir(repo.join("extensions/b")).unwrap();
+        std::os::unix::fs::symlink(&borrowed, repo.join("extensions/b/node_modules")).unwrap();
+        check(serde_json::json!({})).unwrap();
+        assert!(check(serde_json::json!({"gitBranchLockfile": true})).is_err());
+        let error = check(serde_json::json!({"mergeGitBranchLockfiles": true})).unwrap_err();
+        assert!(error.contains("pnpm-lock.old.yaml"), "{error}");
+        assert!(
+            check(serde_json::json!({"mergeGitBranchLockfilesBranchPattern": ["ma?n"]})).is_err()
+        );
+        check(serde_json::json!({"mergeGitBranchLockfilesBranchPattern": ["release/*"]})).unwrap();
+        check(serde_json::json!({
+            "mergeGitBranchLockfiles": false, "mergeGitBranchLockfilesBranchPattern": ["*"],
+        }))
+        .unwrap();
+        fs::write(repo.join("pnpm-lock.main.yaml"), "importers: [unclosed\n").unwrap();
+        let error = check(serde_json::json!({"gitBranchLockfile": true})).unwrap_err();
+        assert!(error.contains("pnpm-lock.main.yaml"), "{error}");
+        // A detached HEAD reads the files of the branches containing it, remote
+        // tracking branches included under their branch name.
+        fs::write(
+            repo.join("pnpm-lock.release.yaml"),
+            "importers:\n  extensions/b: {}\n",
+        )
+        .unwrap();
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        );
+        // A tag sharing the branch's name does not change the branch pnpm reads.
+        run_git(&repo, &["tag", "main"]);
+        assert_eq!(super::current_git_branch(&repo).as_deref(), Some("main"));
+        let error = check(serde_json::json!({"gitBranchLockfile": true})).unwrap_err();
+        assert!(error.contains("pnpm-lock.main.yaml"), "{error}");
+        run_git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/release", "HEAD"],
+        );
+        run_git(&repo, &["checkout", "-q", "--detach"]);
+        run_git(&repo, &["branch", "-q", "-D", "main"]);
+        assert_eq!(
+            super::git_branches_containing_head(&repo),
+            vec!["release".to_string()]
+        );
+        let error = check(serde_json::json!({"gitBranchLockfile": true})).unwrap_err();
+        assert!(error.contains("extensions/b"), "{error}");
+        fs::write(repo.join("pnpm-lock.yaml"), "importers: [unclosed\n").unwrap();
+        let error = check(serde_json::json!({})).unwrap_err();
+        assert!(error.contains("could not read the projects"), "{error}");
+    }
+
+    #[test]
+    fn pnpm_branch_lockfile_selection_matches_pnpm() {
+        assert_eq!(
+            super::git_branch_lockfile_name("main"),
+            "pnpm-lock.main.yaml"
+        );
+        assert_eq!(
+            super::git_branch_lockfile_name("Feature/Äb_1.x-y"),
+            "pnpm-lock.feature!!b_1.x-y.yaml"
+        );
+        assert!(super::is_git_branch_lockfile_name("pnpm-lock.main.yaml"));
+        assert!(!super::is_git_branch_lockfile_name("pnpm-lock.yaml"));
+        assert!(!super::is_git_branch_lockfile_name("pnpm-lock..yaml"));
+        let patterns = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert!(super::pnpm_pattern_matches(&patterns(&["main"]), "main"));
+        assert!(super::pnpm_pattern_matches(
+            &patterns(&["release/*"]),
+            "release/1.0"
+        ));
+        assert!(super::pnpm_pattern_matches(&patterns(&["fe?t"]), "feat"));
+        assert!(!super::pnpm_pattern_matches(&patterns(&["!main"]), "main"));
+        assert!(super::pnpm_pattern_matches(&patterns(&["!main"]), "dev"));
+        assert!(!super::pnpm_pattern_matches(&patterns(&["!a", "!b"]), "b"));
+        assert!(super::pnpm_pattern_matches(
+            &patterns(&["*", "!wip/*"]),
+            "main"
+        ));
+        assert!(!super::pnpm_pattern_matches(
+            &patterns(&["*", "!wip/*"]),
+            "wip/x"
+        ));
+        assert!(super::pnpm_pattern_matches(
+            &patterns(&["*", "!wip/*", "wip/keep"]),
+            "wip/keep"
+        ));
+        assert!(!super::pnpm_pattern_matches(&[], "main"));
+        assert!(super::pnpm_pattern_matches(
+            &patterns(&["a*b*c"]),
+            "aXbYbZc"
+        ));
+        assert!(!super::pnpm_pattern_matches(&patterns(&["a*b"]), "a"));
+        assert!(super::pnpm_pattern_matches(&patterns(&["*"]), ""));
+        assert!(super::pnpm_pattern_matches(&patterns(&["**?"]), "x"));
+        // A pattern that cannot match fails without combinatorial backtracking.
+        let started = std::time::Instant::now();
+        assert!(!super::pnpm_pattern_matches(
+            &patterns(&["*a*a*a*a*a*a*a*a*a*a*a*ab"]),
+            &"a".repeat(4000)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
         let output = Command::new("git")
