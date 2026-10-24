@@ -1737,7 +1737,7 @@ impl ImportStaging {
             // SAFETY: geteuid has no preconditions.
             if metadata.uid() != unsafe { libc::geteuid() } {
                 return Err(format!(
-                    "import staging directory is not owned by the current user: {}",
+                    "import staging directory is not owned by the current user: {}; run the import as the user that owns this OCM home, or set OCM_HOME to a directory you own",
                     display_path(&parent)
                 ));
             }
