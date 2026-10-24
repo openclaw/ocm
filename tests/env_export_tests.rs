@@ -134,6 +134,84 @@ fn env_export_excludes_its_output_inside_the_source() {
     }
 }
 
+#[test]
+fn export_excludes_its_output_inside_preserved_skill_namespaces() {
+    // Saved skill namespaces are preserved byte for byte by state-inclusive
+    // export, but the archive's own staging file is never part of it.
+    let mut locations = vec![
+        ("skill-workshop", ".openclaw/skill-workshop"),
+        ("skill-library", ".openclaw/skill-library/demo-skill"),
+    ];
+    #[cfg(unix)]
+    locations.push(("alias-target", ".openclaw/library-store"));
+    for (label, relative_cwd) in locations {
+        for include_state in [true, false] {
+            let root = TestDir::new("export-output-skill-namespace");
+            let env = ocm_env(&root);
+            let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let source = root.child("ocm-home/envs/source");
+            let library = if label == "alias-target" {
+                ".openclaw/library-store"
+            } else {
+                ".openclaw/skill-library"
+            };
+            let revision = format!("{library}/demo-skill/revisions/{}/SKILL.md", "a".repeat(64));
+            write_text(&source.join(&revision), "saved revision");
+            write_text(
+                &source.join(".openclaw/skill-workshop/proposals/demo/PROPOSAL.md"),
+                "proposal",
+            );
+            #[cfg(unix)]
+            if label == "alias-target" {
+                std::os::unix::fs::symlink("library-store", source.join(".openclaw/skill-library"))
+                    .unwrap();
+            }
+            let cwd = source.join(relative_cwd);
+            let mut args = vec!["env", "export", "source"];
+            if include_state {
+                args.push("--include-state");
+            }
+
+            let exported = run_ocm(&cwd, &env, &args);
+            assert!(exported.status.success(), "{}", stderr(&exported));
+            let output = cwd.join("source.ocm-env.tar");
+            let members = tar::Archive::new(fs::File::open(&output).unwrap())
+                .entries()
+                .unwrap()
+                .map(|entry| {
+                    entry
+                        .unwrap()
+                        .path()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>();
+            let own = members
+                .iter()
+                .filter(|member| {
+                    let name = member.rsplit('/').next().unwrap_or_default();
+                    name.starts_with(".ocm-export-") || name == "source.ocm-env.tar"
+                })
+                .collect::<Vec<_>>();
+            assert!(own.is_empty(), "{label}, state={include_state}: {own:?}");
+            if include_state {
+                assert!(
+                    members.contains(&format!("root/{revision}")),
+                    "{label}: saved revision missing from {members:?}"
+                );
+            }
+            let left = fs::read_dir(&cwd)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".ocm-export-"))
+                .collect::<Vec<_>>();
+            assert!(left.is_empty(), "{label}: staging left behind: {left:?}");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn default_export_selects_equivalent_workspace_root_spellings() {
