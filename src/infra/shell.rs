@@ -171,13 +171,7 @@ pub fn build_openclaw_dev_source_env(
 fn sanitized_openclaw_base_env(base_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     base_env
         .iter()
-        .filter(|(key, _)| {
-            (!key.starts_with("OPENCLAW_")
-                || is_openclaw_diagnostics_passthrough_key(key)
-                || is_include_roots_key(key))
-                && key.as_str() != "OCM_ACTIVE_ENV"
-                && key.as_str() != "OCM_ACTIVE_ENV_ROOT"
-        })
+        .filter(|(key, _)| !is_env_scoped_key(key))
         .map(|(key, value)| {
             (
                 if is_include_roots_key(key) {
@@ -199,16 +193,67 @@ fn is_include_roots_key(key: &str) -> bool {
     }
 }
 
+const OPENCLAW_DIAGNOSTICS_PASSTHROUGH_KEYS: [&str; 6] = [
+    "OPENCLAW_DIAGNOSTICS",
+    "OPENCLAW_DIAGNOSTICS_RUN_ID",
+    "OPENCLAW_DIAGNOSTICS_ENV",
+    "OPENCLAW_DIAGNOSTICS_TIMELINE_PATH",
+    "OPENCLAW_DIAGNOSTICS_EVENT_LOOP",
+    "OPENCLAW_GATEWAY_STARTUP_TRACE",
+];
+
 fn is_openclaw_diagnostics_passthrough_key(key: &str) -> bool {
-    matches!(
-        key,
-        "OPENCLAW_DIAGNOSTICS"
-            | "OPENCLAW_DIAGNOSTICS_RUN_ID"
-            | "OPENCLAW_DIAGNOSTICS_ENV"
-            | "OPENCLAW_DIAGNOSTICS_TIMELINE_PATH"
-            | "OPENCLAW_DIAGNOSTICS_EVENT_LOOP"
-            | "OPENCLAW_GATEWAY_STARTUP_TRACE"
-    )
+    OPENCLAW_DIAGNOSTICS_PASSTHROUGH_KEYS.contains(&key)
+}
+
+/// Keys whose child value comes only from the environment OCM builds for an
+/// env; values inherited from the caller are dropped.
+fn is_env_scoped_key(key: &str) -> bool {
+    (key.starts_with("OPENCLAW_")
+        && !is_openclaw_diagnostics_passthrough_key(key)
+        && !is_include_roots_key(key))
+        || matches!(key, "OCM_ACTIVE_ENV" | "OCM_ACTIVE_ENV_ROOT")
+}
+
+/// Wraps a launcher command for `sh -lc`. A login shell reads the user's
+/// profile after OCM built the child environment, so the script first drops
+/// every env-scoped name the profile exported and then restores the values
+/// from `env`. PATH and other profile settings are left as the profile set them.
+pub fn render_env_scoped_login_command(command: &str, env: &BTreeMap<String, String>) -> String {
+    const IDENTIFIER_CHARS: &str =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
+    let passthrough = OPENCLAW_DIAGNOSTICS_PASSTHROUGH_KEYS
+        .iter()
+        .copied()
+        .chain(["OPENCLAW_INCLUDE_ROOTS"])
+        .collect::<Vec<_>>()
+        .join("|");
+    // `export -p` is a builtin in every POSIX sh; bash prints `declare -x`
+    // outside POSIX mode. Only validated identifiers reach `unset`.
+    let mut script = format!(
+        r#"eval "$(export -p | while IFS= read -r ocm_line; do
+  case $ocm_line in
+    'export '*) ocm_key=${{ocm_line#export }} ;;
+    'declare -x '*) ocm_key=${{ocm_line#declare -x }} ;;
+    *) continue ;;
+  esac
+  ocm_key=${{ocm_key%%=*}}
+  case $ocm_key in
+    {passthrough}|*[!{IDENTIFIER_CHARS}]*) ;;
+    OPENCLAW_*|OCM_ACTIVE_ENV|OCM_ACTIVE_ENV_ROOT) printf 'unset %s
+' "$ocm_key" ;;
+  esac
+done)"
+"#
+    );
+    for (key, value) in env {
+        if is_env_scoped_key(key) && is_shell_identifier(key) {
+            script.push_str(&render_assignment("sh", key, value));
+            script.push('\n');
+        }
+    }
+    script.push_str(command);
+    script
 }
 
 pub fn render_use_script(
@@ -603,5 +648,94 @@ mod tests {
         for line in script.lines().filter(|line| line.contains("set -e")) {
             assert!(line.starts_with("if set -q "), "{line}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_scoped_login_command_restores_env_values_after_the_login_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let profile_bin = home.path().join("profile-bin");
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        std::fs::write(
+            home.path().join(".profile"),
+            [
+                "export OPENCLAW_HOME=/native",
+                "export OPENCLAW_STATE_DIR=/native/.openclaw",
+                "export OPENCLAW_CONFIG_PATH=/native/.openclaw/openclaw.json",
+                "export OPENCLAW_GATEWAY_PORT=1",
+                "export OPENCLAW_PROFILE=work",
+                "export OPENCLAW_PROFILE_ONLY=1",
+                "export OCM_ACTIVE_ENV=other",
+                "export OCM_ACTIVE_ENV_ROOT=/other",
+                "export OPENCLAW_DIAGNOSTICS=from-profile",
+                "export PROFILE_TOOL=from-profile",
+                // A value whose second line looks like another export.
+                "export PROFILE_NOTE='first\nexport OPENCLAW_SERVICE_REPAIR_POLICY=bad'",
+                &format!("PATH=\"{}:$PATH\"; export PATH", profile_bin.display()),
+                "",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let env = BTreeMap::from([
+            ("HOME".to_string(), home.path().display().to_string()),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("OPENCLAW_HOME".to_string(), "/ocm/envs/demo".to_string()),
+            (
+                "OPENCLAW_STATE_DIR".to_string(),
+                "/ocm/envs/demo/.openclaw".to_string(),
+            ),
+            (
+                "OPENCLAW_CONFIG_PATH".to_string(),
+                "/ocm/envs/demo/.openclaw/it's.json".to_string(),
+            ),
+            ("OPENCLAW_GATEWAY_PORT".to_string(), "19011".to_string()),
+            (
+                "OPENCLAW_SERVICE_REPAIR_POLICY".to_string(),
+                "external".to_string(),
+            ),
+            ("OCM_ACTIVE_ENV".to_string(), "demo".to_string()),
+            (
+                "OCM_ACTIVE_ENV_ROOT".to_string(),
+                "/ocm/envs/demo".to_string(),
+            ),
+        ]);
+        let command = r#"for key in OPENCLAW_HOME OPENCLAW_STATE_DIR OPENCLAW_CONFIG_PATH OPENCLAW_GATEWAY_PORT OPENCLAW_SERVICE_REPAIR_POLICY OCM_ACTIVE_ENV OCM_ACTIVE_ENV_ROOT OPENCLAW_PROFILE OPENCLAW_PROFILE_ONLY OPENCLAW_DIAGNOSTICS PROFILE_TOOL; do eval "printf '%s=%s\n' \"\$key\" \"\${$key-unset}\""; done; printf 'PATH=%s\n' "$PATH""#;
+
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-lc", &render_env_scoped_login_command(command, &env)])
+            .env_clear()
+            .envs(&env)
+            .current_dir(home.path())
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let lines = stdout.lines().collect::<Vec<_>>();
+        assert_eq!(
+            &lines[..11],
+            [
+                "OPENCLAW_HOME=/ocm/envs/demo",
+                "OPENCLAW_STATE_DIR=/ocm/envs/demo/.openclaw",
+                "OPENCLAW_CONFIG_PATH=/ocm/envs/demo/.openclaw/it's.json",
+                "OPENCLAW_GATEWAY_PORT=19011",
+                "OPENCLAW_SERVICE_REPAIR_POLICY=external",
+                "OCM_ACTIVE_ENV=demo",
+                "OCM_ACTIVE_ENV_ROOT=/ocm/envs/demo",
+                "OPENCLAW_PROFILE=unset",
+                "OPENCLAW_PROFILE_ONLY=unset",
+                "OPENCLAW_DIAGNOSTICS=from-profile",
+                "PROFILE_TOOL=from-profile",
+            ]
+        );
+        assert!(
+            lines[11].starts_with(&format!("PATH={}:", profile_bin.display())),
+            "{stdout}"
+        );
     }
 }

@@ -18,6 +18,7 @@ use crate::infra::interrupt::CaptureInterrupt;
 use crate::infra::shell::OPENCLAW_NATIVE_SERVICE_IDENTITY_KEYS;
 use crate::infra::shell::{
     apply_external_supervision_protocol_v1, apply_legacy_supervision, quote_posix,
+    render_env_scoped_login_command,
 };
 
 const PROTOCOL: &str = "openclaw.gateway.restart-handoff";
@@ -576,7 +577,7 @@ fn openclaw_program_arguments(
         Ok(vec![
             "/bin/sh".to_string(),
             "-lc".to_string(),
-            machine_command,
+            render_env_scoped_login_command(&machine_command, &spec.process_env),
         ])
     }
 }

@@ -23,7 +23,7 @@ use crate::infra::process_identity::process_group_members;
 use crate::infra::process_identity::{
     ProcessIdentity, current_process_identity, observe_process, process_scope_id,
 };
-use crate::infra::shell::apply_external_supervision_hint;
+use crate::infra::shell::{apply_external_supervision_hint, render_env_scoped_login_command};
 use crate::service::inspect::{
     LaunchdJobStatus, ManagedJobObservation, inspect_job, inspect_job_for_activation,
     inspect_job_for_recovery, observe_job_for_source_watch,
@@ -1901,7 +1901,7 @@ fn supervisor_program_arguments(spec: &SupervisorChildSpec) -> Vec<String> {
                 vec![
                     "/bin/sh".to_string(),
                     "-lc".to_string(),
-                    command.to_string(),
+                    render_env_scoped_login_command(command, &spec.process_env),
                 ]
             }
         }
