@@ -31,6 +31,7 @@ use crate::openclaw_repo::detect_openclaw_checkout;
 use crate::runtime::releases::{
     OpenClawRelease, compare_runtime_release_versions, is_official_openclaw_releases_url,
     normalize_openclaw_channel_selector, official_openclaw_releases_url,
+    select_official_openclaw_release_by_channel,
 };
 use crate::runtime::{
     InstallRuntimeFromOfficialReleaseOptions, OfficialRuntimePrepareAction, RuntimeMeta,
@@ -2115,16 +2116,11 @@ impl Cli {
                 }
             }
             (None, Some(channel)) => {
-                if releases
-                    .iter()
-                    .any(|release| release.channel.as_deref() == Some(channel))
-                {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "OpenClaw release channel \"{channel}\" was not found; simulation did not create any scenario envs"
-                    ))
-                }
+                select_official_openclaw_release_by_channel(&releases, channel)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        format!("{error}; simulation did not create any scenario envs")
+                    })
             }
             _ => Err(
                 "upgrade simulate requires a published version, channel, or local repo path"

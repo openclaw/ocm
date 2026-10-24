@@ -3498,6 +3498,169 @@ fn upgrade_simulate_errors_before_cloning_when_published_target_is_missing() {
     assert_eq!(envs[0]["name"], "demo");
 }
 
+#[cfg(unix)]
+struct ChannelSimulation {
+    _root: TestDir,
+    cwd: PathBuf,
+    env: BTreeMap<String, String>,
+    output: std::process::Output,
+}
+
+#[cfg(unix)]
+fn simulate_published_channel(label: &str, dist_tags: &str, channel: &str) -> ChannelSimulation {
+    let root = TestDir::new(label);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let versions = ["2026.3.24", "2026.3.25-beta.1", "2026.3.25"];
+    let mut tarball_servers = Vec::new();
+    let mut version_entries = Vec::new();
+    for version in versions {
+        let tarball = openclaw_package_tarball(&recording_openclaw_script(version), version);
+        let integrity = sha512_integrity(&tarball);
+        let server = TestHttpServer::serve_bytes_times(
+            &format!("/openclaw-{version}.tgz"),
+            "application/octet-stream",
+            &tarball,
+            10,
+        );
+        version_entries.push(format!(
+            "\"{version}\":{{\"version\":\"{version}\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{integrity}\"}}}}",
+            server.url()
+        ));
+        tarball_servers.push(server);
+    }
+    let packument = format!(
+        "{{\"dist-tags\":{dist_tags},\"versions\":{{{}}},\"time\":{{\"2026.3.24\":\"2026-03-25T16:35:52.000Z\",\"2026.3.25-beta.1\":\"2026-03-26T09:00:00.000Z\",\"2026.3.25\":\"2026-03-27T09:00:00.000Z\"}}}}",
+        version_entries.join(",")
+    );
+    let packument_server = TestHttpServer::serve_bytes_times(
+        "/openclaw",
+        "application/json",
+        packument.as_bytes(),
+        12,
+    );
+
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
+        packument_server.url(),
+    );
+
+    let start = run_ocm(
+        &cwd,
+        &env,
+        &["start", "demo", "--version", "2026.3.24", "--no-service"],
+    );
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    let output = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "upgrade",
+            "simulate",
+            "demo",
+            "--to",
+            channel,
+            "--keep-simulations",
+            "--json",
+        ],
+    );
+    ChannelSimulation {
+        _root: root,
+        cwd,
+        env,
+        output,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_simulate_accepts_channels_that_share_a_version_with_a_higher_priority_tag() {
+    for (label, dist_tags, channel, version) in [
+        (
+            "upgrade-simulate-beta-overlap",
+            "{\"latest\":\"2026.3.25\",\"beta\":\"2026.3.25\"}",
+            "beta",
+            "2026.3.25",
+        ),
+        (
+            "upgrade-simulate-dev-overlap",
+            "{\"latest\":\"2026.3.24\",\"beta\":\"2026.3.25-beta.1\",\"dev\":\"2026.3.25-beta.1\"}",
+            "dev",
+            "2026.3.25-beta.1",
+        ),
+    ] {
+        let simulation = simulate_published_channel(label, dist_tags, channel);
+        let simulate = &simulation.output;
+        assert!(
+            simulate.status.success(),
+            "{channel}\nstdout:\n{}\nstderr:\n{}",
+            stdout(simulate),
+            stderr(simulate)
+        );
+        let json: Value = serde_json::from_str(&stdout(simulate)).unwrap();
+        assert_eq!(json["sourceEnv"], "demo");
+        assert_eq!(json["outcome"], "passed", "{json:#}");
+
+        let sim_name = json["simulationEnv"].as_str().unwrap();
+        let shown = run_ocm(
+            &simulation.cwd,
+            &simulation.env,
+            &["env", "show", sim_name, "--json"],
+        );
+        assert!(shown.status.success(), "{}", stderr(&shown));
+        let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+        let sim_root = Path::new(shown["root"].as_str().unwrap());
+        let command_log = fs::read_to_string(sim_root.join("sim-commands.log")).unwrap();
+        assert!(
+            command_log.contains(&format!(
+                "update --dry-run --json --no-restart --yes --channel {channel}"
+            )),
+            "{command_log}"
+        );
+
+        let runtime_name = json["toBindingName"].as_str().unwrap();
+        let runtime = run_ocm(
+            &simulation.cwd,
+            &simulation.env,
+            &["runtime", "show", runtime_name, "--json"],
+        );
+        assert!(runtime.status.success(), "{}", stderr(&runtime));
+        let runtime: Value = serde_json::from_str(&stdout(&runtime)).unwrap();
+        assert_eq!(runtime["releaseVersion"], version, "{runtime:#}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_simulate_errors_before_cloning_when_published_channel_is_missing() {
+    let simulation = simulate_published_channel(
+        "upgrade-simulate-missing-channel",
+        "{\"latest\":\"2026.3.25\",\"beta\":\"2026.3.25\"}",
+        "dev",
+    );
+    let simulate = &simulation.output;
+    assert!(!simulate.status.success(), "{}", stdout(simulate));
+    assert!(stdout(simulate).is_empty(), "{}", stdout(simulate));
+    let error = stderr(simulate);
+    assert!(
+        error.contains(
+            "OpenClaw release channel \"dev\" was not found; simulation did not create any scenario envs"
+        ),
+        "{error}"
+    );
+
+    let list = run_ocm(&simulation.cwd, &simulation.env, &["env", "list", "--json"]);
+    assert!(list.status.success(), "{}", stderr(&list));
+    let envs: Value = serde_json::from_str(&stdout(&list)).unwrap();
+    let envs = envs.as_array().unwrap();
+    assert_eq!(envs.len(), 1, "{envs:#?}");
+    assert_eq!(envs[0]["name"], "demo");
+}
+
 #[test]
 fn upgrade_simulate_runs_openclaw_update_contract_checks_for_published_targets() {
     let root = TestDir::new("upgrade-simulate-contract");
