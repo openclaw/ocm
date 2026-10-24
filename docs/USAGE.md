@@ -1602,6 +1602,14 @@ missing, replaced or mismatched sources stay inspectable with health not ready.
 These are current configuration observations, not a saved copy of the running
 Gateway's configuration or the launching terminal's inherited variables.
 
+While a foreground session is active, `env status <env>` reports `openclawState`
+from that session instead of the background service: `running` when the
+session's recorded Gateway port accepts a loopback connection and `pending`
+otherwise. It does not request `/health`, and its next step is `dev status <env>`
+rather than a service command, because service install, start and restart are
+refused until the session ends. Unresolved retained service ownership still
+reports `unknown` and points to `service recover <env>` first.
+
 `dev <env> --service` records its preparation children until verified completion.
 Use `dev stop <env>` to cancel setup; a managed Gateway already running keeps its
 launch plan, and deferred restart requests remain pending. Explicit service stop

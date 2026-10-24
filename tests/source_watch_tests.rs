@@ -514,16 +514,42 @@ fn env_status_reports_an_active_source_watch_without_refused_service_steps() {
             .set_service_policy("demo", Some(service_enabled), Some(false))
             .unwrap();
         let watch = lock_source_watch(&root);
-        write_active_source_watch_override(&root, &source_repo);
+        let mut gateway = Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let gateway_port = gateway.as_ref().unwrap().local_addr().unwrap().port();
+        let env_root = EnvironmentService::new(&env, &cwd)
+            .get("demo")
+            .unwrap()
+            .root;
+        let override_path = root.child("ocm-home/source-watch/demo.json");
+        fs::write(
+            &override_path,
+            json!({
+                "kind": "ocm-source-watch-override",
+                "envName": "demo",
+                "repoRoot": path_string(&source_repo),
+                "endpoint": {"envRoot": env_root, "gatewayPort": gateway_port},
+                "watchPid": std::process::id(),
+                "token": "test-source-watch",
+                "startedAt": "2026-06-17T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
 
-        let status: Value = serde_json::from_str(&env_status("--json")).unwrap();
-        assert_eq!(status["resolvedKind"], "source-watch");
-        assert_eq!(status["openclawState"], "running");
-        assert!(env_status("--raw").contains("openclawState: running"));
-        let card = env_status("--color=always");
-        assert!(card.contains("ocm dev status demo"), "{card}");
-        for refused in [refused, "ocm service restart demo"] {
-            assert!(!card.contains(refused), "{card}");
+        // The session's recorded port, not the registered one, decides the state.
+        for (listening, state) in [(true, "running"), (false, "pending")] {
+            if !listening {
+                drop(gateway.take());
+            }
+            let status: Value = serde_json::from_str(&env_status("--json")).unwrap();
+            assert_eq!(status["resolvedKind"], "source-watch");
+            assert_eq!(status["openclawState"], state);
+            assert!(env_status("--raw").contains(&format!("openclawState: {state}")));
+            let card = env_status("--color=always");
+            assert!(card.contains("ocm dev status demo"), "{card}");
+            for refused in [refused, "ocm service restart demo"] {
+                assert!(!card.contains(refused), "{card}");
+            }
         }
         let refusal = run_ocm(&cwd, &env, &["service", "start", "demo"]);
         assert!(
