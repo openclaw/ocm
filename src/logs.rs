@@ -1039,7 +1039,7 @@ fn merge_log_snapshots(snapshots: Vec<LogSnapshot>, tail_lines: Option<usize>) -
 /// their parent. Undated continuation lines of that parent cannot be told apart
 /// from later output, so they move with that output once the file is written later.
 fn place_trailing_undated_output(records: &mut Vec<TimedLogRecord>, modified: Option<SystemTime>) {
-    let Some(modified) = modified.map(OffsetDateTime::from) else {
+    let Some(modified) = modified.and_then(offset_date_time) else {
         return;
     };
     if records
@@ -1068,6 +1068,14 @@ fn place_trailing_undated_output(records: &mut Vec<TimedLogRecord>, modified: Op
     };
     let trailing = last.bytes.split_off(parent_end);
     records.push(TimedLogRecord::new(Some(modified), trailing));
+}
+
+/// Converts a file time without panicking on values `OffsetDateTime` cannot hold.
+fn offset_date_time(time: SystemTime) -> Option<OffsetDateTime> {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(after) => OffsetDateTime::UNIX_EPOCH.checked_add(after.try_into().ok()?),
+        Err(before) => OffsetDateTime::UNIX_EPOCH.checked_sub(before.duration().try_into().ok()?),
+    }
 }
 
 fn merge_log_records_with_tail(records: Vec<TimedLogRecord>, tail_lines: Option<usize>) -> Vec<u8> {
@@ -1469,6 +1477,33 @@ mod tests {
                 .as_bytes()
             );
         }
+    }
+
+    #[test]
+    fn merge_log_snapshots_ignores_file_times_outside_the_timestamp_range() {
+        let far_future = SystemTime::UNIX_EPOCH + Duration::from_secs(400_000_000_000);
+        let merged = merge_log_snapshots(
+            vec![
+                LogSnapshot {
+                    bytes: b"2026-04-20T00:13:46Z [gateway] later\n".to_vec(),
+                    modified: None,
+                },
+                LogSnapshot {
+                    bytes: b"2026-04-20T00:13:45Z [gateway] failed\n    at frame\n".to_vec(),
+                    modified: Some(far_future),
+                },
+            ],
+            None,
+        );
+        assert_eq!(
+            merged,
+            concat!(
+                "2026-04-20T00:13:45Z [gateway] failed\n",
+                "    at frame\n",
+                "2026-04-20T00:13:46Z [gateway] later\n"
+            )
+            .as_bytes()
+        );
     }
 
     #[test]
