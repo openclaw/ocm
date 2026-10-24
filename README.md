@@ -423,10 +423,14 @@ published targets it first validates that the target exists, then runs OpenClaw'
 `update --dry-run --json` plan against the clone, switches the clone, and runs
 update-mode doctor, plugin update dry-run, and gateway status checks. For local
 repos it validates the checkout with dependency/build checks before running the
-same post-update checks. Use `--scenario all` to test the current env config
-plus built-in clean minimum and Telegram-configured env shapes. Use
-`--keep-simulations` only when you need retained simulation envs and temporary
-runtimes for debugging.
+same post-update checks. Its dependency setup runs `pnpm install
+--frozen-lockfile` in the simulation's own worktree only after the same
+destination checks `dev` applies: a linked destination, a modules-directory
+override outside the worktree or a workspace-directory override naming another
+directory fails the simulation before anything is installed. Use
+`--scenario all` to test the current env config plus built-in clean minimum and
+Telegram-configured env shapes. Use `--keep-simulations` only when you need
+retained simulation envs and temporary runtimes for debugging.
 
 ### Use a local checkout or dev build
 

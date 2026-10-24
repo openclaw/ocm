@@ -997,7 +997,22 @@ fn install_fake_simulation_pnpm(
     fs::create_dir_all(&bin_dir).unwrap();
     let pnpm = r#"#!/bin/sh
 case "$1" in
+  config)
+    if [ -n "${OCM_TEST_PNPM_CONFIG_EXIT:-}" ]; then
+      printf 'private configuration diagnostic\n' >&2
+      exit "$OCM_TEST_PNPM_CONFIG_EXIT"
+    fi
+    if [ -n "${OCM_TEST_PNPM_CONFIG:-}" ]; then
+      printf '%s\n' "$OCM_TEST_PNPM_CONFIG"
+    else
+      printf '{}\n'
+    fi
+    exit 0
+    ;;
   install)
+    if [ -n "${OCM_TEST_PNPM_INSTALL_LOG:-}" ]; then
+      printf '%s\n' "$*" >> "$OCM_TEST_PNPM_INSTALL_LOG"
+    fi
     mkdir -p node_modules/.pnpm node_modules/.bin
     touch node_modules/.bin/tsx
     exit 0
@@ -3935,6 +3950,140 @@ fi
                     .is_file()
             );
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_simulate_admits_pnpm_destinations_before_installing() {
+    for case in [
+        "physical",
+        "modules-inside-checkout",
+        "modules-outside-checkout",
+        "workspace-override",
+        "linked-store",
+        "failed-config",
+    ] {
+        let root = TestDir::new(&format!("upgrade-simulate-pnpm-destinations-{case}"));
+        let cwd = root.path();
+        let repo = init_openclaw_repo(&root);
+        let mut env = ocm_env(&root);
+        install_fake_node_and_npm(&root, &mut env, "22.22.3");
+        install_fake_simulation_pnpm(&root, &mut env);
+        env.insert("OCM_TEST_SIMULATION_DOCTOR_OK".to_string(), "1".to_string());
+        let install_log = root.child("pnpm-install.log");
+        env.insert(
+            "OCM_TEST_PNPM_INSTALL_LOG".to_string(),
+            path_string(&install_log),
+        );
+        // Another owner's dependency tree, which inherited pnpm settings name.
+        let borrowed = root.child("borrowed-store");
+        fs::create_dir_all(&borrowed).unwrap();
+        fs::write(borrowed.join("lock.yaml"), "existing borrowed lock\n").unwrap();
+        let started = run_ocm(
+            cwd,
+            &env,
+            &[
+                "start",
+                "demo",
+                "--command",
+                "pnpm openclaw",
+                "--cwd",
+                &path_string(&repo),
+                "--no-service",
+            ],
+        );
+        assert!(started.status.success(), "{}", stderr(&started));
+        match case {
+            "modules-inside-checkout" => {
+                env.insert(
+                    "PNPM_CONFIG_MODULES_DIR".to_string(),
+                    "installed-modules".to_string(),
+                );
+            }
+            "modules-outside-checkout" => {
+                env.insert(
+                    "PNPM_CONFIG_MODULES_DIR".to_string(),
+                    path_string(&borrowed),
+                );
+            }
+            "workspace-override" => {
+                env.insert(
+                    "PNPM_CONFIG_WORKSPACE_DIR".to_string(),
+                    path_string(&borrowed),
+                );
+            }
+            "linked-store" => {
+                let link = root.child("linked-store");
+                std::os::unix::fs::symlink(&borrowed, &link).unwrap();
+                env.insert(
+                    "OCM_TEST_PNPM_CONFIG".to_string(),
+                    serde_json::json!({
+                        "virtualStoreDir": path_string(&link),
+                        "unrelatedPrivateValue": "do-not-render",
+                    })
+                    .to_string(),
+                );
+            }
+            "failed-config" => {
+                env.insert("OCM_TEST_PNPM_CONFIG_EXIT".to_string(), "1".to_string());
+            }
+            _ => {}
+        }
+
+        let simulated = run_ocm(
+            cwd,
+            &env,
+            &[
+                "upgrade",
+                "simulate",
+                "demo",
+                "--to",
+                &path_string(&repo),
+                "--json",
+            ],
+        );
+        let result: Value = serde_json::from_str(&stdout(&simulated)).unwrap();
+        let prepare = result["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "prepare target")
+            .unwrap_or_else(|| panic!("{case}: {result:#}"));
+        let rendered = format!("{}{}", stdout(&simulated), stderr(&simulated));
+        assert!(!rendered.contains("do-not-render"), "{case}");
+        assert!(
+            !rendered.contains("private configuration diagnostic"),
+            "{case}"
+        );
+        assert_eq!(
+            fs::read_to_string(borrowed.join("lock.yaml")).unwrap(),
+            "existing borrowed lock\n",
+            "{case}"
+        );
+        assert_eq!(fs::read_dir(&borrowed).unwrap().count(), 1, "{case}");
+        if matches!(case, "physical" | "modules-inside-checkout") {
+            assert_eq!(prepare["status"], "passed", "{case}: {result:#}");
+            assert_eq!(result["outcome"], "passed", "{case}: {result:#}");
+            assert_eq!(
+                fs::read_to_string(&install_log).unwrap(),
+                "install --frozen-lockfile\n",
+                "{case}"
+            );
+            continue;
+        }
+        assert!(!simulated.status.success(), "{case}: {result:#}");
+        assert_eq!(prepare["status"], "failed", "{case}: {result:#}");
+        assert!(!install_log.exists(), "{case}");
+        let note = prepare["note"].as_str().unwrap();
+        let expected = match case {
+            "modules-outside-checkout" => "resolves outside the selected checkout",
+            "workspace-override" => "selects the pnpm workspace",
+            "linked-store" => "refusing to install OpenClaw source dependencies through",
+            _ => "could not read pnpm dependency destinations",
+        };
+        assert!(note.contains(expected), "{case}: {note}");
+        assert_eq!(result["cleanup"], "cleaned", "{case}: {result:#}");
     }
 }
 

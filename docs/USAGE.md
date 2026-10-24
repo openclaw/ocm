@@ -353,6 +353,7 @@ Use `upgrade simulate` when you want to test what would happen against a publish
 
 - channel-tracked runtimes move forward
 - simulations clone the source env, run OpenClaw's update dry-run plan for published targets, validate local repo builds for repo targets, then run update-mode doctor, plugin update dry-run, and gateway status checks
+- local repo targets install dependencies with `pnpm install --frozen-lockfile` in the simulation's own worktree, after the same pnpm destination checks `dev` applies; a linked destination, a modules-directory override outside the worktree or a workspace-directory override naming another directory fails the `prepare target` check before anything is installed
 - simulation envs and unused temporary runtimes are cleaned up automatically; use `--keep-simulations` only when you need retained debug artifacts
 - cleanup removes only the simulation environment generation created by that run; if the name was removed and recreated during checks, the replacement is preserved and cleanup reports failure without changing the functional outcome
 - if another environment binds to a temporary runtime, cleanup preserves that runtime and reports `cleanup: "failed"` with the dependent environment names; the functional `outcome` is unchanged, and the command exits nonzero. Clear those bindings before removing the retained runtime with `ocm runtime remove <name>`
