@@ -258,14 +258,22 @@ fn archived_git_paths_in_import_removed_roots(
         }
         // The listing supplies the repository markers that import's
         // recognition checks, so most directories need no further lookups.
-        // Import sees a checkout only when its `.git` entry is archived.
+        // Import sees a repository only when its markers are archived: a
+        // checkout's `.git` entry, or a bare repository's HEAD and objects.
+        // Otherwise keep searching inside it like any other directory.
         let relative = directory
             .strip_prefix(&paths.root)
             .map_err(|error| error.to_string())?;
+        let archived = |name: &str, kind| !options.should_skip(&relative.join(name), kind);
+        let visible = in_removed_root(&directory)
+            || if git_entry {
+                archived(".git", EnvArchiveEntryKind::Directory)
+            } else {
+                archived("HEAD", EnvArchiveEntryKind::File)
+                    && archived("objects", EnvArchiveEntryKind::Directory)
+            };
         if (git_entry || (head && objects))
-            && (!git_entry
-                || in_removed_root(&directory)
-                || !options.should_skip(&relative.join(".git"), EnvArchiveEntryKind::Directory))
+            && visible
             && let Some(context) =
                 git_config::copied_destination_git_context(&canonical_root, &directory)
                     .map_err(|error| export_git_selection_error(&directory, error))?

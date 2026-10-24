@@ -1403,6 +1403,7 @@ import retains its whole state directory, so the stores are archived too.
 Include conditions that depend on location, such as `gitdir:`, are evaluated
 where the repository is when exporting. Selecting these Git files runs `git`
 when one of those stores and a Git repository both exist.
+
 `--include-state` means "export this
 environment as the same installation": it includes every file under the
 environment root, including plugin payloads and dependencies, SQLite-backed and

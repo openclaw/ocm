@@ -2385,3 +2385,81 @@ fn default_export_omits_legacy_stores_under_a_state_directory_checkout() {
         );
     }
 }
+
+#[test]
+fn default_export_searches_inside_a_state_directory_bare_repository() {
+    // A bare repository whose HEAD and objects the archive omits is invisible
+    // to import: its include target stays out, and repositories inside the
+    // stores it contains are still found and kept.
+    let fixture = TestDir::new("export-legacy-stores-state-bare");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let state = source.join(".openclaw");
+    export_git(&state, &env, &["init", "-q", "--bare"]);
+    write_text(
+        &state.join("credentials/state.gitconfig"),
+        "[fixture]\n\tunseen = selected\n",
+    );
+    export_git(
+        &state,
+        &env,
+        &["config", "include.path", "credentials/state.gitconfig"],
+    );
+    let notes = state.join("memory/notes.git");
+    fs::create_dir_all(&notes).unwrap();
+    export_git(&notes, &env, &["init", "-q", "--bare"]);
+
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let archived = archived_state_paths(&archive);
+    assert!(
+        !archived.contains(std::path::Path::new("credentials/state.gitconfig")),
+        "an include of an unarchived repository should not be archived"
+    );
+    assert!(archived.contains(std::path::Path::new("memory/notes.git/HEAD")));
+    let target = root.join("target");
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    assert!(target.join(".openclaw/memory/notes.git/HEAD").is_file());
+    assert!(
+        !target
+            .join(".openclaw/credentials/state.gitconfig")
+            .exists()
+    );
+}
