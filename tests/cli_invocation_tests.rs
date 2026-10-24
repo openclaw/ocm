@@ -34,25 +34,32 @@ fn env_exec_propagates_the_child_exit_code() {
     assert_eq!(exec.status.code(), Some(7), "{}", stderr(&exec));
 }
 
+/// A fake OpenClaw that exits with a numeric argument or dies from the named
+/// signal. Perl restores the signal's default action first, so a signal the
+/// test harness ignores (as `nohup` or a background job may) still kills it.
+#[cfg(unix)]
+const SIGNAL_CHILD: &str = "#!/bin/sh\ncase \"$1\" in [0-9]*) exit \"$1\" ;; esac\nexec perl -e '$SIG{$ARGV[0]} = \"DEFAULT\"; kill $ARGV[0], $$; sleep 5; exit 99' \"$1\"\n";
+
 #[cfg(unix)]
 #[test]
 fn env_exec_reports_a_signal_killed_child_as_128_plus_the_signal() {
     let root = TestDir::new("cli-exec-signal-exit");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
+    let child = cwd.join("signal-child");
+    write_executable_script(&child, SIGNAL_CHILD);
+    let child = child.to_str().unwrap();
     let env = ocm_env(&root);
 
     let create = run_ocm(&cwd, &env, &["env", "create", "demo"]);
     assert!(create.status.success(), "{}", stderr(&create));
 
-    let exec = run_ocm(
-        &cwd,
-        &env,
-        &["env", "exec", "demo", "--", "sh", "-c", "kill -TERM $$"],
-    );
+    let exec = run_ocm(&cwd, &env, &["env", "exec", "demo", "--", child, "TERM"]);
     assert_eq!(exec.status.code(), Some(143), "{}", stderr(&exec));
     assert!(
-        stderr(&exec).contains("ocm: \"sh\" was terminated by signal 15 (SIGTERM)"),
+        stderr(&exec).contains(&format!(
+            "ocm: \"{child}\" was terminated by signal 15 (SIGTERM)"
+        )),
         "{}",
         stderr(&exec)
     );
@@ -60,31 +67,24 @@ fn env_exec_reports_a_signal_killed_child_as_128_plus_the_signal() {
 
 #[cfg(unix)]
 #[test]
-fn runtime_bound_env_run_reports_a_signal_killed_child_as_128_plus_the_signal() {
+fn env_run_reports_a_signal_killed_child_as_128_plus_the_signal() {
     let root = TestDir::new("cli-run-signal-exit");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let runtime = cwd.join("openclaw");
-    write_executable_script(
-        &runtime,
-        "#!/bin/sh\ncase \"$1\" in [0-9]*) exit \"$1\" ;; esac\nkill -\"$1\" $$\nexit 99\n",
-    );
+    let child = cwd.join("openclaw");
+    write_executable_script(&child, SIGNAL_CHILD);
+    let child = child.to_str().unwrap();
     let env = ocm_env(&root);
 
-    let add = run_ocm(
-        &cwd,
-        &env,
-        &[
-            "runtime",
-            "add",
-            "fake",
-            "--path",
-            runtime.to_str().unwrap(),
-        ],
-    );
-    assert!(add.status.success(), "{}", stderr(&add));
-    let create = run_ocm(&cwd, &env, &["env", "create", "demo", "--runtime", "fake"]);
-    assert!(create.status.success(), "{}", stderr(&create));
+    for args in [
+        &["runtime", "add", "fake", "--path", child][..],
+        &["env", "create", "demo", "--runtime", "fake"][..],
+        &["launcher", "add", "fakel", "--command", child][..],
+        &["env", "create", "launched", "--launcher", "fakel"][..],
+    ] {
+        let setup = run_ocm(&cwd, &env, args);
+        assert!(setup.status.success(), "{args:?}: {}", stderr(&setup));
+    }
 
     for (args, code, diagnostic) in [
         (
@@ -98,13 +98,15 @@ fn runtime_bound_env_run_reports_a_signal_killed_child_as_128_plus_the_signal() 
             Some("signal 9 (SIGKILL)"),
         ),
         (&["@demo", "--", "INT"][..], 130, None),
+        (&["@demo", "--", "PIPE"][..], 141, None),
         (&["@demo", "--", "42"][..], 42, None),
     ] {
         let run = run_ocm(&cwd, &env, args);
         assert_eq!(run.status.code(), Some(code), "{args:?}: {}", stderr(&run));
         match diagnostic {
             Some(signal) => assert!(
-                stderr(&run).contains(&format!("was terminated by {signal}")),
+                stderr(&run).lines().any(|line| line.starts_with("ocm: \"")
+                    && line.ends_with(&format!("openclaw\" was terminated by {signal}"))),
                 "{args:?}: {}",
                 stderr(&run)
             ),
@@ -115,6 +117,11 @@ fn runtime_bound_env_run_reports_a_signal_killed_child_as_128_plus_the_signal() 
             ),
         }
     }
+
+    // Launcher-bound runs go through `sh -lc`, which either reports the death
+    // itself or replaces itself with the command; both must give 128 + N.
+    let launched = run_ocm(&cwd, &env, &["@launched", "--", "TERM"]);
+    assert_eq!(launched.status.code(), Some(143), "{}", stderr(&launched));
 }
 
 #[test]

@@ -9,6 +9,32 @@ pub fn run_direct(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<i32, String> {
+    run_reporting_as(command, args, env, cwd, command)
+}
+
+pub fn run_shell(command: &str, env: &BTreeMap<String, String>, cwd: &Path) -> Result<i32, String> {
+    let (shell, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-lc")
+    };
+    // A shell may replace itself with the command, so name the command, not the shell.
+    run_reporting_as(
+        shell,
+        &[flag.to_string(), command.to_string()],
+        env,
+        cwd,
+        command,
+    )
+}
+
+fn run_reporting_as(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    display: &str,
+) -> Result<i32, String> {
     let status = Command::new(command)
         .args(args)
         .stdin(Stdio::inherit())
@@ -19,18 +45,10 @@ pub fn run_direct(
         .current_dir(cwd)
         .status()
         .map_err(|error| format!("failed to run \"{command}\": {error}"))?;
-    if let Some(diagnostic) = signal_diagnostic(command, &status) {
+    if let Some(diagnostic) = signal_diagnostic(display, &status) {
         let _ = writeln!(io::stderr().lock(), "{diagnostic}");
     }
     Ok(exit_status_code(&status))
-}
-
-pub fn run_shell(command: &str, env: &BTreeMap<String, String>, cwd: &Path) -> Result<i32, String> {
-    if cfg!(windows) {
-        run_direct("cmd", &["/C".to_string(), command.to_string()], env, cwd)
-    } else {
-        run_direct("sh", &["-lc".to_string(), command.to_string()], env, cwd)
-    }
 }
 
 /// Report a child's exit the way a shell does: its exit code, or 128 plus the
