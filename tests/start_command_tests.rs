@@ -364,7 +364,9 @@ fn start_refused_by_unreadable_config_removes_the_launcher_it_created() {
 }
 
 // A failure after the env was created and bound (here the service install)
-// keeps the launcher the env now uses.
+// happens outside the refusal rollback, so the env keeps its launcher. This
+// does not reach the bound-launcher check in discard_unbound_start_launcher,
+// which only covers a create or rebind that fails after saving the env.
 #[test]
 fn start_failing_after_creating_the_env_keeps_its_launcher() {
     let root = TestDir::new("start-bound-launcher-kept");
