@@ -321,15 +321,16 @@ fn directory_entries(directory: &Path) -> Vec<String> {
 }
 
 #[test]
-fn installer_keeps_the_previous_binary_when_the_write_fails() {
-    for existing in [true, false] {
+fn installer_keeps_the_previous_binary_when_the_write_fails_or_is_interrupted() {
+    for (existing, interrupted) in [(true, false), (false, false), (true, true), (false, true)] {
         let root = TestDir::new("install-failed-write");
         let (fake_bin, archive) = standalone_release(&root);
         // Fail the way coreutils `install` does on a full disk: remove the
-        // target, write part of the file, then exit non-zero.
+        // target and write part of the file. Then either exit non-zero or
+        // terminate the installer mid-write.
         write_executable_script(
             &fake_bin.join("install"),
-            "#!/bin/sh\nfor target; do :; done\nrm -f \"$target\"\nprintf partial > \"$target\"\necho 'install: write error: No space left on device' >&2\nexit 1\n",
+            "#!/bin/sh\nfor target; do :; done\nrm -f \"$target\"\nprintf partial > \"$target\"\nif [ -n \"${TEST_INTERRUPT:-}\" ]; then kill -TERM \"$PPID\"; exit 0; fi\necho 'install: write error: No space left on device' >&2\nexit 1\n",
         );
         let bin_dir = root.child("standalone");
         fs::create_dir_all(&bin_dir).unwrap();
@@ -340,6 +341,9 @@ fn installer_keeps_the_previous_binary_when_the_write_fails() {
             fs::write(&destination, "old").unwrap();
             fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
             command.arg("--force");
+        }
+        if interrupted {
+            command.env("TEST_INTERRUPT", "1");
         }
         let output = command
             .args(["--bin-dir", &path_string(&bin_dir)])
@@ -352,21 +356,24 @@ fn installer_keeps_the_previous_binary_when_the_write_fails() {
             .output()
             .unwrap();
 
-        assert!(!output.status.success(), "existing={existing}");
-        assert!(
-            stderr(&output).contains("No space left on device"),
-            "{}",
-            stderr(&output)
-        );
+        let case = format!("existing={existing} interrupted={interrupted}");
+        assert!(!output.status.success(), "{case}");
+        if !interrupted {
+            assert!(
+                stderr(&output).contains("No space left on device"),
+                "{}",
+                stderr(&output)
+            );
+        }
         if existing {
-            assert_eq!(fs::read(&destination).unwrap(), b"old");
+            assert_eq!(fs::read(&destination).unwrap(), b"old", "{case}");
             assert_eq!(
                 fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
                 0o755
             );
-            assert_eq!(directory_entries(&bin_dir), ["ocm"]);
+            assert_eq!(directory_entries(&bin_dir), ["ocm"], "{case}");
         } else {
-            assert!(directory_entries(&bin_dir).is_empty());
+            assert!(directory_entries(&bin_dir).is_empty(), "{case}");
         }
     }
 }
