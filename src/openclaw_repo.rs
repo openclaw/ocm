@@ -655,7 +655,7 @@ fn pnpm_destinations(repo_root: &Path, output: &[u8]) -> Result<PnpmDestinations
 
 /// Which lockfiles a frozen install reads, following pnpm 12.15's selection.
 enum LockfileSelection {
-    /// The first of these branch lockfiles that exists, else `pnpm-lock.yaml`.
+    /// The first of these branch lockfiles pnpm can load, else `pnpm-lock.yaml`.
     Branch(Vec<String>),
     /// `pnpm-lock.yaml` and every branch lockfile, merged.
     Merge,
@@ -714,23 +714,44 @@ fn current_git_branch(repo_root: &Path) -> Option<String> {
     (output.status.success() && !branch.is_empty()).then(|| branch.to_string())
 }
 
+/// The branches containing HEAD, as pnpm lists them: local and remote-tracking
+/// branches (the latter under their name without the remote), symbolic refs
+/// skipped, sorted and deduplicated.
 fn git_branches_containing_head(repo_root: &Path) -> Vec<String> {
-    git_command()
+    let Some(text) = git_command()
         .arg("-C")
         .arg(repo_root)
-        .args(["branch", "--contains", "HEAD", "--format=%(refname:short)"])
+        .args([
+            "for-each-ref",
+            "refs/heads",
+            "refs/remotes",
+            "--contains",
+            "HEAD",
+            "--format=%(refname) %(symref)",
+        ])
         .output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|text| {
-            text.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty() && !line.starts_with('('))
-                .map(str::to_string)
-                .collect()
+    else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (name, symref) = line.split_once(' ')?;
+            if !symref.trim().is_empty() {
+                return None;
+            }
+            name.strip_prefix("refs/heads/").or_else(|| {
+                name.strip_prefix("refs/remotes/")?
+                    .split_once('/')
+                    .map(|(_, branch)| branch)
+            })
         })
-        .unwrap_or_default()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// pnpm's `pnpm-lock.<branch>.yaml` name: ASCII letters, digits, `_`, `.` and
@@ -801,81 +822,110 @@ fn pnpm_pattern_matches(patterns: &[String], input: &str) -> bool {
     }
 }
 
-/// The projects a frozen install links: the `importers` of the lockfiles pnpm
-/// reads at the lockfile root, across all of a lockfile's YAML documents.
+/// The projects a frozen install links: the `importers` of the lockfile pnpm
+/// loads, read as pnpm 12.15 reads it. The read order is the selection's
+/// candidates, then `pnpm-lock.yaml`; the first file whose main document is not
+/// empty is used (a missing, empty or environment-only file is skipped). When
+/// merging, every effective branch lockfile is folded in as well.
 fn lockfile_projects(
     lockfile_root: &Path,
     selection: &LockfileSelection,
 ) -> Result<Vec<String>, String> {
-    let names: Vec<String> = match selection {
-        LockfileSelection::Branch(candidates) => vec![
-            candidates
-                .iter()
-                .find(|name| lockfile_root.join(name).is_file())
-                .cloned()
-                .unwrap_or_else(|| "pnpm-lock.yaml".to_string()),
-        ],
-        LockfileSelection::Merge => {
-            let mut names = vec!["pnpm-lock.yaml".to_string()];
-            match fs::read_dir(lockfile_root) {
-                Ok(entries) => {
-                    for entry in entries {
-                        let entry = entry.map_err(|error| {
-                            format!(
-                                "failed inspecting pnpm lockfiles in {}: {error}",
-                                display_path(lockfile_root)
-                            )
-                        })?;
-                        if let Some(name) = entry.file_name().to_str()
-                            && is_git_branch_lockfile_name(name)
-                        {
-                            names.push(name.to_string());
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "failed inspecting pnpm lockfiles in {}: {error}",
-                        display_path(lockfile_root)
-                    ));
-                }
-            }
-            names
-        }
-    };
     let mut projects = Vec::new();
-    for name in names {
-        let path = lockfile_root.join(&name);
-        if !path.exists() {
-            continue;
+    let read_order: Vec<String> = match selection {
+        LockfileSelection::Branch(candidates) => candidates
+            .iter()
+            .cloned()
+            .chain(["pnpm-lock.yaml".to_string()])
+            .collect(),
+        LockfileSelection::Merge => vec!["pnpm-lock.yaml".to_string()],
+    };
+    let mut loaded = false;
+    for name in read_order {
+        if lockfile_importers(&lockfile_root.join(name), &mut projects)? {
+            loaded = true;
+            break;
         }
-        let unreadable = || {
-            format!(
-                "could not read the projects in {}; prepare the dependencies explicitly",
-                display_path(&path)
-            )
-        };
-        let text = fs::read(&path).map_err(|_| unreadable())?;
-        for document in serde_yaml::Deserializer::from_slice(&text) {
-            let document = <serde_yaml::Value as serde::Deserialize>::deserialize(document)
-                .map_err(|_| unreadable())?;
-            let Some(importers) = document
-                .get("importers")
-                .and_then(|value| value.as_mapping())
-            else {
-                continue;
-            };
-            for project in importers.keys() {
-                match project {
-                    serde_yaml::Value::String(project) => projects.push(project.clone()),
-                    serde_yaml::Value::Number(project) => projects.push(project.to_string()),
-                    _ => return Err(unreadable()),
-                }
+    }
+    if loaded && matches!(selection, LockfileSelection::Merge) {
+        let entries = match fs::read_dir(lockfile_root) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return Err(format!(
+                    "failed inspecting pnpm lockfiles in {}: {error}",
+                    display_path(lockfile_root)
+                ));
             }
+        };
+        let mut branch_files = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "failed inspecting pnpm lockfiles in {}: {error}",
+                    display_path(lockfile_root)
+                )
+            })?;
+            if let Some(name) = entry.file_name().to_str()
+                && is_git_branch_lockfile_name(name)
+            {
+                branch_files.push(entry.path());
+            }
+        }
+        branch_files.sort();
+        for path in branch_files {
+            lockfile_importers(&path, &mut projects)?;
         }
     }
     Ok(projects)
+}
+
+/// Adds the importers of the lockfile at `path` and reports whether pnpm would
+/// load it: false for a missing file or an empty main document.
+fn lockfile_importers(path: &Path, projects: &mut Vec<String>) -> Result<bool, String> {
+    let unreadable = || {
+        format!(
+            "could not read the projects in {}; prepare the dependencies explicitly",
+            display_path(path)
+        )
+    };
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(unreadable()),
+    };
+    // pnpm strips a byte-order mark, normalizes CRLF and reads only the main
+    // document, the one after a leading environment document.
+    let text = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&text)
+        .replace("\r\n", "\n");
+    let main = match text.strip_prefix("---\n") {
+        Some(rest) => rest
+            .find("\n---\n")
+            .map_or("", |index| &rest[index + "\n---\n".len()..]),
+        None => text.as_str(),
+    };
+    if main.trim().is_empty() {
+        return Ok(false);
+    }
+    for document in serde_yaml::Deserializer::from_str(main) {
+        let document = <serde_yaml::Value as serde::Deserialize>::deserialize(document)
+            .map_err(|_| unreadable())?;
+        let Some(importers) = document
+            .get("importers")
+            .and_then(|value| value.as_mapping())
+        else {
+            continue;
+        };
+        for project in importers.keys() {
+            match project {
+                serde_yaml::Value::String(project) => projects.push(project.clone()),
+                serde_yaml::Value::Number(project) => projects.push(project.to_string()),
+                _ => return Err(unreadable()),
+            }
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn default_worktree_root(repo_root: &Path, env_name: &str) -> PathBuf {
@@ -2112,6 +2162,18 @@ mod tests {
         fs::write(repo.join("pnpm-lock.old.yaml"), "importers: [unclosed\n").unwrap();
         check(serde_json::json!({})).unwrap();
         check(serde_json::json!({"gitBranchLockfile": true})).unwrap();
+        // An empty or environment-only branch lockfile falls back to the shared one.
+        std::os::unix::fs::symlink(&borrowed, repo.join("ui/node_modules")).unwrap();
+        for empty in [
+            "",
+            "---\nlockfileVersion: '9.0'\nimporters:\n  .:\n    configDependencies: {}\n",
+        ] {
+            fs::write(repo.join("pnpm-lock.main.yaml"), empty).unwrap();
+            let error = check(serde_json::json!({"gitBranchLockfile": true})).unwrap_err();
+            assert!(error.contains("ui/node_modules"), "{error}");
+        }
+        fs::remove_file(repo.join("ui/node_modules")).unwrap();
+        fs::remove_file(repo.join("pnpm-lock.main.yaml")).unwrap();
         fs::write(
             repo.join("pnpm-lock.main.yaml"),
             "importers:\n  extensions/b: {}\n",
@@ -2134,6 +2196,41 @@ mod tests {
         fs::write(repo.join("pnpm-lock.main.yaml"), "importers: [unclosed\n").unwrap();
         let error = check(serde_json::json!({"gitBranchLockfile": true})).unwrap_err();
         assert!(error.contains("pnpm-lock.main.yaml"), "{error}");
+        // A detached HEAD reads the files of the branches containing it, remote
+        // tracking branches included under their branch name.
+        fs::write(
+            repo.join("pnpm-lock.release.yaml"),
+            "importers:\n  extensions/b: {}\n",
+        )
+        .unwrap();
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        );
+        run_git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/release", "HEAD"],
+        );
+        run_git(&repo, &["checkout", "-q", "--detach"]);
+        run_git(&repo, &["branch", "-q", "-D", "main"]);
+        assert_eq!(
+            super::git_branches_containing_head(&repo),
+            vec!["release".to_string()]
+        );
+        let error = check(serde_json::json!({"gitBranchLockfile": true})).unwrap_err();
+        assert!(error.contains("extensions/b"), "{error}");
         fs::write(repo.join("pnpm-lock.yaml"), "importers: [unclosed\n").unwrap();
         let error = check(serde_json::json!({})).unwrap_err();
         assert!(error.contains("could not read the projects"), "{error}");
