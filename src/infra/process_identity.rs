@@ -61,6 +61,124 @@ pub(crate) fn process_group_members(group: u32) -> Result<Vec<ProcessObservation
     Ok(members)
 }
 
+/// Whether any member of `process_group` is still running. Zombies do not
+/// count: their parent may never reap them.
+#[cfg(unix)]
+pub(crate) fn process_group_has_live_members(process_group: u32) -> Result<bool, String> {
+    // PID 0 is never a process group member.
+    process_group_has_live_members_except(process_group, 0)
+}
+
+/// Like `process_group_has_live_members`, ignoring the process `except`.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_group_has_live_members_except(
+    process_group: u32,
+    except: u32,
+) -> Result<bool, String> {
+    for entry in fs::read_dir("/proc")
+        .map_err(|error| format!("failed reading /proc for process group members: {error}"))?
+    {
+        let entry = entry.map_err(|error| {
+            format!("failed reading /proc entry for process group members: {error}")
+        })?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .filter(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == except {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let fields = fields.split_whitespace().collect::<Vec<_>>();
+        let is_zombie = matches!(fields.first().copied(), Some("Z" | "X"));
+        let in_group =
+            fields.get(2).and_then(|value| value.parse::<u32>().ok()) == Some(process_group);
+        if in_group && !is_zombie {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_group_has_live_members_except(
+    process_group: u32,
+    except: u32,
+) -> Result<bool, String> {
+    let capacity = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if capacity <= 0 {
+        return Err(format!(
+            "failed listing processes: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let mut pids = vec![0_i32; capacity as usize];
+    let count = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<i32>()) as i32,
+        )
+    };
+    if count < 0 {
+        return Err(format!(
+            "failed reading the process list: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    for pid in pids
+        .into_iter()
+        .take(count as usize)
+        .filter(|pid| *pid > 0 && *pid as u32 != except)
+    {
+        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of_val(&info) as i32,
+            )
+        };
+        if read == std::mem::size_of_val(&info) as i32
+            && info.pbi_pgid == process_group
+            && info.pbi_status != libc::SZOMB
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Without a process list, a group signal probe cannot exclude `except` and
+/// counts zombies; callers must treat a positive answer as uncertain.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) fn process_group_has_live_members_except(
+    process_group: u32,
+    _except: u32,
+) -> Result<bool, String> {
+    if unsafe { libc::kill(-(process_group as libc::pid_t), 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "failed probing process group {process_group}: {error}"
+        ))
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn process_scope_id() -> Result<Option<String>, String> {
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")

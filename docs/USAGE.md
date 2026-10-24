@@ -538,6 +538,28 @@ that service registration and repair are managed outside OpenClaw in this
 context. Commands like `openclaw doctor --fix` can still repair normal env
 state, but background service lifecycle should be handled with `ocm service`.
 
+On Unix, `ocm @<env> --`, `ocm env run` and `ocm env exec` start the command
+in its own process group and return only after it has exited. A SIGTERM,
+SIGINT, SIGQUIT or SIGHUP sent to the OCM process is passed on to that group,
+including processes started by a launcher's shell, so `kill <ocm pid>` also
+stops a foreground Gateway. In a terminal, the command's group holds the
+foreground while it runs, so Ctrl-C reaches it once, directly, and Ctrl-Z
+suspends OCM along with it. After passing a signal on, or when the command dies
+from Ctrl-C or a hangup, OCM also waits for the rest of its process group. If
+that SIGTERM, SIGINT or SIGHUP is what ended the command, OCM then ends by the
+same signal instead of exiting with 128 plus its number, so a calling shell or
+supervisor sees the interruption. SIGKILL cannot be passed on: sent to OCM or
+its process group, it stops OCM alone.
+
+When OCM shares its terminal job with other processes, for example in
+`ocm env exec mira -- openclaw logs | less` or under a script that runs it in
+the foreground, the command stays in that job instead, so the pager or script
+keeps the terminal. Terminal keys then reach every process in the job, and the
+four signals above, sent to OCM, are passed on to the command itself, which may
+therefore see a terminal key twice. In that case processes started by a
+launcher's shell are only signalled if the shell replaces itself with the
+command; `dash`, the usual Linux `sh`, does not.
+
 ### Export one bounded artifact
 
 On Unix, export a file relative to an environment's `OPENCLAW_HOME` without
