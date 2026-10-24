@@ -611,12 +611,14 @@ within the normal readiness timeout. HTTP environments retain the ordinary
 HTTP health check.
 
 The `URL` in `service status <env>`, and the `url=`/`URL` output of
-`dev <env> --service` and of a service restored after `dev` watch, use
-`https://` when the Gateway's TLS setting in that launch context is enabled, or
-was observed enabled before an inaccessible include, and `http://` otherwise.
-These outputs only read local configuration: they never run the native config
-lookup, so a TLS setting visible only to that lookup is not reflected. JSON and
-raw `service status` output contain no URL.
+`dev <env> --service` and of a service restored after `dev` or source watch, use
+`https://` when the Gateway's TLS setting is enabled, or was observed enabled
+before an inaccessible include, and `http://` otherwise. The setting is read in
+the service's launch context: the plan the daemon launched for a running
+Gateway, otherwise its current binding's plan. These outputs only read local
+configuration: they never run the native config lookup, so a TLS setting visible
+only to that lookup is not reflected. JSON and raw `service status` output
+contain no URL.
 
 On Unix, OCM waits for Gateway PID publication before moving a matching caller
 out of the Gateway process group during daemon refresh, snapshot, or upgrade

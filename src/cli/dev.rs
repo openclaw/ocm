@@ -2289,15 +2289,22 @@ impl Cli {
         }
     }
 
-    /// The service's Gateway URL in the dev source launch context `dev status` uses.
+    /// The Gateway URL `service status` advertises for the started or restored
+    /// service, in that service's own launch context and binding.
     fn dev_service_gateway_url(&self, meta: &EnvMeta) -> String {
-        let port = meta.gateway_port.unwrap_or_default();
-        let Some(dev) = meta.dev.as_ref() else {
-            return crate::store::loopback_gateway_url(port, false);
-        };
-        let run_dir = Path::new(dev.source_root());
-        let env = build_openclaw_dev_source_env(meta, &self.env, run_dir);
-        crate::store::gateway_url_for_launch(meta, port, run_dir, &env)
+        self.service_service()
+            .status_with_gateway_url(&meta.name)
+            .ok()
+            .and_then(|status| status.gateway_url)
+            .unwrap_or_else(|| {
+                // An unreadable status still reads the environment's own config.
+                crate::store::gateway_url_for_launch(
+                    meta,
+                    meta.gateway_port.unwrap_or_default(),
+                    Path::new(&meta.root),
+                    &build_openclaw_env(meta, &self.env),
+                )
+            })
     }
 
     fn dev_stdout_profile(&self) -> RenderProfile {

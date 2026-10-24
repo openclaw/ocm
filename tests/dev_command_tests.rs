@@ -6022,6 +6022,54 @@ fn dev_watch_force_takes_over_runtime_env_without_rebinding() {
 
 #[cfg(unix)]
 #[test]
+fn source_watch_restore_of_a_runtime_env_uses_its_configured_gateway_transport() {
+    for tls in [false, true] {
+        let root = TestDir::new(&format!("dev-command-runtime-restore-transport-{tls}"));
+        let repo = init_openclaw_repo(&root);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env_with_gateway_admission(&root);
+        install_fake_dev_runners(&root, &mut env);
+        create_runtime_backed_env(&cwd, &env);
+        let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        let show: Value = serde_json::from_str(&stdout(&show)).unwrap();
+        let config_path = PathBuf::from(show["configPath"].as_str().unwrap());
+        let mut config: Value = fs::read(&config_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        config["gateway"]["tls"] = serde_json::json!({"enabled": tls});
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(start.status.success(), "{}", stderr(&start));
+        let watch = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "dev",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--force",
+                "--no-ui",
+            ],
+        );
+        assert!(watch.status.success(), "{}", stderr(&watch));
+        assert!(stdout(&watch).contains("service restored for demo"));
+        assert!(stdout(&watch).contains("binding=unchanged"));
+        let url = format!(
+            "url={}://127.0.0.1:21901\n",
+            if tls { "https" } else { "http" }
+        );
+        assert!(stdout(&watch).contains(&url), "{}", stdout(&watch));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_takeover_retains_its_source_when_the_selected_alias_is_retargeted() {
     let root = TestDir::new("dev-takeover-source-alias");
     let other = TestDir::new("dev-takeover-other-source");

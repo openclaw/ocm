@@ -188,14 +188,27 @@ fn service_status_observation(
     let meta = env_service.get(name)?;
     let snapshot = load_service_snapshot(env, cwd, false)?;
 
-    build_service_summary(
+    let mut status = build_service_summary(
         &env_service,
         &meta,
         env,
         cwd,
         &snapshot,
         include_gateway_url,
-    )
+    )?;
+    if include_gateway_url {
+        // A running child uses the persisted plan the daemon launched, as
+        // readiness observes it, not the plan rebuilt from this caller.
+        if let Some(child) = running_child_spec(name, env, cwd, &snapshot, &status)? {
+            status.gateway_url = Some(gateway_url_for_launch(
+                &meta,
+                status.gateway_port,
+                Path::new(&child.run_dir),
+                &child.process_env,
+            ));
+        }
+    }
+    Ok(status)
 }
 
 pub(crate) fn service_status_for_readiness(
@@ -215,6 +228,17 @@ pub(super) fn service_readiness_observation(
     let meta = env_service.get(name)?;
     let snapshot = load_service_snapshot(env, cwd, true)?;
     let status = build_service_summary(&env_service, &meta, env, cwd, &snapshot, false)?;
+    let child = running_child_spec(name, env, cwd, &snapshot, &status)?;
+    Ok((status, child))
+}
+
+fn running_child_spec(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    snapshot: &ServiceSnapshot,
+    status: &ServiceSummary,
+) -> Result<Option<SupervisorChildSpec>, String> {
     // Informational plans are rebuilt from the caller environment. Readiness
     // needs the persisted plan actually consumed by the spawning daemon, which
     // self-update intentionally preserves across executable replacement.
@@ -223,7 +247,11 @@ pub(super) fn service_readiness_observation(
     } else {
         None
     };
-    let child = child.filter(|planned| {
+    // A new plan can be published before its replacement child starts. Never
+    // query the new configuration on behalf of the still-running old child.
+    // Older records have no spec hash and retain their authoritative observed
+    // child port, which may differ from the currently planned port.
+    Ok(child.filter(|planned| {
         snapshot.runtime_children.get(name).is_none_or(|running| {
             running.binding_kind == planned.binding_kind
                 && running.binding_name == planned.binding_name
@@ -232,12 +260,7 @@ pub(super) fn service_readiness_observation(
                     .as_ref()
                     .is_none_or(|hash| planned.launch_spec_sha256().as_ref() == Some(hash))
         })
-    });
-    // A new plan can be published before its replacement child starts. Never
-    // query the new configuration on behalf of the still-running old child.
-    // Older records have no spec hash and retain their authoritative observed
-    // child port, which may differ from the currently planned port.
-    Ok((status, child))
+    }))
 }
 
 fn load_service_snapshot(
@@ -311,7 +334,7 @@ fn build_service_summary(
         .as_ref()
         .and_then(|result| result.as_ref().err().cloned());
     let resolved_process = resolved_process.and_then(Result::ok);
-    // Use the planned or resolved launch context, as Gateway readiness does.
+    // Without a running child, use the planned or resolved launch context.
     let gateway_url =
         include_gateway_url.then(|| match (planned_child, resolved_process.as_ref()) {
             (Some(child), _) => gateway_url_for_launch(
