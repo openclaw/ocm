@@ -491,6 +491,59 @@ fn source_watch_override_takes_precedence_for_resolve_and_run() {
 }
 
 #[test]
+fn env_status_reports_an_active_source_watch_without_refused_service_steps() {
+    let root = TestDir::new("source-watch-env-status");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let source_repo = create_source_repo(&root);
+    let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
+    create_runtime_backed_env(&root, &cwd, &env);
+    let env_status = |flag: &str| {
+        let output = run_ocm(&cwd, &env, &["env", "status", "demo", flag]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        stdout(&output)
+    };
+
+    // A foreground session without a service, then a taken-over installed service.
+    for (service_enabled, refused) in [
+        (false, "ocm service install demo"),
+        (true, "ocm service start demo"),
+    ] {
+        EnvironmentService::new(&env, &cwd)
+            .set_service_policy("demo", Some(service_enabled), Some(false))
+            .unwrap();
+        let watch = lock_source_watch(&root);
+        write_active_source_watch_override(&root, &source_repo);
+
+        let status: Value = serde_json::from_str(&env_status("--json")).unwrap();
+        assert_eq!(status["resolvedKind"], "source-watch");
+        assert_eq!(status["openclawState"], "running");
+        assert!(env_status("--raw").contains("openclawState: running"));
+        let card = env_status("--color=always");
+        assert!(card.contains("ocm dev status demo"), "{card}");
+        for refused in [refused, "ocm service restart demo"] {
+            assert!(!card.contains(refused), "{card}");
+        }
+        let refusal = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(
+            stderr(&refusal).contains("cannot start while source watch is active"),
+            "{}",
+            stderr(&refusal)
+        );
+
+        // Once the session ends, status and its service guidance come from the service again.
+        drop(watch);
+        let status: Value = serde_json::from_str(&env_status("--json")).unwrap();
+        assert_eq!(status["resolvedKind"], "runtime");
+        assert_eq!(status["openclawState"], "stopped");
+        let card = env_status("--color=always");
+        assert!(card.contains(refused), "{card}");
+        assert!(!card.contains("ocm dev status demo"), "{card}");
+    }
+}
+
+#[test]
 fn source_watch_blocks_direct_service_policy_changes() {
     let root = TestDir::new("source-watch-service-policy");
     let cwd = root.child("workspace");

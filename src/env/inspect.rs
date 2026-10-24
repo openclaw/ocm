@@ -84,6 +84,12 @@ impl<'a> EnvironmentService<'a> {
         }
 
         if let Some(source) = self.active_source_watch_override(&env.name)? {
+            // The active foreground watch owns this env's Gateway, so the service
+            // projection's state does not describe it. Unresolved service ownership
+            // still reports `unknown` so its inspection keeps priority.
+            if summary.openclaw_state.as_deref() != Some("unknown") {
+                summary.openclaw_state = Some("running".to_string());
+            }
             summary.resolved_kind = Some("source-watch".to_string());
             summary.resolved_name = Some("source-watch".to_string());
             summary.command = Some(source.command_label());
