@@ -198,8 +198,9 @@ fn service_status_observation(
     )?;
     if include_gateway_url {
         // A running child uses the persisted plan the daemon launched, as
-        // readiness observes it, not the plan rebuilt from this caller.
-        if let Some(child) = running_child_spec(name, env, cwd, &snapshot, &status)? {
+        // readiness observes it, not the plan rebuilt from this caller. An
+        // unreadable plan keeps the current one rather than failing status.
+        if let Ok(Some(child)) = running_child_spec(name, env, cwd, &snapshot, &status) {
             status.gateway_url = Some(gateway_url_for_launch(
                 &meta,
                 status.gateway_port,

@@ -501,6 +501,19 @@ fn service_readiness_probes_http_and_tls_across_start_and_forced_restart() {
 }
 
 #[test]
+fn service_status_url_survives_an_unreadable_persisted_plan() {
+    let fixture = ReadinessFixture::new("tls", "explicit");
+    fixture.action(&["service", "start", "demo", "--json"], true);
+    let state = ocm::store::supervisor_state_path(&fixture.env, &fixture.cwd).unwrap();
+    let original = fs::read(&state).unwrap();
+    // Only the URL uses the launched plan; status keeps rendering without it.
+    fs::write(&state, b"not json").unwrap();
+    fixture.assert_status_url(true);
+    fs::write(&state, original).unwrap();
+    fixture.stop();
+}
+
+#[test]
 fn service_readiness_resolves_included_tls_and_config_env_relative_certificate() {
     let mut fixture = ReadinessFixture::new("tls", "include");
     // A caller shell must not override the supervised Gateway's config.env.vars.
