@@ -133,10 +133,22 @@ impl OpenClawRuntimeStateCleanup {
     }
 
     pub(crate) fn apply(&self) -> Result<bool, String> {
-        for path in &self.removals {
-            remove_path(path)?;
-        }
+        self.apply_recording(&mut Vec::new())?;
         Ok(!self.removals.is_empty())
+    }
+
+    /// Records each removal as it completes, so a failure can report what is already gone.
+    pub(crate) fn apply_recording(&self, removed: &mut Vec<PathBuf>) -> Result<(), String> {
+        for path in &self.removals {
+            remove_path(path).map_err(|error| {
+                format!(
+                    "could not finish removing {}, part of it may already be gone: {error}",
+                    display_path(path)
+                )
+            })?;
+            removed.push(path.clone());
+        }
+        Ok(())
     }
 }
 
@@ -3357,21 +3369,36 @@ fn collect_runtime_state_path_refs(
     if let Ok(history) = IntegrityProtectedLibraryPaths::new(&paths.state_dir) {
         history.preserve_in(&mut workspaces);
     }
-    visit_runtime_state_files(
-        &paths.state_dir,
-        &paths.state_dir,
-        &paths.config_path,
-        &workspaces,
-        &mut |path| {
-            if is_integrity_protected_history_path(&paths.state_dir, path) {
-                return;
-            }
-            let Ok(raw) = fs::read_to_string(path) else {
-                return;
-            };
-
-            for token in candidate_path_tokens(&raw) {
-                let candidate = Path::new(token);
+    // A copied environment carries its source's session transcripts, whose
+    // headers record the directory each session ran in. Any other text,
+    // including transcript messages, logs and notes, may mention arbitrary
+    // paths in a live environment, so it is not evidence of a copy.
+    let agents = paths.state_dir.join("agents");
+    if !is_real_dir(&agents) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(&agents) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let sessions = entry.path().join("sessions");
+        if !is_real_dir(&entry.path()) || !is_real_dir(&sessions) || workspaces.contains(&sessions)
+        {
+            continue;
+        }
+        visit_runtime_state_files(
+            &paths.state_dir,
+            &sessions,
+            &paths.config_path,
+            &workspaces,
+            &mut |path| {
+                if is_integrity_protected_history_path(&paths.state_dir, path) {
+                    return;
+                }
+                let Some(cwd) = session_header_cwd(path) else {
+                    return;
+                };
+                let candidate = Path::new(&cwd);
                 if let Some((env_name, env_root)) =
                     matching_foreign_env_root(current, known_envs, candidate)
                 {
@@ -3379,14 +3406,38 @@ fn collect_runtime_state_path_refs(
                         .entry(env_name)
                         .or_insert_with(|| (env_root.clone(), 0));
                     entry.1 += 1;
-                    continue;
+                    return;
                 }
                 if let Some(env_root) = inferred_foreign_env_root(&paths.root, candidate) {
                     *inferred_refs.entry(env_root).or_insert(0) += 1;
                 }
-            }
+            },
+        );
+    }
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+// Session headers are short; a first line beyond this bound is not one.
+const SESSION_HEADER_LIMIT: u64 = 64 * 1024;
+
+fn session_header_cwd(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(file.take(SESSION_HEADER_LIMIT)),
+        &mut line,
+    )
+    .ok()?;
+    match serde_json::from_str::<Value>(&line).ok()? {
+        Value::Object(mut header) => match header.remove("cwd")? {
+            Value::String(cwd) => Some(cwd),
+            _ => None,
         },
-    );
+        _ => None,
+    }
 }
 
 fn visit_runtime_state_files(
@@ -3420,17 +3471,6 @@ fn visit_runtime_state_files(
             on_file(&path);
         }
     }
-}
-
-fn candidate_path_tokens(raw: &str) -> impl Iterator<Item = &str> {
-    raw.split(|ch: char| {
-        ch.is_whitespace()
-            || matches!(
-                ch,
-                '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
-            )
-    })
-    .filter(|token| !token.is_empty())
 }
 
 fn matching_foreign_env_root(
@@ -3893,6 +3933,65 @@ mod tests {
         )));
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn audit_ignores_foreign_paths_outside_session_headers() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        let target_root = temp.path().join("target");
+        let current = meta("target", &display_path(&target_root));
+        let known_envs = vec![meta("source", &display_path(&source_root)), current.clone()];
+        let state = target_root.join(".openclaw");
+        let foreign = display_path(&source_root.join(".openclaw/workspace"));
+        let foreign_json = serde_json::to_string(&foreign).unwrap();
+        for (relative, content) in [
+            ("logs/gateway.log", format!("ls {foreign}\n")),
+            (
+                "memory/notes.md",
+                "/home/someone/.openclaw/openclaw.json\n".to_string(),
+            ),
+            (
+                "credentials/oauth.json",
+                format!("{{\"path\":{foreign_json}}}\n"),
+            ),
+            (
+                "agents/main/sessions/message.jsonl",
+                format!(
+                    "{{\"type\":\"message\",\"text\":{foreign_json}}}\n{{\"cwd\":{foreign_json}}}\n"
+                ),
+            ),
+            (
+                "agents/main/sessions/number.jsonl",
+                "{\"cwd\":1}\n".to_string(),
+            ),
+            (
+                "agents/main/sessions/long.jsonl",
+                format!(
+                    "{{\"pad\":\"{}\",\"cwd\":{foreign_json}}}\n",
+                    "x".repeat(SESSION_HEADER_LIMIT as usize)
+                ),
+            ),
+        ] {
+            let path = state.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let audit = audit_openclaw_state(&current, &known_envs, &BTreeMap::new());
+        assert!(!audit.repair_runtime_state, "{:?}", audit.issues);
+        assert!(audit.issues.is_empty(), "{:?}", audit.issues);
+
+        fs::write(
+            state.join("agents/main/sessions/copied.jsonl"),
+            format!("{{\"type\":\"session\",\"cwd\":{foreign_json}}}\n"),
+        )
+        .unwrap();
+        let audit = audit_openclaw_state(&current, &known_envs, &BTreeMap::new());
+        assert!(audit.repair_runtime_state);
+        assert_eq!(audit.issues.len(), 1, "{:?}", audit.issues);
+        assert!(audit.issues[0].contains(
+            "OpenClaw runtime state contains 1 copied path reference(s) under env \"source\" root"
+        ));
     }
 
     #[cfg(unix)]

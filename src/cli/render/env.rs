@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::cli::env::EnvDestroySummary;
 use crate::env::{
-    EnvCleanupBatchSummary, EnvCleanupSummary, EnvDoctorSummary, EnvExportSummary,
-    EnvImportSummary, EnvSnapshotRemoveSummary, EnvSnapshotRestoreSummary, EnvSnapshotSummary,
-    EnvStatusSummary, EnvSummary, ExecutionSummary,
+    EnvCleanupActionSummary, EnvCleanupBatchSummary, EnvCleanupSummary, EnvDoctorSummary,
+    EnvExportSummary, EnvImportSummary, EnvSnapshotRemoveSummary, EnvSnapshotRestoreSummary,
+    EnvSnapshotSummary, EnvStatusSummary, EnvSummary, ExecutionSummary,
 };
 use crate::infra::terminal::{
     Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table, render_table_with_limit,
@@ -917,7 +917,54 @@ pub fn env_cleanup_batch(cleanup: &EnvCleanupBatchSummary, profile: RenderProfil
         &rows,
         profile.color,
     ));
+    for result in &cleanup.results {
+        push_cleanup_removals(
+            &mut lines,
+            &format!(
+                "{} {}",
+                cleanup_removals_title(cleanup.apply),
+                result.env_name
+            ),
+            &result.actions,
+            profile.color,
+        );
+    }
     lines
+}
+
+fn cleanup_removals_title(apply: bool) -> &'static str {
+    if apply {
+        "Removed from"
+    } else {
+        "Removes from"
+    }
+}
+
+fn push_cleanup_removals(
+    lines: &mut Vec<String>,
+    title: &str,
+    actions: &[EnvCleanupActionSummary],
+    color: bool,
+) {
+    let rows = actions
+        .iter()
+        .flat_map(|action| &action.removals)
+        .map(|path| KeyValueRow::warning("Path", path.clone()))
+        .collect();
+    push_card(lines, title, rows, color);
+}
+
+fn push_raw_cleanup_action(
+    lines: &mut Vec<String>,
+    indent: &str,
+    apply: bool,
+    action: &EnvCleanupActionSummary,
+) {
+    lines.push(format!("{indent}{}: {}", action.kind, action.description));
+    let verb = if apply { "removed" } else { "removes" };
+    for path in &action.removals {
+        lines.push(format!("{indent}  {verb}: {path}"));
+    }
 }
 
 fn env_cleanup_batch_raw(cleanup: &EnvCleanupBatchSummary) -> Vec<String> {
@@ -935,7 +982,7 @@ fn env_cleanup_batch_raw(cleanup: &EnvCleanupBatchSummary) -> Vec<String> {
             lines.push(format!("    safe fixes: {}", result.actions.len()));
         }
         for action in &result.actions {
-            lines.push(format!("    {}: {}", action.kind, action.description));
+            push_raw_cleanup_action(&mut lines, "    ", result.apply, action);
         }
     }
     lines
@@ -972,6 +1019,12 @@ pub fn env_cleanup(cleanup: &EnvCleanupSummary, profile: RenderProfile) -> Vec<S
             .map(|action| KeyValueRow::plain(&action.kind, action.description.clone()))
             .collect::<Vec<_>>();
         push_card(&mut lines, "Plan", actions, profile.color);
+        push_cleanup_removals(
+            &mut lines,
+            if cleanup.apply { "Removed" } else { "Removes" },
+            &cleanup.actions,
+            profile.color,
+        );
     }
     if cleanup.apply {
         if let Some(healthy_after) = cleanup.healthy_after {
@@ -1017,7 +1070,7 @@ fn env_cleanup_raw(cleanup: &EnvCleanupSummary) -> Vec<String> {
         lines.push(format!("  safe fixes: {}", cleanup.actions.len()));
     }
     for action in &cleanup.actions {
-        lines.push(format!("  {}: {}", action.kind, action.description));
+        push_raw_cleanup_action(&mut lines, "  ", cleanup.apply, action);
     }
     if cleanup.apply {
         if let Some(healthy_after) = cleanup.healthy_after {
@@ -1263,14 +1316,80 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        RenderProfile, env_destroy_preview, env_destroyed, env_doctor, env_list, env_resolved,
-        env_show, env_snapshot_list_with_width, env_snapshot_prune_preview, env_snapshot_show,
-        env_status,
+        RenderProfile, env_cleanup, env_cleanup_batch, env_destroy_preview, env_destroyed,
+        env_doctor, env_list, env_resolved, env_show, env_snapshot_list_with_width,
+        env_snapshot_prune_preview, env_snapshot_show, env_status,
     };
     use crate::cli::env::{EnvDestroyStepSummary, EnvDestroySummary};
     use crate::env::{
-        EnvDoctorSummary, EnvSnapshotSummary, EnvStatusSummary, EnvSummary, ExecutionSummary,
+        EnvCleanupActionSummary, EnvCleanupBatchSummary, EnvCleanupSummary, EnvDoctorSummary,
+        EnvSnapshotSummary, EnvStatusSummary, EnvSummary, ExecutionSummary,
     };
+
+    fn cleanup_with_reset(apply: bool) -> EnvCleanupSummary {
+        EnvCleanupSummary {
+            env_name: "demo".to_string(),
+            root: "/tmp/demo".to_string(),
+            apply,
+            default_runtime: None,
+            default_launcher: None,
+            healthy_before: false,
+            healthy_after: apply.then_some(true),
+            actions: vec![EnvCleanupActionSummary {
+                kind: "reset-openclaw-runtime-state".to_string(),
+                description: "clear copied OpenClaw runtime state outside config and workspace"
+                    .to_string(),
+                applied: apply,
+                removals: vec![
+                    ".openclaw/credentials".to_string(),
+                    ".openclaw/logs".to_string(),
+                ],
+            }],
+            issues_before: Vec::new(),
+            issues_after: apply.then(Vec::new),
+        }
+    }
+
+    #[test]
+    fn env_cleanup_lists_each_runtime_state_removal() {
+        for apply in [false, true] {
+            let (card, verb) = if apply {
+                ("Removed", "removed")
+            } else {
+                ("Removes", "removes")
+            };
+            let cleanup = cleanup_with_reset(apply);
+            let pretty = env_cleanup(&cleanup, RenderProfile::pretty(false));
+            assert!(pretty.iter().any(|line| line.contains(card)), "{pretty:?}");
+            for path in [".openclaw/credentials", ".openclaw/logs"] {
+                assert!(pretty.iter().any(|line| line.contains(path)), "{pretty:?}");
+            }
+            let raw = env_cleanup(&cleanup, RenderProfile::raw());
+            assert!(
+                raw.contains(&format!("    {verb}: .openclaw/credentials")),
+                "{raw:?}"
+            );
+
+            let batch = EnvCleanupBatchSummary {
+                apply,
+                count: 1,
+                results: vec![cleanup],
+            };
+            let pretty = env_cleanup_batch(&batch, RenderProfile::pretty(false));
+            assert!(
+                pretty
+                    .iter()
+                    .any(|line| line.contains(&format!("{card} from demo"))),
+                "{pretty:?}"
+            );
+            assert!(pretty.iter().any(|line| line.contains(".openclaw/logs")));
+            let raw = env_cleanup_batch(&batch, RenderProfile::raw());
+            assert!(
+                raw.contains(&format!("      {verb}: .openclaw/logs")),
+                "{raw:?}"
+            );
+        }
+    }
 
     #[test]
     fn env_list_pretty_uses_a_table() {
