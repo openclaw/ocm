@@ -564,6 +564,7 @@ fn complete_migration_import(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut copying = OpenClawDirectoryCopy::new(source_home, source_home)?;
+    copying.relocate_internal_links(source_home, &target_paths.state_dir)?;
     copying.copy(source_home, &target_paths.state_dir)?;
     if !copied_configs.is_empty() {
         // Relocate the admitted graph before resolving any copied directives.
