@@ -19,7 +19,7 @@ pub use execution::{
     resolve_gateway_process_spec, resolve_runtime_run_dir,
 };
 pub(crate) use execution::{
-    config_read_context_for_binding, resolve_config_read_context,
+    config_read_context_for_binding, openclaw_command_words, resolve_config_read_context,
     source_watch_openclaw_program_args,
 };
 pub use health::{
