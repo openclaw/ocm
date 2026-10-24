@@ -845,3 +845,54 @@ fn terminal_job_control_suspends_and_resumes_ocm_with_its_command() {
     wait_with_deadline(&mut terminal.process);
     assert!(!reap_if_running(command_pid), "the command outlived OCM");
 }
+
+#[cfg(unix)]
+#[test]
+fn shared_job_passes_signals_sent_to_ocm_to_the_command() {
+    let fixture = SignalFixture::new("cli-foreground-shared-job");
+    let running = |pid: libc::pid_t| {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        !state.is_empty() && !state.starts_with('Z')
+    };
+    for (signal, name) in [(libc::SIGTERM, "TERM"), (libc::SIGINT, "INT")] {
+        let marker = fixture.marker(&format!("shared-{name}"));
+        // A non-job-control shell runs the pipeline in its own foreground job,
+        // which OCM then shares with `cat`.
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", r#""$0" @bound -- gateway run | cat"#])
+            .arg(crate::support::ocm_test_binary_path())
+            .current_dir(&fixture.cwd)
+            .env_clear()
+            .envs(&fixture.env)
+            .env("OCM_TEST_SIGNAL_MARKER", &marker);
+        let mut terminal = OnTerminal::spawn(command);
+        let command_pid = ready_pid(&marker);
+        let parent = Command::new("ps")
+            .args(["-o", "ppid=", "-p", &command_pid.to_string()])
+            .output()
+            .unwrap();
+        let ocm_pid: libc::pid_t = String::from_utf8_lossy(&parent.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(ocm_pid, signal) }, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while running(ocm_pid) {
+            assert!(std::time::Instant::now() < deadline, "OCM did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let log = fs::read_to_string(&marker).unwrap();
+        wait_with_deadline(&mut terminal.process);
+        let survived = reap_if_running(command_pid);
+        assert!(
+            log.contains(&format!("signal {name}")) && log.ends_with("stopped\n"),
+            "SIG{name} to OCM in a shared job did not reach the command before OCM exited: {log:?}"
+        );
+        assert!(!survived, "SIG{name}: the command outlived OCM");
+    }
+}

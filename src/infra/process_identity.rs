@@ -63,19 +63,33 @@ pub(crate) fn process_group_members(group: u32) -> Result<Vec<ProcessObservation
 
 /// Whether any member of `process_group` is still running. Zombies do not
 /// count: their parent may never reap them.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) fn process_group_has_live_members(process_group: u32) -> Result<bool, String> {
+    // PID 0 is never a process group member.
+    process_group_has_live_members_except(process_group, 0)
+}
+
+/// Like `process_group_has_live_members`, ignoring the process `except`.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_group_has_live_members_except(
+    process_group: u32,
+    except: u32,
+) -> Result<bool, String> {
     for entry in fs::read_dir("/proc")
         .map_err(|error| format!("failed reading /proc for process group members: {error}"))?
     {
         let entry = entry.map_err(|error| {
             format!("failed reading /proc entry for process group members: {error}")
         })?;
-        if !entry
+        let Some(pid) = entry
             .file_name()
             .to_str()
-            .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
-        {
+            .filter(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == except {
             continue;
         }
         let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
@@ -96,7 +110,10 @@ pub(crate) fn process_group_has_live_members(process_group: u32) -> Result<bool,
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn process_group_has_live_members(process_group: u32) -> Result<bool, String> {
+pub(crate) fn process_group_has_live_members_except(
+    process_group: u32,
+    except: u32,
+) -> Result<bool, String> {
     let capacity = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     if capacity <= 0 {
         return Err(format!(
@@ -117,7 +134,11 @@ pub(crate) fn process_group_has_live_members(process_group: u32) -> Result<bool,
             io::Error::last_os_error()
         ));
     }
-    for pid in pids.into_iter().take(count as usize).filter(|pid| *pid > 0) {
+    for pid in pids
+        .into_iter()
+        .take(count as usize)
+        .filter(|pid| *pid > 0 && *pid as u32 != except)
+    {
         let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
         let read = unsafe {
             libc::proc_pidinfo(
@@ -138,8 +159,13 @@ pub(crate) fn process_group_has_live_members(process_group: u32) -> Result<bool,
     Ok(false)
 }
 
+/// Without a process list, a group signal probe cannot exclude `except` and
+/// counts zombies; callers must treat a positive answer as uncertain.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub(crate) fn process_group_has_live_members(process_group: u32) -> Result<bool, String> {
+pub(crate) fn process_group_has_live_members_except(
+    process_group: u32,
+    _except: u32,
+) -> Result<bool, String> {
     if unsafe { libc::kill(-(process_group as libc::pid_t), 0) } == 0 {
         return Ok(true);
     }

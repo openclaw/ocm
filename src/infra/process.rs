@@ -118,7 +118,7 @@ mod foreground {
     use std::time::Duration;
 
     use crate::infra::process_identity::{
-        observe_process, process_group_has_live_members, process_group_members,
+        observe_process, process_group_has_live_members, process_group_has_live_members_except,
     };
 
     /// Signals that ask a foreground command to stop. SIGKILL cannot be relayed.
@@ -251,10 +251,8 @@ mod foreground {
     /// Whether OCM is the only process in its process group. Any doubt keeps
     /// the command in OCM's job, the behavior OCM had before owning commands.
     pub(super) fn alone_in_process_group() -> bool {
-        let pid = std::process::id();
         let group = unsafe { libc::getpgrp() } as u32;
-        process_group_members(group)
-            .is_ok_and(|members| members.iter().all(|member| member.identity.pid == pid))
+        process_group_has_live_members_except(group, std::process::id()) == Ok(false)
     }
 
     /// Report when the leader exits, leaving it unreaped so its process group
@@ -311,12 +309,11 @@ mod foreground {
                 Target::Group(group) => unsafe {
                     libc::kill(-group, signal);
                 },
-                // The terminal delivers SIGINT, SIGQUIT and SIGHUP to the
-                // whole job, command included; only SIGTERM needs passing on.
-                Target::SharedJob(pid) if signal == libc::SIGTERM => unsafe {
+                // OCM cannot tell a terminal key from a signal sent to it
+                // alone, so the command may also see a terminal key twice.
+                Target::SharedJob(pid) => unsafe {
                     libc::kill(pid, signal);
                 },
-                Target::SharedJob(_) => continue,
             }
             relayed |= signal_bit(signal);
         }
