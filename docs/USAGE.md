@@ -1371,7 +1371,11 @@ specified. The archive can be inside the environment, including through a
 directory alias: its own output is excluded from the archived contents. An
 existing output path is refused.
 
-Export omits `.openclaw/state` by default. `--include-state` means "export this
+Export omits `.openclaw/state` by default. Default export keeps shared managed
+skills under `.openclaw/skills` and their global ClawHub tracking metadata under
+`.openclaw/.clawhub`, as clone does. The importing OCM must retain these roots
+too: OCM 0.3.6 and earlier releases remove them during default import.
+`--include-state` means "export this
 environment as the same installation": it includes every file under the
 environment root, including plugin payloads and dependencies, SQLite-backed and
 file-based sessions, and unrelated or legacy data. Only non-durable process

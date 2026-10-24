@@ -3185,6 +3185,9 @@ fn is_durable_openclaw_archive_path(components: &[&str]) -> bool {
             | [".openclaw", "extensions", ..]
             | [".openclaw", "npm", ..]
             | [".openclaw", "git", ..]
+    ) || matches!(
+        components,
+        [".openclaw", root, ..] if is_shared_skill_state_root(OsStr::new(root))
     )
 }
 
@@ -4457,6 +4460,9 @@ mod tests {
             ".openclaw/npm/projects/demo/node_modules/demo/index.js",
             ".openclaw/git/git-demo/repo/.git/HEAD",
             ".openclaw/git/git-demo/repo/openclaw.plugin.json",
+            ".openclaw/skills/shared/SKILL.md",
+            ".openclaw/skills/shared/.clawhub/origin.json",
+            ".openclaw/.clawhub/lock.json",
         ] {
             assert!(
                 !should_skip_openclaw_env_archive_path(Path::new(path), EnvArchiveEntryKind::File),
