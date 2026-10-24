@@ -1726,6 +1726,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} env prune --older-than 30 --yes"),
             ],
             &[
+                "An environment is unused when no env use, exec or run has touched it within the threshold. Protected environments and environments whose background service is set to run are skipped; run service stop first, or use env destroy to remove an environment with its service.",
                 "Legacy roots or owned worktree cleanup containing another registered environment or its required links block preview and apply. Remove that environment separately first.",
                 "Active or unfinished source watches block removal; run dev stop for those envs first.",
                 "Cleanup preserves registered and active temporary dev sources and their required Git metadata.",

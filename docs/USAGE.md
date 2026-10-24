@@ -1528,6 +1528,19 @@ ocm env destroy mira
 ocm env destroy mira --yes
 ```
 
+Remove environments that no `env use`, `env exec` or `env run` has touched within
+a threshold (14 days by default); the command previews until `--yes` is given:
+
+```bash
+ocm env prune
+ocm env prune --older-than 30 --yes
+```
+
+Prune skips protected environments and environments whose background service is
+set to run, such as those started with `ocm start`, because their Gateway is in
+use without any of those commands. Run `ocm service stop <env>` first to make one
+eligible again, or use `ocm env destroy` to remove it with its service.
+
 For legacy layouts created before overlapping roots were rejected, removal refuses
 to delete another registered environment's root or a link needed to reach it,
 including through an owned development worktree or its Git registration directory.
