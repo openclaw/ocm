@@ -132,10 +132,17 @@ enclosing checkout. Existing OCM-owned environments retain their recorded
 worktrees and original repository selection.
 
 New borrowers may prepare missing tooling with `pnpm install --frozen-lockfile`.
-Before automatic installation, OCM reads the selected pnpm configuration and
-refuses linked modules or virtual-store destinations, including custom project
-and global stores, lockfile-relative modules, and linked parents. Failed configuration readback also requires explicit preparation;
-physical default and custom destinations remain supported.
+Before automatic installation, OCM reads the configuration the selected pnpm
+reports (such as `pnpm-workspace.yaml`, pnpm's global `config.yaml` and
+`PNPM_CONFIG_*` settings) and refuses linked modules or virtual-store
+destinations, including custom project and global stores, lockfile-relative
+modules, and linked parents. It also refuses a pnpm workspace-directory override
+(`PNPM_CONFIG_WORKSPACE_DIR`, `NPM_CONFIG_WORKSPACE_DIR` or their lowercase
+spellings) that names another directory. Failed configuration readback also
+requires explicit preparation; physical default and custom destinations remain
+supported. Destinations chosen by a checkout's pnpmfile hooks or configuration
+plugins during installation are not checked, because pnpm applies them only
+while installing.
 Resumed borrowers report missing tooling for explicit preparation; they do not
 reinstall dependencies. Removing a borrower preserves source files, dependencies,
 generated output, and unrelated source processes. Older OCM readers refuse the

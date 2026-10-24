@@ -4060,6 +4060,8 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
         "linked-lockfile-modules",
         "invalid-config",
         "failed-config",
+        "workspace-override",
+        "workspace-self",
     ] {
         let root = TestDir::new("dev-effective-pnpm-destinations");
         let repo = init_openclaw_repo(&root);
@@ -4124,6 +4126,17 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
                 fs::create_dir(repo.join("custom-store")).unwrap();
             }
         }
+        // pnpm installs the workspace these name instead of the checkout's own.
+        if case == "workspace-override" {
+            env.insert(
+                "PNPM_CONFIG_WORKSPACE_DIR".to_string(),
+                path_string(&borrowed),
+            );
+        } else if case == "workspace-self" {
+            env.insert("PNPM_CONFIG_WORKSPACE_DIR".to_string(), String::new());
+            env.insert("npm_config_workspace_dir".to_string(), path_string(&repo));
+        }
+        let admitted = matches!(case, "physical" | "workspace-self");
         let result = run_ocm(
             &cwd,
             &env,
@@ -4131,7 +4144,7 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
         );
         assert_eq!(
             result.status.success(),
-            case == "physical",
+            admitted,
             "{case}: {}",
             stderr(&result)
         );
@@ -4146,13 +4159,21 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
             "existing borrowed lock\n"
         );
         assert_eq!(fs::read_dir(&borrowed).unwrap().count(), 1);
-        if case != "physical" {
+        if !admitted {
             assert!(!root.child("pnpm.log").exists(), "{case}");
             assert!(!root.child("node.log").exists(), "{case}");
         }
         if case.starts_with("linked-") {
             assert!(stderr(&result).contains("refusing to install"), "{case}");
             assert_eq!(fs::read_link(&link).unwrap(), borrowed);
+        }
+        if case == "workspace-override" {
+            assert!(
+                stderr(&result).contains("refusing to install")
+                    && stderr(&result).contains("PNPM_CONFIG_WORKSPACE_DIR"),
+                "{}",
+                stderr(&result)
+            );
         }
     }
 }

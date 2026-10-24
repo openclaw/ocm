@@ -370,11 +370,52 @@ pub(crate) fn source_modules_override(
     Ok(Some(configured))
 }
 
+/// pnpm reads these in order, using the first non-empty one, instead of looking
+/// for the `pnpm-workspace.yaml` around the working directory.
+const PNPM_WORKSPACE_DIR_VARIABLES: [&str; 4] = [
+    "PNPM_CONFIG_WORKSPACE_DIR",
+    "pnpm_config_workspace_dir",
+    "NPM_CONFIG_WORKSPACE_DIR",
+    "npm_config_workspace_dir",
+];
+
+fn ensure_source_workspace_root(
+    repo_root: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    // With this override pnpm installs the named workspace, and its configuration
+    // readback reports that workspace's settings without its root. Admit only an
+    // override that names the selected checkout, so the destinations checked
+    // later are the ones pnpm will write.
+    let Some((key, value)) = PNPM_WORKSPACE_DIR_VARIABLES.iter().find_map(|name| {
+        env.iter().find(|(key, value)| {
+            !value.is_empty()
+                && if cfg!(windows) {
+                    key.eq_ignore_ascii_case(name)
+                } else {
+                    key.as_str() == *name
+                }
+        })
+    }) else {
+        return Ok(());
+    };
+    let selected = clean_path(&repo_root.join(value));
+    match (fs::canonicalize(&selected), fs::canonicalize(repo_root)) {
+        (Ok(selected), Ok(repo)) if selected == repo => Ok(()),
+        _ => Err(format!(
+            "refusing to install OpenClaw source dependencies: {key} selects the pnpm workspace {}, not the selected checkout {}; unset it or point it at that checkout",
+            display_path(&selected),
+            display_path(repo_root)
+        )),
+    }
+}
+
 pub(crate) fn ensure_source_dependency_install_target(
     repo_root: &Path,
     env: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     ensure_checkout_owned_dependencies(repo_root)?;
+    ensure_source_workspace_root(repo_root, env)?;
     let mut modules = vec![repo_root.join("node_modules")];
     if let Some(configured) = source_modules_override(repo_root, env)?
         && !modules.contains(&configured)
@@ -1432,6 +1473,54 @@ mod tests {
         ensure_openclaw_worktree, parse_legacy_registered_worktree_paths,
         prepare_openclaw_simulation_worktree_cleanup, remove_openclaw_worktree,
     };
+
+    #[test]
+    fn dependency_install_target_admits_only_the_checkout_workspace() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        let other = root.path().join("other");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(&other).unwrap();
+        let env = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let repo_value = repo.to_string_lossy().into_owned();
+        let other_value = other.to_string_lossy().into_owned();
+        for admitted in [
+            env(&[]),
+            env(&[("PNPM_CONFIG_WORKSPACE_DIR", ".")]),
+            env(&[("npm_config_workspace_dir", &repo_value)]),
+            // An empty value is unset for pnpm, so the next spelling decides.
+            env(&[
+                ("PNPM_CONFIG_WORKSPACE_DIR", ""),
+                ("NPM_CONFIG_WORKSPACE_DIR", "../repo"),
+            ]),
+            // The first non-empty spelling wins, as in pnpm.
+            env(&[
+                ("PNPM_CONFIG_WORKSPACE_DIR", &repo_value),
+                ("npm_config_workspace_dir", &other_value),
+            ]),
+        ] {
+            super::ensure_source_dependency_install_target(&repo, &admitted).unwrap();
+        }
+        for refused in [
+            env(&[("PNPM_CONFIG_WORKSPACE_DIR", &other_value)]),
+            env(&[("NPM_CONFIG_WORKSPACE_DIR", "../other")]),
+            env(&[("npm_config_workspace_dir", "missing")]),
+            env(&[
+                ("PNPM_CONFIG_WORKSPACE_DIR", ""),
+                ("npm_config_workspace_dir", &other_value),
+            ]),
+        ] {
+            let error =
+                super::ensure_source_dependency_install_target(&repo, &refused).unwrap_err();
+            assert!(error.contains("refusing to install"), "{error}");
+            assert!(error.contains("WORKSPACE_DIR") || error.contains("workspace_dir"));
+        }
+    }
 
     #[cfg(unix)]
     #[test]
