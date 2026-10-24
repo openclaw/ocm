@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -115,7 +115,7 @@ impl<'a> LogService<'a> {
                 source_kind: target.source_kind.clone(),
                 path: display_path(&target.path),
                 tail_lines,
-                content: read_log_text(&target.path, tail_lines)?,
+                content: read_log_text(&target.path, tail_lines)?.0,
                 components: vec![LogComponentSummary {
                     stream: target.stream.clone(),
                     source_kind: target.source_kind.clone(),
@@ -133,10 +133,7 @@ impl<'a> LogService<'a> {
                 path: display_path(&target.path),
             });
             if target.path.exists() {
-                contents.push((
-                    target.stream.clone(),
-                    read_log_text(&target.path, tail_lines)?,
-                ));
+                contents.push(read_log_text(&target.path, tail_lines)?);
             }
         }
         if contents.is_empty() {
@@ -268,17 +265,15 @@ impl<'a> LogService<'a> {
         merge_streams: bool,
         writer: &mut W,
     ) -> Result<(), String> {
-        let mut snapshots = Vec::new();
         let mut cursors = sources
             .into_iter()
             .map(FollowCursor::for_sources)
             .collect::<Vec<_>>();
+        let mut snapshots = Vec::with_capacity(cursors.len());
         for cursor in &mut cursors {
-            if let Some(snapshot) = cursor.snapshot(tail_lines, merge_streams)? {
-                snapshots.push(snapshot);
-            }
+            snapshots.push(cursor.snapshot(tail_lines, merge_streams)?);
         }
-        if merge_streams && snapshots.is_empty() {
+        if merge_streams && snapshots.iter().all(Option::is_none) {
             return Err(format!(
                 "no logs exist for env \"{}\" across stdout or stderr",
                 name
@@ -295,8 +290,8 @@ impl<'a> LogService<'a> {
                     .map_err(|error| error.to_string())?;
                 writer.flush().map_err(|error| error.to_string())?;
             }
-        } else if !snapshots.is_empty() {
-            write_follow_snapshots(writer, snapshots, tail_lines, merge_streams)?;
+        } else if let Some(snapshot) = snapshots.into_iter().flatten().next() {
+            write_follow_snapshot(writer, snapshot)?;
         }
 
         loop {
@@ -429,7 +424,10 @@ impl FollowCursor {
             self.pending.extend_from_slice(&bytes[partial_start..]);
             bytes.truncate(partial_start);
         }
-        Ok(Some(LogSnapshot { bytes }))
+        Ok(Some(LogSnapshot {
+            bytes,
+            modified: self.modified,
+        }))
     }
 
     fn read_update(&mut self) -> Result<Option<FollowUpdate>, String> {
@@ -771,6 +769,8 @@ impl FollowSegment {
 
 struct LogSnapshot {
     bytes: Vec<u8>,
+    /// When the source file was last written, as observed with these bytes.
+    modified: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -863,11 +863,16 @@ fn normalize_stream(stream: &str) -> Result<&str, String> {
     }
 }
 
-fn read_log_text(path: &Path, tail_lines: Option<usize>) -> Result<String, String> {
+fn read_log_text(
+    path: &Path,
+    tail_lines: Option<usize>,
+) -> Result<(String, Option<SystemTime>), String> {
     let (mut file, _) =
         open_log(path)?.ok_or_else(|| format!("log does not exist: {}", display_path(path)))?;
     let (bytes, _, _) = read_log_snapshot_from(&mut file, tail_lines)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    // Observe the write time after reading so it is never older than the bytes read.
+    let modified = file.metadata().ok().as_ref().and_then(modified_time);
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), modified))
 }
 
 fn read_log_snapshot_from(
@@ -956,61 +961,57 @@ fn summarize_sources(targets: &[LogTarget]) -> String {
     }
 }
 
-fn merge_log_texts(contents: Vec<(String, String)>, tail_lines: Option<usize>) -> String {
+fn merge_log_texts(
+    contents: Vec<(String, Option<SystemTime>)>,
+    tail_lines: Option<usize>,
+) -> String {
     let snapshots = contents
         .into_iter()
-        .map(|(_stream, content)| LogSnapshot {
+        .map(|(content, modified)| LogSnapshot {
             bytes: content.into_bytes(),
+            modified,
         })
         .collect::<Vec<_>>();
     String::from_utf8(merge_log_snapshots(snapshots, tail_lines))
         .expect("merging valid UTF-8 preserves valid UTF-8")
 }
 
-fn write_follow_snapshots<W: Write>(
-    writer: &mut W,
-    snapshots: Vec<LogSnapshot>,
-    tail_lines: Option<usize>,
-    merge_streams: bool,
-) -> Result<(), String> {
-    let bytes = if merge_streams {
-        merge_log_snapshots(snapshots, tail_lines)
-    } else {
-        snapshots
-            .into_iter()
-            .next()
-            .map_or_else(Vec::new, |snapshot| snapshot.bytes)
-    };
-    if !bytes.is_empty() {
+fn write_follow_snapshot<W: Write>(writer: &mut W, snapshot: LogSnapshot) -> Result<(), String> {
+    if !snapshot.bytes.is_empty() {
         writer
-            .write_all(&bytes)
+            .write_all(&snapshot.bytes)
             .map_err(|error| error.to_string())?;
         writer.flush().map_err(|error| error.to_string())?;
     }
     Ok(())
 }
 
+/// Builds the merged follow startup batch. `snapshots` holds each cursor's
+/// initial snapshot, in cursor order.
 fn collect_merged_follow_startup(
     cursors: &mut [FollowCursor],
-    snapshots: Vec<LogSnapshot>,
+    snapshots: Vec<Option<LogSnapshot>>,
     tail_lines: Option<usize>,
 ) -> Result<Vec<u8>, String> {
-    let mut records = snapshots
-        .into_iter()
-        .flat_map(|snapshot| log_records(snapshot.bytes))
-        .collect::<Vec<_>>();
-    for cursor in cursors {
+    let mut records = Vec::new();
+    for (cursor, snapshot) in cursors.iter_mut().zip(snapshots) {
+        let mut stream = snapshot.map_or_else(Vec::new, |snapshot| log_records(snapshot.bytes));
         if !cursor.is_initialized()
             && let Some(snapshot) = cursor.snapshot(tail_lines, true)?
         {
-            records.extend(log_records(snapshot.bytes));
+            stream.extend(log_records(snapshot.bytes));
         }
         if cursor.is_initialized() {
             if let Some(update) = cursor.read_update()? {
-                records.extend(cursor.collect_complete_records(update));
+                stream.extend(cursor.collect_complete_records(update));
             }
-            records.extend(cursor.collect_quiet_records());
+            stream.extend(cursor.collect_quiet_records());
         }
+        // Held bytes are still the stream's open end; its last emitted record is not.
+        if cursor.pending.is_empty() {
+            place_trailing_undated_output(&mut stream, cursor.modified);
+        }
+        records.extend(stream);
     }
     Ok(merge_log_records_with_tail(records, tail_lines))
 }
@@ -1018,9 +1019,63 @@ fn collect_merged_follow_startup(
 fn merge_log_snapshots(snapshots: Vec<LogSnapshot>, tail_lines: Option<usize>) -> Vec<u8> {
     let records = snapshots
         .into_iter()
-        .flat_map(|snapshot| log_records(snapshot.bytes))
+        .flat_map(|snapshot| {
+            let mut stream = log_records(snapshot.bytes);
+            place_trailing_undated_output(&mut stream, snapshot.modified);
+            stream
+        })
         .collect::<Vec<_>>();
     merge_log_records_with_tail(records, tail_lines)
+}
+
+/// Orders one stream's trailing undated output by when its file was last written.
+///
+/// Undated lines after a stream's last dated line are its newest output, yet they
+/// carry no time of their own. Left alone they would sort with an older dated
+/// parent, or before every dated record when the window holds no parent, and the
+/// merged tail would cut them. The file's modification time is when the newest of
+/// those bytes was written, so they are placed there instead. When that time is
+/// unknown or not after the stream's newest dated record, the lines stay with
+/// their parent. Undated continuation lines of that parent cannot be told apart
+/// from later output, so they move with that output once the file is written later.
+fn place_trailing_undated_output(records: &mut Vec<TimedLogRecord>, modified: Option<SystemTime>) {
+    let Some(modified) = modified.and_then(offset_date_time) else {
+        return;
+    };
+    if records
+        .iter()
+        .filter_map(|record| record.timestamp)
+        .any(|timestamp| timestamp >= modified)
+    {
+        return;
+    }
+    let Some(last) = records.last_mut() else {
+        return;
+    };
+    if last.timestamp.is_none() {
+        last.timestamp = Some(modified);
+        return;
+    }
+    // A dated record's first line is its only dated line; the rest is undated output.
+    let Some(parent_end) = last
+        .bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .filter(|end| *end < last.bytes.len())
+    else {
+        return;
+    };
+    let trailing = last.bytes.split_off(parent_end);
+    records.push(TimedLogRecord::new(Some(modified), trailing));
+}
+
+/// Converts a file time without panicking on values `OffsetDateTime` cannot hold.
+fn offset_date_time(time: SystemTime) -> Option<OffsetDateTime> {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(after) => OffsetDateTime::UNIX_EPOCH.checked_add(after.try_into().ok()?),
+        Err(before) => OffsetDateTime::UNIX_EPOCH.checked_sub(before.duration().try_into().ok()?),
+    }
 }
 
 fn merge_log_records_with_tail(records: Vec<TimedLogRecord>, tail_lines: Option<usize>) -> Vec<u8> {
@@ -1140,7 +1195,8 @@ mod tests {
     use std::io::{Seek, Write};
     use std::path::{Path, PathBuf};
     use std::thread::sleep;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
+    use time::OffsetDateTime;
 
     fn update_bytes(update: &FollowUpdate) -> Vec<u8> {
         update
@@ -1174,16 +1230,16 @@ mod tests {
         let merged = merge_log_texts(
             vec![
                 (
-                    "stdout".to_string(),
                     concat!(
                         "2026-04-20T00:13:45.497+01:00 [gateway] one\n",
                         "2026-04-20T00:13:47.497+01:00 [gateway] three\n"
                     )
                     .to_string(),
+                    None,
                 ),
                 (
-                    "stderr".to_string(),
                     "2026-04-20T00:13:46.497+01:00 error gateway two\n".to_string(),
+                    None,
                 ),
             ],
             Some(10),
@@ -1211,9 +1267,11 @@ mod tests {
                     )
                     .as_bytes()
                     .to_vec(),
+                    modified: None,
                 },
                 LogSnapshot {
                     bytes: b"2026-04-20T00:13:46Z error worker retrying\n".to_vec(),
+                    modified: None,
                 },
             ],
             None,
@@ -1237,9 +1295,11 @@ mod tests {
             vec![
                 LogSnapshot {
                     bytes: b"2026-04-20T00:13:46Z [gateway] invalid \xff".to_vec(),
+                    modified: None,
                 },
                 LogSnapshot {
                     bytes: b"2026-04-20T00:13:45Z error worker first\n".to_vec(),
+                    modified: None,
                 },
             ],
             None,
@@ -1255,9 +1315,13 @@ mod tests {
     fn merge_log_snapshots_ignores_empty_sources() {
         let merged = merge_log_snapshots(
             vec![
-                LogSnapshot { bytes: Vec::new() },
+                LogSnapshot {
+                    bytes: Vec::new(),
+                    modified: None,
+                },
                 LogSnapshot {
                     bytes: b"2026-04-20T00:13:45Z info present\n".to_vec(),
+                    modified: None,
                 },
             ],
             None,
@@ -1271,9 +1335,11 @@ mod tests {
             vec![
                 LogSnapshot {
                     bytes: b"  2026-04-20T00:13:46Z info indented\n".to_vec(),
+                    modified: None,
                 },
                 LogSnapshot {
                     bytes: b"2026-04-20T00:13:45Z info first\n".to_vec(),
+                    modified: None,
                 },
             ],
             None,
@@ -1290,9 +1356,11 @@ mod tests {
             vec![
                 LogSnapshot {
                     bytes: b"2026-04-20T00:13:47Z info later\n".to_vec(),
+                    modified: None,
                 },
                 LogSnapshot {
                     bytes: b"undated record\n2026-04-20T00:13:45Z info earlier\n".to_vec(),
+                    modified: None,
                 },
             ],
             None,
@@ -1302,6 +1370,139 @@ mod tests {
             b"undated record\n\
               2026-04-20T00:13:45Z info earlier\n\
               2026-04-20T00:13:47Z info later\n"
+        );
+    }
+
+    fn written_at(rfc3339: &str) -> Option<SystemTime> {
+        Some(SystemTime::from(
+            OffsetDateTime::parse(rfc3339, &time::format_description::well_known::Rfc3339).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn merge_log_snapshots_places_trailing_undated_output_at_its_last_write() {
+        let snapshots = || {
+            vec![
+                LogSnapshot {
+                    bytes: concat!(
+                        "2026-04-20T00:13:45Z [gateway] ready\n",
+                        "2026-04-20T00:13:47Z [shutdown] completed cleanly\n"
+                    )
+                    .as_bytes()
+                    .to_vec(),
+                    modified: written_at("2026-04-20T00:13:47Z"),
+                },
+                LogSnapshot {
+                    bytes: b"OpenClaw config is invalid\nRun doctor --fix\n".to_vec(),
+                    modified: written_at("2026-04-20T00:14:10Z"),
+                },
+            ]
+        };
+        assert_eq!(
+            merge_log_snapshots(snapshots(), None),
+            concat!(
+                "2026-04-20T00:13:45Z [gateway] ready\n",
+                "2026-04-20T00:13:47Z [shutdown] completed cleanly\n",
+                "OpenClaw config is invalid\n",
+                "Run doctor --fix\n"
+            )
+            .as_bytes()
+        );
+        assert_eq!(
+            merge_log_snapshots(snapshots(), Some(2)),
+            b"OpenClaw config is invalid\nRun doctor --fix\n"
+        );
+    }
+
+    #[test]
+    fn merge_log_snapshots_moves_trailing_undated_output_past_an_older_parent() {
+        let merged = merge_log_snapshots(
+            vec![
+                LogSnapshot {
+                    bytes: concat!(
+                        "2026-04-20T00:13:46Z [gateway] ready\n",
+                        "2026-04-20T00:13:47Z [shutdown] completed cleanly\n"
+                    )
+                    .as_bytes()
+                    .to_vec(),
+                    modified: written_at("2026-04-20T00:13:47Z"),
+                },
+                LogSnapshot {
+                    bytes: concat!(
+                        "2026-04-20T00:13:45Z [warn] old warning\n",
+                        "OpenClaw config is invalid\n",
+                        "Run doctor --fix\n"
+                    )
+                    .as_bytes()
+                    .to_vec(),
+                    modified: written_at("2026-04-20T00:14:10Z"),
+                },
+            ],
+            Some(3),
+        );
+        assert_eq!(
+            merged,
+            concat!(
+                "2026-04-20T00:13:47Z [shutdown] completed cleanly\n",
+                "OpenClaw config is invalid\n",
+                "Run doctor --fix\n"
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn merge_log_snapshots_keeps_trailing_lines_with_their_parent_without_a_later_write() {
+        for modified in [None, written_at("2026-04-20T00:13:45Z")] {
+            let merged = merge_log_snapshots(
+                vec![
+                    LogSnapshot {
+                        bytes: b"2026-04-20T00:13:46Z [gateway] later\n".to_vec(),
+                        modified: written_at("2026-04-20T00:13:46Z"),
+                    },
+                    LogSnapshot {
+                        bytes: b"2026-04-20T00:13:45Z [gateway] failed\n    at frame\n".to_vec(),
+                        modified,
+                    },
+                ],
+                None,
+            );
+            assert_eq!(
+                merged,
+                concat!(
+                    "2026-04-20T00:13:45Z [gateway] failed\n",
+                    "    at frame\n",
+                    "2026-04-20T00:13:46Z [gateway] later\n"
+                )
+                .as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn merge_log_snapshots_ignores_file_times_outside_the_timestamp_range() {
+        let far_future = SystemTime::UNIX_EPOCH + Duration::from_secs(400_000_000_000);
+        let merged = merge_log_snapshots(
+            vec![
+                LogSnapshot {
+                    bytes: b"2026-04-20T00:13:46Z [gateway] later\n".to_vec(),
+                    modified: None,
+                },
+                LogSnapshot {
+                    bytes: b"2026-04-20T00:13:45Z [gateway] failed\n    at frame\n".to_vec(),
+                    modified: Some(far_future),
+                },
+            ],
+            None,
+        );
+        assert_eq!(
+            merged,
+            concat!(
+                "2026-04-20T00:13:45Z [gateway] failed\n",
+                "    at frame\n",
+                "2026-04-20T00:13:46Z [gateway] later\n"
+            )
+            .as_bytes()
         );
     }
 
@@ -1415,7 +1616,7 @@ mod tests {
         ];
         let snapshots = cursors
             .iter_mut()
-            .map(|cursor| cursor.snapshot(None, true).unwrap().unwrap())
+            .map(|cursor| cursor.snapshot(None, true).unwrap())
             .collect::<Vec<_>>();
         let merged = super::collect_merged_follow_startup(&mut cursors, snapshots, None).unwrap();
         assert_eq!(
@@ -1430,11 +1631,48 @@ mod tests {
         ];
         let snapshots = cursors
             .iter_mut()
-            .map(|cursor| cursor.snapshot(Some(1), true).unwrap().unwrap())
+            .map(|cursor| cursor.snapshot(Some(1), true).unwrap())
             .collect::<Vec<_>>();
         let tailed =
             super::collect_merged_follow_startup(&mut cursors, snapshots, Some(1)).unwrap();
         assert_eq!(tailed, b"2026-04-20T00:13:20Z stdout later\n");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn merged_follow_startup_places_trailing_undated_output_at_its_last_write() {
+        let root = test_root("cursor-startup-trailing-undated");
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        fs::write(
+            &stdout_path,
+            b"2026-04-20T00:13:45Z stdout ready\n2026-04-20T00:13:47Z stdout shutdown\n",
+        )
+        .unwrap();
+        fs::write(&stderr_path, b"config is invalid\nrun doctor --fix\n").unwrap();
+        for (path, modified) in [
+            (&stdout_path, "2026-04-20T00:13:47Z"),
+            (&stderr_path, "2026-04-20T00:14:10Z"),
+        ] {
+            filetime::set_file_mtime(
+                path,
+                filetime::FileTime::from_system_time(written_at(modified).unwrap()),
+            )
+            .unwrap();
+        }
+
+        let mut cursors = vec![
+            FollowCursor::new(log_target(stdout_path)),
+            FollowCursor::new(log_target(stderr_path)),
+        ];
+        let snapshots = cursors
+            .iter_mut()
+            .map(|cursor| cursor.snapshot(Some(2), true).unwrap())
+            .collect::<Vec<_>>();
+        let merged =
+            super::collect_merged_follow_startup(&mut cursors, snapshots, Some(2)).unwrap();
+        assert_eq!(merged, b"config is invalid\nrun doctor --fix\n");
 
         let _ = fs::remove_dir_all(root);
     }

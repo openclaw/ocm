@@ -234,6 +234,7 @@ pub fn logs_help(cmd: &str) -> String {
         &[
             "Default output shows the last 50 lines.",
             "By default OCM shows both stdout and stderr together in time order.",
+            "Untimestamped lines follow the timestamped line before them; untimestamped output at the end of a log, such as a startup error, is placed at that file's last write.",
             "Follow mode cannot be combined with --json.",
             "When both env and service logs exist, OCM reads the newer active file.",
             "A --stream follow started before either log exists waits for both files and follows whichever appears first.",
