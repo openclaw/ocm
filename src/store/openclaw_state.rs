@@ -348,17 +348,43 @@ fn archived_git_paths_in_import_removed_roots(
                 storage.push(target);
             }
         }
-        let mut metadata = vec![context.private_dir.clone(), context.common_dir.clone()];
+        // Mirror import's metadata inspection: it resolves every entry,
+        // follows linked directories, and skips hooks outside refs because
+        // they are authored configuration rather than Git storage.
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum Scope {
+            Root,
+            Refs,
+            Other,
+        }
+        let mut metadata = vec![
+            (context.private_dir.clone(), Scope::Root),
+            (context.common_dir.clone(), Scope::Root),
+        ];
         let mut visited = BTreeSet::new();
-        while let Some(directory) = metadata.pop() {
-            if !visited.insert(directory.clone()) {
+        while let Some((directory, scope)) = metadata.pop() {
+            let Ok(directory) = fs::canonicalize(&directory) else {
+                continue;
+            };
+            if !visited.insert((directory.clone(), scope)) {
                 continue;
             }
             for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
-                match entry.file_type() {
-                    Ok(kind) if kind.is_symlink() => storage.push(entry.path()),
-                    Ok(kind) if kind.is_dir() => metadata.push(entry.path()),
-                    _ => {}
+                let name = entry.file_name();
+                if scope != Scope::Refs && name == OsStr::new("hooks") {
+                    continue;
+                }
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                    storage.push(path.clone());
+                }
+                if fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                    let child = match scope {
+                        Scope::Root if name == OsStr::new("refs") => Scope::Refs,
+                        Scope::Refs => Scope::Refs,
+                        _ => Scope::Other,
+                    };
+                    metadata.push((path, child));
                 }
             }
         }

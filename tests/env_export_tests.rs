@@ -2517,6 +2517,29 @@ fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_use
         repository.join(".git/info/exclude"),
     )
     .unwrap();
+    // A hook link is authored configuration that import neither inspects
+    // nor keeps, so its target in a store stays out.
+    write_text(&state.join("devices/pre-commit"), "#!/bin/sh\n");
+    fs::create_dir_all(repository.join(".git/hooks")).unwrap();
+    std::os::unix::fs::symlink(
+        state.join("devices/pre-commit"),
+        repository.join(".git/hooks/pre-commit"),
+    )
+    .unwrap();
+    // Links inside a linked metadata directory are inspected too.
+    write_text(&state.join("identity/description"), "described\n");
+    fs::create_dir_all(source.join("projects/linked-logs")).unwrap();
+    std::os::unix::fs::symlink(
+        state.join("identity/description"),
+        source.join("projects/linked-logs/description"),
+    )
+    .unwrap();
+    fs::remove_dir_all(repository.join(".git/logs")).ok();
+    std::os::unix::fs::symlink(
+        source.join("projects/linked-logs"),
+        repository.join(".git/logs"),
+    )
+    .unwrap();
 
     let archive = root.join("source.tar");
     let exported = run_ocm(
@@ -2535,6 +2558,8 @@ fn default_export_keeps_a_legacy_store_alias_that_selected_git_configuration_use
     assert!(archived.contains(std::path::Path::new("credentials")));
     assert!(archived.contains(std::path::Path::new("memory")));
     assert!(archived.contains(std::path::Path::new("cron/exclude")));
+    assert!(archived.contains(std::path::Path::new("identity/description")));
+    assert!(!archived.contains(std::path::Path::new("devices/pre-commit")));
     // The source is unavailable while importing.
     fs::rename(&source, root.join("offline")).unwrap();
     let target = root.join("target");
