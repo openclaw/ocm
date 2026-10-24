@@ -250,6 +250,7 @@ fn env_prune_revalidates_candidates_after_waiting_for_operation_locks() {
         "unchanged",
         "protected",
         "removed",
+        "service-started",
     ] {
         let root = TestDir::new(&format!("env-prune-revalidate-{case}"));
         let cwd = root.path();
@@ -327,6 +328,14 @@ fn env_prune_revalidates_candidates_after_waiting_for_operation_locks() {
                 let protected = run_ocm(cwd, &env, &["env", "protect", "c-target", "on"]);
                 assert!(protected.status.success(), "{}", stderr(&protected));
             }
+            "service-started" => {
+                // Service commands wait for this lock as prune does, so the
+                // policy they publish is what prune finds once it gets here.
+                let mut started = get_environment("c-target", &env, cwd).unwrap();
+                started.service_enabled = true;
+                started.service_running = true;
+                save_environment(started, &env, cwd).unwrap();
+            }
             "unchanged" => {}
             _ => unreachable!(),
         }
@@ -383,6 +392,78 @@ fn env_prune_revalidates_candidates_after_waiting_for_operation_locks() {
             );
         }
     }
+}
+
+#[test]
+fn env_prune_skips_environments_whose_service_keeps_the_gateway_running() {
+    let root = TestDir::new("env-prune-service-backed");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_launchd_env(&root);
+    install_fake_launchctl(&root, &mut env);
+
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    for name in ["idle", "served", "stopped"] {
+        let created = run_ocm(&cwd, &env, &["env", "create", name, "--launcher", "stable"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+    }
+    for args in [
+        ["service", "start", "served"],
+        ["service", "start", "stopped"],
+        ["service", "stop", "stopped"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+    let mut roots = BTreeMap::new();
+    for name in ["idle", "served", "stopped"] {
+        let mut meta = get_environment(name, &env, &cwd).unwrap();
+        meta.created_at -= time::Duration::days(30);
+        let meta = save_environment(meta, &env, &cwd).unwrap();
+        let canary = PathBuf::from(&meta.root).join("canary.txt");
+        fs::write(&canary, "environment data").unwrap();
+        roots.insert(name, PathBuf::from(&meta.root));
+    }
+
+    let names = |result: &serde_json::Value, key: &str| -> Vec<String> {
+        result[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let preview = run_ocm(&cwd, &env, &["env", "prune", "--json"]);
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    let preview: serde_json::Value = serde_json::from_str(&stdout(&preview)).unwrap();
+    assert_eq!(names(&preview, "candidates"), ["idle", "stopped"]);
+
+    let applied = run_ocm(&cwd, &env, &["env", "prune", "--yes", "--json"]);
+    assert!(applied.status.success(), "{}", stderr(&applied));
+    let applied: serde_json::Value = serde_json::from_str(&stdout(&applied)).unwrap();
+    assert_eq!(names(&applied, "removed"), ["idle", "stopped"]);
+    assert!(!roots["idle"].exists());
+    assert!(!roots["stopped"].exists());
+    let served = get_environment("served", &env, &cwd).unwrap();
+    assert!(served.service_enabled && served.service_running);
+    assert_eq!(
+        fs::read_to_string(roots["served"].join("canary.txt")).unwrap(),
+        "environment data"
+    );
+
+    // Stopping the service returns the environment to the ordinary age rule.
+    let stopped = run_ocm(&cwd, &env, &["service", "stop", "served"]);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let applied = run_ocm(&cwd, &env, &["env", "prune", "--yes", "--json"]);
+    assert!(applied.status.success(), "{}", stderr(&applied));
+    let applied: serde_json::Value = serde_json::from_str(&stdout(&applied)).unwrap();
+    assert_eq!(names(&applied, "removed"), ["served"]);
+    assert!(!roots["served"].exists());
 }
 
 #[test]
