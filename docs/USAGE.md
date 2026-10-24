@@ -517,6 +517,11 @@ This is the shortest non-interactive path.
 ocm env exec mira -- sh -lc 'echo "$OPENCLAW_HOME"'
 ```
 
+`ocm @<env> --`, `ocm env run` and `ocm env exec` exit with the command's exit
+code. On Unix, when a signal ends the command, OCM exits with 128 plus the
+signal number, as a shell does (for example 137 for `SIGKILL`), and names the
+signal on stderr unless it was `SIGINT` or `SIGPIPE`.
+
 OCM env execution sets OpenClaw's env-scoped paths for you:
 `OPENCLAW_HOME`, `OPENCLAW_STATE_DIR`, and `OPENCLAW_CONFIG_PATH`.
 It also sets `OPENCLAW_SERVICE_REPAIR_POLICY=external`, which tells OpenClaw

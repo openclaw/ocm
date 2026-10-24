@@ -12,6 +12,8 @@ use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
+use crate::support::write_executable_script;
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout};
 
 #[test]
@@ -30,6 +32,89 @@ fn env_exec_propagates_the_child_exit_code() {
         &["env", "exec", "demo", "--", "sh", "-lc", "exit 7"],
     );
     assert_eq!(exec.status.code(), Some(7), "{}", stderr(&exec));
+}
+
+#[cfg(unix)]
+#[test]
+fn env_exec_reports_a_signal_killed_child_as_128_plus_the_signal() {
+    let root = TestDir::new("cli-exec-signal-exit");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    let create = run_ocm(&cwd, &env, &["env", "create", "demo"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+
+    let exec = run_ocm(
+        &cwd,
+        &env,
+        &["env", "exec", "demo", "--", "sh", "-c", "kill -TERM $$"],
+    );
+    assert_eq!(exec.status.code(), Some(143), "{}", stderr(&exec));
+    assert!(
+        stderr(&exec).contains("ocm: \"sh\" was terminated by signal 15 (SIGTERM)"),
+        "{}",
+        stderr(&exec)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_bound_env_run_reports_a_signal_killed_child_as_128_plus_the_signal() {
+    let root = TestDir::new("cli-run-signal-exit");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let runtime = cwd.join("openclaw");
+    write_executable_script(
+        &runtime,
+        "#!/bin/sh\ncase \"$1\" in [0-9]*) exit \"$1\" ;; esac\nkill -\"$1\" $$\nexit 99\n",
+    );
+    let env = ocm_env(&root);
+
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "add",
+            "fake",
+            "--path",
+            runtime.to_str().unwrap(),
+        ],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(&cwd, &env, &["env", "create", "demo", "--runtime", "fake"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+
+    for (args, code, diagnostic) in [
+        (
+            &["@demo", "--", "TERM"][..],
+            143,
+            Some("signal 15 (SIGTERM)"),
+        ),
+        (
+            &["env", "run", "demo", "--", "KILL"][..],
+            137,
+            Some("signal 9 (SIGKILL)"),
+        ),
+        (&["@demo", "--", "INT"][..], 130, None),
+        (&["@demo", "--", "42"][..], 42, None),
+    ] {
+        let run = run_ocm(&cwd, &env, args);
+        assert_eq!(run.status.code(), Some(code), "{args:?}: {}", stderr(&run));
+        match diagnostic {
+            Some(signal) => assert!(
+                stderr(&run).contains(&format!("was terminated by {signal}")),
+                "{args:?}: {}",
+                stderr(&run)
+            ),
+            None => assert!(
+                !stderr(&run).contains("was terminated by signal"),
+                "{args:?}: {}",
+                stderr(&run)
+            ),
+        }
+    }
 }
 
 #[test]
