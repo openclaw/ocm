@@ -2994,15 +2994,19 @@ fn clear_volatile_runtime_state(
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
+        let file_name = entry.file_name();
+        // Durable roots hold plugin payloads, Git checkouts and shared skills,
+        // whose own files may be named like residue (Cargo.lock, a `tmp`
+        // package). Clone and archive import keep these roots verbatim.
         if path == config_path
             || workspaces.contains(&path)
             || is_integrity_protected_history_path(state_root, &path)
+            || (root == state_root && is_durable_openclaw_state_root(&file_name))
         {
             continue;
         }
 
         let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-        let file_name = entry.file_name();
         if metadata.is_dir() && workspaces.has_descendant(&path) {
             changed |= if should_remove_volatile_runtime_path(&file_name, true) {
                 clear_parent_preserving_workspaces(&path, workspaces)?
