@@ -706,11 +706,13 @@ fn current_git_branch(repo_root: &Path) -> Option<String> {
     let output = git_command()
         .arg("-C")
         .arg(repo_root)
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .args(["symbolic-ref", "--quiet", "HEAD"])
         .output()
         .ok()?;
-    let branch = String::from_utf8(output.stdout).ok()?;
-    let branch = branch.trim();
+    // The full ref: `--short` disambiguates a branch that shares a tag's name
+    // as `heads/<branch>`, while pnpm names the branch itself.
+    let reference = String::from_utf8(output.stdout).ok()?;
+    let branch = reference.trim().strip_prefix("refs/heads/")?;
     (output.status.success() && !branch.is_empty()).then(|| branch.to_string())
 }
 
@@ -2219,6 +2221,11 @@ mod tests {
                 "base",
             ],
         );
+        // A tag sharing the branch's name does not change the branch pnpm reads.
+        run_git(&repo, &["tag", "main"]);
+        assert_eq!(super::current_git_branch(&repo).as_deref(), Some("main"));
+        let error = check(serde_json::json!({"gitBranchLockfile": true})).unwrap_err();
+        assert!(error.contains("pnpm-lock.main.yaml"), "{error}");
         run_git(
             &repo,
             &["update-ref", "refs/remotes/origin/release", "HEAD"],
