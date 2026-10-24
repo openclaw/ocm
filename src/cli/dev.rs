@@ -32,6 +32,8 @@ use crate::env::{
 };
 use crate::infra::process::run_direct;
 #[cfg(unix)]
+use crate::infra::process::set_terminal_foreground_process_group;
+#[cfg(unix)]
 use crate::infra::process_identity::process_group_members;
 use crate::infra::process_identity::{ProcessIdentity, observe_process, process_scope_id};
 use crate::infra::shell::{build_openclaw_dev_source_env, build_openclaw_env};
@@ -3693,40 +3695,6 @@ impl Drop for SourceWatchProcessGuard {
             windows_sys::Win32::Foundation::CloseHandle(self.job);
         }
     }
-}
-
-#[cfg(unix)]
-fn set_terminal_foreground_process_group(process_group: libc::pid_t) -> Result<(), String> {
-    let mut previous_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    let mut blocked_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    unsafe {
-        libc::sigemptyset(&mut blocked_mask);
-        libc::sigaddset(&mut blocked_mask, libc::SIGTTOU);
-    }
-    let mask_result =
-        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked_mask, &mut previous_mask) };
-    if mask_result != 0 {
-        return Err(format!(
-            "failed blocking terminal ownership signal: {}",
-            io::Error::from_raw_os_error(mask_result)
-        ));
-    }
-    let terminal_result = unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, process_group) };
-    let terminal_error = (terminal_result == -1).then(io::Error::last_os_error);
-    let restore_mask_result =
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous_mask, std::ptr::null_mut()) };
-    if restore_mask_result != 0 {
-        return Err(format!(
-            "failed restoring terminal ownership signal mask: {}",
-            io::Error::from_raw_os_error(restore_mask_result)
-        ));
-    }
-    if let Some(error) = terminal_error {
-        return Err(format!(
-            "failed assigning source watch terminal ownership: {error}"
-        ));
-    }
-    Ok(())
 }
 
 fn stop_source_watch_child(

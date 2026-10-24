@@ -524,6 +524,15 @@ that service registration and repair are managed outside OpenClaw in this
 context. Commands like `openclaw doctor --fix` can still repair normal env
 state, but background service lifecycle should be handled with `ocm service`.
 
+On Unix, `ocm @<env> --`, `ocm env run` and `ocm env exec` start the command
+in its own process group and return only after it has exited. A SIGTERM,
+SIGINT, SIGQUIT or SIGHUP sent to the OCM process is passed on to that group,
+including processes started by a launcher's shell, so `kill <ocm pid>` also
+stops a foreground Gateway; OCM then waits for the rest of the group too. In a
+terminal, the command's group holds the foreground while it runs, so Ctrl-C
+reaches it once, directly, and Ctrl-Z suspends OCM along with it. SIGKILL
+cannot be passed on: it stops OCM alone.
+
 ### Export one bounded artifact
 
 On Unix, export a file relative to an environment's `OPENCLAW_HOME` without
