@@ -313,11 +313,12 @@ fn env_run_onboard_clears_legacy_skip_bootstrap_by_default() {
     let env_root = clean_path(&root.child("ocm-home/envs/demo"));
     let config_path = env_root.join(".openclaw/openclaw.json");
     let workspace = env_root.join(".openclaw/workspace");
-    let commands: [&[&str]; 4] = [
+    let commands: [&[&str]; 5] = [
         &["env", "run", "demo", "--", "onboard"],
         &["env", "run", "demo", "--", "--no-color", "onboard"],
         &["@demo", "--", "--log-level", "debug", "onboard"],
         &["@demo", "--", "--log-level=debug", "setup"],
+        &["@demo", "--", "--log-level", "debug", "--", "onboard"],
     ];
     for command in commands {
         write_text(

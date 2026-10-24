@@ -248,52 +248,38 @@ pub fn resolve_gateway_process_spec(
     }
 }
 
-fn is_openclaw_root_option_value(value: &str) -> bool {
-    if value.is_empty() || value == "--" {
-        return false;
-    }
-    if !value.starts_with('-') {
-        return true;
-    }
-    let Some(number) = value.strip_prefix('-') else {
-        return false;
-    };
-    let mut parts = number.split('.');
-    let Some(integer) = parts.next() else {
-        return false;
-    };
-    !integer.is_empty()
-        && integer.chars().all(|ch| ch.is_ascii_digit())
-        && parts.next().is_none_or(|fraction| {
-            !fraction.is_empty() && fraction.chars().all(|ch| ch.is_ascii_digit())
-        })
-        && parts.next().is_none()
-}
-
 /// Yields the OpenClaw command words in forwarded arguments, such as `gateway`
-/// and `stop`, skipping root options (`--no-color`, `--log-level debug`) and
-/// other flags, and stopping at `--`.
+/// and `stop`, the way OpenClaw finds its command path: root options are
+/// skipped with their values (`--no-color`, `--log-level debug`), other flags
+/// are skipped, a leading `--` makes the following tokens literal words, and a
+/// `--` after a command word ends the command.
 pub(crate) fn openclaw_command_words(args: &[String]) -> impl Iterator<Item = &str> {
     let mut index = 0;
+    let mut literal = false;
+    let mut found = false;
     std::iter::from_fn(move || {
         while let Some(arg) = args.get(index).map(String::as_str) {
-            if arg == "--" {
-                return None;
+            index += 1;
+            if !literal {
+                if arg == "--" {
+                    if found {
+                        index = args.len();
+                        return None;
+                    }
+                    literal = true;
+                    continue;
+                }
+                if matches!(arg, "--profile" | "--log-level" | "--container") {
+                    // OpenClaw requires a value here and takes the next token as it is.
+                    index = (index + 1).min(args.len());
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    continue;
+                }
             }
-            index += match arg {
-                "--profile" | "--log-level" | "--container"
-                    if args
-                        .get(index + 1)
-                        .is_some_and(|value| is_openclaw_root_option_value(value)) =>
-                {
-                    2
-                }
-                _ if arg.starts_with('-') => 1,
-                _ => {
-                    index += 1;
-                    return Some(arg);
-                }
-            };
+            found = true;
+            return Some(arg);
         }
         None
     })
@@ -693,7 +679,7 @@ mod tests {
 
     #[test]
     fn command_words_skip_openclaw_root_options() {
-        let cases: [(&[&str], &[&str]); 7] = [
+        let cases: [(&[&str], &[&str]); 11] = [
             (&["onboard"], &["onboard"]),
             (&["--no-color", "onboard"], &["onboard"]),
             (&["--dev", "--log-level", "debug", "onboard"], &["onboard"]),
@@ -705,8 +691,18 @@ mod tests {
                 &["--profile", "work", "--container", "box", "setup"],
                 &["setup"],
             ),
-            (&["--log-level", "--", "onboard"], &[]),
-            (&["--", "onboard"], &[]),
+            (
+                &["--log-level", "--no-color", "gateway", "stop"],
+                &["gateway", "stop"],
+            ),
+            (&["--profile", "--", "onboard"], &["onboard"]),
+            (
+                &["--", "onboard", "--install-daemon"],
+                &["onboard", "--install-daemon"],
+            ),
+            (&["--log-level", "debug", "--", "onboard"], &["onboard"]),
+            (&["onboard", "--", "setup"], &["onboard"]),
+            (&["--log-level"], &[]),
         ];
         for (forwarded, expected) in cases {
             assert_eq!(
@@ -728,8 +724,14 @@ mod tests {
                 .unwrap(),
             args(&["--no-color", "onboard", "--skip-daemon"])
         );
-        let refused: [&[&str]; 3] = [
+        assert_eq!(
+            normalize_openclaw_args_for_env(&args(&["--", "onboard"])).unwrap(),
+            args(&["--", "onboard", "--no-install-daemon"])
+        );
+        let refused: [&[&str]; 5] = [
             &["--no-color", "onboard", "--install-daemon"],
+            &["--", "onboard", "--install-daemon"],
+            &["--log-level", "debug", "--", "onboard", "--install-daemon"],
             &["--log-level=debug", "onboard", "--install-daemon"],
             &["--profile", "work", "onboard", "--install-daemon"],
         ];

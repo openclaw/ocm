@@ -638,7 +638,7 @@ fn env_run_rejects_global_daemon_install_during_onboarding() {
     );
     assert!(create.status.success(), "{}", stderr(&create));
 
-    let refused: [&[&str]; 4] = [
+    let refused: [&[&str]; 5] = [
         &["env", "run", "demo", "--", "onboard", "--install-daemon"],
         &[
             "env",
@@ -664,6 +664,7 @@ fn env_run_rejects_global_daemon_install_during_onboarding() {
             "onboard",
             "--install-daemon",
         ],
+        &["@demo", "--", "--", "onboard", "--install-daemon"],
     ];
     for args in refused {
         let run = run_ocm(&cwd, &env, args);
