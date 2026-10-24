@@ -1574,9 +1574,9 @@ The service output the supervisor captured for a removed environment,
 place until an environment with the same name is created, cloned or imported.
 OCM deletes those files when it registers the new environment, so the new
 environment starts without the earlier one's service logs. Copy them before
-reusing the name if you need them. An environment named `daemon` is the
-exception while the supervisor daemon writes its own `daemon.stdout.log` and
-`daemon.stderr.log` to the same directory; OCM keeps those files.
+reusing the name if you need them. OCM never deletes the supervisor daemon's
+own `daemon.stdout.log` and `daemon.stderr.log`, which share that directory by
+default with the logs of an environment named `daemon`.
 
 For legacy layouts created before overlapping roots were rejected, removal refuses
 to delete another registered environment's root or a link needed to reach it,

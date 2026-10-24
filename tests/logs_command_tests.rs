@@ -292,10 +292,11 @@ fn env_create_fails_when_an_earlier_service_log_cannot_be_deleted() {
 
 #[test]
 fn an_env_named_daemon_keeps_only_the_daemons_own_logs() {
-    for layout in ["default", "relocated", "alias"] {
+    for layout in ["default", "relocated", "alias", "case"] {
         if layout == "alias" && !cfg!(unix) {
             continue;
         }
+        let name = if layout == "case" { "Daemon" } else { "daemon" };
         let root = TestDir::new("logs-env-named-daemon");
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
@@ -317,7 +318,15 @@ fn an_env_named_daemon_keeps_only_the_daemons_own_logs() {
             "alias" => std::os::unix::fs::symlink(log.parent().unwrap(), &daemon_logs).unwrap(),
             _ => {}
         }
-        if layout != "default" {
+        if layout == "case" {
+            // On a case-insensitive filesystem Daemon.stdout.log is the
+            // daemon's own file; a hard link gives the same aliasing here.
+            let alias = log.with_file_name("Daemon.stdout.log");
+            if let Err(error) = fs::hard_link(&log, &alias) {
+                assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            }
+        }
+        if layout == "relocated" || layout == "alias" {
             fs::write(
                 root.child("ocm-home/supervisor/daemon-log-config.json"),
                 serde_json::json!({ "logDir": path_string(&daemon_logs) }).to_string(),
@@ -325,15 +334,12 @@ fn an_env_named_daemon_keeps_only_the_daemons_own_logs() {
             .unwrap();
         }
 
-        let created = run_ocm(
-            &cwd,
-            &env,
-            &["env", "create", "daemon", "--launcher", "stable"],
-        );
+        let created = run_ocm(&cwd, &env, &["env", "create", name, "--launcher", "stable"]);
         assert!(created.status.success(), "{}", stderr(&created));
         // In the daemon's directory the file is its own log; after relocation
         // it can only be an earlier env's output.
         assert_eq!(log.exists(), layout != "relocated", "{layout}");
+        assert!(layout != "case" || log.with_file_name("Daemon.stdout.log").exists());
     }
 }
 

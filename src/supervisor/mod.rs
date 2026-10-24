@@ -376,21 +376,21 @@ pub(crate) fn discard_child_logs(
     cwd: &Path,
 ) -> Result<(), String> {
     let logs_dir = supervisor_logs_dir(env, cwd)?;
-    // The daemon writes daemon.<stream>.log. With its default log directory
-    // those are also the child log paths of an env named "daemon"; keep them.
-    if env_name == "daemon" {
-        let daemon_logs_dir = SupervisorService::new(env, cwd).saved_daemon_logs_dir()?;
-        let same_dir = daemon_logs_dir == logs_dir
-            || matches!(
-                (fs::canonicalize(&daemon_logs_dir), fs::canonicalize(&logs_dir)),
-                (Ok(daemon), Ok(child)) if daemon == child
-            );
-        if same_dir {
-            return Ok(());
-        }
-    }
+    // The daemon writes daemon.<stream>.log, by default in this directory. An
+    // env named "daemon" (in any case, on a case-insensitive filesystem) can
+    // resolve to those same files; never delete the daemon's own logs.
+    let daemon_logs_dir = if env_name.eq_ignore_ascii_case("daemon") {
+        Some(SupervisorService::new(env, cwd).saved_daemon_logs_dir()?)
+    } else {
+        None
+    };
     for stream in ["stdout", "stderr"] {
         let path = supervisor_child_log_path(&logs_dir, env_name, stream);
+        if let Some(daemon_logs_dir) = &daemon_logs_dir
+            && is_same_file(&path, &daemon_logs_dir.join(format!("daemon.{stream}.log")))
+        {
+            continue;
+        }
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -403,6 +403,25 @@ pub(crate) fn discard_child_logs(
         }
     }
     Ok(())
+}
+
+/// Whether both paths exist and resolve to the same file.
+fn is_same_file(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        matches!(
+            (fs::metadata(left), fs::metadata(right)),
+            (Ok(left), Ok(right)) if left.dev() == right.dev() && left.ino() == right.ino()
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(
+            (fs::canonicalize(left), fs::canonicalize(right)),
+            (Ok(left), Ok(right)) if left == right
+        )
+    }
 }
 
 pub fn sync_supervisor_binding_if_present(
