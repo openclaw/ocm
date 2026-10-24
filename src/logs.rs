@@ -44,6 +44,43 @@ pub struct LogTarget {
     pub path: PathBuf,
 }
 
+/// The two files that can hold one stream of an env's logs: the env's own
+/// Gateway log and the OCM background service child log.
+#[derive(Clone, Debug)]
+struct LogSources {
+    env_name: String,
+    stream: String,
+    gateway_path: PathBuf,
+    service_path: PathBuf,
+}
+
+impl LogSources {
+    /// Picks the newer existing file, or the Gateway path when neither exists.
+    fn select(&self) -> LogTarget {
+        let gateway_modified = modified_at(&self.gateway_path);
+        let service_modified = modified_at(&self.service_path);
+        let (source_kind, path) = match (gateway_modified, service_modified) {
+            (Some(gateway_time), Some(service_time)) => {
+                if service_time > gateway_time {
+                    ("service", &self.service_path)
+                } else {
+                    ("gateway", &self.gateway_path)
+                }
+            }
+            (Some(_), None) => ("gateway", &self.gateway_path),
+            (None, Some(_)) => ("service", &self.service_path),
+            (None, None) => ("gateway", &self.gateway_path),
+        };
+
+        LogTarget {
+            env_name: self.env_name.clone(),
+            stream: self.stream.clone(),
+            source_kind: source_kind.to_string(),
+            path: path.clone(),
+        }
+    }
+}
+
 pub struct LogService<'a> {
     env: &'a BTreeMap<String, String>,
     cwd: &'a Path,
@@ -121,6 +158,10 @@ impl<'a> LogService<'a> {
     }
 
     pub fn target(&self, name: &str, stream: &str) -> Result<LogTarget, String> {
+        Ok(self.sources(name, stream)?.select())
+    }
+
+    fn sources(&self, name: &str, stream: &str) -> Result<LogSources, String> {
         let stream = normalize_stream(stream)?.to_string();
         let meta = EnvironmentService::new(self.env, self.cwd).get(name)?;
         let env_paths = derive_env_paths(Path::new(&meta.root));
@@ -132,42 +173,68 @@ impl<'a> LogService<'a> {
                 "stderr" => "gateway.err.log",
                 _ => unreachable!("stream validated by normalize_stream"),
             });
-        let supervisor_path =
+        let service_path =
             supervisor_logs_dir(self.env, self.cwd)?.join(format!("{}.{}.log", name, stream));
 
-        let gateway_modified = modified_at(&gateway_path);
-        let supervisor_modified = modified_at(&supervisor_path);
-
-        let (source_kind, path) = match (gateway_modified, supervisor_modified) {
-            (Some(gateway_time), Some(supervisor_time)) => {
-                if supervisor_time > gateway_time {
-                    ("service", supervisor_path)
-                } else {
-                    ("gateway", gateway_path)
-                }
-            }
-            (Some(_), None) => ("gateway", gateway_path),
-            (None, Some(_)) => ("service", supervisor_path),
-            (None, None) => ("gateway", gateway_path),
-        };
-
-        Ok(LogTarget {
+        Ok(LogSources {
             env_name: name.to_string(),
             stream,
-            source_kind: source_kind.to_string(),
-            path,
+            gateway_path,
+            service_path,
         })
     }
 
-    pub fn targets(&self, name: &str, stream: &str) -> Result<Vec<LogTarget>, String> {
+    fn stream_sources(&self, name: &str, stream: &str) -> Result<Vec<LogSources>, String> {
         match normalize_stream(stream)? {
-            "stdout" | "stderr" => Ok(vec![self.target(name, stream)?]),
+            "stdout" | "stderr" => Ok(vec![self.sources(name, stream)?]),
             "all" => Ok(vec![
-                self.target(name, "stdout")?,
-                self.target(name, "stderr")?,
+                self.sources(name, "stdout")?,
+                self.sources(name, "stderr")?,
             ]),
             _ => unreachable!("stream validated by normalize_stream"),
         }
+    }
+
+    pub fn targets(&self, name: &str, stream: &str) -> Result<Vec<LogTarget>, String> {
+        Ok(self
+            .stream_sources(name, stream)?
+            .iter()
+            .map(LogSources::select)
+            .collect())
+    }
+
+    /// Describes the sources a follow starts on. A stream with no log file yet is
+    /// reported as pending on both candidate paths, because follow attaches to
+    /// whichever of them appears first.
+    pub fn follow_components(
+        &self,
+        name: &str,
+        stream: &str,
+    ) -> Result<Vec<LogComponentSummary>, String> {
+        Ok(self
+            .stream_sources(name, stream)?
+            .iter()
+            .map(|sources| {
+                let target = sources.select();
+                if target.path.exists() {
+                    LogComponentSummary {
+                        stream: target.stream,
+                        source_kind: target.source_kind,
+                        path: display_path(&target.path),
+                    }
+                } else {
+                    LogComponentSummary {
+                        stream: target.stream,
+                        source_kind: "pending".to_string(),
+                        path: format!(
+                            "{} or {}",
+                            display_path(&sources.gateway_path),
+                            display_path(&sources.service_path)
+                        ),
+                    }
+                }
+            })
+            .collect())
     }
 
     pub fn follow<W: std::io::Write>(
@@ -178,9 +245,9 @@ impl<'a> LogService<'a> {
         writer: &mut W,
     ) -> Result<LogTarget, String> {
         let stream = normalize_stream(stream)?;
-        let targets = self.targets(name, stream)?;
+        let sources = self.stream_sources(name, stream)?;
         let merge_streams = stream == "all";
-        self.follow_targets(name, targets, tail_lines, merge_streams, writer)?;
+        self.follow_sources(name, sources, tail_lines, merge_streams, writer)?;
         if merge_streams {
             Ok(LogTarget {
                 env_name: name.to_string(),
@@ -193,18 +260,18 @@ impl<'a> LogService<'a> {
         }
     }
 
-    fn follow_targets<W: Write>(
+    fn follow_sources<W: Write>(
         &self,
         name: &str,
-        targets: Vec<LogTarget>,
+        sources: Vec<LogSources>,
         tail_lines: Option<usize>,
         merge_streams: bool,
         writer: &mut W,
     ) -> Result<(), String> {
         let mut snapshots = Vec::new();
-        let mut cursors = targets
+        let mut cursors = sources
             .into_iter()
-            .map(FollowCursor::new)
+            .map(FollowCursor::for_sources)
             .collect::<Vec<_>>();
         for cursor in &mut cursors {
             if let Some(snapshot) = cursor.snapshot(tail_lines, merge_streams)? {
@@ -284,6 +351,9 @@ impl<'a> LogService<'a> {
 
 struct FollowCursor {
     target: LogTarget,
+    /// Set until the first file is opened: the cursor re-selects its target on
+    /// each attempt so it attaches to whichever candidate log appears first.
+    sources: Option<LogSources>,
     offset: u64,
     identity: Option<FileIdentity>,
     modified: Option<std::time::SystemTime>,
@@ -301,6 +371,7 @@ impl FollowCursor {
     fn new(target: LogTarget) -> Self {
         Self {
             target,
+            sources: None,
             offset: 0,
             identity: None,
             modified: None,
@@ -315,6 +386,12 @@ impl FollowCursor {
         }
     }
 
+    fn for_sources(sources: LogSources) -> Self {
+        let mut cursor = Self::new(sources.select());
+        cursor.sources = Some(sources);
+        cursor
+    }
+
     fn is_initialized(&self) -> bool {
         self.initialized
     }
@@ -324,9 +401,13 @@ impl FollowCursor {
         tail_lines: Option<usize>,
         hold_partial_record: bool,
     ) -> Result<Option<LogSnapshot>, String> {
+        if let Some(sources) = &self.sources {
+            self.target = sources.select();
+        }
         let Some((mut file, metadata)) = open_log(&self.target.path)? else {
             return Ok(None);
         };
+        self.sources = None;
         let (mut bytes, offset, _bytes_read) = read_log_snapshot_from(&mut file, tail_lines)?;
         #[cfg(test)]
         {
@@ -1050,8 +1131,8 @@ fn next_log_sequence() -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        FollowCursor, FollowUpdate, LogService, LogSnapshot, LogTarget, merge_log_snapshots,
-        merge_log_texts, tail_bytes,
+        FollowCursor, FollowUpdate, LogService, LogSnapshot, LogSources, LogTarget,
+        merge_log_snapshots, merge_log_texts, tail_bytes,
     };
     use crate::store::ensure_dir;
     use std::collections::BTreeMap;
@@ -1931,6 +2012,57 @@ mod tests {
         assert!(target.path.ends_with("supervisor/logs/demo.stdout.log"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn follow_cursor_attaches_to_the_service_log_when_no_log_existed_at_startup() {
+        let root = test_root("follow-pending-service");
+        let gateway_path = root.join("gateway.err.log");
+        let service_path = root.join("demo.stderr.log");
+        let mut cursor = FollowCursor::for_sources(stderr_sources(&gateway_path, &service_path));
+        assert!(cursor.snapshot(Some(50), false).unwrap().is_none());
+
+        fs::write(&service_path, b"service error\n").unwrap();
+        let snapshot = cursor.snapshot(Some(50), false).unwrap().unwrap();
+        assert_eq!(snapshot.bytes, b"service error\n");
+        assert_eq!(cursor.target.source_kind, "service");
+        assert_eq!(cursor.target.path, service_path);
+
+        // Once attached, the follower stays on its file like tail -f.
+        sleep(Duration::from_millis(20));
+        fs::write(&gateway_path, b"newer gateway error\n").unwrap();
+        append(&service_path, b"second service error\n");
+        let update = cursor.read_update().unwrap().unwrap();
+        assert_eq!(update_bytes(&update), b"second service error\n");
+        assert_eq!(cursor.target.path, service_path);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn follow_cursor_attaches_to_the_gateway_log_when_it_appears_first() {
+        let root = test_root("follow-pending-gateway");
+        let gateway_path = root.join("gateway.err.log");
+        let service_path = root.join("demo.stderr.log");
+        let mut cursor = FollowCursor::for_sources(stderr_sources(&gateway_path, &service_path));
+        assert!(cursor.snapshot(Some(50), false).unwrap().is_none());
+
+        fs::write(&gateway_path, b"gateway error\n").unwrap();
+        let snapshot = cursor.snapshot(Some(50), false).unwrap().unwrap();
+        assert_eq!(snapshot.bytes, b"gateway error\n");
+        assert_eq!(cursor.target.source_kind, "gateway");
+        assert_eq!(cursor.target.path, gateway_path);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn stderr_sources(gateway_path: &Path, service_path: &Path) -> LogSources {
+        LogSources {
+            env_name: "demo".to_string(),
+            stream: "stderr".to_string(),
+            gateway_path: gateway_path.to_path_buf(),
+            service_path: service_path.to_path_buf(),
+        }
     }
 
     fn test_root(label: &str) -> PathBuf {

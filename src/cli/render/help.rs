@@ -236,6 +236,7 @@ pub fn logs_help(cmd: &str) -> String {
             "By default OCM shows both stdout and stderr together in time order.",
             "Follow mode cannot be combined with --json.",
             "When both env and service logs exist, OCM reads the newer active file.",
+            "A --stream follow started before either log exists waits for both files and follows whichever appears first.",
             "Foreground runs still work because OCM can still read the env's own gateway log files directly.",
         ],
     )
