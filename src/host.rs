@@ -8,7 +8,9 @@ use crate::managed_node::{
     OPENCLAW_MIN_NODE_VERSION, OPENCLAW_NODE_VERSION_REQUIREMENT, managed_node_fallback_detail,
     managed_node_fallback_supported,
 };
-use crate::service::{ServiceManagerKind, service_backend_support_error, service_manager_kind};
+use crate::service::{
+    ServiceManagerKind, service_backend_support_error, service_manager_binary, service_manager_kind,
+};
 use crate::store::resolve_user_home;
 
 const INTERNAL_NPM_BIN_ENV: &str = "OCM_INTERNAL_NPM_BIN";
@@ -700,40 +702,42 @@ fn chrome_check(env: &BTreeMap<String, String>) -> HostCheckSummary {
 }
 
 fn service_manager_check(env: &BTreeMap<String, String>) -> HostCheckSummary {
-    let (name, probe, available_detail, missing_suggestion, session_suggestion) =
-        match service_manager_kind(env) {
-            ServiceManagerKind::Launchd => (
-                "launchd",
-                tool_version("launchctl", &["help"]).map(|_| None),
-                "launchd is available",
-                "Use --no-service or make sure launchd is available on this machine.",
-                "Use --no-service, or run OCM in the logged-in user's session so launchctl can reach its launchd domain.",
-            ),
-            ServiceManagerKind::SystemdUser => (
-                "systemd --user",
-                tool_version("systemctl", &["--version"]).map(|summary| Some(summary.version)),
-                "systemd --user service support is available",
-                "Use --no-service or install systemd user services on this machine.",
-                "Use --no-service, or run OCM in a login session that can reach the systemd user manager (sudo, su and cron shells usually cannot).",
-            ),
-            ServiceManagerKind::Unsupported => {
-                return check(
-                    "background-services",
-                    "managed services",
-                    "Keep envs running in the background",
-                    HostCheckLevel::Recommended,
-                    HostCheckStatus::Missing,
-                    HostCheckNotes::new(
-                        None,
-                        Some("managed services are not supported on this platform yet".to_string()),
-                        Some(
-                            "Use --no-service and run OpenClaw directly inside the env for now."
-                                .to_string(),
-                        ),
+    // Probe the same binary the service gate below uses.
+    let kind = service_manager_kind(env);
+    let binary = service_manager_binary(env, kind);
+    let (name, probe, available_detail, missing_suggestion, session_suggestion) = match kind {
+        ServiceManagerKind::Launchd => (
+            "launchd",
+            tool_version(binary, &["help"]).map(|_| None),
+            "launchd is available",
+            "Use --no-service or make sure launchd is available on this machine.",
+            "Use --no-service, or run OCM in the logged-in user's session so launchctl can reach its launchd domain.",
+        ),
+        ServiceManagerKind::SystemdUser => (
+            "systemd --user",
+            tool_version(binary, &["--version"]).map(|summary| Some(summary.version)),
+            "systemd --user service support is available",
+            "Use --no-service or install systemd user services on this machine.",
+            "Use --no-service, or run OCM in a login session that can reach the systemd user manager (sudo, su and cron shells usually cannot).",
+        ),
+        ServiceManagerKind::Unsupported => {
+            return check(
+                "background-services",
+                "managed services",
+                "Keep envs running in the background",
+                HostCheckLevel::Recommended,
+                HostCheckStatus::Missing,
+                HostCheckNotes::new(
+                    None,
+                    Some("managed services are not supported on this platform yet".to_string()),
+                    Some(
+                        "Use --no-service and run OpenClaw directly inside the env for now."
+                            .to_string(),
                     ),
-                );
-            }
-        };
+                ),
+            );
+        }
+    };
     let (status, notes) = match probe {
         Err(detail) => (
             HostCheckStatus::Missing,

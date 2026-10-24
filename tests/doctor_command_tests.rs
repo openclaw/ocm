@@ -159,7 +159,9 @@ fn doctor_host_fix_requires_yes() {
 
 /// Installs a fake service manager whose binary probe always succeeds and whose
 /// session probe (the one the service gate runs) succeeds only while
-/// `session-usable` exists in the fixture root.
+/// `session-usable` exists in the fixture root. The fake is reachable only
+/// through the service manager's binary override, not PATH, so doctor must
+/// probe the same binary as the service gate.
 #[cfg(unix)]
 fn install_service_manager_with_session(
     root: &TestDir,
@@ -178,11 +180,6 @@ fn install_service_manager_with_session(
         usable = path_string(&root.child("session-usable")),
     );
     write_executable_script(&bin_dir.join(binary), &script);
-    let path = env.get("PATH").cloned().unwrap_or_default();
-    env.insert(
-        "PATH".to_string(),
-        format!("{}:{path}", path_string(&bin_dir)),
-    );
     env.insert(
         "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
         manager.to_string(),
