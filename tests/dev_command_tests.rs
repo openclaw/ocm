@@ -316,6 +316,10 @@ if [ "$1" = config ]; then
   fi
   exit 0
 fi
+if [ "$1" = store ]; then
+  printf '%s\n' "$OCM_TEST_PNPM_STORE_PATH"
+  exit 0
+fi
 "#;
     write_executable_script(
         &root.child("fake-dev-bin/pnpm"),
@@ -4062,6 +4066,9 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
         "failed-config",
         "workspace-override",
         "workspace-self",
+        "implicit-global-store",
+        "linked-implicit-global-store",
+        "linked-workspace-project-modules",
     ] {
         let root = TestDir::new("dev-effective-pnpm-destinations");
         let repo = init_openclaw_repo(&root);
@@ -4095,6 +4102,18 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
                 fs::create_dir(repo.join("lockfiles")).unwrap();
                 repo.join("lockfiles/modules")
             } else {
+                if case.ends_with("implicit-global-store") {
+                    // No explicit directory: pnpm links packages under its store.
+                    env.insert(
+                        "OCM_TEST_PNPM_CONFIG".to_string(),
+                        serde_json::json!({"virtualStoreType": "global"}).to_string(),
+                    );
+                    env.insert(
+                        "OCM_TEST_PNPM_STORE_PATH".to_string(),
+                        path_string(&root.child("pnpm-store/v11")),
+                    );
+                    fs::create_dir_all(root.child("pnpm-store/v11")).unwrap();
+                }
                 if case == "linked-global-store" {
                     env.insert(
                         "OCM_TEST_PNPM_CONFIG".to_string(),
@@ -4112,6 +4131,23 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
             | "linked-global-store"
             | "linked-lockfile-modules" => {
                 std::os::unix::fs::symlink(&borrowed, &link).unwrap();
+            }
+            "linked-implicit-global-store" => {
+                std::os::unix::fs::symlink(&borrowed, root.child("pnpm-store/v11/links")).unwrap();
+            }
+            "linked-workspace-project-modules" => {
+                // A frozen install links each lockfile project into its own modules.
+                fs::create_dir(repo.join("custom-store")).unwrap();
+                fs::create_dir(repo.join("ui")).unwrap();
+                fs::write(
+                    repo.join("pnpm-lock.yaml"),
+                    "lockfileVersion: '9.0'\nimporters:\n  .: {}\n  ui: {}\n",
+                )
+                .unwrap();
+                std::os::unix::fs::symlink(&borrowed, repo.join("ui/node_modules")).unwrap();
+            }
+            "implicit-global-store" => {
+                fs::create_dir(root.child("pnpm-store/v11/links")).unwrap();
             }
             "invalid-config" => {
                 env.insert(
@@ -4136,7 +4172,10 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
             env.insert("PNPM_CONFIG_WORKSPACE_DIR".to_string(), String::new());
             env.insert("npm_config_workspace_dir".to_string(), path_string(&repo));
         }
-        let admitted = matches!(case, "physical" | "workspace-self");
+        let admitted = matches!(
+            case,
+            "physical" | "workspace-self" | "implicit-global-store"
+        );
         let result = run_ocm(
             &cwd,
             &env,
@@ -4165,6 +4204,11 @@ fn dev_dependencies_admit_effective_pnpm_destinations_before_installing() {
         }
         if case.starts_with("linked-") {
             assert!(stderr(&result).contains("refusing to install"), "{case}");
+            let link = match case {
+                "linked-implicit-global-store" => root.child("pnpm-store/v11/links"),
+                "linked-workspace-project-modules" => repo.join("ui/node_modules"),
+                _ => link,
+            };
             assert_eq!(fs::read_link(&link).unwrap(), borrowed);
         }
         if case == "workspace-override" {

@@ -135,10 +135,12 @@ New borrowers may prepare missing tooling with `pnpm install --frozen-lockfile`.
 Before automatic installation, OCM reads the configuration the selected pnpm
 reports (such as `pnpm-workspace.yaml`, pnpm's global `config.yaml` and
 `PNPM_CONFIG_*` settings) and refuses linked modules or virtual-store
-destinations, including custom project and global stores, lockfile-relative
-modules, and linked parents. It also refuses a pnpm workspace-directory override
-(`PNPM_CONFIG_WORKSPACE_DIR`, `NPM_CONFIG_WORKSPACE_DIR` or their lowercase
-spellings) that names another directory. Failed configuration readback also
+destinations: each lockfile project's modules directory, the lockfile root's
+modules and installation state, custom project and global stores, a global
+store kept under pnpm's store directory, and linked parents. It also refuses a
+pnpm workspace-directory override (`PNPM_CONFIG_WORKSPACE_DIR`,
+`NPM_CONFIG_WORKSPACE_DIR` or their lowercase spellings) that names another
+directory, and per-project pnpm lockfiles. Failed configuration readback also
 requires explicit preparation; physical default and custom destinations remain
 supported. Destinations chosen by a checkout's pnpmfile hooks or configuration
 plugins during installation are not checked, because pnpm applies them only
