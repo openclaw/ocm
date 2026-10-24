@@ -235,7 +235,7 @@ impl Drop for DevSourceSwitch<'_> {
         );
         let message = match restored {
             Ok(_) => format!(
-                "Switched {} back to {} because it did not start from {}.",
+                "Switched {} back to {} because {} was not prepared.",
                 self.env_name, self.previous, self.selected
             ),
             Err(error)
@@ -924,6 +924,8 @@ impl Cli {
                 None => preparation.map_err(|error| error.message),
             };
         }
+        // The switch commits once the selected checkout is prepared. A later
+        // launch failure leaves a checkout that its next start uses as is.
         if let Some(switch) = source_switch.as_mut() {
             switch.keep();
         }

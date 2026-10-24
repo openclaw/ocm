@@ -1277,7 +1277,7 @@ fn dev_switch_restores_the_previous_source_after_failed_or_interrupted_preparati
     let worktree_arg = path_string(&worktree);
     let node_log = fs::read(root.child("node.log")).unwrap();
     let restored_line =
-        format!("Switched demo back to {repo_arg} because it did not start from {worktree_arg}.");
+        format!("Switched demo back to {repo_arg} because {worktree_arg} was not prepared.");
     let read_env = env.clone();
     let assert_restored = |output: &std::process::Output| {
         assert!(
@@ -1480,4 +1480,62 @@ fn dev_switch_from_a_missing_checkout_keeps_the_selected_binding_when_preparatio
     assert!(switched.status.success(), "{}", stderr(&switched));
     assert_eq!(installs_in(&root, &last), 1);
     assert_eq!(bound(&env), Some(path_string(&last)));
+}
+
+#[test]
+fn dev_switch_commits_once_prepared_even_if_the_gateway_fails_to_launch() {
+    #[cfg(unix)]
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = TestDir::new("dev-switch-launch-failure");
+    let (repo, worktree) = prepared_checkout_and_fresh_worktree(&root);
+    let env = switch_env(&root);
+    let created = run_ocm(&repo, &env, &dev_plain(&["demo"]));
+    assert!(created.status.success(), "{}", stderr(&created));
+    let meta = get_environment("demo", &env, &repo).unwrap();
+    let gateway_log = ocm::store::derive_env_paths(Path::new(&meta.root))
+        .state_dir
+        .join("logs/gateway.log");
+    let _ = fs::remove_file(&gateway_log);
+    fs::create_dir_all(&gateway_log).unwrap();
+    let node_log = fs::read(root.child("node.log")).unwrap();
+    let worktree_arg = path_string(&worktree);
+
+    let failed = run_ocm(&worktree, &env, &dev_plain(&["demo"]));
+    assert!(!failed.status.success());
+    assert!(
+        stderr(&failed).contains("failed opening stdout log"),
+        "{}",
+        stderr(&failed)
+    );
+    assert!(!stderr(&failed).contains("Switched demo back"));
+    assert_eq!(installs_in(&root, &worktree), 1);
+    assert_eq!(fs::read(root.child("node.log")).unwrap(), node_log);
+    let bound = || {
+        get_environment("demo", &env, &repo)
+            .unwrap()
+            .dev
+            .unwrap()
+            .borrowed_source_root()
+            .map(str::to_string)
+    };
+    assert_eq!(bound(), Some(worktree_arg.clone()));
+
+    // The prepared checkout starts as an ordinary resume, without reinstalling.
+    fs::remove_dir(&gateway_log).unwrap();
+    let resumed = run_ocm(&worktree, &env, &dev_plain(&["demo"]));
+    assert!(resumed.status.success(), "{}", stderr(&resumed));
+    assert!(!stderr(&resumed).contains("Switched demo"));
+    assert_eq!(installs_in(&root, &worktree), 1);
+    let log = fs::read_to_string(root.child("node.log")).unwrap();
+    let gateway = log
+        .lines()
+        .rfind(|line| line.contains("gateway run"))
+        .unwrap();
+    assert!(
+        gateway.starts_with(&format!("{worktree_arg}|")),
+        "{gateway}"
+    );
+    assert_eq!(bound(), Some(worktree_arg));
 }
