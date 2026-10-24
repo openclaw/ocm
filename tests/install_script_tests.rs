@@ -4,7 +4,7 @@ mod support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::support::{TestDir, path_string, stderr, write_executable_script};
@@ -205,34 +205,36 @@ fn installer_force_preserves_managed_destinations_before_download() {
     assert!(!linked_missing.exists());
 }
 
-#[test]
-fn installer_preserves_destination_changes_and_standalone_force() {
+const STANDALONE_BINARY: &[u8] = b"new standalone binary";
+
+/// A Linux x86_64 release served by a fake `curl`. When `TEST_ACTION` is set,
+/// the fake changes the destination while `SHA256SUMS` downloads.
+fn standalone_release(root: &TestDir) -> (PathBuf, PathBuf) {
     use flate2::{Compression, write::GzEncoder};
-    for action in ["force", "new-file", "new-symlink", "managed-parent"] {
-        let root = TestDir::new("install-force-standalone");
-        let fake_bin = root.child("fake-bin");
-        fs::create_dir_all(&fake_bin).unwrap();
-        let archive = root.child("archive.tar.gz");
-        let mut builder = tar::Builder::new(GzEncoder::new(
-            fs::File::create(&archive).unwrap(),
-            Compression::default(),
-        ));
-        let bytes = b"new standalone binary";
-        let mut header = tar::Header::new_gnu();
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        builder.append_data(&mut header, "ocm", &bytes[..]).unwrap();
-        builder.into_inner().unwrap().finish().unwrap();
-        let digest = ocm::infra::download::file_sha256(&archive).unwrap();
-        write_executable_script(
-            &fake_bin.join("uname"),
-            "#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo x86_64;; esac\n",
-        );
-        write_executable_script(
-            &fake_bin.join("curl"),
-            &format!(
-                r#"#!/bin/sh
+    let fake_bin = root.child("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let archive = root.child("archive.tar.gz");
+    let mut builder = tar::Builder::new(GzEncoder::new(
+        fs::File::create(&archive).unwrap(),
+        Compression::default(),
+    ));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(STANDALONE_BINARY.len() as u64);
+    header.set_mode(0o755);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "ocm", STANDALONE_BINARY)
+        .unwrap();
+    builder.into_inner().unwrap().finish().unwrap();
+    let digest = ocm::infra::download::file_sha256(&archive).unwrap();
+    write_executable_script(
+        &fake_bin.join("uname"),
+        "#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo x86_64;; esac\n",
+    );
+    write_executable_script(
+        &fake_bin.join("curl"),
+        &format!(
+            r#"#!/bin/sh
 case "$2" in
   */SHA256SUMS)
     printf '{digest}  ocm-x86_64-unknown-linux-gnu.tar.gz\n' > "$4"
@@ -248,8 +250,16 @@ case "$2" in
   *) cp "$TEST_ARCHIVE" "$4";;
 esac
 "#
-            ),
-        );
+        ),
+    );
+    (fake_bin, archive)
+}
+
+#[test]
+fn installer_preserves_destination_changes_and_standalone_force() {
+    for action in ["force", "new-file", "new-symlink", "managed-parent"] {
+        let root = TestDir::new("install-force-standalone");
+        let (fake_bin, archive) = standalone_release(&root);
         let destination = root.child("standalone/ocm");
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         let managed = root.child("node_modules/@openclaw/ocm/bin/ocm");
@@ -280,7 +290,12 @@ esac
             .unwrap();
         if action == "force" {
             assert!(output.status.success(), "{}", stderr(&output));
-            assert_eq!(fs::read(&destination).unwrap(), bytes);
+            assert_eq!(fs::read(&destination).unwrap(), STANDALONE_BINARY);
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert_eq!(directory_entries(destination.parent().unwrap()), ["ocm"]);
         } else {
             assert!(!output.status.success(), "{action}");
             assert_eq!(
@@ -294,4 +309,92 @@ esac
         }
         assert_eq!(fs::read(managed).unwrap(), b"managed");
     }
+}
+
+fn directory_entries(directory: &Path) -> Vec<String> {
+    let mut entries = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
+#[test]
+fn installer_keeps_the_previous_binary_when_the_write_fails() {
+    for existing in [true, false] {
+        let root = TestDir::new("install-failed-write");
+        let (fake_bin, archive) = standalone_release(&root);
+        // Fail the way coreutils `install` does on a full disk: remove the
+        // target, write part of the file, then exit non-zero.
+        write_executable_script(
+            &fake_bin.join("install"),
+            "#!/bin/sh\nfor target; do :; done\nrm -f \"$target\"\nprintf partial > \"$target\"\necho 'install: write error: No space left on device' >&2\nexit 1\n",
+        );
+        let bin_dir = root.child("standalone");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let destination = bin_dir.join("ocm");
+        let mut command = Command::new("bash");
+        command.arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("install.sh"));
+        if existing {
+            fs::write(&destination, "old").unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+            command.arg("--force");
+        }
+        let output = command
+            .args(["--bin-dir", &path_string(&bin_dir)])
+            .env("HOME", root.child("home"))
+            .env("TEST_ARCHIVE", archive)
+            .env(
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "existing={existing}");
+        assert!(
+            stderr(&output).contains("No space left on device"),
+            "{}",
+            stderr(&output)
+        );
+        if existing {
+            assert_eq!(fs::read(&destination).unwrap(), b"old");
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert_eq!(directory_entries(&bin_dir), ["ocm"]);
+        } else {
+            assert!(directory_entries(&bin_dir).is_empty());
+        }
+    }
+}
+
+#[test]
+fn installer_refuses_a_directory_at_the_destination() {
+    let root = TestDir::new("install-directory-destination");
+    let (fake_bin, archive) = standalone_release(&root);
+    let bin_dir = root.child("standalone");
+    fs::create_dir_all(bin_dir.join("ocm")).unwrap();
+    let output = Command::new("bash")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
+        .args(["--force", "--bin-dir", &path_string(&bin_dir)])
+        .env("HOME", root.child("home"))
+        .env("TEST_ARCHIVE", archive)
+        .env(
+            "PATH",
+            format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("is a directory"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(directory_entries(&bin_dir), ["ocm"]);
+    assert!(directory_entries(&bin_dir.join("ocm")).is_empty());
 }

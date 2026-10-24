@@ -147,6 +147,10 @@ protect_destination() {
     echo "error: Homebrew manages this destination; run brew upgrade openclaw/tap/ocm" >&2
     exit 1
   fi
+  if [[ -d "$destination" ]]; then
+    echo "error: ${destination} is a directory; remove it or choose another --bin-dir" >&2
+    exit 1
+  fi
   if [[ -e "$destination" && "$force" != "true" ]]; then
     echo "error: ${destination} already exists; run \"ocm self update\" or rerun with --force to replace it" >&2
     exit 1
@@ -161,8 +165,12 @@ url="$(download_url_for "$version" "$asset")"
 checksums_url="$(download_url_for "$version" "SHA256SUMS")"
 
 tmp_dir="$(mktemp -d)"
+staged_path=""
 cleanup() {
   rm -rf "$tmp_dir"
+  if [[ -n "$staged_path" ]]; then
+    rm -f "$staged_path"
+  fi
 }
 trap cleanup EXIT
 
@@ -215,7 +223,12 @@ fi
 mkdir -p "$bin_dir"
 protect_destination
 
-install -m 0755 "$binary_path" "$destination"
+# Write the new binary beside the destination and rename it into place, so a
+# failed or interrupted write never leaves a partial ocm or removes the old one.
+staged_path="$(mktemp "${bin_dir}/.ocm-install.XXXXXX")"
+install -m 0755 "$binary_path" "$staged_path"
+mv -f "$staged_path" "$destination"
+staged_path=""
 
 echo "Installed ocm to ${destination}"
 case ":${PATH}:" in
