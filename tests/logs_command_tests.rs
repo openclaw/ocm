@@ -161,7 +161,7 @@ fn assert_no_logs(cwd: &std::path::Path, env: &std::collections::BTreeMap<String
 
 #[test]
 fn a_recreated_env_does_not_show_the_removed_envs_service_logs() {
-    let cases: [(&[&str], &[&str]); 2] = [
+    let cases: [(&[&str], &[&str]); 3] = [
         (
             &["env", "remove", "demo"],
             &["env", "create", "demo", "--launcher", "stable"],
@@ -169,6 +169,10 @@ fn a_recreated_env_does_not_show_the_removed_envs_service_logs() {
         (
             &["env", "destroy", "demo", "--yes"],
             &["env", "clone", "keep", "demo"],
+        ),
+        (
+            &["env", "remove", "demo"],
+            &["env", "import", "keep.tar", "--name", "demo"],
         ),
     ];
     for (removal, creation) in cases {
@@ -183,6 +187,12 @@ fn a_recreated_env_does_not_show_the_removed_envs_service_logs() {
             &["env", "create", "keep", "--launcher", "stable"],
         );
         assert!(sibling.status.success(), "{}", stderr(&sibling));
+        let exported = run_ocm(
+            &cwd,
+            &env,
+            &["env", "export", "keep", "--output", "keep.tar"],
+        );
+        assert!(exported.status.success(), "{}", stderr(&exported));
         let logs_dir = write_service_logs(&root, "demo", "removed env");
         write_service_logs(&root, "keep", "sibling");
 
@@ -277,11 +287,15 @@ fn env_create_fails_when_an_earlier_service_log_cannot_be_deleted() {
     let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(!show.status.success());
     assert!(stderr(&show).contains("environment \"demo\" does not exist"));
+    assert!(!root.child("ocm-home/envs/demo").exists());
 }
 
 #[test]
 fn an_env_named_daemon_keeps_only_the_daemons_own_logs() {
-    for relocated in [false, true] {
+    for layout in ["default", "relocated", "alias"] {
+        if layout == "alias" && !cfg!(unix) {
+            continue;
+        }
         let root = TestDir::new("logs-env-named-daemon");
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
@@ -292,19 +306,24 @@ fn an_env_named_daemon_keeps_only_the_daemons_own_logs() {
             &["launcher", "add", "stable", "--command", "openclaw"],
         );
         assert!(launcher.status.success(), "{}", stderr(&launcher));
-        if relocated {
-            let daemon_logs = root.child("daemon-logs");
-            fs::create_dir_all(&daemon_logs).unwrap();
-            fs::create_dir_all(root.child("ocm-home/supervisor")).unwrap();
+        let log = root.child("ocm-home/supervisor/logs/daemon.stdout.log");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(&log, "earlier output\n").unwrap();
+        let daemon_logs = root.child("daemon-logs");
+        match layout {
+            "relocated" => fs::create_dir_all(&daemon_logs).unwrap(),
+            // Another path to the same directory still holds the daemon's logs.
+            #[cfg(unix)]
+            "alias" => std::os::unix::fs::symlink(log.parent().unwrap(), &daemon_logs).unwrap(),
+            _ => {}
+        }
+        if layout != "default" {
             fs::write(
                 root.child("ocm-home/supervisor/daemon-log-config.json"),
                 serde_json::json!({ "logDir": path_string(&daemon_logs) }).to_string(),
             )
             .unwrap();
         }
-        let log = root.child("ocm-home/supervisor/logs/daemon.stdout.log");
-        fs::create_dir_all(log.parent().unwrap()).unwrap();
-        fs::write(&log, "earlier output\n").unwrap();
 
         let created = run_ocm(
             &cwd,
@@ -312,9 +331,9 @@ fn an_env_named_daemon_keeps_only_the_daemons_own_logs() {
             &["env", "create", "daemon", "--launcher", "stable"],
         );
         assert!(created.status.success(), "{}", stderr(&created));
-        // In the default directory the file is the daemon's own log; after
-        // relocation it can only be an earlier env's output.
-        assert_eq!(log.exists(), !relocated, "relocated={relocated}");
+        // In the daemon's directory the file is its own log; after relocation
+        // it can only be an earlier env's output.
+        assert_eq!(log.exists(), layout != "relocated", "{layout}");
     }
 }
 

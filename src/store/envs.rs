@@ -596,6 +596,9 @@ fn create_environment_with_runtime_validation(
     if find_environment(&registry, &name).is_some() {
         return Err(format!("environment \"{name}\" already exists"));
     }
+    // Registration repeats this; doing it before any root is written lets a
+    // failure leave nothing behind.
+    crate::supervisor::discard_child_logs(&name, env, cwd)?;
     registration.recheck(&name, options.dev.as_ref(), &registry.envs)?;
     let _runtime_admission = admit_runtime_binding(
         &registry,

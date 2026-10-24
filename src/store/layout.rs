@@ -317,8 +317,8 @@ pub fn supervisor_logs_dir(env: &BTreeMap<String, String>, cwd: &Path) -> Result
 }
 
 /// The file where the supervisor captures one environment's service output.
-/// It lives outside the environment root and is keyed only by name, so the
-/// environment's removal deletes it explicitly.
+/// It lives outside the environment root and is keyed only by name, so it is
+/// discarded when the name is registered for a new environment.
 pub fn supervisor_child_log_path(logs_dir: &Path, env_name: &str, stream: &str) -> PathBuf {
     logs_dir.join(format!("{env_name}.{stream}.log"))
 }

@@ -378,9 +378,16 @@ pub(crate) fn discard_child_logs(
     let logs_dir = supervisor_logs_dir(env, cwd)?;
     // The daemon writes daemon.<stream>.log. With its default log directory
     // those are also the child log paths of an env named "daemon"; keep them.
-    if env_name == "daemon" && SupervisorService::new(env, cwd).saved_daemon_logs_dir()? == logs_dir
-    {
-        return Ok(());
+    if env_name == "daemon" {
+        let daemon_logs_dir = SupervisorService::new(env, cwd).saved_daemon_logs_dir()?;
+        let same_dir = daemon_logs_dir == logs_dir
+            || matches!(
+                (fs::canonicalize(&daemon_logs_dir), fs::canonicalize(&logs_dir)),
+                (Ok(daemon), Ok(child)) if daemon == child
+            );
+        if same_dir {
+            return Ok(());
+        }
     }
     for stream in ["stdout", "stderr"] {
         let path = supervisor_child_log_path(&logs_dir, env_name, stream);
