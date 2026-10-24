@@ -534,8 +534,6 @@ mod tests {
 
     use super::{exit_status_code, signal_diagnostic};
 
-
-
     #[test]
     fn numeric_exit_codes_are_reported_unchanged() {
         for code in [0, 3, 42, 255] {
@@ -588,7 +586,6 @@ mod tests {
             None
         );
     }
-
 
     #[test]
     fn failed_launch_returns_the_terminal_to_ocm() {
