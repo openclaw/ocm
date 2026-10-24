@@ -732,11 +732,11 @@ fn build_systemd_unit(
     Ok(format!(
         "[Unit]\nDescription={}\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={}\n{}StandardOutput={}\nStandardError={}\nRestart=always\nRestartSec=1\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
         systemd_escape(description),
-        systemd_quote(&display_path(working_directory)),
+        systemd_path_value("WorkingDirectory", working_directory)?,
         exec_start,
         environment_block,
-        systemd_quote(&systemd_output_target(stdout_path, output_mode)),
-        systemd_quote(&systemd_output_target(stderr_path, output_mode)),
+        systemd_output_target("StandardOutput", stdout_path, output_mode)?,
+        systemd_output_target("StandardError", stderr_path, output_mode)?,
     ))
 }
 
@@ -776,11 +776,30 @@ fn systemd_output_mode_for_version(version: Option<u32>) -> SystemdOutputMode {
     }
 }
 
-fn systemd_output_target(path: &Path, mode: SystemdOutputMode) -> String {
+fn systemd_output_target(
+    label: &str,
+    path: &Path,
+    mode: SystemdOutputMode,
+) -> Result<String, String> {
     match mode {
-        SystemdOutputMode::Journal => "journal".to_string(),
-        SystemdOutputMode::Append => format!("append:{}", display_path(path)),
+        SystemdOutputMode::Journal => Ok("journal".to_string()),
+        SystemdOutputMode::Append => Ok(format!("append:{}", systemd_path_value(label, path)?)),
     }
+}
+
+/// Encodes a path for `WorkingDirectory=` or an `append:` output target.
+/// systemd reads these settings verbatim apart from `%` specifiers, so quoting
+/// or backslash escapes would become part of the path. A trailing space is
+/// stripped and a trailing backslash continues the line, so such paths cannot
+/// be written at all.
+fn systemd_path_value(label: &str, path: &Path) -> Result<String, String> {
+    let value = display_path(path);
+    if value.ends_with([' ', '\\']) {
+        return Err(format!(
+            "{label} path cannot end with a space or a backslash in a systemd unit: {value:?}"
+        ));
+    }
+    Ok(value.replace('%', "%%"))
 }
 
 fn plist_escape(value: &str) -> String {
@@ -1155,11 +1174,11 @@ mod tests {
 
     use super::{
         ManagedServiceDefinition, ManagedServiceEnablement, ManagedServiceIdentity,
-        OCM_SERVICE_LABEL, SERVICE_MANAGER_BUSY_ATTEMPTS, ServiceManagerKind, gui_domain,
-        managed_service_identity, managed_service_label, restore_managed_service_registration,
-        retry_service_manager_executable_busy, service_backend_support_error,
-        service_definition_dir, service_manager_kind, systemd_output_mode_for_version,
-        write_managed_service_definition,
+        OCM_SERVICE_LABEL, SERVICE_MANAGER_BUSY_ATTEMPTS, ServiceManagerKind, SystemdOutputMode,
+        build_systemd_unit, gui_domain, managed_service_identity, managed_service_label,
+        restore_managed_service_registration, retry_service_manager_executable_busy,
+        service_backend_support_error, service_definition_dir, service_manager_kind,
+        systemd_output_mode_for_version, write_managed_service_definition,
     };
 
     #[test]
@@ -1610,6 +1629,52 @@ mod tests {
         assert!(unit.contains("StandardError=journal"));
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn systemd_unit_writes_working_directory_and_log_paths_verbatim() {
+        let unit = build_systemd_unit(
+            "test",
+            &[
+                "/opt/bin dir/ocm".to_string(),
+                "__daemon".to_string(),
+                "run".to_string(),
+            ],
+            Path::new("/srv/My \"Store\"\\x%d"),
+            Path::new("/srv/Daemon Logs/daemon.stdout.log"),
+            Path::new("/srv/Daemon Logs/daemon.stderr.log"),
+            &BTreeMap::from([("HOME".to_string(), "/home/my home".to_string())]),
+            SystemdOutputMode::Append,
+        )
+        .unwrap();
+
+        let lines = unit.lines().collect::<Vec<_>>();
+        assert!(lines.contains(&"WorkingDirectory=/srv/My \"Store\"\\x%%d"));
+        assert!(lines.contains(&"StandardOutput=append:/srv/Daemon Logs/daemon.stdout.log"));
+        assert!(lines.contains(&"StandardError=append:/srv/Daemon Logs/daemon.stderr.log"));
+        assert!(lines.contains(&"ExecStart=\"/opt/bin dir/ocm\" __daemon run"));
+        assert!(lines.contains(&"Environment=\"HOME=/home/my home\""));
+    }
+
+    #[test]
+    fn systemd_unit_rejects_paths_systemd_cannot_read_back() {
+        let build = |working_directory: &str, stdout_path: &str| {
+            build_systemd_unit(
+                "test",
+                &["/bin/ocm".to_string()],
+                Path::new(working_directory),
+                Path::new(stdout_path),
+                Path::new("/srv/logs/daemon.stderr.log"),
+                &BTreeMap::new(),
+                SystemdOutputMode::Append,
+            )
+        };
+
+        let error = build("/srv/store ", "/srv/logs/daemon.stdout.log").unwrap_err();
+        assert!(error.contains("WorkingDirectory"), "{error}");
+        assert!(error.contains("\"/srv/store \""), "{error}");
+        let error = build("/srv/store", "/srv/logs\\").unwrap_err();
+        assert!(error.contains("StandardOutput"), "{error}");
     }
 
     #[cfg(unix)]
