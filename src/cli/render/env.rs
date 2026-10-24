@@ -2081,6 +2081,14 @@ fn env_status_next_steps(status: &EnvStatusSummary, command_example: &str) -> Ve
         )];
     }
 
+    // OCM refuses service install, start and restart while the watch is active.
+    if status.resolved_kind.as_deref() == Some("source-watch") {
+        return vec![KeyValueRow::accent(
+            "Dev session",
+            format!("{command_example} dev status {}", status.env_name),
+        )];
+    }
+
     if status.resolved_kind.is_none() {
         return vec![KeyValueRow::accent(
             "Start",
