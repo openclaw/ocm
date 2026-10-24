@@ -316,15 +316,11 @@ fn archived_git_paths_in_import_removed_roots(
         // alternates that other alternates name (Git follows five levels).
         let mut object_dirs = vec![(context.common_dir.join("objects"), 0)];
         while let Some((objects, depth)) = object_dirs.pop() {
-            if depth < 5
-                && let Ok(alternates) = fs::read_to_string(objects.join("info/alternates"))
-            {
+            if depth < 5 {
                 object_dirs.extend(
-                    alternates
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                        .map(|line| (objects.join(line), depth + 1)),
+                    git_alternate_object_dirs(&objects)
+                        .into_iter()
+                        .map(|alternate| (alternate, depth + 1)),
                 );
             }
             storage.push(objects);
@@ -338,6 +334,49 @@ fn archived_git_paths_in_import_removed_roots(
         }
     }
     Ok(archived)
+}
+
+/// Alternate object directories named by `objects/info/alternates`, read as
+/// import's Git graph reads them: C-quoted or literal lines, relative to
+/// `objects`, ignoring comments and anything after a NUL byte.
+fn git_alternate_object_dirs(objects: &Path) -> Vec<PathBuf> {
+    let Ok(original) = fs::read(objects.join("info/alternates")) else {
+        return Vec::new();
+    };
+    let body_end = original
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(original.len());
+    let mut remaining = &original[..body_end];
+    let mut alternates = Vec::new();
+    while !remaining.is_empty() {
+        let end = remaining
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(remaining.len());
+        if end == 0 || remaining[0] == b'#' {
+            remaining = &remaining[(end + 1).min(remaining.len())..];
+            continue;
+        }
+        let (raw, consumed) = crate::openclaw_repo::unquote_git_path(remaining)
+            .unwrap_or_else(|| (remaining[..end].to_vec(), end));
+        remaining = &remaining[(consumed + 1).min(remaining.len())..];
+        let raw = raw.split(|byte| *byte == 0).next().unwrap_or_default();
+        if raw.is_empty() {
+            continue;
+        }
+        #[cfg(unix)]
+        let path = {
+            use std::os::unix::ffi::OsStrExt;
+            PathBuf::from(OsStr::from_bytes(raw))
+        };
+        #[cfg(not(unix))]
+        let Ok(path) = std::str::from_utf8(raw).map(PathBuf::from) else {
+            continue;
+        };
+        alternates.push(objects.join(path));
+    }
+    alternates
 }
 
 fn export_git_selection_error(repository: &Path, error: String) -> String {

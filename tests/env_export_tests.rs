@@ -1944,17 +1944,15 @@ fn assert_default_export_omits_legacy_stores(aliased_root: bool) {
         git(&repository, &["config", "--get", "fixture.retained"]),
         "selected"
     );
-    // An alternate object store that names another one.
+    // An alternate object store that names another one, C-quoted as import
+    // writes it.
     let alternate = state.join("memory/object-store/objects");
     let nested_alternate = state.join("cron/object-store/objects");
     fs::create_dir_all(nested_alternate.join("info")).unwrap();
     write_text(&nested_alternate.join("info/keep"), "");
     write_text(
         &alternate.join("info/alternates"),
-        &format!(
-            "{}\n",
-            export_git_argument(&nested_alternate.to_string_lossy())
-        ),
+        &format!("{}\n", quote(&nested_alternate)),
     );
     write_text(
         &repository.join(".git/objects/info/alternates"),
@@ -2155,6 +2153,20 @@ fn default_export_omits_legacy_stores_under_a_state_directory_checkout() {
     let state = source.join(".openclaw");
     export_git(&state, &env, &["init", "-q"]);
     write_text(&state.join("credentials/oauth.json"), "synthetic secret\n");
+    // Its configuration selects a file in a store, which import never sees.
+    write_text(
+        &state.join("credentials/state.gitconfig"),
+        "[fixture]\n\tunseen = selected\n",
+    );
+    export_git(
+        &state,
+        &env,
+        &["config", "include.path", "../credentials/state.gitconfig"],
+    );
+    assert_eq!(
+        export_git(&state, &env, &["config", "--get", "fixture.unseen"]),
+        "selected"
+    );
     write_text(&state.join("memory/notes.md"), "synthetic secret\n");
 
     let archive = root.join("source.tar");
@@ -2186,7 +2198,11 @@ fn default_export_omits_legacy_stores_under_a_state_directory_checkout() {
         ],
     );
     assert!(imported.status.success(), "{}", stderr(&imported));
-    for relative in ["credentials/oauth.json", "memory/notes.md"] {
+    for relative in [
+        "credentials/oauth.json",
+        "credentials/state.gitconfig",
+        "memory/notes.md",
+    ] {
         assert!(
             !archived.contains(std::path::Path::new(relative)),
             "{relative} should not be archived"
