@@ -1711,6 +1711,100 @@ fn env_default_import_preserves_non_directory_agent_payload() {
     );
 }
 
+#[test]
+fn env_default_export_import_retains_shared_skills_and_clawhub_tracking() {
+    let root = TestDir::new("default-export-shared-skills");
+    let env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    let payloads = [
+        (
+            "skills/tide-tables/SKILL.md",
+            "---\nname: tide-tables\ndescription: Tide lookup\n---\nUse tides.sh.\n",
+        ),
+        ("skills/tide-tables/scripts/tides.sh", "#!/bin/sh\nexit 0\n"),
+        (
+            "skills/tide-tables/.clawhub/origin.json",
+            r#"{"version":1,"registry":"https://clawhub.ai","slug":"tide-tables","installedVersion":"1.0.0","installedAt":1}"#,
+        ),
+        (
+            ".clawhub/lock.json",
+            r#"{"version":1,"skills":{"tide-tables":{"version":"1.0.0","installedAt":1}}}"#,
+        ),
+        (
+            "skills/team-runbook/SKILL.md",
+            "---\nname: team-runbook\ndescription: Authored by hand\n---\nFollow steps.md.\n",
+        ),
+        ("skills/team-runbook/steps.md", "1. Check the gateway.\n"),
+        (
+            "workspace/skills/ws-skill/SKILL.md",
+            "---\nname: ws-skill\ndescription: Workspace skill\n---\n",
+        ),
+        (
+            "extensions/demo/openclaw.plugin.json",
+            "{\"id\":\"demo\"}\n",
+        ),
+    ];
+    for (path, contents) in payloads {
+        write_text(&source.join(path), contents);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            source.join("skills/tide-tables/scripts/tides.sh"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+    }
+
+    let archive = root.child("source.tar");
+    let exported = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let imported = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+
+    let target = root.child("ocm-home/envs/target/.openclaw");
+    for (path, contents) in payloads {
+        assert_eq!(
+            fs::read_to_string(target.join(path)).unwrap(),
+            contents,
+            "{path} should survive default export and import"
+        );
+        assert_eq!(fs::read_to_string(source.join(path)).unwrap(), contents);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(target.join("skills/tide-tables/scripts/tides.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o750);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn env_export_retains_agent_payload_under_equivalent_root_spellings() {
