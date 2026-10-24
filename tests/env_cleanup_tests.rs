@@ -646,11 +646,23 @@ fn env_cleanup_names_removed_state_when_a_reset_fails_partway() {
     let locked = root.child("ocm-home/envs/b/.openclaw/logs/locked");
     crate::support::write_text(&locked.join("gateway.log"), "log\n");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    // Permission bits do not stop a privileged user; the failure cannot be staged then.
+    if fs::write(locked.join("probe"), "").is_ok() {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
 
     let cleanup = run_ocm(&cwd, &env, &["env", "cleanup", "--all", "--yes"]);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(!cleanup.status.success(), "{}", stdout(&cleanup));
     let error = stderr(&cleanup);
+    assert!(
+        error.contains(&format!(
+            "could not finish removing {}, part of it may already be gone",
+            path_string(&root.child("ocm-home/envs/b/.openclaw/logs"))
+        )),
+        "{error}"
+    );
     assert!(
         error.contains(
             "the runtime-state reset of env \"b\" already removed: .openclaw/agents, .openclaw/credentials"

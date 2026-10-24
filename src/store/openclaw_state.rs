@@ -140,7 +140,12 @@ impl OpenClawRuntimeStateCleanup {
     /// Records each removal as it completes, so a failure can report what is already gone.
     pub(crate) fn apply_recording(&self, removed: &mut Vec<PathBuf>) -> Result<(), String> {
         for path in &self.removals {
-            remove_path(path)?;
+            remove_path(path).map_err(|error| {
+                format!(
+                    "could not finish removing {}, part of it may already be gone: {error}",
+                    display_path(path)
+                )
+            })?;
             removed.push(path.clone());
         }
         Ok(())
