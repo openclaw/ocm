@@ -780,19 +780,36 @@ fn is_git_branch_lockfile_name(name: &str) -> bool {
 /// pnpm's branch-pattern matcher: `*` and `?` wildcards, `!` negation; one
 /// pattern, all includes, all negations, or the last matching verdict.
 fn pnpm_pattern_matches(patterns: &[String], input: &str) -> bool {
+    // Anchored `*`/`?` matching with one backtrack point per `*`: O(pattern x
+    // input), so a pattern that cannot match fails quickly.
     fn wildcard(pattern: &[char], input: &[char]) -> bool {
-        match (pattern.first(), input.first()) {
-            (None, None) => true,
-            (Some('*'), _) => {
-                wildcard(&pattern[1..], input)
-                    || (!input.is_empty() && wildcard(pattern, &input[1..]))
+        let (mut p, mut i) = (0, 0);
+        let mut star: Option<(usize, usize)> = None;
+        while i < input.len() {
+            match pattern.get(p) {
+                Some('*') => {
+                    star = Some((p, i));
+                    p += 1;
+                }
+                Some('?') => {
+                    p += 1;
+                    i += 1;
+                }
+                Some(expected) if *expected == input[i] => {
+                    p += 1;
+                    i += 1;
+                }
+                _ => match star {
+                    Some((star_p, star_i)) => {
+                        p = star_p + 1;
+                        i = star_i + 1;
+                        star = Some((star_p, star_i + 1));
+                    }
+                    None => return false,
+                },
             }
-            (Some('?'), Some(_)) => wildcard(&pattern[1..], &input[1..]),
-            (Some(expected), Some(actual)) if expected == actual => {
-                wildcard(&pattern[1..], &input[1..])
-            }
-            _ => false,
         }
+        pattern[p..].iter().all(|character| *character == '*')
     }
     let input: Vec<char> = input.chars().collect();
     let compiled: Vec<(bool, Vec<char>)> = patterns
@@ -2279,6 +2296,20 @@ mod tests {
             "wip/keep"
         ));
         assert!(!super::pnpm_pattern_matches(&[], "main"));
+        assert!(super::pnpm_pattern_matches(
+            &patterns(&["a*b*c"]),
+            "aXbYbZc"
+        ));
+        assert!(!super::pnpm_pattern_matches(&patterns(&["a*b"]), "a"));
+        assert!(super::pnpm_pattern_matches(&patterns(&["*"]), ""));
+        assert!(super::pnpm_pattern_matches(&patterns(&["**?"]), "x"));
+        // A pattern that cannot match fails without combinatorial backtracking.
+        let started = std::time::Instant::now();
+        assert!(!super::pnpm_pattern_matches(
+            &patterns(&["*a*a*a*a*a*a*a*a*a*a*a*ab"]),
+            &"a".repeat(4000)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
