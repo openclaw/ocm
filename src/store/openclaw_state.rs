@@ -492,13 +492,14 @@ fn checkout_storage_paths(
     let mut object_dirs = vec![context.common_dir.join("objects")];
     let mut seen_object_dirs = BTreeSet::new();
     while let Some(objects) = object_dirs.pop() {
-        let identity = fs::canonicalize(&objects).unwrap_or_else(|_| objects.clone());
-        if !seen_object_dirs.insert(identity) {
-            continue;
-        }
-        object_dirs.extend(git_alternate_object_dirs(&objects));
+        // Every listed spelling is resolved by import, even when another
+        // spelling of the same store was already followed.
         storage.push(objects.join("info/alternates"));
-        storage.push(objects);
+        storage.push(objects.clone());
+        let identity = fs::canonicalize(&objects).unwrap_or_else(|_| objects.clone());
+        if seen_object_dirs.insert(identity) {
+            object_dirs.extend(git_alternate_object_dirs(&objects));
+        }
     }
     storage
 }

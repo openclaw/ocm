@@ -2643,9 +2643,23 @@ fn default_export_keeps_every_alternate_object_store_import_requires() {
     for store in &stores {
         write_text(&store.join("pack/keep"), "");
     }
+    // Two store aliases of the same shared store are both listed.
+    write_text(&source.join("projects/shared-store/objects/pack/keep"), "");
+    for alias in ["identity", "devices"] {
+        std::os::unix::fs::symlink(
+            source.join("projects/shared-store/objects"),
+            state.join(alias),
+        )
+        .unwrap();
+    }
     write_text(
         &repository.join(".git/objects/info/alternates"),
-        &format!("{}\n", stores[0].display()),
+        &format!(
+            "{}\n{}\n{}\n",
+            stores[0].display(),
+            state.join("identity").display(),
+            state.join("devices").display()
+        ),
     );
     for pair in stores.windows(2) {
         write_text(
@@ -2684,6 +2698,9 @@ fn default_export_keeps_every_alternate_object_store_import_requires() {
         );
     }
     assert!(archived.contains(std::path::Path::new("credentials/alternate-list")));
+    for alias in ["identity", "devices"] {
+        assert!(archived.contains(std::path::Path::new(alias)), "{alias}");
+    }
     fs::rename(&source, root.join("offline")).unwrap();
     let target = root.join("target");
     let imported = run_ocm(
