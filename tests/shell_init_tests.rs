@@ -191,8 +191,10 @@ fn posix_helper_leaves_caller_variables_unchanged() {
             .to_string_lossy()
             .into_owned(),
     );
-    let created = run_ocm(&cwd, &env, &["env", "create", "demo"]);
-    assert!(created.status.success(), "{}", stderr(&created));
+    for name in ["demo", "other"] {
+        let created = run_ocm(&cwd, &env, &["env", "create", name]);
+        assert!(created.status.success(), "{}", stderr(&created));
+    }
 
     for (shell, init_shell) in [
         ("bash", "bash"),
@@ -226,6 +228,15 @@ ocm_use demo --shell=sh || exit 16
 unset script _ocm_script _ocm_arg
 ocm_use demo || exit 18
 [ -z "${{script+x}}" ] && [ -z "${{_ocm_script+x}}" ] && [ -z "${{_ocm_arg+x}}" ] || exit 19
+readonly _ocm_script=ro script=ro2
+ocm_use other || exit 20
+[ "$OCM_ACTIVE_ENV" = other ] || exit 21
+ocm_use missing 2>/dev/null
+result=$?
+[ "$result" = 1 ] || exit 22
+[ "$script" = ro2 ] && [ "$_ocm_script" = ro ] || exit 23
+ocm_use demo --shell=sh || exit 24
+[ "$OCM_ACTIVE_ENV" = demo ] || exit 25
 printf 'caller variables preserved\n'
 "#,
             stdout(&init)
