@@ -227,6 +227,13 @@ impl Cli {
             None
         };
 
+        // `env remove` deletes the root and registry entry under this lock.
+        // Hold it from the registry recheck through the minimum config write
+        // so start never writes into a root it has not just seen registered.
+        let operation = self
+            .environment_service()
+            .lock_operation(&request.name)
+            .map_err(&discard_launcher)?;
         let mut meta = match existing {
             None => self
                 .environment_service()
@@ -248,9 +255,22 @@ impl Cli {
                     protected: request.protect,
                 })
                 .map_err(&discard_launcher)?,
-            Some(existing) => self
-                .apply_start_to_existing(existing, desired_binding.as_ref(), request.protect)
-                .map_err(&discard_launcher)?,
+            Some(existing) => {
+                let current = self
+                    .environment_service()
+                    .get(&request.name)
+                    .map_err(&discard_launcher)?;
+                // A same-name env created after a removal is a different env;
+                // the prepared config belongs to the one start read first.
+                if current.root != existing.root || current.created_at != existing.created_at {
+                    return Err(discard_launcher(format!(
+                        "environment \"{}\" changed while start was preparing it; retry",
+                        request.name
+                    )));
+                }
+                self.apply_start_to_existing(current, desired_binding.as_ref(), request.protect)
+                    .map_err(&discard_launcher)?
+            }
         };
 
         meta = self
@@ -268,6 +288,7 @@ impl Cli {
             }
             .apply()?;
         }
+        drop(operation);
 
         let detected_plain_home = if created {
             let source = inspect_migration_source(None, &self.env);
@@ -378,6 +399,7 @@ impl Cli {
         }
     }
 
+    // The caller holds the environment operation lock.
     fn apply_start_to_existing(
         &self,
         mut meta: EnvMeta,
@@ -391,21 +413,23 @@ impl Cli {
                         || meta.default_launcher.is_some() =>
                 {
                     self.environment_service()
-                        .set_runtime(&meta.name, runtime_name)?
+                        .set_runtime_locked(&meta.name, runtime_name)?
                 }
                 StartBinding::Launcher(launcher_name)
                     if meta.default_launcher.as_deref() != Some(launcher_name.as_str())
                         || meta.default_runtime.is_some() =>
                 {
                     self.environment_service()
-                        .set_launcher(&meta.name, launcher_name)?
+                        .set_launcher_locked(&meta.name, launcher_name)?
                 }
                 _ => meta,
             };
         }
 
         if protect && !meta.protected {
-            meta = self.environment_service().set_protected(&meta.name, true)?;
+            meta = self
+                .environment_service()
+                .set_protected_locked(&meta.name, true)?;
         }
 
         Ok(meta)

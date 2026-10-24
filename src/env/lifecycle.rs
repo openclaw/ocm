@@ -451,6 +451,14 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn set_protected(&self, name: &str, protected: bool) -> Result<EnvMeta, String> {
         let _lock = self.lock_operation(name)?;
+        self.set_protected_locked(name, protected)
+    }
+
+    pub(crate) fn set_protected_locked(
+        &self,
+        name: &str,
+        protected: bool,
+    ) -> Result<EnvMeta, String> {
         let mut meta = get_environment(name, self.env, self.cwd)?;
         meta.protected = protected;
         save_environment(meta, self.env, self.cwd)
