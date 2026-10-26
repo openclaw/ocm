@@ -540,7 +540,15 @@ impl FollowCursor {
     }
 
     fn take_preceding_records(&mut self) -> Vec<TimedLogRecord> {
-        let complete_len = last_timestamp_start(&self.pending).unwrap_or(0);
+        // A timestamped record may still receive continuation lines. Without
+        // that parent, complete undated lines can advance on every poll; waiting
+        // for a timestamp or a quiet writer would retain them indefinitely.
+        let complete_len = last_timestamp_start(&self.pending).unwrap_or_else(|| {
+            self.pending
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1)
+        });
         if complete_len > 0 {
             let complete = self.pending.drain(..complete_len).collect::<Vec<_>>();
             log_records(complete)
@@ -1680,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn follow_cursor_keeps_undated_partial_multiline_records_together() {
+    fn follow_cursor_emits_complete_undated_lines_and_retains_partial_bytes() {
         let root = test_root("cursor-undated-multiline-partial");
         let path = root.join("gateway.log");
         fs::write(&path, b"initial\n").unwrap();
@@ -1689,13 +1697,65 @@ mod tests {
 
         append(&path, b"frame one\nframe two");
         let update = cursor.read_update().unwrap().unwrap();
-        assert!(cursor.collect_complete_records(update).is_empty());
+        assert_eq!(
+            super::merge_log_records(cursor.collect_complete_records(update)),
+            b"frame one\n"
+        );
+        assert_eq!(cursor.pending, b"frame two");
 
         append(&path, b" completed\n");
         let update = cursor.read_update().unwrap().unwrap();
-        let merged = super::merge_log_records(collect_after_quiet(&mut cursor, update));
-        assert_eq!(merged, b"frame one\nframe two completed\n");
+        let merged = super::merge_log_records(cursor.collect_complete_records(update));
+        assert_eq!(merged, b"frame two completed\n");
+        assert!(cursor.pending.is_empty());
+        assert!(cursor.collect_quiet_records().is_empty());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn follow_cursor_makes_progress_without_a_quiet_poll() {
+        let root = test_root("cursor-continuous-undated");
+        let path = root.join("gateway.log");
+        fs::write(&path, b"seed\n").unwrap();
+        let mut cursor = FollowCursor::new(log_target(path.clone()));
+        cursor.snapshot(None, true).unwrap().unwrap();
+
+        for sequence in 0..100 {
+            // End every read halfway through the next line, including UTF-8.
+            let mut bytes = if sequence == 0 {
+                Vec::new()
+            } else {
+                vec![0x82, 0xac, b'\n']
+            };
+            let line = format!("live-{sequence}\n");
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.extend_from_slice(b"partial \xe2");
+            append(&path, &bytes);
+            let update = cursor.read_update().unwrap().unwrap();
+            let emitted = super::merge_log_records(cursor.collect_complete_records(update));
+            let expected = if sequence == 0 {
+                line
+            } else {
+                format!("partial \u{20ac}\n{line}")
+            };
+            assert_eq!(emitted, expected.as_bytes());
+            assert_eq!(cursor.pending, b"partial \xe2");
+        }
+
+        append(
+            &path,
+            b"\x82\xac\n2026-04-20T00:13:45Z dated\n    continuation\n",
+        );
+        let update = cursor.read_update().unwrap().unwrap();
+        assert_eq!(
+            super::merge_log_records(cursor.collect_complete_records(update)),
+            "partial \u{20ac}\n".as_bytes()
+        );
+        assert_eq!(
+            super::merge_log_records(cursor.collect_quiet_records()),
+            b"2026-04-20T00:13:45Z dated\n    continuation\n"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

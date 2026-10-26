@@ -642,6 +642,156 @@ fn spawn_follow(
     (child, receiver)
 }
 
+#[cfg(unix)]
+#[test]
+fn logs_follow_delivers_continuous_foreground_output_before_the_writer_stops() {
+    use crate::support::write_executable_script;
+
+    let root = TestDir::new("logs-follow-foreground");
+    let cwd = root.child("workspace");
+    let source = root.child("source");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(source.join("scripts")).unwrap();
+    fs::create_dir_all(source.join("extensions")).unwrap();
+    fs::create_dir_all(source.join("node_modules/tsx")).unwrap();
+    fs::write(
+        source.join("package.json"),
+        r#"{"name":"openclaw","version":"2026.4.19","type":"module","devDependencies":{"tsx":"1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.join("node_modules/tsx/package.json"),
+        r#"{"name":"tsx","type":"module","exports":"./index.mjs"}"#,
+    )
+    .unwrap();
+    fs::write(source.join("node_modules/tsx/index.mjs"), "export {};\n").unwrap();
+    for entry in ["openclaw.mjs", "scripts/run-node.mjs"] {
+        fs::write(source.join(entry), "console.log('fixture');\n").unwrap();
+    }
+    fs::write(
+        source.join("scripts/watch-node.mjs"),
+        format!(
+            r#"import fs from 'node:fs';
+const root = {};
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const released = () => fs.existsSync(root + '/release');
+fs.writeSync(1, 'seed\n');
+while (!fs.existsSync(root + '/start') && !released()) await sleep(10);
+for (let i = 0; !released(); i++) {{
+  fs.writeSync(1, `live-${{i}}\n`);
+  await sleep(10);
+}}
+"#,
+            serde_json::to_string(&path_string(root.path())).unwrap()
+        ),
+    )
+    .unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        let output = Command::new("git")
+            .current_dir(&source)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let env = ocm_env(&root);
+    let stable = root.child("bin/stable");
+    write_executable_script(&stable, "#!/bin/sh\nexit 0\n");
+    for args in [
+        vec![
+            "runtime",
+            "add",
+            "stable",
+            "--path",
+            stable.to_str().unwrap(),
+        ],
+        vec!["env", "create", "demo", "--runtime", "stable"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+
+    // Release the real producer even if a follower assertion fails. Reap the
+    // foreground controller before stopping either follower or deleting state.
+    struct Processes {
+        children: Vec<std::process::Child>,
+        release: std::path::PathBuf,
+    }
+    impl Drop for Processes {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.release, "");
+            if let Some(controller) = self.children.first_mut() {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while matches!(controller.try_wait(), Ok(None))
+                    && std::time::Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            for child in &mut self.children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut processes = Processes {
+        children: Vec::new(),
+        release: root.child("release"),
+    };
+    let (controller, foreground) = spawn_follow(
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "demo",
+            "--repo",
+            source.to_str().unwrap(),
+            "--watch",
+            "--force",
+            "--no-ui",
+        ],
+    );
+    processes.children.push(controller);
+    receive_line_containing(&foreground, "seed");
+    let mut followers = Vec::new();
+    for extra in [vec![], vec!["--stream", "info"]] {
+        let mut args = vec!["logs", "demo", "--follow", "--raw", "--tail", "1"];
+        args.extend(extra);
+        let (child, lines) = spawn_follow(&cwd, &env, &args);
+        processes.children.push(child);
+        assert_eq!(receive_line_containing(&lines, "seed"), "seed");
+        followers.push(lines);
+    }
+    fs::write(root.child("start"), "").unwrap();
+    for sequence in 0..50 {
+        let expected = format!("live-{sequence}");
+        for lines in &followers {
+            assert_eq!(
+                lines.recv_timeout(Duration::from_secs(5)).unwrap(),
+                expected
+            );
+        }
+    }
+    assert!(!root.child("release").exists());
+    for child in &mut processes.children {
+        assert!(child.try_wait().unwrap().is_none());
+    }
+    let (log, _) = gateway_log_paths(&root);
+    assert!(fs::read_to_string(log).unwrap().contains("live-49\n"));
+}
+
 fn strip_ansi(line: &str) -> String {
     let mut plain = String::new();
     let mut chars = line.chars();
