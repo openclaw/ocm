@@ -1912,18 +1912,20 @@ impl Cli {
                 name: simulation_name.clone(),
                 root: None,
             })?;
-        if let Err(error) =
-            self.environment_service()
-                .set_service_policy(&cloned.name, Some(false), Some(false))
-        {
-            let _ = self.environment_service().remove_simulation(&cloned);
-            return Err(error);
-        }
-        if cloned.protected
-            && let Err(error) = self
-                .environment_service()
-                .set_protected(&cloned.name, false)
-        {
+        let setup = (|| {
+            let (_, _lock) = self.environment_service().lock_simulation(&cloned)?;
+            self.environment_service().set_service_policy_locked(
+                &cloned.name,
+                Some(false),
+                Some(false),
+            )?;
+            if cloned.protected {
+                self.environment_service()
+                    .set_protected_locked(&cloned.name, false)?;
+            }
+            Ok::<_, String>(())
+        })();
+        if let Err(error) = setup {
             let _ = self.environment_service().remove_simulation(&cloned);
             return Err(error);
         }
@@ -1935,7 +1937,7 @@ impl Cli {
         let mut to_binding_kind = "unknown".to_string();
         let mut to_binding_name = "unknown".to_string();
 
-        let scenario_check = self.apply_simulation_scenario(&cloned.name, scenario);
+        let scenario_check = self.apply_simulation_scenario(&cloned, scenario);
         let scenario_failed = scenario_check.status == "failed";
         checks.push(scenario_check);
         if scenario_failed {
@@ -1952,9 +1954,9 @@ impl Cli {
             );
             return self.finish_simulation_summary(summary, &cloned, options);
         }
-        checks.push(self.run_update_plan_check(&cloned.name, target));
+        checks.push(self.run_update_plan_check(&cloned, target));
 
-        match self.apply_simulation_target(&cloned.name, target, prepared_runtime) {
+        match self.apply_simulation_target(&cloned, target, prepared_runtime) {
             Ok((kind, name, note)) => {
                 to_binding_kind = kind;
                 to_binding_name = name;
@@ -1978,28 +1980,24 @@ impl Cli {
         }
 
         if matches!(target, UpgradeSimulationTarget::LocalRepo { .. }) {
-            checks.push(self.run_local_repo_script_check(&cloned.name, "pnpm build", "build"));
-            checks.push(self.run_local_repo_script_check(
-                &cloned.name,
-                "pnpm ui:build",
-                "ui:build",
-            ));
+            checks.push(self.run_local_repo_script_check(&cloned, "pnpm build", "build"));
+            checks.push(self.run_local_repo_script_check(&cloned, "pnpm ui:build", "ui:build"));
         }
 
-        checks.push(self.run_simulation_check(&cloned.name, "openclaw --version", &["--version"]));
+        checks.push(self.run_simulation_check(&cloned, "openclaw --version", &["--version"]));
         checks.push(self.run_simulation_check_with_env(
-            &cloned.name,
+            &cloned,
             "openclaw doctor",
             &["doctor", "--non-interactive", "--fix"],
             &[("OPENCLAW_UPDATE_IN_PROGRESS", "1")],
         ));
         checks.push(self.run_simulation_check(
-            &cloned.name,
+            &cloned,
             "openclaw plugins update",
             &["plugins", "update", "--all", "--dry-run"],
         ));
         checks.push(self.run_simulation_check(
-            &cloned.name,
+            &cloned,
             "openclaw gateway status",
             &["gateway", "status", "--deep", "--json"],
         ));
@@ -2020,10 +2018,10 @@ impl Cli {
 
     fn apply_simulation_scenario(
         &self,
-        simulation_name: &str,
+        simulation: &crate::env::EnvMeta,
         scenario: UpgradeSimulationScenario,
     ) -> UpgradeSimulationCheck {
-        match self.seed_simulation_scenario(simulation_name, scenario) {
+        match self.seed_simulation_scenario(simulation, scenario) {
             Ok(note) => UpgradeSimulationCheck::passed("seed scenario", note),
             Err(error) => UpgradeSimulationCheck::failed("seed scenario", error),
         }
@@ -2031,12 +2029,13 @@ impl Cli {
 
     fn seed_simulation_scenario(
         &self,
-        simulation_name: &str,
+        simulation: &crate::env::EnvMeta,
         scenario: UpgradeSimulationScenario,
     ) -> Result<String, String> {
+        let (meta, _lock) = self.environment_service().lock_simulation(simulation)?;
         let meta = self
             .environment_service()
-            .apply_effective_gateway_port(self.environment_service().get(simulation_name)?)?;
+            .apply_effective_gateway_port(meta)?;
         let gateway_port = meta.gateway_port.unwrap_or_default();
         let paths = derive_env_paths(Path::new(&meta.root));
         match scenario {
@@ -2055,7 +2054,7 @@ impl Cli {
 
     fn run_update_plan_check(
         &self,
-        simulation_name: &str,
+        simulation: &crate::env::EnvMeta,
         target: &UpgradeSimulationTarget,
     ) -> UpgradeSimulationCheck {
         let Some(update_args) = target.update_plan_args() else {
@@ -2065,7 +2064,7 @@ impl Cli {
             );
         };
         let refs = update_args.iter().map(String::as_str).collect::<Vec<_>>();
-        self.run_simulation_check(simulation_name, "openclaw update plan", &refs)
+        self.run_simulation_check(simulation, "openclaw update plan", &refs)
     }
 
     fn resolve_simulation_target(&self, to: &str) -> Result<UpgradeSimulationTarget, String> {
@@ -2131,10 +2130,12 @@ impl Cli {
 
     fn apply_simulation_target(
         &self,
-        simulation_name: &str,
+        simulation: &crate::env::EnvMeta,
         target: &UpgradeSimulationTarget,
         prepared_runtime: Option<&PreparedSimulationRuntime>,
     ) -> Result<(String, String, String), String> {
+        let (mut meta, lock) = self.environment_service().lock_simulation(simulation)?;
+        let simulation_name = &simulation.name;
         match target {
             UpgradeSimulationTarget::Official { .. } => {
                 let prepared_runtime = prepared_runtime.ok_or_else(|| {
@@ -2142,7 +2143,7 @@ impl Cli {
                         .to_string()
                 })?;
                 self.environment_service()
-                    .set_runtime(simulation_name, &prepared_runtime.name)?;
+                    .set_runtime_locked(simulation_name, &prepared_runtime.name)?;
                 Ok((
                     "runtime".to_string(),
                     prepared_runtime.name.clone(),
@@ -2150,7 +2151,6 @@ impl Cli {
                 ))
             }
             UpgradeSimulationTarget::LocalRepo { repo_root, .. } => {
-                let mut meta = self.environment_service().get(simulation_name)?;
                 meta.default_runtime = None;
                 meta.default_launcher = None;
                 let mut meta = with_prepared_dev_source(
@@ -2173,6 +2173,7 @@ impl Cli {
                     .apply_effective_gateway_port(meta)?;
                 self.prepare_minimum_local_config(&meta, meta.gateway_port.unwrap_or_default())?
                     .apply()?;
+                drop(lock);
                 self.ensure_simulation_dev_dependencies(&meta)?;
                 Ok((
                     "dev".to_string(),
@@ -2243,6 +2244,36 @@ impl Cli {
         }))
     }
 
+    /// Reads pnpm's reported dependency destinations without echoing the output,
+    /// which may contain private configuration values.
+    fn read_simulation_pnpm_destinations(
+        &self,
+        simulation: &crate::env::EnvMeta,
+        source_root: &Path,
+        process_env: &BTreeMap<String, String>,
+        args: &[&str],
+    ) -> Result<Vec<u8>, String> {
+        let mut command = Command::new("pnpm");
+        command
+            .args(args)
+            .env_clear()
+            .envs(process_env)
+            .current_dir(source_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let (_, lock) = self.environment_service().lock_simulation(simulation)?;
+        let output = output_simulation_command(command, lock)
+            .map_err(|error| format!("failed reading pnpm dependency destinations: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not read pnpm dependency destinations; inspect `pnpm {}` in the selected checkout before retrying the simulation",
+                args.join(" ")
+            ));
+        }
+        Ok(output.stdout)
+    }
+
     fn ensure_simulation_dev_dependencies(&self, meta: &crate::env::EnvMeta) -> Result<(), String> {
         let dev = meta
             .dev
@@ -2259,13 +2290,15 @@ impl Cli {
         // pnpm settings can send it to another checkout or through a link.
         let process_env = build_openclaw_env(meta, &self.env);
         ensure_source_dependency_install_target(worktree_root, &process_env)?;
-        let config = read_simulation_pnpm_destinations(
+        let config = self.read_simulation_pnpm_destinations(
+            meta,
             worktree_root,
             &process_env,
             &["config", "list", "--json"],
         )?;
         let store = if source_dependency_install_needs_store_path(worktree_root, &config)? {
-            Some(read_simulation_pnpm_destinations(
+            Some(self.read_simulation_pnpm_destinations(
+                meta,
                 worktree_root,
                 &process_env,
                 &["store", "path"],
@@ -2277,15 +2310,17 @@ impl Cli {
 
         // Admission checks the projects in the checkout's lockfile, so the
         // install must not add others.
-        let output = Command::new("pnpm")
+        let mut command = Command::new("pnpm");
+        command
             .args(["install", "--frozen-lockfile"])
             .env_clear()
             .envs(&process_env)
             .current_dir(worktree_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+            .stderr(Stdio::piped());
+        let (_, lock) = self.environment_service().lock_simulation(meta)?;
+        let output = output_simulation_command(command, lock)
             .map_err(|error| format!("failed to run pnpm install: {error}"))?;
         if output.status.success() {
             return Ok(());
@@ -2298,16 +2333,16 @@ impl Cli {
 
     fn run_simulation_check(
         &self,
-        simulation_name: &str,
+        simulation: &crate::env::EnvMeta,
         name: &str,
         args: &[&str],
     ) -> UpgradeSimulationCheck {
-        self.run_simulation_check_with_env(simulation_name, name, args, &[])
+        self.run_simulation_check_with_env(simulation, name, args, &[])
     }
 
     fn run_simulation_check_with_env(
         &self,
-        simulation_name: &str,
+        simulation: &crate::env::EnvMeta,
         name: &str,
         args: &[&str],
         extra_env: &[(&str, &str)],
@@ -2315,27 +2350,29 @@ impl Cli {
         let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
         match self
             .environment_service()
-            .resolve(simulation_name, None, None, &args)
+            .resolve_simulation(simulation, &args)
         {
-            Ok(resolved) => match self.run_resolved_for_simulation(resolved, extra_env) {
-                Ok(output) if output.status.success() => {
-                    UpgradeSimulationCheck::passed(name, output.first_line())
+            Ok((resolved, lock)) => {
+                match self.run_resolved_for_simulation(resolved, extra_env, lock) {
+                    Ok(output) if output.status.success() => {
+                        UpgradeSimulationCheck::passed(name, output.first_line())
+                    }
+                    Ok(output) => UpgradeSimulationCheck::failed(name, output.failure_summary()),
+                    Err(error) => UpgradeSimulationCheck::failed(name, error),
                 }
-                Ok(output) => UpgradeSimulationCheck::failed(name, output.failure_summary()),
-                Err(error) => UpgradeSimulationCheck::failed(name, error),
-            },
+            }
             Err(error) => UpgradeSimulationCheck::failed(name, error),
         }
     }
 
     fn run_local_repo_script_check(
         &self,
-        simulation_name: &str,
+        simulation: &crate::env::EnvMeta,
         name: &str,
         script: &str,
     ) -> UpgradeSimulationCheck {
-        match self.environment_service().get(simulation_name) {
-            Ok(env_meta) => {
+        match self.environment_service().lock_simulation(simulation) {
+            Ok((env_meta, lock)) => {
                 let Some(dev) = env_meta.dev.as_ref() else {
                     return UpgradeSimulationCheck::failed(
                         name,
@@ -2358,7 +2395,7 @@ impl Cli {
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
-                match command.output() {
+                match output_simulation_command(command, lock) {
                     Ok(output) if output.status.success() => UpgradeSimulationCheck::passed(
                         name,
                         SimulationCommandOutput::from_output(output).first_line(),
@@ -2381,8 +2418,12 @@ impl Cli {
         &self,
         resolved: crate::env::ResolvedExecution,
         extra_env: &[(&str, &str)],
+        lock: EnvironmentOperationLock,
     ) -> Result<SimulationCommandOutput, String> {
-        self.run_resolved_with_operation_lock(resolved, extra_env, None)
+        let command = self.prepare_resolved_command(resolved, extra_env)?;
+        let output = output_simulation_command(command, lock)
+            .map_err(|error| format!("failed to run simulation check: {error}"))?;
+        Ok(SimulationCommandOutput::from_output(output))
     }
 
     fn run_resolved_with_operation_lock(
@@ -2391,6 +2432,20 @@ impl Cli {
         extra_env: &[(&str, &str)],
         operation_lock: Option<&UpgradeCommandLocks<'_>>,
     ) -> Result<SimulationCommandOutput, String> {
+        let mut command = self.prepare_resolved_command(resolved, extra_env)?;
+        let output = match operation_lock {
+            Some(lock) => lock.output(command),
+            None => command.output(),
+        }
+        .map_err(|error| format!("failed to run simulation check: {error}"))?;
+        Ok(SimulationCommandOutput::from_output(output))
+    }
+
+    fn prepare_resolved_command(
+        &self,
+        resolved: crate::env::ResolvedExecution,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Command, String> {
         let (mut command, env_meta, source_root, path_prepend, launcher_command) = match resolved {
             crate::env::ResolvedExecution::Launcher {
                 env,
@@ -2465,12 +2520,7 @@ impl Cli {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let output = match operation_lock {
-            Some(lock) => lock.output(command),
-            None => command.output(),
-        }
-        .map_err(|error| format!("failed to run simulation check: {error}"))?;
-        Ok(SimulationCommandOutput::from_output(output))
+        Ok(command)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6405,30 +6455,15 @@ fn release_version_from_output(actual: &str, hint: Option<&str>) -> Option<Strin
         .map(str::to_string)
 }
 
-/// Reads pnpm's reported dependency destinations without echoing the output,
-/// which may contain private configuration values.
-fn read_simulation_pnpm_destinations(
-    source_root: &Path,
-    process_env: &BTreeMap<String, String>,
-    args: &[&str],
-) -> Result<Vec<u8>, String> {
-    let output = Command::new("pnpm")
-        .args(args)
-        .env_clear()
-        .envs(process_env)
-        .current_dir(source_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|error| format!("failed reading pnpm dependency destinations: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "could not read pnpm dependency destinations; inspect `pnpm {}` in the selected checkout before retrying the simulation",
-            args.join(" ")
-        ));
-    }
-    Ok(output.stdout)
+// Do not retain this lock in the child: operators may remove a simulation
+// while a check runs. It only protects identity validation through spawn.
+fn output_simulation_command(
+    mut command: Command,
+    lock: EnvironmentOperationLock,
+) -> std::io::Result<std::process::Output> {
+    let child = command.spawn()?;
+    drop(lock);
+    child.wait_with_output()
 }
 
 fn simulation_env_name(source_name: &str, scenario: &str) -> String {
@@ -7410,7 +7445,11 @@ mod tests {
         };
 
         let output = cli
-            .run_resolved_for_simulation(resolved, &[("OPENCLAW_UPDATE_IN_PROGRESS", "1")])
+            .run_resolved_with_operation_lock(
+                resolved,
+                &[("OPENCLAW_UPDATE_IN_PROGRESS", "1")],
+                None,
+            )
             .unwrap();
 
         assert!(output.status.success(), "{}", output.stderr);

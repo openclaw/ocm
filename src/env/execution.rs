@@ -418,6 +418,16 @@ impl<'a> EnvironmentService<'a> {
         self.resolve_execution(self.get(name)?, runtime_override, launcher_override, args)
     }
 
+    pub(crate) fn resolve_simulation(
+        &self,
+        expected: &EnvMeta,
+        args: &[String],
+    ) -> Result<(ResolvedExecution, crate::store::EnvironmentOperationLock), String> {
+        let (current, lock) = self.lock_simulation(expected)?;
+        let resolved = self.resolve_execution(current, None, None, args)?;
+        Ok((resolved, lock))
+    }
+
     pub fn resolve_run(
         &self,
         name: &str,
