@@ -10,6 +10,7 @@ All notable changes to OCM are documented here.
 
 ### Changed
 
+- Refresh JSON5 and ZIP handling to json5 1.3.4 and zip 9.1.2, plus compatible Git and build dependency patches, while retaining Rust 1.88 support.
 - Refresh 28 compatible Rust dependencies, including ICU 2.4, ureq 3.5, plist 1.10.3, and Git configuration support, while retaining Rust 1.88 support.
 
 ## 0.3.6 - 2026-10-22
