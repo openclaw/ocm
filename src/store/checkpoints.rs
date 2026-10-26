@@ -17,7 +17,9 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 use std::io::Write;
 
 use super::common::{ensure_dir, path_exists};
+use super::dev_sources::projected_path_contains;
 use super::layout::display_path;
+use super::openclaw_workspaces::canonicalize_path_allow_missing;
 use crate::infra::tree_digest::{inventory_tree, inventory_tree_except};
 
 pub(crate) const STORAGE_APFS_CLONE: &str = "apfs-clone-v1";
@@ -50,6 +52,9 @@ struct CheckpointWorkspace {
 impl CheckpointCleanup {
     fn new(parent: &Path) -> Result<Self, String> {
         ensure_dir(parent)?;
+        // Keep cleanup attached to the allocated directory if a storage alias
+        // is changed while the prepared checkpoint is retained.
+        let parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
         let root = tempfile::Builder::new()
             .prefix(".checkpoint-preparation-")
             .tempdir_in(parent)
@@ -172,6 +177,7 @@ pub(crate) fn prepare_scoped_tree_checkpoint_in(
     let resolved_source = fs::canonicalize(source).map_err(|error| error.to_string())?;
     let source = resolved_source.as_path();
     ensure_checkpoint_source(&requested_source, source)?;
+    ensure_checkpoint_storage_outside_source(source, parent)?;
 
     #[cfg(target_os = "macos")]
     let mut entries = prepare_entries(source, independent)?;
@@ -179,6 +185,7 @@ pub(crate) fn prepare_scoped_tree_checkpoint_in(
     preflight_sqlite_databases(source, independent)?;
 
     let cleanup = CheckpointCleanup::new(parent)?;
+    ensure_checkpoint_storage_outside_source(source, &cleanup.0.root)?;
     #[cfg(target_os = "macos")]
     let cloned = {
         // This live copy is only a seed. Fingerprints were recorded BEFORE cloning;
@@ -215,11 +222,12 @@ pub(crate) fn create_tree_checkpoint_from_preparation(
             display_path(destination)
         ));
     }
+    ensure_checkpoint_source(&prepared.requested_source, &prepared.source)?;
+    ensure_checkpoint_storage_outside_source(&prepared.source, &prepared.cleanup.0.root)?;
     if let Some(parent) = destination.parent() {
+        ensure_checkpoint_storage_outside_source(&prepared.source, parent)?;
         ensure_dir(parent)?;
     }
-
-    ensure_checkpoint_source(&prepared.requested_source, &prepared.source)?;
     let candidate = prepared.cleanup.candidate();
     #[cfg(target_os = "macos")]
     if prepared.cloned {
@@ -249,6 +257,18 @@ pub(crate) fn create_tree_checkpoint_from_preparation(
     ensure_checkpoint_source(&prepared.requested_source, &prepared.source)?;
     fs::rename(&candidate, destination).map_err(|error| error.to_string())?;
     Ok(STORAGE_FULL_COPY.to_string())
+}
+
+fn ensure_checkpoint_storage_outside_source(source: &Path, storage: &Path) -> Result<(), String> {
+    let resolved_storage = canonicalize_path_allow_missing(storage)?;
+    if projected_path_contains(source, &resolved_storage)? {
+        return Err(format!(
+            "checkpoint storage overlaps environment root: {} is within {}; snapshot storage must be outside the environment root",
+            display_path(storage),
+            display_path(source)
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_checkpoint_source(requested: &Path, resolved: &Path) -> Result<(), String> {
@@ -1397,6 +1417,47 @@ mod tests {
         prepare_tree_checkpoint, sqlite_primary_for_sidecar, verify_tree_checkpoint,
     };
     use crate::infra::tree_digest::inventory_tree;
+
+    #[test]
+    fn checkpoint_refuses_overlapping_storage_before_reading_the_source() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("invalid.db"), b"SQLite format 3\0invalid").unwrap();
+        let before = inventory_tree(&source).unwrap();
+        for storage in [source.clone(), source.join("missing/snapshots")] {
+            let error = super::prepare_tree_checkpoint_in(&source, &storage).unwrap_err();
+            assert!(error.contains("checkpoint storage overlaps"), "{error}");
+            assert_eq!(inventory_tree(&source).unwrap(), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_rechecks_storage_alias_before_capture_and_cleans_original_workspace() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let storage = fixture.path().join("storage");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&storage).unwrap();
+        fs::write(source.join("marker"), b"live").unwrap();
+        fs::write(storage.join("existing-checkpoint"), b"saved").unwrap();
+        let before_source = inventory_tree(&source).unwrap();
+        let before_storage = inventory_tree(&storage).unwrap();
+        let alias = fixture.path().join("alias");
+        std::os::unix::fs::symlink(&storage, &alias).unwrap();
+        let prepared = super::prepare_tree_checkpoint_in(&source, &alias).unwrap();
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let error = super::create_tree_checkpoint_from_preparation(
+            prepared,
+            &alias.join("missing/checkpoint"),
+        )
+        .unwrap_err();
+        assert!(error.contains("checkpoint storage overlaps"), "{error}");
+        assert_eq!(inventory_tree(&source).unwrap(), before_source);
+        assert_eq!(inventory_tree(&storage).unwrap(), before_storage);
+    }
 
     #[cfg(unix)]
     #[test]
