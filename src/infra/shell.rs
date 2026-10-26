@@ -407,7 +407,8 @@ fn render_init_fish(command: &str) -> String {
     end
     set -l script (command {command} env use $argv $shell_args)
     or return $status
-    eval $script
+    # Restore command-substitution separators, including newlines inside quoted paths.
+    printf '%s\n' $script | source
 end
 "#
     )

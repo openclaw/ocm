@@ -53,7 +53,7 @@ fn init_fish_prints_a_fish_specific_helper() {
     assert!(output.contains("function ocm_use"));
     assert!(output.contains("set -l shell_args --shell fish"));
     assert!(output.contains("'ocm' env use $argv $shell_args"));
-    assert!(output.contains("eval $script"));
+    assert!(output.contains("printf '%s\\n' $script | source"));
 }
 
 #[test]
@@ -182,6 +182,114 @@ test "$OCM_ACTIVE_ENV" = demo; or exit 14
             stderr(&output)
         );
         assert!(stdout(&output).contains("chained"), "{label}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fish_helper_preserves_exact_paths_for_child_commands() {
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+
+    use crate::support::ocm_test_binary_path;
+
+    if Command::new("fish").arg("--version").output().is_err() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "fish must be installed when CI is set"
+        );
+        eprintln!("skipping: fish is not installed");
+        return;
+    }
+
+    let root = TestDir::new("shell-init-fish-paths");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let binary = root.child("ocm '\\\ncommand");
+    symlink(ocm_test_binary_path(), &binary).unwrap();
+    let reader = root.child("read-selected.sh");
+    fs::write(
+        &reader,
+        r#"test "$OCM_ACTIVE_ENV" = "$PROBE_NAME" || exit 20
+test "$OPENCLAW_HOME" = "$PROBE_ROOT" || exit 21
+test "$OCM_ACTIVE_ENV_ROOT" = "$PROBE_ROOT" || exit 22
+test "$OPENCLAW_STATE_DIR" = "$PROBE_ROOT/.openclaw" || exit 23
+test "$OPENCLAW_CONFIG_PATH" = "$PROBE_ROOT/.openclaw/openclaw.json" || exit 24
+test "$(cat "$OPENCLAW_HOME/selected-env.txt")" = selected || exit 25
+"#,
+    )
+    .unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_SELF".to_string(),
+        binary.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "PROBE_OCM".to_string(),
+        binary.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "PROBE_READER".to_string(),
+        reader.to_string_lossy().into_owned(),
+    );
+
+    for (index, leaf) in [
+        "ordinary space",
+        "with\nnewline",
+        "\n\n'quote'\\$; tab\t\n/root",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let name = format!("selected{index}");
+        let selected = root.child(leaf);
+        let selected_text = selected.to_string_lossy();
+        let created = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", &name, "--root", &selected_text],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        fs::write(selected.join("selected-env.txt"), "selected").unwrap();
+        if leaf.contains('\n') {
+            let sibling = root.child(leaf.replace('\n', " "));
+            fs::create_dir_all(&sibling).unwrap();
+            fs::write(sibling.join("selected-env.txt"), "sibling").unwrap();
+        }
+        env.insert("PROBE_NAME".to_string(), name);
+        env.insert("PROBE_ROOT".to_string(), selected_text.into_owned());
+        let script = r#""$PROBE_OCM" init fish | source
+ocm_use "$PROBE_NAME"; or exit 10
+sh "$PROBE_READER"; or exit $status
+ocm_use missing
+test $status -eq 1; or exit 11
+sh "$PROBE_READER"; or exit $status
+ocm_use "$PROBE_NAME" --shell=fish; or exit 12
+sh "$PROBE_READER"; or exit $status
+"$PROBE_OCM" env use "$PROBE_NAME" --shell fish | source
+test $status -eq 0; or exit 13
+sh "$PROBE_READER"; or exit $status
+"$PROBE_OCM" env exec "$PROBE_NAME" -- sh "$PROBE_READER"
+"#;
+        let output = Command::new("fish")
+            .args(["--no-config", "-c", script])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "leaf={leaf:?}, status={}: {} {}",
+            output.status,
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("environment \"missing\" does not exist"),
+            "{}",
+            stderr(&output)
+        );
     }
 }
 
@@ -361,7 +469,7 @@ printf 'caller variables preserved\n'
 
 #[cfg(unix)]
 #[test]
-fn posix_helper_discards_the_output_of_a_failed_activation() {
+fn helpers_discard_the_output_of_a_failed_activation() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
@@ -371,39 +479,52 @@ fn posix_helper_discards_the_output_of_a_failed_activation() {
     let fake = root.child("failing-ocm");
     fs::write(
         &fake,
-        "#!/bin/sh\necho 'FAILED_STDOUT_RAN=1'\necho 'activation failed' >&2\nexit 9\n",
+        "#!/bin/sh\necho 'echo touched > \"$PROBE_FAILED_OUTPUT\"'\necho 'activation failed' >&2\nexit 9\n",
     )
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     let mut env = ocm_env(&root);
     env.insert("OCM_SELF".to_string(), fake.to_string_lossy().into_owned());
+    let failed_output = root.child("failed-output");
+    env.insert(
+        "PROBE_FAILED_OUTPUT".to_string(),
+        failed_output.to_string_lossy().into_owned(),
+    );
 
     for (shell, init_shell) in [
         ("bash", "bash"),
         ("sh", "sh"),
         ("zsh", "zsh"),
         ("dash", "sh"),
+        ("fish", "fish"),
     ] {
         if !matches!(shell, "bash" | "sh")
             && Command::new(shell).arg("-c").arg(":").output().is_err()
         {
+            assert!(
+                shell != "fish" || std::env::var_os("CI").is_none(),
+                "fish must be installed when CI is set"
+            );
             continue;
         }
         let init = run_ocm(&cwd, &env, &["init", init_shell]);
         assert!(init.status.success(), "{}", stderr(&init));
-        let script = format!(
-            r#"{}
-ocm_use demo
+        let body = if shell == "fish" {
+            r#"ocm_use demo
+test $status -eq 9; or exit 10
+ocm_use demo --shell=fish
+test $status -eq 9; or exit 12
+"#
+        } else {
+            r#"ocm_use demo
 result=$?
 [ "$result" = 9 ] || exit 10
-[ -z "${{FAILED_STDOUT_RAN+x}}" ] || exit 11
 ocm_use demo --shell=sh
 result=$?
 [ "$result" = 9 ] || exit 12
-[ -z "${{FAILED_STDOUT_RAN+x}}" ] || exit 13
-"#,
-            stdout(&init)
-        );
+"#
+        };
+        let script = format!("{}\n{body}", stdout(&init));
         let output = Command::new(shell)
             .args(["-c", &script])
             .current_dir(&cwd)
@@ -419,6 +540,7 @@ result=$?
             stderr(&output)
         );
         assert!(stderr(&output).contains("activation failed"), "{shell}");
+        assert!(!failed_output.exists(), "{shell} evaluated failed output");
     }
 }
 
