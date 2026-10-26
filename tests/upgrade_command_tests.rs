@@ -4252,6 +4252,305 @@ fn upgrade_simulate_admits_pnpm_destinations_before_installing() {
 
 #[cfg(unix)]
 #[test]
+fn upgrade_simulate_rejects_commands_after_registration_changes() {
+    use std::os::unix::process::CommandExt;
+
+    struct SimulationChild(std::process::Child);
+    impl Drop for SimulationChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+
+    // Exercise published-package dispatch, pre-target planning, and local-source
+    // build/dependency commands. Removal remains possible while a child runs.
+    for (local, pause, replacement, keep) in [
+        (false, "--version", "different-root", false),
+        (false, "--version", "same-root", false),
+        (false, "--version", "removed", false),
+        (false, "--version", "different-root", true),
+        (false, "update", "different-root", false),
+        (true, "build", "different-root", false),
+        (true, "install", "same-root", false),
+        (false, "--version", "unchanged", false),
+        (true, "--version", "unchanged", false),
+    ] {
+        let case = format!("{local}-{pause}-{replacement}-{keep}");
+        let root = TestDir::new(&format!("simulation-admission-{case}"));
+        let cwd = root.path();
+        let mut env = ocm_env(&root);
+        install_fake_node_and_npm(&root, &mut env, "22.22.3");
+        let ready = root.child("ready");
+        let release = root.child("release");
+        let calls = root.child("calls");
+        let replacement_calls = root.child("replacement-calls");
+        for (key, path) in [
+            ("OCM_TEST_READY", &ready),
+            ("OCM_TEST_RELEASE", &release),
+            ("OCM_TEST_CALLS", &calls),
+            ("OCM_TEST_REPLACEMENT_CALLS", &replacement_calls),
+        ] {
+            env.insert(key.into(), path_string(path));
+        }
+        env.insert("OCM_TEST_PAUSE".into(), pause.into());
+        let script = r#"#!/bin/sh
+if [ "$1" = openclaw ]; then shift; fi
+case "${OCM_ACTIVE_ENV:-}" in
+  *-sim-*)
+    printf '%s|%s\n' "$OCM_ACTIVE_ENV" "$*" >> "$OCM_TEST_CALLS"
+    if [ "$1" = "$OCM_TEST_PAUSE" ]; then
+      printf '%s\n' "$OCM_ACTIVE_ENV" > "$OCM_TEST_READY"
+      attempts=0
+      while [ ! -f "$OCM_TEST_RELEASE" ]; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 300 ] || exit 91
+        sleep 0.1
+      done
+    fi ;;
+esac
+case "$1" in
+  --version) echo 2026.6.33 ;;
+  config) echo '{}' ;;
+  *) echo '{"status":"ok"}' ;;
+esac
+"#;
+        let source = root.child("source");
+        write_executable_script(&source, script);
+        let replacement_launcher = root.child("replacement-launcher");
+        write_executable_script(
+            &replacement_launcher,
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$OCM_ACTIVE_ENV\" \"$OPENCLAW_STATE_DIR\" \"$*\" >> \"$OCM_TEST_REPLACEMENT_CALLS\"\necho '{}'\n",
+        );
+        for (name, command) in [("source", &source), ("replacement", &replacement_launcher)] {
+            let result = run_ocm(
+                cwd,
+                &env,
+                &[
+                    "launcher",
+                    "add",
+                    name,
+                    "--command",
+                    &path_string(command),
+                    "--cwd",
+                    &path_string(cwd),
+                ],
+            );
+            assert!(result.status.success(), "{case}: {}", stderr(&result));
+        }
+        let created = run_ocm(
+            cwd,
+            &env,
+            &["env", "create", "demo", "--launcher", "source"],
+        );
+        assert!(created.status.success(), "{case}: {}", stderr(&created));
+        let source_meta = ocm::store::get_environment("demo", &env, cwd).unwrap();
+        let source_paths = ocm::store::derive_env_paths(Path::new(&source_meta.root));
+        let config_before = fs::read(&source_paths.config_path).ok();
+        fs::write(source_paths.workspace_dir.join("sentinel"), "source data").unwrap();
+
+        let mut servers = Vec::new();
+        let target = if local {
+            let repo = init_openclaw_repo(&root);
+            let bin = root.child("simulation-bin");
+            fs::create_dir_all(&bin).unwrap();
+            write_executable_script(&bin.join("pnpm"), script);
+            prepend_fake_bin(&mut env, &bin);
+            path_string(&repo)
+        } else {
+            let tarball = openclaw_package_tarball(script, "2026.6.33");
+            let integrity = sha512_integrity(&tarball);
+            let package = TestHttpServer::serve_bytes_times(
+                "/openclaw.tgz",
+                "application/octet-stream",
+                &tarball,
+                2,
+            );
+            let packument = format!(
+                r#"{{"dist-tags":{{"latest":"2026.6.33"}},"versions":{{"2026.6.33":{{"version":"2026.6.33","dist":{{"tarball":"{}","integrity":"{integrity}"}}}}}},"time":{{"2026.6.33":"2026-10-25T00:00:00.000Z"}}}}"#,
+                package.url()
+            );
+            let catalog = TestHttpServer::serve_bytes_times(
+                "/openclaw",
+                "application/json",
+                packument.as_bytes(),
+                8,
+            );
+            env.insert("OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(), catalog.url());
+            servers.extend([package, catalog]);
+            "2026.6.33".into()
+        };
+        let output_path = root.child("simulation.out");
+        let error_path = root.child("simulation.err");
+        let mut command = Command::new(support::ocm_test_binary_path());
+        command
+            .args(["upgrade", "simulate", "demo", "--to", &target, "--json"])
+            .current_dir(cwd)
+            .env_clear()
+            .envs(&env)
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&output_path).unwrap())
+            .stderr(fs::File::create(&error_path).unwrap())
+            .process_group(0);
+        if keep {
+            command.arg("--keep-simulations");
+        }
+        let mut simulation = SimulationChild(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let name = loop {
+            if let Ok(name) = fs::read_to_string(&ready)
+                && !name.trim().is_empty()
+            {
+                break name.trim().to_string();
+            }
+            assert!(
+                simulation.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "{case}: missing barrier: {:?}; {:?}",
+                fs::read_to_string(&output_path),
+                fs::read_to_string(&error_path)
+            );
+            sleep(Duration::from_millis(25));
+        };
+        let original = ocm::store::get_environment(&name, &env, cwd).unwrap();
+        let calls_at_barrier = fs::read(&calls).unwrap();
+        let mut replacement_meta = None;
+        if replacement != "unchanged" {
+            let removed = run_ocm(cwd, &env, &["env", "rm", &name]);
+            assert!(removed.status.success(), "{case}: {}", stderr(&removed));
+            if replacement != "removed" {
+                let new_root = if replacement == "same-root" {
+                    PathBuf::from(&original.root)
+                } else {
+                    root.child("replacement")
+                };
+                let result = run_ocm(
+                    cwd,
+                    &env,
+                    &[
+                        "env",
+                        "create",
+                        &name,
+                        "--root",
+                        &path_string(&new_root),
+                        "--launcher",
+                        "replacement",
+                        "--protect",
+                    ],
+                );
+                assert!(result.status.success(), "{case}: {}", stderr(&result));
+                let meta = ocm::store::get_environment(&name, &env, cwd).unwrap();
+                assert_ne!(meta.created_at, original.created_at);
+                fs::write(new_root.join("sentinel"), "replacement data").unwrap();
+                replacement_meta = Some(meta);
+            }
+        }
+        fs::write(&release, "continue").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = simulation.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{case}: simulation did not finish"
+            );
+            sleep(Duration::from_millis(25));
+        };
+        let result: Value = serde_json::from_slice(&fs::read(&output_path).unwrap()).unwrap();
+        assert!(
+            !replacement_calls.exists(),
+            "{case}: replacement received commands: {:?}",
+            fs::read_to_string(&replacement_calls)
+        );
+        if replacement == "unchanged" {
+            assert!(status.success(), "{case}: {result:#}");
+            assert_eq!(result["outcome"], "passed", "{case}: {result:#}");
+            assert_eq!(result["cleanup"], "cleaned", "{case}: {result:#}");
+            assert!(
+                fs::read_to_string(&calls)
+                    .unwrap()
+                    .contains("|doctor --non-interactive --fix\n")
+            );
+        } else {
+            assert_eq!(status.code(), Some(1), "{case}: {result:#}");
+            assert_eq!(result["outcome"], "failed", "{case}: {result:#}");
+            assert_eq!(
+                result["cleanup"],
+                if keep { "kept" } else { "failed" },
+                "{case}: {result:#}"
+            );
+            assert_eq!(
+                fs::read(&calls).unwrap(),
+                calls_at_barrier,
+                "{case}: stale original received another command"
+            );
+            let rejected = if pause == "update" {
+                "prepare target"
+            } else if local && pause == "install" {
+                "pnpm build"
+            } else {
+                "openclaw doctor"
+            };
+            let check = result["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["name"] == rejected)
+                .unwrap();
+            assert_eq!(check["status"], "failed", "{case}: {result:#}");
+            assert!(
+                check["note"]
+                    .as_str()
+                    .unwrap()
+                    .contains(if replacement == "removed" {
+                        "does not exist"
+                    } else {
+                        "was replaced"
+                    }),
+                "{case}: {result:#}"
+            );
+            if replacement != "removed" {
+                assert!(
+                    check["note"]
+                        .as_str()
+                        .unwrap()
+                        .contains("rerun ocm upgrade simulate against the source environment"),
+                    "{case}: {result:#}"
+                );
+            }
+        }
+        if let Some(expected) = replacement_meta {
+            let current = ocm::store::get_environment(&name, &env, cwd).unwrap();
+            assert_eq!(
+                serde_json::to_value(&current).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "{case}: replacement binding changed"
+            );
+            assert_eq!(
+                fs::read_to_string(Path::new(&current.root).join("sentinel")).unwrap(),
+                "replacement data"
+            );
+        } else {
+            assert!(ocm::store::get_environment(&name, &env, cwd).is_err());
+        }
+        assert_eq!(
+            serde_json::to_value(ocm::store::get_environment("demo", &env, cwd).unwrap()).unwrap(),
+            serde_json::to_value(source_meta).unwrap()
+        );
+        assert_eq!(fs::read(&source_paths.config_path).ok(), config_before);
+        assert_eq!(
+            fs::read_to_string(source_paths.workspace_dir.join("sentinel")).unwrap(),
+            "source data"
+        );
+        drop(servers);
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn upgrade_simulate_cleanup_preserves_replacement_environments() {
     use std::os::unix::process::CommandExt;
 

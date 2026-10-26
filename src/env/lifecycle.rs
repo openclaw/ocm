@@ -430,6 +430,23 @@ impl<'a> EnvironmentService<'a> {
         get_environment(name, self.env, self.cwd)
     }
 
+    /// Admit work only to the temporary registration this simulation created.
+    /// Keep the guard until its command is spawned, not while the child runs.
+    pub(crate) fn lock_simulation(
+        &self,
+        expected: &EnvMeta,
+    ) -> Result<(EnvMeta, EnvironmentOperationLock), String> {
+        let lock = self.lock_operation(&expected.name)?;
+        let current = self.get(&expected.name)?;
+        if current.root != expected.root || current.created_at != expected.created_at {
+            return Err(format!(
+                "simulation environment \"{}\" was replaced; refusing to use it; rerun ocm upgrade simulate against the source environment to create a fresh clone",
+                expected.name
+            ));
+        }
+        Ok((current, lock))
+    }
+
     pub fn find(&self, name: &str) -> Result<Option<EnvMeta>, String> {
         match get_environment(name, self.env, self.cwd) {
             Ok(meta) => Ok(Some(meta)),
@@ -487,6 +504,15 @@ impl<'a> EnvironmentService<'a> {
         service_running: Option<bool>,
     ) -> Result<EnvMeta, String> {
         let _lock = self.lock_operation(name)?;
+        self.set_service_policy_locked(name, service_enabled, service_running)
+    }
+
+    pub(crate) fn set_service_policy_locked(
+        &self,
+        name: &str,
+        service_enabled: Option<bool>,
+        service_running: Option<bool>,
+    ) -> Result<EnvMeta, String> {
         let change = set_environment_service_policy(
             name,
             service_enabled,
