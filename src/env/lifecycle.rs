@@ -440,7 +440,7 @@ impl<'a> EnvironmentService<'a> {
         let current = self.get(&expected.name)?;
         if current.root != expected.root || current.created_at != expected.created_at {
             return Err(format!(
-                "simulation environment \"{}\" was replaced; refusing to use it",
+                "simulation environment \"{}\" was replaced; refusing to use it; rerun ocm upgrade simulate against the source environment to create a fresh clone",
                 expected.name
             ));
         }

@@ -4512,6 +4512,15 @@ esac
                     }),
                 "{case}: {result:#}"
             );
+            if replacement != "removed" {
+                assert!(
+                    check["note"]
+                        .as_str()
+                        .unwrap()
+                        .contains("rerun ocm upgrade simulate against the source environment"),
+                    "{case}: {result:#}"
+                );
+            }
         }
         if let Some(expected) = replacement_meta {
             let current = ocm::store::get_environment(&name, &env, cwd).unwrap();
