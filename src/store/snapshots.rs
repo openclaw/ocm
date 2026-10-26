@@ -1149,6 +1149,7 @@ fn clear_snapshot_runtime_residue(root: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
+    let mut residue = Vec::new();
     for entry in entries {
         let entry_path = entry.path();
         let metadata = fs::symlink_metadata(&entry_path).map_err(|error| error.to_string())?;
@@ -1160,10 +1161,20 @@ fn clear_snapshot_runtime_residue(root: &Path) -> Result<(), String> {
         #[cfg(not(unix))]
         let is_socket = false;
         if is_socket || is_snapshot_process_residue(&entry.file_name(), metadata.is_dir()) {
-            remove_path_if_present(&entry_path)?;
+            residue.push(entry_path);
         }
     }
-    Ok(())
+    if residue.is_empty() {
+        return Ok(());
+    }
+    // Unlinking residue also requires write permission on its captured parent.
+    // Restore that parent's mode before the candidate can become live.
+    super::openclaw_state::with_owner_write_permission(&openclaw_root, || {
+        for path in residue {
+            remove_tree_if_present(&path)?;
+        }
+        Ok(())
+    })
 }
 
 fn remove_path_if_present(path: &Path) -> Result<(), String> {
