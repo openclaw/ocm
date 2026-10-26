@@ -848,6 +848,25 @@ fn daemon_child_output_aliases_cannot_recreate_rotated_diagnostics() {
                 assert!(!diagnostics.contains("child stderr"));
                 assert_eq!(diagnostic.exists(), !rotated);
                 assert_eq!(alias.is_symlink(), !hardlink);
+                if mode == "rotated" || reverse {
+                    let error_output = if diagnostic_stream == "stderr" {
+                        diagnostics.clone()
+                    } else {
+                        stderr(&refused)
+                    };
+                    assert!(
+                        error_output.contains(&path_string(&alias)),
+                        "{error_output}"
+                    );
+                    assert!(
+                        error_output.contains("restore a separately owned target"),
+                        "{error_output}"
+                    );
+                    assert!(
+                        error_output.contains("remove the alias before retrying"),
+                        "{error_output}"
+                    );
+                }
 
                 // Retrying after the unsafe alias is removed starts normally, and
                 // the live diagnostic descriptor still owns only its old output.

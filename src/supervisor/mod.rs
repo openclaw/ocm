@@ -1990,7 +1990,7 @@ fn open_child_log(
                             match fs::symlink_metadata(diagnostic) {
                                 Ok(_) => {
                                     return Err(std::io::Error::other(format!(
-                                        "unresolved supervisor diagnostic alias {}",
+                                        "unresolved supervisor diagnostic alias {}; restore a separately owned target or remove the alias before retrying",
                                         display_path(diagnostic)
                                     )));
                                 }
@@ -2001,7 +2001,26 @@ fn open_child_log(
                         Err(error) => return Err(error),
                     }
                 }
-                OpenOptions::new().create_new(true).append(true).open(path)
+                OpenOptions::new()
+                    .create_new(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::AlreadyExists
+                            && fs::symlink_metadata(path)
+                                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                        {
+                            std::io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "cannot create output through alias {}; restore a separately owned target or remove the alias before retrying",
+                                    display_path(path)
+                                ),
+                            )
+                        } else {
+                            error
+                        }
+                    })
             } else {
                 Err(error)
             }
@@ -4039,7 +4058,16 @@ mod tests {
         symlink("daemon.stderr.log", &intermediate).unwrap();
         symlink("intermediate", &child).unwrap();
         let spec = child_spec("daemon", 19999);
-        assert!(open_child_log(&spec, &child, "stderr", &reserved, &[]).is_err());
+        let error = open_child_log(&spec, &child, "stderr", &reserved, &[]).unwrap_err();
+        assert!(error.contains(&display_path(&child)), "{error}");
+        assert!(
+            error.contains("restore a separately owned target"),
+            "{error}"
+        );
+        assert!(
+            error.contains("remove the alias before retrying"),
+            "{error}"
+        );
         assert!(!diagnostic.exists());
         assert!(child.is_symlink());
         assert!(intermediate.is_symlink());
