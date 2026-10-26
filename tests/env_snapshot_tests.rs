@@ -157,6 +157,125 @@ fn write_empty_snapshot_service(runtime_path: &Path, ocm_home: &str) {
 }
 
 #[test]
+fn env_snapshot_refuses_storage_inside_custom_roots_and_preserves_disjoint_roots() {
+    let layouts = [
+        "exact",
+        "ancestor",
+        "external",
+        "ocm-disjoint",
+        #[cfg(unix)]
+        "source-alias",
+        #[cfg(unix)]
+        "storage-alias",
+    ];
+    for layout in layouts {
+        let root = TestDir::new("snapshot-storage-overlap");
+        let env = ocm_env(&root);
+        let storage = root.child("ocm-home/snapshots");
+        let live = match layout {
+            "exact" => storage.join("source"),
+            "ancestor" => storage.clone(),
+            "ocm-disjoint" => root.child("ocm-home/custom/source"),
+            #[cfg(unix)]
+            "source-alias" => {
+                let target = storage.join("source");
+                fs::create_dir_all(&target).unwrap();
+                let alias = root.child("alias");
+                std::os::unix::fs::symlink(&target, &alias).unwrap();
+                alias
+            }
+            _ => root.child("live"),
+        };
+        let create = run_ocm(
+            root.path(),
+            &env,
+            &["env", "create", "source", "--root", &path_string(&live)],
+        );
+        assert!(create.status.success(), "{layout}: {}", stderr(&create));
+        #[cfg(unix)]
+        if layout == "storage-alias" {
+            fs::remove_dir(&storage).unwrap();
+            std::os::unix::fs::symlink(&live, &storage).unwrap();
+        }
+        let marker = live.join(".openclaw/workspace/marker");
+        fs::write(&marker, b"live data").unwrap();
+
+        // The ancestor layout can already contain another environment's
+        // legitimate snapshot. Refusal must leave that checkpoint intact.
+        let existing = if layout == "ancestor" {
+            let create = run_ocm(root.path(), &env, &["env", "create", "other"]);
+            assert!(create.status.success(), "{}", stderr(&create));
+            let capture = run_ocm(
+                root.path(),
+                &env,
+                &["env", "snapshot", "create", "other", "--json"],
+            );
+            assert!(capture.status.success(), "{}", stderr(&capture));
+            Some(capture.stdout)
+        } else {
+            None
+        };
+        let entries = || {
+            let mut names = fs::read_dir(&live)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let before = entries();
+        let capture = run_ocm(
+            root.path(),
+            &env,
+            &["env", "snapshot", "create", "source", "--json"],
+        );
+        if matches!(layout, "external" | "ocm-disjoint") {
+            assert!(capture.status.success(), "{layout}: {}", stderr(&capture));
+            let snapshot: Value = serde_json::from_slice(&capture.stdout).unwrap();
+            assert_eq!(
+                fs::read(
+                    Path::new(snapshot["archivePath"].as_str().unwrap())
+                        .join(".openclaw/workspace/marker")
+                )
+                .unwrap(),
+                b"live data"
+            );
+        } else {
+            assert_eq!(capture.status.code(), Some(1), "{layout}");
+            assert!(
+                stderr(&capture).contains("checkpoint storage overlaps environment root"),
+                "{layout}: {}",
+                stderr(&capture)
+            );
+            let list = run_ocm(
+                root.path(),
+                &env,
+                &["env", "snapshot", "list", "source", "--json"],
+            );
+            assert!(list.status.success(), "{}", stderr(&list));
+            assert_eq!(
+                serde_json::from_slice::<Value>(&list.stdout).unwrap(),
+                serde_json::json!([])
+            );
+        }
+        assert_eq!(fs::read(&marker).unwrap(), b"live data");
+        assert_eq!(entries(), before, "{layout}: preparation residue");
+        if let Some(existing) = existing {
+            let snapshot: Value = serde_json::from_slice(&existing).unwrap();
+            assert!(Path::new(snapshot["archivePath"].as_str().unwrap()).is_dir());
+            let list = run_ocm(
+                root.path(),
+                &env,
+                &["env", "snapshot", "list", "other", "--json"],
+            );
+            assert!(list.status.success(), "{}", stderr(&list));
+            let list: Value = serde_json::from_slice(&list.stdout).unwrap();
+            assert_eq!(list[0]["id"], snapshot["id"]);
+        }
+    }
+}
+
+#[test]
 fn env_snapshot_create_captures_the_current_environment_state() {
     let root = TestDir::new("env-snapshot-create");
     let cwd = root.child("workspace");

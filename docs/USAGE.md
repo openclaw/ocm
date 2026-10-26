@@ -1341,6 +1341,14 @@ its former backing directory is left untouched. Older tree checkpoints whose
 artifact is itself a symlink are refused on restore: they did not retain
 historical contents. Create a new snapshot to protect the current contents.
 
+Checkpoint storage must be outside the environment root being captured. If a
+custom root contains `$OCM_HOME/snapshots/<env>`, including through a path alias,
+snapshot and upgrade checkpoint preparation refuse with `checkpoint storage
+overlaps environment root` before copying or stopping a running gateway. This
+preserves live data and existing snapshots without recursively copying the
+preparation directory. Disjoint custom roots, including roots elsewhere under
+`OCM_HOME`, remain supported.
+
 Unix sockets are transient process endpoints and are omitted from checkpoints,
 including inactive socket files left by stopped processes. Snapshot creation
 leaves source endpoints untouched. Restore does not recreate sockets; their
