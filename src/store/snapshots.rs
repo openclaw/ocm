@@ -1160,7 +1160,8 @@ fn clear_snapshot_runtime_residue(root: &Path) -> Result<(), String> {
         #[cfg(not(unix))]
         let is_socket = false;
         if is_socket || is_snapshot_process_residue(&entry.file_name(), metadata.is_dir()) {
-            remove_path_if_present(&entry_path)?;
+            // Candidate entries retain captured modes, including read-only directories.
+            remove_tree_if_present(&entry_path)?;
         }
     }
     Ok(())

@@ -1325,6 +1325,103 @@ fn env_snapshot_restores_socket_named_data_and_discards_process_residue() {
 
 #[cfg(unix)]
 #[test]
+fn env_snapshot_restores_readonly_residue_without_changing_durable_modes() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for mode in [0o555, 0o755] {
+        let root = TestDir::new("snapshot-restore-residue-permissions");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let run = |args: &[&str]| {
+            let output = run_ocm(&cwd, &env, args);
+            assert!(output.status.success(), "{}", stderr(&output));
+            output
+        };
+        run(&["env", "create", "source"]);
+        let live = root.child("ocm-home/envs/source");
+        let durable = live.join(".openclaw/workspace/durable");
+        let external = root.child("external");
+        for path in [&durable, &external] {
+            write_text(&path.join("payload"), "captured bytes");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        for name in ["run", "tmp", "temp", "locks"] {
+            let residue = live.join(".openclaw").join(name);
+            write_text(&residue.join("cache/item"), "transient bytes");
+            symlink(&external, residue.join("borrowed")).unwrap();
+            for path in [&residue.join("cache"), &residue] {
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+        // A process-residue link must be unlinked without changing its target.
+        symlink(&external, live.join(".openclaw/gateway.lock")).unwrap();
+        let snapshot = run(&["env", "snapshot", "create", "source", "--json"]);
+        let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+        let id = snapshot["id"].as_str().unwrap();
+        let checkpoint = Path::new(snapshot["archivePath"].as_str().unwrap());
+        write_text(&durable.join("payload"), "current bytes");
+
+        for _ in 0..2 {
+            run(&["env", "snapshot", "restore", "source", id, "--json"]);
+            for path in [
+                &durable,
+                &external,
+                &checkpoint.join(".openclaw/workspace/durable"),
+            ] {
+                assert_eq!(
+                    fs::read_to_string(path.join("payload")).unwrap(),
+                    "captured bytes"
+                );
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o555
+                );
+            }
+            for name in ["run", "tmp", "temp", "locks"] {
+                assert!(!live.join(".openclaw").join(name).exists());
+                let captured = checkpoint.join(".openclaw").join(name);
+                assert_eq!(
+                    fs::read_to_string(captured.join("cache/item")).unwrap(),
+                    "transient bytes"
+                );
+                for path in [&captured, &captured.join("cache")] {
+                    assert_eq!(
+                        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                        mode
+                    );
+                }
+                assert_eq!(fs::read_link(captured.join("borrowed")).unwrap(), external);
+            }
+            assert!(fs::symlink_metadata(live.join(".openclaw/gateway.lock")).is_err());
+            assert_eq!(
+                fs::read_link(checkpoint.join(".openclaw/gateway.lock")).unwrap(),
+                external
+            );
+        }
+        let removed = run(&["env", "snapshot", "remove", "source", id, "--json"]);
+        assert!(!stdout(&removed).contains("cleanup failed"));
+        assert!(!checkpoint.exists());
+        assert!(
+            fs::read_dir(root.child("ocm-home/envs"))
+                .unwrap()
+                .all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("ocm-restore")
+                })
+        );
+        // Permit TestDir to remove the durable fixture after preservation checks.
+        for path in [&durable, &external] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
@@ -1569,6 +1666,15 @@ fn env_snapshot_restore_recovers_the_displaced_root_when_acceptance_fails() {
         write_text(&rejected_read_only_dir.join("state.txt"), "snapshot-only\n");
         fs::set_permissions(&rejected_read_only_dir, fs::Permissions::from_mode(0o555)).unwrap();
     }
+    #[cfg(unix)]
+    let residue = root.child("ocm-home/envs/source/.openclaw/tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        write_text(&residue.join("state.txt"), "captured residue");
+        fs::set_permissions(&residue, fs::Permissions::from_mode(0o555)).unwrap();
+    }
     let snapshot = run_ocm(
         &cwd,
         &env,
@@ -1599,6 +1705,8 @@ fn env_snapshot_restore_recovers_the_displaced_root_when_acceptance_fails() {
         fs::remove_dir_all(&rejected_read_only_dir).unwrap();
     }
     write_text(&notes, "pre-restore-current-state\n");
+    #[cfg(unix)]
+    write_text(&residue.join("state.txt"), "current residue");
     let launchctl_bin = env.get("OCM_INTERNAL_LAUNCHCTL_BIN").unwrap();
     write_executable_script(
         Path::new(launchctl_bin),
@@ -1626,6 +1734,30 @@ fn env_snapshot_restore_recovers_the_displaced_root_when_acceptance_fails() {
         .filter(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
         .count();
     assert_eq!(operation_namespaces, 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (path, expected) in [
+            (&residue, "current residue"),
+            (&artifact.join(".openclaw/tmp"), "captured residue"),
+        ] {
+            assert_eq!(
+                fs::read_to_string(path.join("state.txt")).unwrap(),
+                expected
+            );
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o555
+            );
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::set_permissions(
+            artifact.join(".openclaw/future-durable/read-only"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
 }
 
 #[cfg(target_os = "macos")]
