@@ -33,7 +33,7 @@ use crate::runtime::{
 
 use super::common::{
     ExclusiveFileLock, copy_dir_recursive, copy_path, ensure_dir, load_json_files, path_exists,
-    read_json, write_json,
+    read_json, read_json_if_present, write_json,
 };
 use super::envs::get_environment;
 use super::layout::{
@@ -3259,11 +3259,18 @@ pub fn get_runtime(
     cwd: &Path,
 ) -> Result<RuntimeMeta, String> {
     let safe_name = validate_name(name, "Runtime name")?;
+    find_runtime(&safe_name, env, cwd)?
+        .ok_or_else(|| format!("runtime \"{safe_name}\" does not exist"))
+}
+
+pub(crate) fn find_runtime(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<Option<RuntimeMeta>, String> {
+    let safe_name = validate_name(name, "Runtime name")?;
     let path = runtime_meta_path(&safe_name, env, cwd)?;
-    if !path_exists(&path) {
-        return Err(format!("runtime \"{safe_name}\" does not exist"));
-    }
-    read_json(&path)
+    read_json_if_present(&path)
 }
 
 pub fn get_runtime_verified(

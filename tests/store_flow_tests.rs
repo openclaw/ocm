@@ -2101,6 +2101,135 @@ fn environment_cleanup_applies_binding_repairs() {
 }
 
 #[test]
+fn environment_cleanup_preserves_bindings_when_metadata_cannot_be_read() {
+    let root = TestDir::new("store-env-cleanup-unreadable");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let service = EnvironmentService::new(&env, &cwd);
+    let binary = cwd.join("runtime");
+    fs::write(&binary, "fixture").unwrap();
+
+    for kind in ["runtime", "launcher"] {
+        let metadata = if kind == "runtime" {
+            add_runtime(
+                AddRuntimeOptions {
+                    name: kind.to_string(),
+                    path: path_string(&binary),
+                    description: None,
+                },
+                &env,
+                &cwd,
+            )
+            .unwrap();
+            runtime_meta_path(kind, &env, &cwd).unwrap()
+        } else {
+            add_test_launcher(kind, &env, &cwd);
+            launcher_meta_path(kind, &env, &cwd).unwrap()
+        };
+        service
+            .create(CreateEnvironmentOptions {
+                name: kind.to_string(),
+                root: None,
+                gateway_port: None,
+                service_enabled: false,
+                service_running: false,
+                default_runtime: (kind == "runtime").then(|| kind.to_string()),
+                default_launcher: (kind == "launcher").then(|| kind.to_string()),
+                dev: None,
+                protected: false,
+            })
+            .unwrap();
+        let original = fs::read(&metadata).unwrap();
+
+        for failure in [
+            "invalid-json",
+            "directory",
+            "file-permissions",
+            "parent-permissions",
+        ] {
+            #[cfg(not(unix))]
+            if failure.ends_with("permissions") {
+                continue;
+            }
+            #[cfg(unix)]
+            let permission_target = if failure == "parent-permissions" {
+                metadata.parent().unwrap()
+            } else {
+                metadata.as_path()
+            };
+            #[cfg(unix)]
+            let permissions = fs::metadata(permission_target).unwrap().permissions();
+
+            match failure {
+                "invalid-json" => fs::write(&metadata, "{").unwrap(),
+                "directory" => {
+                    fs::remove_file(&metadata).unwrap();
+                    fs::create_dir(&metadata).unwrap();
+                }
+                #[cfg(unix)]
+                _ => {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(permission_target, fs::Permissions::from_mode(0)).unwrap();
+                    if fs::read(&metadata).is_ok() {
+                        // Root can bypass these permissions; ordinary-user runs cover this case.
+                        fs::set_permissions(permission_target, permissions).unwrap();
+                        continue;
+                    }
+                }
+                #[cfg(not(unix))]
+                _ => unreachable!(),
+            }
+            let doctor = service.doctor(kind);
+            let preview = service.cleanup_preview(kind);
+            let applied = service.cleanup(kind);
+
+            // Restore the fixture even when the inspected operation returned an error.
+            if failure == "directory" {
+                fs::remove_dir(&metadata).unwrap();
+            }
+            #[cfg(unix)]
+            if failure.ends_with("permissions") {
+                fs::set_permissions(permission_target, permissions).unwrap();
+            }
+            fs::write(&metadata, &original).unwrap();
+
+            let doctor = doctor.unwrap();
+            assert!(!doctor.healthy, "{kind}: {failure}");
+            assert_eq!(
+                if kind == "runtime" {
+                    &doctor.runtime_status
+                } else {
+                    &doctor.launcher_status
+                },
+                "broken"
+            );
+            assert!(
+                doctor
+                    .issues
+                    .iter()
+                    .any(|issue| issue.contains("metadata could not be read"))
+            );
+            assert!(preview.unwrap().actions.is_empty(), "{kind}: {failure}");
+            let applied = applied.unwrap();
+            assert!(applied.actions.is_empty(), "{kind}: {failure}");
+            assert_eq!(applied.healthy_after, Some(false));
+            let current = service.get(kind).unwrap();
+            assert_eq!(
+                if kind == "runtime" {
+                    current.default_runtime.as_deref()
+                } else {
+                    current.default_launcher.as_deref()
+                },
+                Some(kind)
+            );
+            assert!(service.doctor(kind).unwrap().healthy);
+            assert!(service.resolve(kind, None, None, &[]).is_ok());
+        }
+    }
+}
+
+#[test]
 fn environment_cleanup_all_limits_results_to_envs_with_safe_repairs() {
     let root = TestDir::new("store-env-cleanup-all");
     let cwd = root.child("workspace");

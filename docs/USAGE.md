@@ -1567,6 +1567,12 @@ ocm env cleanup mira --yes
 ocm env repair-marker mira
 ```
 
+Cleanup clears runtime and launcher bindings only when their metadata is confirmed absent.
+Unreadable or invalid metadata is reported as `broken` by `env doctor`, with the
+underlying error; preview and apply preserve that binding. Restore access or repair
+the metadata, then rerun doctor. Restoring valid metadata allows execution to
+recover without rebinding. `--all` applies the same rule.
+
 Runtime-state cleanup preserves configured agent directories inside the environment, including their authentication and state files beneath generated plugin dependencies.
 It also retains shared managed skills under `.openclaw/skills` and their global ClawHub tracking metadata under `.openclaw/.clawhub`.
 A runtime-state reset is planned only when a session transcript under `.openclaw/agents/<id>/sessions` records, in its header, a working directory under another environment's root or another `.openclaw` directory, as state copied from elsewhere does.
