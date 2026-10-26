@@ -35,22 +35,16 @@ fn read_json(path: &Path) -> Value {
         .unwrap_or(Value::Null)
 }
 
-// Compile the same source as a different release. No patched version strings,
-// fake runtime-version records, shared target directory, or external downloads.
-fn build_candidate(root: &TestDir) -> PathBuf {
+// Compile both versions from the same source with the release profile. Mixing
+// Cargo's large unoptimized test CLI with a smaller candidate makes integrity
+// hashing consume the lifecycle deadlines before the durable worker can start.
+// No patched version strings, fake receipts, shared target, or external downloads.
+fn build_releases(root: &TestDir) -> (PathBuf, PathBuf) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let package = root.child("candidate-package");
+    let package = root.child("release-package");
     fs::create_dir_all(&package).unwrap();
     let manifest = fs::read_to_string(source.join("Cargo.toml"))
         .unwrap()
-        .replacen(
-            &format!("version = \"{}\"", env!("CARGO_PKG_VERSION")),
-            "version = \"9.9.9\"",
-            1,
-        );
-    // The current package already declares both targets. Relocate their paths
-    // without adding duplicate target tables to the isolated release manifest.
-    let manifest = manifest
         .replace(
             "path = \"src/lib.rs\"",
             &format!("path = {:?}", source.join("src/lib.rs")),
@@ -59,32 +53,51 @@ fn build_candidate(root: &TestDir) -> PathBuf {
             "path = \"src/main.rs\"",
             &format!("path = {:?}", source.join("src/main.rs")),
         );
-    fs::write(package.join("Cargo.toml"), manifest).unwrap();
-    let lock = fs::read_to_string(source.join("Cargo.lock"))
-        .unwrap()
-        .replace(
-            &format!(
-                "name = \"ocm\"\nversion = \"{}\"",
-                env!("CARGO_PKG_VERSION")
+    let lock = fs::read_to_string(source.join("Cargo.lock")).unwrap();
+    let current = root.child("current-ocm");
+    let candidate = root.child("candidate-ocm");
+    for (version, destination) in [(env!("CARGO_PKG_VERSION"), &current), ("9.9.9", &candidate)] {
+        fs::write(
+            package.join("Cargo.toml"),
+            manifest.replacen(
+                &format!("version = \"{}\"", env!("CARGO_PKG_VERSION")),
+                &format!("version = {version:?}"),
+                1,
             ),
-            "name = \"ocm\"\nversion = \"9.9.9\"",
-        );
-    fs::write(package.join("Cargo.lock"), lock).unwrap();
-    let output = Command::new(env!("CARGO"))
-        .args(["build", "--locked", "--offline", "--bin", "ocm"])
-        .current_dir(&package)
-        .env("CARGO_TARGET_DIR", package.join("target"))
-        // Debug info adds large payloads to each mandatory integrity check but
-        // does not exercise the update lifecycle. Keep the real source build.
-        .env("CARGO_PROFILE_DEV_DEBUG", "0")
-        .output()
+        )
         .unwrap();
-    assert!(
-        output.status.success(),
-        "candidate build: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    package.join("target/debug/ocm")
+        fs::write(
+            package.join("Cargo.lock"),
+            lock.replace(
+                &format!(
+                    "name = \"ocm\"\nversion = \"{}\"",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                &format!("name = \"ocm\"\nversion = {version:?}"),
+            ),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "--offline",
+                "--bin",
+                "ocm",
+            ])
+            .current_dir(&package)
+            .env("CARGO_TARGET_DIR", package.join("target"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "release {version} build: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::copy(package.join("target/release/ocm"), destination).unwrap();
+    }
+    (current, candidate)
 }
 
 struct Fixture {
@@ -96,7 +109,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(candidate: &Path, label: &str) -> Self {
+    fn new(current: &Path, candidate: &Path, label: &str) -> Self {
         let root = TestDir::new(label);
         let mut env = ocm_env(&root);
         // A subprocess cwd resolves macOS temporary-directory aliases.
@@ -116,7 +129,7 @@ impl Fixture {
         );
         let binary = root.child("bin/ocm");
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        fs::copy(env!("CARGO_BIN_EXE_ocm"), &binary).unwrap();
+        fs::copy(current, &binary).unwrap();
         let archive = root.child("candidate.tar.gz");
         let file = fs::File::create(&archive).unwrap();
         let mut tar = tar::Builder::new(GzEncoder::new(file, Compression::fast()));
@@ -330,10 +343,10 @@ impl Drop for Fixture {
 #[test]
 fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
     let candidate_root = TestDir::new("self-update-build");
-    let candidate = build_candidate(&candidate_root);
+    let (current, candidate) = build_releases(&candidate_root);
 
     for relative in [true, false] {
-        let mut stopped = Fixture::new(&candidate, "transaction-store-context");
+        let mut stopped = Fixture::new(&current, &candidate, "transaction-store-context");
         stopped.setup_gateway();
         let result = stopped.run(&["service", "stop", "running"]);
         assert!(result.status.success(), "{}", stderr(&result));
@@ -419,7 +432,7 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
         assert!(!stopped.root.child("ocm-home/ocm-home").exists());
     }
 
-    let mut absent = Fixture::new(&candidate, "transaction-relative-no-daemon");
+    let mut absent = Fixture::new(&current, &candidate, "transaction-relative-no-daemon");
     absent.env.insert("OCM_HOME".into(), "ocm-home".into());
     let updated = absent.run(&["self", "update", "--version", "9.9.9", "--json"]);
     assert!(updated.status.success(), "{}", stderr(&updated));
@@ -429,7 +442,7 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
     assert!(!absent.root.child("ocm-home/ocm-home").exists());
     drop(absent);
 
-    let uncertain = Fixture::new(&candidate, "transaction-unknown-observation");
+    let uncertain = Fixture::new(&current, &candidate, "transaction-unknown-observation");
     uncertain.setup_gateway();
     let original_binary = file_sha256(&uncertain.binary).unwrap();
     let original_pid = fs::read(uncertain.root.child("daemon.pid")).unwrap();
@@ -517,7 +530,7 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
 
     // The source gateway launches the update in its own group. Refresh kills
     // that group, including the CLI. Only the detached retained helper survives.
-    let success = Fixture::new(&candidate, "transaction-success");
+    let success = Fixture::new(&current, &candidate, "transaction-success");
     success.setup_gateway();
     let before = success.run(&["service", "status", "running", "--json"]);
     let before: Value = serde_json::from_slice(&before.stdout).unwrap();
@@ -578,7 +591,7 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
     );
     drop(success);
 
-    let rollback = Fixture::new(&candidate, "transaction-rollback");
+    let rollback = Fixture::new(&current, &candidate, "transaction-rollback");
     rollback.setup_gateway();
     let original = file_sha256(&rollback.binary).unwrap();
     fs::write(rollback.root.child("fail-candidate"), "yes").unwrap();
@@ -610,7 +623,7 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
     assert_eq!(status["running"], true);
     drop(rollback);
 
-    let mut crash = Fixture::new(&candidate, "transaction-crash");
+    let mut crash = Fixture::new(&current, &candidate, "transaction-crash");
     crash.setup_gateway();
     crash.env.insert("OCM_HOME".into(), "ocm-home".into());
     let original = file_sha256(&crash.binary).unwrap();
@@ -708,7 +721,7 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
     );
     drop(crash);
 
-    let failed_rollback = Fixture::new(&candidate, "transaction-rollback-failed");
+    let failed_rollback = Fixture::new(&current, &candidate, "transaction-rollback-failed");
     failed_rollback.setup_gateway();
     fs::write(failed_rollback.root.child("fail-all"), "yes").unwrap();
     let failure = failed_rollback.run(&["self", "update", "--version", "9.9.9"]);
