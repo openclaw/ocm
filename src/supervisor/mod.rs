@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
-use crate::infra::file_identity::file_is_excluded;
+use crate::infra::file_identity::{FileIdentity, file_identity, file_is_excluded};
 #[cfg(unix)]
 use crate::infra::process_identity::process_group_members;
 use crate::infra::process_identity::{
@@ -1910,11 +1910,63 @@ fn spawn_running_child(
     })
 }
 
+fn supervisor_output_identities() -> Result<Vec<FileIdentity>, String> {
+    let mut identities = Vec::new();
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        for descriptor in [stdout.as_fd(), stderr.as_fd()] {
+            let owned = match descriptor.try_clone_to_owned() {
+                Ok(owned) => owned,
+                // A closed stream cannot own a diagnostic file.
+                Err(error) if error.raw_os_error() == Some(libc::EBADF) => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            let file = File::from(owned);
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            if metadata.is_file() {
+                identities.push(file_identity(&file, &metadata)?);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
+
+        for handle in [
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            // Detached consoles can have null handles; pipes and consoles do
+            // not own a regular diagnostic file. Borrow only a live disk handle.
+            if handle.is_null() || unsafe { GetFileType(handle.cast()) } != FILE_TYPE_DISK {
+                continue;
+            }
+            // Standard output/error keep the handle alive; duplicate it so
+            // dropping the File cannot close the daemon's stream.
+            let owned = unsafe { BorrowedHandle::borrow_raw(handle) }
+                .try_clone_to_owned()
+                .map_err(|error| error.to_string())?;
+            let file = File::from(owned);
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            if metadata.is_file() {
+                identities.push(file_identity(&file, &metadata)?);
+            }
+        }
+    }
+    Ok(identities)
+}
+
 fn open_child_log(
     spec: &SupervisorChildSpec,
     path: &Path,
     stream: &str,
     daemon_logs: &[PathBuf],
+    diagnostic_outputs: &[FileIdentity],
 ) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
@@ -1964,7 +2016,10 @@ fn open_child_log(
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     // Check the handle that the child will inherit, not a pathname observed
     // before opening it. This also detects hard links on Windows.
-    if file_is_excluded(&file, &metadata, daemon_logs)? {
+    if file_is_excluded(&file, &metadata, daemon_logs)?
+        || (!diagnostic_outputs.is_empty()
+            && diagnostic_outputs.contains(&file_identity(&file, &metadata)?))
+    {
         return Err(format!(
             "service log {} aliases the supervisor daemon's diagnostics",
             display_path(path)
@@ -1988,8 +2043,27 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
     } else {
         Vec::new()
     };
-    let stdout = open_child_log(spec, &stdout_path, "stdout", &daemon_logs)?;
-    let stderr = open_child_log(spec, &stderr_path, "stderr", &daemon_logs)?;
+    // A rotated diagnostic file remains owned by the daemon's output handle,
+    // even after its reserved pathname is absent or points to a replacement.
+    let diagnostic_outputs = if daemon_logs.is_empty() {
+        Vec::new()
+    } else {
+        supervisor_output_identities()?
+    };
+    let stdout = open_child_log(
+        spec,
+        &stdout_path,
+        "stdout",
+        &daemon_logs,
+        &diagnostic_outputs,
+    )?;
+    let stderr = open_child_log(
+        spec,
+        &stderr_path,
+        "stderr",
+        &daemon_logs,
+        &diagnostic_outputs,
+    )?;
     let mut process_env = spec.process_env.clone();
     // Bind clients to the actual spawning daemon, not the CLI that last
     // regenerated the desired spec (which must not restart a running Gateway).
@@ -3930,25 +4004,25 @@ mod tests {
         let child = root.path().join(".daemon.stdout.log");
         fs::hard_link(&diagnostic, &child).unwrap();
         let spec = child_spec("Daemon", 19999);
-        let error = open_child_log(&spec, &child, "stdout", &reserved).unwrap_err();
+        let error = open_child_log(&spec, &child, "stdout", &reserved, &[]).unwrap_err();
         assert!(error.contains("aliases the supervisor"), "{error}");
         assert_eq!(fs::read(&diagnostic).unwrap(), b"diagnostics\n");
         fs::remove_file(&child).unwrap();
 
         // First creation and later append retain the same separate output.
-        open_child_log(&spec, &child, "stdout", &reserved)
+        open_child_log(&spec, &child, "stdout", &reserved, &[])
             .unwrap()
             .write_all(b"first\n")
             .unwrap();
         let safe_alias = root.path().join("custom.log");
         fs::hard_link(&child, &safe_alias).unwrap();
-        open_child_log(&spec, &safe_alias, "stdout", &reserved)
+        open_child_log(&spec, &safe_alias, "stdout", &reserved, &[])
             .unwrap()
             .write_all(b"second\n")
             .unwrap();
         assert_eq!(fs::read(&child).unwrap(), b"first\nsecond\n");
         assert_eq!(fs::read(&diagnostic).unwrap(), b"diagnostics\n");
-        assert!(open_child_log(&spec, root.path(), "stdout", &reserved).is_err());
+        assert!(open_child_log(&spec, root.path(), "stdout", &reserved, &[]).is_err());
     }
 
     #[cfg(unix)]
@@ -3965,7 +4039,7 @@ mod tests {
         symlink("daemon.stderr.log", &intermediate).unwrap();
         symlink("intermediate", &child).unwrap();
         let spec = child_spec("daemon", 19999);
-        assert!(open_child_log(&spec, &child, "stderr", &reserved).is_err());
+        assert!(open_child_log(&spec, &child, "stderr", &reserved, &[]).is_err());
         assert!(!diagnostic.exists());
         assert!(child.is_symlink());
         assert!(intermediate.is_symlink());
@@ -3974,7 +4048,7 @@ mod tests {
         let safe = root.path().join("safe.log");
         fs::write(&safe, b"earlier\n").unwrap();
         symlink("safe.log", &intermediate).unwrap();
-        open_child_log(&spec, &child, "stderr", &reserved)
+        open_child_log(&spec, &child, "stderr", &reserved, &[])
             .unwrap()
             .write_all(b"later\n")
             .unwrap();
@@ -3983,12 +4057,12 @@ mod tests {
 
         fs::remove_file(&intermediate).unwrap();
         symlink(".daemon.stderr.log", &intermediate).unwrap();
-        assert!(open_child_log(&spec, &child, "stderr", &reserved).is_err());
+        assert!(open_child_log(&spec, &child, "stderr", &reserved, &[]).is_err());
         assert!(!diagnostic.exists());
 
         fs::remove_file(&child).unwrap();
         symlink(".daemon.stderr.log", &diagnostic).unwrap();
-        assert!(open_child_log(&spec, &child, "stderr", &reserved).is_err());
+        assert!(open_child_log(&spec, &child, "stderr", &reserved, &[]).is_err());
         assert!(!child.exists());
         assert!(diagnostic.is_symlink());
     }
