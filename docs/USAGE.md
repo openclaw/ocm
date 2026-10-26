@@ -723,6 +723,16 @@ started before either file exists waits for both and follows whichever appears
 first, so it shows the service output after a later `ocm service start mira`.
 Once attached, it stays on that file like `tail -f`.
 
+For an environment named `daemon` (including case variants), service-child output
+uses `.daemon.stdout.log` and `.daemon.stderr.log` in the supervisor log directory
+(with the environment's original case). The supervisor's own `daemon.*.log`
+diagnostics remain separate. Older files can contain output from both owners;
+OCM preserves those files but excludes that ambiguous history from the environment
+log view. Existing running services are not restarted by this change. Output from
+an older running daemon remains in its old files. Explicitly refresh that daemon
+from the updated OCM installation during a maintenance window to enable separate
+child output. The environment's own Gateway logs remain available as before.
+
 By default, `ocm logs` merges stdout and stderr in timestamp order and shows the
 last 50 lines. A line without a timestamp stays after the timestamped line
 before it. Untimestamped output at the end of a log, such as the error a Gateway
@@ -1624,7 +1634,9 @@ environment starts without the earlier one's service logs. Copy them before
 reusing the name if you need them. OCM never deletes a file that belongs to
 another registered environment or the supervisor daemon's own
 `daemon.stdout.log` and `daemon.stderr.log`, for example when a case-insensitive
-filesystem resolves the new name to one of those files.
+filesystem resolves the new name to one of those files. For daemon-named
+environments, name reuse clears only their separate `.<env>.stdout.log` and
+`.<env>.stderr.log` child output; the legacy `daemon.*.log` files remain preserved.
 
 For legacy layouts created before overlapping roots were rejected, removal refuses
 to delete another registered environment's root or a link needed to reach it,

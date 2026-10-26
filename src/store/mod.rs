@@ -60,6 +60,7 @@ pub(crate) use gateway_ports::{
     resolve_effective_gateway_ports,
 };
 pub use launchers::{add_launcher, get_launcher, list_launchers, remove_launcher};
+pub(crate) use layout::supervisor_child_log_destination;
 pub use layout::{
     EnvPaths, StorePaths, clean_path, default_env_root, derive_env_paths, display_path,
     env_registry_path, launcher_meta_path, resolve_absolute_path, resolve_ocm_home,

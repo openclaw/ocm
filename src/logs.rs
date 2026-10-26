@@ -9,9 +9,7 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
-use crate::store::{
-    derive_env_paths, display_path, supervisor_child_log_path, supervisor_logs_dir,
-};
+use crate::store::{derive_env_paths, display_path};
 
 const FOLLOW_POLL_INTERVAL_MS: u64 = 250;
 const TAIL_READ_CHUNK_SIZE: usize = 8 * 1024;
@@ -104,10 +102,11 @@ impl<'a> LogService<'a> {
             let target = &targets[0];
             if !target.path.exists() {
                 return Err(format!(
-                    "{} log does not exist for env \"{}\": {}",
+                    "{} log does not exist for env \"{}\": {}{}",
                     target.stream,
                     target.env_name,
-                    display_path(&target.path)
+                    display_path(&target.path),
+                    self.missing_log_hint(name)
                 ));
             }
 
@@ -140,8 +139,9 @@ impl<'a> LogService<'a> {
         }
         if contents.is_empty() {
             return Err(format!(
-                "no logs exist for env \"{}\" across stdout or stderr",
-                name
+                "no logs exist for env \"{}\" across stdout or stderr{}",
+                name,
+                self.missing_log_hint(name)
             ));
         }
 
@@ -154,6 +154,22 @@ impl<'a> LogService<'a> {
             content: merge_log_texts(contents, tail_lines),
             components,
         })
+    }
+
+    fn missing_log_hint(&self, name: &str) -> &'static str {
+        if name.eq_ignore_ascii_case("daemon")
+            && EnvironmentService::new(self.env, self.cwd)
+                .get(name)
+                .ok()
+                .is_some_and(|meta| {
+                    crate::supervisor::SupervisorService::new(self.env, self.cwd)
+                        .has_legacy_child_log_paths(&meta)
+                })
+        {
+            "; legacy service output may include supervisor diagnostics and is omitted. Explicitly refresh an older daemon from the updated OCM installation during a maintenance window to collect separate child output"
+        } else {
+            ""
+        }
     }
 
     pub fn target(&self, name: &str, stream: &str) -> Result<LogTarget, String> {
@@ -172,8 +188,9 @@ impl<'a> LogService<'a> {
                 "stderr" => "gateway.err.log",
                 _ => unreachable!("stream validated by normalize_stream"),
             });
-        let service_path =
-            supervisor_child_log_path(&supervisor_logs_dir(self.env, self.cwd)?, name, &stream);
+        let service_path = crate::supervisor::SupervisorService::new(self.env, self.cwd)
+            .child_log_path(&meta, &stream)?
+            .unwrap_or_else(|| gateway_path.clone());
 
         Ok(LogSources {
             env_name: name.to_string(),
