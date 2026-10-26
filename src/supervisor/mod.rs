@@ -1870,9 +1870,13 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
         .envs(&process_env)
         .current_dir(Path::new(&spec.run_dir));
     #[cfg(target_os = "linux")]
-    for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
-        // Native user-service commands need the spawning daemon's session,
-        // not a caller's transient connection saved in the desired spec.
+    for key in [
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+    ] {
+        // Native user-service commands need the spawning daemon's unit path
+        // and session, not a caller's context saved in the desired spec.
         command.env_remove(key);
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);

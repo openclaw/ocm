@@ -2273,26 +2273,67 @@ fn npx_cannot_rebind_daemon_but_can_inspect_and_stop_it() {
 }
 
 #[test]
-fn systemd_service_install_writes_the_ocm_unit() {
-    let root = TestDir::new("service-systemd-install");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = systemd_env(&root);
-    setup_launcher_env(&cwd, &env);
-
-    let output = run_ocm(&cwd, &env, &["service", "install", "demo", "--json"]);
-    assert!(output.status.success(), "{}", stderr(&output));
-    let body = json_output(&output);
-    assert_eq!(body["installed"], true);
-
-    let service_path = managed_service_definition_path(&env, &cwd, "ocm");
-    assert!(
-        service_path.exists(),
-        "missing {}",
-        path_string(&service_path)
-    );
-    let unit = fs::read_to_string(service_path).unwrap();
-    assert!(unit.contains("__daemon run"));
+fn systemd_service_lifecycle_uses_the_configured_unit_directory() {
+    for setting in ["unset", "empty", "relative", "absolute"] {
+        let root = TestDir::new("service-systemd-config");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = systemd_env(&root);
+        let default_config = Path::new(&env["HOME"]).join(".config");
+        let config = match setting {
+            "unset" => default_config.clone(),
+            "empty" => {
+                env.insert("XDG_CONFIG_HOME".into(), String::new());
+                default_config.clone()
+            }
+            "relative" => {
+                env.insert("XDG_CONFIG_HOME".into(), "relative/config".into());
+                default_config.clone()
+            }
+            _ => {
+                let config = root.child("config home ");
+                env.insert("XDG_CONFIG_HOME".into(), path_string(&config));
+                config
+            }
+        };
+        setup_launcher_env(&cwd, &env);
+        let service_path = config.join("systemd/user/ai.openclaw.ocm.service");
+        for action in ["install", "start"] {
+            let output = run_ocm(&cwd, &env, &["service", action, "demo", "--json"]);
+            assert!(output.status.success(), "{setting}: {}", stderr(&output));
+            assert_eq!(json_output(&output)["installed"], true);
+            assert!(
+                service_path.exists(),
+                "missing {}",
+                path_string(&service_path)
+            );
+            assert!(
+                fs::read_to_string(&service_path)
+                    .unwrap()
+                    .contains("__daemon run")
+            );
+            if setting == "absolute" {
+                assert!(
+                    !default_config
+                        .join("systemd/user/ai.openclaw.ocm.service")
+                        .exists()
+                );
+            }
+            let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+            assert!(status.status.success(), "{}", stderr(&status));
+            assert_eq!(json_output(&status)["ocmServiceInstalled"], true);
+            let stop = run_ocm(&cwd, &env, &["service", "stop", "demo"]);
+            assert!(stop.status.success(), "{}", stderr(&stop));
+            assert!(!service_path.exists());
+        }
+        let start = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(start.status.success(), "{}", stderr(&start));
+        assert!(service_path.exists());
+        let uninstall = run_ocm(&cwd, &env, &["service", "uninstall", "demo", "--json"]);
+        assert!(uninstall.status.success(), "{}", stderr(&uninstall));
+        assert_eq!(json_output(&uninstall)["installed"], false);
+        assert!(!service_path.exists());
+    }
 }
 
 #[test]

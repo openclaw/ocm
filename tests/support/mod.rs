@@ -356,7 +356,10 @@ pub fn managed_service_definition_path(
         .get("OCM_INTERNAL_SERVICE_MANAGER")
         .is_some_and(|value| value.contains("systemd"))
     {
-        home.join(".config")
+        env.get("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| home.join(".config"))
             .join("systemd")
             .join("user")
             .join(format!("{label}.service"))
@@ -464,7 +467,7 @@ pub fn install_fake_systemd_tools(root: &TestDir, env: &mut BTreeMap<String, Str
         path_string(&pid_path),
     );
     let systemctl_script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--user\" ] && [ \"$2\" = \"show\" ]; then\n  unit=\"$3\"\n  fixture_home=\"${{HOME:-$PWD}}\"\n  unit_path=\"$fixture_home/.config/systemd/user/$unit.service\"\n  if [ -f \"$unit_path\" ]; then\n    observed_pid=\"${{OCM_TEST_NATIVE_DAEMON_PID:-4242}}\"\n    if [ -f \"{}\" ]; then read -r observed_pid < \"{}\"; fi\n    printf 'LoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\nSubState=running\\nMainPID=%s\\nFragmentPath=%s\\n' \"$observed_pid\" \"$unit_path\"\n    exit 0\n  fi\n  printf 'LoadState=not-found\\nUnitFileState=not-found\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\nFragmentPath=\\n'\n  exit 4\nfi\nexit 0\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--user\" ] && [ \"$2\" = \"show\" ]; then\n  unit=\"$3\"\n  fixture_home=\"${{HOME:-$PWD}}\"\n  case \"${{XDG_CONFIG_HOME:-}}\" in\n    /*) config_home=\"$XDG_CONFIG_HOME\" ;;\n    *) config_home=\"$fixture_home/.config\" ;;\n  esac\n  unit_path=\"$config_home/systemd/user/$unit.service\"\n  if [ -f \"$unit_path\" ]; then\n    observed_pid=\"${{OCM_TEST_NATIVE_DAEMON_PID:-4242}}\"\n    if [ -f \"{}\" ]; then read -r observed_pid < \"{}\"; fi\n    printf 'LoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\nSubState=running\\nMainPID=%s\\nFragmentPath=%s\\n' \"$observed_pid\" \"$unit_path\"\n    exit 0\n  fi\n  printf 'LoadState=not-found\\nUnitFileState=not-found\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\nFragmentPath=\\n'\n  exit 4\nfi\nexit 0\n",
         path_string(&log_path),
         path_string(&pid_path),
         path_string(&pid_path),

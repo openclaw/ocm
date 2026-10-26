@@ -2924,6 +2924,64 @@ NODE
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_child_inspects_the_spawning_daemons_xdg_service() {
+    let _guard = daemon_runtime_test_lock();
+    for custom in [false, true] {
+        let root = TestDir::new("daemon-child-xdg-service");
+        let mut env = ocm_env(&root);
+        install_fake_systemd_tools(&root, &mut env);
+        let config = root.child("config home ");
+        if custom {
+            env.insert("XDG_CONFIG_HOME".into(), path_string(&config));
+        }
+        let script = root.child("bin/openclaw");
+        let config_marker = root.child("child-config");
+        let status_marker = root.child("child-status.json");
+        write_legacy_openclaw_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"${{XDG_CONFIG_HOME-unset}}\" > '{}'\n\"$OCM_SELF\" service status demo --json > '{}'\n",
+                config_marker.display(),
+                status_marker.display(),
+            ),
+        );
+        for args in [
+            vec![
+                "launcher",
+                "add",
+                "stable",
+                "--command",
+                script.to_str().unwrap(),
+            ],
+            vec!["env", "create", "demo", "--launcher", "stable"],
+            vec!["service", "start", "demo"],
+        ] {
+            let output = run_ocm(root.path(), &env, &args);
+            assert!(output.status.success(), "{}", stderr(&output));
+        }
+        let state_path = root.child("ocm-home/supervisor/state.json");
+        let mut state = read_persisted_service_state(&state_path);
+        for child in state["children"].as_array_mut().unwrap() {
+            child["processEnv"]["XDG_CONFIG_HOME"] = Value::String("/retired/caller/config".into());
+        }
+        write_persisted_service_state(&state_path, &state);
+        let run = run_ocm(root.path(), &env, &["__daemon", "run", "--once", "--json"]);
+        assert!(run.status.success(), "{}", stderr(&run));
+        assert_eq!(
+            fs::read_to_string(&config_marker).unwrap(),
+            if custom {
+                path_string(&config)
+            } else {
+                "unset".into()
+            }
+        );
+        let status: Value = serde_json::from_slice(&fs::read(&status_marker).unwrap()).unwrap();
+        assert_eq!(status["ocmServiceInstalled"], true, "{status}");
+    }
+}
+
 #[test]
 fn daemon_run_once_executes_planned_children() {
     let _guard = daemon_runtime_test_lock();
@@ -3422,13 +3480,14 @@ fn child_restart_recovery_requires_known_daemon_state_and_preserves_siblings() {
             let original = fs::read_to_string(&manager_path).unwrap();
             let marker = root.child("recovery-observed");
             // Direct library calls inherit the test process environment. Keep
-            // the manager's HOME in the same isolated fixture as CLI calls.
+            // the manager's HOME and XDG fallback in the same isolated fixture
+            // as CLI calls, regardless of the test runner's XDG configuration.
             // Override only the recovery decision read; activation stays real
             // to the existing manager fixture.
             write_executable_script(
                 &manager_path,
                 &format!(
-                    "#!/bin/sh\nexport HOME='{home}'\nif [ {operation} ] && [ ! -f '{marker}' ]; then\n : > '{marker}'\n {reply}\nfi\n{original}",
+                    "#!/bin/sh\nexport HOME='{home}'\nunset XDG_CONFIG_HOME\nif [ {operation} ] && [ ! -f '{marker}' ]; then\n : > '{marker}'\n {reply}\nfi\n{original}",
                     home = env["HOME"],
                     marker = path_string(&marker),
                 ),
