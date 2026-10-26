@@ -495,13 +495,21 @@ impl FollowCursor {
     }
 
     fn collect_complete_records(&mut self, update: FollowUpdate) -> Vec<TimedLogRecord> {
+        self.collect_records(update, true)
+    }
+
+    fn collect_records(
+        &mut self,
+        update: FollowUpdate,
+        emit_undated_lines: bool,
+    ) -> Vec<TimedLogRecord> {
         let mut records = Vec::new();
         for segment in update.segments {
             if segment.reset_before && !self.pending.is_empty() {
                 records.extend(log_records(std::mem::take(&mut self.pending)));
             }
             self.pending.extend_from_slice(&segment.bytes);
-            records.extend(self.take_preceding_records());
+            records.extend(self.take_preceding_records(emit_undated_lines));
         }
         records
     }
@@ -539,8 +547,19 @@ impl FollowCursor {
         self.single_line_open = !bytes.ends_with(b"\n");
     }
 
-    fn take_preceding_records(&mut self) -> Vec<TimedLogRecord> {
-        let complete_len = last_timestamp_start(&self.pending).unwrap_or(0);
+    fn take_preceding_records(&mut self, emit_undated_lines: bool) -> Vec<TimedLogRecord> {
+        // A timestamped record may still receive continuation lines. Without
+        // that parent, complete undated lines can advance on every poll; waiting
+        // for a timestamp or a quiet writer would retain them indefinitely.
+        let complete_len = last_timestamp_start(&self.pending).unwrap_or_else(|| {
+            if !emit_undated_lines {
+                return 0;
+            }
+            self.pending
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1)
+        });
         if complete_len > 0 {
             let complete = self.pending.drain(..complete_len).collect::<Vec<_>>();
             log_records(complete)
@@ -1005,7 +1024,10 @@ fn collect_merged_follow_startup(
         }
         if cursor.is_initialized() {
             if let Some(update) = cursor.read_update()? {
-                stream.extend(cursor.collect_complete_records(update));
+                // Startup still makes one global ordering/tail decision. Keep
+                // the undated suffix together until its last-write placement,
+                // even if a partial line completes during the grace poll.
+                stream.extend(cursor.collect_records(update, false));
             }
             stream.extend(cursor.collect_quiet_records());
         }
@@ -1652,35 +1674,52 @@ mod tests {
             b"2026-04-20T00:13:45Z stdout ready\n2026-04-20T00:13:47Z stdout shutdown\n",
         )
         .unwrap();
-        fs::write(&stderr_path, b"config is invalid\nrun doctor --fix\n").unwrap();
-        for (path, modified) in [
-            (&stdout_path, "2026-04-20T00:13:47Z"),
-            (&stderr_path, "2026-04-20T00:14:10Z"),
+        for (initial, update) in [
+            (
+                b"config is invalid\nrun doctor --fix\n".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                b"config is invalid\nrun doctor".as_slice(),
+                b" --fix".as_slice(),
+            ),
+            (
+                b"config is invalid\nrun doctor".as_slice(),
+                b" --fix\n".as_slice(),
+            ),
         ] {
-            filetime::set_file_mtime(
-                path,
-                filetime::FileTime::from_system_time(written_at(modified).unwrap()),
-            )
-            .unwrap();
-        }
+            fs::write(&stderr_path, initial).unwrap();
+            for (path, modified) in [
+                (&stdout_path, "2026-04-20T00:13:47Z"),
+                (&stderr_path, "2026-04-20T00:14:10Z"),
+            ] {
+                filetime::set_file_mtime(
+                    path,
+                    filetime::FileTime::from_system_time(written_at(modified).unwrap()),
+                )
+                .unwrap();
+            }
 
-        let mut cursors = vec![
-            FollowCursor::new(log_target(stdout_path)),
-            FollowCursor::new(log_target(stderr_path)),
-        ];
-        let snapshots = cursors
-            .iter_mut()
-            .map(|cursor| cursor.snapshot(Some(2), true).unwrap())
-            .collect::<Vec<_>>();
-        let merged =
-            super::collect_merged_follow_startup(&mut cursors, snapshots, Some(2)).unwrap();
-        assert_eq!(merged, b"config is invalid\nrun doctor --fix\n");
+            let mut cursors = vec![
+                FollowCursor::new(log_target(stdout_path.clone())),
+                FollowCursor::new(log_target(stderr_path.clone())),
+            ];
+            let snapshots = cursors
+                .iter_mut()
+                .map(|cursor| cursor.snapshot(Some(2), true).unwrap())
+                .collect::<Vec<_>>();
+            // Exercise bytes arriving between the snapshot and startup grace poll.
+            append(&stderr_path, update);
+            let merged =
+                super::collect_merged_follow_startup(&mut cursors, snapshots, Some(2)).unwrap();
+            assert_eq!(merged, b"config is invalid\nrun doctor --fix\n");
+        }
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn follow_cursor_keeps_undated_partial_multiline_records_together() {
+    fn follow_cursor_emits_complete_undated_lines_and_retains_partial_bytes() {
         let root = test_root("cursor-undated-multiline-partial");
         let path = root.join("gateway.log");
         fs::write(&path, b"initial\n").unwrap();
@@ -1689,13 +1728,65 @@ mod tests {
 
         append(&path, b"frame one\nframe two");
         let update = cursor.read_update().unwrap().unwrap();
-        assert!(cursor.collect_complete_records(update).is_empty());
+        assert_eq!(
+            super::merge_log_records(cursor.collect_complete_records(update)),
+            b"frame one\n"
+        );
+        assert_eq!(cursor.pending, b"frame two");
 
         append(&path, b" completed\n");
         let update = cursor.read_update().unwrap().unwrap();
-        let merged = super::merge_log_records(collect_after_quiet(&mut cursor, update));
-        assert_eq!(merged, b"frame one\nframe two completed\n");
+        let merged = super::merge_log_records(cursor.collect_complete_records(update));
+        assert_eq!(merged, b"frame two completed\n");
+        assert!(cursor.pending.is_empty());
+        assert!(cursor.collect_quiet_records().is_empty());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn follow_cursor_makes_progress_without_a_quiet_poll() {
+        let root = test_root("cursor-continuous-undated");
+        let path = root.join("gateway.log");
+        fs::write(&path, b"seed\n").unwrap();
+        let mut cursor = FollowCursor::new(log_target(path.clone()));
+        cursor.snapshot(None, true).unwrap().unwrap();
+
+        for sequence in 0..100 {
+            // End every read halfway through the next line, including UTF-8.
+            let mut bytes = if sequence == 0 {
+                Vec::new()
+            } else {
+                vec![0x82, 0xac, b'\n']
+            };
+            let line = format!("live-{sequence}\n");
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.extend_from_slice(b"partial \xe2");
+            append(&path, &bytes);
+            let update = cursor.read_update().unwrap().unwrap();
+            let emitted = super::merge_log_records(cursor.collect_complete_records(update));
+            let expected = if sequence == 0 {
+                line
+            } else {
+                format!("partial \u{20ac}\n{line}")
+            };
+            assert_eq!(emitted, expected.as_bytes());
+            assert_eq!(cursor.pending, b"partial \xe2");
+        }
+
+        append(
+            &path,
+            b"\x82\xac\n2026-04-20T00:13:45Z dated\n    continuation\n",
+        );
+        let update = cursor.read_update().unwrap().unwrap();
+        assert_eq!(
+            super::merge_log_records(cursor.collect_complete_records(update)),
+            "partial \u{20ac}\n".as_bytes()
+        );
+        assert_eq!(
+            super::merge_log_records(cursor.collect_quiet_records()),
+            b"2026-04-20T00:13:45Z dated\n    continuation\n"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

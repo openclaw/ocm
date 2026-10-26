@@ -729,6 +729,11 @@ before it. Untimestamped output at the end of a log, such as the error a Gateway
 prints when it fails to start, is placed at the time that file was last written,
 so the newest failure remains at the end of the merged view.
 
+While following, complete undated lines are shown as they arrive when no
+timestamped record is open, even if the writer stays busy. An unfinished line
+waits for more bytes or a quiet poll. Timestamped records keep their continuation
+lines together until the next timestamp or a quiet poll.
+
 ### Start, stop, restart
 
 ```bash
