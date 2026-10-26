@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 
 use crate::infra::archive::{extract_tar_gz, extract_zip};
 use crate::infra::download::{download_to_file, normalize_sha256, verify_file_sha256};
+use crate::infra::process_identity::observe_process;
 use crate::store::{display_path, lock_file, resolve_store_paths};
 
 pub const OPENCLAW_MIN_NODE_VERSION: &str = "22.22.3";
@@ -225,6 +226,7 @@ pub(crate) fn ensure_managed_node_toolchain(
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let lock_path = parent.join(format!(".{}.lock", distribution.root_dir_name));
     let _lock = lock_file(&lock_path, "managed Node.js installation")?;
+    reclaim_abandoned_node_stages(parent);
 
     // Another OCM process may have completed the same installation while this
     // process waited for the lock, so validate the shared root again here.
@@ -297,6 +299,43 @@ pub(crate) fn ensure_managed_node_toolchain(
 
     let _ = fs::remove_dir_all(&stage_root);
     result
+}
+
+/// Stages predate recovery and carry only the preparing OCM process's PID and
+/// timestamp. Distribution locks cannot protect this shared staging namespace:
+/// another OCM version may be preparing a different distribution concurrently.
+/// Keep live, reused or uninspectable PIDs; only a confirmed exited owner makes
+/// its disposable stage eligible for best-effort cleanup.
+fn reclaim_abandoned_node_stages(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(node_stage_owner) else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if observe_process(pid).is_ok_and(|owner| owner.is_none_or(|owner| !owner.running)) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn node_stage_owner(name: &str) -> Option<u32> {
+    let (pid, nanos) = name.strip_prefix(".node-toolchain-")?.split_once('-')?;
+    let nanos = nanos.strip_prefix('-').unwrap_or(nanos);
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    if !digits(pid) || !digits(nanos) {
+        return None;
+    }
+    // Unix process inspection accepts a signed PID; reject malformed names
+    // rather than allowing conversion into a process-group or special PID.
+    pid.parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0 && *pid <= i32::MAX as u32)
 }
 
 pub(crate) fn managed_runtime_install_command(
@@ -607,6 +646,24 @@ mod tests {
         apply_path_prepend_to_environment_with_platform_semantics, environment_path_value,
         prepend_to_path,
     };
+
+    #[test]
+    fn node_stage_names_require_the_producer_shape() {
+        assert_eq!(super::node_stage_owner(".node-toolchain-42-123"), Some(42));
+        assert_eq!(super::node_stage_owner(".node-toolchain-42--123"), Some(42));
+        for name in [
+            "node-v24.22.1-linux-x64",
+            ".node-toolchain-42",
+            ".node-toolchain-0-1",
+            ".node-toolchain-4294967295-1",
+            ".node-toolchain-+42-1",
+            ".node-toolchain-42-",
+            ".node-toolchain-42-1-extra",
+            ".node-toolchain-x-1",
+        ] {
+            assert_eq!(super::node_stage_owner(name), None, "{name}");
+        }
+    }
 
     #[test]
     fn package_node_requirement_matches_npm_comparators_and_alternatives() {

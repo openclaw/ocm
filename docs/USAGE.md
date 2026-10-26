@@ -454,6 +454,9 @@ A leftover is kept while another operation holds that runtime's lock and is remo
 Official package installation reads `engines.node` from the integrity-verified archive before invoking npm.
 Ordinary runtime execution reads the installed package manifest and uses a compatible host Node.js when available, otherwise a compatible private toolchain.
 OCM validates cached executables with `node --version` and reuses only its selected private Node.js patch.
+Private toolchain preparation for release flows, including reuse of an already-installed cache, also makes a best-effort attempt to remove hidden `.node-toolchain-*` download and extraction stages left by exited OCM processes.
+Stages are kept while their recorded process is still running or cannot be inspected, including when its PID has been reused; a later preparation retries cleanup.
+Completed shared toolchain caches, unrelated files and directory links are preserved.
 Run `ocm runtime install --channel stable` while online to refresh an older private cache, including when the OpenClaw package is already installed.
 Refreshing a bound runtime also synchronizes its managed service. If the selected Node.js executable changes, the gateway restarts asynchronously. Use a maintenance window and run `ocm service start <env>` to wait for normal gateway readiness before checking health.
 Once refreshed, the selected private runtime remains usable offline.
