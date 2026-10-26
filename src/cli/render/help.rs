@@ -1463,6 +1463,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Only a narrow set of safe repairs is applied.",
+                "Bindings are cleared only when runtime or launcher metadata is confirmed absent. Unreadable or invalid metadata is reported as broken by env doctor and its binding is preserved; restore access or repair the metadata before retrying.",
                 "A runtime-state reset is planned only when a session transcript header records a working directory under another environment root or another .openclaw directory; paths mentioned in messages, logs or other files do not trigger it.",
                 "Preview and apply list each path a runtime-state reset removes, relative to the environment root; a failed apply names the paths already removed and any partly removed path.",
                 "Preview and apply refuse a runtime reset that would affect a registered or active temporary dev source or its required Git metadata, before changing this environment.",

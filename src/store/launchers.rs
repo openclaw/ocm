@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::launcher::{AddLauncherOptions, LauncherMeta};
 
-use super::common::{load_json_files, path_exists, read_json, write_json};
+use super::common::{load_json_files, path_exists, read_json, read_json_if_present, write_json};
 use super::envs::with_locked_environments;
 use super::layout::{display_path, launcher_meta_path, resolve_absolute_path, validate_name};
 use super::now_utc;
@@ -29,11 +29,18 @@ pub fn get_launcher(
     cwd: &Path,
 ) -> Result<LauncherMeta, String> {
     let safe_name = validate_name(name, "Launcher name")?;
+    find_launcher(&safe_name, env, cwd)?
+        .ok_or_else(|| format!("launcher \"{safe_name}\" does not exist"))
+}
+
+pub(crate) fn find_launcher(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<Option<LauncherMeta>, String> {
+    let safe_name = validate_name(name, "Launcher name")?;
     let path = launcher_meta_path(&safe_name, env, cwd)?;
-    if !path_exists(&path) {
-        return Err(format!("launcher \"{safe_name}\" does not exist"));
-    }
-    read_json(&path)
+    read_json_if_present(&path)
 }
 
 pub fn add_launcher(

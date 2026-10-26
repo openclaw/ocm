@@ -714,6 +714,17 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     serde_json::from_str(&raw).map_err(|error| error.to_string())
 }
 
+/// Only a failed read reporting NotFound proves that metadata is absent.
+pub(crate) fn read_json_if_present<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 // Keep operation identity until the controller has consumed it. This envelope is
 // deliberately not serializable: its message can contain paths or other data.
 #[derive(Clone, Copy, Debug, serde::Serialize)]

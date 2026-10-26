@@ -4,9 +4,9 @@ use serde::Serialize;
 
 use super::{EnvMeta, EnvironmentService, ExecutionBinding, resolve_execution_binding};
 use crate::store::{
-    OpenClawConfigRepair, OpenClawRuntimeStateCleanup, audit_openclaw_config, get_launcher,
-    get_runtime, prepare_openclaw_config_repair, prepare_openclaw_runtime_state_repair,
-    runtime_integrity_issue, save_environment,
+    OpenClawConfigRepair, OpenClawRuntimeStateCleanup, audit_openclaw_config, find_launcher,
+    find_runtime, get_runtime, prepare_openclaw_config_repair,
+    prepare_openclaw_runtime_state_repair, runtime_integrity_issue, save_environment,
 };
 use crate::store::{OpenClawStateAudit, audit_openclaw_state, derive_env_paths, display_path};
 
@@ -253,17 +253,27 @@ impl<'a> EnvironmentService<'a> {
         }
 
         let runtime_status = if let Some(runtime_name) = env.default_runtime.clone() {
-            match get_runtime(&runtime_name, self.env, self.cwd) {
-                Ok(runtime) => match runtime_integrity_issue(&runtime, self.env) {
+            match find_runtime(&runtime_name, self.env, self.cwd) {
+                Ok(Some(runtime)) => match runtime_integrity_issue(&runtime, self.env) {
                     Some(issue) => {
                         push_issue(&mut issues, format!("runtime \"{}\" {issue}", runtime.name));
                         "broken".to_string()
                     }
                     None => "ok".to_string(),
                 },
-                Err(error) => {
-                    push_issue(&mut issues, error);
+                Ok(None) => {
+                    push_issue(
+                        &mut issues,
+                        format!("runtime \"{runtime_name}\" does not exist"),
+                    );
                     "missing".to_string()
+                }
+                Err(error) => {
+                    push_issue(
+                        &mut issues,
+                        format!("runtime \"{runtime_name}\" metadata could not be read: {error}"),
+                    );
+                    "broken".to_string()
                 }
             }
         } else {
@@ -271,11 +281,21 @@ impl<'a> EnvironmentService<'a> {
         };
 
         let launcher_status = if let Some(launcher_name) = env.default_launcher.clone() {
-            match get_launcher(&launcher_name, self.env, self.cwd) {
-                Ok(_) => "ok".to_string(),
-                Err(error) => {
-                    push_issue(&mut issues, error);
+            match find_launcher(&launcher_name, self.env, self.cwd) {
+                Ok(Some(_)) => "ok".to_string(),
+                Ok(None) => {
+                    push_issue(
+                        &mut issues,
+                        format!("launcher \"{launcher_name}\" does not exist"),
+                    );
                     "missing".to_string()
+                }
+                Err(error) => {
+                    push_issue(
+                        &mut issues,
+                        format!("launcher \"{launcher_name}\" metadata could not be read: {error}"),
+                    );
+                    "broken".to_string()
                 }
             }
         } else {

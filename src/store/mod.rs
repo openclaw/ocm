@@ -59,6 +59,7 @@ pub(crate) use gateway_ports::{
     openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,
     resolve_effective_gateway_ports,
 };
+pub(crate) use launchers::find_launcher;
 pub use launchers::{add_launcher, get_launcher, list_launchers, remove_launcher};
 pub use layout::{
     EnvPaths, StorePaths, clean_path, default_env_root, derive_env_paths, display_path,
@@ -92,6 +93,7 @@ pub(crate) use openclaw_state::{
 pub(crate) use openclaw_workspaces::{
     OpenClawWorkspaceRuntime, resolve_env_openclaw_workspaces, resolve_plain_openclaw_workspaces,
 };
+pub(crate) use runtimes::find_runtime;
 pub(crate) use runtimes::install_runtime_from_local_openclaw_build;
 pub(crate) use runtimes::install_runtime_from_selected_official_openclaw_release;
 pub(crate) use runtimes::{
