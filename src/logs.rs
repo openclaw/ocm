@@ -495,13 +495,21 @@ impl FollowCursor {
     }
 
     fn collect_complete_records(&mut self, update: FollowUpdate) -> Vec<TimedLogRecord> {
+        self.collect_records(update, true)
+    }
+
+    fn collect_records(
+        &mut self,
+        update: FollowUpdate,
+        emit_undated_lines: bool,
+    ) -> Vec<TimedLogRecord> {
         let mut records = Vec::new();
         for segment in update.segments {
             if segment.reset_before && !self.pending.is_empty() {
                 records.extend(log_records(std::mem::take(&mut self.pending)));
             }
             self.pending.extend_from_slice(&segment.bytes);
-            records.extend(self.take_preceding_records());
+            records.extend(self.take_preceding_records(emit_undated_lines));
         }
         records
     }
@@ -539,11 +547,14 @@ impl FollowCursor {
         self.single_line_open = !bytes.ends_with(b"\n");
     }
 
-    fn take_preceding_records(&mut self) -> Vec<TimedLogRecord> {
+    fn take_preceding_records(&mut self, emit_undated_lines: bool) -> Vec<TimedLogRecord> {
         // A timestamped record may still receive continuation lines. Without
         // that parent, complete undated lines can advance on every poll; waiting
         // for a timestamp or a quiet writer would retain them indefinitely.
         let complete_len = last_timestamp_start(&self.pending).unwrap_or_else(|| {
+            if !emit_undated_lines {
+                return 0;
+            }
             self.pending
                 .iter()
                 .rposition(|byte| *byte == b'\n')
@@ -1013,7 +1024,10 @@ fn collect_merged_follow_startup(
         }
         if cursor.is_initialized() {
             if let Some(update) = cursor.read_update()? {
-                stream.extend(cursor.collect_complete_records(update));
+                // Startup still makes one global ordering/tail decision. Keep
+                // the undated suffix together until its last-write placement,
+                // even if a partial line completes during the grace poll.
+                stream.extend(cursor.collect_records(update, false));
             }
             stream.extend(cursor.collect_quiet_records());
         }
@@ -1660,29 +1674,46 @@ mod tests {
             b"2026-04-20T00:13:45Z stdout ready\n2026-04-20T00:13:47Z stdout shutdown\n",
         )
         .unwrap();
-        fs::write(&stderr_path, b"config is invalid\nrun doctor --fix\n").unwrap();
-        for (path, modified) in [
-            (&stdout_path, "2026-04-20T00:13:47Z"),
-            (&stderr_path, "2026-04-20T00:14:10Z"),
+        for (initial, update) in [
+            (
+                b"config is invalid\nrun doctor --fix\n".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                b"config is invalid\nrun doctor".as_slice(),
+                b" --fix".as_slice(),
+            ),
+            (
+                b"config is invalid\nrun doctor".as_slice(),
+                b" --fix\n".as_slice(),
+            ),
         ] {
-            filetime::set_file_mtime(
-                path,
-                filetime::FileTime::from_system_time(written_at(modified).unwrap()),
-            )
-            .unwrap();
-        }
+            fs::write(&stderr_path, initial).unwrap();
+            for (path, modified) in [
+                (&stdout_path, "2026-04-20T00:13:47Z"),
+                (&stderr_path, "2026-04-20T00:14:10Z"),
+            ] {
+                filetime::set_file_mtime(
+                    path,
+                    filetime::FileTime::from_system_time(written_at(modified).unwrap()),
+                )
+                .unwrap();
+            }
 
-        let mut cursors = vec![
-            FollowCursor::new(log_target(stdout_path)),
-            FollowCursor::new(log_target(stderr_path)),
-        ];
-        let snapshots = cursors
-            .iter_mut()
-            .map(|cursor| cursor.snapshot(Some(2), true).unwrap())
-            .collect::<Vec<_>>();
-        let merged =
-            super::collect_merged_follow_startup(&mut cursors, snapshots, Some(2)).unwrap();
-        assert_eq!(merged, b"config is invalid\nrun doctor --fix\n");
+            let mut cursors = vec![
+                FollowCursor::new(log_target(stdout_path.clone())),
+                FollowCursor::new(log_target(stderr_path.clone())),
+            ];
+            let snapshots = cursors
+                .iter_mut()
+                .map(|cursor| cursor.snapshot(Some(2), true).unwrap())
+                .collect::<Vec<_>>();
+            // Exercise bytes arriving between the snapshot and startup grace poll.
+            append(&stderr_path, update);
+            let merged =
+                super::collect_merged_follow_startup(&mut cursors, snapshots, Some(2)).unwrap();
+            assert_eq!(merged, b"config is invalid\nrun doctor --fix\n");
+        }
 
         let _ = fs::remove_dir_all(root);
     }
