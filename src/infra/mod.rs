@@ -3,6 +3,7 @@ pub mod archive;
 mod archive_path_guard;
 pub(crate) mod command_output;
 pub mod download;
+pub(crate) mod file_identity;
 pub(crate) mod install_owner;
 pub(crate) mod interrupt;
 #[cfg(target_os = "macos")]
