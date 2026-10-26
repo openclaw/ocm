@@ -1796,6 +1796,9 @@ rejected, as it is for `ocm init`.
 The helper runs in the current shell but leaves the shell's other variables,
 options and positional parameters unchanged, apart from setting and clearing
 the activation variables.
+It preserves the selected environment's exact paths, including spaces and
+embedded newlines. If activation fails, the helper returns the command's failure
+status without applying its output or changing the previous activation.
 
 Direct `ocm env use mira` without `--shell` prints code for the shell that runs
 it, so `eval "$(ocm env use mira)"` in Bash, Zsh or `sh` and
