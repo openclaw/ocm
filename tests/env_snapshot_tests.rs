@@ -1328,7 +1328,7 @@ fn env_snapshot_restores_socket_named_data_and_discards_process_residue() {
 fn env_snapshot_restores_readonly_residue_without_changing_durable_modes() {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    for mode in [0o555, 0o755] {
+    for (mode, parent_mode) in [(0o555, 0o755), (0o755, 0o755), (0o555, 0o555)] {
         let root = TestDir::new("snapshot-restore-residue-permissions");
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
@@ -1356,6 +1356,8 @@ fn env_snapshot_restores_readonly_residue_without_changing_durable_modes() {
         }
         // A process-residue link must be unlinked without changing its target.
         symlink(&external, live.join(".openclaw/gateway.lock")).unwrap();
+        let state = live.join(".openclaw");
+        fs::set_permissions(&state, fs::Permissions::from_mode(parent_mode)).unwrap();
         let snapshot = run(&["env", "snapshot", "create", "source", "--json"]);
         let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
         let id = snapshot["id"].as_str().unwrap();
@@ -1364,6 +1366,12 @@ fn env_snapshot_restores_readonly_residue_without_changing_durable_modes() {
 
         for _ in 0..2 {
             run(&["env", "snapshot", "restore", "source", id, "--json"]);
+            for path in [&state, &checkpoint.join(".openclaw")] {
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    parent_mode
+                );
+            }
             for path in [
                 &durable,
                 &external,
@@ -1414,7 +1422,7 @@ fn env_snapshot_restores_readonly_residue_without_changing_durable_modes() {
                 })
         );
         // Permit TestDir to remove the durable fixture after preservation checks.
-        for path in [&durable, &external] {
+        for path in [&state, &durable, &external] {
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
@@ -1674,6 +1682,7 @@ fn env_snapshot_restore_recovers_the_displaced_root_when_acceptance_fails() {
 
         write_text(&residue.join("state.txt"), "captured residue");
         fs::set_permissions(&residue, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(residue.parent().unwrap(), fs::Permissions::from_mode(0o555)).unwrap();
     }
     let snapshot = run_ocm(
         &cwd,
@@ -1738,6 +1747,13 @@ fn env_snapshot_restore_recovers_the_displaced_root_when_acceptance_fails() {
     {
         use std::os::unix::fs::PermissionsExt;
 
+        for path in [residue.parent().unwrap(), &artifact.join(".openclaw")] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o555
+            );
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         for (path, expected) in [
             (&residue, "current residue"),
             (&artifact.join(".openclaw/tmp"), "captured residue"),
