@@ -578,8 +578,11 @@ fn daemon_child_log_aliases_do_not_expose_supervisor_diagnostics() {
         } else {
             fs::hard_link(&log, &child).unwrap();
         }
-        let output = run_ocm(&cwd, &env, &["logs", "daemon", "--json"]);
-        assert!(!output.status.success());
+        for requested_name in ["daemon", " daemon "] {
+            let output = run_ocm(&cwd, &env, &["logs", requested_name, "--json"]);
+            assert!(!output.status.success());
+            assert!(!stdout(&output).contains("shared supervisor diagnostic"));
+        }
         let gateway = root.child("ocm-home/envs/daemon/.openclaw/logs/gateway.log");
         fs::create_dir_all(gateway.parent().unwrap()).unwrap();
         fs::write(&gateway, "gateway output\n").unwrap();

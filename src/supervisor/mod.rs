@@ -751,14 +751,14 @@ impl<'a> SupervisorService<'a> {
         &self,
         meta: &crate::env::EnvMeta,
         stream: &str,
-    ) -> Result<Option<PathBuf>, String> {
+    ) -> Result<PathBuf, String> {
         let default = supervisor_child_log_path(
             &supervisor_logs_dir(self.env, self.cwd)?,
             &meta.name,
             stream,
         );
         if !meta.name.eq_ignore_ascii_case("daemon") {
-            return Ok(Some(default));
+            return Ok(default);
         }
         let path = self
             .persisted_child_for_logs(&meta.name, &meta.root)
@@ -766,9 +766,7 @@ impl<'a> SupervisorService<'a> {
             .flatten()
             .map(|child| child.log_destination(stream))
             .unwrap_or(default);
-        // Unknown daemon-log ownership must not hide a usable Gateway log.
-        // Omit only this service candidate when its ownership cannot be checked.
-        Ok((!self.is_daemon_log(&path).unwrap_or(true)).then_some(path))
+        Ok(path)
     }
 
     pub(crate) fn has_legacy_child_log_paths(&self, meta: &crate::env::EnvMeta) -> bool {
@@ -783,20 +781,27 @@ impl<'a> SupervisorService<'a> {
                 })
     }
 
-    fn is_daemon_log(&self, path: &Path) -> Result<bool, String> {
-        // Keep aliases out too: an apparently distinct filename can still
-        // resolve to the daemon's diagnostic file on the underlying filesystem.
+    pub(crate) fn daemon_log_paths(&self) -> Result<Vec<PathBuf>, String> {
+        let mut paths = Vec::new();
         for dir in [
             supervisor_logs_dir(self.env, self.cwd)?,
             self.saved_daemon_logs_dir()?,
         ] {
             for stream in ["stdout", "stderr"] {
-                if is_same_file(path, &dir.join(format!("daemon.{stream}.log"))) {
-                    return Ok(true);
+                let path = dir.join(format!("daemon.{stream}.log"));
+                if !paths.contains(&path) {
+                    paths.push(path);
                 }
             }
         }
-        Ok(false)
+        Ok(paths)
+    }
+
+    fn is_daemon_log(&self, path: &Path) -> Result<bool, String> {
+        Ok(self
+            .daemon_log_paths()?
+            .iter()
+            .any(|daemon| is_same_file(path, daemon)))
     }
 
     fn inspect_with_checked_daemon(
