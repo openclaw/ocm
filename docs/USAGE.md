@@ -604,6 +604,14 @@ ocm service status mira
 
 Use `service install` when you want a background service for an environment that was created with `--no-service`, or when you want to bring an older env under background management later.
 
+On Linux, OCM writes its user-service unit under `$XDG_CONFIG_HOME/systemd/user`
+when `XDG_CONFIG_HOME` is an absolute path. An unset, empty, or relative value
+uses `$HOME/.config/systemd/user`, matching systemd's user-unit lookup.
+Run OCM with the same XDG configuration as the user manager; changing a shell's
+environment does not reconfigure an already-running manager. Service inspection,
+start, stop, and uninstall use the same directory. macOS continues to use
+`$HOME/Library/LaunchAgents`.
+
 Service readiness requests `/health` on the local Gateway port using the
 configured transport. A `gateway.bind: "custom"` with an IPv4
 `gateway.customBindHost` assigned to this machine uses that address, including for pinned runtimes that

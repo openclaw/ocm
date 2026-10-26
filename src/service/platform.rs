@@ -193,7 +193,13 @@ pub(crate) fn service_definition_dir(env: &BTreeMap<String, String>) -> PathBuf 
     let home = resolve_user_home(env);
     match service_manager_kind(env) {
         ServiceManagerKind::Launchd => home.join("Library").join("LaunchAgents"),
-        ServiceManagerKind::SystemdUser => home.join(".config").join("systemd").join("user"),
+        ServiceManagerKind::SystemdUser => env
+            .get("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| home.join(".config"))
+            .join("systemd")
+            .join("user"),
         ServiceManagerKind::Unsupported => home.join(".ocm").join("unsupported-services"),
     }
 }
@@ -1494,29 +1500,51 @@ mod tests {
 
     #[test]
     fn service_paths_follow_the_selected_backend() {
-        let mut env = BTreeMap::new();
-        env.insert("HOME".to_string(), "/tmp/home".to_string());
-        env.insert("OCM_HOME".to_string(), "/tmp/store".to_string());
-        env.insert(
-            "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
-            "systemd-user".to_string(),
-        );
+        let home = std::env::temp_dir().join("ocm-service-home");
+        let config = std::env::temp_dir().join("ocm-config home ");
+        let mut env = BTreeMap::from([
+            ("HOME".to_string(), home.display().to_string()),
+            (
+                "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+                "systemd-user".to_string(),
+            ),
+        ]);
 
-        assert_eq!(
-            service_definition_dir(&env).display().to_string(),
-            "/tmp/home/.config/systemd/user"
-        );
-        assert_eq!(
-            managed_service_identity(&env, Path::new("/tmp"))
-                .unwrap()
-                .definition_path
-                .display()
-                .to_string(),
-            format!(
-                "/tmp/home/.config/systemd/user/{}.service",
-                managed_service_label()
-            )
-        );
+        for value in [
+            None,
+            Some(""),
+            Some("relative/config"),
+            Some(config.to_str().unwrap()),
+        ] {
+            if let Some(value) = value {
+                env.insert("XDG_CONFIG_HOME".to_string(), value.to_string());
+            } else {
+                env.remove("XDG_CONFIG_HOME");
+            }
+            let expected = if value == Some(config.to_str().unwrap()) {
+                config.join("systemd/user")
+            } else {
+                home.join(".config/systemd/user")
+            };
+            assert_eq!(service_definition_dir(&env), expected);
+            assert_eq!(
+                managed_service_identity(&env, &home)
+                    .unwrap()
+                    .definition_path,
+                expected.join(format!("{}.service", managed_service_label()))
+            );
+        }
+
+        for (backend, directory) in [
+            ("launchd", "Library/LaunchAgents"),
+            ("unsupported", ".ocm/unsupported-services"),
+        ] {
+            env.insert(
+                "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+                backend.to_string(),
+            );
+            assert_eq!(service_definition_dir(&env), home.join(directory));
+        }
     }
 
     #[test]
