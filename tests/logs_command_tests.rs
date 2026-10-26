@@ -527,10 +527,82 @@ fn an_env_named_daemon_keeps_only_the_daemons_own_logs() {
 
         let created = run_ocm(&cwd, &env, &["env", "create", name, "--launcher", "stable"]);
         assert!(created.status.success(), "{}", stderr(&created));
-        // In the daemon's directory the file is its own log; after relocation
-        // it can only be an earlier env's output.
-        assert_eq!(log.exists(), layout != "relocated", "{layout}");
+        // Legacy files may already contain mixed history. Keep them even
+        // after relocation, but never attribute them to the new environment.
+        assert!(log.exists(), "{layout}");
+        let output = run_ocm(&cwd, &env, &["logs", name, "--json"]);
+        assert!(!output.status.success(), "{layout}: {}", stdout(&output));
+        assert!(!stdout(&output).contains("earlier output"));
+        let child_log = log.with_file_name(format!(".{name}.stdout.log"));
+        fs::write(&child_log, "child-only output\n").unwrap();
+        let output = run_ocm(&cwd, &env, &["logs", name, "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(stdout(&output).contains("child-only output"));
+        assert!(!stdout(&output).contains("earlier output"));
         assert!(layout != "case" || log.with_file_name("Daemon.stdout.log").exists());
+        let removed = run_ocm(&cwd, &env, &["env", "remove", name]);
+        assert!(removed.status.success(), "{}", stderr(&removed));
+        let created = run_ocm(&cwd, &env, &["env", "create", name, "--launcher", "stable"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        assert!(!child_log.exists());
+        assert_eq!(fs::read_to_string(&log).unwrap(), "earlier output\n");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_child_log_aliases_do_not_expose_supervisor_diagnostics() {
+    for symlink in [false, true] {
+        let root = TestDir::new("daemon-log-alias");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let added = run_ocm(
+            &cwd,
+            &env,
+            &["launcher", "add", "fixture", "--command", "openclaw"],
+        );
+        assert!(added.status.success(), "{}", stderr(&added));
+        let created = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "daemon", "--launcher", "fixture"],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        let log = root.child("ocm-home/supervisor/logs/daemon.stderr.log");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(&log, "shared supervisor diagnostic\n").unwrap();
+        let child = log.with_file_name(".daemon.stdout.log");
+        if symlink {
+            std::os::unix::fs::symlink(&log, &child).unwrap();
+        } else {
+            fs::hard_link(&log, &child).unwrap();
+        }
+        for requested_name in ["daemon", " daemon "] {
+            let output = run_ocm(&cwd, &env, &["logs", requested_name, "--json"]);
+            assert!(!output.status.success());
+            assert!(!stdout(&output).contains("shared supervisor diagnostic"));
+        }
+        let gateway = root.child("ocm-home/envs/daemon/.openclaw/logs/gateway.log");
+        fs::create_dir_all(gateway.parent().unwrap()).unwrap();
+        fs::write(&gateway, "gateway output\n").unwrap();
+        let output = run_ocm(&cwd, &env, &["logs", "daemon", "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(!stdout(&output).contains("shared supervisor diagnostic"));
+        assert!(stdout(&output).contains("gateway output"));
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            "shared supervisor diagnostic\n"
+        );
+        fs::write(
+            root.child("ocm-home/supervisor/daemon-log-config.json"),
+            "invalid json",
+        )
+        .unwrap();
+        let output = run_ocm(&cwd, &env, &["logs", "daemon", "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(stdout(&output).contains("gateway output"));
+        assert!(!stdout(&output).contains("shared supervisor diagnostic"));
     }
 }
 

@@ -38,8 +38,8 @@ use crate::service::platform::{
 use crate::store::{
     display_path, ensure_dir, ensure_store, list_environments, lock_file, now_utc,
     openclaw_port_family_available, openclaw_port_family_range, read_json, resolve_ocm_home,
-    supervisor_child_log_path, supervisor_logs_dir, supervisor_runtime_path, supervisor_state_path,
-    write_json,
+    supervisor_child_log_destination, supervisor_child_log_path, supervisor_logs_dir,
+    supervisor_runtime_path, supervisor_state_path, write_json,
 };
 
 mod openclaw_handoff;
@@ -119,6 +119,15 @@ pub struct SupervisorChildSpec {
 }
 
 impl SupervisorChildSpec {
+    pub(crate) fn log_destination(&self, stream: &str) -> PathBuf {
+        let path = if stream == "stdout" {
+            &self.stdout_path
+        } else {
+            &self.stderr_path
+        };
+        supervisor_child_log_destination(Path::new(path), &self.env_name, stream)
+    }
+
     pub(crate) fn launch_spec_sha256(&self) -> Option<String> {
         serde_json::to_vec(self).ok().map(|bytes| {
             Sha256::digest(bytes)
@@ -381,20 +390,24 @@ pub(crate) fn discard_child_logs<'n>(
     cwd: &Path,
 ) -> Result<(), String> {
     let logs_dir = supervisor_logs_dir(env, cwd)?;
-    let mut owners = registered
+    let owners = registered
         .into_iter()
         .filter(|name| *name != env_name)
         .map(|name| (logs_dir.clone(), name.to_string()))
         .collect::<Vec<_>>();
-    if env_name.eq_ignore_ascii_case("daemon") {
-        let daemon_logs_dir = SupervisorService::new(env, cwd).saved_daemon_logs_dir()?;
-        owners.push((daemon_logs_dir, "daemon".to_string()));
-    }
+    let daemon_logs_dir = if env_name.eq_ignore_ascii_case("daemon") {
+        Some(SupervisorService::new(env, cwd).saved_daemon_logs_dir()?)
+    } else {
+        None
+    };
     for stream in ["stdout", "stderr"] {
         let path = supervisor_child_log_path(&logs_dir, env_name, stream);
         if owners
             .iter()
             .any(|(dir, owner)| is_same_file(&path, &supervisor_child_log_path(dir, owner, stream)))
+            || daemon_logs_dir
+                .as_ref()
+                .is_some_and(|dir| is_same_file(&path, &dir.join(format!("daemon.{stream}.log"))))
         {
             continue;
         }
@@ -711,6 +724,84 @@ impl<'a> SupervisorService<'a> {
             .children
             .into_iter()
             .find(|child| child.env_name == name))
+    }
+
+    fn persisted_child_for_logs(
+        &self,
+        name: &str,
+        env_root: &str,
+    ) -> Result<Option<SupervisorChildSpec>, String> {
+        let (_, state) = self.read_persisted_state()?;
+        if state.kind != SUPERVISOR_STATE_KIND
+            || state.ocm_home != display_path(&resolve_ocm_home(self.env, self.cwd)?)
+        {
+            return Err("saved service log paths belong to another store".to_string());
+        }
+        Ok(state.children.into_iter().find(|child| {
+            child.env_name == name
+                && child
+                    .process_env
+                    .get("OCM_ACTIVE_ENV_ROOT")
+                    .map(String::as_str)
+                    == Some(env_root)
+        }))
+    }
+
+    pub(crate) fn child_log_path(
+        &self,
+        meta: &crate::env::EnvMeta,
+        stream: &str,
+    ) -> Result<PathBuf, String> {
+        let default = supervisor_child_log_path(
+            &supervisor_logs_dir(self.env, self.cwd)?,
+            &meta.name,
+            stream,
+        );
+        if !meta.name.eq_ignore_ascii_case("daemon") {
+            return Ok(default);
+        }
+        let path = self
+            .persisted_child_for_logs(&meta.name, &meta.root)
+            .ok()
+            .flatten()
+            .map(|child| child.log_destination(stream))
+            .unwrap_or(default);
+        Ok(path)
+    }
+
+    pub(crate) fn has_legacy_child_log_paths(&self, meta: &crate::env::EnvMeta) -> bool {
+        meta.name.eq_ignore_ascii_case("daemon")
+            && self
+                .persisted_child_for_logs(&meta.name, &meta.root)
+                .ok()
+                .flatten()
+                .is_some_and(|child| {
+                    child.log_destination("stdout") != Path::new(&child.stdout_path)
+                        || child.log_destination("stderr") != Path::new(&child.stderr_path)
+                })
+    }
+
+    pub(crate) fn daemon_log_paths(&self) -> Result<Vec<PathBuf>, String> {
+        let mut paths = Vec::new();
+        for dir in [
+            supervisor_logs_dir(self.env, self.cwd)?,
+            self.saved_daemon_logs_dir()?,
+        ] {
+            for stream in ["stdout", "stderr"] {
+                let path = dir.join(format!("daemon.{stream}.log"));
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    fn is_daemon_log(&self, path: &Path) -> Result<bool, String> {
+        Ok(self
+            .daemon_log_paths()?
+            .iter()
+            .any(|daemon| is_same_file(path, daemon)))
     }
 
     fn inspect_with_checked_daemon(
@@ -1110,7 +1201,7 @@ impl<'a> SupervisorService<'a> {
                         .parse::<u32>()
                         .map_err(|_| format!("failed to parse child port for env \"{name}\""))?;
                     let process_env = build_supervised_openclaw_env(process.process_env);
-                    children.push(SupervisorChildSpec {
+                    let mut spec = SupervisorChildSpec {
                         env_name: name,
                         binding_kind: process.binding_kind,
                         binding_name: process.binding_name,
@@ -1134,7 +1225,20 @@ impl<'a> SupervisorService<'a> {
                             "stderr",
                         )),
                         process_env,
-                    });
+                    };
+                    if spec.env_name.eq_ignore_ascii_case("daemon")
+                        && let Some(previous) = self
+                            .persisted_child_for_logs(&spec.env_name, &env_meta.root)
+                            .ok()
+                            .flatten()
+                    {
+                        // Preserve the published launch identity, including for an
+                        // older running daemon. A log-only change must not reload
+                        // the child during an unrelated full/sibling sync.
+                        spec.stdout_path = previous.stdout_path;
+                        spec.stderr_path = previous.stderr_path;
+                    }
+                    children.push(spec);
                 }
                 Err(reason) => skipped_envs.push(SkippedSupervisorEnv {
                     env_name: name,
@@ -1820,16 +1924,29 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
             spec.env_name
         ));
     };
-    if let Some(parent) = Path::new(&spec.stdout_path).parent() {
+    let stdout_path = spec.log_destination("stdout");
+    let stderr_path = spec.log_destination("stderr");
+    if spec.env_name.eq_ignore_ascii_case("daemon") {
+        let supervisor = SupervisorService::new(&spec.process_env, Path::new(&spec.run_dir));
+        for path in [&stdout_path, &stderr_path] {
+            if supervisor.is_daemon_log(path)? {
+                return Err(format!(
+                    "service log {} aliases the supervisor daemon's diagnostics",
+                    display_path(path)
+                ));
+            }
+        }
+    }
+    if let Some(parent) = stdout_path.parent() {
         ensure_dir(parent)?;
     }
-    if let Some(parent) = Path::new(&spec.stderr_path).parent() {
+    if let Some(parent) = stderr_path.parent() {
         ensure_dir(parent)?;
     }
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&spec.stdout_path)
+        .open(&stdout_path)
         .map_err(|error| {
             format!(
                 "failed opening stdout log for env \"{}\": {error}",
@@ -1839,7 +1956,7 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
     let stderr = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&spec.stderr_path)
+        .open(&stderr_path)
         .map_err(|error| {
             format!(
                 "failed opening stderr log for env \"{}\": {error}",
@@ -3693,8 +3810,8 @@ fn supervisor_runtime_child(running_child: &RunningSupervisorChild) -> Superviso
         pid: running_child.child.id(),
         restart_count: running_child.restart_count,
         child_port: running_child.spec.child_port,
-        stdout_path: running_child.spec.stdout_path.clone(),
-        stderr_path: running_child.spec.stderr_path.clone(),
+        stdout_path: display_path(&running_child.spec.log_destination("stdout")),
+        stderr_path: display_path(&running_child.spec.log_destination("stderr")),
     }
 }
 
@@ -3715,8 +3832,8 @@ fn supervisor_runtime_service_running(
         restart_count: running_child.restart_count,
         child_port: running_child.spec.child_port,
         pid: Some(running_child.child.id()),
-        stdout_path: running_child.spec.stdout_path.clone(),
-        stderr_path: running_child.spec.stderr_path.clone(),
+        stdout_path: display_path(&running_child.spec.log_destination("stdout")),
+        stderr_path: display_path(&running_child.spec.log_destination("stderr")),
         last_exit_code: None,
         last_error: running_child
             .cleanup_error
@@ -3739,8 +3856,8 @@ fn supervisor_runtime_service_inactive(
         restart_count: inactive_child.restart_count,
         child_port: inactive_child.spec.child_port,
         pid: None,
-        stdout_path: inactive_child.spec.stdout_path.clone(),
-        stderr_path: inactive_child.spec.stderr_path.clone(),
+        stdout_path: display_path(&inactive_child.spec.log_destination("stdout")),
+        stderr_path: display_path(&inactive_child.spec.log_destination("stderr")),
         last_exit_code: inactive_child.last_exit_code,
         last_error: inactive_child.last_error.clone(),
         last_event_at: inactive_child.last_event_at,

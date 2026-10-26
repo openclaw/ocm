@@ -9,9 +9,7 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
-use crate::store::{
-    derive_env_paths, display_path, supervisor_child_log_path, supervisor_logs_dir,
-};
+use crate::store::{derive_env_paths, display_path};
 
 const FOLLOW_POLL_INTERVAL_MS: u64 = 250;
 const TAIL_READ_CHUNK_SIZE: usize = 8 * 1024;
@@ -54,13 +52,32 @@ struct LogSources {
     stream: String,
     gateway_path: PathBuf,
     service_path: PathBuf,
+    excluded_paths: Vec<PathBuf>,
 }
 
 impl LogSources {
+    fn exclusions_for(&self, target: &LogTarget) -> &[PathBuf] {
+        if target.source_kind == "service" {
+            &self.excluded_paths
+        } else {
+            &[]
+        }
+    }
+
     /// Picks the newer existing file, or the Gateway path when neither exists.
     fn select(&self) -> LogTarget {
+        let modified = |path: &Path| {
+            if self.excluded_paths.is_empty() {
+                modified_at(path)
+            } else {
+                open_log_excluding(path, &self.excluded_paths)
+                    .ok()
+                    .flatten()
+                    .and_then(|(_, metadata)| modified_time(&metadata))
+            }
+        };
         let gateway_modified = modified_at(&self.gateway_path);
-        let service_modified = modified_at(&self.service_path);
+        let service_modified = modified(&self.service_path);
         let (source_kind, path) = match (gateway_modified, service_modified) {
             (Some(gateway_time), Some(service_time)) => {
                 if service_time > gateway_time {
@@ -99,15 +116,17 @@ impl<'a> LogService<'a> {
         stream: &str,
         tail_lines: Option<usize>,
     ) -> Result<LogSummary, String> {
-        let targets = self.targets(name, stream)?;
+        let sources = self.stream_sources(name, stream)?;
+        let targets = sources.iter().map(LogSources::select).collect::<Vec<_>>();
         if targets.len() == 1 {
             let target = &targets[0];
             if !target.path.exists() {
                 return Err(format!(
-                    "{} log does not exist for env \"{}\": {}",
+                    "{} log does not exist for env \"{}\": {}{}",
                     target.stream,
                     target.env_name,
-                    display_path(&target.path)
+                    display_path(&target.path),
+                    self.missing_log_hint(name)
                 ));
             }
 
@@ -117,7 +136,12 @@ impl<'a> LogService<'a> {
                 source_kind: target.source_kind.clone(),
                 path: display_path(&target.path),
                 tail_lines,
-                content: read_log_text(&target.path, tail_lines)?.0,
+                content: read_log_text(
+                    &target.path,
+                    tail_lines,
+                    sources[0].exclusions_for(target),
+                )?
+                .0,
                 components: vec![LogComponentSummary {
                     stream: target.stream.clone(),
                     source_kind: target.source_kind.clone(),
@@ -128,20 +152,25 @@ impl<'a> LogService<'a> {
 
         let mut contents = Vec::new();
         let mut components = Vec::new();
-        for target in &targets {
+        for (target, source) in targets.iter().zip(&sources) {
             components.push(LogComponentSummary {
                 stream: target.stream.clone(),
                 source_kind: target.source_kind.clone(),
                 path: display_path(&target.path),
             });
             if target.path.exists() {
-                contents.push(read_log_text(&target.path, tail_lines)?);
+                contents.push(read_log_text(
+                    &target.path,
+                    tail_lines,
+                    source.exclusions_for(target),
+                )?);
             }
         }
         if contents.is_empty() {
             return Err(format!(
-                "no logs exist for env \"{}\" across stdout or stderr",
-                name
+                "no logs exist for env \"{}\" across stdout or stderr{}",
+                name,
+                self.missing_log_hint(name)
             ));
         }
 
@@ -154,6 +183,22 @@ impl<'a> LogService<'a> {
             content: merge_log_texts(contents, tail_lines),
             components,
         })
+    }
+
+    fn missing_log_hint(&self, name: &str) -> &'static str {
+        if name.eq_ignore_ascii_case("daemon")
+            && EnvironmentService::new(self.env, self.cwd)
+                .get(name)
+                .ok()
+                .is_some_and(|meta| {
+                    crate::supervisor::SupervisorService::new(self.env, self.cwd)
+                        .has_legacy_child_log_paths(&meta)
+                })
+        {
+            "; legacy service output may include supervisor diagnostics and is omitted. Explicitly refresh an older daemon from the updated OCM installation during a maintenance window to collect separate child output"
+        } else {
+            ""
+        }
     }
 
     pub fn target(&self, name: &str, stream: &str) -> Result<LogTarget, String> {
@@ -172,14 +217,27 @@ impl<'a> LogService<'a> {
                 "stderr" => "gateway.err.log",
                 _ => unreachable!("stream validated by normalize_stream"),
             });
-        let service_path =
-            supervisor_child_log_path(&supervisor_logs_dir(self.env, self.cwd)?, name, &stream);
+        let supervisor = crate::supervisor::SupervisorService::new(self.env, self.cwd);
+        let mut service_path = supervisor.child_log_path(&meta, &stream)?;
+        let excluded_paths = if meta.name.eq_ignore_ascii_case("daemon") {
+            match supervisor.daemon_log_paths() {
+                Ok(paths) => paths,
+                Err(_) => {
+                    // Unknown service-log ownership must not hide Gateway output.
+                    service_path = gateway_path.clone();
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
         Ok(LogSources {
             env_name: name.to_string(),
             stream,
             gateway_path,
             service_path,
+            excluded_paths,
         })
     }
 
@@ -357,6 +415,7 @@ struct FollowCursor {
     initialized: bool,
     pending: Vec<u8>,
     file: Option<File>,
+    excluded_paths: Vec<PathBuf>,
     retired_files: VecDeque<RetiredFile>,
     single_line_open: bool,
     single_separator_pending: bool,
@@ -375,6 +434,7 @@ impl FollowCursor {
             initialized: false,
             pending: Vec::new(),
             file: None,
+            excluded_paths: Vec::new(),
             retired_files: VecDeque::new(),
             single_line_open: false,
             single_separator_pending: false,
@@ -385,8 +445,18 @@ impl FollowCursor {
 
     fn for_sources(sources: LogSources) -> Self {
         let mut cursor = Self::new(sources.select());
+        cursor.excluded_paths = sources.excluded_paths.clone();
         cursor.sources = Some(sources);
         cursor
+    }
+
+    fn open_target_log(&self) -> Result<Option<(File, fs::Metadata)>, String> {
+        let exclusions = if self.target.source_kind == "service" {
+            &self.excluded_paths[..]
+        } else {
+            &[]
+        };
+        open_log_excluding(&self.target.path, exclusions)
     }
 
     fn is_initialized(&self) -> bool {
@@ -401,10 +471,13 @@ impl FollowCursor {
         if let Some(sources) = &self.sources {
             self.target = sources.select();
         }
-        let Some((mut file, metadata)) = open_log(&self.target.path)? else {
+        let Some((mut file, metadata)) = self.open_target_log()? else {
             return Ok(None);
         };
         self.sources = None;
+        if self.target.source_kind != "service" {
+            self.excluded_paths.clear();
+        }
         let (mut bytes, offset, _bytes_read) = read_log_snapshot_from(&mut file, tail_lines)?;
         #[cfg(test)]
         {
@@ -433,7 +506,7 @@ impl FollowCursor {
     }
 
     fn read_update(&mut self) -> Result<Option<FollowUpdate>, String> {
-        let Some((mut path_file, metadata)) = open_log(&self.target.path)? else {
+        let Some((mut path_file, metadata)) = self.open_target_log()? else {
             let mut segments = self.drain_retired_files()?;
             if self.file.is_some() {
                 self.retire_current_file();
@@ -615,7 +688,8 @@ impl FollowCursor {
         pending_source.extend(independent_sources);
         let mut retained = VecDeque::with_capacity(pending_source.len());
         while let Some(mut retired) = pending_source.pop_front() {
-            let (file_segments, keep, _bytes_read) = drain_retired_file(&mut retired)?;
+            let (file_segments, keep, _bytes_read) =
+                drain_retired_file(&mut retired, &self.excluded_paths)?;
             #[cfg(test)]
             {
                 self.read_metrics.range_bytes += _bytes_read;
@@ -663,7 +737,7 @@ impl FollowCursor {
         let Some(mut retired) = self.retired_files.pop_back() else {
             return Ok(Vec::new());
         };
-        let (segments, keep, _bytes_read) = drain_retired_file(&mut retired)?;
+        let (segments, keep, _bytes_read) = drain_retired_file(&mut retired, &self.excluded_paths)?;
         #[cfg(test)]
         {
             self.read_metrics.range_bytes += _bytes_read;
@@ -707,8 +781,12 @@ struct RetiredFile {
 
 fn drain_retired_file(
     retired: &mut RetiredFile,
+    excluded_paths: &[PathBuf],
 ) -> Result<(Vec<FollowSegment>, bool, u64), String> {
     let metadata = retired.file.metadata().map_err(|error| error.to_string())?;
+    if file_is_excluded(&retired.file, &metadata, excluded_paths)? {
+        return Ok((Vec::new(), false, 0));
+    }
     let end = metadata.len();
     let reset = end < retired.offset
         || (end == retired.offset && modified_time(&metadata) != retired.modified);
@@ -845,6 +923,48 @@ fn file_identity(_file: &File, metadata: &fs::Metadata) -> Result<FileIdentity, 
     })
 }
 
+fn file_is_excluded(
+    file: &File,
+    metadata: &fs::Metadata,
+    excluded_paths: &[PathBuf],
+) -> Result<bool, String> {
+    if excluded_paths.is_empty() {
+        return Ok(false);
+    }
+    let identity = file_identity(file, metadata)?;
+    for path in excluded_paths {
+        #[cfg(unix)]
+        let excluded_identity = match fs::metadata(path) {
+            Ok(metadata) => Some(file_identity(file, &metadata)?),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        #[cfg(not(unix))]
+        let excluded_identity = open_log(path)?
+            .map(|(excluded, metadata)| file_identity(&excluded, &metadata))
+            .transpose()?;
+        if excluded_identity.as_ref() == Some(&identity) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn open_log_excluding(
+    path: &Path,
+    excluded_paths: &[PathBuf],
+) -> Result<Option<(File, fs::Metadata)>, String> {
+    let Some((file, metadata)) = open_log(path)? else {
+        return Ok(None);
+    };
+    // Validate the opened handle, including delayed attachment and rotation,
+    // rather than relying on the path's identity when follow was started.
+    if file_is_excluded(&file, &metadata, excluded_paths)? {
+        return Ok(None);
+    }
+    Ok(Some((file, metadata)))
+}
+
 fn open_log(path: &Path) -> Result<Option<(File, fs::Metadata)>, String> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -887,9 +1007,10 @@ fn normalize_stream(stream: &str) -> Result<&str, String> {
 fn read_log_text(
     path: &Path,
     tail_lines: Option<usize>,
+    excluded_paths: &[PathBuf],
 ) -> Result<(String, Option<SystemTime>), String> {
-    let (mut file, _) =
-        open_log(path)?.ok_or_else(|| format!("log does not exist: {}", display_path(path)))?;
+    let (mut file, _) = open_log_excluding(path, excluded_paths)?
+        .ok_or_else(|| format!("log does not exist: {}", display_path(path)))?;
     let (bytes, _, _) = read_log_snapshot_from(&mut file, tail_lines)?;
     // Observe the write time after reading so it is never older than the bytes read.
     let modified = file.metadata().ok().as_ref().and_then(modified_time);
@@ -2387,12 +2508,61 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn follow_rechecks_diagnostic_ownership_on_attachment_rotation_and_retired_handles() {
+        let root = test_root("follow-daemon-alias");
+        let gateway = root.join("gateway.err.log");
+        let service = root.join(".daemon.stderr.log");
+        let diagnostic = root.join("daemon.stderr.log");
+        let mut sources = stderr_sources(&gateway, &service);
+        sources.excluded_paths.push(diagnostic.clone());
+        std::os::unix::fs::symlink(&diagnostic, &service).unwrap();
+        let mut cursor = FollowCursor::for_sources(sources);
+        assert!(cursor.snapshot(None, false).unwrap().is_none());
+        fs::write(&diagnostic, b"shared diagnostic\n").unwrap();
+        assert!(cursor.snapshot(None, false).unwrap().is_none());
+
+        fs::remove_file(&service).unwrap();
+        fs::write(&service, b"child first\n").unwrap();
+        assert_eq!(
+            cursor.snapshot(None, false).unwrap().unwrap().bytes,
+            b"child first\n"
+        );
+        let retired = root.join("retired-child.log");
+        fs::rename(&service, &retired).unwrap();
+        std::os::unix::fs::symlink(&diagnostic, &service).unwrap();
+        assert!(cursor.read_update().unwrap().is_none());
+        fs::remove_file(&service).unwrap();
+        fs::write(&service, b"child replacement\n").unwrap();
+        let update = cursor.read_update().unwrap().unwrap();
+        assert_eq!(cursor.single_stream_bytes(update), b"child replacement\n");
+
+        // The retained old handle must not expose diagnostics either, even if
+        // a later writer claims its inode after rotation.
+        fs::remove_file(&diagnostic).unwrap();
+        fs::hard_link(&retired, &diagnostic).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&diagnostic)
+            .unwrap()
+            .write_all(b"shared later\n")
+            .unwrap();
+        if let Some(update) = cursor.read_update().unwrap() {
+            assert!(
+                !String::from_utf8_lossy(&cursor.single_stream_bytes(update)).contains("shared")
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn stderr_sources(gateway_path: &Path, service_path: &Path) -> LogSources {
         LogSources {
             env_name: "demo".to_string(),
             stream: "stderr".to_string(),
             gateway_path: gateway_path.to_path_buf(),
             service_path: service_path.to_path_buf(),
+            excluded_paths: Vec::new(),
         }
     }
 

@@ -639,6 +639,129 @@ fn service_start_preserves_native_cli_identity_across_service_boundaries() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_named_children_separate_output_without_rewriting_legacy_launch_identity() {
+    for mode in ["new", "legacy", "case", "explicit"] {
+        let name = if mode == "case" { "Daemon" } else { "daemon" };
+        let root = TestDir::new("daemon-child-log-identity");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = systemd_env(&root);
+        let child = root.child("child");
+        write_executable_script(
+            &child,
+            "#!/bin/sh\nprintf 'child stdout\\n'\nprintf 'child stderr\\n' >&2\n",
+        );
+        let added = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "launcher",
+                "add",
+                "fixture",
+                "--command",
+                &path_string(&child),
+            ],
+        );
+        assert!(added.status.success(), "{}", stderr(&added));
+        let created = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", name, "--launcher", "fixture"],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        let started = run_ocm(&cwd, &env, &["service", "start", name]);
+        assert!(started.status.success(), "{}", stderr(&started));
+        let state_path = supervisor_state_path(&env, &cwd).unwrap();
+        let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let logs = root.child("ocm-home/supervisor/logs");
+        for stream in ["stdout", "stderr"] {
+            let key = format!("{stream}Path");
+            assert_eq!(
+                state["children"][0][&key],
+                path_string(&logs.join(format!(".{name}.{stream}.log")))
+            );
+            if mode != "new" {
+                // A persisted explicit destination is still valid. Legacy
+                // diagnostic basenames need a new physical child destination.
+                let file = if mode == "explicit" {
+                    format!("custom.{stream}.log")
+                } else if mode == "case" {
+                    format!("Daemon.{stream}.log")
+                } else if stream == "stdout" {
+                    "daemon.stderr.log".to_string()
+                } else {
+                    "daemon.stdout.log".to_string()
+                };
+                state["children"][0][&key] = json!(path_string(&logs.join(file)));
+            }
+        }
+        fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        let supervisor = ocm::supervisor::SupervisorService::new(&env, &cwd);
+        let synced = serde_json::to_value(supervisor.sync().unwrap()).unwrap();
+        assert_eq!(
+            synced["children"], state["children"],
+            "log-only sync must preserve the launch identity: {mode}"
+        );
+        let before = run_ocm(&cwd, &env, &["logs", name, "--json"]);
+        assert!(!before.status.success());
+        assert_eq!(
+            stderr(&before).contains("legacy service output"),
+            mode == "legacy" || mode == "case"
+        );
+        let daemon_log = logs.join("daemon.stderr.log");
+        let sink = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&daemon_log)
+            .unwrap();
+        let run = Command::new(crate::support::ocm_test_binary_path())
+            .args(["__daemon", "run", "--once", "--json"])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .stderr(sink)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            fs::read_to_string(&daemon_log).unwrap()
+        );
+        let diagnostics = fs::read_to_string(&daemon_log).unwrap();
+        assert!(diagnostics.contains("ocm service: starting"));
+        assert!(!diagnostics.contains("child stderr"));
+        for (stream, expected) in [("info", "child stdout\n"), ("error", "child stderr\n")] {
+            let output = run_ocm(&cwd, &env, &["logs", name, "--stream", stream, "--json"]);
+            assert!(output.status.success(), "{}", stderr(&output));
+            let body = json_output(&output);
+            assert_eq!(body["content"], expected, "{mode}: {body}");
+            assert_eq!(body["sourceKind"], "service");
+        }
+        let status = run_ocm(&cwd, &env, &["service", "status", name, "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let status = json_output(&status);
+        let expected = if mode == "explicit" {
+            "custom.stderr.log".to_string()
+        } else {
+            format!(".{name}.stderr.log")
+        };
+        assert_eq!(status["stderrPath"], path_string(&logs.join(expected)));
+        assert_eq!(fs::read_to_string(&daemon_log).unwrap(), diagnostics);
+        if mode == "explicit" {
+            state["children"][0]["processEnv"]["OCM_ACTIVE_ENV_ROOT"] =
+                json!("another-environment");
+            fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+            let output = run_ocm(&cwd, &env, &["logs", name, "--json"]);
+            assert!(
+                !output.status.success(),
+                "foreign root must not authorize a saved log path"
+            );
+        }
+    }
+}
+
 #[test]
 fn service_install_uses_valid_path_ocm_for_dev_artifact() {
     let root = TestDir::new("service-install-valid-path-ocm");

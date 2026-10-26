@@ -320,7 +320,35 @@ pub fn supervisor_logs_dir(env: &BTreeMap<String, String>, cwd: &Path) -> Result
 /// It lives outside the environment root and is keyed only by name, so it is
 /// discarded when the name is registered for a new environment.
 pub fn supervisor_child_log_path(logs_dir: &Path, env_name: &str, stream: &str) -> PathBuf {
-    logs_dir.join(format!("{env_name}.{stream}.log"))
+    let prefix = if env_name.eq_ignore_ascii_case("daemon") {
+        "."
+    } else {
+        ""
+    };
+    logs_dir.join(format!("{prefix}{env_name}.{stream}.log"))
+}
+
+/// Old plans can name the shared daemon's diagnostic file. Keep the saved
+/// launch identity intact, but separate the output of each newly spawned child.
+/// An explicit destination outside that reserved basename remains unchanged.
+pub(crate) fn supervisor_child_log_destination(
+    path: &Path,
+    env_name: &str,
+    stream: &str,
+) -> PathBuf {
+    if env_name.eq_ignore_ascii_case("daemon")
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("daemon.stdout.log")
+                    || name.eq_ignore_ascii_case("daemon.stderr.log")
+            })
+    {
+        path.with_file_name(format!(".{env_name}.{stream}.log"))
+    } else {
+        path.to_path_buf()
+    }
 }
 
 pub fn source_watch_override_path(

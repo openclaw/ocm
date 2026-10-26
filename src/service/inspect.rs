@@ -502,11 +502,11 @@ fn build_service_summary(
             .transpose()?,
         stdout_path: runtime_child
             .map(|child| child.stdout_path.clone())
-            .or_else(|| planned_child.map(|child| child.stdout_path.clone()))
+            .or_else(|| planned_child.map(|child| display_path(&child.log_destination("stdout"))))
             .or(Some(fallback_stdout)),
         stderr_path: runtime_child
             .map(|child| child.stderr_path.clone())
-            .or_else(|| planned_child.map(|child| child.stderr_path.clone()))
+            .or_else(|| planned_child.map(|child| display_path(&child.log_destination("stderr"))))
             .or(Some(fallback_stderr)),
         issue,
     })
