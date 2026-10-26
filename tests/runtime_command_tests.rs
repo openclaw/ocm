@@ -4435,6 +4435,268 @@ fn official_runtime_install_uses_managed_node_when_npm_is_missing() {
 
 #[cfg(unix)]
 #[test]
+fn official_runtime_install_reclaims_interrupted_node_preparation() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::os::unix::fs::symlink;
+    use std::time::Instant;
+
+    struct InstallChild(std::process::Child);
+    impl Drop for InstallChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let wait_for = |label: &str, ready: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready() {
+            assert!(Instant::now() < deadline, "fixture did not reach {label}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let root = TestDir::new("runtime-interrupted-private-node");
+    let cwd = root.child("workspace");
+    let empty_path = root.child("empty-path");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&empty_path).unwrap();
+    let tarball = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
+    let package_server =
+        TestHttpServer::serve_bytes_times("/openclaw.tgz", "application/octet-stream", &tarball, 3);
+    let packument = serde_json::json!({
+        "dist-tags": {"latest": "2026.3.24", "beta": "2026.3.24"},
+        "versions": {"2026.3.24": {"version": "2026.3.24", "dist": {
+            "tarball": package_server.url(), "integrity": sha512_integrity(&tarball)
+        }}}
+    });
+    let registry = TestHttpServer::serve_bytes_times(
+        "/openclaw",
+        "application/json",
+        packument.to_string().as_bytes(),
+        4,
+    );
+    let mut env = ocm_env(&root);
+    env.insert("PATH".into(), path_string(&empty_path));
+    env.insert("OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(), registry.url());
+    let node_server = install_fake_managed_node_archive(&root, &mut env, "24.22.1");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut interrupted_env = env.clone();
+    interrupted_env.insert(
+        "OCM_INTERNAL_MANAGED_NODE_ARCHIVE_URL".into(),
+        format!("http://{}/node.tar.gz", listener.local_addr().unwrap()),
+    );
+    let spawn = |name: &str, env: &BTreeMap<String, String>| {
+        InstallChild(
+            Command::new(support::ocm_test_binary_path())
+                .current_dir(&cwd)
+                .env_clear()
+                .envs(env)
+                .args(["runtime", "install", "--channel", name, "--json"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut interrupted = spawn("beta", &interrupted_env);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Some(status) = interrupted.0.try_wait().unwrap() {
+                    let mut error = String::new();
+                    interrupted
+                        .0
+                        .stderr
+                        .take()
+                        .unwrap()
+                        .read_to_string(&mut error)
+                        .unwrap();
+                    panic!("private Node install exited {status}: {error}");
+                }
+                assert!(Instant::now() < deadline, "no private Node download");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut request = [0; 4096];
+    assert!(stream.read(&mut request).unwrap() > 0);
+    stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    stream.write_all(&vec![0; 524288]).unwrap();
+    stream.flush().unwrap();
+    let parent = root.child("ocm-home/toolchains/node");
+    let stages = || {
+        fs::read_dir(&parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".node-toolchain-")
+            })
+            .collect::<Vec<_>>()
+    };
+    wait_for("partial download on disk", &|| {
+        stages().iter().any(|stage| {
+            fs::read_dir(stage)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.metadata().unwrap().len() >= 65536)
+        })
+    });
+    let abandoned = stages().pop().unwrap();
+    let lock_path = fs::read_dir(&parent)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "lock"))
+        .unwrap();
+    let lock_probe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    assert_eq!(
+        fs2::FileExt::try_lock_exclusive(&lock_probe)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    // A second real install must wait while the first process owns preparation.
+    let mut failure_env = env.clone();
+    failure_env.insert(
+        "OCM_INTERNAL_MANAGED_NODE_ARCHIVE_SHA256".into(),
+        "0".repeat(64),
+    );
+    let mut contender = spawn("stable", &failure_env);
+    // Runtime installation also owns the environment registry lock, so the
+    // contender selects its release but cannot download its package yet.
+    wait_for("second release selection", &|| {
+        registry.requests().len() == 2
+    });
+    assert!(contender.0.try_wait().unwrap().is_none());
+    assert!(abandoned.is_dir());
+    assert!(node_server.requests().is_empty());
+    interrupted.0.kill().unwrap();
+    assert!(!interrupted.0.wait().unwrap().success());
+    drop(stream);
+    let failed = contender.0.wait().unwrap();
+    let mut error = String::new();
+    contender
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+    assert!(
+        !failed.success() && error.contains("sha256 mismatch"),
+        "{error}"
+    );
+    assert!(
+        !abandoned.exists(),
+        "checksum-failure retry retained old Node stage"
+    );
+    assert!(
+        stages().is_empty(),
+        "ordinary failed retry retained its own stage"
+    );
+
+    let _successful_node = install_fake_managed_node_archive(&root, &mut env, "24.22.1");
+    let install = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "install", "--channel", "stable", "--json"],
+    );
+    assert!(install.status.success(), "{}", stderr(&install));
+    let caches = fs::read_dir(&parent)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("node-v")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(caches.len(), 1);
+    let cached_node = caches[0].join("bin/node");
+    let cached_hash = file_sha256(&cached_node).unwrap();
+
+    // Cache hits also recover abandoned stages, preserving live owners from
+    // other distributions, malformed names, non-directories and symlink targets.
+    let mut exited = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let dead_pid = exited.id();
+    exited.wait().unwrap();
+    let stale = parent.join(format!(".node-toolchain-{dead_pid}-1"));
+    let live = parent.join(format!(".node-toolchain-{}-2", std::process::id()));
+    let malformed = parent.join(".node-toolchain-unrelated");
+    let other_cache = parent.join("node-v24.15.0-other-platform");
+    let outside = root.child("unrelated");
+    for path in [&stale, &live, &malformed, &other_cache, &outside] {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("keep"), "payload").unwrap();
+    }
+    let old_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(parent.join(".node-v24.15.0-other-platform.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&old_lock).unwrap();
+    let link = parent.join(format!(".node-toolchain-{dead_pid}-3"));
+    symlink(&outside, &link).unwrap();
+    let file = parent.join(format!(".node-toolchain-{dead_pid}-4"));
+    fs::write(&file, "keep").unwrap();
+    env.insert(
+        "OCM_INTERNAL_MANAGED_NODE_ARCHIVE_URL".into(),
+        "http://127.0.0.1:1/unavailable".into(),
+    );
+    let reused = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "install", "--channel", "stable", "--json"],
+    );
+    assert!(reused.status.success(), "{}", stderr(&reused));
+    assert!(!stale.exists(), "cache reuse skipped stage recovery");
+    for path in [&live, &malformed, &other_cache, &outside, &link] {
+        assert_eq!(fs::read_to_string(path.join("keep")).unwrap(), "payload");
+    }
+    assert_eq!(fs::read_to_string(file).unwrap(), "keep");
+    assert_eq!(file_sha256(&cached_node).unwrap(), cached_hash);
+    assert_eq!(
+        package_server.requests().len(),
+        3,
+        "reuse reinstalled package"
+    );
+    let verify = run_ocm(&cwd, &env, &["runtime", "verify", "stable", "--json"]);
+    assert!(verify.status.success(), "{}", stderr(&verify));
+    let remove = run_ocm(&cwd, &env, &["runtime", "remove", "stable", "--json"]);
+    assert!(remove.status.success(), "{}", stderr(&remove));
+    assert_eq!(file_sha256(&cached_node).unwrap(), cached_hash);
+}
+
+#[cfg(unix)]
+#[test]
 fn official_runtime_install_replaces_previous_managed_node() {
     check_managed_node_install(true);
 }
