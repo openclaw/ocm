@@ -739,9 +739,13 @@ Once attached, it stays on that file like `tail -f`.
 For an environment named `daemon` (including case variants), service-child output
 uses `.daemon.stdout.log` and `.daemon.stderr.log` in the supervisor log directory
 (with the environment's original case). The supervisor's own `daemon.*.log`
-diagnostics remain separate. Older files can contain output from both owners;
-OCM preserves those files but excludes that ambiguous history from the environment
-log view. Existing running services are not restarted by this change. Output from
+diagnostics remain separate. A child-output alias must point to an existing,
+separately owned file; an alias with a missing target is refused at child startup,
+including while diagnostic files are being rotated. New child output is also
+refused while a diagnostic alias has a missing target. Restore separately owned
+targets or remove the unsafe aliases before retrying. Older files can contain
+output from both owners; OCM preserves those files but excludes that ambiguous
+history from the environment log view. Existing running services are not restarted by this change. Output from
 an older running daemon remains in its old files. Explicitly refresh that daemon
 from the updated OCM installation during a maintenance window to enable separate
 child output. The environment's own Gateway logs remain available as before.

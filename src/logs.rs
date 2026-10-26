@@ -9,6 +9,7 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
+use crate::infra::file_identity::{FileIdentity, file_identity, file_is_excluded};
 use crate::store::{derive_env_paths, display_path};
 
 const FOLLOW_POLL_INTERVAL_MS: u64 = 250;
@@ -870,84 +871,6 @@ struct LogSnapshot {
     bytes: Vec<u8>,
     /// When the source file was last written, as observed with these bytes.
     modified: Option<SystemTime>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum FileIdentity {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows {
-        volume_serial_number: u32,
-        file_index: u64,
-    },
-    #[cfg(not(any(unix, windows)))]
-    Portable {
-        created: Option<std::time::SystemTime>,
-    },
-}
-
-#[cfg(unix)]
-fn file_identity(_file: &File, metadata: &fs::Metadata) -> Result<FileIdentity, String> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(FileIdentity::Unix {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn file_identity(file: &File, _metadata: &fs::Metadata) -> Result<FileIdentity, String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-
-    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
-    // The handle and output pointer remain valid for the duration of the call.
-    let succeeded =
-        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
-    if succeeded == 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    Ok(FileIdentity::Windows {
-        volume_serial_number: information.dwVolumeSerialNumber,
-        file_index: ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn file_identity(_file: &File, metadata: &fs::Metadata) -> Result<FileIdentity, String> {
-    Ok(FileIdentity::Portable {
-        created: metadata.created().ok(),
-    })
-}
-
-fn file_is_excluded(
-    file: &File,
-    metadata: &fs::Metadata,
-    excluded_paths: &[PathBuf],
-) -> Result<bool, String> {
-    if excluded_paths.is_empty() {
-        return Ok(false);
-    }
-    let identity = file_identity(file, metadata)?;
-    for path in excluded_paths {
-        #[cfg(unix)]
-        let excluded_identity = match fs::metadata(path) {
-            Ok(metadata) => Some(file_identity(file, &metadata)?),
-            Err(error) if error.kind() == ErrorKind::NotFound => None,
-            Err(error) => return Err(error.to_string()),
-        };
-        #[cfg(not(unix))]
-        let excluded_identity = open_log(path)?
-            .map(|(excluded, metadata)| file_identity(&excluded, &metadata))
-            .transpose()?;
-        if excluded_identity.as_ref() == Some(&identity) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn open_log_excluding(

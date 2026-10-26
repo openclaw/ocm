@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
+use crate::infra::file_identity::{FileIdentity, file_identity, file_is_excluded};
 #[cfg(unix)]
 use crate::infra::process_identity::process_group_members;
 use crate::infra::process_identity::{
@@ -795,13 +796,6 @@ impl<'a> SupervisorService<'a> {
             }
         }
         Ok(paths)
-    }
-
-    fn is_daemon_log(&self, path: &Path) -> Result<bool, String> {
-        Ok(self
-            .daemon_log_paths()?
-            .iter()
-            .any(|daemon| is_same_file(path, daemon)))
     }
 
     fn inspect_with_checked_daemon(
@@ -1916,6 +1910,143 @@ fn spawn_running_child(
     })
 }
 
+fn supervisor_output_identities() -> Result<Vec<FileIdentity>, String> {
+    let mut identities = Vec::new();
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        for descriptor in [stdout.as_fd(), stderr.as_fd()] {
+            let owned = match descriptor.try_clone_to_owned() {
+                Ok(owned) => owned,
+                // A closed stream cannot own a diagnostic file.
+                Err(error) if error.raw_os_error() == Some(libc::EBADF) => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            let file = File::from(owned);
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            if metadata.is_file() {
+                identities.push(file_identity(&file, &metadata)?);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
+
+        for handle in [
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            // Detached consoles can have null handles; pipes and consoles do
+            // not own a regular diagnostic file. Borrow only a live disk handle.
+            if handle.is_null() || unsafe { GetFileType(handle.cast()) } != FILE_TYPE_DISK {
+                continue;
+            }
+            // Standard output/error keep the handle alive; duplicate it so
+            // dropping the File cannot close the daemon's stream.
+            let owned = unsafe { BorrowedHandle::borrow_raw(handle) }
+                .try_clone_to_owned()
+                .map_err(|error| error.to_string())?;
+            let file = File::from(owned);
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            if metadata.is_file() {
+                identities.push(file_identity(&file, &metadata)?);
+            }
+        }
+    }
+    Ok(identities)
+}
+
+fn open_child_log(
+    spec: &SupervisorChildSpec,
+    path: &Path,
+    stream: &str,
+    daemon_logs: &[PathBuf],
+    diagnostic_outputs: &[FileIdentity],
+) -> Result<File, String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let file = if daemon_logs.is_empty() {
+        OpenOptions::new().create(true).append(true).open(path)
+    } else {
+        // Never create through a dangling output alias: its target may be a
+        // diagnostic pathname temporarily absent during rotation. Existing
+        // safe aliases remain usable, and exclusive creation cannot follow a
+        // link introduced after the first open found no file.
+        OpenOptions::new().append(true).open(path).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                // The reverse alias matters too: creating this file must not
+                // satisfy a dangling diagnostic link. Without its target we
+                // cannot establish that a new output is separately owned.
+                for diagnostic in daemon_logs {
+                    match fs::metadata(diagnostic) {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            match fs::symlink_metadata(diagnostic) {
+                                Ok(_) => {
+                                    return Err(std::io::Error::other(format!(
+                                        "unresolved supervisor diagnostic alias {}; restore a separately owned target or remove the alias before retrying",
+                                        display_path(diagnostic)
+                                    )));
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                OpenOptions::new()
+                    .create_new(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::AlreadyExists
+                            && fs::symlink_metadata(path)
+                                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                        {
+                            std::io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "cannot create output through alias {}; restore a separately owned target or remove the alias before retrying",
+                                    display_path(path)
+                                ),
+                            )
+                        } else {
+                            error
+                        }
+                    })
+            } else {
+                Err(error)
+            }
+        })
+    }
+    .map_err(|error| {
+        format!(
+            "failed opening {stream} log for env \"{}\": {error}",
+            spec.env_name
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    // Check the handle that the child will inherit, not a pathname observed
+    // before opening it. This also detects hard links on Windows.
+    if file_is_excluded(&file, &metadata, daemon_logs)?
+        || (!diagnostic_outputs.is_empty()
+            && diagnostic_outputs.contains(&file_identity(&file, &metadata)?))
+    {
+        return Err(format!(
+            "service log {} aliases the supervisor daemon's diagnostics",
+            display_path(path)
+        ));
+    }
+    Ok(file)
+}
+
 fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
     let program_arguments = supervisor_program_arguments(spec);
     let Some(program) = program_arguments.first() else {
@@ -1926,43 +2057,32 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
     };
     let stdout_path = spec.log_destination("stdout");
     let stderr_path = spec.log_destination("stderr");
-    if spec.env_name.eq_ignore_ascii_case("daemon") {
-        let supervisor = SupervisorService::new(&spec.process_env, Path::new(&spec.run_dir));
-        for path in [&stdout_path, &stderr_path] {
-            if supervisor.is_daemon_log(path)? {
-                return Err(format!(
-                    "service log {} aliases the supervisor daemon's diagnostics",
-                    display_path(path)
-                ));
-            }
-        }
-    }
-    if let Some(parent) = stdout_path.parent() {
-        ensure_dir(parent)?;
-    }
-    if let Some(parent) = stderr_path.parent() {
-        ensure_dir(parent)?;
-    }
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&stdout_path)
-        .map_err(|error| {
-            format!(
-                "failed opening stdout log for env \"{}\": {error}",
-                spec.env_name
-            )
-        })?;
-    let stderr = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&stderr_path)
-        .map_err(|error| {
-            format!(
-                "failed opening stderr log for env \"{}\": {error}",
-                spec.env_name
-            )
-        })?;
+    let daemon_logs = if spec.env_name.eq_ignore_ascii_case("daemon") {
+        SupervisorService::new(&spec.process_env, Path::new(&spec.run_dir)).daemon_log_paths()?
+    } else {
+        Vec::new()
+    };
+    // A rotated diagnostic file remains owned by the daemon's output handle,
+    // even after its reserved pathname is absent or points to a replacement.
+    let diagnostic_outputs = if daemon_logs.is_empty() {
+        Vec::new()
+    } else {
+        supervisor_output_identities()?
+    };
+    let stdout = open_child_log(
+        spec,
+        &stdout_path,
+        "stdout",
+        &daemon_logs,
+        &diagnostic_outputs,
+    )?;
+    let stderr = open_child_log(
+        spec,
+        &stderr_path,
+        "stderr",
+        &daemon_logs,
+        &diagnostic_outputs,
+    )?;
     let mut process_env = spec.process_env.clone();
     // Bind clients to the actual spawning daemon, not the CLI that last
     // regenerated the desired spec (which must not restart a running Gateway).
@@ -3890,6 +4010,89 @@ mod tests {
             stderr_path: format!("/tmp/{name}.stderr.log"),
             process_env: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn child_log_admission_checks_opened_files_and_preserves_safe_append() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let diagnostic = root.path().join("daemon.stderr.log");
+        fs::write(&diagnostic, b"diagnostics\n").unwrap();
+        let reserved = vec![diagnostic.clone()];
+        let child = root.path().join(".daemon.stdout.log");
+        fs::hard_link(&diagnostic, &child).unwrap();
+        let spec = child_spec("Daemon", 19999);
+        let error = open_child_log(&spec, &child, "stdout", &reserved, &[]).unwrap_err();
+        assert!(error.contains("aliases the supervisor"), "{error}");
+        assert_eq!(fs::read(&diagnostic).unwrap(), b"diagnostics\n");
+        fs::remove_file(&child).unwrap();
+
+        // First creation and later append retain the same separate output.
+        open_child_log(&spec, &child, "stdout", &reserved, &[])
+            .unwrap()
+            .write_all(b"first\n")
+            .unwrap();
+        let safe_alias = root.path().join("custom.log");
+        fs::hard_link(&child, &safe_alias).unwrap();
+        open_child_log(&spec, &safe_alias, "stdout", &reserved, &[])
+            .unwrap()
+            .write_all(b"second\n")
+            .unwrap();
+        assert_eq!(fs::read(&child).unwrap(), b"first\nsecond\n");
+        assert_eq!(fs::read(&diagnostic).unwrap(), b"diagnostics\n");
+        assert!(open_child_log(&spec, root.path(), "stdout", &reserved, &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_log_admission_refuses_missing_alias_targets_but_keeps_existing_safe_aliases() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let diagnostic = root.path().join("daemon.stderr.log");
+        let reserved = vec![diagnostic.clone()];
+        let child = root.path().join(".daemon.stderr.log");
+        let intermediate = root.path().join("intermediate");
+        symlink("daemon.stderr.log", &intermediate).unwrap();
+        symlink("intermediate", &child).unwrap();
+        let spec = child_spec("daemon", 19999);
+        let error = open_child_log(&spec, &child, "stderr", &reserved, &[]).unwrap_err();
+        assert!(error.contains(&display_path(&child)), "{error}");
+        assert!(
+            error.contains("restore a separately owned target"),
+            "{error}"
+        );
+        assert!(
+            error.contains("remove the alias before retrying"),
+            "{error}"
+        );
+        assert!(!diagnostic.exists());
+        assert!(child.is_symlink());
+        assert!(intermediate.is_symlink());
+
+        fs::remove_file(&intermediate).unwrap();
+        let safe = root.path().join("safe.log");
+        fs::write(&safe, b"earlier\n").unwrap();
+        symlink("safe.log", &intermediate).unwrap();
+        open_child_log(&spec, &child, "stderr", &reserved, &[])
+            .unwrap()
+            .write_all(b"later\n")
+            .unwrap();
+        assert_eq!(fs::read(&safe).unwrap(), b"earlier\nlater\n");
+        assert!(!diagnostic.exists());
+
+        fs::remove_file(&intermediate).unwrap();
+        symlink(".daemon.stderr.log", &intermediate).unwrap();
+        assert!(open_child_log(&spec, &child, "stderr", &reserved, &[]).is_err());
+        assert!(!diagnostic.exists());
+
+        fs::remove_file(&child).unwrap();
+        symlink(".daemon.stderr.log", &diagnostic).unwrap();
+        assert!(open_child_log(&spec, &child, "stderr", &reserved, &[]).is_err());
+        assert!(!child.exists());
+        assert!(diagnostic.is_symlink());
     }
 
     fn supervisor_state(restart_requests: Vec<SupervisorRestartRequest>) -> SupervisorState {

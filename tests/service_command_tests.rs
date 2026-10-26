@@ -762,6 +762,136 @@ fn daemon_named_children_separate_output_without_rewriting_legacy_launch_identit
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_child_output_aliases_cannot_recreate_rotated_diagnostics() {
+    use std::os::unix::fs::symlink;
+
+    for diagnostic_stream in ["stdout", "stderr"] {
+        for stream in ["stdout", "stderr"] {
+            for mode in ["existing", "rotated", "reverse-rotated", "hardlink-rotated"] {
+                let rotated = mode != "existing";
+                let reverse = mode == "reverse-rotated";
+                let hardlink = mode == "hardlink-rotated";
+                let root = TestDir::new("daemon-output-rotation");
+                let cwd = root.child("workspace");
+                fs::create_dir_all(&cwd).unwrap();
+                let env = systemd_env(&root);
+                let child = root.child("child");
+                write_executable_script(
+                    &child,
+                    "#!/bin/sh\nprintf 'child stdout\\n'\nprintf 'child stderr\\n' >&2\n",
+                );
+                for args in [
+                    vec![
+                        "launcher",
+                        "add",
+                        "fixture",
+                        "--command",
+                        child.to_str().unwrap(),
+                    ],
+                    vec!["env", "create", "Daemon", "--launcher", "fixture"],
+                    vec!["service", "start", "Daemon"],
+                ] {
+                    let output = run_ocm(&cwd, &env, &args);
+                    assert!(output.status.success(), "{}", stderr(&output));
+                }
+                let logs = root.child("ocm-home/supervisor/logs");
+                let diagnostic = logs.join(format!("daemon.{diagnostic_stream}.log"));
+                let child_output = logs.join(format!(".Daemon.{stream}.log"));
+                let backing = if reverse { &child_output } else { &diagnostic };
+                fs::write(backing, b"preserved diagnostics\n").unwrap();
+                if reverse {
+                    symlink(child_output.file_name().unwrap(), &diagnostic).unwrap();
+                }
+                if hardlink {
+                    fs::hard_link(&diagnostic, &child_output).unwrap();
+                }
+                let sink = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&diagnostic)
+                    .unwrap();
+                let retained = if rotated {
+                    let retained = logs.join(format!("daemon.{diagnostic_stream}.log.1"));
+                    fs::rename(backing, &retained).unwrap();
+                    retained
+                } else {
+                    diagnostic.clone()
+                };
+                let alias = if reverse {
+                    diagnostic.clone()
+                } else {
+                    child_output
+                };
+                if !reverse && !hardlink {
+                    symlink(diagnostic.file_name().unwrap(), &alias).unwrap();
+                }
+                let run_once = || {
+                    let mut command = Command::new(crate::support::ocm_test_binary_path());
+                    command
+                        .args(["__daemon", "run", "--once", "--json"])
+                        .current_dir(&cwd)
+                        .env_clear()
+                        .envs(&env);
+                    if diagnostic_stream == "stdout" {
+                        command.stdout(sink.try_clone().unwrap());
+                    } else {
+                        command.stderr(sink.try_clone().unwrap());
+                    }
+                    command.output().unwrap()
+                };
+                let refused = run_once();
+                assert!(!refused.status.success(), "{stream}, rotated={rotated}");
+                let diagnostics = fs::read_to_string(&retained).unwrap();
+                assert!(diagnostics.starts_with("preserved diagnostics\n"));
+                assert!(!diagnostics.contains("child stdout"));
+                assert!(!diagnostics.contains("child stderr"));
+                assert_eq!(diagnostic.exists(), !rotated);
+                assert_eq!(alias.is_symlink(), !hardlink);
+                if mode == "rotated" || reverse {
+                    let error_output = if diagnostic_stream == "stderr" {
+                        diagnostics.clone()
+                    } else {
+                        stderr(&refused)
+                    };
+                    assert!(
+                        error_output.contains(&path_string(&alias)),
+                        "{error_output}"
+                    );
+                    assert!(
+                        error_output.contains("restore a separately owned target"),
+                        "{error_output}"
+                    );
+                    assert!(
+                        error_output.contains("remove the alias before retrying"),
+                        "{error_output}"
+                    );
+                }
+
+                // Retrying after the unsafe alias is removed starts normally, and
+                // the live diagnostic descriptor still owns only its old output.
+                fs::remove_file(&alias).unwrap();
+                assert!(run_once().status.success());
+                for (stream, expected) in [("info", "child stdout\n"), ("error", "child stderr\n")]
+                {
+                    let output = run_ocm(
+                        &cwd,
+                        &env,
+                        &["logs", "Daemon", "--stream", stream, "--json"],
+                    );
+                    assert!(output.status.success(), "{}", stderr(&output));
+                    assert_eq!(json_output(&output)["content"], expected);
+                }
+                assert_eq!(diagnostic.exists(), !rotated);
+                let diagnostics = fs::read_to_string(&retained).unwrap();
+                assert!(diagnostics.starts_with("preserved diagnostics\n"));
+                assert!(!diagnostics.contains("child stdout"));
+                assert!(!diagnostics.contains("child stderr"));
+            }
+        }
+    }
+}
+
 #[test]
 fn service_install_uses_valid_path_ocm_for_dev_artifact() {
     let root = TestDir::new("service-install-valid-path-ocm");
