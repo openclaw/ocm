@@ -2492,7 +2492,8 @@ fn preserve_materialized_extension_dependencies(
     link_or_copy: fn(&Path, &Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let install_files = fs::canonicalize(install_files).map_err(|error| error.to_string())?;
-    let host = installed_openclaw_package_root(&install_files);
+    let host = fs::canonicalize(installed_openclaw_package_root(&install_files))
+        .map_err(|error| error.to_string())?;
     let source = fs::canonicalize(installed_package).map_err(|error| error.to_string())?;
     let target = fs::canonicalize(target).map_err(|error| error.to_string())?;
     let extension_root = target.clone();
