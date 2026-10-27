@@ -430,7 +430,9 @@ verification.
 cleans temporary simulation envs and runtimes when the run finishes. For
 published targets it first validates that the target exists, then runs OpenClaw's own
 `update --dry-run --json` plan against the clone, switches the clone, and runs
-update-mode doctor, plugin update dry-run, and gateway status checks. For local
+update-mode doctor, plugin update dry-run, and gateway status checks. If the
+selected runtime changes before the switch, preparation fails; rerun the
+simulation to select the target again. For local
 repos it validates the checkout with dependency/build checks before running the
 same post-update checks. Its dependency setup runs `pnpm install
 --frozen-lockfile` in the simulation's own worktree only after the same

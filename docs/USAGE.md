@@ -361,6 +361,7 @@ Use `upgrade simulate` when you want to test what would happen against a publish
 - cleanup removes only the simulation environment generation created by that run; if the name was removed and recreated during checks, the replacement is preserved and cleanup reports failure without changing the functional outcome
 - if another environment binds to a temporary runtime, cleanup preserves that runtime and reports `cleanup: "failed"` with the dependent environment names; the functional `outcome` is unchanged, and the command exits nonzero. Clear those bindings before removing the retained runtime with `ocm runtime remove <name>`
 - missing published targets fail before any simulation env is created
+- a selected runtime that changes before the clone switches fails the `prepare target` check instead of validating a different release; rerun the simulation to select the target again
 - `--scenario all` runs built-in current, clean minimum, and Telegram-configured env shapes as separate simulation clones
 - target runtime installation, checkpoint preflight, and runtime recovery preparation run while the current managed gateway remains available; preparation failure leaves it unchanged
 - a running managed gateway is stopped only for checkpoint capture, runtime publication, environment mutation, and finalization

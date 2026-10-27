@@ -520,6 +520,7 @@ struct UpgradeRollbackPlan {
 #[derive(Clone, Debug)]
 struct PreparedSimulationRuntime {
     name: String,
+    meta: RuntimeMeta,
     note: String,
     temporary: bool,
 }
@@ -2142,6 +2143,19 @@ impl Cli {
                     "simulation target runtime was not prepared before scenario execution"
                         .to_string()
                 })?;
+                // Keep the comparison and binding in the same admission window:
+                // a supported update may have replaced this unbound name while
+                // the source update plan was running.
+                let _admission =
+                    try_lock_runtime_binding(&prepared_runtime.name, &self.env, &self.cwd)?;
+                if get_runtime(&prepared_runtime.name, &self.env, &self.cwd)?
+                    != prepared_runtime.meta
+                {
+                    return Err(format!(
+                        "simulation target runtime {:?} changed after preparation; rerun the simulation",
+                        prepared_runtime.name
+                    ));
+                }
                 self.environment_service()
                     .set_runtime_locked(simulation_name, &prepared_runtime.name)?;
                 Ok((
@@ -2210,6 +2224,7 @@ impl Cli {
             if healthy && same_release {
                 return Ok(Some(PreparedSimulationRuntime {
                     name: canonical_name.clone(),
+                    meta: existing,
                     note: format!("using installed runtime {canonical_name}"),
                     temporary: false,
                 }));
@@ -2217,7 +2232,7 @@ impl Cli {
         }
 
         let runtime_name = simulation_runtime_name(source_name);
-        install_runtime_from_selected_official_openclaw_release(
+        let meta = install_runtime_from_selected_official_openclaw_release(
             runtime_name.clone(),
             false,
             official_openclaw_releases_url(&self.env),
@@ -2239,6 +2254,7 @@ impl Cli {
         )?;
         Ok(Some(PreparedSimulationRuntime {
             name: runtime_name,
+            meta: meta.meta,
             note: "installed temporary runtime for simulation".to_string(),
             temporary: true,
         }))

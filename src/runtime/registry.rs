@@ -49,7 +49,7 @@ impl RuntimeReleaseSelectorKind {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeCompanionMeta {
     pub id: String,
@@ -60,7 +60,7 @@ pub struct RuntimeCompanionMeta {
     pub entrypoint_sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeMeta {
     pub kind: String,

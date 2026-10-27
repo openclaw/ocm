@@ -3266,6 +3266,199 @@ fn upgrade_simulate_tests_a_published_version_without_changing_the_source_env() 
 
 #[cfg(unix)]
 #[test]
+fn upgrade_simulate_rechecks_prepared_runtime_before_binding() {
+    use std::os::unix::process::CommandExt;
+
+    struct Simulation(std::process::Child);
+    impl Drop for Simulation {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+
+    for replace in [false, true] {
+        let root = TestDir::new("simulation-runtime-identity");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_node_and_npm(&root, &mut env, "22.22.3");
+        let ready = root.child("plan.ready");
+        let release = root.child("plan.release");
+        env.insert("OCM_TEST_PLAN_READY".into(), path_string(&ready));
+        env.insert("OCM_TEST_PLAN_RELEASE".into(), path_string(&release));
+        let old = root.child("old-openclaw");
+        write_executable_script(
+            &old,
+            r#"#!/bin/sh
+if [ "$1" = update ]; then
+  : > "$OCM_TEST_PLAN_READY"
+  attempts=0
+  while [ ! -f "$OCM_TEST_PLAN_RELEASE" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 400 ] || exit 19
+    sleep 0.05
+  done
+fi
+printf '2026.3.24\n'
+"#,
+        );
+        let target = openclaw_package_tarball("#!/bin/sh\nprintf '2026.3.25\\n'\n", "2026.3.25");
+        let replacement =
+            openclaw_package_tarball("#!/bin/sh\nprintf '2026.3.26\\n'\n", "2026.3.26");
+        let target_server = TestHttpServer::serve_bytes_times(
+            "/target.tgz",
+            "application/octet-stream",
+            &target,
+            4,
+        );
+        let replacement_server = TestHttpServer::serve_bytes_times(
+            "/replacement.tgz",
+            "application/octet-stream",
+            &replacement,
+            4,
+        );
+        let packument = serde_json::json!({
+            "dist-tags": {"latest": "2026.3.26"},
+            "versions": {
+                "2026.3.25": {"version": "2026.3.25", "dist": {
+                    "tarball": target_server.url(), "integrity": sha512_integrity(&target)
+                }},
+                "2026.3.26": {"version": "2026.3.26", "dist": {
+                    "tarball": replacement_server.url(), "integrity": sha512_integrity(&replacement)
+                }}
+            },
+            "time": {"2026.3.25": "2026-03-25T09:00:00.000Z", "2026.3.26": "2026-03-26T09:00:00.000Z"}
+        });
+        let registry = TestHttpServer::serve_bytes_times(
+            "/openclaw",
+            "application/json",
+            packument.to_string().as_bytes(),
+            12,
+        );
+        env.insert("OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(), registry.url());
+        let run = |args: &[&str]| {
+            let output = run_ocm(&cwd, &env, args);
+            assert!(output.status.success(), "{}", stderr(&output));
+            output
+        };
+        run(&["runtime", "add", "old", "--path", &path_string(&old)]);
+        run(&["env", "create", "demo", "--runtime", "old"]);
+        run(&["runtime", "install", "--version", "2026.3.25"]);
+        let source = root.child("ocm-home/envs/demo");
+        let config = source.join(".openclaw/openclaw.json");
+        let sentinel = source.join("source-sentinel");
+        fs::write(&config, "{}\n").unwrap();
+        fs::write(&sentinel, "source data").unwrap();
+        let source_before = stdout(&run(&["env", "show", "demo", "--json"]));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ocm"));
+        command
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .process_group(0)
+            .args([
+                "upgrade",
+                "simulate",
+                "demo",
+                "--to",
+                "2026.3.25",
+                "--keep-simulations",
+                "--json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut simulation = Simulation(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(
+                simulation.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "simulation did not reach its source update plan"
+            );
+            sleep(Duration::from_millis(20));
+        }
+        if replace {
+            let update = run(&[
+                "runtime",
+                "update",
+                "2026.3.25",
+                "--version",
+                "2026.3.26",
+                "--json",
+            ]);
+            let updated: Value = serde_json::from_str(&stdout(&update)).unwrap();
+            assert_eq!(updated["releaseVersion"], "2026.3.26");
+        }
+        fs::write(&release, "finish").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = simulation.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "simulation did not settle");
+            sleep(Duration::from_millis(20));
+        };
+        let mut output = String::new();
+        simulation
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        let summary: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(status.success(), !replace, "{summary}");
+        assert_eq!(summary["to"], "2026.3.25");
+        assert_eq!(
+            summary["outcome"],
+            if replace { "failed" } else { "passed" }
+        );
+        let sim_name = summary["simulationEnv"].as_str().unwrap();
+        let checks = summary["checks"].as_array().unwrap();
+        if replace {
+            assert!(checks.iter().any(|check| {
+                check["name"] == "prepare target"
+                    && check["status"] == "failed"
+                    && check["note"]
+                        .as_str()
+                        .unwrap()
+                        .contains("changed after preparation")
+            }));
+            assert!(
+                !checks
+                    .iter()
+                    .any(|check| check["name"] == "openclaw --version")
+            );
+            assert_eq!(
+                stdout(&run(&["env", "run", sim_name, "--", "--version"])).trim(),
+                "2026.3.24"
+            );
+        } else {
+            assert_eq!(summary["toBindingName"], "2026.3.25");
+            assert_eq!(
+                stdout(&run(&["env", "run", sim_name, "--", "--version"])).trim(),
+                "2026.3.25"
+            );
+            let update = run_ocm(
+                &cwd,
+                &env,
+                &["runtime", "update", "2026.3.25", "--version", "2026.3.26"],
+            );
+            assert!(!update.status.success());
+            assert!(stderr(&update).contains("still used by environment(s)"));
+            assert!(stderr(&update).contains(sim_name));
+        }
+        assert_eq!(
+            stdout(&run(&["env", "show", "demo", "--json"])),
+            source_before
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), "{}\n");
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "source data");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn upgrade_simulate_preserves_an_accepted_runtime_borrower() {
     use std::os::unix::process::CommandExt;
 
