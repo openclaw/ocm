@@ -1494,6 +1494,34 @@ fn cleanup_npm_lifecycle_environment(lifecycle_root: &Path) -> Result<(), String
     })
 }
 
+#[cfg(windows)]
+fn npm_command_prefix(path: &Path) -> PathBuf {
+    use std::path::Prefix;
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    // canonicalize returns filesystem-API verbatim paths. npm's path handling
+    // recurses on those prefixes; keep the same physical drive/UNC destination
+    // in the spelling accepted by the native command.
+    let mut native = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut prefix = OsString::from(r"\\");
+            prefix.push(server);
+            prefix.push(r"\");
+            prefix.push(share);
+            PathBuf::from(prefix)
+        }
+        _ => return path.to_path_buf(),
+    };
+    for component in components {
+        native.push(component.as_os_str());
+    }
+    native
+}
+
 fn install_openclaw_package_with_npm(
     archive_path: &Path,
     additional_archives: &[PathBuf],
@@ -1511,6 +1539,8 @@ fn install_openclaw_package_with_npm(
             display_path(install_files)
         )
     })?;
+    #[cfg(windows)]
+    let npm_prefix = npm_command_prefix(&npm_prefix);
     let requirement = if local_adapter.is_some() {
         NodeRequirement::default()
     } else {
@@ -4240,6 +4270,15 @@ mod tests {
                 None,
             )
             .unwrap();
+            for log in std::fs::read_dir(root.join("cache/_logs")).unwrap() {
+                let log = std::fs::read_to_string(log.unwrap().path()).unwrap();
+                for line in log
+                    .lines()
+                    .filter(|line| line.contains("info using ") || line.contains("verbose argv "))
+                {
+                    println!("{line}");
+                }
+            }
             let modules = install.join("node_modules");
             for (package, name, entry) in [
                 ("openclaw", "openclaw", "openclaw.mjs"),
@@ -4264,6 +4303,16 @@ mod tests {
             return;
         }
 
+        for (input, expected) in [
+            (r"\\?\C:\state\stage\files", r"C:\state\stage\files"),
+            (r"\\?\UNC\server\share\state", r"\\server\share\state"),
+            (r"\\?\Volume{device}\state", r"\\?\Volume{device}\state"),
+        ] {
+            assert_eq!(
+                super::npm_command_prefix(Path::new(input)),
+                Path::new(expected)
+            );
+        }
         let root = tempfile::tempdir().unwrap();
         let pack = |path: &Path, name: &str, entry: &str| {
             let mut manifest = serde_json::json!({
@@ -4312,8 +4361,17 @@ mod tests {
         let tmp = root.path().join("tmp");
         std::fs::create_dir(&home).unwrap();
         std::fs::create_dir(&tmp).unwrap();
+        let npm = Command::new("where.exe").arg("npm.cmd").output().unwrap();
+        assert!(
+            npm.status.success(),
+            "{}",
+            String::from_utf8_lossy(&npm.stderr)
+        );
+        let npm = String::from_utf8(npm.stdout).unwrap();
+        let npm = npm.lines().next().unwrap().trim();
+        println!("Native npm: {npm}");
         let mut command = Command::new(std::env::current_exe().unwrap());
-        command.env_clear();
+        command.env_clear().env("OCM_INTERNAL_NPM_BIN", npm);
         for (key, value) in std::env::vars_os() {
             if matches!(
                 key.to_string_lossy().to_ascii_uppercase().as_str(),
@@ -4334,6 +4392,8 @@ mod tests {
             .env("TMP", &tmp)
             .env("TEMP", &tmp)
             .env("npm_config_cache", root.path().join("cache"))
+            .env("npm_config_loglevel", "verbose")
+            .env("npm_config_logs_max", "10")
             .env("npm_config_offline", "true")
             .env("npm_config_install_strategy", "linked")
             .current_dir(root.path())
