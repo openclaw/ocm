@@ -224,36 +224,6 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Attribute native snapshot stop marker on unchanged baseline
-        if: runner.os == 'macOS'
-        timeout-minutes: 5
-        run: |
-          baseline="$RUNNER_TEMP/ocm-snapshot-baseline"
-          baseline_target="$RUNNER_TEMP/ocm-snapshot-baseline-target"
-          git fetch --no-tags --depth=1 origin dc282d315de01731c395983076bd04e633554bff
-          git worktree add --detach "$baseline" dc282d315de01731c395983076bd04e633554bff
-          git -C "$baseline" rev-parse HEAD 'HEAD^{tree}'
-          git -C "$baseline" status --porcelain
-          git rev-parse HEAD 'HEAD^{tree}'
-          git diff --exit-code dc282d315de01731c395983076bd04e633554bff HEAD -- src/env src/supervisor src/store/checkpoints.rs tests/daemon_runtime_tests.rs tests/support/mod.rs Cargo.lock
-          rustc -vV
-          node --version
-          cd "$baseline"
-          cargo test --locked --target-dir "$baseline_target" --test daemon_runtime_tests --no-run
-          shasum -a 256 "$baseline_target/debug/ocm" Cargo.lock
-          for test_binary in "$baseline_target"/debug/deps/daemon_runtime_tests-*; do
-            if [ -f "$test_binary" ] && [ -x "$test_binary" ]; then shasum -a 256 "$test_binary"; fi
-          done
-          for attempt in {1..20}; do
-            printf 'SNAPSHOT_BASELINE_ATTEMPT=%s\n' "$attempt"
-            if cargo test --locked --target-dir "$baseline_target" --test daemon_runtime_tests snapshot_create_preserves_all_running_siblings_and_restores_target -- --exact --nocapture; then
-              printf 'SNAPSHOT_BASELINE_RESULT=%s:pass\n' "$attempt"
-            else
-              result=$?
-              printf 'SNAPSHOT_BASELINE_RESULT=%s:failure:%s\n' "$attempt" "$result"
-              exit "$result"
-            fi
-          done
       - name: Run test suite
         run: cargo test --locked
       - name: Smoke test cargo install
