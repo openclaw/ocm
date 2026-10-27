@@ -1623,24 +1623,48 @@ impl Cli {
             })?;
             self.resolve_dev_repo_root(Some(repo_root.to_string()))?
         };
-        if let SourceWatchState::Active(active) = &observation {
+        let pending_source = if meta.dev.is_none()
+            && !matches!(observation, SourceWatchState::Active(_))
+        {
+            let lease = env_service.observe_source_watch_lease(&meta.name)?;
+            Some(env_service
+                .source_watch_session(&meta.name)?
+                .filter(|session| {
+                    !session.closed
+                        && !session.service_preparation
+                        && session.restore_target_matches(meta)
+                        && lease.as_ref().is_some_and(|lease| {
+                            lease.held && lease.lease_id == session.lease_id
+                        })
+                })
+                .and_then(|session| session.repo_root)
+                .filter(|source| Path::new(source).is_absolute())
+                .ok_or_else(|| format!(
+                    "source watch for env {} is {state}, but its source is unavailable; retry after startup or restoration completes",
+                    meta.name
+                ))?)
+        } else {
+            None
+        };
+        let current_source = match &observation {
+            SourceWatchState::Active(active) => Some(active.repo_root.as_str()),
+            _ => pending_source.as_deref(),
+        };
+        if let Some(current_source) = current_source {
             let requested = fs::canonicalize(&expected_source).map_err(|error| {
                 format!(
                     "failed to resolve requested source {}: {error}",
                     display_path(&expected_source)
                 )
             })?;
-            let current = fs::canonicalize(&active.repo_root).map_err(|error| {
-                format!(
-                    "failed to resolve active source {}: {error}",
-                    active.repo_root
-                )
+            let current = fs::canonicalize(current_source).map_err(|error| {
+                format!("failed to resolve session source {current_source}: {error}")
             })?;
             if requested != current {
                 return Err(format!(
                     "source watch for env {} already uses {}; stop that session before selecting {}",
                     meta.name,
-                    active.repo_root,
+                    current_source,
                     display_path(&requested)
                 ));
             }

@@ -142,6 +142,15 @@ All foreground combinations support `ocm dev stop <env>` and reuse a matching
 active session. `dev status` reports backend watching separately from session
 ownership.
 
+Temporary takeover reuse checks the captured canonical checkout during preparation
+and service restoration as well as while active. A request for another checkout
+is refused; a matching request reports the current session's progress without
+starting another process. Older non-dev sessions that have not recorded their
+source cannot prove a match during startup or restoration: retry after that phase
+finishes. This refusal leaves the existing session running, and `dev stop` and
+recovery remain available. Active older sessions use their recorded source override.
+
+
 Creating or changing a dev binding is refused while an environment containing or
 owning its source, worktree path, or required Git metadata is busy with another operation.
 Required Git metadata includes linked `objects/pack` directories and pack files, and object stores
