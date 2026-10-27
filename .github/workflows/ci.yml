@@ -221,6 +221,44 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Qualify Node interruption fixture socket mode and repetitions
+        if: github.event_name == 'pull_request' && github.head_ref == 'node-fixture-stream' && runner.os == 'macOS'
+        timeout-minutes: 10
+        env:
+          PROOF_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          proof_root="$RUNNER_TEMP/node-fixture-mode"
+          git worktree add --detach "$proof_root" "$PROOF_HEAD"
+          git -C "$proof_root" rev-parse HEAD 'HEAD^{tree}'
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          export PROOF_ROOT="$proof_root"
+          python3 - <<'PYMODE'
+          import os
+          from pathlib import Path
+          path = Path(os.environ["PROOF_ROOT"]) / "tests/runtime_command_tests.rs"
+          source = path.read_text()
+          marker = "    stream.set_nonblocking(false).unwrap();"
+          assert source.count(marker) == 1
+          observation = """    let inherited = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&stream), libc::F_GETFL) };
+              assert!(inherited >= 0);
+              assert_ne!(inherited & libc::O_NONBLOCK, 0, "native accepted socket must reproduce inherited mode");
+              stream.set_nonblocking(false).unwrap();
+              let normalized = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&stream), libc::F_GETFL) };
+              let listener_flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&listener), libc::F_GETFL) };
+              assert!(normalized >= 0 && listener_flags >= 0);
+              assert_eq!(normalized & libc::O_NONBLOCK, 0);
+              assert_ne!(listener_flags & libc::O_NONBLOCK, 0);
+              eprintln!("native socket flags inherited={inherited} normalized={normalized} listener={listener_flags}");"""
+          path.write_text(source.replace(marker, observation))
+          PYMODE
+          cargo test --manifest-path "$proof_root/Cargo.toml" --locked --test runtime_command_tests official_runtime_install_reclaims_interrupted_node_preparation -- --exact --nocapture
+          git -C "$proof_root" restore tests/runtime_command_tests.rs
+          git -C "$proof_root" diff --exit-code
+          for attempt in $(seq 1 20); do
+            echo "Uninstrumented candidate exact-test attempt $attempt"
+            cargo test --manifest-path "$proof_root/Cargo.toml" --locked --test runtime_command_tests official_runtime_install_reclaims_interrupted_node_preparation -- --exact --nocapture
+          done
+
       - name: Run test suite
         run: cargo test --locked
       - name: Smoke test cargo install
