@@ -4,6 +4,10 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+### Changed
+
+- Refresh Git configuration support to gix-config 0.62.1 while retaining Rust 1.88 support, and update the pinned Rust cache and Python setup actions. Thanks @dependabot (#706, #707).
+
 ## 0.3.7 - 2026-10-27
 
 **Highlights:** Reliable migration and scoped recovery, preserved local extension dependencies, and upgrade simulations that verify the selected target.
