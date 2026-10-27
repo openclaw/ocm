@@ -190,6 +190,20 @@ jobs:
             brew install fish
           fi
           fish --version
+      - name: Reproduce interrupted Node fixture on pinned baseline (temporary PR723 attribution)
+        if: github.event_name == 'pull_request' && github.event.pull_request.number == 723 && runner.os == 'macOS'
+        run: |
+          baseline=e9c9f51aa9541c7afcb09149cb2ec94e721ab4e2
+          baseline_root="$RUNNER_TEMP/ocm-pr723-baseline"
+          git fetch --no-tags origin "$baseline"
+          git worktree add --detach "$baseline_root" "$baseline"
+          git -C "$baseline_root" rev-parse HEAD 'HEAD^{tree}'
+          git -C "$baseline_root" status --short
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          for attempt in $(seq 1 20); do
+            echo "Pinned baseline exact-test attempt $attempt"
+            cargo test --manifest-path "$baseline_root/Cargo.toml" --locked --test runtime_command_tests official_runtime_install_reclaims_interrupted_node_preparation -- --exact --nocapture
+          done
       - name: Prove macOS private config creation across users
         if: runner.os == 'macOS'
         run: |
