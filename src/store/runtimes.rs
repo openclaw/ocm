@@ -1529,6 +1529,7 @@ fn install_openclaw_package_with_npm(
     cwd: &Path,
     env: &BTreeMap<String, String>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
+    guard: &RuntimeMutationGuard,
 ) -> Result<(), String> {
     // npm's linked installer can treat an aliased prefix as already up to date
     // without installing its packages. Resolve only this existing owned stage;
@@ -1581,6 +1582,7 @@ fn install_openclaw_package_with_npm(
         local_adapter.apply_environment(&mut command);
     }
     let lifecycle_root = isolate_npm_lifecycle_environment(&mut command, install_files)?;
+    guard.retain_for_child(&mut command);
     let output = command.output();
     let cleanup = cleanup_npm_lifecycle_environment(&lifecycle_root);
     let output = output.map_err(|error| {
@@ -1801,6 +1803,7 @@ fn pack_local_openclaw_companion(
     pack_dir: &Path,
     spec: LocalCompanionSpec,
     env: &BTreeMap<String, String>,
+    guard: &RuntimeMutationGuard,
 ) -> Result<PackedLocalCompanion, String> {
     let package_dir = format!("extensions/{}", spec.directory_name);
     let output_dir = pack_dir.join("companions").join(&spec.id);
@@ -1811,6 +1814,7 @@ fn pack_local_openclaw_companion(
         .arg("scripts/lib/plugin-npm-runtime-build.mjs")
         .arg(&package_dir)
         .current_dir(repo_path);
+    guard.retain_for_child(&mut build);
     run_local_companion_command(
         &mut build,
         &format!("local companion runtime build for {}", spec.id),
@@ -1822,6 +1826,7 @@ fn pack_local_openclaw_companion(
         .arg("--package-dir")
         .arg(&package_dir)
         .current_dir(repo_path);
+    guard.retain_for_child(&mut lock_check);
     run_local_companion_command(
         &mut lock_check,
         &format!("local companion package-lock check for {}", spec.id),
@@ -1839,6 +1844,7 @@ fn pack_local_openclaw_companion(
         .arg("--pack-destination")
         .arg(&output_dir)
         .current_dir(repo_path);
+    guard.retain_for_child(&mut pack);
     run_local_companion_command(
         &mut pack,
         &format!("local companion package build for {}", spec.id),
@@ -1961,6 +1967,7 @@ fn install_local_openclaw_companion(
     scratch_dir: &Path,
     context: InstallContext<'_>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
+    guard: &RuntimeMutationGuard,
 ) -> Result<RuntimeCompanionMeta, String> {
     let install_root = scratch_dir.join("companion-installs").join(&packed.spec.id);
     ensure_dir(&install_root)?;
@@ -1998,6 +2005,7 @@ fn install_local_openclaw_companion(
         .stderr(Stdio::piped());
     install_command.apply_environment(&mut command, context.env)?;
     let lifecycle_root = isolate_npm_lifecycle_environment(&mut command, &install_root)?;
+    guard.retain_for_child(&mut command);
     let output = command.output();
     let cleanup = cleanup_npm_lifecycle_environment(&lifecycle_root);
     let output = output.map_err(|error| {
@@ -2112,6 +2120,7 @@ fn pack_local_openclaw_repo(
     pack_dir: &Path,
     env: &BTreeMap<String, String>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
+    guard: &RuntimeMutationGuard,
 ) -> Result<PathBuf, String> {
     ensure_dir(pack_dir)?;
     let npm = local_adapter
@@ -2146,6 +2155,7 @@ fn pack_local_openclaw_repo(
             OPENCLAW_OCM_SOURCE_PERFORMANCE_BUILD_PROFILE,
         );
     }
+    guard.retain_for_child(&mut command);
     let output = command.output().map_err(|error| {
         format!(
             "failed to run npm pack for local OpenClaw build in {}: {error}",
@@ -2336,6 +2346,7 @@ fn pack_local_source_extensions(
     extensions: Vec<LocalSourceExtension>,
     pack_dir: &Path,
     env: &BTreeMap<String, String>,
+    guard: &RuntimeMutationGuard,
 ) -> Result<Vec<LocalSourceExtensionArchive>, String> {
     if extensions.is_empty() {
         return Ok(Vec::new());
@@ -2361,6 +2372,7 @@ fn pack_local_source_extensions(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     npm.apply_environment(&mut command, env)?;
+    guard.retain_for_child(&mut command);
     let output = command.output().map_err(|error| {
         format!("failed to run npm pack for local OpenClaw source extensions: {error}")
     })?;
@@ -3219,6 +3231,7 @@ fn stage_runtime_from_openclaw_package_archive(
         context.cwd,
         context.env,
         local_adapter,
+        &target._lock,
     )?;
     expose_openclaw_package_runtime_dependencies(&target.install_files)?;
     // Exposing dependencies can copy them into the host when links are unavailable.
@@ -3543,6 +3556,9 @@ fn remove_runtime_files(
 ) -> Result<RuntimeMeta, String> {
     let meta = get_runtime(name, env, cwd)?;
     let path = runtime_meta_path(&meta.name, env, cwd)?;
+    if let Some(parent) = path.parent() {
+        reclaim_abandoned_runtime_stages(parent, &meta.name, env, cwd);
+    }
     if let Some(install_root) = meta.install_root.as_deref() {
         let expected_root = runtime_install_root(&meta.name, env, cwd)?;
         if clean_path(Path::new(install_root)) == expected_root && path_exists(&expected_root) {
@@ -3699,122 +3715,117 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
         .as_deref()
         .map(|target_env| resolve_target_source_plugin_closure(target_env, &repo_path, context))
         .transpose()?;
-    let stores = super::ensure_store(context.env, context.cwd)?;
-    let pack_dir = stores.runtimes_dir.join(format!(
-        ".{name}.pack-{}-{}",
-        std::process::id(),
-        now_utc().unix_timestamp_nanos()
-    ));
-    let _ = fs::remove_dir_all(&pack_dir);
+    // Packing belongs to the same recoverable, locked stage as installation.
+    // Legacy .pack roots have no such ownership and must remain untouched.
+    let target = prepare_runtime_install_target(name, options.force, context)?;
+    let pack_dir = target.install_root.join("pack");
 
-    let result = (|| {
-        let mut local_adapter = local_build_npm_adapter(&repo_path, context.env)?;
-        let archive_path =
-            pack_local_openclaw_repo(&repo_path, &pack_dir, context.env, local_adapter.as_ref())?;
-        let needs_source_extensions = options.include_source_extensions
-            || target_source_plugins
-                .as_ref()
-                .is_some_and(|plugins| !plugins.is_empty());
-        let packaged_ids = needs_source_extensions
-            .then(|| packaged_openclaw_extension_ids(&archive_path))
-            .transpose()?
-            .unwrap_or_default();
-        let source_extensions = if options.include_source_extensions {
-            let extensions =
-                local_source_extensions_from_build(&repo_path, &packaged_ids, false, None)?;
-            pack_local_source_extensions(extensions, &pack_dir, context.env)?
-        } else if let Some(target_source_plugins) = target_source_plugins
+    let mut local_adapter = local_build_npm_adapter(&repo_path, context.env)?;
+    let archive_path = pack_local_openclaw_repo(
+        &repo_path,
+        &pack_dir,
+        context.env,
+        local_adapter.as_ref(),
+        &target._lock,
+    )?;
+    let needs_source_extensions = options.include_source_extensions
+        || target_source_plugins
             .as_ref()
-            .filter(|plugins| !plugins.is_empty())
-        {
-            let extensions = local_source_extensions_from_build(
-                &repo_path,
-                &packaged_ids,
-                true,
-                Some(target_source_plugins),
-            )?;
-            let available_ids = extensions
-                .iter()
-                .map(|extension| extension.id.clone())
-                .collect::<BTreeSet<_>>();
-            let missing = target_source_plugins
-                .difference(&available_ids)
-                .cloned()
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                return Err(format!(
-                    "the local OpenClaw build did not produce required source plugins for target environment {}: {}",
-                    options.target_env.as_deref().unwrap_or_default(),
-                    missing.join(", ")
-                ));
-            }
-            pack_local_source_extensions(extensions, &pack_dir, context.env)?
-        } else {
-            Vec::new()
-        };
-        if let Some(adapter) = local_adapter.as_mut()
-            && !source_extensions.is_empty()
-            && let Some(plan) = local_workspace_dependency_plan(&repo_path, &source_extensions)?
-        {
-            let versions = serde_json::from_str(&plan.versions_json)
-                .map_err(|error| format!("failed to parse workspace versions: {error}"))?;
-            // The native adapter only knows packages it packs itself. The root may also
-            // reference an extension supplied separately, so rewrite it with the full plan.
-            patch_workspace_package_archive(&archive_path, &versions)?;
-            for extension in &source_extensions {
-                patch_workspace_package_archive(&extension.archive_path, &versions)?;
-            }
-            adapter.workspace_dependency_dirs = Some(plan.dirs);
-            adapter.workspace_dependency_versions = Some(plan.versions_json);
-        }
-        let packed_companions = companion_specs
-            .into_values()
-            .map(|spec| pack_local_openclaw_companion(&repo_path, &pack_dir, spec, context.env))
-            .collect::<Result<Vec<_>, _>>()?;
-        let target = prepare_runtime_install_target(name, options.force, context)?;
-        if path_exists(&target.install_root) {
+            .is_some_and(|plugins| !plugins.is_empty());
+    let packaged_ids = needs_source_extensions
+        .then(|| packaged_openclaw_extension_ids(&archive_path))
+        .transpose()?
+        .unwrap_or_default();
+    let source_extensions = if options.include_source_extensions {
+        let extensions =
+            local_source_extensions_from_build(&repo_path, &packaged_ids, false, None)?;
+        pack_local_source_extensions(extensions, &pack_dir, context.env, &target._lock)?
+    } else if let Some(target_source_plugins) = target_source_plugins
+        .as_ref()
+        .filter(|plugins| !plugins.is_empty())
+    {
+        let extensions = local_source_extensions_from_build(
+            &repo_path,
+            &packaged_ids,
+            true,
+            Some(target_source_plugins),
+        )?;
+        let available_ids = extensions
+            .iter()
+            .map(|extension| extension.id.clone())
+            .collect::<BTreeSet<_>>();
+        let missing = target_source_plugins
+            .difference(&available_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
             return Err(format!(
-                "runtime install root already exists: {}",
-                display_path(&target.install_root)
+                "the local OpenClaw build did not produce required source plugins for target environment {}: {}",
+                options.target_env.as_deref().unwrap_or_default(),
+                missing.join(", ")
             ));
         }
-        ensure_dir(&target.install_files)?;
-        let description = trim_description(options.description)
-            .or_else(|| Some(default_local_build_description(&version, commit.as_deref())));
-        let mut meta = stage_runtime_from_openclaw_package_archive(
-            &target,
-            &archive_path,
-            RuntimeSourceDetails {
-                path: Some(repo_path),
-                ..RuntimeSourceDetails::default()
-            },
-            RuntimeReleaseDetails {
-                version: Some(version),
-                ..RuntimeReleaseDetails::default()
-            },
-            description,
-            context,
-            local_adapter.as_ref(),
-            &source_extensions,
-        )?;
-        meta.companions = packed_companions
-            .iter()
-            .map(|packed| {
-                install_local_openclaw_companion(
-                    packed,
-                    &target.install_files,
-                    &pack_dir,
-                    context,
-                    local_adapter.as_ref(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        meta.runtime_sha256 = Some(tree_sha256(&target.install_files.join("node_modules"))?);
-        publish_runtime(target, meta)
-    })();
-
-    let _ = fs::remove_dir_all(&pack_dir);
-    result
+        pack_local_source_extensions(extensions, &pack_dir, context.env, &target._lock)?
+    } else {
+        Vec::new()
+    };
+    if let Some(adapter) = local_adapter.as_mut()
+        && !source_extensions.is_empty()
+        && let Some(plan) = local_workspace_dependency_plan(&repo_path, &source_extensions)?
+    {
+        let versions = serde_json::from_str(&plan.versions_json)
+            .map_err(|error| format!("failed to parse workspace versions: {error}"))?;
+        // The native adapter only knows packages it packs itself. The root may also
+        // reference an extension supplied separately, so rewrite it with the full plan.
+        patch_workspace_package_archive(&archive_path, &versions)?;
+        for extension in &source_extensions {
+            patch_workspace_package_archive(&extension.archive_path, &versions)?;
+        }
+        adapter.workspace_dependency_dirs = Some(plan.dirs);
+        adapter.workspace_dependency_versions = Some(plan.versions_json);
+    }
+    let packed_companions = companion_specs
+        .into_values()
+        .map(|spec| {
+            pack_local_openclaw_companion(&repo_path, &pack_dir, spec, context.env, &target._lock)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ensure_dir(&target.install_files)?;
+    let description = trim_description(options.description)
+        .or_else(|| Some(default_local_build_description(&version, commit.as_deref())));
+    let mut meta = stage_runtime_from_openclaw_package_archive(
+        &target,
+        &archive_path,
+        RuntimeSourceDetails {
+            path: Some(repo_path),
+            ..RuntimeSourceDetails::default()
+        },
+        RuntimeReleaseDetails {
+            version: Some(version),
+            ..RuntimeReleaseDetails::default()
+        },
+        description,
+        context,
+        local_adapter.as_ref(),
+        &source_extensions,
+    )?;
+    meta.companions = packed_companions
+        .iter()
+        .map(|packed| {
+            install_local_openclaw_companion(
+                packed,
+                &target.install_files,
+                &pack_dir,
+                context,
+                local_adapter.as_ref(),
+                &target._lock,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    meta.runtime_sha256 = Some(tree_sha256(&target.install_files.join("node_modules"))?);
+    // A published runtime contains installed files, never packing scratch.
+    fs::remove_dir_all(&pack_dir).map_err(|error| error.to_string())?;
+    publish_runtime(target, meta)
 }
 
 pub fn install_runtime_from_release(
