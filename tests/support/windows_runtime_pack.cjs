@@ -33,15 +33,37 @@ if (process.env.PACK_BEAT) setInterval(() => {
   fs.writeFileSync(process.env.PACK_BEAT, String(Date.now()));
 }, 50);
 `);
-  const env = {...process.env,
-    USERPROFILE: process.env.HOME,
+  const env = {};
+  for (const key of ['PATH', 'PATHEXT', 'SystemRoot', 'WINDIR', 'COMSPEC']) {
+    const entry = Object.entries(process.env).find(([name]) => name.toUpperCase() === key.toUpperCase());
+    if (entry) env[key] = entry[1];
+  }
+  Object.assign(env, {
+    HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
+    OCM_HOME: path.join(root, 'ocm-home'), OCM_INTERNAL_SKIP_SERVICE_READINESS: '1',
+    TEMP: root, TMP: root,
     APPDATA: path.join(root, 'appdata'), LOCALAPPDATA: path.join(root, 'localappdata'),
     npm_config_cache: path.join(root, 'cache'), npm_config_offline: 'true',
     OCM_INTERNAL_NPM_BIN: cp.execFileSync('where.exe', ['npm.cmd'], {encoding: 'utf8'})
       .trim().split(/\r?\n/)[0],
     PACK_BEAT: beat, PACK_DONE: done, PACK_FINISHED: finished,
-  };
+  });
+  fs.mkdirSync(env.HOME, {recursive: true});
+  fs.mkdirSync(env.OCM_HOME, {recursive: true});
   fs.writeFileSync(path.join(root, 'npm-bin'), env.OCM_INTERNAL_NPM_BIN);
+  // Temporary unchanged-base attribution, removed after its native result.
+  if (process.argv[4] === '--ordinary-probe') {
+    delete env.PACK_BEAT;
+    delete env.PACK_DONE;
+    delete env.PACK_FINISHED;
+    const result = cp.spawnSync(binary,
+      ['runtime', 'build-local', 'stable', '--repo', repo, '--force', '--json'],
+      {cwd: repo, env, encoding: 'utf8', timeout: 90000});
+    if (result.error) throw result.error;
+    console.log(JSON.stringify({phase: 'ordinary-build', node: process.version,
+      binary, exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr}));
+    return;
+  }
   // Losing the parent before the private launcher opens custody must not
   // recreate that Job or start a writer. Exercise its real dispatch boundary.
   const forbidden = path.join(root, 'missing-parent-writer');

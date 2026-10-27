@@ -111,12 +111,30 @@ jobs:
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
-    - name: Prove native Windows installed runtime launch
+      - name: Prove native Windows installed runtime launch
         timeout-minutes: 5
         shell: pwsh
         run: |
           cargo test --locked --test runtime_launch_tests -- --include-ignored --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'native launch regression failed' }
+      - name: Attribute unchanged-base Windows local build
+        if: github.event_name == 'pull_request' && github.event.pull_request.number == 717
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $baseline = Join-Path $env:RUNNER_TEMP 'ocm-pack-baseline'
+          git fetch --no-tags --depth=1 origin e9c9f51aa9541c7afcb09149cb2ec94e721ab4e2
+          if ($LASTEXITCODE -ne 0) { throw 'baseline fetch failed' }
+          git worktree add --detach $baseline e9c9f51aa9541c7afcb09149cb2ec94e721ab4e2
+          if ($LASTEXITCODE -ne 0) { throw 'baseline checkout failed' }
+          git -C $baseline rev-parse HEAD
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'ocm-pack-baseline-target'
+          cargo build --locked --bin ocm --manifest-path (Join-Path $baseline 'Cargo.toml')
+          if ($LASTEXITCODE -ne 0) { throw 'baseline build failed' }
+          $fixture = Join-Path $env:RUNNER_TEMP ('ocm-tests/pack-baseline-' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Force $fixture | Out-Null
+          'owned' | node tests/support/windows_runtime_pack.cjs (Join-Path $env:CARGO_TARGET_DIR 'debug/ocm.exe') $fixture --ordinary-probe
+          if ($LASTEXITCODE -ne 0) { throw 'baseline probe failed' }
       - name: Prove native Windows runtime packing custody
         timeout-minutes: 5
         run: cargo test --locked --test windows_runtime_pack_tests native_windows_pack_preserves_live_child_archive -- --exact --nocapture
