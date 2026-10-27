@@ -51,21 +51,6 @@ if (process.env.PACK_BEAT) setInterval(() => {
   fs.mkdirSync(env.HOME, {recursive: true});
   fs.mkdirSync(env.OCM_HOME, {recursive: true});
   fs.writeFileSync(path.join(root, 'npm-bin'), env.OCM_INTERNAL_NPM_BIN);
-  // Temporary unchanged-base attribution, removed after its native result.
-  if (process.argv[4] === '--ordinary-probe') {
-    delete env.PACK_BEAT;
-    delete env.PACK_DONE;
-    delete env.PACK_FINISHED;
-    const result = cp.spawnSync(binary,
-      ['runtime', 'build-local', 'stable', '--repo', repo, '--force', '--json'],
-      {cwd: root, env, encoding: 'utf8', timeout: 90000});
-    if (result.error) throw result.error;
-    const npmCli = path.join(path.dirname(env.OCM_INTERNAL_NPM_BIN), 'node_modules/npm/bin/npm-cli.js');
-    const npm = cp.execFileSync(process.execPath, [npmCli, '--version'], {cwd: root, env, encoding: 'utf8'}).trim();
-    console.log(JSON.stringify({phase: 'ordinary-build', node: process.version, npm, cwd: root,
-      binary, exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr}));
-    return;
-  }
   // Losing the parent before the private launcher opens custody must not
   // recreate that Job or start a writer. Exercise its real dispatch boundary.
   const forbidden = path.join(root, 'missing-parent-writer');

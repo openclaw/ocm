@@ -117,13 +117,6 @@ jobs:
         run: |
           cargo test --locked --test runtime_launch_tests -- --include-ignored --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'native launch regression failed' }
-      - name: Attribute unchanged-base Windows local build
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 717
-        timeout-minutes: 10
-        shell: pwsh
-        run: |
-          node tests/support/windows_digest_qualification.cjs dc282d315de01731c395983076bd04e633554bff --assembly-only 31a9e6b78465a1fae940d67e585fd6f77a06ce1a
-          if ($LASTEXITCODE -ne 0) { throw 'baseline probe failed' }
       - name: Prove native Windows runtime packing custody
         timeout-minutes: 5
         run: cargo test --locked --test windows_runtime_pack_tests native_windows_pack_preserves_live_child_archive -- --exact --nocapture
@@ -244,13 +237,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Observe pinned macOS foreground regression
+      - name: Observe pinned macOS foreground regression with siblings
         if: runner.os == 'macOS' && github.event_name == 'pull_request' && github.event.pull_request.number == 717
         timeout-minutes: 5
         run: |
-          collector="$GITHUB_WORKSPACE/tests/support/foreground_resume_observe.py"
-          observation="$RUNNER_TEMP/foreground-resume-recheck-observation"
-          baseline="$RUNNER_TEMP/foreground-resume-recheck-base"
+          collector="$GITHUB_WORKSPACE/tests/support/foreground_resume_observe_suite.py"
+          observation="$RUNNER_TEMP/foreground-resume-recheck-suite-observation"
+          baseline="$RUNNER_TEMP/foreground-resume-recheck-suite-base"
           dump_observation() {
             if [ -d "$observation" ]; then
               python3 - "$observation" <<'PY'
