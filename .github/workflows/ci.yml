@@ -111,12 +111,14 @@ jobs:
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
-      - name: Prove native Windows installed runtime launch
+    - name: Prove native Windows installed runtime launch
         timeout-minutes: 5
         shell: pwsh
         run: |
           cargo test --locked --test runtime_launch_tests -- --include-ignored --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'native launch regression failed' }
+      - name: Prove native Windows runtime packing custody
+        run: cargo test --locked --test windows_runtime_pack_tests native_windows_pack_preserves_live_child_archive -- --exact --nocapture
       - name: Prove native Windows dev stop lifecycle
         run: |
           cargo test --locked --lib windows_source_watch_ -- --nocapture

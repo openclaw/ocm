@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[cfg(windows)]
+pub mod windows_job;
+
 #[cfg(target_os = "macos")]
 pub mod active_service_log;
 
