@@ -4,14 +4,44 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+## 0.3.7 - 2026-10-27
+
+**Highlights:** Reliable migration and scoped recovery, preserved local extension dependencies, and upgrade simulations that verify the selected target.
+
+### Added
+
+- Start a stopped borrowed dev environment from another checkout and switch it to that worktree while preserving its environment data. Active sessions still require matching source and port choices. ([#617](https://github.com/openclaw/ocm/pull/617), [#657](https://github.com/openclaw/ocm/pull/657), [#709](https://github.com/openclaw/ocm/pull/709))
+
 ### Fixed
 
+- Preserve implicit external default workspaces through both migration and adoption, with the imported configuration selecting the copied data and the source left unchanged. ([#719](https://github.com/openclaw/ocm/pull/719))
+- Restore scoped checkpoints across read-only captured ancestors without changing live ancestor permissions or independent project contents. Preserve full snapshots of symlinked roots, safely clear read-only transient residue, and reject snapshot storage that overlaps a custom source root. ([#721](https://github.com/openclaw/ocm/pull/721), [#607](https://github.com/openclaw/ocm/pull/607), [#695](https://github.com/openclaw/ocm/pull/695), [#701](https://github.com/openclaw/ocm/pull/701))
+- Preserve native npm's installed dependency versions and their transitive bindings when materializing selected source extensions, including the directory-copy fallback. ([#722](https://github.com/openclaw/ocm/pull/722))
+- Honor environment-backed plugin policies, source manifest aliases, native slot values and authorized configuration include roots in targeted local builds. ([#585](https://github.com/openclaw/ocm/pull/585), [#589](https://github.com/openclaw/ocm/pull/589), [#593](https://github.com/openclaw/ocm/pull/593), [#606](https://github.com/openclaw/ocm/pull/606))
+- Reject a simulation target replaced after preparation instead of reporting another release as successfully validated. Keep simulation checks on their original environment, handle channels sharing a release version, and prevent local-repo simulation installs from writing dependencies into the user's checkout. ([#723](https://github.com/openclaw/ocm/pull/723), [#697](https://github.com/openclaw/ocm/pull/697), [#651](https://github.com/openclaw/ocm/pull/651), [#663](https://github.com/openclaw/ocm/pull/663))
 - Reject blocking OpenClaw finalization receipts before publishing a replacement runtime, including capability-consent errors returned with a successful exit status, while preserving nonblocking plugin warnings. Thanks @hannesrudolph (#132).
+- Preserve environment bindings when runtime or launcher metadata is unreadable, and skip dev environments correctly during bulk upgrades. ([#696](https://github.com/openclaw/ocm/pull/696), [#679](https://github.com/openclaw/ocm/pull/679))
+- Migrate admitted home aliases, copied plugins and internal absolute links without writing back into the source. Retain durable plugin dependencies and skill files whose names resemble runtime residue. ([#588](https://github.com/openclaw/ocm/pull/588), [#603](https://github.com/openclaw/ocm/pull/603), [#604](https://github.com/openclaw/ocm/pull/604), [#658](https://github.com/openclaw/ocm/pull/658), [#675](https://github.com/openclaw/ocm/pull/675))
+- Retain shared skills, ClawHub tracking and saved skill revisions when copying or cleaning environments. Keep ordinary export archives free of credentials and device identity omitted by ordinary import, exclude archive staging files from their own contents, and stage imports privately. ([#605](https://github.com/openclaw/ocm/pull/605), [#609](https://github.com/openclaw/ocm/pull/609), [#615](https://github.com/openclaw/ocm/pull/615), [#630](https://github.com/openclaw/ocm/pull/630), [#672](https://github.com/openclaw/ocm/pull/672), [#654](https://github.com/openclaw/ocm/pull/654), [#618](https://github.com/openclaw/ocm/pull/618))
+- Protect active environments during pruning, registered source Git configuration during cleanup, and live credentials and sessions from deletion based on unrelated path text. ([#660](https://github.com/openclaw/ocm/pull/660), [#614](https://github.com/openclaw/ocm/pull/614), [#665](https://github.com/openclaw/ocm/pull/665))
+- Reuse a healthy Gateway on repeated start, avoid recreating an environment removed concurrently, clean up launchers after refused startup, and retain onboarding guards when root options precede the command. ([#649](https://github.com/openclaw/ocm/pull/649), [#656](https://github.com/openclaw/ocm/pull/656), [#669](https://github.com/openclaw/ocm/pull/669), [#646](https://github.com/openclaw/ocm/pull/646))
+- Stop admitting new Gateways after daemon shutdown is requested. Preserve foreground command cleanup after background-to-foreground job control and report signal termination consistently. ([#720](https://github.com/openclaw/ocm/pull/720), [#718](https://github.com/openclaw/ocm/pull/718), [#673](https://github.com/openclaw/ocm/pull/673), [#664](https://github.com/openclaw/ocm/pull/664))
+- Recognize healthy Gateways on custom local and pinned tailnet addresses, and render TLS-aware URLs and accurate foreground-dev status. ([#592](https://github.com/openclaw/ocm/pull/592), [#608](https://github.com/openclaw/ocm/pull/608), [#610](https://github.com/openclaw/ocm/pull/610), [#670](https://github.com/openclaw/ocm/pull/670), [#634](https://github.com/openclaw/ocm/pull/634))
+- Honor Linux's configured XDG service directory, quote service paths containing spaces, and report unavailable user service managers accurately. ([#699](https://github.com/openclaw/ocm/pull/699), [#674](https://github.com/openclaw/ocm/pull/674), [#633](https://github.com/openclaw/ocm/pull/633))
+- Keep undated startup errors visible, stream continuous undated output promptly, follow logs created after attachment, and separate recreated environments from old service log history. ([#662](https://github.com/openclaw/ocm/pull/662), [#694](https://github.com/openclaw/ocm/pull/694), [#666](https://github.com/openclaw/ocm/pull/666), [#668](https://github.com/openclaw/ocm/pull/668))
+- Exclude current supervisor diagnostic identities from environment logs and refresh those exclusions in already-attached followers. Preserve independently owned history and prevent child-log aliases from recreating diagnostics during rotation; fully unrecorded historical aliases remain outside the attribution guarantee. ([#702](https://github.com/openclaw/ocm/pull/702), [#703](https://github.com/openclaw/ocm/pull/703), [#708](https://github.com/openclaw/ocm/pull/708), [#724](https://github.com/openclaw/ocm/pull/724))
+- Preserve shell activation include roots and caller variables, select the evaluating shell correctly, validate explicit shell names, and handle Fish paths containing newlines. Keep launcher execution scoped when login profiles export other OpenClaw paths. ([#587](https://github.com/openclaw/ocm/pull/587), [#626](https://github.com/openclaw/ocm/pull/626), [#642](https://github.com/openclaw/ocm/pull/642), [#681](https://github.com/openclaw/ocm/pull/681), [#698](https://github.com/openclaw/ocm/pull/698), [#676](https://github.com/openclaw/ocm/pull/676))
+- Preserve authorized includes in dev startup and resolve foreground-dev relative includes from the source checkout. ([#590](https://github.com/openclaw/ocm/pull/590), [#591](https://github.com/openclaw/ocm/pull/591))
+- Reclaim abandoned runtime and private Node preparation stages, refuse automatic installs through linked custom pnpm stores, preserve the installed executable if installer publication fails, and refuse self-update when daemon ownership is uncertain. ([#667](https://github.com/openclaw/ocm/pull/667), [#700](https://github.com/openclaw/ocm/pull/700), [#611](https://github.com/openclaw/ocm/pull/611), [#659](https://github.com/openclaw/ocm/pull/659), [#612](https://github.com/openclaw/ocm/pull/612))
 
 ### Changed
 
 - Refresh JSON5 and ZIP handling to json5 1.3.4 and zip 9.1.2, plus compatible Git and build dependency patches, while retaining Rust 1.88 support.
 - Refresh 28 compatible Rust dependencies, including ICU 2.4, ureq 3.5, plist 1.10.3, and Git configuration support, while retaining Rust 1.88 support.
+
+### Upgrade notes
+
+See [usage guidance](docs/USAGE.md) for stopped dev checkout switching, independent upgrade paths, migration, and export modes. Use `--include-state` when an export must preserve the environment's complete state; ordinary exports retain their documented selective scope.
 
 ## 0.3.6 - 2026-10-22
 
