@@ -4752,6 +4752,9 @@ fn official_runtime_install_reclaims_interrupted_node_preparation() {
             Err(error) => panic!("{error}"),
         }
     };
+    // Accepted sockets can inherit the listener's nonblocking mode on macOS.
+    // Restore blocking I/O so the existing timeouts bound the partial response.
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
