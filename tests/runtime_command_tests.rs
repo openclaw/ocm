@@ -1008,6 +1008,224 @@ fn runtime_build_local_with_native_npm_preserves_tree_integrity() {
 
 #[cfg(unix)]
 #[test]
+fn runtime_build_local_recovers_interrupted_packing() {
+    use std::os::unix::{fs::symlink, process::CommandExt};
+    use std::time::Instant;
+
+    struct PackChild(std::process::Child);
+    impl Drop for PackChild {
+        fn drop(&mut self) {
+            // This fixture starts its own group, including native npm and postpack.
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+    let root = TestDir::new("runtime-interrupted-pack");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    fs::create_dir_all(&repo).unwrap();
+    let manifest = serde_json::json!({
+        "name":"openclaw", "version":"2026.4.25",
+        "bin":{"openclaw":"openclaw.mjs"}, "engines":{"node":">=22.22.3"},
+        "files":["openclaw.mjs", "postpack.cjs"],
+        "scripts":{"postpack":"node postpack.cjs"}
+    })
+    .to_string();
+    fs::write(repo.join("package.json"), &manifest).unwrap();
+    write_executable_script(
+        &repo.join("openclaw.mjs"),
+        "#!/usr/bin/env node\nconsole.log('stable');\n",
+    );
+    fs::write(
+        repo.join("postpack.cjs"),
+        r#"
+const fs = require('node:fs');
+if (process.env.OCM_TEST_PACK_FAIL === '1') process.exit(23);
+if (process.env.OCM_TEST_PACK_MARKER) {
+    fs.writeFileSync(process.env.OCM_TEST_PACK_MARKER, String(process.pid));
+    setInterval(() => {}, 1000);
+}
+"#,
+    )
+    .unwrap();
+    let mut env = ocm_env(&root);
+    env.insert("npm_config_offline".into(), "true".into());
+    env.insert(
+        "npm_config_cache".into(),
+        path_string(&root.child("npm-cache")),
+    );
+    let args = [
+        "runtime",
+        "build-local",
+        "stable",
+        "--repo",
+        "./openclaw",
+        "--force",
+        "--json",
+    ];
+    let build = run_ocm(&cwd, &env, &args);
+    assert!(build.status.success(), "{}", stderr(&build));
+    let runtimes = root.child("ocm-home/runtimes");
+    let installed = runtime_install_root("stable", &env, &cwd).unwrap();
+    let binary = installed_openclaw_runtime_entrypoint(&installed);
+    let original = fs::read(&binary).unwrap();
+    assert!(!installed.join("pack").exists());
+
+    // Neither a legacy pack name nor malformed stages establish ownership.
+    let legacy = runtimes.join(".stable.pack-1-2");
+    let malformed = runtimes.join(".stable.stage-not-a-pid-2");
+    let outside = root.child("unowned");
+    for path in [&legacy, &malformed, &outside] {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("keep"), "unowned").unwrap();
+    }
+    let linked = runtimes.join(".stable.stage-1-2");
+    symlink(&outside, &linked).unwrap();
+    let stages = || {
+        fs::read_dir(&runtimes)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().unwrap().is_dir())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".stable.stage-")
+            })
+            .filter(|path| *path != malformed)
+            .collect::<Vec<_>>()
+    };
+    let marker = root.child("postpack-ready");
+    let log = root.child("postpack.stderr");
+    let wait_for = |label: &str, ready: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "{label}: {}",
+                fs::read_to_string(&log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let spawn = || {
+        let _ = fs::remove_file(&marker);
+        let child = PackChild(
+            Command::new(support::ocm_test_binary_path())
+                .current_dir(&cwd)
+                .env_clear()
+                .envs(&env)
+                .env("OCM_TEST_PACK_MARKER", &marker)
+                .args(args)
+                .process_group(0)
+                .stdout(Stdio::null())
+                .stderr(fs::File::create(&log).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        wait_for("native postpack", &|| marker.exists());
+        child
+    };
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(runtimes.join(".stable.lock"))
+        .unwrap();
+    let released = || match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => {
+            fs2::FileExt::unlock(&lock).unwrap();
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(error) => panic!("lock probe: {error}"),
+    };
+
+    let mut child = spawn();
+    let abandoned = stages()
+        .pop()
+        .expect("packing must use a recoverable stage");
+    let archive = abandoned.join("pack/openclaw-2026.4.25.tgz");
+    assert!(archive.metadata().unwrap().len() > 0);
+    let archive_bytes = fs::read(&archive).unwrap();
+    // Kill OCM alone: npm still owns this archive while its postpack runs.
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert!(!released(), "surviving npm must retain runtime custody");
+    let other = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "other",
+            "--path",
+            "./openclaw/openclaw.mjs",
+        ],
+    );
+    assert!(other.status.success(), "{}", stderr(&other));
+    assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+    assert_eq!(fs::read(&binary).unwrap(), original);
+    drop(child); // Now stop the whole group; the next operation can reclaim it.
+    wait_for("abandoned runtime lock", &released);
+    let retry = run_ocm(&cwd, &env, &args);
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    assert!(!abandoned.exists());
+    assert!(stages().is_empty());
+    assert!(!installed.join("pack").exists());
+    let verify = run_ocm(&cwd, &env, &["runtime", "verify", "stable", "--json"]);
+    assert!(verify.status.success(), "{}", stderr(&verify));
+
+    let mut failed_env = env.clone();
+    failed_env.insert("OCM_TEST_PACK_FAIL".into(), "1".into());
+    let failed = run_ocm(&cwd, &failed_env, &args);
+    assert!(!failed.status.success());
+    assert!(stderr(&failed).contains("failed to pack local OpenClaw build"));
+    assert!(stages().is_empty());
+    assert_eq!(fs::read(&binary).unwrap(), original);
+
+    let child = spawn();
+    let abandoned = stages().pop().unwrap();
+    drop(child);
+    wait_for("second abandoned runtime lock", &released);
+    let remove = run_ocm(&cwd, &env, &["runtime", "remove", "stable", "--json"]);
+    assert!(remove.status.success(), "{}", stderr(&remove));
+    assert!(!abandoned.exists());
+    assert!(!installed.exists());
+    assert!(stages().is_empty());
+    // A malformed registration cannot claim that its embedded name is locked.
+    let other_meta = runtimes.join("other.json");
+    let mut meta: Value = serde_json::from_slice(&fs::read(&other_meta).unwrap()).unwrap();
+    meta["name"] = serde_json::json!("stable");
+    fs::write(&other_meta, serde_json::to_vec(&meta).unwrap()).unwrap();
+    let mut child = spawn();
+    let active = stages().pop().unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert!(!released());
+    let remove_other = run_ocm(&cwd, &env, &["runtime", "remove", "other", "--json"]);
+    assert!(!remove_other.status.success());
+    assert!(active.join("pack/openclaw-2026.4.25.tgz").exists());
+    drop(child);
+    wait_for("malformed-record control lock", &released);
+    let retry = run_ocm(&cwd, &env, &args);
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    assert!(!active.exists());
+    assert!(stages().is_empty());
+
+    for path in [&legacy, &malformed, &outside] {
+        assert_eq!(fs::read_to_string(path.join("keep")).unwrap(), "unowned");
+    }
+    assert!(linked.symlink_metadata().unwrap().is_symlink());
+    assert_eq!(
+        fs::read_to_string(repo.join("package.json")).unwrap(),
+        manifest
+    );
+    assert_eq!(fs::read(repo.join("openclaw.mjs")).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
 fn runtime_build_local_rejects_dependencies_from_another_checkout_before_pack() {
     let root = TestDir::new("runtime-build-local-external-dependencies");
     let cwd = root.child("workspace");

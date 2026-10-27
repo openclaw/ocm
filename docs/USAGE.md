@@ -232,6 +232,14 @@ ocm upgrade luna --runtime main-local
 
 Use this when you need to test what users will run after an OpenClaw release, but from a local checkout before publishing. OCM runs `npm pack` in the OpenClaw repo, which triggers OpenClaw's package prepack path instead of registering a source checkout command.
 
+Packing scratch belongs to the runtime's installation stage. Normal completion
+or failure removes it; after an interrupted build, a later installation or
+removal of an existing runtime reclaims abandoned stages. Active runtime
+operations remain protected. Packing and installation children retain custody
+of their stage if OCM exits before they do, so recovery waits for them to end.
+Legacy `.pack-*` directories from older OCM versions are left untouched because
+their ownership cannot be established safely from their names alone.
+
 When the root package or selected source extensions depend on private
 `workspace:*` packages, OCM resolves
 their complete transitive closure. Its build-only npm proxy rewrites nested

@@ -108,6 +108,13 @@ jobs:
         with:
           node-version: '22.23.4'
           package-manager-cache: false
+      - name: Prove native Windows stage command ownership
+        timeout-minutes: 5
+        run: |
+          cargo test --locked --lib windows_stage_command::tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib windows_runtime_stage::tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
@@ -121,10 +128,14 @@ jobs:
         run: |
           cargo test --locked --lib windows_source_watch_ -- --nocapture
           cargo test --locked --test windows_dev_stop_tests native_windows_dev_stop_lifecycle -- --exact --nocapture
-
       - name: Prove native Windows runtime installation prefixes
         timeout-minutes: 5
         run: cargo test --locked --lib store::runtimes::tests::native_npm_prefix_accepts_windows_paths -- --exact --nocapture
+      - name: Prove native Windows runtime packing custody
+        timeout-minutes: 5
+        run: |
+          cargo test --locked --test windows_runtime_pack_tests native_windows_pack_preserves_live_child_archive -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
