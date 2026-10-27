@@ -47,6 +47,19 @@ pub(crate) fn resolve_runtime_launch(
         });
     }
 
+    // Windows does not execute an installed JavaScript entrypoint by its shebang.
+    // Keep the package as Node's first argument, without adding a shell wrapper.
+    if cfg!(windows) && is_openclaw_package_runtime(meta) {
+        let mut args = vec![meta.binary_path.clone()];
+        args.extend(openclaw_args.iter().cloned());
+        return Ok(RuntimeLaunchSpec {
+            runtime_binary_path: meta.binary_path.clone(),
+            program: "node".to_string(),
+            args,
+            path_prepend: None,
+        });
+    }
+
     Ok(RuntimeLaunchSpec {
         runtime_binary_path: meta.binary_path.clone(),
         program: meta.binary_path.clone(),

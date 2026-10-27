@@ -92,6 +92,7 @@ Inside this repo, use the development wrapper:
 
 Published OpenClaw release flows prefer host Node.js and npm when Node satisfies the selected package's `engines.node` requirement.
 OCM checks the verified package before installation and the installed manifest before ordinary execution.
+Windows invokes installed OpenClaw package entrypoints through the selected Node.js executable, preserving the forwarded arguments and environment.
 On supported platforms, OCM can manage a private Node.js 24.22.1 copy when the host tools are missing or incompatible.
 OCM reuses only the selected private Node.js version after checking the executable. Older private caches must be refreshed with `ocm start` or `ocm runtime install --channel stable` before offline launches.
 Packages without `engines.node` retain the legacy baseline of Node.js `22.22.3+`, `24.15.0+`, or `25.9.0+`.
@@ -748,8 +749,9 @@ Use `ocm service start <env>` when you want to run one again; see
 [service status and recovery](docs/USAGE.md#start-stop-restart).
 
 OCM negotiates fresh-process restart support only when it executes an
-`openclaw.mjs` entrypoint directly or through OCM's managed Node.js toolchain,
-so the gateway PID is the process OCM owns. `ocm service status <env>` reports
+`openclaw.mjs` entrypoint directly or runs an installed package through its
+selected Node.js executable, so the gateway PID is the process OCM owns.
+`ocm service status <env>` reports
 `protocol v1` when OpenClaw can hand restart intent back to OCM atomically.
 With that protocol, `ocm service restart <env>` asks OpenClaw to restart
 immediately through its recovery handoff. OpenClaw records eligible active
@@ -761,7 +763,7 @@ External restart requests collect the native helper result while observing repla
 A pending helper or unobserved replacement produces a warning without forcing a supervisor restart.
 Requests made inside the target Gateway remain asynchronous so the caller cannot block its own restart.
 
-Package-manager, shell, host-Node, and other wrapper-backed bindings run in
+Package-manager, shell, custom host-Node, and other wrapper-backed bindings run in
 legacy compatibility mode without OCM's native service identity or detached
 respawn. `ocm service restart <env>` preserves their existing direct-supervisor
 restart behavior and warns that in-flight work cannot be recovered. Bind a

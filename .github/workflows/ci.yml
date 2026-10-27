@@ -111,6 +111,24 @@ jobs:
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
+      - name: Prove native Windows installed runtime launch
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          # Temporary exact-base comparison; separate target avoids artifact reuse.
+          $baseline = Join-Path $env:RUNNER_TEMP 'ocm-launch-base'
+          git fetch --no-tags --depth=1 origin 3ea8e040728031a13d830c944a8646649bf590b4
+          if ($LASTEXITCODE -ne 0) { throw 'baseline fetch failed' }
+          git worktree add --detach $baseline 3ea8e040728031a13d830c944a8646649bf590b4
+          if ($LASTEXITCODE -ne 0) { throw 'baseline checkout failed' }
+          git -C $baseline rev-parse HEAD 'HEAD^{tree}'
+          git -C $baseline status --porcelain
+          $baselineTarget = Join-Path $env:RUNNER_TEMP 'ocm-launch-base-target'
+          cargo build --locked --bin ocm --manifest-path (Join-Path $baseline 'Cargo.toml') --target-dir $baselineTarget
+          if ($LASTEXITCODE -ne 0) { throw 'baseline build failed' }
+          $env:OCM_TEST_BASELINE_BINARY = Join-Path $baselineTarget 'debug/ocm.exe'
+          cargo test --locked --test runtime_launch_tests -- --include-ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'native launch regression failed' }
       - name: Prove native Windows dev stop lifecycle
         run: |
           cargo test --locked --lib windows_source_watch_ -- --nocapture
