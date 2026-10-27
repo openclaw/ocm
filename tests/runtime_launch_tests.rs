@@ -164,43 +164,9 @@ fn installed_package_launch_preserves_command_identity() {
     let metadata_before = fs::read(&fixture.metadata_path).unwrap();
     let entrypoint_before = fs::read(&fixture.entrypoint).unwrap();
 
-    // Temporary before/after qualification against exactly the same published
-    // state. The native job supplies its separately built unchanged-base CLI.
-    #[cfg(windows)]
-    if let Some(baseline) = std::env::var_os("OCM_TEST_BASELINE_BINARY") {
-        let baseline = PathBuf::from(baseline);
-        let before = support::run_ocm_binary(
-            &baseline,
-            &fixture.cwd,
-            &fixture.env,
-            &["@native", "--", "--version"],
-        );
-        println!(
-            "{}",
-            json!({"phase":"installed-launch-before",
-            "binarySha256":ocm::infra::download::file_sha256(&baseline).unwrap(),
-            "metadataSha256":ocm::infra::download::file_sha256(&fixture.metadata_path).unwrap(),
-            "entrypointSha256":ocm::infra::download::file_sha256(&fixture.entrypoint).unwrap(),
-            "exit":before.status.code(),"stdout":stdout(&before),"stderr":stderr(&before)})
-        );
-        assert_eq!(before.status.code(), Some(1));
-        assert!(
-            stderr(&before).contains("os error 193"),
-            "{}",
-            stderr(&before)
-        );
-    }
     let version = fixture.run(&["@native", "--", "--version"]);
     assert!(version.status.success(), "{}", stderr(&version));
     assert_eq!(stdout(&version).trim(), VERSION);
-    println!(
-        "{}",
-        json!({"phase":"installed-launch-after",
-        "binarySha256":ocm::infra::download::file_sha256(&support::ocm_test_binary_path()).unwrap(),
-        "metadataSha256":ocm::infra::download::file_sha256(&fixture.metadata_path).unwrap(),
-        "entrypointSha256":ocm::infra::download::file_sha256(&fixture.entrypoint).unwrap(),
-        "exit":version.status.code(),"stdout":stdout(&version),"stderr":stderr(&version)})
-    );
 
     let forwarded = [
         "echo",
