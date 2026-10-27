@@ -237,16 +237,6 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Bind packing candidate executable to its source
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 717
-        run: |
-          git rev-parse HEAD 'HEAD^{tree}'
-          test -z "$(git status --porcelain)"
-          test -z "${OCM_TEST_BINARY:-}"
-          touch src/lib.rs src/main.rs
-          cargo build --locked --bin ocm
-          node -e 'const fs = require("node:fs"); const crypto = require("node:crypto"); const path = require("node:path"); const binary = path.resolve("target/debug/ocm"); console.log(JSON.stringify({binary, sha256:crypto.createHash("sha256").update(fs.readFileSync(binary)).digest("hex")}));'
-          git hash-object src/lib.rs src/main.rs
       - name: Run test suite
         run: cargo test --locked
       - name: Smoke test cargo install
