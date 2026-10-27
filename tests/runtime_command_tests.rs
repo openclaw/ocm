@@ -1308,6 +1308,12 @@ fn runtime_build_local_preserves_installed_extension_dependency_bindings() {
     let repo = cwd.join("openclaw");
     fs::create_dir_all(&repo).unwrap();
     let mut env = ocm_env(&root);
+    // npm's linked strategy skips installing into a symlinked prefix. Keep
+    // this layout test independent of temporary-root aliases (e.g. macOS /var).
+    env.insert(
+        "OCM_HOME".into(),
+        path_string(&fs::canonicalize(env.get("OCM_HOME").unwrap()).unwrap()),
+    );
     env.insert("npm_config_offline".into(), "true".into());
     env.insert(
         "npm_config_cache".into(),
@@ -1446,7 +1452,7 @@ int symlink(const char *source, const char *target) {
         .unwrap();
     }
 
-    for strategy in ["default", "nested", "copy"]
+    for strategy in ["default", "nested", "linked", "copy"]
         .into_iter()
         .filter(|strategy| {
             *strategy != "copy"
@@ -1459,8 +1465,8 @@ int symlink(const char *source, const char *target) {
     {
         env.remove("npm_config_install_strategy");
         env.remove("LD_PRELOAD");
-        if strategy == "nested" {
-            env.insert("npm_config_install_strategy".into(), "nested".into());
+        if matches!(strategy, "nested" | "linked") {
+            env.insert("npm_config_install_strategy".into(), strategy.into());
         }
         #[cfg(all(
             target_os = "linux",
@@ -1487,6 +1493,19 @@ int symlink(const char *source, const char *target) {
         let prefix = runtime_install_root(strategy, &env, &cwd)
             .unwrap()
             .join("files/node_modules");
+        assert!(
+            prefix
+                .join("openclaw/node_modules/@scout/plugin/package.json")
+                .is_file()
+        );
+        if strategy == "linked" {
+            let host = fs::canonicalize(prefix.join("openclaw")).unwrap();
+            assert!(host.starts_with(fs::canonicalize(prefix.join(".store")).unwrap()));
+            assert_eq!(
+                fs::canonicalize(prefix.join("openclaw/node_modules/@scout/plugin")).unwrap(),
+                fs::canonicalize(prefix.join("@scout/plugin")).unwrap()
+            );
+        }
         if strategy == "copy" {
             for dependency in ["shared", "bridge"] {
                 let binding = prefix.join(format!(
