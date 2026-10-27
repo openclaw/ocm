@@ -4327,9 +4327,19 @@ mod tests {
         // environment as a real caller, without changing parallel tests' env.
         if let Some(root) = std::env::var_os("OCM_TEST_NPM_PREFIX_ABI") {
             let root = std::path::PathBuf::from(root);
-            let install = root.join("install");
-            std::fs::create_dir(&install).unwrap();
             let env = std::env::vars().collect();
+            let owner = super::prepare_runtime_install_target(
+                "prefix-probe".into(),
+                false,
+                super::InstallContext {
+                    env: &env,
+                    cwd: &root,
+                    runtime_guard: None,
+                },
+            )
+            .unwrap();
+            let install = owner.install_files.clone();
+            std::fs::create_dir_all(&install).unwrap();
             super::install_openclaw_package_with_npm(
                 &root.join("core.tgz"),
                 &[root.join("plugin.tgz")],
@@ -4337,6 +4347,7 @@ mod tests {
                 &root,
                 &env,
                 None,
+                &owner,
             )
             .unwrap();
             for log in std::fs::read_dir(root.join("cache/_logs")).unwrap() {
@@ -4456,6 +4467,7 @@ mod tests {
                 "--nocapture",
             ])
             .env("OCM_TEST_NPM_PREFIX_ABI", root.path())
+            .env("OCM_HOME", root.path().join("store"))
             .env("HOME", &home)
             .env("USERPROFILE", &home)
             .env("TMP", &tmp)
