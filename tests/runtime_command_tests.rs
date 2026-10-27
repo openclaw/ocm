@@ -1316,6 +1316,51 @@ fn runtime_build_local_preserves_installed_extension_dependency_bindings() {
     env.insert("npm_config_audit".into(), "false".into());
     env.insert("npm_config_fund".into(), "false".into());
 
+    // Exercise the existing copy fallback through the complete CLI assembly on
+    // Linux. Interpose only OCM's runtime links; native npm keeps installing its
+    // real package graph. The native compiler is already used by bundled SQLite.
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        not(target_feature = "crt-static")
+    ))]
+    let denied_links = {
+        let source = root.child("deny-runtime-links.c");
+        let library = root.child("deny-runtime-links.so");
+        fs::write(&source, r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+int symlink(const char *source, const char *target) {
+    char executable[4096];
+    ssize_t n = readlink("/proc/self/exe", executable, sizeof executable - 1);
+    if (n > 0) {
+        executable[n] = 0;
+        const char *name = strrchr(executable, '/');
+        if (name && strcmp(name + 1, "ocm") == 0 && strstr(target, "/files/node_modules/openclaw/")) {
+            errno = EOPNOTSUPP;
+            return -1;
+        }
+    }
+    int (*original)(const char *, const char *) = dlsym(RTLD_NEXT, "symlink");
+    return original(source, target);
+}
+"#).unwrap();
+        let output = Command::new("cc")
+            .args(["-shared", "-fPIC"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&library)
+            .arg("-ldl")
+            .env("TMPDIR", root.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        library
+    };
+
     let write_package = |dir: &Path, package: Value, entry: &str| {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join("package.json"), package.to_string()).unwrap();
@@ -1356,7 +1401,7 @@ fn runtime_build_local_preserves_installed_extension_dependency_bindings() {
             "bin":{"openclaw":"openclaw.mjs"}, "engines":{"node":">=22.22.3"},
             "exports":{"./sdk":"./sdk.mjs"},
             "files":["openclaw.mjs", "sdk.mjs", "dist/extensions/builtin"],
-            "dependencies":{"@scout/shared":shared1, "@scout/leaf":leaf2}
+        "dependencies":{"@scout/shared":shared1, "@scout/leaf":leaf1}
         })
         .to_string(),
     )
@@ -1401,9 +1446,29 @@ fn runtime_build_local_preserves_installed_extension_dependency_bindings() {
         .unwrap();
     }
 
-    for strategy in ["default", "nested"] {
+    for strategy in ["default", "nested", "copy"]
+        .into_iter()
+        .filter(|strategy| {
+            *strategy != "copy"
+                || cfg!(all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    not(target_feature = "crt-static")
+                ))
+        })
+    {
+        env.remove("npm_config_install_strategy");
+        env.remove("LD_PRELOAD");
         if strategy == "nested" {
             env.insert("npm_config_install_strategy".into(), "nested".into());
+        }
+        #[cfg(all(
+            target_os = "linux",
+            target_env = "gnu",
+            not(target_feature = "crt-static")
+        ))]
+        if strategy == "copy" {
+            env.insert("LD_PRELOAD".into(), path_string(&denied_links));
         }
         let build = run_ocm(
             &cwd,
@@ -1422,6 +1487,14 @@ fn runtime_build_local_preserves_installed_extension_dependency_bindings() {
         let prefix = runtime_install_root(strategy, &env, &cwd)
             .unwrap()
             .join("files/node_modules");
+        if strategy == "copy" {
+            for dependency in ["shared", "bridge"] {
+                let binding = prefix.join(format!(
+                    "openclaw/dist/extensions/probe/node_modules/@scout/{dependency}"
+                ));
+                assert!(fs::symlink_metadata(binding).unwrap().file_type().is_dir());
+            }
+        }
         let expected =
             serde_json::json!({"direct":2,"privateLeaf":1,"transitive":2,"host":"host-sdk"});
         for entry in [

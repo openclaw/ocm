@@ -3178,8 +3178,10 @@ fn stage_runtime_from_openclaw_package_archive(
         context.env,
         local_adapter,
     )?;
-    materialize_local_source_extensions(&target.install_files, source_extensions)?;
     expose_openclaw_package_runtime_dependencies(&target.install_files)?;
+    // Exposing dependencies can copy them into the host when links are unavailable.
+    // Preserve extension bindings against that final ancestor layout.
+    materialize_local_source_extensions(&target.install_files, source_extensions)?;
 
     let binary_path = installed_openclaw_binary_path(&target.install_files);
     if !path_exists(&binary_path) {
