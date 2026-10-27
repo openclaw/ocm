@@ -47,6 +47,7 @@ pub(crate) struct OpenClawWorkspaceInventory {
     agent_directory_templates: BTreeMap<String, PathBuf>,
     config_include_paths: BTreeSet<PathBuf>,
     agent_workspace_roots: BTreeMap<String, PathBuf>,
+    resolved_agent_ids: BTreeMap<String, String>,
     configured_default_workspace: Option<PathBuf>,
     configured_agent_workspace_roots: BTreeMap<String, PathBuf>,
     default_agent_id: String,
@@ -214,6 +215,10 @@ impl OpenClawWorkspaceInventory {
         self.agent_workspace_roots
             .iter()
             .map(|(id, path)| (id.as_str(), path.as_path()))
+    }
+
+    pub(crate) fn resolved_agent_ids(&self) -> &BTreeMap<String, String> {
+        &self.resolved_agent_ids
     }
 
     pub(crate) fn agent_workspace(&self, agent_id: &str) -> Option<&Path> {
@@ -919,6 +924,18 @@ fn resolve_openclaw_workspaces_from_config(
         .map(|resolved| resolved.include_paths)
         .unwrap_or_default();
     let entries = agent_entries(&config);
+    // Preserve the correspondence to authored IDs before environment expansion
+    // so copied configuration can select the same agents without erasing templates.
+    let resolved_agent_ids = authored_entries
+        .iter()
+        .zip(&entries)
+        .filter_map(|(authored, resolved)| {
+            Some((
+                authored.get("id")?.as_str()?.to_string(),
+                normalize_agent_id(resolved.get("id")?.as_str()?),
+            ))
+        })
+        .collect();
     let default_agent_id = resolve_default_agent_id(&entries);
     let default_workspace = config
         .pointer("/agents/defaults/workspace")
@@ -1029,6 +1046,7 @@ fn resolve_openclaw_workspaces_from_config(
         agent_directory_templates,
         config_include_paths,
         agent_workspace_roots,
+        resolved_agent_ids,
         configured_default_workspace,
         configured_agent_workspace_roots,
         default_agent_id,
@@ -1375,7 +1393,7 @@ fn is_openclaw_env_var_name(name: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit())
 }
 
-pub(super) fn agent_entries(config: &Value) -> Vec<Map<String, Value>> {
+fn agent_entries(config: &Value) -> Vec<Map<String, Value>> {
     if let Some(entries) = config.pointer("/agents/entries").and_then(Value::as_object) {
         return javascript_property_entries(entries)
             .into_iter()

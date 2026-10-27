@@ -1718,6 +1718,7 @@ fn migration_preserves_implicit_external_default_workspaces() {
             "empty-entries",
             "entries",
             "list",
+            "templated-list",
             "shared",
         ] {
             let root = TestDir::new("migrate-implicit-external-workspace");
@@ -1740,6 +1741,9 @@ fn migration_preserves_implicit_external_default_workspaces() {
                 "list" => Some(
                     serde_json::json!({"agents": {"list": [{"id": "personal", "default": true}, {"id": "ops"}]}}),
                 ),
+                "templated-list" => Some(
+                    serde_json::json!({"env": {"AGENT_ID": "personal"}, "agents": {"list": [{"id": "${AGENT_ID}", "default": true}, {"id": "ops"}]}}),
+                ),
                 "shared" => Some(
                     serde_json::json!({"agents": {"list": [{"id": "main"}, {"id": "ops", "workspace": external.join("nested")}]}}),
                 ),
@@ -1748,7 +1752,7 @@ fn migration_preserves_implicit_external_default_workspaces() {
             if let Some(config) = config {
                 fs::write(source.join("openclaw.json"), config.to_string()).unwrap();
             }
-            if shape == "list" {
+            if matches!(shape, "list" | "templated-list") {
                 fs::create_dir_all(source.join("workspace-ops")).unwrap();
                 fs::write(
                     source.join("workspace-ops/USER.md"),
@@ -1780,7 +1784,7 @@ fn migration_preserves_implicit_external_default_workspaces() {
                     .unwrap();
             let pointer = match shape {
                 "entries" => "/agents/entries/main/workspace",
-                "list" | "shared" => "/agents/list/0/workspace",
+                "list" | "templated-list" | "shared" => "/agents/list/0/workspace",
                 _ => "/agents/defaults/workspace",
             };
             let workspace = Path::new(config.pointer(pointer).unwrap().as_str().unwrap());
@@ -1790,7 +1794,10 @@ fn migration_preserves_implicit_external_default_workspaces() {
                 "durable workspace\n"
             );
             assert!(!target.join(".openclaw/workspace").is_symlink());
-            if shape == "list" {
+            if shape == "templated-list" {
+                assert_eq!(config["agents"]["list"][0]["id"], "${AGENT_ID}");
+            }
+            if matches!(shape, "list" | "templated-list") {
                 assert!(config.pointer("/agents/defaults/workspace").is_none());
                 assert!(config.pointer("/agents/list/1/workspace").is_none());
                 assert_eq!(

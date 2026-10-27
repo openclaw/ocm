@@ -16,7 +16,7 @@ use super::gateway_ports::read_port_number;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_workspaces::{
     OpenClawConfigReadContext, OpenClawConfigReadError, OpenClawWorkspaceInventory,
-    OpenClawWorkspaceRuntime, agent_entries, load_effective_openclaw_config, normalize_agent_id,
+    OpenClawWorkspaceRuntime, load_effective_openclaw_config, normalize_agent_id,
     read_openclaw_config_field, read_regular_text_file, resolve_openclaw_config_env,
 };
 
@@ -283,12 +283,13 @@ pub(crate) fn rewrite_external_workspace_paths_for_migration(
     config_path: &Path,
     default_workspace: Option<&Path>,
     agent_workspaces: &BTreeMap<String, PathBuf>,
+    resolved_agent_ids: &BTreeMap<String, String>,
 ) -> Result<bool, String> {
     if default_workspace.is_none() && agent_workspaces.is_empty() {
         return Ok(false);
     }
     let mut value = read_config_value(config_path)?.unwrap_or_else(|| json!({}));
-    let implicit_main = agent_entries(&value).is_empty();
+    let implicit_main = resolved_agent_ids.is_empty();
     let object = value
         .as_object_mut()
         .ok_or("cannot rewrite migrated workspace in a non-object OpenClaw config")?;
@@ -307,7 +308,10 @@ pub(crate) fn rewrite_external_workspace_paths_for_migration(
     }
     if let Some(entries) = agents.get_mut("entries").and_then(Value::as_object_mut) {
         for (agent_id, entry) in entries {
-            let Some(workspace) = agent_workspaces.get(&normalize_agent_id(agent_id)) else {
+            let Some(workspace) = resolved_agent_ids
+                .get(agent_id)
+                .and_then(|id| agent_workspaces.get(id))
+            else {
                 continue;
             };
             changed |= set_workspace_path(Some(entry), workspace);
@@ -322,7 +326,10 @@ pub(crate) fn rewrite_external_workspace_paths_for_migration(
             else {
                 continue;
             };
-            let Some(workspace) = agent_workspaces.get(&normalize_agent_id(agent_id)) else {
+            let Some(workspace) = resolved_agent_ids
+                .get(agent_id)
+                .and_then(|id| agent_workspaces.get(id))
+            else {
                 continue;
             };
             changed |= set_workspace_path(Some(entry), workspace);
