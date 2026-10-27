@@ -1304,6 +1304,12 @@ and deletions in place. Shared ancestor directories stay in place, but their
 metadata can change when owned siblings are replaced. Existing service-log and
 socket rules and SQLite validation still apply to the captured state.
 
+Captured read-only ancestor modes do not prevent scoped restore: OCM temporarily
+allows owner writes only to staging parents while moving owned entries, then
+restores their permissions. Current shared ancestors keep their permissions and
+identity; they must permit replacing owned children. OCM does not make a current
+read-only ancestor writable or change the saved checkpoint's modes.
+
 Each upgrade checkpoint records its scope. Changing the environment's current
 list affects future checkpoints only. Old whole-root checkpoints still restore
 the whole root; declaring independent paths does not retrofit them. Scoped
