@@ -3216,6 +3216,10 @@ fn dev_command_rejects_an_unregistered_clone_at_the_managed_path() {
 
 #[test]
 fn dev_borrowed_linked_checkout_uses_explicit_and_enclosing_source() {
+    #[cfg(unix)]
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TestDir::new("dev-borrowed-linked");
     let repo = init_openclaw_repo(&root);
     for destination in [".worktrees/input", ".worktrees/other"] {
@@ -3245,7 +3249,17 @@ fn dev_borrowed_linked_checkout_uses_explicit_and_enclosing_source() {
     install_fake_dev_runners(&root, &mut env);
 
     for (name, cwd, args) in [
-        ("demo", &repo, dev_plain(&["demo", "--repo", &source_arg])),
+        (
+            "demo",
+            &repo,
+            dev_plain(&[
+                "demo",
+                "--repo",
+                &source_arg,
+                "--port",
+                dev_rebind::REBIND_GATEWAY_PORT,
+            ]),
+        ),
         ("enclosing", &nested, dev_plain(&["enclosing"])),
     ] {
         let created = run_ocm(cwd, &env, &args);

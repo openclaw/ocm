@@ -400,9 +400,9 @@ dependencies = [
 
 [[package]]
 name = "gix-config"
-version = "0.62.0"
+version = "0.62.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65a9c000fa9a9154f22ffc8f8d74426e9300d759c2029e8701e2ba39d5d464ea"
+checksum = "2d8de82251a43c9f845458cd64e565f7350ce446bb786348f79d80dc5089806e"
 dependencies = [
  "bstr",
  "gix-config-value",

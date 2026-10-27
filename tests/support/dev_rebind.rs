@@ -4,7 +4,7 @@ use super::*;
 // family is in use, and parallel fixture stores allocate and probe from 18789
 // upward. Tests that rebind therefore create their environment with this
 // family below that range; INITIAL_UI_TEST_LOCK keeps them from sharing it.
-const REBIND_GATEWAY_PORT: &str = "16789";
+pub(super) const REBIND_GATEWAY_PORT: &str = "16789";
 
 fn rebind(
     cwd: &Path,

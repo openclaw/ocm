@@ -436,10 +436,22 @@ fn assert_command_receives_signal(
     args: &[&str],
     (signal, name): (libc::c_int, &str),
 ) {
+    use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt;
 
     let marker = fixture.marker(label);
-    let mut process = without_terminal(&mut fixture.command(args, &marker))
+    let mut command = fixture.command(args, &marker);
+    // Remote harnesses may ignore SIGHUP; this case requires a handled signal.
+    // The ignored-signal case below establishes its own inherited disposition.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut process = without_terminal(&mut command)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
