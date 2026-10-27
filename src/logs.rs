@@ -439,6 +439,11 @@ impl<'a> LogService<'a> {
                 sources.service_available = cursor.service_available;
                 sources.excluded_paths.clone_from(&cursor.excluded_paths);
             }
+            if !cursor.service_available {
+                // Ownership is unknown, not diagnostic. Keep already-read child
+                // bytes until a valid configuration can settle their identity.
+                continue;
+            }
             // A merged record may be waiting for its continuation. Do not
             // emit that buffer after its owning handle becomes diagnostic.
             let mut pending_excluded = cursor.current_file_is_excluded()?;
@@ -1145,6 +1150,14 @@ fn collect_merged_follow_startup(
 ) -> Result<Vec<u8>, String> {
     let mut records = Vec::new();
     for (cursor, snapshot) in cursors.iter_mut().zip(snapshots) {
+        if !cursor.service_available {
+            if let Some(snapshot) = snapshot {
+                let mut held = snapshot.bytes;
+                held.append(&mut cursor.pending);
+                cursor.pending = held;
+            }
+            continue;
+        }
         let mut stream = if cursor.current_file_is_excluded()? {
             Vec::new()
         } else {
@@ -2646,6 +2659,69 @@ mod tests {
         let update = cursors[0].read_update().unwrap().unwrap();
         assert_eq!(update_bytes(&update), b"safe while unavailable\n");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_config_holds_startup_and_pending_child_bytes_until_resolved() {
+        for becomes_diagnostic in [false, true] {
+            let root = test_root("follow-unavailable-buffer");
+            let config = root.join("supervisor/daemon-log-config.json");
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            let child = root.join("child.log");
+            let gateway = root.join("gateway.log");
+            let mut env = BTreeMap::new();
+            env.insert("OCM_HOME".into(), root.display().to_string());
+            let service = LogService::new(&env, &root);
+            let mut sources = stderr_sources(&gateway, &child);
+            sources.excluded_paths = crate::supervisor::SupervisorService::new(&env, &root)
+                .daemon_log_paths()
+                .unwrap();
+            fs::write(
+                &child,
+                b"2026-10-27T12:00:00Z first child record\n2026-10-27T12:00:01Z child partial",
+            )
+            .unwrap();
+            let mut cursors = vec![FollowCursor::for_sources(sources)];
+            let snapshots = vec![cursors[0].snapshot(None, true).unwrap()];
+            assert!(!snapshots[0].as_ref().unwrap().bytes.is_empty());
+            assert!(!cursors[0].pending.is_empty());
+            fs::write(&config, "invalid json").unwrap();
+            service.refresh_follow_exclusions(&mut cursors).unwrap();
+            assert!(
+                super::collect_merged_follow_startup(&mut cursors, snapshots, None)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(cursors[0].collect_quiet_records().is_empty());
+            append(&child, b" completed\n");
+            assert!(cursors[0].read_update().unwrap().is_none());
+            if becomes_diagnostic {
+                let diagnostic_dir = root.join("diagnostics");
+                fs::create_dir_all(&diagnostic_dir).unwrap();
+                fs::hard_link(&child, diagnostic_dir.join("daemon.stderr.log")).unwrap();
+                fs::write(
+                    &config,
+                    serde_json::json!({"logDir": diagnostic_dir}).to_string(),
+                )
+                .unwrap();
+            } else {
+                fs::remove_file(&config).unwrap();
+            }
+            service.refresh_follow_exclusions(&mut cursors).unwrap();
+            let mut records = Vec::new();
+            if let Some(update) = cursors[0].read_update().unwrap() {
+                records.extend(cursors[0].collect_complete_records(update));
+            }
+            records.extend(cursors[0].collect_quiet_records());
+            let output = super::merge_log_records(records);
+            if becomes_diagnostic {
+                assert!(output.is_empty());
+            } else {
+                assert_eq!(output, fs::read(&child).unwrap());
+            }
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     fn stderr_sources(gateway_path: &Path, service_path: &Path) -> LogSources {
