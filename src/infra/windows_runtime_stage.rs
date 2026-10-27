@@ -16,9 +16,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_ASSIGN_PROCESS, JOB_OBJECT_QUERY,
-    OpenJobObjectW,
+    AssignProcessToJobObject, CreateJobObjectW, OpenJobObjectW,
 };
+use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_ASSIGN_PROCESS, JOB_OBJECT_QUERY};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use super::file_identity::{FileIdentity, file_identity};
@@ -61,7 +61,12 @@ fn job_name(stage: &Path) -> io::Result<String> {
         };
         digest.update(unit.to_le_bytes());
     }
-    Ok(format!("{JOB_PREFIX}{:x}", digest.finalize()))
+    let digest: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(format!("{JOB_PREFIX}{digest}"))
 }
 
 pub(crate) struct StageJob {
