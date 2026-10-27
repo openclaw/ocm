@@ -238,7 +238,7 @@ jobs:
           retention-days: 7
 
       - name: Observe pinned macOS foreground regression with siblings
-        if: runner.os == 'macOS' && github.event_name == 'pull_request' && github.event.pull_request.number == 717
+        if: runner.os == 'macOS' && github.event_name == 'pull_request' && github.event.pull_request.number == 717 && github.event.pull_request.head.sha == '5a884bf3f5e19e236faece3ff2d8d640509662ab'
         timeout-minutes: 5
         run: |
           collector="$GITHUB_WORKSPACE/tests/support/foreground_resume_observe_suite.py"
@@ -268,7 +268,7 @@ jobs:
           git rev-parse HEAD 'HEAD^{tree}'
           test -z "$(git status --porcelain)"
           cargo --version
-          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/foreground-resume-recheck-suite-target"
           if python3 "$collector" "$observation" 20; then
             collector_exit=0
           else
@@ -277,6 +277,16 @@ jobs:
           printf '{"collectorExit":%s}\n' "$collector_exit"
           test -f "$observation/identity.json"
           test -f "$observation/results.json"
+      - name: Bind packing candidate executable to its source
+        if: github.event_name == 'pull_request' && github.event.pull_request.number == 717
+        run: |
+          git rev-parse HEAD 'HEAD^{tree}'
+          test -z "$(git status --porcelain)"
+          test -z "${OCM_TEST_BINARY:-}"
+          touch src/lib.rs src/main.rs
+          cargo build --locked --bin ocm
+          node -e 'const fs = require("node:fs"); const crypto = require("node:crypto"); const path = require("node:path"); const binary = path.resolve("target/debug/ocm"); console.log(JSON.stringify({binary, sha256:crypto.createHash("sha256").update(fs.readFileSync(binary)).digest("hex")}));'
+          git hash-object src/lib.rs src/main.rs
       - name: Run test suite
         run: cargo test --locked
       - name: Smoke test cargo install
