@@ -117,13 +117,13 @@ jobs:
         run: |
           cargo test --locked --test runtime_launch_tests -- --include-ignored --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'native launch regression failed' }
-      - name: Prove native Windows runtime packing custody
-        timeout-minutes: 5
-        run: cargo test --locked --test windows_runtime_pack_tests native_windows_pack_preserves_live_child_archive -- --exact --nocapture
       - name: Prove native Windows dev stop lifecycle
         run: |
           cargo test --locked --lib windows_source_watch_ -- --nocapture
           cargo test --locked --test windows_dev_stop_tests native_windows_dev_stop_lifecycle -- --exact --nocapture
+      - name: Prove native Windows runtime packing custody
+        timeout-minutes: 5
+        run: cargo test --locked --test windows_runtime_pack_tests native_windows_pack_preserves_live_child_archive -- --exact --nocapture
 
       - name: Prove native Windows runtime installation prefixes
         timeout-minutes: 5
