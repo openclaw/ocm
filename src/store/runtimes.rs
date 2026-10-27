@@ -110,7 +110,10 @@ fn symlink_or_copy_dir(source: &Path, target: &Path) -> Result<(), String> {
 }
 
 fn relative_symlink_target(source: &Path, target: &Path) -> Option<PathBuf> {
-    let target_parent = target.parent()?;
+    // npm can link packages into .store. Relative links are interpreted from
+    // their physical parent, and must stay valid when the staged runtime moves.
+    let source = fs::canonicalize(source).ok()?;
+    let target_parent = fs::canonicalize(target.parent()?).ok()?;
     let source_components = source.components().collect::<Vec<_>>();
     let parent_components = target_parent.components().collect::<Vec<_>>();
     let common = source_components
@@ -4205,6 +4208,35 @@ pub fn verify_runtime_binary(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn dependency_links_resolve_aliases_and_survive_runtime_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join("stage");
+        let source = stage.join("packages/dependency");
+        let parent = stage.join("store/host/node_modules");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(source.join("package.json"), "{}").unwrap();
+        std::os::unix::fs::symlink("packages/dependency", stage.join("source")).unwrap();
+        std::os::unix::fs::symlink("store/host", stage.join("host")).unwrap();
+
+        let target = stage.join("host/node_modules/dependency");
+        super::symlink_or_copy_dir(&stage.join("source"), &target).unwrap();
+        assert!(std::fs::read_link(&target).unwrap().is_relative());
+        assert_eq!(
+            std::fs::canonicalize(&target).unwrap(),
+            std::fs::canonicalize(&source).unwrap()
+        );
+
+        let published = root.path().join("published");
+        std::fs::rename(&stage, &published).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(published.join("host/node_modules/dependency")).unwrap(),
+            std::fs::canonicalize(published.join("packages/dependency")).unwrap()
+        );
+    }
+
     #[test]
     fn materialized_dependency_copy_fallback_preserves_nested_bindings_and_cycles() {
         let root = tempfile::tempdir().unwrap();
