@@ -1546,7 +1546,8 @@ fn migrate_copies_deep_external_workspaces_with_bounded_directory_handles() {
 #[cfg(unix)]
 #[test]
 fn migrate_rejects_copied_workspace_destination_links_without_changing_originals() {
-    for agent in [false, true] {
+    for selection in ["default", "agent", "implicit"] {
+        let agent = selection != "default";
         for layout in ["parent", "workspace", "nested", "file", "dangling"] {
             let root = TestDir::new("migrate-copied-workspace-destination-link");
             let cwd = root.child("cwd");
@@ -1568,7 +1569,9 @@ fn migrate_rejects_copied_workspace_destination_links_without_changing_originals
             )
             .unwrap();
             fs::write(unrelated.join("notes.txt"), "unrelated payload\n").unwrap();
-            let destination = if agent {
+            let destination = if selection == "implicit" {
+                "workspaces/agents/main"
+            } else if agent {
                 "workspaces/agents/ops"
             } else {
                 "workspaces/default"
@@ -1595,7 +1598,11 @@ fn migrate_rejects_copied_workspace_destination_links_without_changing_originals
                 _ => unrelated.clone(),
             };
             std::os::unix::fs::symlink(&link_target, &link).unwrap();
-            let config = if agent {
+            let config = if selection == "implicit" {
+                fs::remove_dir(source.join("workspace")).unwrap();
+                std::os::unix::fs::symlink(&selected, source.join("workspace")).unwrap();
+                serde_json::json!({"agents": {"entries": {"main": {}}}})
+            } else if agent {
                 serde_json::json!({"agents": {"defaults": {"workspace": source.join("workspace")}, "list": [{"id": "ops", "workspace": selected}]}})
             } else {
                 serde_json::json!({"agents": {"defaults": {"workspace": selected}}})
@@ -1619,7 +1626,7 @@ fn migrate_rejects_copied_workspace_destination_links_without_changing_originals
             assert_eq!(
                 output.status.code(),
                 Some(1),
-                "agent={agent}, layout={layout}"
+                "selection={selection}, layout={layout}"
             );
             assert!(
                 stderr(&output).contains("copied destination symlink"),
@@ -1633,7 +1640,7 @@ fn migrate_rejects_copied_workspace_destination_links_without_changing_originals
                     migration_source_inventory(&selected),
                     migration_source_inventory(&unrelated)
                 ],
-                "agent={agent}, layout={layout}"
+                "selection={selection}, layout={layout}"
             );
             assert!(!root.child("ocm-home/envs/mira").exists());
             let registry: serde_json::Value =
@@ -1699,6 +1706,120 @@ fn adopt_import_copies_a_symlinked_external_workspace_into_the_disposable_enviro
         fs::read_to_string(external.join("notes.txt")).unwrap(),
         "repo-backed data\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn migration_preserves_implicit_external_default_workspaces() {
+    for adopt in [false, true] {
+        for shape in [
+            "missing",
+            "defaults",
+            "empty-entries",
+            "entries",
+            "list",
+            "shared",
+        ] {
+            let root = TestDir::new("migrate-implicit-external-workspace");
+            let source = root.child("home/.openclaw");
+            let external = root.child("project");
+            let empty_bin = root.child("empty-bin");
+            fs::create_dir_all(&source).unwrap();
+            fs::create_dir_all(external.join("nested")).unwrap();
+            fs::create_dir_all(&empty_bin).unwrap();
+            fs::write(external.join("USER.md"), "durable workspace\n").unwrap();
+            fs::write(external.join("nested/notes.txt"), "shared notes\n").unwrap();
+            std::os::unix::fs::symlink(&external, source.join("workspace")).unwrap();
+            let config = match shape {
+                "missing" => None,
+                "defaults" => {
+                    Some(serde_json::json!({"agents": {"defaults": {"timeoutSeconds": 60}}}))
+                }
+                "empty-entries" => Some(serde_json::json!({"agents": {"entries": {}}})),
+                "entries" => Some(serde_json::json!({"agents": {"entries": {"main": {}}}})),
+                "list" => Some(
+                    serde_json::json!({"agents": {"list": [{"id": "personal", "default": true}, {"id": "ops"}]}}),
+                ),
+                "shared" => Some(
+                    serde_json::json!({"agents": {"list": [{"id": "main"}, {"id": "ops", "workspace": external.join("nested")}]}}),
+                ),
+                _ => unreachable!(),
+            };
+            if let Some(config) = config {
+                fs::write(source.join("openclaw.json"), config.to_string()).unwrap();
+            }
+            if shape == "list" {
+                fs::create_dir_all(source.join("workspace-ops")).unwrap();
+                fs::write(
+                    source.join("workspace-ops/USER.md"),
+                    "secondary workspace\n",
+                )
+                .unwrap();
+            }
+            let before = [
+                migration_source_inventory(&source),
+                migration_source_inventory(&external),
+            ];
+            let mut env = ocm_env(&root);
+            env.insert("HOME".into(), root.child("home").display().to_string());
+            env.insert("PATH".into(), empty_bin.display().to_string());
+            let args = if adopt {
+                vec!["adopt", "import", "--name", "mira", "--json"]
+            } else {
+                vec!["migrate", "mira", "--json"]
+            };
+            let output = run_ocm(root.path(), &env, &args);
+            assert!(
+                output.status.success(),
+                "adopt={adopt} shape={shape}: {}",
+                stderr(&output)
+            );
+            let target = root.child("ocm-home/envs/mira");
+            let config: serde_json::Value =
+                serde_json::from_slice(&fs::read(target.join(".openclaw/openclaw.json")).unwrap())
+                    .unwrap();
+            let pointer = match shape {
+                "entries" => "/agents/entries/main/workspace",
+                "list" | "shared" => "/agents/list/0/workspace",
+                _ => "/agents/defaults/workspace",
+            };
+            let workspace = Path::new(config.pointer(pointer).unwrap().as_str().unwrap());
+            assert!(workspace.starts_with(&target));
+            assert_eq!(
+                fs::read_to_string(workspace.join("USER.md")).unwrap(),
+                "durable workspace\n"
+            );
+            assert!(!target.join(".openclaw/workspace").is_symlink());
+            if shape == "list" {
+                assert!(config.pointer("/agents/defaults/workspace").is_none());
+                assert!(config.pointer("/agents/list/1/workspace").is_none());
+                assert_eq!(
+                    fs::read_to_string(target.join(".openclaw/workspace-ops/USER.md")).unwrap(),
+                    "secondary workspace\n"
+                );
+            }
+            if shape == "shared" {
+                let shared = Path::new(
+                    config
+                        .pointer("/agents/list/1/workspace")
+                        .unwrap()
+                        .as_str()
+                        .unwrap(),
+                );
+                assert_eq!(shared, workspace.join("nested"));
+                fs::write(shared.join("new.txt"), "imported only\n").unwrap();
+                assert!(workspace.join("nested/new.txt").is_file());
+            }
+            assert_eq!(
+                before,
+                [
+                    migration_source_inventory(&source),
+                    migration_source_inventory(&external)
+                ],
+                "adopt={adopt} shape={shape}"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]

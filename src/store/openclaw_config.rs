@@ -16,7 +16,7 @@ use super::gateway_ports::read_port_number;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_workspaces::{
     OpenClawConfigReadContext, OpenClawConfigReadError, OpenClawWorkspaceInventory,
-    OpenClawWorkspaceRuntime, load_effective_openclaw_config, normalize_agent_id,
+    OpenClawWorkspaceRuntime, agent_entries, load_effective_openclaw_config, normalize_agent_id,
     read_openclaw_config_field, read_regular_text_file, resolve_openclaw_config_env,
 };
 
@@ -287,16 +287,23 @@ pub(crate) fn rewrite_external_workspace_paths_for_migration(
     if default_workspace.is_none() && agent_workspaces.is_empty() {
         return Ok(false);
     }
-    let Some(mut value) = read_config_value(config_path)? else {
-        return Ok(false);
-    };
-    let Some(agents) = value.get_mut("agents").and_then(Value::as_object_mut) else {
-        return Ok(false);
-    };
+    let mut value = read_config_value(config_path)?.unwrap_or_else(|| json!({}));
+    let implicit_main = agent_entries(&value).is_empty();
+    let object = value
+        .as_object_mut()
+        .ok_or("cannot rewrite migrated workspace in a non-object OpenClaw config")?;
+    let agents = ensure_object_field(object, "agents");
 
     let mut changed = false;
     if let Some(default_workspace) = default_workspace {
         changed |= set_workspace_path(agents.get_mut("defaults"), default_workspace);
+    }
+    // With no authored agent entry, OpenClaw's implicit main agent consumes
+    // defaults.workspace. Do not set this fallback for an authored agent: that
+    // would also change the implicit workspace selection of secondary agents.
+    if implicit_main && let Some(workspace) = agent_workspaces.get("main") {
+        ensure_object_field(agents, "defaults");
+        changed |= set_workspace_path(agents.get_mut("defaults"), workspace);
     }
     if let Some(entries) = agents.get_mut("entries").and_then(Value::as_object_mut) {
         for (agent_id, entry) in entries {

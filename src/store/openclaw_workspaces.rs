@@ -246,7 +246,7 @@ impl OpenClawWorkspaceInventory {
         self.workspace_roots.iter().map(PathBuf::as_path)
     }
 
-    /// Admit configured migration workspaces before choosing their copied trees.
+    /// Admit migration workspaces before choosing their copied trees.
     /// Internal references also participate when an external workspace contains
     /// the plain home; config includes remain owned by their original tree.
     pub(crate) fn workspace_sources_for_migration(
@@ -276,6 +276,20 @@ impl OpenClawWorkspaceInventory {
             let source =
                 migration_workspace_source(workspace, source_root, &canonical_source_root)?;
             agent_workspaces.insert(agent_id.clone(), source);
+        }
+        // The default agent can use the standard workspace without an authored
+        // path. Its external symlink target needs the same copy and projection
+        // as an explicitly configured workspace; copying the home keeps only
+        // the link. Other implicit agent layouts retain their admission policy.
+        if self.configured_default_workspace.is_none()
+            && !agent_workspaces.contains_key(&self.default_agent_id)
+            && let Some(workspace) = self.default_agent_workspace()
+        {
+            let source =
+                migration_workspace_source(workspace, source_root, &canonical_source_root)?;
+            if !source.canonical.starts_with(&canonical_source_root) {
+                agent_workspaces.insert(self.default_agent_id.clone(), source);
+            }
         }
 
         Ok(MigrationWorkspaceSources {
@@ -1361,7 +1375,7 @@ fn is_openclaw_env_var_name(name: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit())
 }
 
-fn agent_entries(config: &Value) -> Vec<Map<String, Value>> {
+pub(super) fn agent_entries(config: &Value) -> Vec<Map<String, Value>> {
     if let Some(entries) = config.pointer("/agents/entries").and_then(Value::as_object) {
         return javascript_property_entries(entries)
             .into_iter()
