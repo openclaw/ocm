@@ -456,6 +456,7 @@ A leftover is kept while another operation holds that runtime's lock and is remo
 
 Official package installation reads `engines.node` from the integrity-verified archive before invoking npm.
 Ordinary runtime execution reads the installed package manifest and uses a compatible host Node.js when available, otherwise a compatible private toolchain.
+On Windows, OCM invokes that Node.js executable with the installed `openclaw.mjs` entrypoint followed by the original arguments. Registered commands and other custom executable runtimes keep their existing direct execution.
 OCM validates cached executables with `node --version` and reuses only its selected private Node.js patch.
 Private toolchain preparation for release flows, including reuse of an already-installed cache, also makes a best-effort attempt to remove hidden `.node-toolchain-*` download and extraction stages left by exited OCM processes.
 Stages are kept while their recorded process is still running or cannot be inspected, including when its PID has been reused; a later preparation retries cleanup.
