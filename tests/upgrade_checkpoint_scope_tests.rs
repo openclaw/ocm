@@ -339,6 +339,97 @@ fn independent_project_survives_success_failure_interrupt_and_explicit_rollback(
 }
 
 #[test]
+fn captured_readonly_ancestors_allow_scoped_restore_and_upgrade_rollback() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for mode in ["manual", "explicit", "failure"] {
+        let fixture = Fixture::new();
+        let workspace = fixture.state.join("workspace");
+        let identity = workspace.join("IDENTITY.md");
+        fs::set_permissions(&identity, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o555)).unwrap();
+        let ancestor_inode = fs::metadata(&workspace).unwrap().ino();
+        let ready = fixture.root.child("ready");
+        let release = fixture.root.child("release");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ocm"))
+            .args(["upgrade", "demo", "--runtime", "new", "--json"])
+            .current_dir(fixture.root.path())
+            .env_clear()
+            .envs(&fixture.env)
+            .env("OCM_PROOF_READY", &ready)
+            .env("OCM_PROOF_RELEASE", &release)
+            .env("OCM_PROOF_FAIL", if mode == "failure" { "1" } else { "0" })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready.exists() && Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+            sleep(Duration::from_millis(10));
+        }
+        // Capture has finished before the native finalizer waits. Model its
+        // owned-state mutation with writable live parents and a readonly backup.
+        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&identity, fs::Permissions::from_mode(0o644)).unwrap();
+        if !ready.exists() {
+            write_text(&release, "release");
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "finalizer not reached: {} {}",
+                stdout(&output),
+                stderr(&output)
+            );
+        }
+        write_text(&identity, "migrated identity\n");
+        let expected_project = fixture.edit_project();
+        write_text(&release, "release");
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            mode != "failure",
+            "{} {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let id = receipt["snapshotId"].as_str().unwrap();
+        let show = fixture.run_ok(&["env", "snapshot", "show", "demo", id, "--json"]);
+        let snapshot: Value = serde_json::from_slice(&show.stdout).unwrap();
+        let captured =
+            PathBuf::from(snapshot["archivePath"].as_str().unwrap()).join(".openclaw/workspace");
+        assert_eq!(fs::metadata(&captured).unwrap().mode() & 0o777, 0o555);
+        match mode {
+            "manual" => {
+                fixture.run_ok(&["env", "snapshot", "restore", "demo", id]);
+            }
+            "explicit" => {
+                fixture.run_ok(&["upgrade", "rollback", "demo", "--json"]);
+            }
+            "failure" => assert_eq!(receipt["rollback"], "restored", "{receipt}"),
+            _ => unreachable!(),
+        }
+        fixture.assert_project(&expected_project);
+        assert_eq!(fs::read_to_string(&identity).unwrap(), "identity\n");
+        assert_eq!(fs::metadata(&identity).unwrap().mode() & 0o777, 0o444);
+        let ancestor = fs::metadata(&workspace).unwrap();
+        assert_eq!(ancestor.ino(), ancestor_inode);
+        assert_eq!(ancestor.mode() & 0o777, 0o755);
+        assert_eq!(fs::metadata(&captured).unwrap().mode() & 0o777, 0o555);
+        assert_eq!(
+            fs::read_to_string(captured.join("IDENTITY.md")).unwrap(),
+            "identity\n"
+        );
+        let current = fixture.run_ok(&["env", "show", "demo", "--json"]);
+        let current: Value = serde_json::from_slice(&current.stdout).unwrap();
+        assert_eq!(current["defaultRuntime"], "old");
+        // Remove through the permission-aware checkpoint owner so TestDir can
+        // reclaim the fixture without leaving a readonly saved tree behind.
+        fixture.run_ok(&["env", "snapshot", "remove", "demo", id]);
+    }
+}
+
+#[test]
 fn scoped_manual_restore_and_rollback_restore_owned_symlink_entries() {
     for manual in [true, false] {
         let mut fixture = Fixture::new();

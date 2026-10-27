@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use super::layout::display_path;
+use super::openclaw_state::with_owner_write_permission;
 
 /// The declared paths are opaque to checkpoints. In particular, checking their
 /// contents to decide whether to omit them would repeat the original scope bug.
@@ -172,8 +173,19 @@ pub(crate) fn replace_owned_entries(
             }
             let staged = candidate.join(&relative);
             if entry_exists(&staged)? {
-                fs::rename(&staged, &live).map_err(|error| error.to_string())?;
-                replacement.installed = true;
+                // Shared ancestors stay in place, so their captured modes do
+                // not need to permit removing children from our staging tree.
+                // Never relax the corresponding live ancestor's permissions.
+                with_owner_write_permission(
+                    staged.parent().expect("owned entry has a parent"),
+                    || {
+                        fs::rename(&staged, &live).map_err(|error| error.to_string())?;
+                        // Permission restoration can fail after the move; retain
+                        // that move in the ledger so compensation still undoes it.
+                        replacement.installed = true;
+                        Ok(())
+                    },
+                )?;
             }
         }
         Ok(())
@@ -183,12 +195,17 @@ pub(crate) fn replace_owned_entries(
             let live = current.join(&replacement.relative);
             let revert = (|| {
                 if replacement.installed {
-                    fs::rename(&live, candidate.join(&replacement.relative))?;
+                    let staged = candidate.join(&replacement.relative);
+                    with_owner_write_permission(
+                        staged.parent().expect("owned entry has a parent"),
+                        || fs::rename(&live, &staged).map_err(|error| error.to_string()),
+                    )?;
                 }
                 if replacement.displaced {
-                    fs::rename(displaced.join(&replacement.relative), &live)?;
+                    fs::rename(displaced.join(&replacement.relative), &live)
+                        .map_err(|error| error.to_string())?;
                 }
-                Ok::<_, std::io::Error>(())
+                Ok::<_, String>(())
             })();
             if let Err(revert_error) = revert {
                 return Err(SnapshotRestoreError {
@@ -235,14 +252,20 @@ mod tests {
         fs::write(current.join("z-parent/project/file"), "developer").unwrap();
         let before = fs::metadata(current.join("z-parent/project/file")).unwrap();
         fs::set_permissions(current.join("z-parent"), fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o555)).unwrap();
         let result = replace_owned_entries(
             &current,
             &candidate,
             &backup,
             &[PathBuf::from("z-parent/project")],
         );
+        let live_mode = fs::metadata(current.join("z-parent")).unwrap().mode() & 0o777;
+        let staged_mode = fs::metadata(&candidate).unwrap().mode() & 0o777;
         fs::set_permissions(current.join("z-parent"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.unwrap_err().prior_state_restored);
+        assert_eq!(live_mode, 0o500);
+        assert_eq!(staged_mode, 0o555);
         assert_eq!(
             fs::read_link(current.join("b-link")).unwrap(),
             Path::new("missing-live")
@@ -285,7 +308,10 @@ mod tests {
         fs::write(current.join("workspace/project/new"), "new work").unwrap();
         fs::write(current.join("new-runtime-state"), "new runtime").unwrap();
         symlink("missing-new", current.join("new-link")).unwrap();
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o555)).unwrap();
         replace_owned_entries(&current, &backup, &rejected, &paths).unwrap();
+        assert_eq!(fs::metadata(&backup).unwrap().mode() & 0o777, 0o555);
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(fs::read(current.join("owned")).unwrap(), b"original");
         assert_eq!(
             fs::read(current.join("workspace/project/new")).unwrap(),
