@@ -94,7 +94,8 @@ fn inventory_path(
 fn hash_file(path: &Path) -> Result<[u8; 32], String> {
     let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    // Keep the streaming buffer off the stack: Windows executables reserve 1 MiB.
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
         if read == 0 {
@@ -200,7 +201,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tree_digest_preserves_v1_encoding() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -208,6 +209,53 @@ mod tests {
         assert_eq!(
             tree_sha256(root.path()).unwrap(),
             "47d8bf62e61e92d5b7e76a8669b829db917ffdeaf8e1b6484ec4882c3d42d005"
+        );
+
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let empty = root.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let payload = nested.join("payload");
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(&payload, bytes).unwrap();
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o640)).unwrap();
+        for (name, target) in [("link", "nested/payload"), ("dangling", "missing")] {
+            let link = root.path().join(name);
+            symlink(target, &link).unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::ffi::OsStrExt;
+
+                // macOS applies the umask to symlinks; pin the fixture's own mode.
+                let path = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+                let result = unsafe {
+                    libc::fchmodat(
+                        libc::AT_FDCWD,
+                        path.as_ptr(),
+                        0o777,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+            }
+            assert_eq!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o777
+            );
+        }
+
+        // Captured with the original v1 implementation, including multiple reads.
+        assert_eq!(
+            tree_sha256(root.path()).unwrap(),
+            "9d79f997d4019648f2cc93134177ff7908d4d725dd4fd8878e88cba0f2a13030"
         );
     }
 

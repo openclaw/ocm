@@ -108,6 +108,9 @@ jobs:
         with:
           node-version: '22.23.4'
           package-manager-cache: false
+      - name: Prove native Windows runtime tree hashing
+        timeout-minutes: 5
+        run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
       - name: Prove native Windows dev stop lifecycle
         run: |
           cargo test --locked --lib windows_source_watch_ -- --nocapture
