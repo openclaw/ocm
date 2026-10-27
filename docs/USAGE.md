@@ -266,6 +266,8 @@ places them in the managed runtime's bundled-extension root. Extensions from
 global, state, workspace, or other external paths are not included or promoted.
 Materialized extensions retain the installed dependency bindings, including
 when npm hoists a version that differs from the core package's private version.
+These builds also support an existing directory alias in `OCM_HOME`, including
+native npm's `linked` installation strategy, without changing the caller's npm settings.
 Without the flag, `build-local` remains release-shaped.
 Because the opt-in installs every omitted extension and its dependency closure,
 the resulting runtime can take longer to build and use substantially more disk

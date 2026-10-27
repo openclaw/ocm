@@ -2604,6 +2604,121 @@ fn runtime_build_local_resolves_native_plugin_identity_to_declared_source() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn runtime_build_local_installs_native_packages_through_store_aliases() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDir::new("runtime-native-prefix-alias");
+    let cwd = fs::canonicalize(root.path()).unwrap();
+    let repo = cwd.join("source");
+    let plugin = repo.join("dist/extensions/probe");
+    fs::create_dir_all(&plugin).unwrap();
+    let core_manifest = serde_json::json!({
+        "name": "openclaw", "version": "2026.4.25", "type": "module",
+        "bin": {"openclaw": "openclaw.mjs"}, "engines": {"node": ">=22.22.3"},
+        "files": ["openclaw.mjs"]
+    })
+    .to_string();
+    let plugin_manifest = serde_json::json!({
+        "name": "@prefix/probe", "version": "2026.4.25", "type": "module",
+        "files": ["index.mjs", "openclaw.plugin.json"],
+        "openclaw": {"extensions": ["./index.mjs"], "runtimeExtensions": ["./index.mjs"]}
+    })
+    .to_string();
+    fs::write(repo.join("package.json"), &core_manifest).unwrap();
+    fs::write(plugin.join("package.json"), &plugin_manifest).unwrap();
+    fs::write(
+        plugin.join("openclaw.plugin.json"),
+        r#"{"id":"probe","configSchema":{"type":"object"}}"#,
+    )
+    .unwrap();
+    fs::write(plugin.join("index.mjs"), "export default 'probe-ready';\n").unwrap();
+    let core_script = "#!/usr/bin/env node\nimport value from './dist/extensions/probe/index.mjs'; console.log(value);\n";
+    write_executable_script(&repo.join("openclaw.mjs"), core_script);
+
+    let cases = [
+        ("physical-linked", false, "linked"),
+        ("alias-linked", true, "linked"),
+        ("alias-hoisted", true, "hoisted"),
+        ("alias-nested", true, "nested"),
+    ];
+    for (label, alias, strategy) in cases {
+        let case = cwd.join(label);
+        let physical = case.join("store");
+        fs::create_dir_all(&physical).unwrap();
+        let store = if alias {
+            let path = case.join("store-alias");
+            symlink(&physical, &path).unwrap();
+            path
+        } else {
+            physical
+        };
+        let mut env = ocm_env(&root);
+        env.insert("OCM_HOME".into(), path_string(&store));
+        env.insert("npm_config_offline".into(), "true".into());
+        env.insert("npm_config_audit".into(), "false".into());
+        env.insert("npm_config_fund".into(), "false".into());
+        env.insert(
+            "npm_config_cache".into(),
+            path_string(&case.join("npm-cache")),
+        );
+        env.insert("npm_config_install_strategy".into(), strategy.into());
+        let build = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "build-local",
+                "demo",
+                "--repo",
+                &path_string(&repo),
+                "--include-source-extensions",
+                "--json",
+            ],
+        );
+        assert!(build.status.success(), "{label}: {}", stderr(&build));
+        let meta: Value = serde_json::from_str(&stdout(&build)).unwrap();
+        let installed = store.join("runtimes/demo");
+        assert_eq!(meta["installRoot"], path_string(&installed));
+        let modules = installed.join("files/node_modules");
+        let core = modules.join("openclaw");
+        assert!(core.join("package.json").is_file());
+        assert!(modules.join("@prefix/probe/package.json").is_file());
+        assert_eq!(
+            fs::symlink_metadata(&core)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            strategy == "linked"
+        );
+        assert!(!installed.join("files/.ocm-npm-lifecycle").exists());
+        let verified = run_ocm(&cwd, &env, &["runtime", "verify", "demo", "--json"]);
+        assert!(verified.status.success(), "{label}: {}", stderr(&verified));
+        let created = run_ocm(&cwd, &env, &["env", "create", "demo", "--runtime", "demo"]);
+        assert!(created.status.success(), "{label}: {}", stderr(&created));
+        let executed = run_ocm(&cwd, &env, &["@demo", "--", "--version"]);
+        assert!(executed.status.success(), "{label}: {}", stderr(&executed));
+        assert_eq!(stdout(&executed).trim(), "probe-ready");
+        assert!(fs::read_dir(store.join("runtimes")).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            !name.contains(".stage-") && !name.contains(".pack-")
+        }));
+        assert_eq!(
+            fs::read_to_string(repo.join("package.json")).unwrap(),
+            core_manifest
+        );
+        assert_eq!(
+            fs::read_to_string(plugin.join("package.json")).unwrap(),
+            plugin_manifest
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("openclaw.mjs")).unwrap(),
+            core_script
+        );
+    }
+}
+
 #[test]
 fn runtime_build_local_resolves_manifest_aliases_with_real_npm() {
     let root = TestDir::new("runtime-manifest-aliases-real-npm");

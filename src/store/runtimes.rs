@@ -1494,6 +1494,34 @@ fn cleanup_npm_lifecycle_environment(lifecycle_root: &Path) -> Result<(), String
     })
 }
 
+#[cfg(windows)]
+fn npm_command_prefix(path: &Path) -> PathBuf {
+    use std::path::Prefix;
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    // canonicalize returns filesystem-API verbatim paths. npm's path handling
+    // recurses on those prefixes; keep the same physical drive/UNC destination
+    // in the spelling accepted by the native command.
+    let mut native = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut prefix = OsString::from(r"\\");
+            prefix.push(server);
+            prefix.push(r"\");
+            prefix.push(share);
+            PathBuf::from(prefix)
+        }
+        _ => return path.to_path_buf(),
+    };
+    for component in components {
+        native.push(component.as_os_str());
+    }
+    native
+}
+
 fn install_openclaw_package_with_npm(
     archive_path: &Path,
     additional_archives: &[PathBuf],
@@ -1502,6 +1530,17 @@ fn install_openclaw_package_with_npm(
     env: &BTreeMap<String, String>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
 ) -> Result<(), String> {
+    // npm's linked installer can treat an aliased prefix as already up to date
+    // without installing its packages. Resolve only this existing owned stage;
+    // keep the configured store and published metadata paths unchanged.
+    let npm_prefix = fs::canonicalize(install_files).map_err(|error| {
+        format!(
+            "failed to resolve npm installation directory {}: {error}",
+            display_path(install_files)
+        )
+    })?;
+    #[cfg(windows)]
+    let npm_prefix = npm_command_prefix(&npm_prefix);
     let requirement = if local_adapter.is_some() {
         NodeRequirement::default()
     } else {
@@ -1525,7 +1564,7 @@ fn install_openclaw_package_with_npm(
         .args(&install_command.args)
         .arg("install")
         .arg("--prefix")
-        .arg(install_files)
+        .arg(&npm_prefix)
         .arg("--omit=dev")
         .arg("--no-save")
         .arg("--package-lock=false")
@@ -4208,6 +4247,166 @@ pub fn verify_runtime_binary(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn native_npm_prefix_accepts_windows_paths() {
+        use std::io::Write;
+        use std::path::Path;
+        use std::process::Command;
+
+        // Use a child test process so npm sees the same isolated process
+        // environment as a real caller, without changing parallel tests' env.
+        if let Some(root) = std::env::var_os("OCM_TEST_NPM_PREFIX_ABI") {
+            let root = std::path::PathBuf::from(root);
+            let install = root.join("install");
+            std::fs::create_dir(&install).unwrap();
+            let env = std::env::vars().collect();
+            super::install_openclaw_package_with_npm(
+                &root.join("core.tgz"),
+                &[root.join("plugin.tgz")],
+                &install,
+                &root,
+                &env,
+                None,
+            )
+            .unwrap();
+            for log in std::fs::read_dir(root.join("cache/_logs")).unwrap() {
+                let log = std::fs::read_to_string(log.unwrap().path()).unwrap();
+                for line in log
+                    .lines()
+                    .filter(|line| line.contains("info using ") || line.contains("verbose argv "))
+                {
+                    println!("{line}");
+                }
+            }
+            let modules = install.join("node_modules");
+            for (package, name, entry) in [
+                ("openclaw", "openclaw", "openclaw.mjs"),
+                ("@prefix/probe", "@prefix/probe", "index.mjs"),
+            ] {
+                let manifest: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(modules.join(package).join("package.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(manifest["name"], name);
+                assert_eq!(manifest["version"], "2026.4.25");
+                assert_eq!(
+                    std::fs::read(modules.join(package).join(entry)).unwrap(),
+                    b"export default 'prefix';\n"
+                );
+            }
+            assert!(
+                modules.join(".store").is_dir(),
+                "native linked strategy was not retained"
+            );
+            assert!(!install.join(".ocm-npm-lifecycle").exists());
+            return;
+        }
+
+        for (input, expected) in [
+            (r"\\?\C:\state\stage\files", r"C:\state\stage\files"),
+            (r"\\?\UNC\server\share\state", r"\\server\share\state"),
+            (r"\\?\Volume{device}\state", r"\\?\Volume{device}\state"),
+        ] {
+            assert_eq!(
+                super::npm_command_prefix(Path::new(input)),
+                Path::new(expected)
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let pack = |path: &Path, name: &str, entry: &str| {
+            let mut manifest = serde_json::json!({
+                "name": name, "version": "2026.4.25", "type": "module",
+                "engines": {"node": ">=22.22.3"}
+            });
+            if name == "openclaw" {
+                manifest["bin"] = serde_json::json!({"openclaw": entry});
+            }
+            let encoder = flate2::write::GzEncoder::new(
+                std::fs::File::create(path).unwrap(),
+                flate2::Compression::default(),
+            );
+            let mut archive = tar::Builder::new(encoder);
+            for (file, bytes) in [
+                (
+                    "package/package.json".to_string(),
+                    manifest.to_string().into_bytes(),
+                ),
+                (
+                    format!("package/{entry}"),
+                    b"export default 'prefix';\n".to_vec(),
+                ),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive.append_data(&mut header, file, &bytes[..]).unwrap();
+            }
+            archive
+                .into_inner()
+                .unwrap()
+                .finish()
+                .unwrap()
+                .flush()
+                .unwrap();
+        };
+        pack(&root.path().join("core.tgz"), "openclaw", "openclaw.mjs");
+        pack(
+            &root.path().join("plugin.tgz"),
+            "@prefix/probe",
+            "index.mjs",
+        );
+        let home = root.path().join("home");
+        let tmp = root.path().join("tmp");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&tmp).unwrap();
+        let npm = Command::new("where.exe").arg("npm.cmd").output().unwrap();
+        assert!(
+            npm.status.success(),
+            "{}",
+            String::from_utf8_lossy(&npm.stderr)
+        );
+        let npm = String::from_utf8(npm.stdout).unwrap();
+        let npm = npm.lines().next().unwrap().trim();
+        println!("Native npm: {npm}");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.env_clear().env("OCM_INTERNAL_NPM_BIN", npm);
+        for (key, value) in std::env::vars_os() {
+            if matches!(
+                key.to_string_lossy().to_ascii_uppercase().as_str(),
+                "PATH" | "SYSTEMROOT" | "WINDIR" | "COMSPEC" | "PATHEXT"
+            ) {
+                command.env(key, value);
+            }
+        }
+        let output = command
+            .args([
+                "--exact",
+                "store::runtimes::tests::native_npm_prefix_accepts_windows_paths",
+                "--nocapture",
+            ])
+            .env("OCM_TEST_NPM_PREFIX_ABI", root.path())
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("TMP", &tmp)
+            .env("TEMP", &tmp)
+            .env("npm_config_cache", root.path().join("cache"))
+            .env("npm_config_loglevel", "verbose")
+            .env("npm_config_logs_max", "10")
+            .env("npm_config_offline", "true")
+            .env("npm_config_install_strategy", "linked")
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "native prefix child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn dependency_links_resolve_aliases_and_survive_runtime_publication() {
