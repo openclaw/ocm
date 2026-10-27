@@ -10,6 +10,9 @@ const readline = require('node:readline');
 assert.equal(process.platform, 'win32');
 const revision = process.argv[2];
 assert.match(revision, /^[a-f0-9]{40}$/);
+const assemblyOnly = process.argv[3] === '--assembly-only';
+const expectedDiagnosticTree = process.argv[4];
+if (assemblyOnly) assert.match(expectedDiagnosticTree, /^[a-f0-9]{40}$/);
 const repository = process.cwd();
 const root = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'ocm-digest-qualification-'));
 const fixtureDriver = path.join(repository, 'tests/support/windows_runtime_pack.cjs');
@@ -77,7 +80,9 @@ async function frameEvidence(target, sourceTree) {
     const lines = readline.createInterface({input, crlfDelay: Infinity});
     let capture = null;
     for await (const line of lines) {
-      if (!capture && line.includes('tree_digest') && line.includes('hash_file') &&
+      // Exclude generic map_err/closure symbols that merely contain this path.
+      const exactFunction = /tree_digest9hash_file(?:17h[0-9a-f]+E)?(?::|\s*$)/.test(line);
+      if (!capture && exactFunction &&
           (/^\s*\.seh_proc\s/.test(line) || /^\s*\S+:/.test(line))) capture = [];
       if (capture) {
         capture.push(line);
@@ -101,7 +106,7 @@ async function frameEvidence(target, sourceTree) {
   assert(found, 'No emitted native hash_file prologue found');
 }
 async function main() {
-  console.log(JSON.stringify({phase: 'qualification-input', revision, root,
+  console.log(JSON.stringify({phase: 'qualification-input', revision, root, assemblyOnly,
     driverSha256: await sha256(__filename), fixtureDriverSha256: await sha256(fixtureDriver),
     node: process.version, nodeBinarySha256: await sha256(process.execPath),
     rustflags: process.env.RUSTFLAGS || null, encodedRustflags: process.env.CARGO_ENCODED_RUSTFLAGS || null,
@@ -111,18 +116,20 @@ async function main() {
   run('git', ['fetch', '--no-tags', '--depth=1', 'origin', revision]);
   const baseline = path.join(root, 'baseline');
   const diagnostic = path.join(root, 'diagnostic');
-  for (const checkout of [baseline, diagnostic]) {
+  for (const checkout of assemblyOnly ? [diagnostic] : [baseline, diagnostic]) {
     run('git', ['worktree', 'add', '--detach', checkout, revision]);
     assert.equal(git(['rev-parse', 'HEAD'], checkout), revision);
     assert.equal(git(['status', '--porcelain'], checkout), '');
   }
-  const baselineTarget = path.join(root, 'baseline-target');
-  const baselineEnv = {...process.env, CARGO_TARGET_DIR: baselineTarget};
-  run('cargo', ['build', '--locked', '--bin', 'ocm', '--manifest-path', path.join(baseline, 'Cargo.toml')],
-    {env: baselineEnv});
-  const baselineBinary = path.join(baselineTarget, 'debug/ocm.exe');
-  await identity('baseline', baseline, baselineBinary);
-  probe('baseline', baselineBinary);
+  if (!assemblyOnly) {
+    const baselineTarget = path.join(root, 'baseline-target');
+    const baselineEnv = {...process.env, CARGO_TARGET_DIR: baselineTarget};
+    run('cargo', ['build', '--locked', '--bin', 'ocm', '--manifest-path', path.join(baseline, 'Cargo.toml')],
+      {env: baselineEnv});
+    const baselineBinary = path.join(baselineTarget, 'debug/ocm.exe');
+    await identity('baseline', baseline, baselineBinary);
+    probe('baseline', baselineBinary);
+  }
 
   const sourceFile = path.join(diagnostic, 'src/infra/tree_digest.rs');
   const source = fs.readFileSync(sourceFile, 'utf8');
@@ -137,6 +144,17 @@ async function main() {
   run('git', ['diff', '--cached', '--', 'src/infra/tree_digest.rs'], {cwd: diagnostic});
   const diagnosticTarget = path.join(root, 'diagnostic-target');
   const diagnosticEnv = {...process.env, CARGO_TARGET_DIR: diagnosticTarget};
+  if (assemblyOnly) {
+    const tree = git(['write-tree'], diagnostic);
+    assert.equal(tree, expectedDiagnosticTree, 'Diagnostic source differs from the native run');
+    console.log(JSON.stringify({phase: 'assembly-source', head: revision, tree,
+      status: git(['status', '--porcelain'], diagnostic),
+      digestSourceSha256: await sha256(sourceFile)}));
+    run('cargo', ['rustc', '--locked', '--lib', '--manifest-path', path.join(diagnostic, 'Cargo.toml'),
+      '--', '--emit=asm,link'], {env: diagnosticEnv});
+    await frameEvidence(diagnosticTarget, tree);
+    return;
+  }
   run('cargo', ['build', '--locked', '--bin', 'ocm', '--manifest-path', path.join(diagnostic, 'Cargo.toml')],
     {env: diagnosticEnv});
   const diagnosticBinary = path.join(diagnosticTarget, 'debug/ocm.exe');

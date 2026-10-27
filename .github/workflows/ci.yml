@@ -122,7 +122,7 @@ jobs:
         timeout-minutes: 10
         shell: pwsh
         run: |
-          node tests/support/windows_digest_qualification.cjs dc282d315de01731c395983076bd04e633554bff
+          node tests/support/windows_digest_qualification.cjs dc282d315de01731c395983076bd04e633554bff --assembly-only 31a9e6b78465a1fae940d67e585fd6f77a06ce1a
           if ($LASTEXITCODE -ne 0) { throw 'baseline probe failed' }
       - name: Prove native Windows runtime packing custody
         timeout-minutes: 5
@@ -244,6 +244,46 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Observe pinned macOS foreground regression
+        if: runner.os == 'macOS' && github.event_name == 'pull_request' && github.event.pull_request.number == 717
+        timeout-minutes: 5
+        run: |
+          collector="$GITHUB_WORKSPACE/tests/support/foreground_resume_observe.py"
+          observation="$RUNNER_TEMP/foreground-resume-recheck-observation"
+          baseline="$RUNNER_TEMP/foreground-resume-recheck-base"
+          dump_observation() {
+            if [ -d "$observation" ]; then
+              python3 - "$observation" <<'PY'
+          import pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          files = [root / 'identity.json', root / 'results.json']
+          for attempt in sorted(root.iterdir()):
+              if attempt.is_dir() and attempt.name.isdigit():
+                  files.extend(attempt / name for name in ('observations.jsonl', 'test.log'))
+          for file in files:
+              if file.is_file():
+                  print(f'=== {file.relative_to(root)} ===', flush=True)
+                  print(file.read_text(), end='', flush=True)
+          PY
+            fi
+          }
+          trap dump_observation EXIT
+          shasum -a 256 "$collector"
+          git fetch --no-tags --depth=1 origin dc282d315de01731c395983076bd04e633554bff
+          git worktree add --detach "$baseline" dc282d315de01731c395983076bd04e633554bff
+          cd "$baseline"
+          git rev-parse HEAD 'HEAD^{tree}'
+          test -z "$(git status --porcelain)"
+          cargo --version
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          if python3 "$collector" "$observation" 20; then
+            collector_exit=0
+          else
+            collector_exit=$?
+          fi
+          printf '{"collectorExit":%s}\n' "$collector_exit"
+          test -f "$observation/identity.json"
+          test -f "$observation/results.json"
       - name: Run test suite
         run: cargo test --locked
       - name: Smoke test cargo install
