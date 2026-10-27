@@ -58,9 +58,11 @@ if (process.env.PACK_BEAT) setInterval(() => {
     delete env.PACK_FINISHED;
     const result = cp.spawnSync(binary,
       ['runtime', 'build-local', 'stable', '--repo', repo, '--force', '--json'],
-      {cwd: repo, env, encoding: 'utf8', timeout: 90000});
+      {cwd: root, env, encoding: 'utf8', timeout: 90000});
     if (result.error) throw result.error;
-    console.log(JSON.stringify({phase: 'ordinary-build', node: process.version,
+    const npmCli = path.join(path.dirname(env.OCM_INTERNAL_NPM_BIN), 'node_modules/npm/bin/npm-cli.js');
+    const npm = cp.execFileSync(process.execPath, [npmCli, '--version'], {cwd: root, env, encoding: 'utf8'}).trim();
+    console.log(JSON.stringify({phase: 'ordinary-build', node: process.version, npm, cwd: root,
       binary, exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr}));
     return;
   }

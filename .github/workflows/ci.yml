@@ -122,18 +122,7 @@ jobs:
         timeout-minutes: 10
         shell: pwsh
         run: |
-          $baseline = Join-Path $env:RUNNER_TEMP 'ocm-pack-baseline'
-          git fetch --no-tags --depth=1 origin e9c9f51aa9541c7afcb09149cb2ec94e721ab4e2
-          if ($LASTEXITCODE -ne 0) { throw 'baseline fetch failed' }
-          git worktree add --detach $baseline e9c9f51aa9541c7afcb09149cb2ec94e721ab4e2
-          if ($LASTEXITCODE -ne 0) { throw 'baseline checkout failed' }
-          git -C $baseline rev-parse HEAD
-          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'ocm-pack-baseline-target'
-          cargo build --locked --bin ocm --manifest-path (Join-Path $baseline 'Cargo.toml')
-          if ($LASTEXITCODE -ne 0) { throw 'baseline build failed' }
-          $fixture = Join-Path $env:RUNNER_TEMP ('ocm-tests/pack-baseline-' + [guid]::NewGuid())
-          New-Item -ItemType Directory -Force $fixture | Out-Null
-          'owned' | node tests/support/windows_runtime_pack.cjs (Join-Path $env:CARGO_TARGET_DIR 'debug/ocm.exe') $fixture --ordinary-probe
+          node tests/support/windows_digest_qualification.cjs dc282d315de01731c395983076bd04e633554bff
           if ($LASTEXITCODE -ne 0) { throw 'baseline probe failed' }
       - name: Prove native Windows runtime packing custody
         timeout-minutes: 5
