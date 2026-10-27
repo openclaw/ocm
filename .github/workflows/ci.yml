@@ -228,6 +228,7 @@ jobs:
           PROOF_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           proof_root="$RUNNER_TEMP/node-fixture-mode"
+          git fetch --depth=1 origin "$PROOF_HEAD"
           git worktree add --detach "$proof_root" "$PROOF_HEAD"
           git -C "$proof_root" rev-parse HEAD 'HEAD^{tree}'
           export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
