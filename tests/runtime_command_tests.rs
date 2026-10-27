@@ -1308,6 +1308,12 @@ fn runtime_build_local_preserves_installed_extension_dependency_bindings() {
     let repo = cwd.join("openclaw");
     fs::create_dir_all(&repo).unwrap();
     let mut env = ocm_env(&root);
+    // npm's linked strategy skips installing into a symlinked prefix. Keep
+    // this layout test independent of temporary-root aliases (e.g. macOS /var).
+    env.insert(
+        "OCM_HOME".into(),
+        path_string(&fs::canonicalize(env.get("OCM_HOME").unwrap()).unwrap()),
+    );
     env.insert("npm_config_offline".into(), "true".into());
     env.insert(
         "npm_config_cache".into(),
