@@ -220,13 +220,14 @@ mod foreground {
             }
         }
         let status = child.wait();
-        terminal.restore();
         let death = status.as_ref().ok().and_then(ExitStatusExt::signal);
         // Only a command group holding the terminal receives its keys without
-        // OCM; in a shared job OCM saw them itself and relayed them.
+        // OCM; in a shared job OCM saw them itself and relayed them. Use the
+        // current assignment: a background job can take the terminal after fg.
         let terminal_stop = isolate
-            && terminal.owned
+            && terminal.assigned
             && matches!(death, Some(libc::SIGINT | libc::SIGQUIT | libc::SIGHUP));
+        terminal.restore();
         // A shell leader can exit before the processes it started finish
         // handling the same stop request. The group ID stays reserved while
         // any member remains. Waiting is best effort: an unreadable process

@@ -863,6 +863,118 @@ fn terminal_job_control_suspends_and_resumes_ocm_with_its_command() {
 
 #[cfg(unix)]
 #[test]
+fn terminal_interrupt_waits_for_descendants_after_background_job_is_foregrounded() {
+    use std::io::Write;
+
+    let fixture = SignalFixture::new("cli-background-foreground-drain");
+    let helper = fixture.root.child("descendant.py");
+    fs::write(
+        &helper,
+        r#"import os, signal, time
+from pathlib import Path
+marker = Path(os.environ["OCM_TEST_SIGNAL_MARKER"])
+def record(message):
+    with marker.open("a") as stream:
+        stream.write(message + "\n")
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+worker = os.fork()
+signal.alarm(15)
+if worker == 0:
+    def finish(signum, frame):
+        record("signal INT")
+        time.sleep(1)
+        record("stopped")
+        os._exit(0)
+    signal.signal(signal.SIGINT, finish)
+    record("ready " + str(os.getpid()))
+    while True: time.sleep(0.1)
+while not marker.exists() or "ready" not in marker.read_text():
+    time.sleep(0.01)
+record("owner " + str(os.getppid()))
+record("reading")
+os.read(0, 1)
+record("read")
+while True: time.sleep(0.1)
+"#,
+    )
+    .unwrap();
+    // Both cases kill the leader while its same-group descendant drains.
+    // Only the background case first stops on terminal input, then uses fg.
+    for background in [false, true] {
+        let marker = fixture.marker(if background {
+            "background"
+        } else {
+            "foreground"
+        });
+        let mut command = Command::new("bash");
+        command
+            .args(["--norc", "--noprofile", "-i"])
+            .current_dir(&fixture.cwd)
+            .env_clear()
+            .envs(&fixture.env)
+            .env("OCM_TEST_SIGNAL_MARKER", &marker)
+            .env("OCM_BIN", crate::support::ocm_test_binary_path())
+            .env("OCM_TEST_CHILD", &helper);
+        let mut terminal = OnTerminal::spawn(command);
+        let invocation = r#""$OCM_BIN" env exec bound -- python3 "$OCM_TEST_CHILD""#;
+        let returned = r#"printf 'returned %s\n' "$?" >> "$OCM_TEST_SIGNAL_MARKER""#;
+        let line = if background {
+            format!("{invocation} &\n")
+        } else {
+            format!("{invocation}\n")
+        };
+        terminal.master.write_all(line.as_bytes()).unwrap();
+        let log = wait_for_marker(&marker, "reading\n");
+        let worker_pid = ready_pid(&marker);
+        if background {
+            let ocm_pid = log
+                .lines()
+                .find_map(|line| line.strip_prefix("owner "))
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let state = Command::new("ps")
+                    .args(["-o", "stat=", "-p", ocm_pid])
+                    .output()
+                    .unwrap();
+                if String::from_utf8_lossy(&state.stdout)
+                    .trim_start()
+                    .starts_with('T')
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "OCM did not stop");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            terminal.master.write_all(b"fg\n").unwrap();
+        }
+        terminal.master.write_all(b"x\n").unwrap();
+        wait_for_marker(&marker, "read\n");
+        terminal.master.write_all(b"\x03").unwrap();
+        wait_for_marker(&marker, "signal INT\n");
+        // Queue a fresh command: Bash discards the remainder of an interrupted
+        // command line. It can read this only after OCM returns, and records
+        // completion independently of the test's later observation.
+        terminal
+            .master
+            .write_all(format!("{returned}\n").as_bytes())
+            .unwrap();
+        let at_return = wait_for_marker(&marker, "returned ");
+        wait_for_marker(&marker, "stopped\n");
+        terminal.master.write_all(b"exit\n").unwrap();
+        wait_with_deadline(&mut terminal.process);
+        let survived = reap_if_running(worker_pid);
+        assert!(
+            at_return.contains("stopped\nreturned 130\n"),
+            "background={background}: OCM returned before descendant cleanup: {at_return}"
+        );
+        assert_eq!(at_return.matches("signal INT").count(), 1, "{at_return}");
+        assert!(!survived, "the descendant outlived OCM");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn shared_job_passes_signals_sent_to_ocm_to_the_command() {
     let fixture = SignalFixture::new("cli-foreground-shared-job");
     let running = |pid: libc::pid_t| {

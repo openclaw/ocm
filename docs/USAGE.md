@@ -550,8 +550,10 @@ stops a foreground Gateway. In a terminal, the command's group holds the
 foreground while it runs, so Ctrl-C reaches it once, directly, and Ctrl-Z
 suspends OCM along with it. After passing a signal on, or when the command dies
 from Ctrl-C or a hangup, OCM also waits for the rest of its process group. If
-that SIGTERM, SIGINT or SIGHUP is what ended the command, OCM then ends by the
-same signal instead of exiting with 128 plus its number, so a calling shell or
+the job started in the background and was resumed with `fg`, the same wait
+applies after terminal interruption. If that SIGTERM, SIGINT or SIGHUP is what
+ended the command, OCM then ends by the same signal instead of exiting with
+128 plus its number, so a calling shell or
 supervisor sees the interruption. SIGKILL cannot be passed on: sent to OCM or
 its process group, it stops OCM alone.
 
