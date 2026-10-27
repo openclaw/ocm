@@ -110,26 +110,7 @@ jobs:
           package-manager-cache: false
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
-        shell: pwsh
-        run: |
-          # Temporary unchanged-base launch attribution using candidate-published state.
-          $baseline = Join-Path $env:RUNNER_TEMP 'ocm-launch-baseline'
-          git fetch --no-tags --depth=1 origin dc282d315de01731c395983076bd04e633554bff
-          if ($LASTEXITCODE -ne 0) { throw 'baseline fetch failed' }
-          git worktree add --detach $baseline dc282d315de01731c395983076bd04e633554bff
-          if ($LASTEXITCODE -ne 0) { throw 'baseline checkout failed' }
-          git -C $baseline rev-parse HEAD 'HEAD^{tree}'
-          git -C $baseline status --porcelain
-          git rev-parse HEAD 'HEAD^{tree}'
-          git diff --exit-code dc282d315de01731c395983076bd04e633554bff HEAD -- src/runtime src/env src/launcher src/cli/env.rs src/cli/mod.rs src/host.rs src/managed_node.rs src/store/envs.rs src/store/runtimes.rs src/infra/process.rs Cargo.lock
-          if ($LASTEXITCODE -ne 0) { throw 'launch or persisted-state inputs changed' }
-          rustc -vV
-          $baselineTarget = Join-Path $env:RUNNER_TEMP 'ocm-launch-baseline-target'
-          cargo build --locked --bin ocm --manifest-path (Join-Path $baseline 'Cargo.toml') --target-dir $baselineTarget
-          if ($LASTEXITCODE -ne 0) { throw 'baseline build failed' }
-          $env:OCM_TEST_BASELINE_BINARY = Join-Path $baselineTarget 'debug/ocm.exe'
-          Get-FileHash $env:OCM_TEST_BASELINE_BINARY -Algorithm SHA256
-          cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
+        run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
       - name: Prove native Windows dev stop lifecycle
         run: |
           cargo test --locked --lib windows_source_watch_ -- --nocapture
@@ -243,6 +224,36 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Attribute native snapshot stop marker on unchanged baseline
+        if: runner.os == 'macOS'
+        timeout-minutes: 5
+        run: |
+          baseline="$RUNNER_TEMP/ocm-snapshot-baseline"
+          baseline_target="$RUNNER_TEMP/ocm-snapshot-baseline-target"
+          git fetch --no-tags --depth=1 origin dc282d315de01731c395983076bd04e633554bff
+          git worktree add --detach "$baseline" dc282d315de01731c395983076bd04e633554bff
+          git -C "$baseline" rev-parse HEAD 'HEAD^{tree}'
+          git -C "$baseline" status --porcelain
+          git rev-parse HEAD 'HEAD^{tree}'
+          git diff --exit-code dc282d315de01731c395983076bd04e633554bff HEAD -- src/env src/supervisor src/store/checkpoints.rs tests/daemon_runtime_tests.rs tests/support/mod.rs Cargo.lock
+          rustc -vV
+          node --version
+          cd "$baseline"
+          cargo test --locked --target-dir "$baseline_target" --test daemon_runtime_tests --no-run
+          shasum -a 256 "$baseline_target/debug/ocm" Cargo.lock
+          for test_binary in "$baseline_target"/debug/deps/daemon_runtime_tests-*; do
+            if [ -f "$test_binary" ] && [ -x "$test_binary" ]; then shasum -a 256 "$test_binary"; fi
+          done
+          for attempt in {1..20}; do
+            printf 'SNAPSHOT_BASELINE_ATTEMPT=%s\n' "$attempt"
+            if cargo test --locked --target-dir "$baseline_target" --test daemon_runtime_tests snapshot_create_preserves_all_running_siblings_and_restores_target -- --exact --nocapture; then
+              printf 'SNAPSHOT_BASELINE_RESULT=%s:pass\n' "$attempt"
+            else
+              result=$?
+              printf 'SNAPSHOT_BASELINE_RESULT=%s:failure:%s\n' "$attempt" "$result"
+              exit "$result"
+            fi
+          done
       - name: Run test suite
         run: cargo test --locked
       - name: Smoke test cargo install

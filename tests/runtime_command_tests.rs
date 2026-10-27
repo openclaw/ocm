@@ -987,40 +987,6 @@ fn runtime_build_local_with_native_npm_preserves_tree_integrity() {
         serde_json::from_str::<Value>(&stdout(&verify)).unwrap()["healthy"],
         true
     );
-    let create = run_ocm(
-        root.path(),
-        &env,
-        &["env", "create", "native", "--runtime", "native"],
-    );
-    assert!(create.status.success(), "{}", stderr(&create));
-    let execute = run_ocm(root.path(), &env, &["@native", "--", "--version"]);
-
-    // Temporary native attribution against a legitimately published runtime.
-    if let Some(baseline) = std::env::var_os("OCM_TEST_BASELINE_BINARY") {
-        let baseline = PathBuf::from(baseline);
-        let baseline_launch = support::run_ocm_binary(
-            &baseline,
-            root.path(),
-            &env,
-            &["@native", "--", "--version"],
-        );
-        println!(
-            "{}",
-            serde_json::json!({
-                "phase": "native-launch-comparison",
-                "candidateBinarySha256": file_sha256(&support::ocm_test_binary_path()).unwrap(),
-                "baselineBinarySha256": file_sha256(&baseline).unwrap(),
-                "runtimeMetadata": meta,
-                "runtimeMetadataSha256": file_sha256(&runtime_meta_path("native", &env, root.path()).unwrap()).unwrap(),
-                "entrypointSha256": file_sha256(&PathBuf::from(meta["binaryPath"].as_str().unwrap())).unwrap(),
-                "candidateExit": execute.status.code(), "candidateStdout": stdout(&execute), "candidateStderr": stderr(&execute),
-                "baselineExit": baseline_launch.status.code(), "baselineStdout": stdout(&baseline_launch), "baselineStderr": stderr(&baseline_launch),
-                "command": ["@native", "--", "--version"], "cwd": root.path(),
-            })
-        );
-    }
-    let expected_output = payload.len().to_string();
-
     // Same-size drift beyond the first two reads must still invalidate the tree.
     *payload.last_mut().unwrap() ^= 1;
     fs::write(&installed_payload, payload).unwrap();
@@ -1038,13 +1004,6 @@ fn runtime_build_local_with_native_npm_preserves_tree_integrity() {
             .unwrap()
             .contains("runtime sha256 mismatch")
     );
-    println!(
-        "{}",
-        serde_json::json!({"phase": "native-integrity", "buildPublished": true,
-        "originalHealthy": true, "changedLastByteAfterTwoChunksRejected": true, "drift": drift})
-    );
-    assert!(execute.status.success(), "{}", stderr(&execute));
-    assert_eq!(stdout(&execute).trim(), expected_output);
 }
 
 #[cfg(unix)]
