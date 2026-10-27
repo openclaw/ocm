@@ -743,10 +743,27 @@ diagnostics remain separate. A child-output alias must point to an existing,
 separately owned file; an alias with a missing target is refused at child startup,
 including while diagnostic files are being rotated. New child output is also
 refused while a diagnostic alias has a missing target. Restore separately owned
-targets or remove the unsafe aliases before retrying. Older files can contain
-output from both owners; OCM preserves those files but excludes that ambiguous
-history from the environment log view. Existing running services are not restarted by this change. Output from
-an older running daemon remains in its old files. Explicitly refresh that daemon
+targets or remove the unsafe aliases before retrying. At child startup, OCM also
+refuses output into a file still held open as the supervisor's own stdout or
+stderr, even if its diagnostic pathname has been rotated or replaced.
+
+The log reader omits the old `daemon.stdout.log` and `daemon.stderr.log` child
+destinations, which can contain output from both owners, and excludes child files
+that match the current diagnostic files in the default or configured diagnostic
+directory. These identity checks apply to snapshots and follow, including
+retained file handles after rotation. OCM preserves the excluded files and keeps
+independently owned child history readable.
+
+OCM does not record which files received diagnostics in the past. If rotation or
+removal leaves a diagnostic file reachable only through a child-output alias,
+with no matching current diagnostic file, a fresh reader cannot distinguish it
+from legitimate child history. That alias can still expose old diagnostics;
+retrospective attribution of such unrecorded history is unsupported. The
+supervisor's startup checks do not give the reader access to its live output
+handles or establish historical ownership.
+
+Existing running services are not restarted by these protections. Output from an
+older running daemon remains in its old files. Explicitly refresh that daemon
 from the updated OCM installation during a maintenance window to enable separate
 child output. The environment's own Gateway logs remain available as before.
 
