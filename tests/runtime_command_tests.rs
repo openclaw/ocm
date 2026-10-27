@@ -1193,6 +1193,26 @@ if (process.env.OCM_TEST_PACK_MARKER) {
     assert!(!abandoned.exists());
     assert!(!installed.exists());
     assert!(stages().is_empty());
+    // A malformed registration cannot claim that its embedded name is locked.
+    let other_meta = runtimes.join("other.json");
+    let mut meta: Value = serde_json::from_slice(&fs::read(&other_meta).unwrap()).unwrap();
+    meta["name"] = serde_json::json!("stable");
+    fs::write(&other_meta, serde_json::to_vec(&meta).unwrap()).unwrap();
+    let mut child = spawn();
+    let active = stages().pop().unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert!(!released());
+    let remove_other = run_ocm(&cwd, &env, &["runtime", "remove", "other", "--json"]);
+    assert!(!remove_other.status.success());
+    assert!(active.join("pack/openclaw-2026.4.25.tgz").exists());
+    drop(child);
+    wait_for("malformed-record control lock", &released);
+    let retry = run_ocm(&cwd, &env, &args);
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    assert!(!active.exists());
+    assert!(stages().is_empty());
+
     for path in [&legacy, &malformed, &outside] {
         assert_eq!(fs::read_to_string(path.join("keep")).unwrap(), "unowned");
     }

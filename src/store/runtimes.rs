@@ -3557,7 +3557,7 @@ fn remove_runtime_files(
     let meta = get_runtime(name, env, cwd)?;
     let path = runtime_meta_path(&meta.name, env, cwd)?;
     if let Some(parent) = path.parent() {
-        reclaim_abandoned_runtime_stages(parent, &meta.name, env, cwd);
+        reclaim_abandoned_runtime_stages(parent, name, env, cwd);
     }
     if let Some(install_root) = meta.install_root.as_deref() {
         let expected_root = runtime_install_root(&meta.name, env, cwd)?;
