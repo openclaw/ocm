@@ -47,6 +47,7 @@ pub(crate) struct OpenClawWorkspaceInventory {
     agent_directory_templates: BTreeMap<String, PathBuf>,
     config_include_paths: BTreeSet<PathBuf>,
     agent_workspace_roots: BTreeMap<String, PathBuf>,
+    resolved_agent_ids: BTreeMap<String, String>,
     configured_default_workspace: Option<PathBuf>,
     configured_agent_workspace_roots: BTreeMap<String, PathBuf>,
     default_agent_id: String,
@@ -216,6 +217,10 @@ impl OpenClawWorkspaceInventory {
             .map(|(id, path)| (id.as_str(), path.as_path()))
     }
 
+    pub(crate) fn resolved_agent_ids(&self) -> &BTreeMap<String, String> {
+        &self.resolved_agent_ids
+    }
+
     pub(crate) fn agent_workspace(&self, agent_id: &str) -> Option<&Path> {
         self.agent_workspace_roots
             .get(&normalize_agent_id(agent_id))
@@ -246,7 +251,7 @@ impl OpenClawWorkspaceInventory {
         self.workspace_roots.iter().map(PathBuf::as_path)
     }
 
-    /// Admit configured migration workspaces before choosing their copied trees.
+    /// Admit migration workspaces before choosing their copied trees.
     /// Internal references also participate when an external workspace contains
     /// the plain home; config includes remain owned by their original tree.
     pub(crate) fn workspace_sources_for_migration(
@@ -276,6 +281,20 @@ impl OpenClawWorkspaceInventory {
             let source =
                 migration_workspace_source(workspace, source_root, &canonical_source_root)?;
             agent_workspaces.insert(agent_id.clone(), source);
+        }
+        // The default agent can use the standard workspace without an authored
+        // path. Its external symlink target needs the same copy and projection
+        // as an explicitly configured workspace; copying the home keeps only
+        // the link. Other implicit agent layouts retain their admission policy.
+        if self.configured_default_workspace.is_none()
+            && !agent_workspaces.contains_key(&self.default_agent_id)
+            && let Some(workspace) = self.default_agent_workspace()
+        {
+            let source =
+                migration_workspace_source(workspace, source_root, &canonical_source_root)?;
+            if !source.canonical.starts_with(&canonical_source_root) {
+                agent_workspaces.insert(self.default_agent_id.clone(), source);
+            }
         }
 
         Ok(MigrationWorkspaceSources {
@@ -905,6 +924,18 @@ fn resolve_openclaw_workspaces_from_config(
         .map(|resolved| resolved.include_paths)
         .unwrap_or_default();
     let entries = agent_entries(&config);
+    // Preserve the correspondence to authored IDs before environment expansion
+    // so copied configuration can select the same agents without erasing templates.
+    let resolved_agent_ids = authored_entries
+        .iter()
+        .zip(&entries)
+        .filter_map(|(authored, resolved)| {
+            Some((
+                authored.get("id")?.as_str()?.to_string(),
+                normalize_agent_id(resolved.get("id")?.as_str()?),
+            ))
+        })
+        .collect();
     let default_agent_id = resolve_default_agent_id(&entries);
     let default_workspace = config
         .pointer("/agents/defaults/workspace")
@@ -1015,6 +1046,7 @@ fn resolve_openclaw_workspaces_from_config(
         agent_directory_templates,
         config_include_paths,
         agent_workspace_roots,
+        resolved_agent_ids,
         configured_default_workspace,
         configured_agent_workspace_roots,
         default_agent_id,

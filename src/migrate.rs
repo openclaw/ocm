@@ -72,6 +72,7 @@ struct MigrationCopyPlan {
     config_include_paths: Vec<PathBuf>,
     default_workspace: Option<ExternalWorkspaceCopy>,
     agent_workspaces: BTreeMap<String, ExternalWorkspaceCopy>,
+    resolved_agent_ids: BTreeMap<String, String>,
     copies: Vec<ExternalWorkspaceCopy>,
 }
 
@@ -117,6 +118,7 @@ impl MigrationCopyPlan {
         let mut plan = Self {
             source_config_roots,
             config_include_paths: inventory.config_include_paths().cloned().collect(),
+            resolved_agent_ids: inventory.resolved_agent_ids().clone(),
             ..Self::default()
         };
         if let Some(source) = sources.default_workspace {
@@ -250,6 +252,7 @@ impl MigrationCopyPlan {
                 .as_ref()
                 .map(|workspace| workspace.target.as_path()),
             &agent_workspaces,
+            &self.resolved_agent_ids,
         )?;
         Ok(())
     }

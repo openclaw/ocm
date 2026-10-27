@@ -1155,6 +1155,12 @@ Each database is a coherent committed snapshot; databases and other files are no
 The source stays running and its database contents are not rewritten.
 
 Plain-home migration (`migrate` and `adopt import`) rebases retained SQLite session locations and database registry paths into the copied state directory and configured external workspace copies, including filesystem aliases.
+The default agent's implicit `.openclaw/workspace` is also copied when it is an
+absolute symlink to an external directory, even without a workspace setting or
+agent entry. The imported configuration selects that environment-owned copy;
+the source directory, configuration and link stay unchanged. Ordinary default
+directories retain their existing location. Other implicit workspace aliases
+remain subject to the existing safety checks and roll back on refusal.
 Session locations follow the actual shared workspace projection, while in-home database registry paths stay in the fixed copied state directory.
 When a configured workspace contains the original home, its workspace locations select the enclosing workspace copy; active runtime databases still use the new `.openclaw` state directory.
 Recognized legacy session headers with an in-home `cwd` follow the same workspace projection; other legacy text and external references keep their existing relocation policy.
