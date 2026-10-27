@@ -223,8 +223,34 @@ mod tests {
             .collect();
         std::fs::write(&payload, bytes).unwrap();
         std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o640)).unwrap();
-        symlink("nested/payload", root.path().join("link")).unwrap();
-        symlink("missing", root.path().join("dangling")).unwrap();
+        for (name, target) in [("link", "nested/payload"), ("dangling", "missing")] {
+            let link = root.path().join(name);
+            symlink(target, &link).unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::ffi::OsStrExt;
+
+                // macOS applies the umask to symlinks; pin the fixture's own mode.
+                let path = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+                let result = unsafe {
+                    libc::fchmodat(
+                        libc::AT_FDCWD,
+                        path.as_ptr(),
+                        0o777,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+            }
+            assert_eq!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o777
+            );
+        }
 
         // Captured with the original v1 implementation, including multiple reads.
         assert_eq!(
