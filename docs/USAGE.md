@@ -751,8 +751,13 @@ The log reader omits the old `daemon.stdout.log` and `daemon.stderr.log` child
 destinations, which can contain output from both owners, and excludes child files
 that match the current diagnostic files in the default or configured diagnostic
 directory. These identity checks apply to snapshots and follow, including
-retained file handles after rotation. OCM preserves the excluded files and keeps
-independently owned child history readable.
+retained file handles after rotation. Existing followers pick up diagnostic-directory
+changes made by `service refresh-daemon` on their next poll. Daemon-named service
+followers read the small saved directory configuration once per 250 ms poll,
+shared across both streams; ordinary names and attached Gateway logs need no
+extra configuration reads. If the configuration becomes unreadable, service
+output pauses while attached Gateway output continues. OCM preserves the excluded
+files and keeps independently owned child history readable.
 
 OCM does not record which files received diagnostics in the past. If rotation or
 removal leaves a diagnostic file reachable only through a child-output alias,

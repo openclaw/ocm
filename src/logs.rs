@@ -54,6 +54,7 @@ struct LogSources {
     gateway_path: PathBuf,
     service_path: PathBuf,
     excluded_paths: Vec<PathBuf>,
+    service_available: bool,
 }
 
 impl LogSources {
@@ -78,7 +79,10 @@ impl LogSources {
             }
         };
         let gateway_modified = modified_at(&self.gateway_path);
-        let service_modified = modified(&self.service_path);
+        let service_modified = self
+            .service_available
+            .then(|| modified(&self.service_path))
+            .flatten();
         let (source_kind, path) = match (gateway_modified, service_modified) {
             (Some(gateway_time), Some(service_time)) => {
                 if service_time > gateway_time {
@@ -219,13 +223,14 @@ impl<'a> LogService<'a> {
                 _ => unreachable!("stream validated by normalize_stream"),
             });
         let supervisor = crate::supervisor::SupervisorService::new(self.env, self.cwd);
-        let mut service_path = supervisor.child_log_path(&meta, &stream)?;
+        let service_path = supervisor.child_log_path(&meta, &stream)?;
+        let mut service_available = true;
         let excluded_paths = if meta.name.eq_ignore_ascii_case("daemon") {
             match supervisor.daemon_log_paths() {
                 Ok(paths) => paths,
                 Err(_) => {
                     // Unknown service-log ownership must not hide Gateway output.
-                    service_path = gateway_path.clone();
+                    service_available = false;
                     Vec::new()
                 }
             }
@@ -239,6 +244,7 @@ impl<'a> LogService<'a> {
             gateway_path,
             service_path,
             excluded_paths,
+            service_available,
         })
     }
 
@@ -344,6 +350,7 @@ impl<'a> LogService<'a> {
             // Give the trailing record one poll to receive continuation lines,
             // then perform one global sort and tail decision for the startup batch.
             sleep(Duration::from_millis(FOLLOW_POLL_INTERVAL_MS));
+            self.refresh_follow_exclusions(&mut cursors)?;
             let bytes = collect_merged_follow_startup(&mut cursors, snapshots, tail_lines)?;
             if !bytes.is_empty() {
                 writer
@@ -356,6 +363,7 @@ impl<'a> LogService<'a> {
         }
 
         loop {
+            self.refresh_follow_exclusions(&mut cursors)?;
             let mut records = Vec::new();
             let mut wrote = false;
             for cursor in &mut cursors {
@@ -403,6 +411,52 @@ impl<'a> LogService<'a> {
             sleep(Duration::from_millis(FOLLOW_POLL_INTERVAL_MS));
         }
     }
+
+    fn refresh_follow_exclusions(&self, cursors: &mut [FollowCursor]) -> Result<(), String> {
+        if !cursors.iter().any(FollowCursor::needs_diagnostic_paths) {
+            return Ok(());
+        }
+        // Resolve once per existing poll, shared by both streams and their
+        // retained handles. Ordinary names and attached Gateway logs need none.
+        let paths =
+            crate::supervisor::SupervisorService::new(self.env, self.cwd).daemon_log_paths();
+        for cursor in cursors
+            .iter_mut()
+            .filter(|cursor| cursor.needs_diagnostic_paths())
+        {
+            if cursor.service_available == paths.is_ok()
+                && paths
+                    .as_ref()
+                    .is_ok_and(|paths| paths == &cursor.excluded_paths)
+            {
+                continue;
+            }
+            cursor.service_available = paths.is_ok();
+            if let Ok(paths) = &paths {
+                cursor.excluded_paths.clone_from(paths);
+            }
+            if let Some(sources) = &mut cursor.sources {
+                sources.service_available = cursor.service_available;
+                sources.excluded_paths.clone_from(&cursor.excluded_paths);
+            }
+            // A merged record may be waiting for its continuation. Do not
+            // emit that buffer after its owning handle becomes diagnostic.
+            let mut pending_excluded = cursor.current_file_is_excluded()?;
+            for retired in cursor
+                .retired_files
+                .iter()
+                .filter(|retired| retired.shares_pending)
+            {
+                let metadata = retired.file.metadata().map_err(|error| error.to_string())?;
+                pending_excluded |=
+                    file_is_excluded(&retired.file, &metadata, &cursor.excluded_paths)?;
+            }
+            if pending_excluded {
+                cursor.pending.clear();
+            }
+        }
+        Ok(())
+    }
 }
 
 struct FollowCursor {
@@ -417,6 +471,7 @@ struct FollowCursor {
     pending: Vec<u8>,
     file: Option<File>,
     excluded_paths: Vec<PathBuf>,
+    service_available: bool,
     retired_files: VecDeque<RetiredFile>,
     single_line_open: bool,
     single_separator_pending: bool,
@@ -436,6 +491,7 @@ impl FollowCursor {
             pending: Vec::new(),
             file: None,
             excluded_paths: Vec::new(),
+            service_available: true,
             retired_files: VecDeque::new(),
             single_line_open: false,
             single_separator_pending: false,
@@ -447,17 +503,39 @@ impl FollowCursor {
     fn for_sources(sources: LogSources) -> Self {
         let mut cursor = Self::new(sources.select());
         cursor.excluded_paths = sources.excluded_paths.clone();
+        cursor.service_available = sources.service_available;
         cursor.sources = Some(sources);
         cursor
     }
 
     fn open_target_log(&self) -> Result<Option<(File, fs::Metadata)>, String> {
+        if self.target.source_kind == "service" && !self.service_available {
+            return Ok(None);
+        }
         let exclusions = if self.target.source_kind == "service" {
             &self.excluded_paths[..]
         } else {
             &[]
         };
         open_log_excluding(&self.target.path, exclusions)
+    }
+
+    fn needs_diagnostic_paths(&self) -> bool {
+        (!self.excluded_paths.is_empty() || !self.service_available)
+            && (self.sources.is_some() || self.target.source_kind == "service")
+    }
+
+    fn current_file_is_excluded(&self) -> Result<bool, String> {
+        if self.target.source_kind != "service" {
+            return Ok(false);
+        }
+        if !self.service_available {
+            return Ok(true);
+        }
+        self.file.as_ref().map_or(Ok(false), |file| {
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            file_is_excluded(file, &metadata, &self.excluded_paths)
+        })
     }
 
     fn is_initialized(&self) -> bool {
@@ -478,6 +556,7 @@ impl FollowCursor {
         self.sources = None;
         if self.target.source_kind != "service" {
             self.excluded_paths.clear();
+            self.service_available = true;
         }
         let (mut bytes, offset, _bytes_read) = read_log_snapshot_from(&mut file, tail_lines)?;
         #[cfg(test)]
@@ -507,6 +586,9 @@ impl FollowCursor {
     }
 
     fn read_update(&mut self) -> Result<Option<FollowUpdate>, String> {
+        if self.target.source_kind == "service" && !self.service_available {
+            return Ok(None);
+        }
         let Some((mut path_file, metadata)) = self.open_target_log()? else {
             let mut segments = self.drain_retired_files()?;
             if self.file.is_some() {
@@ -589,6 +671,9 @@ impl FollowCursor {
     }
 
     fn collect_quiet_records(&mut self) -> Vec<TimedLogRecord> {
+        if !self.service_available {
+            return Vec::new();
+        }
         if !self.pending.is_empty() && !self.has_shared_retired_source() {
             log_records(std::mem::take(&mut self.pending))
         } else {
@@ -1060,7 +1145,11 @@ fn collect_merged_follow_startup(
 ) -> Result<Vec<u8>, String> {
     let mut records = Vec::new();
     for (cursor, snapshot) in cursors.iter_mut().zip(snapshots) {
-        let mut stream = snapshot.map_or_else(Vec::new, |snapshot| log_records(snapshot.bytes));
+        let mut stream = if cursor.current_file_is_excluded()? {
+            Vec::new()
+        } else {
+            snapshot.map_or_else(Vec::new, |snapshot| log_records(snapshot.bytes))
+        };
         if !cursor.is_initialized()
             && let Some(snapshot) = cursor.snapshot(tail_lines, true)?
         {
@@ -2479,6 +2568,86 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn refreshed_exclusions_cover_pending_retired_and_unavailable_sources() {
+        let root = test_root("follow-refreshed-config");
+        let config = root.join("supervisor/daemon-log-config.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let mut env = BTreeMap::new();
+        env.insert("OCM_HOME".into(), root.display().to_string());
+        let service = LogService::new(&env, &root);
+        let diagnostic = root.join("new/daemon.stderr.log");
+        fs::create_dir_all(diagnostic.parent().unwrap()).unwrap();
+        let child = root.join("child.log");
+        let gateway = root.join("gateway.log");
+        let mut sources = stderr_sources(&gateway, &child);
+        sources.excluded_paths = crate::supervisor::SupervisorService::new(&env, &root)
+            .daemon_log_paths()
+            .unwrap();
+        let mut cursors = vec![FollowCursor::for_sources(sources)];
+        assert!(cursors[0].snapshot(None, true).unwrap().is_none());
+        fs::write(&diagnostic, b"diagnostic\n").unwrap();
+        fs::hard_link(&diagnostic, &child).unwrap();
+        let saved = serde_json::json!({"logDir": diagnostic.parent().unwrap()}).to_string();
+        fs::write(&config, &saved).unwrap();
+        service.refresh_follow_exclusions(&mut cursors).unwrap();
+        assert!(cursors[0].snapshot(None, true).unwrap().is_none());
+
+        fs::remove_file(&child).unwrap();
+        fs::write(&child, b"child partial").unwrap();
+        assert!(
+            cursors[0]
+                .snapshot(None, true)
+                .unwrap()
+                .unwrap()
+                .bytes
+                .is_empty()
+        );
+        let retired = root.join("retired.log");
+        fs::rename(&child, &retired).unwrap();
+        assert!(cursors[0].read_update().unwrap().is_none());
+        assert!(!cursors[0].pending.is_empty());
+        // A retained handle becomes diagnostic under a different current
+        // directory, even with its child pathname missing. Drop its held record.
+        let next = root.join("next");
+        fs::create_dir_all(&next).unwrap();
+        fs::hard_link(&retired, next.join("daemon.stderr.log")).unwrap();
+        fs::write(&config, serde_json::json!({"logDir": next}).to_string()).unwrap();
+        service.refresh_follow_exclusions(&mut cursors).unwrap();
+        assert!(cursors[0].pending.is_empty());
+        append(&retired, b"diagnostic continuation\n");
+        assert!(cursors[0].read_update().unwrap().is_none());
+        assert!(cursors[0].collect_quiet_records().is_empty());
+        // Independently owned replacement and rotated history remain readable.
+        fs::write(&child, b"safe replacement\n").unwrap();
+        let update = cursors[0].read_update().unwrap().unwrap();
+        assert_eq!(update_bytes(&update), b"safe replacement\n");
+        let safe_retired = root.join("safe-retired.log");
+        fs::rename(&child, &safe_retired).unwrap();
+        cursors[0].read_update().unwrap();
+        append(&safe_retired, b"safe delayed\n");
+        let update = cursors[0].read_update().unwrap().unwrap();
+        assert_eq!(update_bytes(&update), b"safe delayed\n");
+
+        fs::write(&gateway, b"gateway\n").unwrap();
+        let mut gateway_cursor = FollowCursor::for_sources(stderr_sources(&gateway, &child));
+        gateway_cursor.snapshot(None, false).unwrap().unwrap();
+        cursors.push(gateway_cursor);
+        fs::write(&config, "invalid json").unwrap();
+        service.refresh_follow_exclusions(&mut cursors).unwrap();
+        append(&safe_retired, b"safe while unavailable\n");
+        append(&gateway, b"gateway continues\n");
+        assert!(cursors[0].read_update().unwrap().is_none());
+        let update = cursors[1].read_update().unwrap().unwrap();
+        assert_eq!(update_bytes(&update), b"gateway continues\n");
+        fs::write(&config, &saved).unwrap();
+        service.refresh_follow_exclusions(&mut cursors).unwrap();
+        let update = cursors[0].read_update().unwrap().unwrap();
+        assert_eq!(update_bytes(&update), b"safe while unavailable\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn stderr_sources(gateway_path: &Path, service_path: &Path) -> LogSources {
         LogSources {
             env_name: "demo".to_string(),
@@ -2486,6 +2655,7 @@ mod tests {
             gateway_path: gateway_path.to_path_buf(),
             service_path: service_path.to_path_buf(),
             excluded_paths: Vec::new(),
+            service_available: true,
         }
     }
 

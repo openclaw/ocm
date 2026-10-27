@@ -606,6 +606,146 @@ fn daemon_child_log_aliases_do_not_expose_supervisor_diagnostics() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn existing_followers_exclude_native_diagnostics_after_directory_refresh() {
+    use crate::support::{install_fake_launchctl, write_executable_script};
+
+    let root = TestDir::new("logs-follow-refresh-diagnostics");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+    env.insert("OCM_SELF".into(), env!("CARGO_BIN_EXE_ocm").into());
+    install_fake_launchctl(&root, &mut env);
+    let launcher = root.child("child");
+    write_executable_script(&launcher, "#!/bin/sh\nprintf 'child output\\n' >&2\n");
+    for args in [
+        vec![
+            "launcher",
+            "add",
+            "fixture",
+            "--command",
+            launcher.to_str().unwrap(),
+        ],
+        vec!["env", "create", "daemon", "--launcher", "fixture"],
+        vec!["service", "start", "daemon"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let daemon_once = |directory: &std::path::Path| {
+        fs::create_dir_all(directory).unwrap();
+        let diagnostic = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join("daemon.stderr.log"))
+            .unwrap();
+        Command::new(env!("CARGO_BIN_EXE_ocm"))
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .args(["__daemon", "run", "--once"])
+            .stdout(Stdio::null())
+            .stderr(diagnostic)
+            .status()
+            .unwrap()
+    };
+    let original = root.child("ocm-home/supervisor/logs");
+    assert!(daemon_once(&original).success());
+    let child_path = original.join(".daemon.stderr.log");
+    assert!(
+        fs::read_to_string(&child_path)
+            .unwrap()
+            .contains("child output")
+    );
+
+    struct Followers(Vec<std::process::Child>);
+    impl Drop for Followers {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut followers = Followers(Vec::new());
+    let mut receivers = Vec::new();
+    for stream_args in [vec![], vec!["--stream", "error"]] {
+        let mut args = vec!["logs", "daemon", "--follow", "--raw"];
+        args.extend(stream_args);
+        let (child, receiver) = spawn_follow(&cwd, &env, &args);
+        followers.0.push(child);
+        receive_line_containing(&receiver, "child output");
+        receivers.push(receiver);
+    }
+
+    // A supported refresh publishes each new directory while the same readers
+    // stay attached. Before selection, the extra link is ordinary child history.
+    for generation in ["first", "second"] {
+        let next = root.child(generation);
+        fs::create_dir_all(&next).unwrap();
+        fs::hard_link(&child_path, next.join("daemon.stderr.log")).unwrap();
+        let mut refresh_env = env.clone();
+        refresh_env.insert("OCM_DAEMON_LOG_DIR".into(), path_string(&next));
+        let output = run_ocm(
+            &cwd,
+            &refresh_env,
+            &[
+                "service",
+                "refresh-daemon",
+                "--acknowledge-gateway-restarts",
+                "--json",
+            ],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+        let summary: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(
+            summary["stderrPath"],
+            path_string(&next.join("daemon.stderr.log"))
+        );
+        assert!(!daemon_once(&next).success());
+        let diagnostics = fs::read_to_string(next.join("daemon.stderr.log")).unwrap();
+        assert!(
+            diagnostics.contains("ocm service: starting daemon"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("aliases the supervisor daemon's diagnostics"),
+            "{diagnostics}"
+        );
+        // Keep the known current alias present for several polls; otherwise a
+        // later replacement could hide a stale reader's failure by timing alone.
+        thread::sleep(Duration::from_millis(750));
+        let fresh = run_ocm(
+            &cwd,
+            &env,
+            &["logs", "daemon", "--stream", "error", "--raw"],
+        );
+        assert!(!fresh.status.success());
+        assert!(stdout(&fresh).is_empty());
+        for receiver in &receivers {
+            assert!(
+                receiver.try_iter().collect::<Vec<_>>().is_empty(),
+                "existing follower exposed diagnostic bytes"
+            );
+        }
+        fs::remove_file(&child_path).unwrap();
+        let history = format!("independent child history {generation}");
+        fs::write(&child_path, format!("{history}\n")).unwrap();
+        for receiver in &receivers {
+            assert_eq!(receive_line_containing(receiver, &history), history);
+        }
+        let fresh = run_ocm(
+            &cwd,
+            &env,
+            &["logs", "daemon", "--stream", "error", "--raw"],
+        );
+        assert!(fresh.status.success(), "{}", stderr(&fresh));
+        assert_eq!(stdout(&fresh), format!("{history}\n"));
+    }
+}
+
 #[test]
 fn logs_prefer_the_newer_service_log_when_gateway_log_is_stale() {
     let root = TestDir::new("logs-prefer-newer-service");
