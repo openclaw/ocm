@@ -1721,6 +1721,7 @@ impl<'a> SupervisorService<'a> {
             self.env,
             self.cwd,
             &gateway_admission,
+            &stop_requested,
         )?;
         write_supervisor_runtime_state(
             &runtime_path,
@@ -1765,6 +1766,7 @@ impl<'a> SupervisorService<'a> {
                 self.env,
                 self.cwd,
                 &gateway_admission,
+                &stop_requested,
             )?;
             if runtime_dirty {
                 write_supervisor_runtime_state(
@@ -3023,6 +3025,7 @@ fn start_due_children(
     env: &BTreeMap<String, String>,
     cwd: &Path,
     gateway_admission: &SupervisorGatewayAdmission,
+    stop_requested: &AtomicBool,
 ) -> Result<bool, String> {
     let runtime_path = supervisor_runtime_path(env, cwd)?;
     let ocm_home = display_path(&resolve_ocm_home(env, cwd)?);
@@ -3034,6 +3037,9 @@ fn start_due_children(
     let mut runtime_dirty = false;
 
     for env_name in due {
+        if stop_requested.load(Ordering::SeqCst) {
+            break;
+        }
         let Some(next_child) = pending.get(&env_name).cloned() else {
             continue;
         };
@@ -3091,10 +3097,18 @@ fn start_due_children(
             // Do not probe a contended child. Probing itself stays outside
             // admission, so a slow OpenClaw command cannot block watch claims.
             drop(admit_supervisor_child_start(&next_child.spec, env, cwd)?);
+            if stop_requested.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             let restart_handoff_support = probe_restart_handoff_support(&next_child.spec);
             if let RestartHandoffSupport::CleanupUnverified(error) = &restart_handoff_support {
                 cleanup_unverified = true;
                 return Err(error.clone());
+            }
+            // Let an already-running bounded probe settle, but do not turn its
+            // result into a new Gateway after daemon shutdown was requested.
+            if stop_requested.load(Ordering::SeqCst) {
+                return Ok(None);
             }
             let admission = admit_supervisor_child_start(&next_child.spec, env, cwd)?;
             // Dynamic reconciliation may have queued this target only in memory.
@@ -3108,16 +3122,20 @@ fn start_due_children(
                 inactive,
                 gateway_admission,
             )?;
+            if stop_requested.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             let child = spawn_running_child(
                 next_child.spec.clone(),
                 next_child.restart_count,
                 next_child.quick_clean_restart_count,
                 restart_handoff_support,
             )?;
-            Ok((child, admission))
+            Ok(Some((child, admission)))
         })();
         match start_result {
-            Ok((running_child, _admission)) => {
+            Ok(None) => break,
+            Ok(Some((running_child, _admission))) => {
                 pending.remove(&env_name);
                 running.insert(env_name.clone(), running_child);
                 inactive.remove(&env_name);
@@ -4458,6 +4476,7 @@ mod tests {
             &env,
             root.path(),
             &admission,
+            &AtomicBool::new(false),
         );
         // Opening the child logs is the first spawn operation, even if the
         // process is stopped before its executable has time to run.
@@ -4486,7 +4505,8 @@ mod tests {
                 &mut inactive,
                 &env,
                 root.path(),
-                &admission
+                &admission,
+                &AtomicBool::new(false),
             )
             .unwrap()
         );
