@@ -116,6 +116,10 @@ jobs:
           cargo test --locked --lib windows_source_watch_ -- --nocapture
           cargo test --locked --test windows_dev_stop_tests native_windows_dev_stop_lifecycle -- --exact --nocapture
 
+      - name: Prove native Windows runtime installation prefixes
+        timeout-minutes: 5
+        run: cargo test --locked --lib store::runtimes::tests::native_npm_prefix_accepts_windows_paths -- --exact --nocapture
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
         with:
