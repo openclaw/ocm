@@ -900,6 +900,122 @@ fn runtime_build_local_packs_and_installs_release_shaped_package() {
     assert!(verify.status.success(), "{}", stderr(&verify));
 }
 
+#[test]
+fn runtime_build_local_with_native_npm_preserves_tree_integrity() {
+    let root = TestDir::new("runtime-native-tree-integrity");
+    let repo = root.child("repo");
+    fs::create_dir(&repo).unwrap();
+    let mut env = ocm_env(&root);
+    for (key, value) in [
+        ("npm_config_offline", "true".to_string()),
+        ("npm_config_cache", path_string(&root.child("npm-cache"))),
+        ("npm_config_audit", "false".to_string()),
+        ("npm_config_fund", "false".to_string()),
+    ] {
+        env.insert(key.to_string(), value);
+    }
+    #[cfg(windows)]
+    {
+        for key in ["PATHEXT", "WINDIR", "COMSPEC"] {
+            if let Ok(value) = std::env::var(key) {
+                env.insert(key.to_string(), value);
+            }
+        }
+        for (key, directory) in [
+            ("USERPROFILE", "home"),
+            ("APPDATA", "appdata"),
+            ("LOCALAPPDATA", "localappdata"),
+            ("TEMP", "tmp"),
+            ("TMP", "tmp"),
+        ] {
+            fs::create_dir_all(root.child(directory)).unwrap();
+            env.insert(key.to_string(), path_string(&root.child(directory)));
+        }
+        let npm = Command::new("where.exe").arg("npm.cmd").output().unwrap();
+        assert!(npm.status.success(), "{}", stderr(&npm));
+        env.insert(
+            "OCM_INTERNAL_NPM_BIN".to_string(),
+            stdout(&npm).lines().next().unwrap().trim().to_string(),
+        );
+    }
+    fs::write(
+        repo.join("package.json"),
+        serde_json::json!({
+            "name": "openclaw", "version": "2026.4.25",
+            "bin": {"openclaw": "openclaw.mjs"},
+            "engines": {"node": ">=22.22.3"},
+            "files": ["openclaw.mjs", "payload"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    write_executable_script(
+        &repo.join("openclaw.mjs"),
+        "#!/usr/bin/env node\nimport { readFileSync } from 'node:fs';\nconsole.log(readFileSync(new URL('./payload', import.meta.url)).length);\n",
+    );
+    let mut payload: Vec<u8> = (0..2 * 1024 * 1024 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    fs::write(repo.join("payload"), &payload).unwrap();
+
+    let build = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "native",
+            "--repo",
+            &path_string(&repo),
+            "--json",
+        ],
+    );
+    assert!(build.status.success(), "{}", stderr(&build));
+    let meta: Value = serde_json::from_str(&stdout(&build)).unwrap();
+    assert_eq!(meta["runtimeSha256"].as_str().unwrap().len(), 64);
+    let installed = runtime_install_root("native", &env, root.path()).unwrap();
+    let installed_payload = installed.join("files/node_modules/openclaw/payload");
+    assert_eq!(fs::read(&installed_payload).unwrap(), payload);
+
+    let verify = run_ocm(
+        root.path(),
+        &env,
+        &["runtime", "verify", "native", "--json"],
+    );
+    assert!(verify.status.success(), "{}", stderr(&verify));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&verify)).unwrap()["healthy"],
+        true
+    );
+    let create = run_ocm(
+        root.path(),
+        &env,
+        &["env", "create", "native", "--runtime", "native"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let execute = run_ocm(root.path(), &env, &["@native", "--", "--version"]);
+    assert!(execute.status.success(), "{}", stderr(&execute));
+    assert_eq!(stdout(&execute).trim(), payload.len().to_string());
+
+    // Same-size drift beyond the first two reads must still invalidate the tree.
+    *payload.last_mut().unwrap() ^= 1;
+    fs::write(&installed_payload, payload).unwrap();
+    let drift = run_ocm(
+        root.path(),
+        &env,
+        &["runtime", "verify", "native", "--json"],
+    );
+    assert_eq!(drift.status.code(), Some(1), "{}", stderr(&drift));
+    let drift: Value = serde_json::from_str(&stdout(&drift)).unwrap();
+    assert_eq!(drift["healthy"], false);
+    assert!(
+        drift["issue"]
+            .as_str()
+            .unwrap()
+            .contains("runtime sha256 mismatch")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn runtime_build_local_rejects_dependencies_from_another_checkout_before_pack() {
