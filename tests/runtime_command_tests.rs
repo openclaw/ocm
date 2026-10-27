@@ -1302,6 +1302,163 @@ fn runtime_build_local_can_include_source_extensions_without_widening_default_tr
 }
 
 #[test]
+fn runtime_build_local_preserves_installed_extension_dependency_bindings() {
+    let root = TestDir::new("runtime-source-dependency-bindings");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    fs::create_dir_all(&repo).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert("npm_config_offline".into(), "true".into());
+    env.insert(
+        "npm_config_cache".into(),
+        path_string(&root.child("npm-cache")),
+    );
+    env.insert("npm_config_audit".into(), "false".into());
+    env.insert("npm_config_fund".into(), "false".into());
+
+    let write_package = |dir: &Path, package: Value, entry: &str| {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("package.json"), package.to_string()).unwrap();
+        fs::write(dir.join("index.mjs"), entry).unwrap();
+    };
+    let pack_dependency = |name: &str, version: u8| {
+        let dir = cwd.join(format!("{name}-{version}"));
+        write_package(
+            &dir,
+            serde_json::json!({
+                "name":format!("@scout/{name}"), "version":format!("{version}.0.0"),
+                "type":"module", "exports":"./index.mjs", "files":["index.mjs"]
+            }),
+            &format!("export const value = {version};\n"),
+        );
+        let output = Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
+            .args(["pack", "--json", "--ignore-scripts"])
+            .current_dir(&dir)
+            .env_clear()
+            .envs(&env)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let packed: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        format!(
+            "file:{}",
+            path_string(&dir.join(packed[0]["filename"].as_str().unwrap()))
+        )
+    };
+    let shared1 = pack_dependency("shared", 1);
+    let shared2 = pack_dependency("shared", 2);
+    let leaf1 = pack_dependency("leaf", 1);
+    let leaf2 = pack_dependency("leaf", 2);
+    fs::write(
+        repo.join("package.json"),
+        serde_json::json!({
+            "name":"openclaw", "version":"2026.10.27", "type":"module",
+            "bin":{"openclaw":"openclaw.mjs"}, "engines":{"node":">=22.22.3"},
+            "exports":{"./sdk":"./sdk.mjs"},
+            "files":["openclaw.mjs", "sdk.mjs", "dist/extensions/builtin"],
+            "dependencies":{"@scout/shared":shared1, "@scout/leaf":leaf2}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(repo.join("sdk.mjs"), "export const host = 'host-sdk';\n").unwrap();
+    write_executable_script(
+        &repo.join("openclaw.mjs"),
+        "#!/usr/bin/env node\nimport {value as host} from '@scout/shared';\nimport builtin from './dist/extensions/builtin/index.mjs';\nimport plugin from './dist/extensions/probe/index.mjs';\nconsole.log(JSON.stringify({host,builtin,plugin}));\n",
+    );
+    write_package(
+        &repo.join("dist/extensions/builtin"),
+        serde_json::json!({"name":"@scout/builtin","version":"1.0.0","type":"module"}),
+        "import {value} from '@scout/shared'; export default value;\n",
+    );
+    for (id, package, entry) in [
+        (
+            "bridge",
+            serde_json::json!({
+                "name":"@scout/bridge", "version":"1.0.0", "type":"module",
+                "exports":"./index.mjs", "files":["index.mjs","openclaw.plugin.json"],
+                "dependencies":{"@scout/leaf":leaf2}
+            }),
+            "import {value} from '@scout/leaf'; export default value;\n",
+        ),
+        (
+            "probe",
+            serde_json::json!({
+                "name":"@scout/plugin", "version":"1.0.0", "type":"module",
+                "exports":"./index.mjs", "files":["index.mjs","openclaw.plugin.json"],
+                "dependencies":{"@scout/shared":shared2,"@scout/leaf":leaf1,"@scout/bridge":"1.0.0"},
+                "peerDependencies":{"openclaw":"*"}
+            }),
+            "import {value as direct} from '@scout/shared';\nimport {value as privateLeaf} from '@scout/leaf';\nimport transitive from '@scout/bridge';\nimport {host} from 'openclaw/sdk';\nexport default {direct,privateLeaf,transitive,host};\n",
+        ),
+    ] {
+        let dir = repo.join("dist/extensions").join(id);
+        write_package(&dir, package, entry);
+        fs::write(
+            dir.join("openclaw.plugin.json"),
+            serde_json::json!({"id":id,"configSchema":{"type":"object"}}).to_string(),
+        )
+        .unwrap();
+    }
+
+    for strategy in ["default", "nested"] {
+        if strategy == "nested" {
+            env.insert("npm_config_install_strategy".into(), "nested".into());
+        }
+        let build = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "build-local",
+                strategy,
+                "--repo",
+                repo.to_str().unwrap(),
+                "--include-source-extensions",
+                "--json",
+            ],
+        );
+        assert!(build.status.success(), "{strategy}: {}", stderr(&build));
+        let prefix = runtime_install_root(strategy, &env, &cwd)
+            .unwrap()
+            .join("files/node_modules");
+        let expected =
+            serde_json::json!({"direct":2,"privateLeaf":1,"transitive":2,"host":"host-sdk"});
+        for entry in [
+            prefix.join("@scout/plugin/index.mjs"),
+            prefix.join("openclaw/dist/extensions/probe/index.mjs"),
+        ] {
+            let output = Command::new("node").args(["--input-type=module", "-e",
+                "import {pathToFileURL} from 'node:url'; console.log(JSON.stringify((await import(pathToFileURL(process.argv[1]))).default));",
+                entry.to_str().unwrap()]).current_dir(&cwd).env_clear().envs(&env).output().unwrap();
+            assert!(output.status.success(), "{strategy}: {}", stderr(&output));
+            assert_eq!(
+                serde_json::from_str::<Value>(&stdout(&output)).unwrap(),
+                expected
+            );
+        }
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", strategy, "--runtime", strategy, "--json"],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        let launch = run_ocm(&cwd, &env, &[&format!("@{strategy}"), "--", "--version"]);
+        assert!(launch.status.success(), "{strategy}: {}", stderr(&launch));
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&launch)).unwrap(),
+            serde_json::json!({"host":1,"builtin":1,"plugin":expected})
+        );
+        let verify = run_ocm(&cwd, &env, &["runtime", "verify", strategy, "--json"]);
+        assert!(verify.status.success(), "{}", stderr(&verify));
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&verify)).unwrap()["healthy"],
+            true
+        );
+    }
+}
+
+#[test]
 fn runtime_build_local_derives_source_plugins_from_target_env_before_pack() {
     let root = TestDir::new("runtime-build-local-target-source-plugins");
     let cwd = root.child("workspace");

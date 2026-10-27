@@ -264,6 +264,8 @@ OCM packages only built extensions under that checkout's `dist/extensions`
 that are absent from the core tarball, installs their runtime dependencies, and
 places them in the managed runtime's bundled-extension root. Extensions from
 global, state, workspace, or other external paths are not included or promoted.
+Materialized extensions retain the installed dependency bindings, including
+when npm hoists a version that differs from the core package's private version.
 Without the flag, `build-local` remains release-shaped.
 Because the opt-in installs every omitted extension and its dependency closure,
 the resulting runtime can take longer to build and use substantially more disk

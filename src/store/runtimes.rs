@@ -2463,6 +2463,112 @@ fn ensure_local_extension_openclaw_peer(
     link_or_copy_openclaw_host(host_package, &peer_path)
 }
 
+fn installed_dependency_directory(
+    package_root: &Path,
+    package_path: &Path,
+    install_files: &Path,
+) -> Result<Option<PathBuf>, String> {
+    for ancestor in package_root
+        .ancestors()
+        .take_while(|path| path.starts_with(install_files))
+    {
+        if ancestor.file_name() == Some(OsStr::new("node_modules")) {
+            continue;
+        }
+        let candidate = ancestor.join("node_modules").join(package_path);
+        if candidate.join("package.json").is_file() {
+            return fs::canonicalize(candidate)
+                .map(Some)
+                .map_err(|error| error.to_string());
+        }
+    }
+    Ok(None)
+}
+
+fn preserve_materialized_extension_dependencies(
+    install_files: &Path,
+    installed_package: &Path,
+    target: &Path,
+    link_or_copy: fn(&Path, &Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let install_files = fs::canonicalize(install_files).map_err(|error| error.to_string())?;
+    let host = installed_openclaw_package_root(&install_files);
+    let source = fs::canonicalize(installed_package).map_err(|error| error.to_string())?;
+    let target = fs::canonicalize(target).map_err(|error| error.to_string())?;
+    let extension_root = target.clone();
+    let mut copies = BTreeMap::from([(target.clone(), source.clone())]);
+    let mut pending = vec![(source, target)];
+    let mut visited = BTreeSet::new();
+    while let Some((source, target)) = pending.pop() {
+        if !visited.insert(target.clone()) {
+            continue;
+        }
+        let package: serde_json::Value = read_json(&source.join("package.json"))?;
+        let dependencies = ["dependencies", "optionalDependencies", "peerDependencies"]
+            .into_iter()
+            .filter_map(|section| package.get(section).and_then(serde_json::Value::as_object))
+            .flat_map(|entries| entries.keys())
+            .collect::<BTreeSet<_>>();
+        for name in dependencies {
+            if name == "openclaw"
+                && target == extension_root
+                && package.pointer("/peerDependencies/openclaw").is_some()
+            {
+                // The existing explicit host-peer step owns this binding.
+                continue;
+            }
+            let relative = npm_package_relative_path(name)
+                .ok_or_else(|| format!("invalid installed extension dependency name: {name}"))?;
+            let Some(dependency) =
+                installed_dependency_directory(&source, &relative, &install_files)?
+            else {
+                // npm may omit an optional dependency. Do not install anything here.
+                continue;
+            };
+            if let Some(resolved) =
+                installed_dependency_directory(&target, &relative, &install_files)?
+            {
+                if resolved == dependency {
+                    // A link to the original package retains its complete npm ancestry.
+                    continue;
+                }
+                // A copied private package still has the right identity, but its own
+                // inherited dependencies may also have changed when it moved.
+                let original = resolved.ancestors().find_map(|ancestor| {
+                    copies
+                        .get(ancestor)
+                        .map(|original| original.join(resolved.strip_prefix(ancestor).unwrap()))
+                });
+                if original
+                    .as_ref()
+                    .and_then(|path| fs::canonicalize(path).ok())
+                    == Some(dependency.clone())
+                {
+                    pending.push((dependency, resolved));
+                    continue;
+                }
+            }
+            let binding = target.join("node_modules").join(relative);
+            remove_path_if_present(&binding)?;
+            if dependency == host {
+                // Keep the existing host-peer fallback: the host contains the target.
+                link_or_copy_openclaw_host(&host, &binding)?;
+                continue;
+            }
+            link_or_copy(&dependency, &binding)?;
+            let resolved = fs::canonicalize(&binding).map_err(|error| error.to_string())?;
+            if resolved != dependency {
+                // The copy fallback needs the same treatment recursively. Tracking
+                // destination identities lets cyclic dependencies reuse an ancestor
+                // copy only when normal package lookup actually reaches it.
+                copies.insert(resolved.clone(), dependency.clone());
+                pending.push((dependency, resolved));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn materialize_local_source_extensions(
     install_files: &Path,
     extensions: &[LocalSourceExtensionArchive],
@@ -2497,6 +2603,12 @@ fn materialize_local_source_extensions(
             ));
         }
         copy_dir_recursive(&installed_package, &target)?;
+        preserve_materialized_extension_dependencies(
+            install_files,
+            &installed_package,
+            &target,
+            symlink_or_copy_dir,
+        )?;
         ensure_local_extension_openclaw_peer(
             &installed_openclaw_package_root(install_files),
             &target,
@@ -4090,6 +4202,88 @@ pub fn verify_runtime_binary(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn materialized_dependency_copy_fallback_preserves_nested_bindings_and_cycles() {
+        let root = tempfile::tempdir().unwrap();
+        let files = root.path();
+        let modules = files.join("node_modules");
+        let source = modules.join("@scope/plugin");
+        let target = modules.join("openclaw/dist/extensions/probe");
+        let write = |dir: &std::path::Path, dependencies: serde_json::Value, entry: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("package.json"),
+                serde_json::json!({
+                    "main":"index.cjs", "dependencies":dependencies
+                })
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(dir.join("index.cjs"), entry).unwrap();
+        };
+        write(
+            &source,
+            serde_json::json!({"a":"1","bridge":"1","cycle":"1"}),
+            "exports.ready=true; exports.values=[require('a'),require('bridge'),require('cycle').ready];",
+        );
+        write(
+            &source.join("node_modules/a"),
+            serde_json::json!({}),
+            "module.exports=1;",
+        );
+        write(
+            &modules.join("a"),
+            serde_json::json!({}),
+            "module.exports=2;",
+        );
+        write(
+            &modules.join("bridge"),
+            serde_json::json!({"a":"2"}),
+            "module.exports=require('a');",
+        );
+        write(
+            &modules.join("cycle"),
+            serde_json::json!({"@scope/plugin":"1"}),
+            "exports.ready=require('@scope/plugin').ready;",
+        );
+        // Each wrong host-local package would shadow the original prefix binding.
+        for name in ["bridge", "cycle", "@scope/plugin"] {
+            write(
+                &modules.join("openclaw/node_modules").join(name),
+                serde_json::json!({}),
+                "throw Error('wrong host dependency');",
+            );
+        }
+        super::copy_dir_recursive(&source, &target).unwrap();
+        super::preserve_materialized_extension_dependencies(
+            files,
+            &source,
+            &target,
+            super::copy_dir_recursive,
+        )
+        .unwrap();
+        let output = std::process::Command::new("node")
+            .args([
+                "-e",
+                "console.log(JSON.stringify(require(process.argv[1]).values));",
+                target.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[1,2,true]");
+        // Repairing the copy must never rewrite the npm-installed source graph.
+        assert!(!source.join("node_modules/bridge").exists());
+        assert_eq!(
+            std::fs::read_to_string(modules.join("a/index.cjs")).unwrap(),
+            "module.exports=2;"
+        );
+    }
+
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
