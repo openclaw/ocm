@@ -16,8 +16,8 @@ use super::gateway_ports::read_port_number;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_workspaces::{
     OpenClawConfigReadContext, OpenClawConfigReadError, OpenClawWorkspaceInventory,
-    OpenClawWorkspaceRuntime, load_effective_openclaw_config, normalize_agent_id,
-    read_openclaw_config_field, read_regular_text_file, resolve_openclaw_config_env,
+    OpenClawWorkspaceRuntime, load_effective_openclaw_config, read_openclaw_config_field,
+    read_regular_text_file, resolve_openclaw_config_env,
 };
 
 #[cfg(all(test, target_os = "macos"))]
