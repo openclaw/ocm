@@ -2220,6 +2220,145 @@ if (args[1] === 'restart-handoff') {{
 }
 
 #[test]
+#[cfg(unix)]
+fn daemon_shutdown_stops_initial_and_reconciled_startup_admission() {
+    let _guard = daemon_runtime_test_lock();
+    for (reconciled, cancel_during_probe) in [(false, true), (true, true), (false, false)] {
+        let root = TestDir::new("daemon-shutdown-admission");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_service_manager(&root, &mut env);
+        let peer = root.child("peer/openclaw.mjs");
+        write_executable_script(
+            &peer,
+            &format!(
+                r#"#!/usr/bin/env node
+import fs from 'node:fs';
+const root = {root:?};
+const name = process.env.OCM_ACTIVE_ENV;
+const args = process.argv.slice(2);
+const mark = kind => fs.writeFileSync(`${{root}}/${{name}}.${{kind}}`, String(process.pid));
+if (args[1] === 'restart-handoff') {{
+  mark('probe');
+  const deadline = Date.now() + 12000;
+  const timer = setInterval(() => {{
+    if (!fs.existsSync(`${{root}}/${{name}}.allow`) && Date.now() < deadline) return;
+    clearInterval(timer);
+    console.log(JSON.stringify({{ok:true,protocol:'openclaw.gateway.restart-handoff',protocolVersion:1,operations:['consume']}}));
+  }}, 10);
+}} else {{
+  process.on('SIGTERM', () => process.exit(0));
+  process.on('SIGINT', () => process.exit(0));
+  mark('started');
+  setTimeout(() => process.exit(0), 20000);
+}}
+"#,
+                root = path_string(root.path()),
+            ),
+        );
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", "peer", "--path", &path_string(&peer)],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        for name in ["alpha", "beta"] {
+            for args in [
+                vec!["env", "create", name, "--runtime", "peer"],
+                vec!["service", "start", name],
+            ] {
+                let result = run_ocm(&cwd, &env, &args);
+                assert!(result.status.success(), "{}", stderr(&result));
+            }
+        }
+        let service = SupervisorService::new(&env, &cwd);
+        let env_service = EnvironmentService::new(&env, &cwd);
+        if reconciled {
+            for name in ["alpha", "beta"] {
+                env_service.set_service_running(name, false).unwrap();
+            }
+        }
+        service.sync().unwrap();
+        let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+        let mut daemon = spawn_daemon_process(&cwd, &env);
+        let idle = !reconciled
+            || wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5)).is_some();
+        if reconciled {
+            for name in ["alpha", "beta"] {
+                env_service.set_service_running(name, true).unwrap();
+            }
+            service.sync().unwrap();
+        }
+        let probed = wait_for_file(&root.child("alpha.probe"), Duration::from_secs(5));
+        if cancel_during_probe {
+            assert_eq!(unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) }, 0);
+            // Keep the probe blocked while the daemon's signal thread observes TERM.
+            sleep(Duration::from_millis(300));
+        }
+        fs::write(root.child("alpha.allow"), "release").unwrap();
+        fs::write(root.child("beta.allow"), "release").unwrap();
+        let started = cancel_during_probe
+            || wait_for_file(&root.child("beta.started"), Duration::from_secs(5));
+        if !cancel_during_probe {
+            assert_eq!(unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) }, 0);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = daemon.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            sleep(Duration::from_millis(25));
+        };
+        let final_runtime = fs::read(&runtime_path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+        let mut live_peers = Vec::new();
+        for name in ["alpha", "beta"] {
+            for kind in ["probe", "started"] {
+                if let Ok(raw) = fs::read_to_string(root.child(format!("{name}.{kind}"))) {
+                    let pid = raw.parse::<u32>().unwrap();
+                    if process_exists(pid) {
+                        live_peers.push(pid);
+                    }
+                }
+            }
+        }
+        // Preserve observations before fallback teardown; a forced stop is not a pass.
+        if status.is_none() {
+            stop_process(&mut daemon);
+        }
+        for pid in &live_peers {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        assert!(
+            idle && probed && started,
+            "fixture did not reach its native boundary"
+        );
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "shutdown failed"
+        );
+        assert!(
+            live_peers.is_empty(),
+            "daemon left peers alive: {live_peers:?}"
+        );
+        assert_eq!(final_runtime.unwrap()["children"], serde_json::json!([]));
+        assert_eq!(root.child("alpha.started").exists(), !cancel_during_probe);
+        assert_eq!(root.child("beta.probe").exists(), !cancel_during_probe);
+        assert_eq!(root.child("beta.started").exists(), !cancel_during_probe);
+        for name in ["alpha", "beta"] {
+            assert!(env_service.get(name).unwrap().service_running);
+        }
+    }
+}
+
+#[test]
 fn daemon_publishes_a_started_child_before_a_sibling_probe_can_block() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("daemon-spawn-publication");
