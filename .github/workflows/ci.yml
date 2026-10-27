@@ -237,46 +237,6 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Observe pinned macOS foreground regression with siblings
-        if: runner.os == 'macOS' && github.event_name == 'pull_request' && github.event.pull_request.number == 717 && github.event.pull_request.head.sha == '5a884bf3f5e19e236faece3ff2d8d640509662ab'
-        timeout-minutes: 5
-        run: |
-          collector="$GITHUB_WORKSPACE/tests/support/foreground_resume_observe_suite.py"
-          observation="$RUNNER_TEMP/foreground-resume-recheck-suite-observation"
-          baseline="$RUNNER_TEMP/foreground-resume-recheck-suite-base"
-          dump_observation() {
-            if [ -d "$observation" ]; then
-              python3 - "$observation" <<'PY'
-          import pathlib, sys
-          root = pathlib.Path(sys.argv[1])
-          files = [root / 'identity.json', root / 'results.json']
-          for attempt in sorted(root.iterdir()):
-              if attempt.is_dir() and attempt.name.isdigit():
-                  files.extend(attempt / name for name in ('observations.jsonl', 'test.log'))
-          for file in files:
-              if file.is_file():
-                  print(f'=== {file.relative_to(root)} ===', flush=True)
-                  print(file.read_text(), end='', flush=True)
-          PY
-            fi
-          }
-          trap dump_observation EXIT
-          shasum -a 256 "$collector"
-          git fetch --no-tags --depth=1 origin dc282d315de01731c395983076bd04e633554bff
-          git worktree add --detach "$baseline" dc282d315de01731c395983076bd04e633554bff
-          cd "$baseline"
-          git rev-parse HEAD 'HEAD^{tree}'
-          test -z "$(git status --porcelain)"
-          cargo --version
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/foreground-resume-recheck-suite-target"
-          if python3 "$collector" "$observation" 20; then
-            collector_exit=0
-          else
-            collector_exit=$?
-          fi
-          printf '{"collectorExit":%s}\n' "$collector_exit"
-          test -f "$observation/identity.json"
-          test -f "$observation/results.json"
       - name: Bind packing candidate executable to its source
         if: github.event_name == 'pull_request' && github.event.pull_request.number == 717
         run: |
