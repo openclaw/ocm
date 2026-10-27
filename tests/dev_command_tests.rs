@@ -5817,6 +5817,7 @@ fn dev_command_can_start_a_background_service() {
     {
         let preparation = read_source_watch_session(&root);
         assert_eq!(preparation["servicePreparation"], true);
+        assert!(preparation.get("repoRoot").is_none());
         assert_eq!(preparation["watching"], false);
         assert!(preparation["ui"].is_null());
         assert_eq!(preparation["closed"], true);
@@ -5976,6 +5977,13 @@ fn dev_watch_force_takes_over_runtime_env_without_rebinding() {
     );
     assert!(watch.status.success(), "{}", stderr(&watch));
     assert!(stdout(&watch).contains("service restored for demo"));
+    #[cfg(unix)]
+    {
+        let completed = read_source_watch_session(&root);
+        assert_eq!(completed["repoRoot"], path_string(&canonical_repo));
+        assert_eq!(completed["closed"], true);
+        assert_eq!(completed["completion"]["serviceRestored"], true);
+    }
 
     let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(show.status.success(), "{}", stderr(&show));
@@ -7911,6 +7919,104 @@ fn dev_service_preparation_cancellation_preserves_its_running_service() {
     assert_eq!(read_source_watch_session(&root)["closed"], true);
     let final_state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert!(final_state["children"].as_array().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn temporary_takeover_checks_its_source_while_preparing() {
+    for ui in [false, true] {
+        let root = TestDir::new("takeover-starting-source");
+        let other = TestDir::new("takeover-starting-other");
+        let repo = fs::canonicalize(init_openclaw_repo(&root)).unwrap();
+        let other_repo = init_openclaw_repo(&other);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = service_env_with_gateway_admission(&root);
+        install_probe_aware_fake_dev_runners(&root, &mut env);
+        declare_source_tooling(&repo);
+        for name in ["tsx", "tsdown", "chokidar"] {
+            write_resolvable_source_tool(&repo, name);
+        }
+        create_runtime_backed_env(&cwd, &env);
+        let binding = get_environment("demo", &env, &cwd).unwrap();
+        let started = root.child("preparation.started");
+        let release = root.child("source-watch.release");
+        let node_path = root.child("fake-dev-bin/node");
+        let node = fs::read_to_string(&node_path).unwrap();
+        let barrier = format!(
+            "#!/bin/sh\nif [ \"$6\" = ocm-source-dependencies ]; then\n  : > '{}'\n  while [ ! -f '{}' ]; do /bin/sleep 0.05; done\nfi\n",
+            path_string(&started),
+            path_string(&release),
+        );
+        write_executable_script(&node_path, &node.replacen("#!/bin/sh\n", &barrier, 1));
+        let alias = root.child("selected-source");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        let mode = if ui { "--ui" } else { "--no-ui" };
+        let selected = path_string(&alias);
+        let args = [
+            "dev", "demo", "--repo", &selected, "--watch", "--force", mode,
+        ];
+        let watch = DevWatchFixture::spawn(&root, &cwd, &env, &args);
+        assert!(wait_for_path(&started, Duration::from_secs(30)));
+        let status = run_ocm(&cwd, &env, &["dev", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+        assert_eq!(status["sourceWatch"]["state"], "starting");
+        assert!(status["repoRoot"].is_null());
+        let session = read_source_watch_session(&root);
+        assert_eq!(session["repoRoot"], path_string(&repo));
+        for source in [&alias, &repo] {
+            let same = run_ocm(
+                &cwd,
+                &env,
+                &[
+                    "dev",
+                    "demo",
+                    "--repo",
+                    &path_string(source),
+                    "--watch",
+                    "--force",
+                    mode,
+                ],
+            );
+            assert!(same.status.success(), "{}", stderr(&same));
+            assert!(stderr(&same).contains("is starting; keeping the existing session"));
+        }
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&other_repo, &alias).unwrap();
+        for source in [&alias, &other_repo] {
+            let different = run_ocm(
+                &cwd,
+                &env,
+                &[
+                    "dev",
+                    "demo",
+                    "--repo",
+                    &path_string(source),
+                    "--watch",
+                    "--force",
+                    mode,
+                ],
+            );
+            assert!(!different.status.success());
+            assert!(
+                stderr(&different).contains("stop that session before selecting"),
+                "{}",
+                stderr(&different)
+            );
+            assert_eq!(read_source_watch_session(&root), session);
+        }
+        let stopped = run_dev_stop(&cwd, &env);
+        assert!(stopped.status.success(), "{}", stderr(&stopped));
+        let watched = watch.finish();
+        assert_eq!(watched.status.code(), Some(130), "{}", stderr(&watched));
+        let closed = read_source_watch_session(&root);
+        assert_eq!(closed["closed"], true);
+        assert_eq!(closed["repoRoot"], path_string(&repo));
+        let after = get_environment("demo", &env, &cwd).unwrap();
+        assert_eq!(after.dev, binding.dev);
+        assert_eq!(after.default_runtime, binding.default_runtime);
+    }
 }
 
 #[cfg(unix)]

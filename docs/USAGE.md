@@ -1682,6 +1682,15 @@ Changing a selected path alias while the session runs does not redirect the
 worker or environment commands. A repeat request through that alias is refused
 if it now selects another checkout; stop the session before switching sources.
 Equivalent aliases that still select the active checkout can reuse it.
+
+Temporary takeover reuse checks the captured canonical checkout during preparation
+and service restoration as well as while active. A request for another checkout
+is refused; a matching request reports the current session's progress without
+starting another process. Older non-dev sessions that have not recorded their
+source cannot prove a match during startup or restoration: retry after that phase
+finishes. This refusal leaves the existing session running, and `dev stop` and
+recovery remain available. Active older sessions use their recorded source override.
+
 Temporary source sessions also refuse to start while an environment operation
 can replace their checkout or Git metadata. Retry after the containing operation
 finishes; refusal leaves the temporary session and service policy unchanged.

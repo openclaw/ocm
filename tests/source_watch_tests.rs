@@ -339,8 +339,11 @@ fn dev_status_observes_active_and_transitional_source_watch() {
             "--force",
         ]),
     );
-    assert!(repeated.status.success(), "{}", stderr(&repeated));
-    assert!(stderr(&repeated).contains("is starting; keeping the existing session"));
+    assert!(!repeated.status.success());
+    assert!(
+        stderr(&repeated)
+            .contains("its source is unavailable; retry after startup or restoration completes")
+    );
     assert!(!stdout(&repeated).contains("ready"));
     assert!(!override_path.exists());
     assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
@@ -837,12 +840,13 @@ fn restoring_source_watch_lease_allows_runtime_fallback() {
         ]),
     );
     assert!(
-        overlapping_watch.status.success(),
+        !overlapping_watch.status.success(),
         "{}",
         stderr(&overlapping_watch)
     );
     assert!(
-        stderr(&overlapping_watch).contains("is restoring; keeping the existing session"),
+        stderr(&overlapping_watch)
+            .contains("its source is unavailable; retry after startup or restoration completes"),
         "{}",
         stderr(&overlapping_watch)
     );
@@ -1123,4 +1127,86 @@ fn source_watch_override_flows_to_env_exec_and_status_surfaces() {
 
     let node_log = fs::read_to_string(node_log).unwrap();
     assert_node_uses_source(&node_log, &source_repo);
+}
+
+#[test]
+fn transitional_takeover_reuse_qualifies_the_recorded_source_generation() {
+    for state in ["starting", "restoring"] {
+        let root = TestDir::new(&format!("takeover-source-{state}"));
+        let other = TestDir::new("takeover-source-other");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let source = fs::canonicalize(create_source_repo(&root)).unwrap();
+        let other_source = create_source_repo(&other);
+        let mut env = ocm_env(&root);
+        install_fake_service_manager(&root, &mut env);
+        create_runtime_backed_env(&root, &cwd, &env);
+        let meta = EnvironmentService::new(&env, &cwd).get("demo").unwrap();
+        let generation = "source-generation";
+        let lock_id = if state == "restoring" {
+            format!("restoring:{generation}")
+        } else {
+            generation.to_string()
+        };
+        let _lease = lock_source_watch_with_id(&root, &lock_id);
+        let session_path = root.child("ocm-home/source-watch/demo.session");
+        let session = json!({
+            "kind": "ocm-source-foreground-session-v1", "envName": "demo",
+            "leaseId": generation, "envRoot": meta.root,
+            "envCreatedAt": meta.created_at.format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "repoRoot": path_string(&source), "processScope": null,
+            "controller": {"pid": std::process::id(), "startedAt": "fixture"},
+            "child": null, "childSpawnPending": false, "watching": true,
+            "restoreService": false, "closed": false
+        });
+        fs::write(&session_path, serde_json::to_vec(&session).unwrap()).unwrap();
+        let request = |repo: &Path| {
+            run_ocm(
+                &cwd,
+                &env,
+                &dev_watch(&["demo", "--repo", &path_string(repo), "--watch", "--force"]),
+            )
+        };
+        let same = request(&source);
+        assert!(same.status.success(), "{}", stderr(&same));
+        assert!(stderr(&same).contains(&format!("is {state}; keeping the existing session")));
+        let different = request(&other_source);
+        assert!(!different.status.success());
+        assert!(
+            stderr(&different).contains("stop that session before selecting"),
+            "{}",
+            stderr(&different)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&session_path).unwrap()).unwrap(),
+            session
+        );
+
+        // A path from another environment or generation is not source identity
+        // for the held lease. Legacy records stay readable but cannot prove reuse.
+        for (key, value) in [
+            ("leaseId", json!("old-generation")),
+            ("envRoot", json!(root.child("replaced-env"))),
+            ("envCreatedAt", json!("2000-01-01T00:00:00Z")),
+            ("closed", json!(true)),
+            ("repoRoot", Value::Null),
+        ] {
+            let mut invalid = session.clone();
+            if value.is_null() {
+                invalid.as_object_mut().unwrap().remove(key);
+            } else {
+                invalid[key] = value;
+            }
+            let bytes = serde_json::to_vec(&invalid).unwrap();
+            fs::write(&session_path, &bytes).unwrap();
+            let unverified = request(&source);
+            assert!(!unverified.status.success(), "{state}/{key}");
+            assert!(
+                stderr(&unverified).contains("its source is unavailable"),
+                "{state}/{key}: {}",
+                stderr(&unverified)
+            );
+            assert_eq!(fs::read(&session_path).unwrap(), bytes);
+        }
+    }
 }

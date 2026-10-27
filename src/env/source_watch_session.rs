@@ -95,6 +95,8 @@ pub(crate) struct SourceWatchSession {
     pub(crate) env_name: String,
     pub(crate) lease_id: String,
     pub(crate) env_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repo_root: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub(crate) env_created_at: OffsetDateTime,
     pub(crate) process_scope: Option<String>,
@@ -170,8 +172,9 @@ impl SourceWatchSessionPaths {
         meta: &EnvMeta,
         lease_id: &str,
         mode: super::SourceWatchMode,
+        repo_root: &Path,
     ) -> Result<SourceWatchSession, String> {
-        self.create_session_with_mode(meta, lease_id, mode, false)
+        self.create_session_with_mode(meta, lease_id, mode, false, repo_root)
     }
 
     pub(super) fn create_ui_session(
@@ -179,12 +182,14 @@ impl SourceWatchSessionPaths {
         meta: &EnvMeta,
         lease_id: &str,
         watching: bool,
+        repo_root: &Path,
     ) -> Result<SourceWatchSession, String> {
         self.create_session_with_mode(
             meta,
             lease_id,
             super::SourceWatchMode::Foreground { watching },
             true,
+            repo_root,
         )
     }
 
@@ -194,6 +199,7 @@ impl SourceWatchSessionPaths {
         lease_id: &str,
         mode: super::SourceWatchMode,
         ui: bool,
+        repo_root: &Path,
     ) -> Result<SourceWatchSession, String> {
         let session = SourceWatchSession {
             kind: if ui {
@@ -207,6 +213,7 @@ impl SourceWatchSessionPaths {
             env_name: meta.name.clone(),
             lease_id: lease_id.to_string(),
             env_root: meta.root.clone(),
+            repo_root: (!mode.is_service_preparation()).then(|| display_path(repo_root)),
             env_created_at: meta.created_at,
             process_scope: process_scope_id()?,
             controller: current_process_identity()?,
@@ -316,6 +323,7 @@ impl SourceWatchSessionPaths {
             ).into());
         }
         if current.kind != session.kind
+            || current.repo_root != session.repo_root
             || current.watching != session.watching
             || current.service_preparation != session.service_preparation
             || current.ui.is_some() != session.ui.is_some()
@@ -327,7 +335,7 @@ impl SourceWatchSessionPaths {
                     session.ui.as_ref().and_then(|ui| ui.target.as_ref()) != Some(target)
                 })
         {
-            return Err("dev session mode or captured UI target changed".into());
+            return Err("dev session mode, source or captured UI target changed".into());
         }
         crate::store::write_json_detailed(&self.session, session)
     }
@@ -722,10 +730,21 @@ mod tests {
             .source_watch_session_paths("demo")
             .unwrap();
         let mut session = paths
-            .create_ui_session(&meta, "ui-generation", false)
+            .create_ui_session(&meta, "ui-generation", false, root.path())
             .unwrap();
         assert!(!session.is_watching());
         assert!(!session.service_preparation);
+        assert_eq!(
+            session.repo_root.as_deref(),
+            Some(display_path(root.path()).as_str())
+        );
+        let mut retargeted = session.clone();
+        retargeted.repo_root = Some(display_path(&root.path().join("other")));
+        assert!(paths.save_session(&retargeted).is_err());
+        assert_eq!(
+            paths.load_session("demo").unwrap().unwrap().repo_root,
+            session.repo_root
+        );
         let gateway = ProcessIdentity {
             pid: session.controller.pid + 10000,
             started_at: "gateway".to_string(),
@@ -790,6 +809,7 @@ mod tests {
             env_name: "demo".to_string(),
             lease_id: "retained-fixture".to_string(),
             env_root: display_path(&root.path().join("env")),
+            repo_root: None,
             env_created_at: crate::store::now_utc(),
             process_scope: process_scope_id().unwrap(),
             controller: ProcessIdentity {
@@ -907,6 +927,7 @@ mod tests {
             env_name: "demo".to_string(),
             lease_id: "completed-fixture".to_string(),
             env_root: display_path(&root.path().join("env")),
+            repo_root: None,
             env_created_at: crate::store::now_utc(),
             process_scope: process_scope_id().unwrap(),
             controller: current_process_identity().unwrap(),

@@ -907,9 +907,9 @@ impl<'a> EnvironmentService<'a> {
         remove_file_if_present(&override_path)?;
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         let session = Some(if ui {
-            session_paths.create_ui_session(&meta, &lease_id, mode.is_watching())?
+            session_paths.create_ui_session(&meta, &lease_id, mode.is_watching(), &source_root)?
         } else {
-            session_paths.create_session(&meta, &lease_id, mode)?
+            session_paths.create_session(&meta, &lease_id, mode, &source_root)?
         });
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let session = None;
