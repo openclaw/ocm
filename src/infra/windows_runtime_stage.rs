@@ -94,7 +94,8 @@ impl StageJob {
             return Err(io::Error::other("runtime stage already has child custody"));
         }
         // Default creator ACL; writers cannot break away and are never killed
-        // when this handle closes. Process membership keeps custody alive.
+        // when this handle closes. Children also retain a zero-access handle so
+        // custody remains discoverable by name after the creator exits.
         Ok(Self { handle })
     }
     pub(crate) fn output(&self, command: &Command) -> io::Result<Output> {
@@ -114,10 +115,12 @@ impl StageJob {
         };
         let spawned = (|| {
             let container = HandleContainer::create()?;
+            let pin = pin_job(self.handle.as_raw_handle())?;
             let streams = container.duplicate(&[
                 stdin.as_raw_handle(),
                 stdout_write.as_raw_handle(),
                 stderr_write.as_raw_handle(),
+                pin.as_raw_handle(),
             ])?;
             let parent = container.process.as_raw_handle();
             let jobs = [self.handle.as_raw_handle()];
@@ -157,6 +160,29 @@ impl StageJob {
             stderr: stderr?,
         })
     }
+}
+
+// Process membership retains the Job object, but its name disappears when the
+// last handle closes. Give only the intended child a lifetime pin, without Job
+// query, mutation or termination rights. The embedding host's copy cannot leak
+// through unrelated std::Command spawns because it is never inheritable here.
+fn pin_job(job: HANDLE) -> io::Result<OwnedHandle> {
+    let mut pin = std::ptr::null_mut();
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            job,
+            GetCurrentProcess(),
+            &mut pin,
+            0,
+            0,
+            0,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedHandle::from_raw_handle(pin) })
 }
 fn read_all(mut reader: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();

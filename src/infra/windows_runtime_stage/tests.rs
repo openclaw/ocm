@@ -7,12 +7,16 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
-use windows_sys::Win32::System::JobObjects::{IsProcessInJob, TerminateJobObject};
+use windows_sys::Win32::System::JobObjects::{
+    IsProcessInJob, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+    QueryInformationJobObject, TerminateJobObject,
+};
 use windows_sys::Win32::System::Threading::{
     GetProcessHandleCount, GetProcessId, OpenThread, SuspendThread, THREAD_SUSPEND_RESUME,
     TerminateProcess,
@@ -197,6 +201,21 @@ fn node(script: &str) -> Command {
     command
 }
 
+fn waiting_node(ready: &Path, release: &Path) -> Command {
+    let mut command = node(
+        r#"
+const fs = require('node:fs');
+fs.writeFileSync(process.argv[1], 'ready');
+const timer = setInterval(() => {
+  if (fs.existsSync(process.argv[2])) { clearInterval(timer); process.exit(0); }
+}, 20);
+setTimeout(() => process.exit(98), 30000);
+"#,
+    );
+    command.arg(ready).arg(release);
+    command
+}
+
 fn wait_for_file(path: &Path) {
     let deadline = Instant::now() + DEADLINE;
     while !path.is_file() {
@@ -225,6 +244,8 @@ fn spawn_in_container(
     )?;
     attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, streams)?;
     attributes.set(PROC_THREAD_ATTRIBUTE_JOB_LIST, &jobs)?;
+    // A namespace pin may follow stdio in HANDLE_LIST; only the first three
+    // entries are standard streams in STARTUPINFO.
     create_process(
         &mut prepared,
         &mut attributes,
@@ -331,26 +352,78 @@ fn target_joins_stage_but_not_holder_job_and_holder_never_runs() {
     }
     assert!(found, "holder has no initial thread");
 
-    let ready = root.path().join("ready");
-    let release = root.path().join("release");
-    let mut command = node(
-        r#"
-const fs = require('node:fs');
-fs.writeFileSync(process.argv[1], 'ready');
-const timer = setInterval(() => {
-  if (fs.existsSync(process.argv[2])) { clearInterval(timer); process.exit(0); }
-}, 20);
-setTimeout(() => process.exit(98), 30000);
-"#,
-    );
-    command.arg(&ready).arg(&release);
     let input = fs::File::open("NUL").unwrap();
     let output = fs::OpenOptions::new().write(true).open("NUL").unwrap();
+    // Causal control: membership without an inherited handle does not retain
+    // the name used by reclamation. Keep the actual admitted child alive.
+    {
+        let control_root = tempfile::tempdir().unwrap();
+        let control_stage = StageJob::create(control_root.path()).unwrap();
+        let ready = control_root.path().join("ready");
+        let release = control_root.path().join("release");
+        let streams = container
+            .duplicate(&[
+                input.as_raw_handle(),
+                output.as_raw_handle(),
+                output.as_raw_handle(),
+            ])
+            .unwrap();
+        let child = FixtureProcess(
+            spawn_in_container(
+                &waiting_node(&ready, &release),
+                &container,
+                control_stage.handle.as_raw_handle(),
+                &streams.handles,
+            )
+            .unwrap(),
+        );
+        drop(streams);
+        wait_for_file(&ready);
+        assert!(belongs(
+            child.0.as_raw_handle(),
+            control_stage.handle.as_raw_handle()
+        ));
+        drop(control_stage);
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.0.as_raw_handle(), 0) },
+            WAIT_TIMEOUT
+        );
+        assert!(
+            !has_custody(control_root.path()).unwrap(),
+            "unpinned membership unexpectedly retained the named Job"
+        );
+        fs::write(release, b"done").unwrap();
+        child.wait();
+        assert!(wait_process(&child.0).unwrap().success());
+    }
+
+    let ready = root.path().join("ready");
+    let release = root.path().join("release");
+    let command = waiting_node(&ready, &release);
+    let pin = super::pin_job(stage.handle.as_raw_handle()).unwrap();
+    noninheritable(pin.as_raw_handle());
+    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    let queried = unsafe {
+        QueryInformationJobObject(
+            pin.as_raw_handle(),
+            JobObjectBasicAccountingInformation,
+            std::ptr::from_mut(&mut accounting).cast(),
+            std::mem::size_of_val(&accounting) as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    let query_error = unsafe { GetLastError() };
+    assert_eq!(
+        queried, 0,
+        "the lifetime pin unexpectedly grants Job query access"
+    );
+    assert_eq!(query_error, ERROR_ACCESS_DENIED);
     let streams = container
         .duplicate(&[
             input.as_raw_handle(),
             output.as_raw_handle(),
             output.as_raw_handle(),
+            pin.as_raw_handle(),
         ])
         .unwrap();
     let target = FixtureProcess(
@@ -374,14 +447,25 @@ setTimeout(() => process.exit(98), 30000);
         unsafe { WaitForSingleObject(observed_holder.as_raw_handle(), 5_000) },
         WAIT_OBJECT_0
     );
+    // No parent-owned Job handle may mask whether the child retained its pin.
+    drop(pin);
+    drop(stage);
     assert_eq!(
         unsafe { WaitForSingleObject(target.0.as_raw_handle(), 0) },
         WAIT_TIMEOUT,
         "holder cleanup terminated the real writer"
     );
+    assert!(
+        has_custody(root.path()).unwrap(),
+        "the real child did not retain the named Job after owner cleanup"
+    );
     fs::write(release, b"done").unwrap();
     target.wait();
     assert!(wait_process(&target.0).unwrap().success());
+    assert!(
+        !has_custody(root.path()).unwrap(),
+        "named custody remained after the last real child exited"
+    );
 }
 
 #[test]
@@ -392,6 +476,7 @@ fn unrelated_std_child_cannot_hold_stage_capture_open() {
     let input = fs::File::open("NUL").unwrap();
     let error = fs::OpenOptions::new().write(true).open("NUL").unwrap();
     let (reader, writer) = io::pipe().unwrap();
+    let pin = super::pin_job(stage.handle.as_raw_handle()).unwrap();
     for handle in [
         input.as_raw_handle(),
         error.as_raw_handle(),
@@ -400,6 +485,7 @@ fn unrelated_std_child_cannot_hold_stage_capture_open() {
         container.process.as_raw_handle(),
         container.job.as_ref().unwrap().as_raw_handle(),
         stage.handle.as_raw_handle(),
+        pin.as_raw_handle(),
     ] {
         noninheritable(handle);
     }
@@ -408,6 +494,7 @@ fn unrelated_std_child_cannot_hold_stage_capture_open() {
             input.as_raw_handle(),
             writer.as_raw_handle(),
             error.as_raw_handle(),
+            pin.as_raw_handle(),
         ])
         .unwrap();
     // Start an ordinary std caller (inherit-all on MSRV 1.88) while inheritable
@@ -432,9 +519,22 @@ setTimeout(() => process.exit(98), 30000);
     wait_for_file(&ready);
     // Duplicating into the holder must not change the host source flags.
     noninheritable(writer.as_raw_handle());
+    noninheritable(pin.as_raw_handle());
+    let target_ready = root.path().join("target-ready");
+    let target_release = root.path().join("target-release");
+    let mut command = node(
+        r#"
+const fs = require('node:fs');
+process.stdout.write('complete');
+fs.writeFileSync(process.argv[1], 'ready');
+setInterval(() => { if (fs.existsSync(process.argv[2])) process.exit(0); }, 20);
+setTimeout(() => process.exit(98), 30000);
+"#,
+    );
+    command.arg(&target_ready).arg(&target_release);
     let target = FixtureProcess(
         spawn_in_container(
-            &node("process.stdout.write('complete');"),
+            &command,
             &container,
             stage.handle.as_raw_handle(),
             &streams.handles,
@@ -443,17 +543,34 @@ setTimeout(() => process.exit(98), 30000);
     );
     drop(streams);
     drop(writer);
+    drop(pin);
+    drop(stage);
     let (sender, receiver) = mpsc::sync_channel(1);
     let read_worker = thread::spawn(move || {
         let _ = sender.send(read_all(reader));
     });
+    wait_for_file(&target_ready);
+    assert_eq!(
+        unsafe { WaitForSingleObject(target.0.as_raw_handle(), 0) },
+        WAIT_TIMEOUT
+    );
+    assert!(
+        has_custody(root.path()).unwrap(),
+        "the real child lost named custody after all owner copies closed"
+    );
+    fs::write(target_release, b"done").unwrap();
     target.wait();
+    assert!(wait_process(&target.0).unwrap().success());
     let captured = receiver.recv_timeout(Duration::from_secs(3));
     // Check before releasing the unrelated process: an EOF obtained only after
     // that process dies would conceal the inherited-writer regression.
     assert_eq!(
         unsafe { WaitForSingleObject(unrelated.0.as_raw_handle(), 0) },
         WAIT_TIMEOUT
+    );
+    assert!(
+        !has_custody(root.path()).unwrap(),
+        "the unrelated std child inherited the stage namespace pin"
     );
     match captured {
         Ok(output) => {

@@ -317,7 +317,7 @@ impl RuntimeInstallTarget {
                     crate::infra::windows_runtime_stage::StageJob::create(&self.install_root)?;
                 job.output(command)
             };
-            // Our handle is closed before this check. A surviving launcher or
+            // Our handle is closed before this check. A surviving command or
             // descendant must finish before a caller consumes or deletes scratch.
             self.finish_children().map_err(std::io::Error::other)?;
             output
