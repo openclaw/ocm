@@ -1,6 +1,9 @@
 mod install;
 mod launch;
 mod npm_proxy;
+#[cfg(windows)]
+#[doc(hidden)]
+pub use crate::infra::windows_runtime_stage::try_run_internal_runtime_stage;
 mod registry;
 pub mod releases;
 mod verify;

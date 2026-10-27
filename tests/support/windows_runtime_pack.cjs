@@ -24,7 +24,8 @@ async function main() {
   fs.writeFileSync(path.join(repo, 'openclaw.mjs'), 'console.log("fixture");');
   fs.writeFileSync(path.join(repo, 'postpack.cjs'), `
 const fs = require('node:fs');
-setInterval(() => {
+if (process.env.PACK_FAIL === '1') process.exit(23);
+if (process.env.PACK_BEAT) setInterval(() => {
   if (fs.existsSync(process.env.PACK_DONE)) {
     fs.writeFileSync(process.env.PACK_FINISHED, 'done');
     process.exit(0);
@@ -40,6 +41,23 @@ setInterval(() => {
       .trim().split(/\r?\n/)[0],
     PACK_BEAT: beat, PACK_DONE: done, PACK_FINISHED: finished,
   };
+  fs.writeFileSync(path.join(root, 'npm-bin'), env.OCM_INTERNAL_NPM_BIN);
+  // Losing the parent before the private launcher opens custody must not
+  // recreate that Job or start a writer. Exercise its real dispatch boundary.
+  const forbidden = path.join(root, 'missing-parent-writer');
+  const request = [process.execPath, '-e',
+    'require("node:fs").writeFileSync(' + JSON.stringify(forbidden) + ',"unexpected")'];
+  const missing = cp.spawnSync(binary, [], {
+    cwd: repo,
+    env: {...env, OCM_INTERNAL_RUNTIME_STAGE_JOB: 'Global\\ocm-runtime-stage-' +
+      require('node:crypto').randomBytes(32).toString('hex')},
+    input: JSON.stringify(request.map(value =>
+      Array.from({length: value.length}, (_, index) => value.charCodeAt(index)))),
+    encoding: 'utf8', timeout: 10000,
+  });
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /runtime stage launcher:.*os error 2/);
+  assert(!fs.existsSync(forbidden), 'Missing parent custody started a writer');
   const log = fs.openSync(path.join(root, 'pack.log'), 'w');
   const child = cp.spawn(binary, ['runtime', 'build-local', 'stable', '--repo', repo, '--json'],
     {cwd: repo, env, stdio: ['ignore', log, log]});

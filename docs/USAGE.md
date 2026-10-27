@@ -235,8 +235,8 @@ Use this when you need to test what users will run after an OpenClaw release, bu
 Packing scratch belongs to the runtime's installation stage. Normal completion
 or failure removes it; after an interrupted build, a later installation or
 removal of an existing runtime reclaims abandoned stages. Active runtime
-operations remain protected. On Unix, packing and installation children retain
-the runtime lock if OCM exits before they do, so recovery waits for them to end.
+operations remain protected. Packing and installation children retain custody
+of their stage if OCM exits before they do, so recovery waits for them to end.
 Legacy `.pack-*` directories from older OCM versions are left untouched because
 their ownership cannot be established safely from their names alone.
 

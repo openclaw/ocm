@@ -8,7 +8,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use support::{TestDir, ocm_env, ocm_test_binary_path, windows_job::FixtureJob};
+use support::{
+    TestDir, ocm_env, ocm_test_binary_path, path_string, run_ocm, stderr, windows_job::FixtureJob,
+};
 
 #[test]
 fn native_windows_pack_preserves_live_child_archive() {
@@ -63,4 +65,81 @@ fn native_windows_pack_preserves_live_child_archive() {
         matches!(&result, Ok(status) if status.success()),
         "{result:?}\n{diagnostics}"
     );
+
+    // The original active-child assertion ran before Job cleanup. With all
+    // descendants now proven stopped, retry must reclaim its abandoned stage.
+    let mut env = ocm_env(&fixture);
+    for key in ["WINDIR", "COMSPEC", "PATHEXT"] {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.into(), value);
+        }
+    }
+    env.insert("USERPROFILE".into(), path_string(&fixture.child("home")));
+    env.insert("APPDATA".into(), path_string(&fixture.child("appdata")));
+    env.insert(
+        "LOCALAPPDATA".into(),
+        path_string(&fixture.child("localappdata")),
+    );
+    env.insert("TEMP".into(), path_string(fixture.path()));
+    env.insert("TMP".into(), path_string(fixture.path()));
+    env.insert("npm_config_offline".into(), "true".into());
+    env.insert(
+        "npm_config_cache".into(),
+        path_string(&fixture.child("cache")),
+    );
+    env.insert(
+        "OCM_INTERNAL_NPM_BIN".into(),
+        fs::read_to_string(fixture.child("npm-bin")).unwrap(),
+    );
+    let source = path_string(&fixture.child("repo"));
+    let args = [
+        "runtime",
+        "build-local",
+        "stable",
+        "--repo",
+        &source,
+        "--force",
+        "--json",
+    ];
+    let retry = run_ocm(fixture.path(), &env, &args);
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    let runtimes = fixture.child("ocm-home/runtimes");
+    let no_stages = || {
+        fs::read_dir(&runtimes)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| {
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".stable.stage-")
+            })
+    };
+    assert!(no_stages());
+    assert!(!runtimes.join("stable/pack").exists());
+    let verify = run_ocm(
+        fixture.path(),
+        &env,
+        &["runtime", "verify", "stable", "--json"],
+    );
+    assert!(verify.status.success(), "{}", stderr(&verify));
+    env.insert("PACK_FAIL".into(), "1".into());
+    let failure = run_ocm(fixture.path(), &env, &args);
+    assert!(!failure.status.success());
+    assert!(stderr(&failure).contains("failed to pack local OpenClaw build"));
+    assert!(no_stages());
+    let verify = run_ocm(
+        fixture.path(),
+        &env,
+        &["runtime", "verify", "stable", "--json"],
+    );
+    assert!(verify.status.success(), "{}", stderr(&verify));
+    let remove = run_ocm(
+        fixture.path(),
+        &env,
+        &["runtime", "remove", "stable", "--json"],
+    );
+    assert!(remove.status.success(), "{}", stderr(&remove));
+    assert!(no_stages());
+    println!("native Windows retry, publication, error preservation and removal passed");
 }

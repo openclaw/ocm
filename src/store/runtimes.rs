@@ -308,6 +308,40 @@ struct RuntimeInstallTarget {
     _lock: Arc<RuntimeMutationGuard>,
 }
 
+impl RuntimeInstallTarget {
+    fn output(&self, command: &mut Command) -> std::io::Result<std::process::Output> {
+        #[cfg(windows)]
+        {
+            let output = {
+                let job =
+                    crate::infra::windows_runtime_stage::StageJob::create(&self.install_root)?;
+                job.output(command)
+            };
+            // Our handle is closed before this check. A surviving launcher or
+            // descendant must finish before a caller consumes or deletes scratch.
+            self.finish_children().map_err(std::io::Error::other)?;
+            output
+        }
+        #[cfg(not(windows))]
+        {
+            self._lock.retain_for_child(command);
+            command.output()
+        }
+    }
+
+    fn finish_children(&self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            if crate::infra::windows_runtime_stage::has_custody(&self.install_root)
+                .map_err(|error| error.to_string())?
+            {
+                return Err("runtime packing or installation children are still running; retry after they finish".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct PreparedRuntimeInstall {
     target: Option<RuntimeInstallTarget>,
     meta: RuntimeMeta,
@@ -358,7 +392,9 @@ enum OfficialRuntimeInstallTarget {
 
 impl Drop for RuntimeInstallTarget {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.install_root);
+        if self.finish_children().is_ok() {
+            let _ = fs::remove_dir_all(&self.install_root);
+        }
         live_runtime_stages().remove(&self.install_root);
     }
 }
@@ -1529,7 +1565,7 @@ fn install_openclaw_package_with_npm(
     cwd: &Path,
     env: &BTreeMap<String, String>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
-    guard: &RuntimeMutationGuard,
+    owner: &RuntimeInstallTarget,
 ) -> Result<(), String> {
     // npm's linked installer can treat an aliased prefix as already up to date
     // without installing its packages. Resolve only this existing owned stage;
@@ -1582,9 +1618,10 @@ fn install_openclaw_package_with_npm(
         local_adapter.apply_environment(&mut command);
     }
     let lifecycle_root = isolate_npm_lifecycle_environment(&mut command, install_files)?;
-    guard.retain_for_child(&mut command);
-    let output = command.output();
-    let cleanup = cleanup_npm_lifecycle_environment(&lifecycle_root);
+    let output = owner.output(&mut command);
+    let cleanup = owner
+        .finish_children()
+        .and_then(|()| cleanup_npm_lifecycle_environment(&lifecycle_root));
     let output = output.map_err(|error| {
         format!(
             "failed to run {} while installing the OpenClaw package: {error}",
@@ -1774,7 +1811,11 @@ fn load_local_companion_spec(
     })
 }
 
-fn run_local_companion_command(command: &mut Command, label: &str) -> Result<(), String> {
+fn run_local_companion_command(
+    command: &mut Command,
+    label: &str,
+    owner: &RuntimeInstallTarget,
+) -> Result<(), String> {
     command
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
         .env("npm_config_fund", "false")
@@ -1783,8 +1824,8 @@ fn run_local_companion_command(command: &mut Command, label: &str) -> Result<(),
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = command
-        .output()
+    let output = owner
+        .output(command)
         .map_err(|error| format!("failed to run {label}: {error}"))?;
     if output.status.success() {
         return Ok(());
@@ -1803,7 +1844,7 @@ fn pack_local_openclaw_companion(
     pack_dir: &Path,
     spec: LocalCompanionSpec,
     env: &BTreeMap<String, String>,
-    guard: &RuntimeMutationGuard,
+    owner: &RuntimeInstallTarget,
 ) -> Result<PackedLocalCompanion, String> {
     let package_dir = format!("extensions/{}", spec.directory_name);
     let output_dir = pack_dir.join("companions").join(&spec.id);
@@ -1814,10 +1855,10 @@ fn pack_local_openclaw_companion(
         .arg("scripts/lib/plugin-npm-runtime-build.mjs")
         .arg(&package_dir)
         .current_dir(repo_path);
-    guard.retain_for_child(&mut build);
     run_local_companion_command(
         &mut build,
         &format!("local companion runtime build for {}", spec.id),
+        owner,
     )?;
 
     let mut lock_check = Command::new("node");
@@ -1826,10 +1867,10 @@ fn pack_local_openclaw_companion(
         .arg("--package-dir")
         .arg(&package_dir)
         .current_dir(repo_path);
-    guard.retain_for_child(&mut lock_check);
     run_local_companion_command(
         &mut lock_check,
         &format!("local companion package-lock check for {}", spec.id),
+        owner,
     )?;
 
     let mut pack = Command::new("node");
@@ -1844,10 +1885,10 @@ fn pack_local_openclaw_companion(
         .arg("--pack-destination")
         .arg(&output_dir)
         .current_dir(repo_path);
-    guard.retain_for_child(&mut pack);
     run_local_companion_command(
         &mut pack,
         &format!("local companion package build for {}", spec.id),
+        owner,
     )?;
 
     let mut archives = fs::read_dir(&output_dir)
@@ -1967,7 +2008,7 @@ fn install_local_openclaw_companion(
     scratch_dir: &Path,
     context: InstallContext<'_>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
-    guard: &RuntimeMutationGuard,
+    owner: &RuntimeInstallTarget,
 ) -> Result<RuntimeCompanionMeta, String> {
     let install_root = scratch_dir.join("companion-installs").join(&packed.spec.id);
     ensure_dir(&install_root)?;
@@ -2005,9 +2046,10 @@ fn install_local_openclaw_companion(
         .stderr(Stdio::piped());
     install_command.apply_environment(&mut command, context.env)?;
     let lifecycle_root = isolate_npm_lifecycle_environment(&mut command, &install_root)?;
-    guard.retain_for_child(&mut command);
-    let output = command.output();
-    let cleanup = cleanup_npm_lifecycle_environment(&lifecycle_root);
+    let output = owner.output(&mut command);
+    let cleanup = owner
+        .finish_children()
+        .and_then(|()| cleanup_npm_lifecycle_environment(&lifecycle_root));
     let output = output.map_err(|error| {
         format!(
             "failed to install local companion {} with {}: {error}",
@@ -2120,7 +2162,7 @@ fn pack_local_openclaw_repo(
     pack_dir: &Path,
     env: &BTreeMap<String, String>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
-    guard: &RuntimeMutationGuard,
+    owner: &RuntimeInstallTarget,
 ) -> Result<PathBuf, String> {
     ensure_dir(pack_dir)?;
     let npm = local_adapter
@@ -2155,8 +2197,7 @@ fn pack_local_openclaw_repo(
             OPENCLAW_OCM_SOURCE_PERFORMANCE_BUILD_PROFILE,
         );
     }
-    guard.retain_for_child(&mut command);
-    let output = command.output().map_err(|error| {
+    let output = owner.output(&mut command).map_err(|error| {
         format!(
             "failed to run npm pack for local OpenClaw build in {}: {error}",
             display_path(repo_path)
@@ -2346,7 +2387,7 @@ fn pack_local_source_extensions(
     extensions: Vec<LocalSourceExtension>,
     pack_dir: &Path,
     env: &BTreeMap<String, String>,
-    guard: &RuntimeMutationGuard,
+    owner: &RuntimeInstallTarget,
 ) -> Result<Vec<LocalSourceExtensionArchive>, String> {
     if extensions.is_empty() {
         return Ok(Vec::new());
@@ -2372,8 +2413,7 @@ fn pack_local_source_extensions(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     npm.apply_environment(&mut command, env)?;
-    guard.retain_for_child(&mut command);
-    let output = command.output().map_err(|error| {
+    let output = owner.output(&mut command).map_err(|error| {
         format!("failed to run npm pack for local OpenClaw source extensions: {error}")
     })?;
     if !output.status.success() {
@@ -2863,6 +2903,13 @@ fn reclaim_abandoned_runtime_stages(
             continue;
         }
         if name == held {
+            #[cfg(windows)]
+            if !matches!(
+                crate::infra::windows_runtime_stage::has_custody(&path),
+                Ok(false)
+            ) {
+                continue;
+            }
             let _ = fs::remove_dir_all(&path);
             continue;
         }
@@ -2872,6 +2919,13 @@ fn reclaim_abandoned_runtime_stages(
         let Ok(Some(owner)) = super::try_lock_file(&lock_path, "runtime mutation") else {
             continue;
         };
+        #[cfg(windows)]
+        if !matches!(
+            crate::infra::windows_runtime_stage::has_custody(&path),
+            Ok(false)
+        ) {
+            continue;
+        }
         let claimed = runtimes_dir.join(format!(
             ".{held}.stage-{}-{}",
             std::process::id(),
@@ -3200,7 +3254,9 @@ fn prepare_runtime_from_openclaw_package(
             None,
             &[],
         );
-        let _ = fs::remove_file(&archive_path);
+        if target.finish_children().is_ok() {
+            let _ = fs::remove_file(&archive_path);
+        }
         Ok(PreparedRuntimeInstall {
             target: Some(target),
             meta: meta?,
@@ -3231,7 +3287,7 @@ fn stage_runtime_from_openclaw_package_archive(
         context.cwd,
         context.env,
         local_adapter,
-        &target._lock,
+        target,
     )?;
     expose_openclaw_package_runtime_dependencies(&target.install_files)?;
     // Exposing dependencies can copy them into the host when links are unavailable.
@@ -3327,6 +3383,7 @@ fn lock_runtime_publication_paths(
 }
 
 fn publish_runtime(target: RuntimeInstallTarget, meta: RuntimeMeta) -> Result<RuntimeMeta, String> {
+    target.finish_children()?;
     let _namespace_locks =
         lock_runtime_publication_paths(&target.name, &target.final_meta_path, true)?;
     check_runtime_publication_paths(
@@ -3726,7 +3783,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
         &pack_dir,
         context.env,
         local_adapter.as_ref(),
-        &target._lock,
+        &target,
     )?;
     let needs_source_extensions = options.include_source_extensions
         || target_source_plugins
@@ -3739,7 +3796,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
     let source_extensions = if options.include_source_extensions {
         let extensions =
             local_source_extensions_from_build(&repo_path, &packaged_ids, false, None)?;
-        pack_local_source_extensions(extensions, &pack_dir, context.env, &target._lock)?
+        pack_local_source_extensions(extensions, &pack_dir, context.env, &target)?
     } else if let Some(target_source_plugins) = target_source_plugins
         .as_ref()
         .filter(|plugins| !plugins.is_empty())
@@ -3765,7 +3822,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
                 missing.join(", ")
             ));
         }
-        pack_local_source_extensions(extensions, &pack_dir, context.env, &target._lock)?
+        pack_local_source_extensions(extensions, &pack_dir, context.env, &target)?
     } else {
         Vec::new()
     };
@@ -3787,7 +3844,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
     let packed_companions = companion_specs
         .into_values()
         .map(|spec| {
-            pack_local_openclaw_companion(&repo_path, &pack_dir, spec, context.env, &target._lock)
+            pack_local_openclaw_companion(&repo_path, &pack_dir, spec, context.env, &target)
         })
         .collect::<Result<Vec<_>, _>>()?;
     ensure_dir(&target.install_files)?;
@@ -3818,12 +3875,13 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
                 &pack_dir,
                 context,
                 local_adapter.as_ref(),
-                &target._lock,
+                &target,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
     meta.runtime_sha256 = Some(tree_sha256(&target.install_files.join("node_modules"))?);
     // A published runtime contains installed files, never packing scratch.
+    target.finish_children()?;
     fs::remove_dir_all(&pack_dir).map_err(|error| error.to_string())?;
     publish_runtime(target, meta)
 }
