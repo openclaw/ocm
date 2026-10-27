@@ -3,18 +3,72 @@
 mod support;
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{
+    ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 use support::{
     TestDir, ocm_env, ocm_test_binary_path, path_string, run_ocm, stderr, windows_job::FixtureJob,
 };
 
+fn pin_stage_holder(owner: u32, executable: &str) -> io::Result<Option<OwnedHandle>> {
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut entry = PROCESSENTRY32W::default();
+    entry.dwSize = std::mem::size_of_val(&entry) as u32;
+    let mut found = None;
+    let mut available = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
+    let mut last_error = if available == 0 {
+        unsafe { GetLastError() }
+    } else {
+        0
+    };
+    while available != 0 {
+        let end = entry
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+        if entry.th32ParentProcessID == owner && name.eq_ignore_ascii_case(executable) {
+            if found.is_some() {
+                return Err(io::Error::other("ambiguous stage holder"));
+            }
+            let process =
+                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID) };
+            if process.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            found = Some(unsafe { OwnedHandle::from_raw_handle(process) });
+        }
+        available = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
+        if available == 0 {
+            last_error = unsafe { GetLastError() };
+        }
+    }
+    if last_error != ERROR_NO_MORE_FILES {
+        return Err(io::Error::from_raw_os_error(last_error as i32));
+    }
+    Ok(found)
+}
+
 #[test]
 fn native_windows_pack_preserves_live_child_archive() {
-    let fixture = TestDir::new("native-windows-runtime-pack");
+    let fixture = TestDir::new("native-windows-runtime-pack & %PATH% !literal! 雪");
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let output_path = fixture.child("proof.log");
     let output = fs::File::create(&output_path).unwrap();
@@ -47,7 +101,42 @@ fn native_windows_pack_preserves_live_child_archive() {
     // The helper must not spawn OCM until all descendants belong to our Job.
     child.stdin.take().unwrap().write_all(b"owned\n").unwrap();
     let deadline = Instant::now() + Duration::from_secs(120);
+    let executable = ocm_test_binary_path();
+    let executable = executable
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let mut holder = None;
+    let mut holder_terminated = false;
     let result = loop {
+        if holder.is_none() {
+            if let Some(owner) = fs::read_to_string(fixture.child("owner-pid"))
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+            {
+                match pin_stage_holder(owner, &executable) {
+                    Ok(Some(process)) => {
+                        holder = Some(process);
+                        fs::write(fixture.child("helper-observed"), "observed").unwrap();
+                    }
+                    Ok(None) => {}
+                    Err(error) => break Err(error.to_string()),
+                }
+            }
+        }
+        if !holder_terminated && fixture.child("owner-killed").exists() {
+            if let Some(process) = &holder {
+                let mut code = 0;
+                if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
+                    break Err(io::Error::last_os_error().to_string());
+                }
+                if code != STILL_ACTIVE as u32 {
+                    holder_terminated = true;
+                    fs::write(fixture.child("helper-terminated"), "terminated").unwrap();
+                }
+            }
+        }
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Err(error) => break Err(error.to_string()),
@@ -65,6 +154,8 @@ fn native_windows_pack_preserves_live_child_archive() {
         matches!(&result, Ok(status) if status.success()),
         "{result:?}\n{diagnostics}"
     );
+
+    assert!(holder_terminated, "the inert holder survived its owner");
 
     // The original active-child assertion ran before Job cleanup. With all
     // descendants now proven stopped, retry must reclaim its abandoned stage.
@@ -91,7 +182,7 @@ fn native_windows_pack_preserves_live_child_archive() {
         "OCM_INTERNAL_NPM_BIN".into(),
         fs::read_to_string(fixture.child("npm-bin")).unwrap(),
     );
-    let source = path_string(&fixture.child("repo"));
+    let source = path_string(&fixture.child("repo & %PATH% !literal! 雪"));
     let args = [
         "runtime",
         "build-local",

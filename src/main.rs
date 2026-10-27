@@ -17,10 +17,6 @@ fn main() {
 }
 
 fn run() -> Result<i32, String> {
-    #[cfg(windows)]
-    if let Some(result) = ocm::runtime::try_run_internal_runtime_stage() {
-        return result;
-    }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let env_map = env::vars_os()
         .map(|(key, value)| {

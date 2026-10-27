@@ -1,32 +1,40 @@
-//! Ephemeral Windows custody for children using a runtime installation stage.
-//! The Job outlives the OCM parent while any launcher handle or member remains.
-
-use std::ffi::{OsStr, OsString};
+//! Stage-scoped Windows custody, independent of the embedding executable.
+use super::file_identity::{FileIdentity, file_identity};
+use super::windows_stage_command::PreparedCommand;
+use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Read, Write};
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::io::{self, Read};
+use std::marker::PhantomData;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::process::ExitStatusExt;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
-
-use sha2::{Digest, Sha256};
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError};
+use std::process::{Command, ExitStatus, Output};
+use std::thread;
+use windows_sys::Win32::Foundation::{
+    DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS,
+    ERROR_FILE_NOT_FOUND, GetLastError, HANDLE, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, OpenJobObjectW,
+    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, OpenJobObjectW,
+    SetInformationJobObject,
 };
-use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_ASSIGN_PROCESS, JOB_OBJECT_QUERY};
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-use super::file_identity::{FileIdentity, file_identity};
-
-const JOB_ENV: &str = "OCM_INTERNAL_RUNTIME_STAGE_JOB";
+use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
+use windows_sys::Win32::System::Threading::{
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+    PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+};
 const JOB_PREFIX: &str = "Global\\ocm-runtime-stage-";
-const REQUEST_LIMIT: u64 = 1024 * 1024;
-
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
 }
@@ -70,14 +78,13 @@ fn job_name(stage: &Path) -> io::Result<String> {
 }
 
 pub(crate) struct StageJob {
-    _handle: OwnedHandle,
-    name: String,
+    handle: OwnedHandle,
 }
-
 impl StageJob {
     pub(crate) fn create(stage: &Path) -> io::Result<Self> {
         let name = job_name(stage)?;
-        let raw = unsafe { CreateJobObjectW(std::ptr::null(), wide(OsStr::new(&name)).as_ptr()) };
+        let encoded_name = wide(OsStr::new(&name));
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), encoded_name.as_ptr()) };
         if raw.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -86,61 +93,295 @@ impl StageJob {
         if existed {
             return Err(io::Error::other("runtime stage already has child custody"));
         }
-        // Default creator ACL, no breakaway and no kill-on-close limit. Ordinary
-        // descendants retain membership even after this handle's owner exits.
-        Ok(Self {
-            _handle: handle,
-            name,
+        // Default creator ACL; writers cannot break away and are never killed
+        // when this handle closes. Process membership keeps custody alive.
+        Ok(Self { handle })
+    }
+    pub(crate) fn output(&self, command: &Command) -> io::Result<Output> {
+        let mut command = PreparedCommand::from_stage_command(command)?;
+        let stdin = fs::File::open("NUL")?;
+        let (stdout_read, stdout_write) = io::pipe()?;
+        let (stderr_read, stderr_write) = io::pipe()?;
+        let stdout_reader = thread::Builder::new().spawn(move || read_all(stdout_read))?;
+        let stderr_reader = match thread::Builder::new().spawn(move || read_all(stderr_read)) {
+            Ok(reader) => reader,
+            Err(error) => {
+                drop(stdout_write);
+                drop(stderr_write);
+                let _ = stdout_reader.join();
+                return Err(error);
+            }
+        };
+        let spawned = (|| {
+            let container = HandleContainer::create()?;
+            let streams = container.duplicate(&[
+                stdin.as_raw_handle(),
+                stdout_write.as_raw_handle(),
+                stderr_write.as_raw_handle(),
+            ])?;
+            let parent = container.process.as_raw_handle();
+            let jobs = [self.handle.as_raw_handle()];
+            let mut attributes = Attributes::new(3)?;
+            attributes.set(
+                PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+                std::slice::from_ref(&parent),
+            )?;
+            attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &streams.handles)?;
+            attributes.set(PROC_THREAD_ATTRIBUTE_JOB_LIST, &jobs)?;
+            let process = create_process(
+                &mut command,
+                &mut attributes,
+                0,
+                Some([streams.handles[0], streams.handles[1], streams.handles[2]]),
+            )?;
+            drop(attributes);
+            // The inert parent must not hold a writer after creation.
+            drop(streams);
+            Ok::<_, io::Error>((process, container))
+        })();
+        drop(stdin);
+        drop(stdout_write);
+        drop(stderr_write);
+        let (status, container) = match spawned {
+            Ok((process, container)) => (wait_process(&process), Some(container)),
+            Err(error) => (Err(error), None),
+        };
+        let stdout = join_reader(stdout_reader);
+        let stderr = join_reader(stderr_reader);
+        // Only the never-running holder is terminated. Actual writers belong
+        // to the distinct stage Job and survive the creator's termination.
+        drop(container);
+        Ok(Output {
+            status: status?,
+            stdout: stdout?,
+            stderr: stderr?,
         })
     }
-
-    pub(crate) fn output(&self, command: &Command) -> io::Result<Output> {
-        let request = std::iter::once(command.get_program())
-            .chain(command.get_args())
-            .map(|arg| arg.encode_wide().collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-        let request = serde_json::to_vec(&request).map_err(io::Error::other)?;
-        if request.len() as u64 > REQUEST_LIMIT {
-            return Err(io::Error::other(
-                "runtime stage command exceeds its request bound",
-            ));
-        }
-        let mut launcher = Command::new(std::env::current_exe()?);
-        if let Some(cwd) = command.get_current_dir() {
-            launcher.current_dir(cwd);
-        }
-        for (key, value) in command.get_envs() {
-            match value {
-                Some(value) => launcher.env(key, value),
-                None => launcher.env_remove(key),
-            };
-        }
-        // These owner-built commands use null stdin and captured output. Keep
-        // their argument bytes in a private pipe, not another command-line parser.
-        launcher
-            .env(JOB_ENV, &self.name)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = launcher.spawn()?;
-        let written = child.stdin.take().unwrap().write_all(&request);
-        let output = child.wait_with_output()?;
-        if output.status.success() {
-            written?;
-        }
-        Ok(output)
-    }
+}
+fn read_all(mut reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+fn join_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("runtime output reader panicked"))?
 }
 
-/// Absence is conclusive only after opening the exact Job reports not found.
-/// An open launcher handle is custody even before it joins the Job itself.
+/// Microsoft's isolated handle-container pattern keeps inheritable handles out
+/// of the embedding process, where unrelated legacy/std spawns could borrow them.
+/// https://devblogs.microsoft.com/oldnewthing/20200306-00/?p=103538
+struct HandleContainer {
+    job: Option<OwnedHandle>,
+    process: OwnedHandle,
+}
+impl HandleContainer {
+    fn create() -> io::Result<Self> {
+        let mut command =
+            PreparedCommand::from_stage_command(&Command::new(std::env::current_exe()?))?;
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // Child creation silently leaves only this private holder Job. Its
+        // explicit JOB_LIST assigns the real child to the non-breakaway stage.
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+        if unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let jobs = [job.as_raw_handle()];
+        let mut attributes = Attributes::new(1)?;
+        attributes.set(PROC_THREAD_ATTRIBUTE_JOB_LIST, &jobs)?;
+        // Creation and Job admission are atomic. This thread is never resumed;
+        // owner death closes the private Job and cannot orphan a suspended holder.
+        let process = create_process(&mut command, &mut attributes, CREATE_SUSPENDED, None)?;
+        Ok(Self {
+            job: Some(job),
+            process,
+        })
+    }
+    fn duplicate<'a>(&'a self, sources: &[HANDLE]) -> io::Result<RemoteHandles<'a>> {
+        let mut copies = RemoteHandles {
+            process: &self.process,
+            handles: Vec::with_capacity(sources.len()),
+        };
+        for &source in sources {
+            let mut copy = std::ptr::null_mut();
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    source,
+                    self.process.as_raw_handle(),
+                    &mut copy,
+                    0,
+                    1,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            copies.handles.push(copy);
+        }
+        Ok(copies)
+    }
+}
+impl Drop for HandleContainer {
+    fn drop(&mut self) {
+        drop(self.job.take());
+        // The sole private Job handle kills only this never-running process.
+        let _ = unsafe { WaitForSingleObject(self.process.as_raw_handle(), INFINITE) };
+    }
+}
+struct RemoteHandles<'a> {
+    process: &'a OwnedHandle,
+    handles: Vec<HANDLE>,
+}
+impl Drop for RemoteHandles<'_> {
+    fn drop(&mut self) {
+        for handle in self.handles.drain(..) {
+            // CLOSE_SOURCE closes the remote source even on duplication error;
+            // a terminated holder has already closed its handle table.
+            unsafe {
+                DuplicateHandle(
+                    self.process.as_raw_handle(),
+                    handle,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    DUPLICATE_CLOSE_SOURCE,
+                );
+            }
+        }
+    }
+}
+struct Attributes<'a> {
+    storage: Vec<usize>,
+    initialized: bool,
+    values: PhantomData<&'a [u8]>,
+}
+impl<'a> Attributes<'a> {
+    fn new(count: u32) -> io::Result<Self> {
+        let mut bytes = 0;
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut bytes);
+        }
+        if bytes == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut list = Self {
+            storage: vec![0; bytes.div_ceil(std::mem::size_of::<usize>())],
+            initialized: false,
+            values: PhantomData,
+        };
+        if unsafe { InitializeProcThreadAttributeList(list.raw(), count, 0, &mut bytes) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        list.initialized = true;
+        Ok(list)
+    }
+    fn raw(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.storage.as_mut_ptr().cast()
+    }
+    fn set<T>(&mut self, key: u32, value: &'a [T]) -> io::Result<()> {
+        if unsafe {
+            UpdateProcThreadAttribute(
+                self.raw(),
+                0,
+                key as usize,
+                value.as_ptr().cast(),
+                std::mem::size_of_val(value),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+impl Drop for Attributes<'_> {
+    fn drop(&mut self) {
+        if self.initialized {
+            unsafe {
+                DeleteProcThreadAttributeList(self.raw());
+            }
+        }
+    }
+}
+fn create_process(
+    command: &mut PreparedCommand,
+    attributes: &mut Attributes<'_>,
+    flags: u32,
+    streams: Option<[HANDLE; 3]>,
+) -> io::Result<OwnedHandle> {
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.lpAttributeList = attributes.raw();
+    if let Some([stdin, stdout, stderr]) = streams {
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = stdin;
+        startup.StartupInfo.hStdOutput = stdout;
+        startup.StartupInfo.hStdError = stderr;
+    }
+    let mut process = PROCESS_INFORMATION::default();
+    if unsafe {
+        CreateProcessW(
+            command.application.as_ptr(),
+            command.command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            i32::from(streams.is_some()),
+            flags | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            command.environment.as_ptr().cast(),
+            command
+                .cwd
+                .as_ref()
+                .map_or(std::ptr::null(), |cwd| cwd.as_ptr()),
+            &startup.StartupInfo,
+            &mut process,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    drop(unsafe { OwnedHandle::from_raw_handle(process.hThread) });
+    Ok(unsafe { OwnedHandle::from_raw_handle(process.hProcess) })
+}
+fn wait_process(process: &OwnedHandle) -> io::Result<ExitStatus> {
+    if unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } != WAIT_OBJECT_0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut code = 0;
+    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ExitStatus::from_raw(code))
+}
+
+/// Only absence of the exact named Job is conclusive; errors preserve custody.
 pub(crate) fn has_custody(stage: &Path) -> io::Result<bool> {
     let name = match job_name(stage) {
         Ok(name) => name,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    let raw = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, wide(OsStr::new(&name)).as_ptr()) };
+    let encoded_name = wide(OsStr::new(&name));
+    let raw = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, encoded_name.as_ptr()) };
     if raw.is_null() {
         let error = io::Error::last_os_error();
         return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
@@ -153,54 +394,6 @@ pub(crate) fn has_custody(stage: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Same-executable private child dispatch; not a supported CLI entry point.
-#[doc(hidden)]
-pub fn try_run_internal_runtime_stage() -> Option<Result<i32, String>> {
-    let name = std::env::var_os(JOB_ENV)?;
-    Some(run_launcher(&name).map_err(|error| format!("runtime stage launcher: {error}")))
-}
-
-fn run_launcher(name: &OsStr) -> io::Result<i32> {
-    name.to_str()
-        .and_then(|name| name.strip_prefix(JOB_PREFIX))
-        .filter(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| io::Error::other("invalid custody name"))?;
-    let mut request = Vec::new();
-    io::stdin()
-        .take(REQUEST_LIMIT + 1)
-        .read_to_end(&mut request)?;
-    if request.len() as u64 > REQUEST_LIMIT {
-        return Err(io::Error::other("command request exceeds its bound"));
-    }
-    let request: Vec<Vec<u16>> = serde_json::from_slice(&request).map_err(io::Error::other)?;
-    let mut args = request.iter().map(|arg| OsString::from_wide(arg));
-    let program = args
-        .next()
-        .filter(|program| !program.is_empty())
-        .ok_or_else(|| io::Error::other("missing command program"))?;
-
-    // Never create here. Parent death before this open must leave no writer;
-    // after this open our handle bridges the interval before self-assignment.
-    let raw = unsafe {
-        OpenJobObjectW(
-            JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_QUERY,
-            0,
-            wide(name).as_ptr(),
-        )
-    };
-    if raw.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let job = unsafe { OwnedHandle::from_raw_handle(raw) };
-    if unsafe { AssignProcessToJobObject(job.as_raw_handle(), GetCurrentProcess()) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let status = Command::new(program)
-        .args(args)
-        .env_remove(JOB_ENV)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
-    Ok(status.code().unwrap_or(1))
-}
+#[cfg(test)]
+#[path = "windows_runtime_stage/tests.rs"]
+mod tests;

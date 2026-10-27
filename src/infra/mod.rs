@@ -20,3 +20,5 @@ pub(crate) mod tree_digest;
 pub(crate) mod windows_runtime_stage;
 #[cfg(windows)]
 pub(crate) mod windows_security;
+#[cfg(windows)]
+pub(crate) mod windows_stage_command;

@@ -11,7 +11,7 @@ assert.equal(path.basename(path.dirname(root)), 'ocm-tests');
 assert.ok(fs.statSync(binary).isFile());
 
 async function main() {
-  const repo = path.join(root, 'repo');
+  const repo = path.join(root, 'repo & %PATH% !literal! 雪');
   const beat = path.join(root, 'heartbeat');
   const done = path.join(root, 'done');
   const finished = path.join(root, 'finished');
@@ -51,22 +51,6 @@ if (process.env.PACK_BEAT) setInterval(() => {
   fs.mkdirSync(env.HOME, {recursive: true});
   fs.mkdirSync(env.OCM_HOME, {recursive: true});
   fs.writeFileSync(path.join(root, 'npm-bin'), env.OCM_INTERNAL_NPM_BIN);
-  // Losing the parent before the private launcher opens custody must not
-  // recreate that Job or start a writer. Exercise its real dispatch boundary.
-  const forbidden = path.join(root, 'missing-parent-writer');
-  const request = [process.execPath, '-e',
-    'require("node:fs").writeFileSync(' + JSON.stringify(forbidden) + ',"unexpected")'];
-  const missing = cp.spawnSync(binary, [], {
-    cwd: repo,
-    env: {...env, OCM_INTERNAL_RUNTIME_STAGE_JOB: 'Global\\ocm-runtime-stage-' +
-      require('node:crypto').randomBytes(32).toString('hex')},
-    input: JSON.stringify(request.map(value =>
-      Array.from({length: value.length}, (_, index) => value.charCodeAt(index)))),
-    encoding: 'utf8', timeout: 10000,
-  });
-  assert.notEqual(missing.status, 0);
-  assert.match(missing.stderr, /runtime stage launcher:.*os error 2/);
-  assert(!fs.existsSync(forbidden), 'Missing parent custody started a writer');
   const log = fs.openSync(path.join(root, 'pack.log'), 'w');
   const child = cp.spawn(binary, ['runtime', 'build-local', 'stable', '--repo', repo, '--json'],
     {cwd: repo, env, stdio: ['ignore', log, log]});
@@ -82,6 +66,8 @@ if (process.env.PACK_BEAT) setInterval(() => {
   };
   try {
     await wait(() => fs.existsSync(beat));
+    fs.writeFileSync(path.join(root, "owner-pid"), String(child.pid));
+    await wait(() => fs.existsSync(path.join(root, "helper-observed")));
     const runtimes = path.join(env.OCM_HOME, 'runtimes');
     const scratch = fs.readdirSync(runtimes).find(name =>
       name.startsWith('.stable.stage-') || name.startsWith('.stable.pack-'));
@@ -92,6 +78,8 @@ if (process.env.PACK_BEAT) setInterval(() => {
     const bytes = fs.readFileSync(archive);
     child.kill();
     await wait(() => child.exitCode !== null || child.signalCode !== null);
+    fs.writeFileSync(path.join(root, "owner-killed"), "killed");
+    await wait(() => fs.existsSync(path.join(root, "helper-terminated")));
     const before = fs.readFileSync(beat, 'utf8');
     await wait(() => fs.readFileSync(beat, 'utf8') !== before);
     const other = cp.spawnSync(binary, ['runtime', 'install', 'other', '--path', process.execPath, '--json'],
@@ -100,7 +88,7 @@ if (process.env.PACK_BEAT) setInterval(() => {
     const after = fs.readFileSync(beat, 'utf8');
     await wait(() => fs.readFileSync(beat, 'utf8') !== after);
     console.log(JSON.stringify({platform: process.platform, scratch,
-      packChildStillRunning: true, archivePreserved: fs.existsSync(archive)}));
+      holderTerminated: true, packChildStillRunning: true, archivePreserved: fs.existsSync(archive)}));
     assert(fs.existsSync(archive), 'Recovery deleted the archive while native postpack remained active');
     assert.deepEqual(fs.readFileSync(archive), bytes);
   } finally {
