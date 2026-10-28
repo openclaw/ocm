@@ -624,7 +624,7 @@ fn append_env_root(
                 .map_err(EnvArchiveWriteError::from_entry_io)?;
             continue;
         }
-        if discover_sqlite {
+        if capture.is_some() {
             return Err(EnvArchiveWriteError::EntryDisappeared(
                 "archive entry changed type".to_string(),
             ));
@@ -2028,11 +2028,13 @@ mod tests {
 
     #[cfg(unix)]
     fn replace_preserved_file_parent(path: &Path, kind: EnvArchiveEntryKind) -> bool {
-        if path == Path::new("opaque/payload.txt") && kind == EnvArchiveEntryKind::File {
+        if path == Path::new("opaque/payload.txt")
+            && matches!(kind, EnvArchiveEntryKind::File | EnvArchiveEntryKind::Other)
+        {
             let mut fixture = PRESERVED_FILE_REPLACEMENT.lock().unwrap();
             let (source, outside, replaced) = fixture.as_mut().unwrap();
             if !*replaced {
-                fs::rename(source.join("opaque"), source.join("saved")).unwrap();
+                fs::rename(source.join("opaque"), source.with_file_name("saved")).unwrap();
                 std::os::unix::fs::symlink(outside, source.join("opaque")).unwrap();
                 *replaced = true;
             }
@@ -2043,13 +2045,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn preserved_archive_bytes_keep_file_acquisition_guards() {
-        for (include_state, preserve) in [(false, false), (true, false), (true, true)] {
+        for (include_state, preserve, special) in [
+            (false, false, false),
+            (false, false, true),
+            (true, false, false),
+            (true, true, false),
+        ] {
             let fixture = tempfile::tempdir().unwrap();
             let source = fixture.path().join("home");
             let outside = fixture.path().join("outside");
             fs::create_dir_all(source.join("opaque")).unwrap();
             fs::create_dir(&outside).unwrap();
-            fs::write(source.join("opaque/payload.txt"), b"owned artifact").unwrap();
+            if special {
+                use std::os::unix::ffi::OsStrExt;
+                let path = std::ffi::CString::new(
+                    source.join("opaque/payload.txt").as_os_str().as_bytes(),
+                )
+                .unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            } else {
+                fs::write(source.join("opaque/payload.txt"), b"owned artifact").unwrap();
+            }
             let external = b"external private fixture";
             fs::write(outside.join("payload.txt"), external).unwrap();
             *PRESERVED_FILE_REPLACEMENT.lock().unwrap() = Some((source.clone(), outside, false));

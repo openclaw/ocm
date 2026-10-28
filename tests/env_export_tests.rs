@@ -3047,7 +3047,7 @@ fn env_export_does_not_read_through_a_replaced_source_parent() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn env_export_keeps_ordinary_sparse_files_compact() {
+fn env_export_preserves_ordinary_sparse_files() {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     let root = TestDir::new("export-sparse");
@@ -3073,6 +3073,8 @@ fn env_export_keeps_ordinary_sparse_files_compact() {
         ],
     );
     assert!(export.status.success(), "{}", stderr(&export));
+    // tar 0.4.46 discovers sparse extents on Linux, but not macOS.
+    #[cfg(target_os = "linux")]
     assert!(output.metadata().unwrap().len() < 1024 * 1024);
     let extracted =
         extract_env_archive::<EnvArchiveMetadata>(&output, &root.child("extract")).unwrap();
