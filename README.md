@@ -414,7 +414,10 @@ Use `ocm upgrade <env>` so the environment gets the snapshot, OpenClaw migration
 An idle alias with no environment binding still permits replacement or removal of its backing runtime.
 
 Runtime package and companion installation preserves the caller's npm settings,
-including script policy and home-relative configuration. OpenClaw lifecycle
+including script policy and home-relative configuration. Existing `OCM_HOME`
+directory aliases also work with npm's linked strategy: package and companion
+installers resolve their owned installation directories while runtime metadata
+keeps the configured store path. OpenClaw lifecycle
 state uses a disposable directory, and inherited service state paths are cleared
 so installation cannot discover the caller's OpenClaw state through those paths.
 

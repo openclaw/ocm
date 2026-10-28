@@ -1562,6 +1562,21 @@ fn npm_command_prefix(path: &Path) -> PathBuf {
     native
 }
 
+fn prepare_npm_install_prefix(install_directory: &Path) -> Result<PathBuf, String> {
+    // npm's linked installer can treat an aliased prefix as already up to date
+    // without installing its packages. Resolve only this existing owned stage;
+    // keep the configured store and published metadata paths unchanged.
+    let npm_prefix = fs::canonicalize(install_directory).map_err(|error| {
+        format!(
+            "failed to resolve npm installation directory {}: {error}",
+            display_path(install_directory)
+        )
+    })?;
+    #[cfg(windows)]
+    let npm_prefix = npm_command_prefix(&npm_prefix);
+    Ok(npm_prefix)
+}
+
 fn install_openclaw_package_with_npm(
     archive_path: &Path,
     additional_archives: &[PathBuf],
@@ -1571,17 +1586,7 @@ fn install_openclaw_package_with_npm(
     local_adapter: Option<&LocalBuildNpmAdapter>,
     owner: &RuntimeInstallTarget,
 ) -> Result<(), String> {
-    // npm's linked installer can treat an aliased prefix as already up to date
-    // without installing its packages. Resolve only this existing owned stage;
-    // keep the configured store and published metadata paths unchanged.
-    let npm_prefix = fs::canonicalize(install_files).map_err(|error| {
-        format!(
-            "failed to resolve npm installation directory {}: {error}",
-            display_path(install_files)
-        )
-    })?;
-    #[cfg(windows)]
-    let npm_prefix = npm_command_prefix(&npm_prefix);
+    let npm_prefix = prepare_npm_install_prefix(install_files)?;
     let requirement = if local_adapter.is_some() {
         NodeRequirement::default()
     } else {
@@ -2205,6 +2210,7 @@ fn install_local_openclaw_companion(
 ) -> Result<RuntimeCompanionMeta, String> {
     let install_root = scratch_dir.join("companion-installs").join(&packed.spec.id);
     ensure_dir(&install_root)?;
+    let npm_prefix = prepare_npm_install_prefix(&install_root)?;
     let install_command = if let Some(local_adapter) = local_adapter {
         CommandSpec {
             program: local_adapter.real_npm.clone(),
@@ -2225,7 +2231,7 @@ fn install_local_openclaw_companion(
         .args(&install_command.args)
         .arg("install")
         .arg("--prefix")
-        .arg(&install_root)
+        .arg(&npm_prefix)
         .arg("--omit=dev")
         .arg("--omit=peer")
         .arg("--no-save")

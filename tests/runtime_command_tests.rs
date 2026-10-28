@@ -3891,7 +3891,7 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
     let repo = cwd.join("openclaw");
     fs::create_dir_all(&repo).unwrap();
     let mut env = ocm_env(&root);
-    // Keep this dependency-layout test independent of prefix aliases on macOS.
+    // Start from a physical store so each explicit alias case has the same baseline.
     env.insert(
         "OCM_HOME".into(),
         path_string(&fs::canonicalize(env.get("OCM_HOME").unwrap()).unwrap()),
@@ -4043,10 +4043,27 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
         "import {spawnSync} from 'node:child_process'; const [,,run,dir,separator,command,...args]=process.argv; const child=spawnSync(command,args,{cwd:dir,stdio:'inherit',shell:process.platform==='win32'}); process.exit(child.status ?? 1);\n").unwrap();
     let companion_archive = pack(&companion);
     let source_before = file_sha256(&companion.join("package.json")).unwrap();
-    for strategy in ["hoisted", "nested", "linked"] {
+    #[cfg(unix)]
+    let physical_store = PathBuf::from(env.get("OCM_HOME").unwrap());
+    let aliased_store = root.child("store-alias");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&physical_store, &aliased_store).unwrap();
+    let cases = [
+        ("hoisted", "hoisted", false),
+        ("nested", "nested", false),
+        ("linked", "linked", false),
+        #[cfg(unix)]
+        ("alias-linked", "linked", true),
+        #[cfg(unix)]
+        ("alias-hoisted", "hoisted", true),
+    ];
+    for (name, strategy, alias) in cases {
         let mut selected_env = env.clone();
         selected_env.insert("npm_config_install_strategy".into(), strategy.into());
-        let native = root.child(&format!("native-{strategy}"));
+        if alias {
+            selected_env.insert("OCM_HOME".into(), path_string(&aliased_store));
+        }
+        let native = root.child(&format!("native-{name}"));
         fs::create_dir_all(&native).unwrap();
         // Native npm's linked strategy also needs a physical prefix for the control.
         #[cfg(unix)]
@@ -4093,7 +4110,7 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
             &[
                 "runtime",
                 "build-local",
-                strategy,
+                name,
                 "--repo",
                 &path_string(&repo),
                 "--companion",
@@ -4102,7 +4119,9 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
             ],
         );
         assert!(build.status.success(), "{strategy}: {}", stderr(&build));
-        let installed = runtime_install_root(strategy, &env, &cwd).unwrap();
+        let installed = runtime_install_root(name, &selected_env, &cwd).unwrap();
+        let metadata: Value = serde_json::from_str(&stdout(&build)).unwrap();
+        assert_eq!(metadata["installRoot"], path_string(&installed), "{name}");
         assert!(!installed.join("pack").exists());
         let plugin = installed.join("files/node_modules/openclaw/dist/extensions/codex");
         if strategy != "linked" {
@@ -4110,11 +4129,15 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
         }
         let create = run_ocm(
             &cwd,
-            &env,
-            &["env", "create", strategy, "--runtime", strategy],
+            &selected_env,
+            &["env", "create", name, "--runtime", name],
         );
         assert!(create.status.success(), "{}", stderr(&create));
-        let launch = run_ocm(&cwd, &env, &[&format!("@{strategy}"), "--", "--version"]);
+        let launch = run_ocm(
+            &cwd,
+            &selected_env,
+            &[&format!("@{name}"), "--", "--version"],
+        );
         assert!(launch.status.success(), "{strategy}: {}", stderr(&launch));
         let result: Value = serde_json::from_str(&stdout(&launch)).unwrap();
         assert_eq!(
@@ -4122,7 +4145,7 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
             serde_json::json!({"host":1,"companion":control}),
             "{strategy}"
         );
-        let verify = run_ocm(&cwd, &env, &["runtime", "verify", strategy, "--json"]);
+        let verify = run_ocm(&cwd, &selected_env, &["runtime", "verify", name, "--json"]);
         assert!(verify.status.success(), "{strategy}: {}", stderr(&verify));
         assert_eq!(
             file_sha256(&companion.join("package.json")).unwrap(),
@@ -4138,8 +4161,11 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
             "module.exports={version:2};"
         );
     }
+    #[cfg(unix)]
+    env.insert("OCM_HOME".into(), path_string(&aliased_store));
+    env.insert("npm_config_install_strategy".into(), "linked".into());
     // A failure after dependency materialization must still discard the stage.
-    let mut invalid = manifest;
+    let mut invalid = manifest.clone();
     invalid["openclaw"]["runtimeExtensions"] = serde_json::json!(["./missing.cjs"]);
     fs::write(companion.join("package.json"), invalid.to_string()).unwrap();
     let failed = run_ocm(
@@ -4162,6 +4188,45 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
         stderr(&failed)
     );
     assert!(!runtime_install_root("failed", &env, &cwd).unwrap().exists());
+    // A native npm install failure must preserve the same absence of partial state.
+    let mut unavailable = manifest;
+    unavailable["dependencies"]["unavailable"] =
+        serde_json::json!(format!("file:{}", path_string(&root.child("missing.tgz"))));
+    fs::write(companion.join("package.json"), unavailable.to_string()).unwrap();
+    let unavailable_before = file_sha256(&companion.join("package.json")).unwrap();
+    let failed_install = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "failed-install",
+            "--repo",
+            &path_string(&repo),
+            "--companion",
+            "codex",
+        ],
+    );
+    assert!(!failed_install.status.success());
+    assert!(
+        stderr(&failed_install).contains("failed to install local companion codex"),
+        "{}",
+        stderr(&failed_install)
+    );
+    assert!(
+        !runtime_install_root("failed-install", &env, &cwd)
+            .unwrap()
+            .exists()
+    );
+    assert!(
+        !runtime_meta_path("failed-install", &env, &cwd)
+            .unwrap()
+            .exists()
+    );
+    assert_eq!(
+        file_sha256(&companion.join("package.json")).unwrap(),
+        unavailable_before
+    );
     let runtimes = Path::new(env.get("OCM_HOME").unwrap()).join("runtimes");
     assert!(fs::read_dir(runtimes).unwrap().all(|entry| {
         !entry

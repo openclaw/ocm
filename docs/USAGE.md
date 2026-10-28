@@ -257,6 +257,8 @@ until commit, then move with the published runtime. Integrity metadata covers th
 published link targets. Runtime recovery checks saved package bytes independently
 of the current installation and preserves the recorded bindings for restoration.
 
+Companion installation also supports an existing `OCM_HOME` directory alias with npm's linked strategy. OCM resolves the owned npm prefix without changing the caller's strategy or the store path in runtime metadata. Failed companion installation does not publish a partial runtime.
+
 The installed runtime uses the same package layout as published OpenClaw runtimes:
 
 ```text
