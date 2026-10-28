@@ -118,7 +118,7 @@ jobs:
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
-      - name: Observe retained runtime namespace spellings
+      - name: Capture native legacy upgrade lock baseline
         if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 751
         continue-on-error: true
         timeout-minutes: 15
@@ -127,53 +127,35 @@ jobs:
           CARGO_BUILD_JOBS: 2
         run: |
           $ErrorActionPreference = 'Stop'
-          $area = Join-Path $env:RUNNER_TEMP ('namespace-reader-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          $area = Join-Path $env:RUNNER_TEMP ('legacy-lock-baseline-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
           New-Item -ItemType Directory -Path $area | Out-Null
           $source = Join-Path $area 'source'
-          git fetch --depth=1 origin 06e4780e4b5264c70a9f840f95dd2cf5fd43e73a
-          if ($LASTEXITCODE -ne 0) { throw 'namespace source fetch failed' }
-          git worktree add --detach $source 06e4780e4b5264c70a9f840f95dd2cf5fd43e73a
-          if ($LASTEXITCODE -ne 0) { throw 'namespace checkout failed' }
-          $patch = Join-Path $area 'namespace-case-diagnostic.patch'
-          [IO.File]::WriteAllBytes($patch, [Convert]::FromBase64String('LS0tIGEvc3JjL3N0b3JlL3J1bnRpbWVzLnJzCisrKyBiL3NyYy9zdG9yZS9ydW50aW1lcy5ycwpAQCAtNDcyNiw3ICs0NzI2LDEzIEBACiAgICAgICAgIHVzZSBjcmF0ZTo6c3RvcmU6OnVwZ3JhZGVfaGlzdG9yeTo6Z2V0X3VwZ3JhZGVfcnVudGltZV9yZWNvdmVyeTsKIAogICAgICAgICB3aW5kb3dzX2p1bmN0aW9uOjp0ZXN0czo6d2l0aG91dF9zeW1saW5rX3ByaXZpbGVnZSh8fCB7CisgICAgICAgICAgZm9yIHJ1bnRpbWVfcGFyZW50IGluIFsicnVudGltZXMiLCAiUnVudGltZXMiXSB7CiAgICAgICAgICAgICBsZXQgcm9vdCA9IHRlbXBmaWxlOjp0ZW1wZGlyKCkudW53cmFwKCk7CisgICAgICAgICAgICBzdGQ6OmZzOjpjcmVhdGVfZGlyX2FsbChyb290LnBhdGgoKS5qb2luKCJwaHlzaWNhbC1zdG9yZSIpLmpvaW4ocnVudGltZV9wYXJlbnQpKS51bndyYXAoKTsKKyAgICAgICAgICAgIHdpbmRvd3NfanVuY3Rpb246OmNyZWF0ZSgKKyAgICAgICAgICAgICAgICAmc3RkOjpmczo6Y2Fub25pY2FsaXplKHJvb3QucGF0aCgpLmpvaW4oInBoeXNpY2FsLXN0b3JlIikpLnVud3JhcCgpLAorICAgICAgICAgICAgICAgICZyb290LnBhdGgoKS5qb2luKCJzdG9yZSIpLAorICAgICAgICAgICAgKS51bndyYXAoKTsKICAgICAgICAgICAgIGxldCBlbnYgPSBzdGQ6OmNvbGxlY3Rpb25zOjpCVHJlZU1hcDo6ZnJvbShbKAogICAgICAgICAgICAgICAgICJPQ01fSE9NRSIuaW50bygpLAogICAgICAgICAgICAgICAgIHJvb3QucGF0aCgpLmpvaW4oInN0b3JlIikuZGlzcGxheSgpLnRvX3N0cmluZygpLApAQCAtNDc1Niw3ICs0NzYyLDkgQEAKICAgICAgICAgICAgIGxldCBkaWdlc3QgPSB0cmVlX3NoYTI1NigmbW9kdWxlcykudW53cmFwKCk7CiAgICAgICAgICAgICBhc3NlcnRfZXEhKG9yaWdpbmFsLnJ1bnRpbWVfc2hhMjU2LmFzX2RlcmVmKCksIFNvbWUoZGlnZXN0LmFzX3N0cigpKSk7CiAgICAgICAgICAgICBsZXQgcnVudGltZXMgPSBpbnN0YWxsZWQucGFyZW50KCkudW53cmFwKCk7CisgICAgICAgICAgICBlcHJpbnRsbiEoIlIxMV9OQU1FU1BBQ0UgcGFyZW50PXtydW50aW1lX3BhcmVudH0gb3JpZ2luYWw9e30gcGh5c2ljYWxfYmVmb3JlPXt9IHRhcmdldD17Oj99IiwgaW5zdGFsbGVkLmRpc3BsYXkoKSwgc3VwZXI6OnBoeXNpY2FsX3J1bnRpbWVfZGVzdGluYXRpb24oaW5zdGFsbGVkKS51bndyYXAoKS5kaXNwbGF5KCksIHdpbmRvd3NfanVuY3Rpb246OnRhcmdldCgmbW9kdWxlcy5qb2luKCJvcGVuY2xhdyIpKS51bndyYXAoKSk7CiAgICAgICAgICAgICByZW1vdmVfb3duZWRfdHJlZShydW50aW1lcykudW53cmFwKCk7CisgICAgICAgICAgICBlcHJpbnRsbiEoIlIxMV9OQU1FU1BBQ0UgcGFyZW50PXtydW50aW1lX3BhcmVudH0gcGh5c2ljYWxfYWZ0ZXI9e30iLCBzdXBlcjo6cGh5c2ljYWxfcnVudGltZV9kZXN0aW5hdGlvbihpbnN0YWxsZWQpLnVud3JhcCgpLmRpc3BsYXkoKSk7CiAgICAgICAgICAgICBhc3NlcnQhKAogICAgICAgICAgICAgICAgICFiYWNrdXAKICAgICAgICAgICAgICAgICAgICAgLmpvaW4oImZpbGVzL25vZGVfbW9kdWxlcy9vcGVuY2xhdy9vcGVuY2xhdy5tanMiKQpAQCAtNDc3Miw3ICs0NzgwLDkgQEAKICAgICAgICAgICAgICAgICAgICAgcm9vdC5wYXRoKCksCiAgICAgICAgICAgICAgICAgKQogICAgICAgICAgICAgfTsKLSAgICAgICAgICAgIGFzc2VydCEobG9hZCgpLmlzX29rKCkpOworICAgICAgICAgICAgbGV0IGZpcnN0ID0gbG9hZCgpOworICAgICAgICAgICAgZXByaW50bG4hKCJSMTFfTkFNRVNQQUNFIHBhcmVudD17cnVudGltZV9wYXJlbnR9IGxvYWRfZXJyb3I9ezo/fSBwYXJlbnRfZXhpc3RzPXt9IiwgZmlyc3QuYXNfcmVmKCkuZXJyKCksIHJ1bnRpbWVzLmV4aXN0cygpKTsKKyAgICAgICAgICAgIGFzc2VydCEoZmlyc3QuaXNfb2soKSwgInBhcmVudD17cnVudGltZV9wYXJlbnR9OiB7Oj99IiwgZmlyc3QuZXJyKCkpOwogICAgICAgICAgICAgYXNzZXJ0ISghcnVudGltZXMuZXhpc3RzKCksICJyZWNvdmVyeSBhZG1pc3Npb24gbXVzdCBiZSByZWFkLW9ubHkiKTsKIAogICAgICAgICAgICAgbGV0IHJlcGxhY2VtZW50ID0gcHJlcGFyZWRfanVuY3Rpb25fcnVudGltZShyb290LnBhdGgoKSwgJmVudiwgImN1cnJlbnQiKQpAQCAtNDgwMSw2ICs0ODExLDggQEAKICAgICAgICAgICAgICAgICBzdGQ6OmZzOjpyZWFkX3RvX3N0cmluZyhyb290LnBhdGgoKS5qb2luKCJvdXRzaWRlL3NlbnRpbmVsIikpLnVud3JhcCgpLAogICAgICAgICAgICAgICAgICJ1bnRvdWNoZWQiCiAgICAgICAgICAgICApOworICAgICAgICAgICAgZXByaW50bG4hKCJSMTFfTkFNRVNQQUNFIHBhcmVudD17cnVudGltZV9wYXJlbnR9IGNvbXBsZXRlIik7CisgICAgICAgICAgfQogICAgICAgICB9KTsKICAgICB9CiAK'))
-          if ((Get-FileHash $patch -Algorithm SHA256).Hash -ne '9734318441a451559b38e883f46af0947a35e333edcbce2974d80bc849600fc1') { throw 'namespace patch checksum mismatch' }
+          git fetch --depth=1 origin 7f1afb279798960d04e18337471f093459e4c674
+          if ($LASTEXITCODE -ne 0) { throw 'lock baseline source fetch failed' }
+          git worktree add --detach $source 7f1afb279798960d04e18337471f093459e4c674
+          if ($LASTEXITCODE -ne 0) { throw 'lock baseline checkout failed' }
           $previousTarget = $env:CARGO_TARGET_DIR
           Push-Location $source
           try {
             $env:CARGO_TARGET_DIR = Join-Path $area 'target'
             git rev-parse HEAD 'HEAD^{tree}'
-            if ((git rev-parse 'HEAD^{tree}') -ne 'f161562b365ccb82e43700b1af82f7465499b642') { throw 'namespace product tree mismatch' }
+            if ((git rev-parse 'HEAD^{tree}') -ne '3256c9f1e1246b40abc8330e6f74145998fdd507') { throw 'lock baseline tree mismatch' }
             $dirty = git status --porcelain=v1 --untracked-files=no
-            if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'namespace product checkout is not clean' }
+            if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'lock baseline checkout is not clean' }
             rustc -Vv
             cargo --version
-            node --version
-            Get-FileHash -LiteralPath (Get-Command node).Source -Algorithm SHA256
-            git apply --check $patch
-            if ($LASTEXITCODE -ne 0) { throw 'namespace patch does not apply' }
-            git apply $patch
-            if ($LASTEXITCODE -ne 0) { throw 'namespace patch failed' }
-            git add -- src/store/runtimes.rs
-            git diff --cached --stat
-            git write-tree
-            Get-FileHash -LiteralPath @('Cargo.lock', 'src/store/runtimes.rs', 'src/infra/windows_junction.rs', 'tests/support/windows_without_symlinks.ps1') -Algorithm SHA256
-            Write-Output 'BEGIN namespace-case-diagnostic 06e4780e'
-            $captureExit = $null
-            try {
-              . ./tests/support/windows_without_symlinks.ps1
-              Invoke-WithoutDeveloperSymlinks {
-                cargo test --locked --lib store::runtimes::tests::runtime_junction_recovery_reads_saved_bytes_with_absent_or_replaced_final_root -- --exact --nocapture
-                if ($LASTEXITCODE -ne 0) { throw 'runtime recovery namespace failed' }
-              }
-              $captureExit = $LASTEXITCODE
-            } finally {
-              if ($null -eq $captureExit) { $captureExit = $LASTEXITCODE }
-              $testBinaries = @(Get-ChildItem -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'debug/deps') -Filter 'ocm-*.exe' -File)
-              if ($testBinaries.Count -ne 1) { throw 'namespace test executable identity is ambiguous' }
-              $testHash = (Get-FileHash $testBinaries[0].FullName -Algorithm SHA256).Hash
-              @{revision='06e4780e4b5264c70a9f840f95dd2cf5fd43e73a'; exit=$captureExit; testExecutable=$testBinaries[0].FullName; testSha256=$testHash} | ConvertTo-Json -Compress
-              Write-Output "END namespace-case-diagnostic exit=$captureExit"
-            }
+            Get-FileHash -LiteralPath @('Cargo.lock', 'src/store/upgrade_history.rs') -Algorithm SHA256
+            Write-Output 'BEGIN legacy-lock-baseline 7f1afb27'
+            cargo test --locked --lib store::upgrade_history::tests::upgrade_locks_preserve_legacy_global_and_ordinary_paths -- --exact --nocapture
+            $captureExit = $LASTEXITCODE
+            $testBinaries = @(Get-ChildItem -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'debug/deps') -Filter 'ocm-*.exe' -File)
+            if ($testBinaries.Count -ne 1) { throw 'lock baseline test executable identity is ambiguous' }
+            $testHash = (Get-FileHash $testBinaries[0].FullName -Algorithm SHA256).Hash
+            $dirty = git status --porcelain=v1 --untracked-files=no
+            if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'lock baseline test changed tracked source' }
+            @{revision='7f1afb279798960d04e18337471f093459e4c674'; tree='3256c9f1e1246b40abc8330e6f74145998fdd507'; exit=$captureExit; testExecutable=$testBinaries[0].FullName; testSha256=$testHash; sourceUnchanged=$true} | ConvertTo-Json -Compress
+            Write-Output "END legacy-lock-baseline exit=$captureExit"
+            if ($captureExit -ne 0) { throw 'legacy upgrade lock baseline retained its failure' }
           } finally {
             $env:CARGO_TARGET_DIR = $previousTarget
             Pop-Location
