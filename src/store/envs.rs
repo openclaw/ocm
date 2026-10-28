@@ -420,6 +420,8 @@ pub(crate) fn save_environment_with_validated_runtime_guard(
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
     let registration = DevSourceRegistration::acquire(&meta.name, meta.dev.as_ref(), env, cwd)?;
+    let service = crate::env::EnvironmentService::new(env, cwd);
+    let _admission_lock = service.lock_gateway_admission(&meta.name)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     registration.recheck(&meta.name, meta.dev.as_ref(), &registry.envs)?;

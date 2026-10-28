@@ -2386,6 +2386,8 @@ fn daemon_revalidates_binding_after_capability_probe() {
         ("launcher", "launcher", false),
         ("launcher", "launcher", true),
         ("launcher", "unchanged", false),
+        ("launcher", "runtime", false),
+        ("launcher", "runtime", true),
     ] {
         let root = TestDir::new("daemon-binding-admission");
         let cwd = root.child("workspace");
@@ -2439,7 +2441,7 @@ fn daemon_revalidates_binding_after_capability_probe() {
             Duration::from_secs(5)
         ));
         let replacement = root.child("replacement");
-        if change == "launcher" {
+        if matches!(change, "launcher" | "runtime") {
             write_executable_script(
                 &replacement,
                 &format!(
@@ -2451,10 +2453,14 @@ fn daemon_revalidates_binding_after_capability_probe() {
                 &cwd,
                 &env,
                 &[
-                    "launcher",
+                    change,
                     "add",
                     "replacement",
-                    "--command",
+                    if change == "runtime" {
+                        "--path"
+                    } else {
+                        "--command"
+                    },
                     &path_string(&replacement),
                 ],
             );
@@ -2468,6 +2474,14 @@ fn daemon_revalidates_binding_after_capability_probe() {
         let args = match change {
             "clear" => Some(vec!["env", setter, "alpha", "none", "--json"]),
             "stop" => Some(vec!["service", "stop", "alpha", "--json"]),
+            "runtime" => Some(vec![
+                "start",
+                "alpha",
+                "--runtime",
+                "replacement",
+                "--no-service",
+                "--json",
+            ]),
             "launcher" => Some(vec![
                 "env",
                 "set-launcher",
@@ -2556,7 +2570,7 @@ fn daemon_revalidates_binding_after_capability_probe() {
             .find(|child| child["envName"] == "alpha");
         match change {
             "clear" | "stop" => assert!(alpha.is_none(), "{plan}"),
-            "launcher" => assert_eq!(alpha.unwrap()["bindingKind"], "launcher"),
+            "launcher" | "runtime" => assert_eq!(alpha.unwrap()["bindingKind"], change),
             _ => assert_eq!(alpha.unwrap()["bindingName"], "peer"),
         }
         fs::write(root.child("alpha.allow"), "release").unwrap();
@@ -2579,7 +2593,7 @@ fn daemon_revalidates_binding_after_capability_probe() {
             ));
         }
         fs::write(root.child("beta.allow"), "release").unwrap();
-        let expected = if matches!(change, "unchanged" | "launcher") {
+        let expected = if matches!(change, "unchanged" | "launcher" | "runtime") {
             2
         } else {
             1
@@ -2605,7 +2619,7 @@ fn daemon_revalidates_binding_after_capability_probe() {
                 vec!["beta"]
             }
         );
-        if change == "launcher" {
+        if matches!(change, "launcher" | "runtime") {
             assert!(wait_for_file(
                 &root.child("replacement.started"),
                 Duration::from_secs(5)

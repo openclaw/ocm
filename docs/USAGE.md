@@ -849,8 +849,9 @@ Saved dev service plans must still match the env's current binding and recorded
 worktree. If OCM refuses a stale plan, use `ocm service restart <env>` to refresh it.
 Pending runtime and launcher starts also recheck the selected binding after
 capability probing. Clearing a binding with `ocm env set-runtime <env> none` or
-`ocm env set-launcher <env> none`, or selecting another launcher, prevents a
-pending probe from starting the removed binding. This preserves service-running
+`ocm env set-launcher <env> none`, or replacing a launcher, prevents a pending
+probe from starting the removed binding. This also covers selecting a runtime
+with `ocm start <env> --runtime <runtime> --no-service`. This preserves service-running
 intent; normal reconciliation applies the updated plan and any remaining binding.
 Changing a binding does not instantly terminate an already-running Gateway.
 
