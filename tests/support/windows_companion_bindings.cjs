@@ -152,18 +152,74 @@ function main() {
   // Both the native prefixes and the generated host inspect the same exported
   // graph facts in one process, including identity between separate companions.
   const inspectCompanions = `function inspect(pluginPaths) {
-  const plugins=pluginPaths.map(file=>require(file));
-  console.log(JSON.stringify({companions:plugins.map(plugin=>plugin.observation),
-    isolated:plugins.every((plugin,index)=>plugins.slice(0,index).every(previous=>
-      plugin.token!==previous.token && plugin.direct!==previous.direct && plugin.common!==previous.common))}));
+  let graph;
+  try {
+    const plugins=pluginPaths.map(file=>require(file));
+    graph={companions:plugins.map(plugin=>plugin.observation),
+      isolated:plugins.every((plugin,index)=>plugins.slice(0,index).every(previous=>
+        plugin.token!==previous.token && plugin.direct!==previous.direct && plugin.common!==previous.common))};
+  } finally {
+    // Observe only after loading and computing graph facts. Diagnostics neither
+    // canonicalize import paths nor load additional fixture modules.
+    try {
+      const fs=require('node:fs'), path=require('node:path');
+      const {createRequire}=require('node:module');
+      const identities=new Map();
+      const identity=value=>{
+        if(!value || !['object','function'].includes(typeof value)) return null;
+        if(!identities.has(value)) identities.set(value,identities.size+1);
+        return identities.get(value);
+      };
+      const attempt=read=>{
+        try {return {value:read()};}
+        catch(error) {return {code:error.code??null,message:String(error.message).slice(0,300)};}
+      };
+      const spelling=filename=>({filename,
+        realpath:attempt(()=>fs.realpathSync(filename)),
+        nativeRealpath:attempt(()=>fs.realpathSync.native(filename))});
+      const entries=Object.entries(require.cache).filter(([,entry])=>
+        ['index.cjs','sdk.cjs'].includes(path.basename(entry.filename)));
+      const specifiers=['value','bridge-a','bridge-b','cyclic-bridge-a','cyclic-bridge-b',
+        '@openclaw/codex','@openclaw/second','openclaw/sdk'];
+      const modules=entries.slice(0,32).map(([cacheKey,entry])=>{
+        const localRequire=createRequire(entry.filename);
+        return {cacheKey,id:entry.id,...spelling(entry.filename),loaded:entry.loaded,
+          exportsId:identity(entry.exports),tokenId:identity(entry.exports?.token),
+          directId:identity(entry.exports?.direct),commonId:identity(entry.exports?.common),
+          valueId:identity(entry.exports?.value),pluginId:entry.exports?.observation?.id??null,
+          children:entry.children.slice(0,16).map(child=>({id:child.id,filename:child.filename})),
+          omittedChildren:Math.max(0,entry.children.length-16),
+          resolutions:specifiers.map(specifier=>({specifier,
+            resolved:attempt(()=>spelling(localRequire.resolve(specifier)))}))};
+      });
+      console.error(JSON.stringify({moduleIdentityDiagnostics:true,
+        requested:pluginPaths.map(requested=>({requested,
+          resolved:attempt(()=>spelling(require.resolve(requested)))})),
+        modules,omittedModules:Math.max(0,entries.length-32)}));
+    } catch(error) {
+      console.error(JSON.stringify({moduleIdentityDiagnostics:true,error:String(error)}));
+    }
+  }
+  console.log(JSON.stringify(graph));
 }`;
   const failures = [];
   const cases = [
     {name: 'plain-hoisted', strategy: 'hoisted', bundled: false},
     {name: 'plain-nested', strategy: 'nested', bundled: false},
-    {name: 'bundled-hoisted', strategy: 'hoisted', bundled: true},
+    {name: 'bundled-hoisted', strategy: 'hoisted', bundled: true, lifecycle: true},
+    {name: 'plain-linked', strategy: 'linked', bundled: false},
+    {name: 'bundled-linked', strategy: 'linked', bundled: true},
   ];
-  for (const scenario of cases) {
+  // Temporary comparison selection; remove after the bounded baseline runs.
+  const requestedCases = process.env.OCM_TEST_COMPANION_CASES;
+  const selectedNames = requestedCases === undefined
+    ? cases.map(scenario => scenario.name) : requestedCases.split(',').map(name => name.trim());
+  assert.ok(selectedNames.length > 0 && selectedNames.every(name => cases.some(scenario => scenario.name === name)),
+    'OCM_TEST_COMPANION_CASES must name existing fixture cases');
+  assert.equal(new Set(selectedNames).size, selectedNames.length, 'Fixture case selection contains duplicates');
+  const selectedCases = cases.filter(scenario => selectedNames.includes(scenario.name));
+  console.log(JSON.stringify({selectedCases: selectedNames, allCases: selectedCases.length === cases.length}));
+  for (const scenario of selectedCases) {
     const startedAt = Date.now();
     const repo = path.join(root, scenario.name);
     fs.mkdirSync(repo);
@@ -181,7 +237,17 @@ function main() {
     fs.writeFileSync(path.join(repo, 'sdk.cjs'), "module.exports='host-sdk-1';\n");
     // npm resolves peer metadata even with --omit=peer. Supply the declared
     // host archive for the offline native control, as in the Unix fixture.
-    const hostArchive = scenario.bundled ? pack(repo) : undefined;
+    let hostArchive;
+    try {
+      hostArchive = scenario.bundled ? pack(repo) : undefined;
+    } catch (error) {
+      console.error(error);
+      const failure = {scenario: scenario.name, phase: 'native-prerequisite',
+        step: 'host-pack', failure: String(error)};
+      failures.push(failure);
+      console.log(JSON.stringify({...failure, elapsedMs: Date.now() - startedAt}));
+      continue;
+    }
     const companion = path.join(repo, 'extensions/codex');
     const manifest = {
       name: '@openclaw/codex', version, main: 'index.cjs',
@@ -227,28 +293,67 @@ const result=spawnSync(process.execPath,[cli,...args],{cwd:directory,stdio:'inhe
 if(result.error) throw result.error;
 process.exit(result.status??1);
 `);
-    const nativePaths = [];
-    for (const id of companionIds) {
-      const archive = pack(path.join(repo, 'extensions', id));
-      const nativePrefix = path.join(root, `native-${scenario.name}-${id}`);
-      npm(['install', '--prefix', nativePrefix, '--omit=dev', '--omit=peer', '--no-save',
-        '--package-lock=false', archive, ...(hostArchive ? [hostArchive] : [])], {env: selectedEnv});
-      nativePaths.push(path.join(nativePrefix, 'node_modules/@openclaw', id));
-    }
     let expectedSource = treeSnapshot(repo);
     console.log(JSON.stringify({scenario, fixtureSha256: digest(JSON.stringify(expectedSource)), sourceFiles: expectedSource}));
-    const native = JSON.parse(run(process.execPath,
-      ['-e', inspectCompanions + '\ninspect(process.argv.slice(1));', ...nativePaths],
-      {env: selectedEnv}));
-    assert.deepEqual(native.companions[0].values, [1, 1, 1]);
-    if (scenario.bundled) {
-      assert.equal(native.companions[0].shared, true, 'Native bridges must share the hoisted module');
-      assert.equal(native.companions[0].private, true, 'Native bundled and hoisted modules must remain distinct');
-      assert.equal(native.companions[0].cycle, true, 'Native dependency cycles must return the owning companion');
-      assert.equal(native.isolated, true, 'Independent native companion prefixes must retain separate identity');
-      for (const plugin of native.companions) assert.equal(plugin.peer, 'host-sdk-1');
-    }
+    let native;
+    let prerequisiteStep = 'pack';
     try {
+      const nativePaths = [];
+      for (const id of companionIds) {
+        prerequisiteStep = `pack:${id}`;
+        const archive = pack(path.join(repo, 'extensions', id));
+        const requestedPrefix = path.join(root, `native-${scenario.name}-${id}`);
+        fs.mkdirSync(requestedPrefix, {recursive: true});
+        // npm's linked-layout control must use one physical prefix spelling.
+        // The OCM store deliberately retains its original configured spelling.
+        const nativePrefix = scenario.strategy === 'linked'
+          ? fs.realpathSync.native(requestedPrefix) : requestedPrefix;
+        console.log(JSON.stringify({scenario: scenario.name, phase: 'native-prerequisite', id,
+          requestedPrefix, nativePrefix, realpath: fs.realpathSync(requestedPrefix),
+          nativeRealpath: fs.realpathSync.native(requestedPrefix),
+          configuredOcmHome: env.OCM_HOME, ocmHomeRealpath: fs.realpathSync(env.OCM_HOME),
+          ocmHomeNativeRealpath: fs.realpathSync.native(env.OCM_HOME)}));
+        prerequisiteStep = `install:${id}`;
+        npm(['install', '--prefix', nativePrefix, '--omit=dev', '--omit=peer', '--no-save',
+          '--package-lock=false', archive, ...(hostArchive ? [hostArchive] : [])], {env: selectedEnv});
+        nativePaths.push(path.join(nativePrefix, 'node_modules/@openclaw', id));
+      }
+      prerequisiteStep = 'import';
+      native = JSON.parse(run(process.execPath,
+        ['-e', inspectCompanions + '\ninspect(process.argv.slice(1));', ...nativePaths],
+        {env: selectedEnv}));
+    } catch (error) {
+      console.error(error);
+      const failure = {scenario: scenario.name, phase: 'native-prerequisite',
+        step: prerequisiteStep, failure: String(error)};
+      failures.push(failure);
+      console.log(JSON.stringify(failure));
+      try {
+        assert.deepEqual(treeSnapshot(repo), expectedSource, 'Native preparation changed the source fixture');
+        console.log(JSON.stringify({scenario: scenario.name, sourceBytesUnchanged: true}));
+      } catch (sourceError) {
+        failures.push({scenario: scenario.name, phase: 'native-source-preservation',
+          failure: String(sourceError)});
+      }
+      console.log(JSON.stringify({scenario: scenario.name, elapsedMs: Date.now() - startedAt}));
+      continue;
+    }
+    let phase = 'native-graph';
+    try {
+      console.log(JSON.stringify({scenario, phase, native}));
+      assert.deepEqual(native.companions[0].values, [1, 1, 1]);
+      assert.deepEqual(native.companions.map(plugin => plugin.id), companionIds);
+      if (scenario.bundled) {
+        if (scenario.strategy === 'hoisted') {
+          assert.equal(native.companions[0].shared, true, 'Native bridges must share the hoisted module');
+          assert.equal(native.companions[0].private, true, 'Native bundled and hoisted modules must remain distinct');
+          assert.equal(native.companions[0].cycle, true, 'Native dependency cycles must return the owning companion');
+        }
+        assert.equal(native.companions[1].value, 1);
+        assert.equal(native.isolated, true, 'Independent native companion prefixes must retain separate identity');
+        for (const plugin of native.companions) assert.equal(plugin.peer, 'host-sdk-1');
+      }
+      phase = 'ocm-build';
       const buildArgs = ['runtime', 'build-local', scenario.name, '--repo', repo,
         ...companionIds.flatMap(id => ['--companion', id]), '--json'];
       const metadata = JSON.parse(run(binary, buildArgs, {env: selectedEnv}));
@@ -258,7 +363,8 @@ process.exit(result.status??1);
       assertNoRuntimeScratch(scenario.name, installed);
       const metadataPath = path.join(env.OCM_HOME, 'runtimes', `${scenario.name}.json`);
       let bound = false;
-      function observeRuntime(currentMetadata, expected, phase) {
+      function observeRuntime(currentMetadata, expected, observationPhase) {
+        phase = `ocm-${observationPhase}`;
         assertNoRuntimeScratch(scenario.name, installed);
         assert.deepEqual(currentMetadata.companions.map(plugin => plugin.id), companionIds);
         const metadataSha256 = fileDigest(metadataPath);
@@ -285,7 +391,7 @@ process.exit(result.status??1);
         // must now belong to the published runtime, never its removed stage.
         return treeSnapshot(installed, true);
       }
-      if (!scenario.bundled) {
+      if (!scenario.lifecycle) {
         run(binary, ['env', 'create', scenario.name, '--runtime', scenario.name], {env: selectedEnv});
         bound = true;
       }
@@ -293,6 +399,10 @@ process.exit(result.status??1);
       if (scenario.bundled) {
         assert.ok(Object.values(initialTree).some(entry => entry.link),
           'The conflicting graph must retain its shared packages through directory bindings');
+      }
+      // Reuse the hoisted case's replacement/rollback proof; linked cases add
+      // their distinct installed graph without multiplying lifecycle builds.
+      if (scenario.lifecycle) {
         // Keep the runtime unbound: --force correctly refuses a bound runtime.
         // New code and host SDK markers distinguish replacement from retaining
         // the old tree, without changing the dependency graph under comparison.
@@ -300,6 +410,7 @@ process.exit(result.status??1);
         fs.writeFileSync(path.join(second, 'index.cjs'), secondSource + 'exports.observation.generation=2;\n');
         fs.writeFileSync(path.join(repo, 'sdk.cjs'), "module.exports='host-sdk-2';\n");
         expectedSource = treeSnapshot(repo);
+        phase = 'ocm-replacement-build';
         const replacement = JSON.parse(run(binary, [...buildArgs, '--force'], {env: selectedEnv}));
         assert.equal(path.resolve(replacement.installRoot).toLowerCase(), installed.toLowerCase());
         assert.notEqual(replacement.runtimeSha256, metadata.runtimeSha256, 'Replacement retained the old runtime digest');
@@ -314,6 +425,7 @@ process.exit(result.status??1);
           openclaw: {...secondManifest.openclaw, runtimeExtensions: ['./missing.cjs']}};
         fs.writeFileSync(path.join(second, 'package.json'), JSON.stringify(invalidManifest));
         expectedSource = treeSnapshot(repo);
+        phase = 'ocm-failed-replacement';
         const failed = observe(binary, [...buildArgs, '--force'], {env: selectedEnv});
         assert.equal(failed.status, 1, 'The missing companion entry must reject replacement');
         assert.match(failed.stderr, /missing runtime entrypoint/);
@@ -328,16 +440,22 @@ process.exit(result.status??1);
       }
     } catch (error) {
       console.error(error);
-      failures.push({scenario: scenario.name, failure: String(error)});
+      failures.push({scenario: scenario.name, phase, failure: String(error)});
     } finally {
-      assert.deepEqual(treeSnapshot(repo), expectedSource, 'OCM changed the source fixture');
-      console.log(JSON.stringify({scenario: scenario.name, sourceBytesUnchanged: true,
-        elapsedMs: Date.now() - startedAt}));
+      try {
+        assert.deepEqual(treeSnapshot(repo), expectedSource, 'OCM changed the source fixture');
+        console.log(JSON.stringify({scenario: scenario.name, sourceBytesUnchanged: true}));
+      } catch (sourceError) {
+        failures.push({scenario: scenario.name, phase: 'source-preservation', failure: String(sourceError)});
+      }
+      console.log(JSON.stringify({scenario: scenario.name, elapsedMs: Date.now() - startedAt}));
     }
   }
-  console.log(JSON.stringify({nativeWindowsCompanionObservationsComplete: true, failures}));
+  console.log(JSON.stringify({nativeWindowsCompanionObservationsComplete: true,
+    selectedCases: selectedNames, allCases: selectedCases.length === cases.length, failures}));
   assert.deepEqual(failures, [], 'Native companion dependency checks failed');
-  console.log(JSON.stringify({nativeWindowsCompanionWithoutSymlinkPrivilege: 'passed'}));
+  console.log(JSON.stringify({nativeWindowsCompanionWithoutSymlinkPrivilege: 'passed',
+    selectedCases: selectedNames, allCases: selectedCases.length === cases.length}));
 }
 
 try {

@@ -233,6 +233,9 @@ fn native_windows_companion_without_symlink_privilege() {
     }
     env.insert("OCM_TEST_BINARY".into(), path_string(&binary));
     env.insert(CHILD_ROOT.into(), path_string(fixture.path()));
+    if let Ok(cases) = std::env::var("OCM_TEST_COMPANION_CASES") {
+        env.insert("OCM_TEST_COMPANION_CASES".into(), cases);
+    }
     let args = ["--exact", TEST_NAME, "--nocapture", "--test-threads=1"];
     println!(
         "{}",
