@@ -118,7 +118,7 @@ jobs:
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
-      - name: Capture isolated R12 private directory premise
+      - name: Capture isolated current-target host publication
         if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 751
         continue-on-error: true
         timeout-minutes: 15
@@ -127,45 +127,62 @@ jobs:
           CARGO_BUILD_JOBS: 2
         run: |
           $ErrorActionPreference = 'Stop'
-          $area = Join-Path $env:RUNNER_TEMP ('r12-premise-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          $carrierRoot = (Get-Location).Path
+          $area = Join-Path $env:RUNNER_TEMP ('host-target-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
           New-Item -ItemType Directory -Path $area | Out-Null
           $source = Join-Path $area 'source'
-          git fetch --depth=1 origin ca30b244e2e3f9b46fd2581ffe4c9c43c337e6d6
-          if ($LASTEXITCODE -ne 0) { throw 'R12 premise source fetch failed' }
-          git worktree add --detach $source ca30b244e2e3f9b46fd2581ffe4c9c43c337e6d6
-          if ($LASTEXITCODE -ne 0) { throw 'R12 premise checkout failed' }
-          $patch = Join-Path $area 'premise.patch'
-          [IO.File]::WriteAllBytes($patch, [Convert]::FromBase64String('LS0tIGEvc3JjL3N0b3JlL2NvbW1vbi5ycworKysgYi9zcmMvc3RvcmUvY29tbW9uLnJzCkBAIC0xNTc1LDMgKzE1NzUsNDUgQEAKICAgICAgICAgfQogICAgIH0KIH0KKworI1tjZmcoYWxsKHRlc3QsIHdpbmRvd3MpKV0KK21vZCBwcml2YXRlX2RpcmVjdG9yeV9wYXRoX3ByZW1pc2UgeworICAgIHVzZSBzdXBlcjo6KjsKKyAgICB1c2Ugc3RkOjpvczo6d2luZG93czo6ZmZpOjpPc1N0ckV4dDsKKworICAgICNbdGVzdF0KKyAgICBmbiBuYXRpdmVfcHJpdmF0ZV9kaXJlY3RvcnlfcGF0aF9wcmVtaXNlKCkgeworICAgICAgICBsZXQgcm9vdCA9IHRlbXBmaWxlOjp0ZW1wZGlyKCkudW53cmFwKCk7CisgICAgICAgIGxldCBjYW5vbmljYWwgPSByb290LnBhdGgoKS5jYW5vbmljYWxpemUoKS51bndyYXAoKTsKKyAgICAgICAgbGV0IG9yZGluYXJ5ID0gUGF0aEJ1Zjo6ZnJvbShjYW5vbmljYWwudG9fc3RyKCkudW53cmFwKCkuc3RyaXBfcHJlZml4KHIiXFw/XCIpLnVud3JhcCgpKTsKKyAgICAgICAgbGV0IHBhcmVudCA9IG9yZGluYXJ5LmpvaW4oInAiLnJlcGVhdCg4MCkpOworICAgICAgICBmczo6Y3JlYXRlX2Rpcl9hbGwoJnBhcmVudCkudW53cmFwKCk7CisgICAgICAgIGxldCBuYW1lID0gImQiLnJlcGVhdCgyNTIgLSBwYXJlbnQuYXNfb3Nfc3RyKCkuZW5jb2RlX3dpZGUoKS5jb3VudCgpIC0gMSk7CisgICAgICAgIGxldCBkaXJlY3RvcnkgPSBwYXJlbnQuam9pbigmbmFtZSk7CisgICAgICAgIGFzc2VydF9lcSEoZGlyZWN0b3J5LmFzX29zX3N0cigpLmVuY29kZV93aWRlKCkuY291bnQoKSwgMjUyKTsKKyAgICAgICAgbGV0IG5hdGl2ZSA9IHBhcmVudC5jYW5vbmljYWxpemUoKS51bndyYXAoKS5qb2luKG5hbWUpOworICAgICAgICBhc3NlcnQhKG5hdGl2ZS5hc19vc19zdHIoKS5lbmNvZGVfd2lkZSgpLmNvdW50KCkgPiAyNTIpOworICAgICAgICBsZXQgY3JlYXRlID0gZW5zdXJlX3ByaXZhdGVfZGlyKCZkaXJlY3RvcnkpOworICAgICAgICBwcmludGxuISgiUjEyIG9yZGluYXJ5IGNyZWF0ZSB1bml0cz0yNTIgcmVzdWx0PXtjcmVhdGU6P30iKTsKKyAgICAgICAgYXNzZXJ0IShjcmVhdGUuaXNfZXJyKCkpOworICAgICAgICBlbnN1cmVfcHJpdmF0ZV9kaXIoJm5hdGl2ZSkudW53cmFwKCk7CisgICAgICAgIHByaW50bG4hKCJSMTIgbmF0aXZlIGNyZWF0ZSBzdWNjZWVkcyIpOworICAgICAgICBhc3NlcnQhKGZzOjpzeW1saW5rX21ldGFkYXRhKCZkaXJlY3RvcnkpLnVud3JhcCgpLmlzX2RpcigpKTsKKyAgICAgICAgbGV0IGRpcmVjdCA9IGNyYXRlOjppbmZyYTo6d2luZG93c19zZWN1cml0eTo6ZW5zdXJlX3ByaXZhdGVfZGlyZWN0b3J5KCZkaXJlY3RvcnkpOworICAgICAgICBwcmludGxuISgiUjEyIGhlbHBlciByZW9wZW4gcmF3IGVycm9yPXs6P30iLCBkaXJlY3QuYXNfcmVmKCkuZXJyKCkuYW5kX3RoZW4ofGV8IGUucmF3X29zX2Vycm9yKCkpKTsKKyAgICAgICAgYXNzZXJ0X2VxIShkaXJlY3QudW53cmFwX2VycigpLnJhd19vc19lcnJvcigpLCBTb21lKDIwNikpOworICAgICAgICBsZXQgcmVvcGVuID0gZW5zdXJlX3ByaXZhdGVfZGlyKCZkaXJlY3RvcnkpOworICAgICAgICBwcmludGxuISgiUjEyIG9yZGluYXJ5IHJlb3BlbiByZXN1bHQ9e3Jlb3Blbjo/fSIpOworICAgICAgICBhc3NlcnQhKHJlb3Blbi5pc19lcnIoKSk7CisgICAgICAgIGVuc3VyZV9wcml2YXRlX2RpcigmbmF0aXZlKS51bndyYXAoKTsKKyAgICAgICAgcHJpbnRsbiEoIlIxMiBuYXRpdmUgcmVvcGVuIHN1Y2NlZWRzIik7CisgICAgICAgIGZzOjp3cml0ZShkaXJlY3Rvcnkuam9pbigicmV0YWluZWQudHh0IiksIGIib3duZWQgY2xlYW51cCBmaXh0dXJlIikudW53cmFwKCk7CisgICAgICAgIGxldCBjbGVhbnVwID0gcmVtb3ZlX293bmVkX3RyZWUoJm9yZGluYXJ5KTsKKyAgICAgICAgcHJpbnRsbiEoIlIxMiBvcmRpbmFyeSBvd25lZCBjbGVhbnVwIHJlc3VsdD17Y2xlYW51cDo/fSIpOworICAgICAgICBhc3NlcnQhKGNsZWFudXAuaXNfZXJyKCkpOworICAgICAgICBhc3NlcnRfZXEhKGZzOjpyZWFkKGRpcmVjdG9yeS5qb2luKCJyZXRhaW5lZC50eHQiKSkudW53cmFwKCksIGIib3duZWQgY2xlYW51cCBmaXh0dXJlIik7CisgICAgICAgIHJlbW92ZV9vd25lZF90cmVlKCZjYW5vbmljYWwpLnVud3JhcCgpOworICAgICAgICBwcmludGxuISgiUjEyIG5hdGl2ZSBvd25lZCBjbGVhbnVwIHN1Y2NlZWRzIik7CisgICAgICAgIGFzc2VydCEoIW9yZGluYXJ5LmV4aXN0cygpKTsKKyAgICB9Cit9Cg=='))
-          if ((Get-FileHash $patch -Algorithm SHA256).Hash -ne 'ba0c394425e35e20272a2fd13885393002eed3efe0d404eea1a5fd68cee474c5') {
-            throw 'R12 premise patch checksum mismatch'
-          }
+          git fetch --depth=1 origin 7f1afb279798960d04e18337471f093459e4c674
+          if ($LASTEXITCODE -ne 0) { throw 'target source fetch failed' }
+          git worktree add --detach $source 7f1afb279798960d04e18337471f093459e4c674
+          if ($LASTEXITCODE -ne 0) { throw 'target checkout failed' }
           $previousTarget = $env:CARGO_TARGET_DIR
+          $previousBinary = $env:OCM_TEST_BINARY
+          $previousProbe = $env:OCM_TEST_ROOT_JUNCTION_PROBE
           Push-Location $source
           try {
             $env:CARGO_TARGET_DIR = Join-Path $area 'target'
             git rev-parse HEAD 'HEAD^{tree}'
-            if ((git rev-parse 'HEAD^{tree}') -ne '2fff4bb974199b93c4604935a562afeedb486382') { throw 'R12 product tree mismatch' }
+            if ((git rev-parse 'HEAD^{tree}') -ne '3256c9f1e1246b40abc8330e6f74145998fdd507') { throw 'target product tree mismatch' }
+            $dirty = git status --porcelain=v1 --untracked-files=no
+            if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'target product checkout is not clean' }
             rustc -Vv
             cargo --version
-            git apply --check $patch
-            if ($LASTEXITCODE -ne 0) { throw 'R12 premise patch does not apply' }
-            git apply $patch
-            if ($LASTEXITCODE -ne 0) { throw 'R12 premise patch failed' }
-            git add -- src/store/common.rs
+            node --version
+            npm --version
+            if ((node --version) -ne 'v22.23.4' -or (npm --version) -ne '10.9.9') { throw 'target control tool version mismatch' }
+            Get-FileHash Cargo.lock -Algorithm SHA256
+            cargo build --locked
+            if ($LASTEXITCODE -ne 0) { throw 'pure target product build failed' }
+            $productDirectory = Join-Path $area 'product'
+            New-Item -ItemType Directory -Path $productDirectory | Out-Null
+            $productBinary = Join-Path $productDirectory 'ocm.exe'
+            Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'debug/ocm.exe') -Destination $productBinary
+            $productHash = (Get-FileHash $productBinary -Algorithm SHA256).Hash
+            @{productBinary=$productBinary; productSha256=$productHash} | ConvertTo-Json -Compress
+            foreach ($relative in @('tests/windows_companion_bindings_tests.rs', 'tests/support/windows_runtime_root_probe.cjs', 'tests/support/windows_without_symlinks.ps1')) {
+              Copy-Item -LiteralPath (Join-Path $carrierRoot $relative) -Destination (Join-Path $source $relative)
+              @{fixture=$relative; sha256=(Get-FileHash $relative -Algorithm SHA256).Hash} | ConvertTo-Json -Compress
+            }
+            if ((Get-FileHash tests/support/windows_runtime_root_probe.cjs -Algorithm SHA256).Hash -ne 'c92730052761aca37d257720ef2b3b7cd307685f586b51ec10192289e05a9af5') { throw 'frozen root probe identity mismatch' }
+            git add -- tests/windows_companion_bindings_tests.rs tests/support/windows_runtime_root_probe.cjs tests/support/windows_without_symlinks.ps1
             git diff --cached --stat
             git write-tree
-            Get-FileHash src/store/common.rs -Algorithm SHA256
-            cargo check --workspace --all-targets --locked
-            if ($LASTEXITCODE -ne 0) { throw 'R12 premise compile check failed' }
-            cargo test --locked --lib store::common::private_directory_path_premise::native_private_directory_path_premise -- --exact --nocapture
+            $env:OCM_TEST_BINARY = $productBinary
+            $env:OCM_TEST_ROOT_JUNCTION_PROBE = '1'
+            $proof = '$ErrorActionPreference = "Stop"; . ./tests/support/windows_without_symlinks.ps1; Invoke-WithoutDeveloperSymlinks { cargo test --locked --test windows_companion_bindings_tests native_windows_companion_without_symlink_privilege -- --exact --nocapture; if ($LASTEXITCODE -ne 0) { throw "native linked companion comparison failed" } }'
+            Write-Output 'Capture pure 7f1afb target host-only publication'
+            $output = & pwsh -NoProfile -Command $proof 2>&1
             $captureExit = $LASTEXITCODE
-            $testBinaries = @(Get-ChildItem -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'debug/deps') -Filter 'ocm-*.exe' -File)
-            if ($testBinaries.Count -ne 1) { throw 'R12 premise test executable identity is ambiguous' }
-            Write-Output "R12 test executable=$($testBinaries[0].FullName)"
-            Get-FileHash $testBinaries[0].FullName -Algorithm SHA256
-            Write-Output "R12 isolated premise exit=$captureExit"
-            if ($captureExit -ne 0) { throw 'R12 premise test failed' }
+            $output | Write-Output
+            $afterHash = (Get-FileHash $productBinary -Algorithm SHA256).Hash
+            @{productBinary=$productBinary; productSha256After=$afterHash} | ConvertTo-Json -Compress
+            if ($afterHash -ne $productHash) { throw 'target product binary changed during fixture compilation' }
+            Write-Output "Pure 7f1afb target hostOnlyExit=$captureExit"
+            if (!($output -match '"nativeWindowsRootPublicationObservationsComplete":true')) { throw 'target root publication observations did not complete' }
+            if ($captureExit -ne 0) { throw 'target host publication control retained its failure' }
           } finally {
+            $env:OCM_TEST_BINARY = $previousBinary
+            $env:OCM_TEST_ROOT_JUNCTION_PROBE = $previousProbe
             $env:CARGO_TARGET_DIR = $previousTarget
             Pop-Location
           }
