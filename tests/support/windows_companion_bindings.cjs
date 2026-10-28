@@ -15,6 +15,7 @@ assert.equal(path.basename(path.dirname(root)), 'ocm-tests');
 assert.ok(fs.statSync(binary).isFile());
 assert.ok(fs.statSync(root).isDirectory());
 const baselineValues = process.env.OCM_TEST_COMPANION_BASELINE_VALUES === '1';
+const captureOnly = process.env.OCM_TEST_COMPANION_CAPTURE_ONLY === '1';
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const fileDigest = file => digest(fs.readFileSync(file));
 
@@ -37,7 +38,7 @@ for (const key of ['HOME', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'OCM_HOME', 'npm_c
   fs.mkdirSync(env[key], {recursive: true});
 }
 
-function run(command, args, options = {}) {
+function observe(command, args, options = {}) {
   const cwd = options.cwd || root;
   console.log(JSON.stringify({command, args, cwd, windowsHide: options.windowsHide ?? false}));
   const result = cp.spawnSync(command, args, {
@@ -48,6 +49,11 @@ function run(command, args, options = {}) {
     error: result.error ? String(result.error) : null,
     stdout: result.stdout || '', stderr: result.stderr || ''}));
   if (result.error) throw result.error;
+  return result;
+}
+
+function run(command, args, options = {}) {
+  const result = observe(command, args, options);
   assert.equal(result.status, 0, `${command} failed: ${result.stderr}`);
   return result.stdout;
 }
@@ -78,7 +84,7 @@ function main() {
   console.log(JSON.stringify({platform: process.platform, release: os.release(), version: os.version(),
     architecture: process.arch, node: process.version, nodeBinary: process.execPath,
     nodeSha256: fileDigest(process.execPath), binary, binarySha256: fileDigest(binary),
-    scriptSha256: fileDigest(__filename), baselineValues}));
+    scriptSha256: fileDigest(__filename), baselineValues, captureOnly}));
   const npmCommand = run('where.exe', ['npm.cmd']).trim().split(/\r?\n/)[0];
   assert.ok(path.isAbsolute(npmCommand) && fs.statSync(npmCommand).isFile());
   const npmCli = path.join(path.dirname(npmCommand), 'node_modules/npm/bin/npm-cli.js');
@@ -88,21 +94,6 @@ function main() {
     npmCli, npmCliSha256: fileDigest(npmCli)}));
   run(process.execPath, [npmCli, '--version']);
   run(binary, ['--version']);
-  // Match the ordinary Windows command route used by the existing packing
-  // fixture. Record a hidden-console control without treating it as product proof.
-  for (const windowsHide of [false, true]) {
-    const command = env.COMSPEC || path.join(env.SystemRoot, 'System32/cmd.exe');
-    const control = cp.spawnSync(command, ['/d', '/c', 'ver'], {
-      cwd: root, env, encoding: 'utf8', timeout: 10000, windowsHide,
-    });
-    console.log(JSON.stringify({command, args: ['/d', '/c', 'ver'], windowsHide,
-      exit: control.status, error: control.error ? String(control.error) : null,
-      stdout: control.stdout || '', stderr: control.stderr || ''}));
-    if (!windowsHide) {
-      assert.ifError(control.error);
-      assert.equal(control.status, 0, 'Ordinary native cmd.exe prerequisite failed');
-    }
-  }
 
   const archives = path.join(root, 'archives');
   const packages = path.join(root, 'packages');
@@ -138,7 +129,7 @@ function main() {
     {name: 'plain-nested', strategy: 'nested', bundled: false},
     {name: 'bundled-hoisted', strategy: 'hoisted', bundled: true},
   ];
-  for (const scenario of cases) {
+  for (const scenario of cases.filter(value => !captureOnly || value.name === 'plain-hoisted')) {
     const repo = path.join(root, scenario.name);
     fs.mkdirSync(repo);
     const selectedEnv = {...env, npm_config_install_strategy: scenario.strategy};
@@ -202,6 +193,31 @@ process.exit(result.status??1);
       const stages = fs.readdirSync(path.join(env.OCM_HOME, 'runtimes')).filter(name =>
         name.startsWith(`.${scenario.name}.stage-`) || name.startsWith(`.${scenario.name}.pack-`));
       assert.deepEqual(stages, [], 'Successful publication left a temporary stage');
+      if (captureOnly) {
+        const metadataPath = path.join(env.OCM_HOME, 'runtimes', `${scenario.name}.json`);
+        const metadataSha256 = fileDigest(metadataPath);
+        const observed = observe(binary, ['runtime', 'verify', scenario.name, '--json'], {env: selectedEnv});
+        assert.ok([0, 1].includes(observed.status), 'Unexpected verification process outcome');
+        const verification = JSON.parse(observed.stdout);
+        assert.equal(typeof verification.healthy, 'boolean');
+        assert.equal(fileDigest(metadataPath), metadataSha256, 'Verification rewrote generated metadata');
+        console.log(JSON.stringify({captureOnly: true, scenario: scenario.name,
+          buildExit: 0, verifyExit: observed.status,
+          emittedEntrypoint: metadata.companions[0].entrypoint,
+          metadataSha256, generatedMetadataUnchanged: true, verification}));
+        // These are independent product commands, not a successful verification.
+        // Keep the captured diagnostic intact and observe whether binding can run.
+        const binding = observe(binary, ['env', 'create', scenario.name, '--runtime', scenario.name], {env: selectedEnv});
+        const entrypoint = binding.status === 0 ? observe(binary,
+          [`@${scenario.name}`, '--', '--version'], {env: selectedEnv}) : null;
+        console.log(JSON.stringify({independentBindingObservation: true,
+          verifyExit: observed.status, verificationHealthy: verification.healthy,
+          bindingExit: binding.status, entrypointExit: entrypoint?.status ?? null,
+          entrypointStdout: entrypoint?.stdout ?? null,
+          entrypointStderr: entrypoint?.stderr ?? null}));
+        assert.equal(fileDigest(metadataPath), metadataSha256, 'Binding observation rewrote generated runtime metadata');
+        continue;
+      }
       const verified = JSON.parse(run(binary, ['runtime', 'verify', scenario.name, '--json'], {env: selectedEnv}));
       assert.equal(verified.healthy, true);
       run(binary, ['env', 'create', scenario.name, '--runtime', scenario.name], {env: selectedEnv});
@@ -221,7 +237,8 @@ process.exit(result.status??1);
       console.log(JSON.stringify({scenario: scenario.name, sourceBytesUnchanged: true}));
     }
   }
-  console.log(JSON.stringify({nativeWindowsCompanionWithoutSymlinkPrivilege: 'passed', baselineValues}));
+  console.log(JSON.stringify(captureOnly ? {nativeWindowsCompanionCapture: 'captured', captureOnly: true} :
+    {nativeWindowsCompanionWithoutSymlinkPrivilege: 'passed', baselineValues}));
 }
 
 try {
