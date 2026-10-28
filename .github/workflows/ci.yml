@@ -154,21 +154,33 @@ jobs:
           $harness = ($artifacts | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'windows_companion_bindings_tests' -and $_.executable } | Select-Object -Last 1).executable
           if (!$harness) { throw 'comparison harness missing' }
           Get-FileHash $harness -Algorithm SHA256
-          $env:OCM_TEST_BINARY = Join-Path $area 'baseline-target/debug/ocm.exe'
-          $env:OCM_TEST_COMPANION_BASELINE_VALUES = '1'
-          & $harness --exact native_windows_companion_without_symlink_privilege --nocapture
-          $baselineExit = $LASTEXITCODE
-          Remove-Item Env:OCM_TEST_COMPANION_BASELINE_VALUES
-          $env:OCM_TEST_BINARY = Join-Path $area 'candidate-target/debug/ocm.exe'
-          & $harness --exact native_windows_companion_without_symlink_privilege --nocapture
-          $candidateExit = $LASTEXITCODE
-          Remove-Item Env:OCM_TEST_BINARY
-          Write-Output "baselineExit=$baselineExit candidateExit=$candidateExit"
-          Get-FileHash (Join-Path $area 'baseline-target/debug/ocm.exe'), (Join-Path $area 'candidate-target/debug/ocm.exe') -Algorithm SHA256
-          if ($baselineExit -ne 0 -or $candidateExit -ne 0) { throw 'native companion compatibility comparison failed' }
+          $policyFixture = Join-Path $area 'candidate/tests/support/windows_without_symlinks.ps1'
+          Get-FileHash $policyFixture -Algorithm SHA256
+          . $policyFixture
+          Invoke-WithoutDeveloperSymlinks {
+            $env:OCM_TEST_BINARY = Join-Path $area 'baseline-target/debug/ocm.exe'
+            $env:OCM_TEST_COMPANION_BASELINE_VALUES = '1'
+            & $harness --exact native_windows_companion_without_symlink_privilege --nocapture
+            $baselineExit = $LASTEXITCODE
+            Remove-Item Env:OCM_TEST_COMPANION_BASELINE_VALUES
+            $env:OCM_TEST_BINARY = Join-Path $area 'candidate-target/debug/ocm.exe'
+            & $harness --exact native_windows_companion_without_symlink_privilege --nocapture
+            $candidateExit = $LASTEXITCODE
+            Remove-Item Env:OCM_TEST_BINARY
+            Write-Output "baselineExit=$baselineExit candidateExit=$candidateExit"
+            Get-FileHash (Join-Path $area 'baseline-target/debug/ocm.exe'), (Join-Path $area 'candidate-target/debug/ocm.exe') -Algorithm SHA256
+            if ($baselineExit -ne 0 -or $candidateExit -ne 0) { throw 'native companion compatibility comparison failed' }
+          }
       - name: Prove native Windows companion dependency bindings
         timeout-minutes: 5
-        run: cargo test --locked --test windows_companion_bindings_tests native_windows_companion_without_symlink_privilege -- --exact --nocapture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . ./tests/support/windows_without_symlinks.ps1
+          Invoke-WithoutDeveloperSymlinks {
+            cargo test --locked --test windows_companion_bindings_tests native_windows_companion_without_symlink_privilege -- --exact --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'native companion regression failed' }
+          }
       - name: Prove native Windows installed runtime launch
         timeout-minutes: 5
         shell: pwsh
