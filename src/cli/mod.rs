@@ -244,7 +244,13 @@ impl Cli {
         }
         let stdout = io::stdout();
         let mut handle = stdout.lock();
-        Self::record_stdout_result(handle.write_all(text.as_bytes()));
+        // A final partial line can remain buffered even when write_all succeeds.
+        // Observe its output error before finish_output chooses the exit status.
+        Self::record_stdout_result(
+            handle
+                .write_all(text.as_bytes())
+                .and_then(|_| handle.flush()),
+        );
         Ok(())
     }
 
