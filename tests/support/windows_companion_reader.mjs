@@ -165,7 +165,7 @@ try {
 }
 
 report.status = report.failures.length === 0 ? 'passed' : 'failed';
-// The host's later raw-import JSON is a separate control, never this receipt.
+// The host's later fixture JSON is a separate control, never this receipt.
 console.log(JSON.stringify(report));
 if (report.status !== 'passed') {
   throw new Error(`Actual OpenClaw reader proof failed: ${report.failures.map(failure => failure.phase).join(', ')}`);

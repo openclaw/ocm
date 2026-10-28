@@ -158,7 +158,10 @@ function main() {
   const inspectCompanions = `function inspect(pluginPaths) {
   let graph;
   try {
-    const plugins=pluginPaths.map(file=>require(file));
+    // Mirror the native canonical entry returned by OpenClaw's final admission.
+    // The production-loader preload separately qualifies this fixture boundary.
+    const fs=require('node:fs');
+    const plugins=pluginPaths.map(file=>require(fs.realpathSync.native(require.resolve(file))));
     graph={companions:plugins.map(plugin=>plugin.observation),
       isolated:plugins.every((plugin,index)=>plugins.slice(0,index).every(previous=>
         plugin.token!==previous.token && plugin.direct!==previous.direct && plugin.common!==previous.common))};
@@ -391,18 +394,18 @@ process.exit(result.status??1);
         console.log(JSON.stringify({scenario: scenario.name, phase, verificationExit: verification.status,
           verificationHealthy: verified.healthy, verificationIssue: verified.issue ?? null}));
         const comparisons = [];
-        // Do not let a failed raw-import control prevent the genuine reader
+        // Do not let a failed admission fixture prevent the production reader
         // from observing the same installed bytes through its own admission.
         try {
           const materialized = JSON.parse(bound
             ? run(binary, [`@${scenario.name}`, '--', '--version'], {env: selectedEnv})
             : run(process.execPath, [currentMetadata.binaryPath, '--version'], {env: selectedEnv}));
-          console.log(JSON.stringify({scenario, phase, reader: 'raw-import-control', native, expected, materialized}));
+          console.log(JSON.stringify({scenario, phase, reader: 'canonical-entry-fixture', native, expected, materialized}));
           assert.deepEqual(materialized, expected, 'Raw import changed the native dependency graph');
-          comparisons.push({reader: 'raw-import-control', status: 'passed'});
+          comparisons.push({reader: 'canonical-entry-fixture', status: 'passed'});
         } catch (error) {
           console.error(error);
-          comparisons.push({reader: 'raw-import-control', status: 'failed', failure: String(error)});
+          comparisons.push({reader: 'canonical-entry-fixture', status: 'failed', failure: String(error)});
         }
         if (openclawSource) {
           try {

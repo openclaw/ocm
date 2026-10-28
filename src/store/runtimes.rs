@@ -2682,12 +2682,15 @@ impl CompanionDependencyBindings {
             _target.finish_children()?;
             let stage =
                 fs::canonicalize(&_target.install_root).map_err(|error| error.to_string())?;
-            // Node's CommonJS realpath walk preserves ordinary path spellings,
-            // including Windows short names. Use the published binary's store
-            // spelling for every binding, so a junction does not create a second
-            // module-cache identity. Never resolve through the predecessor here.
-            let final_root = std::path::absolute(&_target.final_install_root)
-                .map_err(|error| error.to_string())?;
+            // OpenClaw's final entry admission uses the native canonical path.
+            // Keep dependencies in that same namespace without resolving through
+            // a predecessor at the final root.
+            let final_root = stage.with_file_name(
+                _target
+                    .final_install_root
+                    .file_name()
+                    .ok_or("runtime has no final name")?,
+            );
             let replacements = self
                 .junctions
                 .iter()
@@ -4912,7 +4915,7 @@ mod tests {
                 let mut bindings = super::CompanionDependencyBindings::default();
                 bindings.junctions.insert(first.clone(), source.clone());
                 bindings.junctions.insert(second.clone(), source.clone());
-                let final_package = std::path::absolute(&target.final_install_root)
+                let final_package = std::fs::canonicalize(&target.final_install_root)
                     .unwrap()
                     .join("files/package");
                 if partial {
