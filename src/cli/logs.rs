@@ -7,17 +7,33 @@ use super::{Cli, render};
 // still returning the error so a follower stops reading immediately.
 struct LogStdout<'a, W> {
     inner: &'a mut W,
+    header: Option<String>,
     broken_pipe: bool,
+}
+
+impl<W: Write> LogStdout<'_, W> {
+    fn write_header(&mut self) -> io::Result<()> {
+        if let Some(header) = self.header.take() {
+            self.inner
+                .write_all(header.as_bytes())
+                .inspect_err(|error| {
+                    self.broken_pipe |= error.kind() == io::ErrorKind::BrokenPipe;
+                })?;
+        }
+        Ok(())
+    }
 }
 
 impl<W: Write> Write for LogStdout<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_header()?;
         self.inner.write(buf).inspect_err(|error| {
             self.broken_pipe |= error.kind() == io::ErrorKind::BrokenPipe;
         })
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.write_header()?;
         self.inner.flush().inspect_err(|error| {
             self.broken_pipe |= error.kind() == io::ErrorKind::BrokenPipe;
         })
@@ -109,19 +125,28 @@ impl Cli {
             }
         };
         if follow {
-            if profile.pretty {
-                self.stdout_lines(render::logs::log_header(
-                    name,
-                    &self.log_service().follow_components(name, stream)?,
-                    tail_lines,
-                    true,
-                    profile,
-                ));
-            }
+            let header = if profile.pretty {
+                Some(
+                    render::logs::log_header(
+                        name,
+                        &self.log_service().follow_components(name, stream)?,
+                        tail_lines,
+                        true,
+                        profile,
+                    )
+                    .join("\n")
+                        + "\n",
+                )
+            } else {
+                None
+            };
             let stdout = io::stdout();
             let mut handle = stdout.lock();
             let mut output = LogStdout {
                 inner: &mut handle,
+                // The follower validates initial reads before writing/flushing
+                // this header, including when the source is empty or pending.
+                header,
                 broken_pipe: false,
             };
             let result = if profile.pretty {
@@ -197,18 +222,21 @@ mod tests {
             std::io::ErrorKind::BrokenPipe,
             std::io::ErrorKind::PermissionDenied,
         ] {
-            for fail_write in [false, true] {
-                let mut sink = FailingWriter { kind, fail_write };
-                let mut output = LogStdout {
-                    inner: &mut sink,
-                    broken_pipe: false,
-                };
-                let error = output
-                    .write_all(b"record\n")
-                    .and_then(|_| output.flush())
-                    .unwrap_err();
-                assert_eq!(error.kind(), kind);
-                assert_eq!(output.broken_pipe, kind == std::io::ErrorKind::BrokenPipe);
+            for header in [None, Some("header\n".to_string())] {
+                for fail_write in [false, true] {
+                    let mut sink = FailingWriter { kind, fail_write };
+                    let mut output = LogStdout {
+                        inner: &mut sink,
+                        header: header.clone(),
+                        broken_pipe: false,
+                    };
+                    let error = output
+                        .write_all(b"record\n")
+                        .and_then(|_| output.flush())
+                        .unwrap_err();
+                    assert_eq!(error.kind(), kind);
+                    assert_eq!(output.broken_pipe, kind == std::io::ErrorKind::BrokenPipe);
+                }
             }
         }
     }

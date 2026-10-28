@@ -410,6 +410,44 @@ fn logs_with_closed_stdout_terminate_quietly() {
 
 #[cfg(unix)]
 #[test]
+fn empty_and_pending_pretty_log_follow_stops_on_closed_stdout() {
+    let root = TestDir::new("empty-logs-closed-stdout");
+    let (cwd, env) = native_log_fixture(&root, 0);
+    for pending in [false, true] {
+        if pending {
+            for stream in ["stdout", "stderr"] {
+                fs::remove_file(root.child(&format!("ocm-home/supervisor/logs/demo.{stream}.log")))
+                    .unwrap();
+            }
+        }
+        for stream in [vec![], vec!["--stream", "info"], vec!["--stream", "error"]] {
+            // An absent merged source is a read failure; pending single streams
+            // are supported and still need to deliver their header.
+            if pending && stream.is_empty() {
+                continue;
+            }
+            let (reader, writer) = UnixStream::pair().unwrap();
+            drop(reader);
+            let mut args = vec!["logs", "demo", "--follow", "--color", "always"];
+            args.extend_from_slice(&stream);
+            let mut child = LogReader(
+                Command::new(env!("CARGO_BIN_EXE_ocm"))
+                    .current_dir(&cwd)
+                    .env_clear()
+                    .envs(&env)
+                    .args(&args)
+                    .stdout(Stdio::from(OwnedFd::from(writer)))
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            child.assert_quiet_success();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn logs_follow_exits_when_consumer_closes_after_initial_output() {
     use std::io::{BufRead, BufReader};
     for stream in [vec![], vec!["--stream", "info"], vec!["--stream", "error"]] {
