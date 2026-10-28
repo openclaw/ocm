@@ -3271,7 +3271,7 @@ fn copied_config_fixture(
 }
 
 #[test]
-fn env_clone_copied_git_shared_repositories_read_history_without_the_source() {
+fn env_clone_copied_git_config_shared_repositories_read_history_without_the_source() {
     for route in ["clone", "migrate", "adopt"] {
         let root = TestDir::new("copy-shared-git");
         let (mut env, source, donor) = copied_config_fixture(&root);
@@ -3321,7 +3321,7 @@ fn env_clone_copied_git_shared_repositories_read_history_without_the_source() {
 }
 
 #[test]
-fn env_clone_copied_git_shared_repositories_refuse_uncopied_donors() {
+fn env_clone_copied_git_config_shared_repositories_refuse_uncopied_donors() {
     for route in ["clone", "migrate", "adopt"] {
         let root = TestDir::new("copy-shared-git-external");
         let (env, source, donor) = copied_config_fixture(&root);
