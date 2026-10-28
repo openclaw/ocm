@@ -1485,6 +1485,12 @@ ocm env snapshot list mira
 ocm env snapshot list --all
 ```
 
+Snapshot ownership uses the exact environment name. If names such as `Demo` and
+`demo` share a snapshot directory on a case-insensitive filesystem, each list
+shows only that owner's validated records and `--all` shows each record once.
+Existing snapshots remain readable in place, including snapshots retained after
+an environment is removed. Corrupt or misplaced metadata still fails listing.
+
 Show:
 
 ```bash
@@ -1518,6 +1524,10 @@ Prune:
 ```bash
 ocm env snapshot prune mira --keep 3 --yes
 ```
+
+With `--all`, retention is applied separately to each exact environment name,
+including names whose snapshot directories refer to the same physical directory.
+Show, restore, and remove require the snapshot's exact owner name.
 
 ### Export and import
 

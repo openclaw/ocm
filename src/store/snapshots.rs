@@ -1276,13 +1276,10 @@ pub fn list_env_snapshots(
     let files = load_json_files(&dir)?;
     let mut out = Vec::with_capacity(files.len());
     for file in files {
-        let snapshot_id = file
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| format!("snapshot path has an invalid id: {}", display_path(&file)))?;
-        let snapshot = read_json(&file)?;
-        validate_env_snapshot_identity(&snapshot, &safe_env_name, snapshot_id, env, cwd)?;
-        out.push(snapshot);
+        let snapshot = read_inventory_snapshot(&file, &safe_env_name, env, cwd)?;
+        if snapshot.env_name == safe_env_name {
+            out.push(snapshot);
+        }
     }
     sort_snapshots(&mut out);
     Ok(out)
@@ -1313,19 +1310,42 @@ pub fn list_all_env_snapshots(
         let env_name = validate_name(env_name, "Environment name")?;
         let files = load_json_files(&path)?;
         for file in files {
-            let snapshot_id = file
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| {
-                    format!("snapshot path has an invalid id: {}", display_path(&file))
-                })?;
-            let snapshot = read_json(&file)?;
-            validate_env_snapshot_identity(&snapshot, &env_name, snapshot_id, env, cwd)?;
-            out.push(snapshot);
+            out.push(read_inventory_snapshot(&file, &env_name, env, cwd)?);
         }
     }
     sort_snapshots(&mut out);
     Ok(out)
+}
+
+fn read_inventory_snapshot(
+    file: &Path,
+    directory_owner: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvSnapshotMeta, String> {
+    let snapshot_id = file
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("snapshot path has an invalid id: {}", display_path(file)))?;
+    let snapshot: EnvSnapshotMeta = read_json(file)?;
+    // Validate even records that a scoped list will filter out. A shared directory
+    // must not hide corrupt metadata belonging to the other exact owner.
+    validate_env_snapshot_identity(&snapshot, &snapshot.env_name, snapshot_id, env, cwd)?;
+    if snapshot.env_name != directory_owner {
+        let expected = snapshot_meta_path(&snapshot.env_name, snapshot_id, env, cwd)?;
+        if !snapshot.env_name.eq_ignore_ascii_case(directory_owner)
+            || path_identity(&snapshot_env_dir(&snapshot.env_name, env, cwd)?)?
+                != path_identity(&snapshot_env_dir(directory_owner, env, cwd)?)?
+            || path_identity(&expected)? != path_identity(file)?
+        {
+            return Err(format!(
+                "snapshot metadata {} is not in its environment's expected location {}",
+                display_path(file),
+                display_path(&expected)
+            ));
+        }
+    }
+    Ok(snapshot)
 }
 
 fn validate_env_snapshot_identity(

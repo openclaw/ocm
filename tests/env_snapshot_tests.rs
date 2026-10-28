@@ -475,6 +475,231 @@ fn env_snapshot_list_json_supports_the_global_view() {
 }
 
 #[test]
+fn env_snapshot_inventory_preserves_exact_case_owners_through_retention() {
+    let root = TestDir::new("snapshot-case-owners");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    let run = |args: &[&str]| {
+        let result = run_ocm(cwd, &env, args);
+        assert!(result.status.success(), "{args:?}: {}", stderr(&result));
+        serde_json::from_str::<Value>(&stdout(&result)).unwrap()
+    };
+    for (name, directory) in [("Demo", "upper"), ("demo", "lower")] {
+        run(&[
+            "env",
+            "create",
+            name,
+            "--root",
+            &path_string(&root.child(directory)),
+            "--json",
+        ]);
+        write_text(
+            &root.child(directory).join(".openclaw/workspace/note"),
+            name,
+        );
+    }
+    let upper = run(&["env", "snapshot", "create", "Demo", "--json"]);
+    let upper_id = upper["id"].as_str().unwrap();
+    assert_eq!(
+        run(&["env", "snapshot", "list", "demo", "--json"]),
+        serde_json::json!([])
+    );
+    let lower = run(&["env", "snapshot", "create", "demo", "--json"]);
+    let lower_id = lower["id"].as_str().unwrap();
+    let lower_artifact = Path::new(lower["archivePath"].as_str().unwrap());
+    let lower_note = lower_artifact.join(".openclaw/workspace/note");
+    let lower_metadata = root
+        .child("ocm-home/snapshots/demo")
+        .join(format!("{lower_id}.json"));
+    let original_lower_metadata = fs::read(&lower_metadata).unwrap();
+    for (name, own, foreign) in [("Demo", upper_id, lower_id), ("demo", lower_id, upper_id)] {
+        let list = run(&["env", "snapshot", "list", name, "--json"]);
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["envName"], name);
+        assert_eq!(list[0]["id"], own);
+        assert_eq!(
+            run(&["env", "snapshot", "show", name, own, "--json"])["id"],
+            own
+        );
+        for action in ["show", "restore", "remove"] {
+            let rejected = run_ocm(cwd, &env, &["env", "snapshot", action, name, foreign]);
+            assert!(
+                !rejected.status.success(),
+                "{action} accepted a foreign owner"
+            );
+        }
+    }
+    assert_eq!(
+        run(&["env", "snapshot", "list", "--all", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(fs::read(&lower_metadata).unwrap(), original_lower_metadata);
+    assert_eq!(fs::read_to_string(&lower_note).unwrap(), "demo");
+    assert_eq!(
+        fs::read_to_string(root.child("upper/.openclaw/workspace/note")).unwrap(),
+        "Demo"
+    );
+    assert_eq!(
+        fs::read_to_string(root.child("lower/.openclaw/workspace/note")).unwrap(),
+        "demo"
+    );
+
+    write_text(&root.child("upper/.openclaw/workspace/note"), "drift");
+    // An unreadable selected artifact must leave both live roots and its sibling intact.
+    let upper_artifact = Path::new(upper["archivePath"].as_str().unwrap());
+    let held_artifact = root.child("held-artifact");
+    fs::rename(upper_artifact, &held_artifact).unwrap();
+    let failed = run_ocm(cwd, &env, &["env", "snapshot", "restore", "Demo", upper_id]);
+    assert!(!failed.status.success());
+    assert_eq!(
+        fs::read_to_string(root.child("upper/.openclaw/workspace/note")).unwrap(),
+        "drift"
+    );
+    fs::rename(&held_artifact, upper_artifact).unwrap();
+    run(&["env", "snapshot", "restore", "Demo", upper_id, "--json"]);
+    assert_eq!(
+        fs::read_to_string(root.child("upper/.openclaw/workspace/note")).unwrap(),
+        "Demo"
+    );
+    assert_eq!(
+        fs::read_to_string(root.child("lower/.openclaw/workspace/note")).unwrap(),
+        "demo"
+    );
+    assert_eq!(fs::read_to_string(&lower_note).unwrap(), "demo");
+    assert_eq!(fs::read(&lower_metadata).unwrap(), original_lower_metadata);
+
+    // Linked recovery shares the same owner directory as well; only the selected
+    // snapshot's marker may be reclaimed by removal or prune.
+    let upper_recovery = root.child("ocm-home/upgrade-history/Demo/upper.recovery");
+    let lower_recovery = root.child("ocm-home/upgrade-history/demo/lower.recovery");
+    for (path, id) in [(&upper_recovery, upper_id), (&lower_recovery, lower_id)] {
+        write_text(&path.join("snapshot-id"), id);
+        write_text(&path.join("payload"), "retained runtime bytes");
+    }
+    let upper_new = run(&["env", "snapshot", "create", "Demo", "--json"]);
+    let lower_new = run(&["env", "snapshot", "create", "demo", "--json"]);
+    let preview = run(&["env", "snapshot", "prune", "--all", "--keep", "1", "--json"]);
+    assert_eq!(preview["count"], 2);
+    run(&[
+        "env", "snapshot", "prune", "Demo", "--keep", "1", "--yes", "--json",
+    ]);
+    assert!(!upper_artifact.exists());
+    assert!(!upper_recovery.exists());
+    assert_eq!(
+        fs::read_to_string(lower_recovery.join("payload")).unwrap(),
+        "retained runtime bytes"
+    );
+    assert_eq!(fs::read_to_string(&lower_note).unwrap(), "demo");
+    assert_eq!(
+        run(&["env", "snapshot", "list", "demo", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    run(&[
+        "env", "snapshot", "prune", "--all", "--keep", "1", "--yes", "--json",
+    ]);
+    assert!(!lower_artifact.exists());
+    assert!(!lower_recovery.exists());
+    for (name, snapshot) in [("Demo", &upper_new), ("demo", &lower_new)] {
+        let list = run(&["env", "snapshot", "list", name, "--json"]);
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["id"], snapshot["id"]);
+    }
+    run(&[
+        "env",
+        "snapshot",
+        "remove",
+        "Demo",
+        upper_new["id"].as_str().unwrap(),
+        "--json",
+    ]);
+    assert!(Path::new(lower_new["archivePath"].as_str().unwrap()).exists());
+    // Environment removal retains snapshots, including global inventory when no
+    // registry entry remains to supply the exact owner spelling.
+    run(&["env", "remove", "demo", "--json"]);
+    assert!(root.child("upper/.openclaw/workspace/note").exists());
+    let retained = run(&["env", "snapshot", "list", "--all", "--json"]);
+    assert_eq!(retained.as_array().unwrap().len(), 1);
+    assert_eq!(retained[0]["envName"], "demo");
+    assert_eq!(
+        run(&["env", "snapshot", "list", "demo", "--json"])[0]["id"],
+        lower_new["id"]
+    );
+}
+
+#[test]
+fn env_snapshot_inventory_validates_foreign_records_before_filtering() {
+    let root = TestDir::new("snapshot-inventory-validation");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    for (name, directory) in [("Demo", "upper"), ("demo", "lower")] {
+        let created = run_ocm(
+            cwd,
+            &env,
+            &[
+                "env",
+                "create",
+                name,
+                "--root",
+                &path_string(&root.child(directory)),
+            ],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+    }
+    let created = run_ocm(cwd, &env, &["env", "snapshot", "create", "Demo", "--json"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let snapshot: Value = serde_json::from_str(&stdout(&created)).unwrap();
+    let id = snapshot["id"].as_str().unwrap();
+    let actual = root
+        .child("ocm-home/snapshots/Demo")
+        .join(format!("{id}.json"));
+    let lower_dir = root.child("ocm-home/snapshots/demo");
+    // On case-sensitive volumes, copy the foreign metadata to exercise the
+    // misplaced-record guard. On insensitive volumes this is already one file.
+    fs::create_dir_all(&lower_dir).unwrap();
+    let misplaced = lower_dir.join(format!("{id}.json"));
+    let aliases =
+        actual.parent().unwrap().canonicalize().unwrap() == lower_dir.canonicalize().unwrap();
+    if !aliases {
+        fs::copy(&actual, &misplaced).unwrap();
+        let rejected = run_ocm(cwd, &env, &["env", "snapshot", "list", "demo"]);
+        assert!(
+            !rejected.status.success(),
+            "distinct directories admitted foreign metadata"
+        );
+    }
+    let original = fs::read(&misplaced).unwrap();
+    let metadata: Value = serde_json::from_slice(&original).unwrap();
+    for (field, value) in [
+        ("id", serde_json::json!("different")),
+        ("kind", serde_json::json!("unsupported")),
+        ("storageKind", serde_json::json!("unsupported")),
+        ("upgradeScope", serde_json::json!({"independent_paths": []})),
+        (
+            "archivePath",
+            serde_json::json!(path_string(&root.child("foreign"))),
+        ),
+        ("envName", serde_json::json!("other")),
+    ] {
+        let mut corrupt = metadata.clone();
+        corrupt[field] = value;
+        fs::write(&misplaced, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+        for scope in ["demo", "--all"] {
+            let rejected = run_ocm(cwd, &env, &["env", "snapshot", "list", scope]);
+            assert!(!rejected.status.success(), "{scope} hid corrupt {field}");
+        }
+    }
+    fs::write(&misplaced, b"{broken json").unwrap();
+    let rejected = run_ocm(cwd, &env, &["env", "snapshot", "list", "demo"]);
+    assert!(!rejected.status.success());
+}
+
+#[test]
 fn env_snapshot_restore_reverts_state_from_the_selected_snapshot() {
     let root = TestDir::new("env-snapshot-restore");
     let cwd = root.child("workspace");
