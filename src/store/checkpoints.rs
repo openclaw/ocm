@@ -131,6 +131,7 @@ enum SqliteCheck {
     NotDatabase,
     Verified,
     Deferred,
+    ReadOnlyDirectory,
 }
 
 pub(crate) fn default_snapshot_storage_kind() -> String {
@@ -343,14 +344,61 @@ fn preflight_sqlite_databases(root: &Path, independent: &[PathBuf]) -> Result<()
 }
 
 fn verify_sqlite_database(path: &Path) -> Result<bool, String> {
-    match check_sqlite_database(path)? {
+    let mut check = check_sqlite_database(path)?;
+    if check == SqliteCheck::ReadOnlyDirectory {
+        // Only the isolated captured tree reaches this verifier. A live source
+        // must retain SQLite locking and defer this check until after capture.
+        let connection = open_closed_checkpoint_database(path)?;
+        check = check_sqlite_integrity(path, &connection)?;
+    }
+    match check {
         SqliteCheck::NotDatabase => Ok(false),
         SqliteCheck::Verified => Ok(true),
         SqliteCheck::Deferred => Err(format!(
             "checkpoint SQLite database remained busy after quiescence: {}",
             display_path(path)
         )),
+        SqliteCheck::ReadOnlyDirectory => Err(format!(
+            "checkpoint SQLite database requires a writable directory: {}",
+            display_path(path)
+        )),
     }
+}
+
+fn open_closed_checkpoint_database(path: &Path) -> Result<Connection, String> {
+    // Immutable reads ignore WAL and rollback journals. Never select this path
+    // when any sidecar exists, including a dangling link, or cannot be inspected.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        match fs::symlink_metadata(&sidecar) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            result => {
+                return Err(format!(
+                    "cannot verify read-only checkpoint SQLite database {} without normal sidecar access: {}",
+                    display_path(path),
+                    result
+                        .err()
+                        .map_or_else(|| "sidecar present".to_string(), |error| error.to_string())
+                ));
+            }
+        }
+    }
+    let mut location =
+        url::Url::from_file_path(path).map_err(|_| "invalid checkpoint database path")?;
+    location.set_query(Some("immutable=1"));
+    Connection::open_with_flags(
+        location.as_str(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to open checkpoint SQLite database {}: {error}",
+            display_path(path)
+        )
+    })
 }
 
 fn check_sqlite_database(path: &Path) -> Result<SqliteCheck, String> {
@@ -366,6 +414,9 @@ fn check_sqlite_database(path: &Path) -> Result<SqliteCheck, String> {
     ) {
         Ok(connection) => connection,
         Err(error) if sqlite_is_busy(&error) => return Ok(SqliteCheck::Deferred),
+        Err(error) if sqlite_needs_writable_directory(&error) => {
+            return Ok(SqliteCheck::ReadOnlyDirectory);
+        }
         Err(error) => {
             return Err(format!(
                 "failed to open checkpoint SQLite database {}: {error}",
@@ -373,9 +424,16 @@ fn check_sqlite_database(path: &Path) -> Result<SqliteCheck, String> {
             ));
         }
     };
+    check_sqlite_integrity(path, &connection)
+}
+
+fn check_sqlite_integrity(path: &Path, connection: &Connection) -> Result<SqliteCheck, String> {
     let result: String = match connection.query_row("PRAGMA quick_check", [], |row| row.get(0)) {
         Ok(result) => result,
         Err(error) if sqlite_is_busy(&error) => return Ok(SqliteCheck::Deferred),
+        Err(error) if sqlite_needs_writable_directory(&error) => {
+            return Ok(SqliteCheck::ReadOnlyDirectory);
+        }
         Err(error) => {
             return Err(format!(
                 "failed to verify checkpoint SQLite database {}: {error}",
@@ -390,6 +448,12 @@ fn check_sqlite_database(path: &Path) -> Result<SqliteCheck, String> {
         ));
     }
     Ok(SqliteCheck::Verified)
+}
+
+fn sqlite_needs_writable_directory(error: &rusqlite::Error) -> bool {
+    error
+        .sqlite_error()
+        .is_some_and(|error| error.extended_code == rusqlite::ffi::SQLITE_READONLY_DIRECTORY)
 }
 
 fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
@@ -474,7 +538,11 @@ fn prepare_entry_path(
             relative,
             PreparedEntry {
                 fingerprint: after.filter(|fingerprint| {
-                    *fingerprint == before && sqlite_check != SqliteCheck::Deferred
+                    *fingerprint == before
+                        && matches!(
+                            sqlite_check,
+                            SqliteCheck::NotDatabase | SqliteCheck::Verified
+                        )
                 }),
                 sqlite: sqlite_check != SqliteCheck::NotDatabase,
             },
@@ -2013,7 +2081,6 @@ mod tests {
         assert!(!destination.exists());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn prepared_checkpoint_defers_busy_sqlite_until_capture() {
         let source = tempfile::tempdir().unwrap();
@@ -2028,16 +2095,61 @@ mod tests {
             )
             .unwrap();
 
-        let prepared = prepare_tree_checkpoint(source.path()).unwrap();
+        assert_eq!(
+            super::check_sqlite_database(&database_path).unwrap(),
+            super::SqliteCheck::Deferred
+        );
+        let prepared = super::prepare_tree_checkpoint(source.path()).unwrap();
         database.execute_batch("ROLLBACK").unwrap();
         drop(database);
         let destination_parent = tempfile::tempdir().unwrap();
         let destination = destination_parent.path().join("checkpoint");
 
-        let storage = create_tree_checkpoint_from_preparation(prepared, &destination).unwrap();
+        let storage =
+            super::create_tree_checkpoint_from_preparation(prepared, &destination).unwrap();
 
+        #[cfg(target_os = "macos")]
         assert_eq!(storage, STORAGE_APFS_CLONE);
-        verify_tree_checkpoint(source.path(), &destination).unwrap();
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(storage, super::STORAGE_FULL_COPY);
+        super::verify_tree_checkpoint(source.path(), &destination).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_sqlite_retry_requires_absent_sidecars() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let database_path = root.path().join("state.sqlite");
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE state(value TEXT);")
+            .unwrap();
+        drop(database);
+        fs::set_permissions(&database_path, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        assert_eq!(
+            super::check_sqlite_database(&database_path).unwrap(),
+            super::SqliteCheck::ReadOnlyDirectory
+        );
+        assert!(super::verify_sqlite_database(&database_path).unwrap());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = root.path().join(format!("state.sqlite{suffix}"));
+            fs::write(&sidecar, b"sidecar bytes").unwrap();
+            assert!(
+                super::open_closed_checkpoint_database(&database_path).is_err(),
+                "{suffix}"
+            );
+            fs::remove_file(&sidecar).unwrap();
+            symlink("missing", &sidecar).unwrap();
+            assert!(
+                super::open_closed_checkpoint_database(&database_path).is_err(),
+                "{suffix}"
+            );
+            fs::remove_file(sidecar).unwrap();
+        }
     }
 
     #[cfg(target_os = "macos")]

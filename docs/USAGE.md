@@ -1437,6 +1437,11 @@ ordinary `user.*` extended attributes can be captured and restored together.
 OCM preserves their final modes and attributes without making the live source
 writable or removing its attributes.
 
+Clean, closed WAL-mode SQLite databases can also be captured and restored from
+read-only directories without creating sidecars there. SQLite integrity checks
+remain required; databases with WAL or journal sidecars retain normal SQLite
+validation so committed sidecar data is not ignored.
+
 A symlinked environment root is resolved for capture so the checkpoint contains
 independent bytes; links inside the root remain links. Restore replaces the
 registered root entry with the captured directory. If that entry is a symlink,
