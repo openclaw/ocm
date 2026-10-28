@@ -1,14 +1,16 @@
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::{MaybeUninit, size_of};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    ERROR_FILENAME_EXCED_RANGE, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, AddAccessAllowedAce,
@@ -107,7 +109,22 @@ pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
         if unsafe { CreateDirectoryW(encoded.as_ptr(), attributes) } != 0 {
             return Ok(());
         }
-        let error = io::Error::last_os_error();
+        let mut error = io::Error::last_os_error();
+        let mut retry_path = None;
+        if error.raw_os_error() == Some(ERROR_FILENAME_EXCED_RANGE as i32) {
+            let extended = extended_directory_path(path)?;
+            if extended.as_os_str() == path.as_os_str() {
+                return Err(error);
+            }
+            encoded = extended.as_os_str().encode_wide().chain(Some(0)).collect();
+            retry_path = Some(extended);
+            // Retry with the same protected descriptor. Ordinary successful
+            // paths retain their original Win32 interpretation.
+            if unsafe { CreateDirectoryW(encoded.as_ptr(), attributes) } != 0 {
+                return Ok(());
+            }
+            error = io::Error::last_os_error();
+        }
         if error.kind() != io::ErrorKind::AlreadyExists {
             return Err(error);
         }
@@ -115,7 +132,7 @@ pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
             .access_mode(READ_CONTROL | WRITE_DAC | WRITE_OWNER)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)?;
+            .open(retry_path.as_deref().unwrap_or(path))?;
         let metadata = directory.metadata()?;
         if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(io::Error::new(
@@ -137,6 +154,35 @@ pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
         }
         Ok(())
     })
+}
+
+fn extended_directory_path(path: &Path) -> io::Result<PathBuf> {
+    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    const SEP: u16 = b'\\' as u16;
+    const QUERY: u16 = b'?' as u16;
+    const COLON: u16 = b':' as u16;
+    const DOT: u16 = b'.' as u16;
+    if encoded.starts_with(&[SEP, SEP, QUERY, SEP])
+        || encoded.starts_with(&[SEP, QUERY, QUERY, SEP])
+    {
+        return Ok(path.to_owned());
+    }
+    // GetFullPathNameW semantics normalize relative paths, separators and dot
+    // components without following the final entry (unlike canonicalize).
+    let absolute = std::path::absolute(path)?;
+    let encoded = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    let (prefix, rest) = match encoded.as_slice() {
+        [_, COLON, SEP, ..] => (r"\\?\", encoded.as_slice()),
+        [SEP, SEP, DOT, SEP, rest @ ..] => (r"\\?\", rest),
+        [SEP, SEP, QUERY, SEP, ..] | [SEP, QUERY, QUERY, SEP, ..] => ("", encoded.as_slice()),
+        [SEP, SEP, rest @ ..] => (r"\\?\UNC\", rest),
+        _ => ("", encoded.as_slice()),
+    };
+    let extended = prefix
+        .encode_utf16()
+        .chain(rest.iter().copied())
+        .collect::<Vec<_>>();
+    Ok(PathBuf::from(OsString::from_wide(&extended)))
 }
 
 pub(crate) fn owned_handle(raw: HANDLE) -> io::Result<OwnedHandle> {
@@ -374,4 +420,31 @@ pub(crate) fn has_user_only_access(file: &File) -> io::Result<bool> {
 #[cfg(test)]
 pub(crate) fn assert_private_file_security(file: &File) {
     assert!(has_user_only_access(file).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_config_extended_directory_namespaces_are_lexical() {
+        for (input, expected) in [
+            (r"C:\one/../two", r"\\?\C:\two"),
+            (r"\\server\share\one\..\two", r"\\?\UNC\server\share\two"),
+            (r"\\.\C:\one\..\two", r"\\?\C:\two"),
+            (r"\\?\C:\literal. ", r"\\?\C:\literal. "),
+            (
+                r"\\?\UNC\server\share\literal. ",
+                r"\\?\UNC\server\share\literal. ",
+            ),
+            (r"\??\C:\literal. ", r"\??\C:\literal. "),
+        ] {
+            assert_eq!(
+                extended_directory_path(Path::new(input))
+                    .unwrap()
+                    .as_os_str(),
+                expected
+            );
+        }
+    }
 }
