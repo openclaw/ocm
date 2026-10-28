@@ -1228,6 +1228,10 @@ OpenClaw worktree registry. Their repositories and required Git storage must all
 be inside the copied footprint. Staging in the destination then uses its own
 index; the source checkout and registrations remain unchanged. An incomplete or
 external Git graph fails the copy and removes the provisional target.
+Ordinary shared Git checkouts created with `git clone --shared` also relocate
+their object-alternate paths during clone, `migrate`, and `adopt import`. The
+donor object storage must be inside the copied footprint. The copied checkout
+can then read its history after the original environment is moved or removed.
 Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 The same active-state ownership check applies to migration and its existing import rollback.
 

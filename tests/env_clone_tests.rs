@@ -3271,6 +3271,107 @@ fn copied_config_fixture(
 }
 
 #[test]
+fn env_clone_copied_git_shared_repositories_read_history_without_the_source() {
+    for route in ["clone", "migrate", "adopt"] {
+        let root = TestDir::new("copy-shared-git");
+        let (mut env, source, donor) = copied_config_fixture(&root);
+        env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+        let workspace = source.join(".openclaw/workspace");
+        for (name, flag) in [("shared", "--shared"), ("independent", "--no-hardlinks")] {
+            copied_config_git(
+                &workspace,
+                &env,
+                &["clone", flag, donor.to_str().unwrap(), name],
+            );
+        }
+        let before = file_bytes(&source);
+        let home = source.join(".openclaw");
+        let output = match route {
+            "clone" => run_ocm(root.path(), &env, &["env", "clone", "source", "target"]),
+            "migrate" => run_ocm(
+                root.path(),
+                &env,
+                &["migrate", "target", home.to_str().unwrap()],
+            ),
+            "adopt" => run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "adopt",
+                    "import",
+                    "--name",
+                    "target",
+                    home.to_str().unwrap(),
+                ],
+            ),
+            _ => unreachable!(),
+        };
+        assert!(output.status.success(), "{route}: {}", stderr(&output));
+        assert_eq!(file_bytes(&source), before, "{route} changed source bytes");
+        fs::rename(&source, source.with_extension("offline")).unwrap();
+        let target = source.parent().unwrap().join("target/.openclaw/workspace");
+        for name in ["nested repo", "shared", "independent"] {
+            assert_eq!(
+                copied_config_git(&target.join(name), &env, &["show", "HEAD:file"]),
+                "authored content",
+                "{route}: {name} depends on the original environment"
+            );
+        }
+    }
+}
+
+#[test]
+fn env_clone_copied_git_shared_repositories_refuse_uncopied_donors() {
+    for route in ["clone", "migrate", "adopt"] {
+        let root = TestDir::new("copy-shared-git-external");
+        let (env, source, donor) = copied_config_fixture(&root);
+        let external = root.child("external donor");
+        fs::rename(&donor, &external).unwrap();
+        let workspace = source.join(".openclaw/workspace");
+        copied_config_git(
+            &workspace,
+            &env,
+            &["clone", "--shared", external.to_str().unwrap(), "shared"],
+        );
+        let source_before = file_bytes(&source);
+        let donor_before = file_bytes(&external);
+        let home = source.join(".openclaw");
+        let output = match route {
+            "clone" => run_ocm(root.path(), &env, &["env", "clone", "source", "target"]),
+            "migrate" => run_ocm(
+                root.path(),
+                &env,
+                &["migrate", "target", home.to_str().unwrap()],
+            ),
+            "adopt" => run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "adopt",
+                    "import",
+                    "--name",
+                    "target",
+                    home.to_str().unwrap(),
+                ],
+            ),
+            _ => unreachable!(),
+        };
+        assert!(
+            !output.status.success(),
+            "{route} copied an external dependency"
+        );
+        assert!(
+            stderr(&output).contains("Git alternate is outside the copied environment"),
+            "{route}: {}",
+            stderr(&output)
+        );
+        assert!(!source.parent().unwrap().join("target").exists());
+        assert_eq!(file_bytes(&source), source_before);
+        assert_eq!(file_bytes(&external), donor_before);
+    }
+}
+
+#[test]
 fn env_clone_copied_git_config_native_worktrees_stage_independently_without_a_registry() {
     for route in ["clone", "migrate", "adopt"] {
         for storage_only in [false, true] {

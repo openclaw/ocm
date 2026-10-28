@@ -184,7 +184,7 @@ pub(in crate::store) fn validate_copied_git_config(
 
 /// Structural roots must be relocated before Git can safely resolve their
 /// configuration contexts. Ordinary repositories keep their existing config-only
-/// path unless native worktree registrations require structural relocation.
+/// path unless worktree registrations or object alternates require relocation.
 pub(in crate::store) struct CopiedGitRepositories {
     pub roots: Vec<PathBuf>,
     pub contexts: Vec<CopiedGitConfigContext>,
@@ -241,7 +241,7 @@ pub(in crate::store) fn copied_destination_git_repositories(
         } else if let Some(context) = copied_destination_git_context(&canonical_target, &path)? {
             // Native validation distinguishes ordinary repositories from opaque
             // project fixtures containing .git/HEAD and objects lookalikes.
-            if entry.join("worktrees").exists() {
+            if entry.join("worktrees").exists() || entry.join("objects/info/alternates").exists() {
                 git_roots.insert(path.clone());
             }
             for directory in [&context.private_dir, &context.common_dir] {
