@@ -1382,6 +1382,15 @@ fn preserve_metadata(
     metadata: &fs::Metadata,
     symlink: bool,
 ) -> Result<(), String> {
+    // Linux requires write permission to set user attributes. Keep the new
+    // destination writable until its attributes have been copied, then apply
+    // the source's final mode (which may be read-only).
+    #[cfg(unix)]
+    for name in xattr::list(source).map_err(|error| error.to_string())? {
+        if let Some(value) = xattr::get(source, &name).map_err(|error| error.to_string())? {
+            xattr::set(destination, &name, &value).map_err(|error| error.to_string())?;
+        }
+    }
     if !symlink {
         fs::set_permissions(destination, metadata.permissions())
             .map_err(|error| error.to_string())?;
@@ -1393,12 +1402,6 @@ fn preserve_metadata(
             .map_err(|error| error.to_string())?;
     } else {
         set_file_times(destination, accessed, modified).map_err(|error| error.to_string())?;
-    }
-    #[cfg(unix)]
-    for name in xattr::list(source).map_err(|error| error.to_string())? {
-        if let Some(value) = xattr::get(source, &name).map_err(|error| error.to_string())? {
-            xattr::set(destination, &name, &value).map_err(|error| error.to_string())?;
-        }
     }
     Ok(())
 }

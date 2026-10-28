@@ -1402,6 +1402,11 @@ sidecars, modes, symlinks, plugin data, and unknown future paths. Restore stages
 an exclusive candidate beside the live root and retains the displaced root
 until service acceptance; failed acceptance restores the displaced root.
 
+On Linux, readable files and traversable directories with read-only modes and
+ordinary `user.*` extended attributes can be captured and restored together.
+OCM preserves their final modes and attributes without making the live source
+writable or removing its attributes.
+
 A symlinked environment root is resolved for capture so the checkpoint contains
 independent bytes; links inside the root remain links. Restore replaces the
 registered root entry with the captured directory. If that entry is a symlink,
