@@ -302,14 +302,25 @@ fn service_keeps_gateway_running(meta: &EnvMeta) -> bool {
     meta.service_enabled && meta.service_running
 }
 
-pub fn select_prune_candidates(envs: &[EnvMeta], older_than_days: i64) -> Vec<EnvMeta> {
-    let cutoff = now_utc() - Duration::days(older_than_days);
-    envs.iter()
+fn prune_cutoff(older_than_days: i64) -> Result<OffsetDateTime, String> {
+    older_than_days
+        .checked_mul(86_400)
+        .and_then(|seconds| now_utc().checked_sub(Duration::seconds(seconds)))
+        .ok_or_else(|| "--older-than is outside the supported date range".to_string())
+}
+
+pub fn select_prune_candidates(
+    envs: &[EnvMeta],
+    older_than_days: i64,
+) -> Result<Vec<EnvMeta>, String> {
+    let cutoff = prune_cutoff(older_than_days)?;
+    Ok(envs
+        .iter()
         .filter(|meta| !meta.protected)
         .filter(|meta| !service_keeps_gateway_running(meta))
         .filter(|meta| meta.last_used_at.unwrap_or(meta.created_at) < cutoff)
         .cloned()
-        .collect()
+        .collect())
 }
 
 impl<'a> EnvironmentService<'a> {
@@ -570,7 +581,7 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn prune_candidates(&self, older_than_days: i64) -> Result<Vec<EnvMeta>, String> {
         let envs = list_environments(self.env, self.cwd)?;
-        let candidates = select_prune_candidates(&envs, older_than_days);
+        let candidates = select_prune_candidates(&envs, older_than_days)?;
         for candidate in &candidates {
             crate::store::ensure_environment_removal_preserves_registered_roots(candidate, &envs)?;
         }
@@ -578,8 +589,8 @@ impl<'a> EnvironmentService<'a> {
     }
 
     pub fn prune(&self, older_than_days: i64) -> Result<Vec<EnvMeta>, String> {
+        let cutoff = prune_cutoff(older_than_days)?;
         let candidates = self.prune_candidates(older_than_days)?;
-        let cutoff = now_utc() - Duration::days(older_than_days);
         let mut removed = Vec::with_capacity(candidates.len());
         for meta in candidates {
             let _lock = self.lock_operation(&meta.name)?;
