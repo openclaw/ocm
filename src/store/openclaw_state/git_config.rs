@@ -10,8 +10,7 @@ use crate::openclaw_repo::{
 };
 
 use super::{
-    IntegrityProtectedLibraryPaths, copied_history_state_roots, is_copied_git_entry,
-    is_integrity_protected_history_destination, is_integrity_protected_history_path,
+    copied_history_state_roots, is_copied_git_entry, is_integrity_protected_history_destination,
     with_owner_write_permission,
 };
 use crate::store::layout::{EnvPaths, display_path};
@@ -184,10 +183,11 @@ pub(in crate::store) fn validate_copied_git_config(
 }
 
 /// Structural roots must be relocated before Git can safely resolve their
-/// configuration contexts. Native bare repositories have no .git entry.
+/// configuration contexts. Ordinary repositories keep their existing config-only
+/// path unless native worktree registrations require structural relocation.
 pub(in crate::store) struct CopiedGitRepositories {
     pub roots: Vec<PathBuf>,
-    pub bare_contexts: Vec<CopiedGitConfigContext>,
+    pub contexts: Vec<CopiedGitConfigContext>,
 }
 
 pub(in crate::store) fn copied_workspace_git_repositories(
@@ -212,48 +212,62 @@ pub(in crate::store) fn copied_destination_git_repositories(
 ) -> Result<CopiedGitRepositories, String> {
     let mut pending = roots.into_iter().collect::<Vec<_>>();
     let mut seen = BTreeSet::new();
+    let mut metadata_roots = BTreeSet::new();
     let mut git_roots = BTreeSet::new();
     let canonical_target = fs::canonicalize(&target.root).map_err(|e| e.to_string())?;
-    let history = IntegrityProtectedLibraryPaths::new(&target.state_dir)?;
-    let mut bare_contexts = Vec::new();
+    let mut contexts = Vec::new();
     while let Some(path) = pending.pop() {
-        if is_integrity_protected_history_path(&target.state_dir, &path)
-            || history.roots.iter().any(|root| path.starts_with(root))
-        {
-            continue;
-        }
         let metadata = match fs::symlink_metadata(&path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.to_string()),
         };
-        if !metadata.is_dir() || !seen.insert(path.clone()) {
+        if !metadata.is_dir() || metadata_roots.contains(&path) || !seen.insert(path.clone()) {
             continue;
         }
-        if fs::symlink_metadata(path.join(".git")).is_err()
-            && let Some(context) = copied_destination_git_context(&canonical_target, &path)?
-        {
-            bare_contexts.push(context);
-            continue; // Do not scan a native bare repository's administrative storage.
+        let entry = path.join(".git");
+        let structural_pointer = match fs::symlink_metadata(&entry) {
+            Ok(metadata) => {
+                (!metadata.is_dir() || entry.join("commondir").is_file())
+                    && is_copied_git_entry(&entry, metadata.file_type())?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.to_string()),
+        };
+        if structural_pointer {
+            // The copied gitfile may still select source storage, including a
+            // source that is now offline. Let the graph validate its projection.
+            git_roots.insert(path.clone());
+        } else if let Some(context) = copied_destination_git_context(&canonical_target, &path)? {
+            // Native validation distinguishes ordinary repositories from opaque
+            // project fixtures containing .git/HEAD and objects lookalikes.
+            if entry.join("worktrees").exists() {
+                git_roots.insert(path.clone());
+            }
+            for directory in [&context.private_dir, &context.common_dir] {
+                let owned = owned(&canonical_target, directory)?;
+                metadata_roots.insert(
+                    target
+                        .root
+                        .join(owned.strip_prefix(&canonical_target).unwrap()),
+                );
+            }
+            contexts.push(context);
+            if !entry.exists() {
+                continue; // A native bare repository is administrative storage.
+            }
         }
-        for entry in fs::read_dir(&path).map_err(|e| e.to_string())? {
+        for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
-            let kind = entry.file_type().map_err(|e| e.to_string())?;
-            if entry.file_name() == ".git" {
-                // Do not resolve copied gitfiles against the source. The graph
-                // owner projects and validates every required destination first.
-                if is_copied_git_entry(&entry.path(), kind)? {
-                    git_roots.insert(path.clone());
-                }
-            } else if kind.is_dir() {
-                // Never follow directory links or descend into .git storage.
+            if entry.file_name() != ".git" && entry.file_type().map_err(|e| e.to_string())?.is_dir()
+            {
                 pending.push(entry.path());
             }
         }
     }
     Ok(CopiedGitRepositories {
         roots: git_roots.into_iter().collect(),
-        bare_contexts,
+        contexts,
     })
 }
 

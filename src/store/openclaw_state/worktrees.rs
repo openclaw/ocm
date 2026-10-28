@@ -432,6 +432,7 @@ fn read_managed_registry(
                 "cannot copy managed worktree {id}: repository and checkout have different Git ownership"
             ));
         }
+        graph.preserved.extend([repo.clone(), checkout.clone()]);
         records.push(CopiedWorktree { id, repo, checkout });
     }
     Ok(records)
@@ -688,8 +689,12 @@ impl CopyGraph<'_> {
             common: common.clone(),
         };
         self.checkouts.insert(root.clone(), identity.clone());
-        self.preserved
-            .extend([root.clone(), private.clone(), common.clone()]);
+        self.preserved.extend([private.clone(), common.clone()]);
+        if private != common {
+            // Linked checkouts need complete retention. An ordinary repository
+            // keeps the caller's existing workspace/runtime-debris policy.
+            self.preserved.insert(root.clone());
+        }
         if self.commons.insert(common.clone()) {
             self.inspect_metadata(&common, MetadataScope::Root)?;
             self.alternates(&common.join("objects"))?;

@@ -840,7 +840,7 @@ fn clone_environment_with_policy(
                 (&source_paths.root, &target_paths.root),
                 (&canonical_source_root, &target_paths.root),
             ],
-            git_repositories.bare_contexts,
+            git_repositories.contexts,
             &git_repositories.roots,
         )?;
         let created_at = now_utc();

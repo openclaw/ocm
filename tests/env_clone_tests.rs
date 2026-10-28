@@ -4107,6 +4107,8 @@ fn env_clone_copied_git_config_preserves_bare_repositories_and_nonrepository_dat
     copied_config_git(&repo, &env, &["config", "core.bare", "true"]);
     let workspace = source.join(".openclaw/workspace");
     write_text(&workspace.join("data/.git"), "ordinary data\n");
+    write_text(&workspace.join("lookalike/.git/HEAD"), "not a Git HEAD\n");
+    fs::create_dir_all(workspace.join("lookalike/.git/objects")).unwrap();
     write_text(
         &workspace.join("directory/.git/config"),
         "not Git configuration\n",
@@ -4137,6 +4139,10 @@ fn env_clone_copied_git_config_preserves_bare_repositories_and_nonrepository_dat
         "ordinary data\n"
     );
     assert_eq!(
+        fs::read_to_string(target.join("lookalike/.git/HEAD")).unwrap(),
+        "not a Git HEAD\n"
+    );
+    assert_eq!(
         fs::read_to_string(target.join("directory/.git/config")).unwrap(),
         "not Git configuration\n"
     );
@@ -4149,6 +4155,53 @@ fn env_clone_copied_git_config_preserves_bare_repositories_and_nonrepository_dat
         .unwrap(),
         fs::canonicalize(target.join("directory/nested")).unwrap()
     );
+}
+
+#[test]
+fn env_clone_copied_git_config_keeps_ordinary_repository_runtime_cleanup() {
+    for linked in [false, true] {
+        let root = TestDir::new("clone-git-runtime-cleanup");
+        let (env, source, original) = copied_config_fixture(&root);
+        let repo = source.join(".openclaw/extensions/generated");
+        fs::create_dir_all(repo.parent().unwrap()).unwrap();
+        fs::rename(original, &repo).unwrap();
+        write_text(&repo.join(".openclaw-runtime-deps.json"), "{}\n");
+        write_text(
+            &repo.join("node_modules/stale"),
+            "generated runtime payload\n",
+        );
+        write_text(
+            &source.join(".openclaw/openclaw.json"),
+            &serde_json::json!({"agents":{"defaults":{"workspace":repo}}}).to_string(),
+        );
+        if linked {
+            managed_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-qb",
+                    "task",
+                    source.join(".openclaw/workspace/task").to_str().unwrap(),
+                ],
+            );
+        }
+        let before = file_bytes(&source);
+        let output = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let target = source
+            .parent()
+            .unwrap()
+            .join("target/.openclaw/extensions/generated");
+        assert!(!target.join(".openclaw-runtime-deps.json").exists());
+        assert!(!target.join("node_modules/stale").exists());
+        assert!(target.join(".git/config").is_file());
+        assert_eq!(
+            fs::read(target.join("file")).unwrap(),
+            b"authored content\n"
+        );
+        assert_eq!(file_bytes(&source), before);
+    }
 }
 
 #[test]
