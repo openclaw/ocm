@@ -3856,6 +3856,10 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
         let mut selected_env = env.clone();
         selected_env.insert("npm_config_install_strategy".into(), strategy.into());
         let native = root.child(&format!("native-{strategy}"));
+        fs::create_dir_all(&native).unwrap();
+        // Native npm's linked strategy also needs a physical prefix for the control.
+        #[cfg(unix)]
+        let native = fs::canonicalize(native).unwrap();
         let install = Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
             .args(["install", "--prefix"])
             .arg(&native)
