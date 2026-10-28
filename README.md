@@ -428,7 +428,11 @@ isolated dependencies, and records artifact and entrypoint hashes for runtime
 verification.
 
 `upgrade simulate` clones the source env, leaves the real env untouched, and
-cleans temporary simulation envs and runtimes when the run finishes. For
+cleans temporary simulation envs and runtimes when the run finishes. Runtime
+cleanup checks the original registration lifetime: removing a temporary runtime
+and independently reinstalling its name preserves the new installation and
+reports cleanup failure. Updating the existing temporary runtime does not
+transfer ownership; unused temporary runtimes are still cleaned. For
 published targets it first validates that the target exists, then runs OpenClaw's own
 `update --dry-run --json` plan against the clone, switches the clone, and runs
 update-mode doctor, plugin update dry-run, and gateway status checks. If the

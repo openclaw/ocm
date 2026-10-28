@@ -301,6 +301,7 @@ impl RuntimeReleaseDetails {
 
 struct RuntimeInstallTarget {
     name: String,
+    created_at: Option<time::OffsetDateTime>,
     final_meta_path: PathBuf,
     final_install_root: PathBuf,
     install_root: PathBuf,
@@ -2724,7 +2725,7 @@ fn build_installed_runtime_meta(
         .strip_prefix(&target.install_root)
         .map(|relative| target.final_install_root.join(relative))
         .unwrap_or_else(|_| binary_path.to_path_buf());
-    let created_at = now_utc();
+    let updated_at = now_utc();
     RuntimeMeta {
         kind: "ocm-runtime".to_string(),
         name: target.name.clone(),
@@ -2743,8 +2744,8 @@ fn build_installed_runtime_meta(
         install_root: Some(display_path(&target.final_install_root)),
         companions: Vec::new(),
         description,
-        created_at,
-        updated_at: created_at,
+        created_at: target.created_at.unwrap_or(updated_at),
+        updated_at,
     }
 }
 
@@ -2843,6 +2844,13 @@ fn prepare_runtime_install_target_with_lock(
     if path_exists(&final_meta_path) && !replace_existing {
         return Err(format!("runtime \"{name}\" already exists"));
     }
+    // Replacement updates the same registration; only remove followed by a new
+    // install starts another lifetime. Keep force-install repair of malformed
+    // metadata possible, but never borrow identity from an invalid record.
+    let created_at = read_json::<RuntimeMeta>(&final_meta_path)
+        .ok()
+        .filter(|meta| meta.name == name)
+        .map(|meta| meta.created_at);
     reclaim_abandoned_runtime_stages(parent, &name, env, cwd);
     let install_root = parent.join(format!(
         ".{name}.stage-{}-{}",
@@ -2854,6 +2862,7 @@ fn prepare_runtime_install_target_with_lock(
     let install_files = install_root.join("files");
     Ok(RuntimeInstallTarget {
         name,
+        created_at,
         final_meta_path,
         final_install_root,
         install_root,

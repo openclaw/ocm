@@ -6632,6 +6632,8 @@ fn runtime_install_force_replaces_an_existing_runtime_definition() {
     );
     assert!(add.status.success(), "{}", stderr(&add));
 
+    let original = ocm::store::get_runtime("stable", &env, &cwd).unwrap();
+
     let duplicate_install = run_ocm(
         &cwd,
         &env,
@@ -6671,6 +6673,46 @@ fn runtime_install_force_replaces_an_existing_runtime_definition() {
         "\"binaryPath\": \"{}\"",
         path_string(&expected_binary)
     )));
+    let replaced = ocm::store::get_runtime("stable", &env, &cwd).unwrap();
+    assert_eq!(replaced.created_at, original.created_at);
+    assert!(replaced.updated_at > original.updated_at);
+
+    // Force-install still repairs an unreadable registration. Its unknown
+    // previous lifetime must not be inherited by automatic cleanup.
+    let registration = ocm::store::runtime_meta_path("stable", &env, &cwd).unwrap();
+    fs::write(&registration, "{invalid metadata").unwrap();
+    let repair = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "stable",
+            "--path",
+            "./downloads/openclaw",
+            "--force",
+        ],
+    );
+    assert!(repair.status.success(), "{}", stderr(&repair));
+    let repaired = ocm::store::get_runtime("stable", &env, &cwd).unwrap();
+    assert_ne!(repaired.created_at, replaced.created_at);
+
+    let remove = run_ocm(&cwd, &env, &["runtime", "remove", "stable"]);
+    assert!(remove.status.success(), "{}", stderr(&remove));
+    let reinstall = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "stable",
+            "--path",
+            "./downloads/openclaw",
+        ],
+    );
+    assert!(reinstall.status.success(), "{}", stderr(&reinstall));
+    let recreated = ocm::store::get_runtime("stable", &env, &cwd).unwrap();
+    assert_ne!(recreated.created_at, repaired.created_at);
 }
 
 #[test]
