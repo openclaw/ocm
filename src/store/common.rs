@@ -1368,11 +1368,13 @@ mod tests {
     fn sqlite_copy_snapshots_internal_shared_state_aliases() {
         use std::os::unix::fs::symlink;
 
-        for (location, link_first, root_alias) in [
-            ("workspace/active", false, false),
-            ("workspace/active", true, true),
-            ("../shared-store", true, false),
-            ("imports/ordinary", false, false),
+        for (location, link_first, root_alias, outside_state) in [
+            ("workspace/active", false, false, false),
+            ("workspace/active", true, true, false),
+            ("../shared-store", true, false, false),
+            ("imports/ordinary", false, false, false),
+            ("workspace/active", true, true, true),
+            ("workspace/active", true, false, true),
         ] {
             let fixture = tempfile::tempdir().unwrap();
             let physical = fixture.path().join("source");
@@ -1394,7 +1396,8 @@ mod tests {
             if !link_first {
                 symlink(location, &link).unwrap();
             }
-            let agent = state.join("custom-agent/records.db");
+            let agent_root = if outside_state { &source } else { &state };
+            let agent = agent_root.join("custom-agent/records.db");
             fs::create_dir_all(agent.parent().unwrap()).unwrap();
             let paths = [
                 storage.join("openclaw.sqlite"),
@@ -1417,7 +1420,7 @@ mod tests {
             writers[0]
                 .execute(
                     "INSERT INTO agent_databases VALUES (?1)",
-                    [agent.to_str().unwrap()],
+                    [fs::canonicalize(&agent).unwrap().to_str().unwrap()],
                 )
                 .unwrap();
             let originals: Vec<_> = paths
