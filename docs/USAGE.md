@@ -830,6 +830,10 @@ Retry after restoring manager access; `ocm service status` remains available for
 
 Saved dev service plans must still match the env's current binding and recorded
 worktree. If OCM refuses a stale plan, use `ocm service restart <env>` to refresh it.
+Pending runtime starts also recheck the selected runtime after capability probing.
+Clearing that binding with `ocm env set-runtime <env> none` prevents a pending
+probe from starting the removed runtime. This preserves service-running intent;
+normal reconciliation applies the updated plan and any remaining binding.
 
 Normal restart is gateway-aware while the Gateway is running and
 `ocm service status mira` reports restart handoff `protocol v1`: OpenClaw records

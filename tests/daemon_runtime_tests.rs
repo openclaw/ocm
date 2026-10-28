@@ -2219,21 +2219,12 @@ if (args[1] === 'restart-handoff') {{
     }
 }
 
-#[test]
 #[cfg(unix)]
-fn daemon_shutdown_stops_initial_and_reconciled_startup_admission() {
-    let _guard = daemon_runtime_test_lock();
-    for (reconciled, cancel_during_probe) in [(false, true), (true, true), (false, false)] {
-        let root = TestDir::new("daemon-shutdown-admission");
-        let cwd = root.child("workspace");
-        fs::create_dir_all(&cwd).unwrap();
-        let mut env = ocm_env(&root);
-        install_fake_service_manager(&root, &mut env);
-        let peer = root.child("peer/openclaw.mjs");
-        write_executable_script(
-            &peer,
-            &format!(
-                r#"#!/usr/bin/env node
+fn write_gated_handoff_peer(root: &TestDir, peer: &Path) {
+    write_executable_script(
+        peer,
+        &format!(
+            r#"#!/usr/bin/env node
 import fs from 'node:fs';
 const root = {root:?};
 const name = process.env.OCM_ACTIVE_ENV;
@@ -2254,9 +2245,23 @@ if (args[1] === 'restart-handoff') {{
   setTimeout(() => process.exit(0), 20000);
 }}
 "#,
-                root = path_string(root.path()),
-            ),
-        );
+            root = path_string(root.path()),
+        ),
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn daemon_shutdown_stops_initial_and_reconciled_startup_admission() {
+    let _guard = daemon_runtime_test_lock();
+    for (reconciled, cancel_during_probe) in [(false, true), (true, true), (false, false)] {
+        let root = TestDir::new("daemon-shutdown-admission");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_service_manager(&root, &mut env);
+        let peer = root.child("peer/openclaw.mjs");
+        write_gated_handoff_peer(&root, &peer);
         let add = run_ocm(
             &cwd,
             &env,
@@ -2355,6 +2360,166 @@ if (args[1] === 'restart-handoff') {{
         for name in ["alpha", "beta"] {
             assert!(env_service.get(name).unwrap().service_running);
         }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn daemon_revalidates_runtime_binding_after_capability_probe() {
+    let _guard = daemon_runtime_test_lock();
+    struct Daemon(Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            stop_process(&mut self.0);
+        }
+    }
+    for (change, reconciled) in [
+        ("clear", false),
+        ("clear", true),
+        ("unchanged", false),
+        ("stop", false),
+        ("launcher", false),
+    ] {
+        let root = TestDir::new("daemon-runtime-binding-admission");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_service_manager(&root, &mut env);
+        let peer = root.child("peer/openclaw.mjs");
+        write_gated_handoff_peer(&root, &peer);
+        let added = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", "peer", "--path", &path_string(&peer)],
+        );
+        assert!(added.status.success(), "{}", stderr(&added));
+        for name in ["alpha", "beta"] {
+            for args in [
+                vec!["env", "create", name, "--runtime", "peer"],
+                vec!["service", "start", name],
+            ] {
+                let result = run_ocm(&cwd, &env, &args);
+                assert!(result.status.success(), "{}", stderr(&result));
+            }
+        }
+        let env_service = EnvironmentService::new(&env, &cwd);
+        if reconciled {
+            for name in ["alpha", "beta"] {
+                env_service.set_service_running(name, false).unwrap();
+            }
+        }
+        let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+        let _daemon = Daemon(spawn_daemon_process(&cwd, &env));
+        if reconciled {
+            wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5))
+                .expect("idle daemon did not publish runtime state");
+            for name in ["alpha", "beta"] {
+                env_service.set_service_running(name, true).unwrap();
+            }
+        }
+        assert!(wait_for_file(
+            &root.child("alpha.probe"),
+            Duration::from_secs(5)
+        ));
+        let replacement = root.child("replacement");
+        if change == "launcher" {
+            write_executable_script(
+                &replacement,
+                &format!(
+                    "#!/bin/sh\nprintf 'started\\n' > '{}'\nexec sleep 20\n",
+                    path_string(&root.child("replacement.started")),
+                ),
+            );
+            let added = run_ocm(
+                &cwd,
+                &env,
+                &[
+                    "launcher",
+                    "add",
+                    "replacement",
+                    "--command",
+                    &path_string(&replacement),
+                ],
+            );
+            assert!(added.status.success(), "{}", stderr(&added));
+        }
+        let args = match change {
+            "clear" => Some(vec!["env", "set-runtime", "alpha", "none", "--json"]),
+            "stop" => Some(vec!["service", "stop", "alpha", "--json"]),
+            "launcher" => Some(vec![
+                "env",
+                "set-launcher",
+                "alpha",
+                "replacement",
+                "--json",
+            ]),
+            _ => None,
+        };
+        if let Some(args) = args {
+            let changed = run_ocm(&cwd, &env, &args);
+            assert!(changed.status.success(), "{}", stderr(&changed));
+        }
+        let plan: Value = serde_json::from_slice(
+            &fs::read(root.child("ocm-home/supervisor/state.json")).unwrap(),
+        )
+        .unwrap();
+        let alpha = plan["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["envName"] == "alpha");
+        match change {
+            "clear" | "stop" => assert!(alpha.is_none(), "{plan}"),
+            "launcher" => assert_eq!(alpha.unwrap()["bindingKind"], "launcher"),
+            _ => assert_eq!(alpha.unwrap()["bindingName"], "peer"),
+        }
+        fs::write(root.child("alpha.allow"), "release").unwrap();
+        assert!(wait_for_file(
+            &root.child("beta.probe"),
+            Duration::from_secs(5)
+        ));
+        // The sibling gate holds the startup batch before normal reconciliation.
+        // Runtime publication records any admitted PID before that gate is reached.
+        let runtime: Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+        assert_eq!(
+            runtime_child_pid(&runtime, "alpha").is_some(),
+            change == "unchanged",
+            "{change}/{reconciled}: stale runtime admitted: {runtime}"
+        );
+        if change == "unchanged" {
+            assert!(wait_for_file(
+                &root.child("alpha.started"),
+                Duration::from_secs(5)
+            ));
+        }
+        fs::write(root.child("beta.allow"), "release").unwrap();
+        let expected = if matches!(change, "unchanged" | "launcher") {
+            2
+        } else {
+            1
+        };
+        wait_for_runtime_children(
+            &runtime_path,
+            expected,
+            Some("beta"),
+            Duration::from_secs(5),
+        )
+        .expect("updated plan did not reconcile");
+        if change == "launcher" {
+            assert!(wait_for_file(
+                &root.child("replacement.started"),
+                Duration::from_secs(5)
+            ));
+        }
+        assert_eq!(
+            root.child("alpha.started").exists(),
+            change == "unchanged",
+            "{change}/{reconciled}: removed runtime executed"
+        );
+        assert_eq!(
+            env_service.get("alpha").unwrap().service_running,
+            change != "stop"
+        );
     }
 }
 
