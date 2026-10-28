@@ -2365,37 +2365,56 @@ fn daemon_shutdown_stops_initial_and_reconciled_startup_admission() {
 
 #[test]
 #[cfg(unix)]
-fn daemon_revalidates_runtime_binding_after_capability_probe() {
+fn daemon_revalidates_binding_after_capability_probe() {
     let _guard = daemon_runtime_test_lock();
     struct Daemon(Child);
     impl Drop for Daemon {
         fn drop(&mut self) {
-            stop_process(&mut self.0);
+            if self.0.try_wait().ok().flatten().is_none() {
+                stop_process(&mut self.0);
+            }
         }
     }
-    for (change, reconciled) in [
-        ("clear", false),
-        ("clear", true),
-        ("unchanged", false),
-        ("stop", false),
-        ("launcher", false),
+    for (binding, change, reconciled) in [
+        ("runtime", "clear", false),
+        ("runtime", "clear", true),
+        ("runtime", "unchanged", false),
+        ("runtime", "stop", false),
+        ("runtime", "launcher", false),
+        ("launcher", "clear", false),
+        ("launcher", "clear", true),
+        ("launcher", "launcher", false),
+        ("launcher", "launcher", true),
+        ("launcher", "unchanged", false),
+        ("launcher", "runtime", false),
+        ("launcher", "runtime", true),
     ] {
-        let root = TestDir::new("daemon-runtime-binding-admission");
+        let root = TestDir::new("daemon-binding-admission");
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
         let mut env = ocm_env(&root);
         install_fake_service_manager(&root, &mut env);
         let peer = root.child("peer/openclaw.mjs");
         write_gated_handoff_peer(&root, &peer);
+        let selector = if binding == "runtime" {
+            "--runtime"
+        } else {
+            "--launcher"
+        };
+        let location = if binding == "runtime" {
+            "--path"
+        } else {
+            "--command"
+        };
         let added = run_ocm(
             &cwd,
             &env,
-            &["runtime", "add", "peer", "--path", &path_string(&peer)],
+            &[binding, "add", "peer", location, &path_string(&peer)],
         );
         assert!(added.status.success(), "{}", stderr(&added));
         for name in ["alpha", "beta"] {
             for args in [
-                vec!["env", "create", name, "--runtime", "peer"],
+                vec!["env", "create", name, selector, "peer"],
                 vec!["service", "start", name],
             ] {
                 let result = run_ocm(&cwd, &env, &args);
@@ -2409,7 +2428,7 @@ fn daemon_revalidates_runtime_binding_after_capability_probe() {
             }
         }
         let runtime_path = root.child("ocm-home/supervisor/runtime.json");
-        let _daemon = Daemon(spawn_daemon_process(&cwd, &env));
+        let mut daemon = Daemon(spawn_daemon_process(&cwd, &env));
         if reconciled {
             wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5))
                 .expect("idle daemon did not publish runtime state");
@@ -2422,11 +2441,11 @@ fn daemon_revalidates_runtime_binding_after_capability_probe() {
             Duration::from_secs(5)
         ));
         let replacement = root.child("replacement");
-        if change == "launcher" {
+        if matches!(change, "launcher" | "runtime") {
             write_executable_script(
                 &replacement,
                 &format!(
-                    "#!/bin/sh\nprintf 'started\\n' > '{}'\nexec sleep 20\n",
+                    "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec sleep 20\n",
                     path_string(&root.child("replacement.started")),
                 ),
             );
@@ -2434,18 +2453,35 @@ fn daemon_revalidates_runtime_binding_after_capability_probe() {
                 &cwd,
                 &env,
                 &[
-                    "launcher",
+                    change,
                     "add",
                     "replacement",
-                    "--command",
+                    if change == "runtime" {
+                        "--path"
+                    } else {
+                        "--command"
+                    },
                     &path_string(&replacement),
                 ],
             );
             assert!(added.status.success(), "{}", stderr(&added));
         }
+        let setter = if binding == "runtime" {
+            "set-runtime"
+        } else {
+            "set-launcher"
+        };
         let args = match change {
-            "clear" => Some(vec!["env", "set-runtime", "alpha", "none", "--json"]),
+            "clear" => Some(vec!["env", setter, "alpha", "none", "--json"]),
             "stop" => Some(vec!["service", "stop", "alpha", "--json"]),
+            "runtime" => Some(vec![
+                "start",
+                "alpha",
+                "--runtime",
+                "replacement",
+                "--no-service",
+                "--json",
+            ]),
             "launcher" => Some(vec![
                 "env",
                 "set-launcher",
@@ -2456,8 +2492,72 @@ fn daemon_revalidates_runtime_binding_after_capability_probe() {
             _ => None,
         };
         if let Some(args) = args {
-            let changed = run_ocm(&cwd, &env, &args);
-            assert!(changed.status.success(), "{}", stderr(&changed));
+            // Hold the same admission used through spawn/publication. The setter
+            // must wait before taking registry exclusion, so unrelated envs can
+            // still mutate while a Gateway start is being published.
+            let admission = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.child("ocm-home/source-watch/alpha.admission"))
+                .unwrap();
+            admission.lock_exclusive().unwrap();
+            let mut changed = Daemon(
+                Command::new(ocm_test_binary_path())
+                    .current_dir(&cwd)
+                    .args(&args)
+                    .env_clear()
+                    .envs(&env)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let operation = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.child("ocm-home/locks/environments/alpha.lock"))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if FileExt::try_lock_exclusive(&operation).is_err() {
+                    break;
+                }
+                FileExt::unlock(&operation).unwrap();
+                assert!(
+                    Instant::now() < deadline,
+                    "setter did not take operation lock"
+                );
+                assert!(
+                    changed.0.try_wait().unwrap().is_none(),
+                    "setter bypassed admission"
+                );
+                sleep(Duration::from_millis(10));
+            }
+            sleep(Duration::from_millis(100));
+            assert!(
+                changed.0.try_wait().unwrap().is_none(),
+                "setter bypassed admission"
+            );
+            let registry = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.child("ocm-home/envs.lock"))
+                .unwrap();
+            assert!(
+                FileExt::try_lock_exclusive(&registry).is_ok(),
+                "setter holds registry while waiting for admission"
+            );
+            drop(registry);
+            drop(admission);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = changed.0.try_wait().unwrap() {
+                    assert!(status.success(), "binding setter failed: {args:?}");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "binding setter deadlocked");
+                sleep(Duration::from_millis(10));
+            }
         }
         let plan: Value = serde_json::from_slice(
             &fs::read(root.child("ocm-home/supervisor/state.json")).unwrap(),
@@ -2470,7 +2570,7 @@ fn daemon_revalidates_runtime_binding_after_capability_probe() {
             .find(|child| child["envName"] == "alpha");
         match change {
             "clear" | "stop" => assert!(alpha.is_none(), "{plan}"),
-            "launcher" => assert_eq!(alpha.unwrap()["bindingKind"], "launcher"),
+            "launcher" | "runtime" => assert_eq!(alpha.unwrap()["bindingKind"], change),
             _ => assert_eq!(alpha.unwrap()["bindingName"], "peer"),
         }
         fs::write(root.child("alpha.allow"), "release").unwrap();
@@ -2484,7 +2584,7 @@ fn daemon_revalidates_runtime_binding_after_capability_probe() {
         assert_eq!(
             runtime_child_pid(&runtime, "alpha").is_some(),
             change == "unchanged",
-            "{change}/{reconciled}: stale runtime admitted: {runtime}"
+            "{binding}/{change}/{reconciled}: stale binding admitted: {runtime}"
         );
         if change == "unchanged" {
             assert!(wait_for_file(
@@ -2493,19 +2593,33 @@ fn daemon_revalidates_runtime_binding_after_capability_probe() {
             ));
         }
         fs::write(root.child("beta.allow"), "release").unwrap();
-        let expected = if matches!(change, "unchanged" | "launcher") {
+        let expected = if matches!(change, "unchanged" | "launcher" | "runtime") {
             2
         } else {
             1
         };
-        wait_for_runtime_children(
+        let runtime = wait_for_runtime_children(
             &runtime_path,
             expected,
             Some("beta"),
             Duration::from_secs(5),
         )
         .expect("updated plan did not reconcile");
-        if change == "launcher" {
+        let names = runtime["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|child| child["envName"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            if expected == 2 {
+                vec!["alpha", "beta"]
+            } else {
+                vec!["beta"]
+            }
+        );
+        if matches!(change, "launcher" | "runtime") {
             assert!(wait_for_file(
                 &root.child("replacement.started"),
                 Duration::from_secs(5)
@@ -2514,12 +2628,31 @@ fn daemon_revalidates_runtime_binding_after_capability_probe() {
         assert_eq!(
             root.child("alpha.started").exists(),
             change == "unchanged",
-            "{change}/{reconciled}: removed runtime executed"
+            "{binding}/{change}/{reconciled}: removed binding executed"
         );
         assert_eq!(
             env_service.get("alpha").unwrap().service_running,
             change != "stop"
         );
+        stop_process(&mut daemon.0);
+        assert!(daemon.0.try_wait().unwrap().unwrap().success());
+        let final_runtime: Value =
+            serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+        assert_eq!(final_runtime["children"], serde_json::json!([]));
+        for marker in [
+            "alpha.probe",
+            "beta.probe",
+            "alpha.started",
+            "beta.started",
+            "replacement.started",
+        ] {
+            if let Ok(raw) = fs::read_to_string(root.child(marker)) {
+                assert!(
+                    !process_exists(raw.trim().parse().unwrap()),
+                    "owned peer survived: {marker}"
+                );
+            }
+        }
     }
 }
 

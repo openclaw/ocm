@@ -3529,9 +3529,9 @@ fn admit_supervisor_child_start(
             spec.env_name
         ));
     }
-    // A capability probe runs outside admission. Its saved runtime may have
-    // been cleared or replaced while the probe was in flight. The binding
-    // clear shares this lock, which stays held through spawn and publication.
+    // A capability probe runs outside admission. Its saved binding may have
+    // been cleared or replaced while the probe was in flight. Binding clears
+    // share this lock, which stays held through spawn and publication.
     if spec.binding_kind == "runtime"
         && !matches!(
             crate::env::resolve_execution_binding(&meta, None, None)?,
@@ -3540,6 +3540,17 @@ fn admit_supervisor_child_start(
     {
         return Err(format!(
             "refusing to start env \"{}\": its saved runtime plan no longer matches the registered binding; restart the service to refresh its plan",
+            spec.env_name
+        ));
+    }
+    if spec.binding_kind == "launcher"
+        && !matches!(
+            crate::env::resolve_execution_binding(&meta, None, None)?,
+            crate::env::ExecutionBinding::Launcher(name) if name == spec.binding_name
+        )
+    {
+        return Err(format!(
+            "refusing to start env \"{}\": its saved launcher plan no longer matches the registered binding; restart the service to refresh its plan",
             spec.env_name
         ));
     }
