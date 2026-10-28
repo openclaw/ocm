@@ -4723,9 +4723,8 @@ mod tests {
     fn runtime_junction_recovery_reads_saved_bytes_with_absent_or_replaced_final_root() {
         use crate::infra::{tree_digest::tree_sha256, windows_junction};
         use crate::store::common::{copy_dir_preserving_modes, remove_owned_tree, write_json};
-        use crate::store::upgrade_history::{
-            get_upgrade_runtime_recovery, upgrade_history_runtime_recovery_dir,
-        };
+        use crate::store::layout::upgrade_history_runtime_recovery_dir;
+        use crate::store::upgrade_history::get_upgrade_runtime_recovery;
 
         windows_junction::tests::without_symlink_privilege(|| {
             let root = tempfile::tempdir().unwrap();
