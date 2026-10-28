@@ -164,7 +164,8 @@ in `.gitmodules` (including nested submodules). Removing a containing environmen
 refuses while another registered source depends on that storage. Independent clones
 with their own objects remain removable. Active Git configuration files, including
 user/system includes and enabled per-worktree configuration, are protected with
-their symlink paths as well. Sharing read-only settings alone does not prevent
+their access symlinks and traversed directories as well, including directories before
+`..` in an include path. Sharing read-only settings alone does not prevent
 independent source upgrades.
 This also applies to local upgrade simulations; retry after that operation finishes.
 Unchanged source bindings remain writable during restore and recovery.

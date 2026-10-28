@@ -1028,6 +1028,8 @@ fn public_dev_preserves_required_git_configuration() {
     for mode in [
         "common",
         "include",
+        "route",
+        "direct-outside",
         "conditional",
         "global",
         "global-inactive",
@@ -1055,14 +1057,24 @@ fn public_dev_preserves_required_git_configuration() {
         write_text(&source.join("openclaw.mjs"), "// finite source command\n");
         let config = source.join(".git/config");
         let original = fs::read(&config).unwrap();
-        let required = Path::new(&owner.root).join(if mode == "global" {
-            ".openclaw/logs/required.config"
+        let required = if matches!(mode, "route" | "direct-outside") {
+            Path::new(&owner.root)
+                .parent()
+                .unwrap()
+                .join("required.config")
         } else {
-            "required.config"
-        });
+            Path::new(&owner.root).join(if mode == "global" {
+                ".openclaw/logs/required.config"
+            } else {
+                "required.config"
+            })
+        };
         fs::create_dir_all(required.parent().unwrap()).unwrap();
         fs::write(&required, &original).unwrap();
-        if matches!(mode, "include" | "conditional" | "global" | "worktree") {
+        if matches!(
+            mode,
+            "include" | "route" | "direct-outside" | "conditional" | "global" | "worktree"
+        ) {
             // Repository format is read from the common config before normal
             // include selection. Keep it there and exercise ordinary Git
             // configuration through the included/worktree file.
@@ -1086,6 +1098,19 @@ fn public_dev_preserves_required_git_configuration() {
                 symlink(&parent, directory.join("parent")).unwrap();
                 symlink(&required, directory.join("child")).unwrap();
                 git(&source, &["config", "include.path", "configs/parent"]);
+            }
+            "route" | "direct-outside" => {
+                // Both files are outside owner. Only the authored route needs
+                // owner to survive; canonicalizing the file loses that fact.
+                let selected = if mode == "route" {
+                    Path::new(&owner.root).join("../required.config")
+                } else {
+                    required.clone()
+                };
+                git(
+                    &source,
+                    &["config", "include.path", &path_string(&selected)],
+                );
             }
             "conditional" => {
                 // Match this Git directory itself. A trailing slash asks Git
@@ -1154,13 +1179,25 @@ fn public_dev_preserves_required_git_configuration() {
         let before_head = git(&source, &["rev-parse", "--verify", "HEAD"]);
         assert_eq!(before_head.len(), 64);
         git(&source, &["fsck", "--full"]);
-        if matches!(mode, "include" | "conditional" | "global" | "worktree") {
+        if matches!(
+            mode,
+            "include" | "route" | "direct-outside" | "conditional" | "global" | "worktree"
+        ) {
             assert_eq!(
                 git(&source, &["config", "--get", "remote.origin.url"]),
                 "https://example.invalid/source.git"
             );
+            if matches!(mode, "route" | "direct-outside") {
+                assert_eq!(
+                    git(&source, &["remote", "get-url", "origin"]),
+                    "https://example.invalid/source.git"
+                );
+            }
         }
-        let dependent = !matches!(mode, "contained" | "inactive" | "global-inactive");
+        let dependent = !matches!(
+            mode,
+            "contained" | "direct-outside" | "inactive" | "global-inactive"
+        );
         let register = || {
             run_ocm(
                 cwd,
@@ -1235,11 +1272,20 @@ fn public_dev_preserves_required_git_configuration() {
             git(&source, &["rev-parse", "--verify", "HEAD"]),
             before_head
         );
-        if matches!(mode, "include" | "conditional" | "global" | "worktree") {
+        if matches!(
+            mode,
+            "include" | "route" | "direct-outside" | "conditional" | "global" | "worktree"
+        ) {
             assert_eq!(
                 git(&source, &["config", "--get", "remote.origin.url"]),
                 "https://example.invalid/source.git"
             );
+            if matches!(mode, "route" | "direct-outside") {
+                assert_eq!(
+                    git(&source, &["remote", "get-url", "origin"]),
+                    "https://example.invalid/source.git"
+                );
+            }
         }
     }
 }

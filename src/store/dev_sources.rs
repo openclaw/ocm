@@ -247,7 +247,8 @@ fn existing_cleanup_path(path: &Path) -> Result<Option<PathBuf>, String> {
 pub(crate) struct SourceFootprint {
     pub(crate) entries: BTreeSet<PathBuf>,
     pub(crate) content_roots: BTreeSet<PathBuf>,
-    // Required read dependencies, which may be shared by independent sources.
+    // Required read dependencies and access-route directories, which may be
+    // shared by independent sources.
     // Preserve them during deletion without treating shared settings as shared
     // mutable checkout or Git storage.
     pub(crate) config_entries: BTreeSet<PathBuf>,
@@ -320,7 +321,7 @@ pub(crate) fn existing_source_path_entries(path: &Path) -> Result<BTreeSet<PathB
     Ok(entries)
 }
 
-// Copy cleanup also needs ordinary directories traversed before a parent
+// Access routes include ordinary directories traversed before a parent
 // component, even when they contain none of the final target's bytes.
 pub(crate) fn existing_source_path_route_entries(path: &Path) -> Result<BTreeSet<PathBuf>, String> {
     let mut entries = BTreeSet::new();
@@ -339,13 +340,14 @@ fn record_git_path(
     path: &Path,
     footprint: &mut SourceFootprint,
     reserve_missing: bool,
+    include_directories: bool,
     links: &mut BTreeSet<PathBuf>,
 ) -> Result<Option<PathBuf>, String> {
     if reserve_missing && existing_cleanup_path(path)?.is_none() {
         reserve_path(path, footprint)?;
         return Ok(None);
     }
-    record_path_entries(path, &mut footprint.entries, links, false).map(Some)
+    record_path_entries(path, &mut footprint.entries, links, include_directories).map(Some)
 }
 
 fn append_git_footprint(
@@ -360,6 +362,8 @@ fn append_git_footprint(
     // Protect the common config even if it has no entries or its symlink target
     // is missing. Other files are selected by Git, preserving conditional-include
     // and worktree-config semantics instead of interpreting config ourselves.
+    // Preserve ordinary route directories too: opening owner/../config still
+    // requires owner, even though it contains none of the configuration bytes.
     let mut configuration = SourceFootprint::default();
     let mut config_links = BTreeSet::new();
     let config = git.common_dir.join("config");
@@ -369,6 +373,7 @@ fn append_git_footprint(
                 &config,
                 &mut configuration,
                 reserve_missing,
+                true,
                 &mut config_links,
             )?;
         }
@@ -386,6 +391,7 @@ fn append_git_footprint(
                 &path,
                 &mut configuration,
                 reserve_missing,
+                true,
                 &mut config_links,
             )?;
         }
@@ -395,14 +401,14 @@ fn append_git_footprint(
         .reserved_roots
         .extend(configuration.reserved_roots);
     for path in git.entries {
-        record_git_path(&path, footprint, reserve_missing, links)?;
+        record_git_path(&path, footprint, reserve_missing, false, links)?;
     }
     if include_worktree_entry && let Some(path) = git.worktree_entry {
-        record_git_path(&path, footprint, reserve_missing, links)?;
+        record_git_path(&path, footprint, reserve_missing, false, links)?;
     }
     let objects = git.common_dir.join("objects");
     for path in [git.private_dir, git.common_dir] {
-        if let Some(resolved) = record_git_path(&path, footprint, reserve_missing, links)? {
+        if let Some(resolved) = record_git_path(&path, footprint, reserve_missing, false, links)? {
             footprint.content_roots.insert(resolved);
         }
     }
@@ -452,7 +458,8 @@ fn append_loose_object_footprint(
         *paths_left = paths_left
             .checked_sub(1)
             .ok_or_else(|| git_dependency_limit_error(path, "loose storage alias"))?;
-        let Some(resolved) = record_git_path(path, &mut observed, reserve_missing, &mut links)?
+        let Some(resolved) =
+            record_git_path(path, &mut observed, reserve_missing, false, &mut links)?
         else {
             return Ok(false);
         };
@@ -540,7 +547,9 @@ fn append_git_object_footprint(
         let packs = resolved.join("pack");
         match fs::symlink_metadata(&packs) {
             Ok(_) => {
-                if let Some(packs) = record_git_path(&packs, footprint, reserve_missing, links)? {
+                if let Some(packs) =
+                    record_git_path(&packs, footprint, reserve_missing, false, links)?
+                {
                     footprint.content_roots.insert(packs.clone());
                     for entry in fs::read_dir(&packs).map_err(|error| error.to_string())? {
                         let entry = entry.map_err(|error| error.to_string())?;
@@ -553,7 +562,13 @@ fn append_git_object_footprint(
                                 return Err(git_dependency_limit_error(&packs, "pack alias"));
                             }
                             *paths_left -= 1;
-                            record_git_path(&entry.path(), footprint, reserve_missing, links)?;
+                            record_git_path(
+                                &entry.path(),
+                                footprint,
+                                reserve_missing,
+                                false,
+                                links,
+                            )?;
                         }
                     }
                 }
@@ -567,7 +582,7 @@ fn append_git_object_footprint(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.to_string()),
         }
-        if record_git_path(&file, footprint, reserve_missing, links)?.is_none() {
+        if record_git_path(&file, footprint, reserve_missing, false, links)?.is_none() {
             continue;
         }
         let alternates = crate::openclaw_repo::read_git_alternates(&file)?;
@@ -656,7 +671,7 @@ fn inspect_source_footprint_paths(
             let modules = root.join(".gitmodules");
             match fs::symlink_metadata(&modules) {
                 Ok(_) => {
-                    record_git_path(&modules, &mut footprint, reserve_missing, &mut links)?;
+                    record_git_path(&modules, &mut footprint, reserve_missing, false, &mut links)?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.to_string()),
