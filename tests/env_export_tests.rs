@@ -988,7 +988,8 @@ fn env_export_include_state_round_trips_committed_sqlite_state() {
     }
     #[cfg(unix)]
     let _socket = {
-        let short_root = tempfile::tempdir_in("/tmp").unwrap();
+        // Keep the short socket path on the same filesystem as the source.
+        let short_root = tempfile::tempdir().unwrap();
         let path = short_root.path().join("socket");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         fs::rename(path, source.join("state/native")).unwrap();
@@ -2879,4 +2880,249 @@ fn default_export_omits_storage_of_a_standalone_bare_repository() {
     assert!(imported.status.success(), "{}", stderr(&imported));
     assert!(target.join("projects/mirror.git/HEAD").is_file());
     assert!(!target.join(".openclaw/cron").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn env_export_does_not_read_through_a_replaced_source_parent() {
+    use std::io::{Read, Write};
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct Exporter(Child);
+    impl Drop for Exporter {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    for include_state in [false, true] {
+        let root = TestDir::new("export-parent-replacement");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let parent = root.child("ocm-home/envs/source/.openclaw/workspace/race");
+        let outside = root.child("outside");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(parent.join("z-payload.txt"), b"owned payload").unwrap();
+        fs::write(outside.join("z-payload.txt"), b"external payload").unwrap();
+        let large_size = 128 * 1024 * 1024;
+        let mut large = fs::File::create(parent.join("a-large.bin")).unwrap();
+        // Dense bytes are essential: tar can skip a sparse file's holes before
+        // the observer sees any output, leaving no replacement schedule.
+        let block = vec![b'A'; 1024 * 1024];
+        for _ in 0..128 {
+            large.write_all(&block).unwrap();
+        }
+        drop(large);
+        let destination = root.child("archives");
+        fs::create_dir(&destination).unwrap();
+        for replaced in [false, true] {
+            let output = destination.join(format!("archive-{replaced}.tar"));
+            let mut command = Command::new(support::ocm_test_binary_path());
+            command
+                .current_dir(root.path())
+                .env_clear()
+                .envs(&env)
+                .args(["env", "export", "source", "--output"])
+                .arg(&output)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            if include_state {
+                command.arg("--include-state");
+            }
+            let mut exporter = Exporter(command.spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            if replaced {
+                loop {
+                    assert!(Instant::now() < deadline, "export never reached dense file");
+                    assert!(
+                        exporter.0.try_wait().unwrap().is_none(),
+                        "export finished before replacement"
+                    );
+                    let stage = fs::read_dir(&destination)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .find(|path| {
+                            path.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with(".ocm-export-")
+                        });
+                    if let Some(stage) = stage
+                        && stage.metadata().unwrap().len() >= 1024 * 1024
+                    {
+                        let pid = exporter.0.id() as libc::pid_t;
+                        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+                        let mut status = 0;
+                        assert_eq!(
+                            unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+                            pid
+                        );
+                        assert!(libc::WIFSTOPPED(status));
+                        let written = stage.metadata().unwrap().len();
+                        assert!(
+                            (1024 * 1024..large_size - 1024 * 1024).contains(&written),
+                            "no mid-file schedule: {written}"
+                        );
+                        fs::rename(&parent, root.child("retained")).unwrap();
+                        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+                        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+                        eprintln!(
+                            "include_state={include_state}: replaced parent after {written} of {large_size} bytes"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            let status = loop {
+                if let Some(status) = exporter.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "export did not complete");
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let mut errors = String::new();
+            exporter
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut errors)
+                .unwrap();
+            assert!(status.success(), "{errors}");
+            let mut archive = tar::Archive::new(fs::File::open(&output).unwrap());
+            let mut payload = None;
+            let mut link = None;
+            for entry in archive.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().into_owned();
+                if path == Path::new("root/.openclaw/workspace/race")
+                    && entry.header().entry_type().is_symlink()
+                {
+                    link = entry.link_name().unwrap().map(|path| path.into_owned());
+                }
+                if path == Path::new("root/.openclaw/workspace/race/z-payload.txt") {
+                    let mut bytes = Vec::new();
+                    entry.read_to_end(&mut bytes).unwrap();
+                    payload = Some(bytes);
+                }
+            }
+            if replaced {
+                assert_eq!(link.as_deref(), Some(outside.as_path()));
+                assert_eq!(payload, None);
+            } else {
+                assert_eq!(payload.as_deref(), Some(b"owned payload".as_slice()));
+            }
+            assert!(!fs::read_dir(&destination).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ocm-export-")
+            }));
+        }
+        assert_eq!(
+            fs::read(root.child("retained/z-payload.txt")).unwrap(),
+            b"owned payload"
+        );
+        assert_eq!(
+            fs::metadata(root.child("retained/a-large.bin"))
+                .unwrap()
+                .len(),
+            large_size
+        );
+        assert_eq!(
+            fs::read(outside.join("z-payload.txt")).unwrap(),
+            b"external payload"
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn env_export_keeps_ordinary_sparse_files_compact() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let root = TestDir::new("export-sparse");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let path = root.child("ocm-home/envs/source/.openclaw/workspace/sparse.bin");
+    let mut file = fs::File::create(&path).unwrap();
+    file.set_len(128 * 1024 * 1024).unwrap();
+    file.seek(SeekFrom::End(-4)).unwrap();
+    file.write_all(b"tail").unwrap();
+    drop(file);
+    let output = root.child("archive.tar");
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            output.to_str().unwrap(),
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    assert!(output.metadata().unwrap().len() < 1024 * 1024);
+    let extracted =
+        extract_env_archive::<EnvArchiveMetadata>(&output, &root.child("extract")).unwrap();
+    let mut file =
+        fs::File::open(extracted.root_dir.join(".openclaw/workspace/sparse.bin")).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 128 * 1024 * 1024);
+    file.seek(SeekFrom::End(-4)).unwrap();
+    let mut tail = [0; 4];
+    file.read_exact(&mut tail).unwrap();
+    assert_eq!(&tail, b"tail");
+}
+
+#[cfg(unix)]
+#[test]
+fn env_export_does_not_open_excluded_sqlite_sidecars() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("requires an unprivileged user for unreadable sidecar proof");
+        return;
+    }
+    let root = TestDir::new("export-unreadable-sidecar");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let sidecar = root.child("ocm-home/envs/source/.openclaw/workspace/unused.sqlite-wal");
+    fs::write(&sidecar, b"excluded sidecar").unwrap();
+    fs::set_permissions(&sidecar, fs::Permissions::from_mode(0)).unwrap();
+    assert!(fs::File::open(&sidecar).is_err());
+    let archive = root.child("archive.tar");
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(export.status.success(), "{}", stderr(&export));
+    let mut archive = tar::Archive::new(fs::File::open(archive).unwrap());
+    assert!(!archive.entries().unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .unwrap()
+            .ends_with("unused.sqlite-wal")
+    }));
+    assert_eq!(fs::read(sidecar).unwrap(), b"excluded sidecar");
 }

@@ -217,7 +217,9 @@ pub fn write_env_archive_with_options<T: Serialize>(
         .canonicalize()
         .map_err(|error| error.to_string())?;
     let source_root = resolved_root.as_path();
-    let capture = if options.sqlite_content_roots.is_empty() && !options.relocate_internal_symlinks
+    let capture = if options.sqlite_content_roots.is_empty()
+        && !options.relocate_internal_symlinks
+        && !options.snapshot_sqlite_files
     {
         None
     } else {
@@ -417,12 +419,25 @@ fn append_env_root(
             .sqlite_content_roots
             .iter()
             .any(|root| relative_path.starts_with(root));
-        let mut captured = if discover_sqlite && metadata.is_file() {
-            Some(capture.unwrap().file(relative_path, &metadata)?)
+        if !preserve_bytes
+            && !discover_sqlite
+            && options.snapshot_sqlite_files
+            && sqlite_database_path_for_sidecar(relative_path).is_some()
+        {
+            continue;
+        }
+        // Source containment applies independently of SQLite discovery.
+        let mut captured = if metadata.is_file() {
+            capture
+                .map(|source| source.file(relative_path, &metadata))
+                .transpose()?
         } else {
             None
         };
-        let state_database = if !preserve_bytes && let Some(captured) = &mut captured {
+        let state_database = if discover_sqlite
+            && !preserve_bytes
+            && let Some(captured) = &mut captured
+        {
             state_databases.contains(&path)
                 || file_is_sqlite_database(&mut captured.file)
                     .map_err(EnvArchiveWriteError::Fatal)?
@@ -431,20 +446,16 @@ fn append_env_root(
         };
         if state_database {
             state_sidecars.extend(sqlite_sidecar_paths(&path));
-        } else if !preserve_bytes && let Some(captured) = &mut captured {
+        } else if discover_sqlite
+            && !preserve_bytes
+            && let Some(captured) = &mut captured
+        {
             if state_sidecars.contains(&path)
                 || is_orphan_sqlite_sidecar(&path, &mut captured.file)
                     .map_err(EnvArchiveWriteError::from_entry_io)?
             {
                 continue;
             }
-        }
-        if !preserve_bytes
-            && !discover_sqlite
-            && options.snapshot_sqlite_files
-            && sqlite_database_path_for_sidecar(relative_path).is_some()
-        {
-            continue;
         }
 
         let archive_path = Path::new(ENV_ARCHIVE_ROOT_DIR).join(relative_path);
@@ -499,7 +510,7 @@ fn append_env_root(
                     path.display()
                 )));
             }
-            let snapshot = if let Some(source) = capture.filter(|_| discover_sqlite) {
+            let snapshot = if let Some(source) = capture {
                 #[cfg(target_os = "macos")]
                 let guard = super::archive_path_guard::SqlitePathGuard::new(
                     &source.root,
@@ -555,20 +566,28 @@ fn append_env_root(
         }
 
         if let Some(mut captured) = captured {
-            let captured_metadata = captured
-                .file
-                .metadata()
-                .map_err(EnvArchiveWriteError::from_entry_io)?;
-            append_bounded_file(
-                builder,
-                &archive_path,
-                &mut captured.file,
-                &captured_metadata,
-            )?;
+            if discover_sqlite {
+                let captured_metadata = captured
+                    .file
+                    .metadata()
+                    .map_err(EnvArchiveWriteError::from_entry_io)?;
+                append_bounded_file(
+                    builder,
+                    &archive_path,
+                    &mut captured.file,
+                    &captured_metadata,
+                )?;
+            } else {
+                // Keep ordinary export's sparse-file encoding, using the
+                // acquired handle instead of reopening a mutable pathname.
+                builder
+                    .append_file(&archive_path, &mut captured.file)
+                    .map_err(EnvArchiveWriteError::from_entry_io)?;
+            }
             continue;
         }
 
-        if metadata.is_symlink() && (discover_sqlite || options.relocate_internal_symlinks) {
+        if metadata.is_symlink() && capture.is_some() {
             let source = capture.unwrap();
             let captured_target = source.link(relative_path, &metadata)?;
             let owned = if options.relocate_internal_symlinks {
@@ -2024,7 +2043,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn preserved_archive_bytes_keep_file_acquisition_guards() {
-        for preserve in [false, true] {
+        for (include_state, preserve) in [(false, false), (true, false), (true, true)] {
             let fixture = tempfile::tempdir().unwrap();
             let source = fixture.path().join("home");
             let outside = fixture.path().join("outside");
@@ -2036,11 +2055,15 @@ mod tests {
             *PRESERVED_FILE_REPLACEMENT.lock().unwrap() = Some((source.clone(), outside, false));
             let output = fixture.path().join("archive.tar");
             let mut options = EnvArchiveOptions {
-                sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
+                sqlite_content_roots: if include_state {
+                    BTreeSet::from([PathBuf::new()])
+                } else {
+                    BTreeSet::new()
+                },
                 snapshot_sqlite_files: true,
                 should_exclude_path: replace_preserved_file_parent,
-                relocate_internal_symlinks: true,
-                private_output: true,
+                relocate_internal_symlinks: include_state,
+                private_output: include_state,
                 ..EnvArchiveOptions::default()
             };
             if preserve {

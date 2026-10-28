@@ -1578,7 +1578,9 @@ External workspaces, the environment root itself and workspace paths redirected 
 Within the selected content, ordinary export preserves symlinks, including links
 named `*.sqlite`, without copying their targets. Regular `*.sqlite` files still
 use coherent committed snapshots, including uncheckpointed WAL writes, and omit
-raw database sidecars.
+raw database sidecars. If a source parent is replaced during acquisition, export
+retries from its captured root or fails without publishing a partial archive; it
+does not copy bytes through a replacement symlink.
 
 New archives, with or without `--include-state`, retain the accepted source root and its captured canonical path in optional `env.canonicalSourceRoot` metadata.
 Configuration relocation uses both recorded roots without requiring the original source or alias to exist; state-inclusive runtime-reference relocation uses the same identities.
