@@ -25,18 +25,18 @@ use crate::env::EnvMeta;
 use crate::env::EnvSummary;
 pub(crate) use checkpoints::CheckpointCleanup;
 pub(crate) use common::{
-    ExclusiveFileLock, FileWriteError, FileWriteOperation, OpenClawDirectoryCopy,
-    copy_dir_preserving_modes, ensure_dir, lock_file, read_json, remove_owned_tree, try_lock_file,
-    write_json, write_json_detailed,
+    ExclusiveFileLock, ExclusiveFileLockSet, FileWriteError, FileWriteOperation,
+    OpenClawDirectoryCopy, copy_dir_preserving_modes, ensure_dir, lock_file, read_json,
+    remove_owned_tree, try_lock_file, write_json, write_json_detailed,
 };
 pub(crate) use dev_registration::{DevSourceRegistration, with_prepared_dev_source};
 pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
 pub(crate) use dev_ui_ports::reserve as reserve_dev_ui_port;
 pub(crate) use envs::{
     EnvironmentOperationLock, ensure_environment_removal_preserves_registered_roots,
-    ensure_runtime_cleanup_preserves_registered_roots, lock_env_registry,
-    lock_environment_operation, rebind_environment_dev, remove_environment_locked,
-    validate_gateway_port,
+    ensure_runtime_cleanup_preserves_registered_roots, environment_operation_lock_path,
+    lock_env_registry, lock_environment_operation, rebind_environment_dev,
+    remove_environment_locked, validate_gateway_port,
 };
 pub(crate) use envs::{
     EnvironmentServicePolicyChange, environment_service_policy_revision,
@@ -132,7 +132,7 @@ pub use upgrade_history::{
 pub(crate) use upgrade_history::{
     UpgradeRuntimeRecovery, get_upgrade_runtime_recovery, lock_upgrade_batch,
     lock_upgrade_participant, lock_upgrade_transaction, remove_upgrade_recovery,
-    remove_upgrade_recovery_for_snapshot,
+    remove_upgrade_recovery_for_snapshot, upgrade_transaction_lock_path,
 };
 
 pub fn now_utc() -> OffsetDateTime {

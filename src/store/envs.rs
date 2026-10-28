@@ -101,7 +101,7 @@ fn write_env_registry(
 pub(crate) type EnvRegistryLock = super::common::ExclusiveFileLock;
 pub(crate) type EnvironmentOperationLock = super::common::ExclusiveFileLock;
 
-pub(super) fn environment_operation_lock_path(
+pub(crate) fn environment_operation_lock_path(
     name: &str,
     env: &BTreeMap<String, String>,
     cwd: &Path,

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +12,7 @@ use serde::de::DeserializeOwned;
 
 use super::openclaw_state::{OpenClawSqliteCopy, is_sqlite_database};
 use super::openclaw_workspaces::canonicalize_path_allow_missing;
+use crate::infra::file_identity::{FileIdentity, file_identity};
 use crate::infra::sqlite_snapshot::create_sqlite_snapshot;
 
 #[cfg(unix)]
@@ -28,6 +30,35 @@ pub(crate) fn ensure_dir(path: &Path) -> Result<(), String> {
 pub(crate) struct ExclusiveFileLock {
     file: File,
     child_custody: AtomicBool,
+}
+
+/// Retain one guard per physical file for a caller acquiring several locks.
+#[derive(Default)]
+pub(crate) struct ExclusiveFileLockSet {
+    locks: Vec<(FileIdentity, Arc<ExclusiveFileLock>)>,
+}
+
+impl ExclusiveFileLockSet {
+    pub(crate) fn acquire(
+        &mut self,
+        path: &Path,
+        label: &str,
+    ) -> Result<Arc<ExclusiveFileLock>, String> {
+        let file = open_lock_file(path, label)?;
+        // Identify the handle we would lock, not a path that could now name a
+        // different file. Retained guards keep their identities alive.
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        let identity = file_identity(&file, &metadata)?;
+        #[cfg(any(unix, windows))]
+        if let Some((_, lock)) = self.locks.iter().find(|(held, _)| held == &identity) {
+            return Ok(Arc::clone(lock));
+        }
+        // The portable identity is only a timestamp; never use it to elide
+        // exclusion on platforms without an actual file identity.
+        let lock = Arc::new(lock_open_file(file, path, label)?);
+        self.locks.push((identity, Arc::clone(&lock)));
+        Ok(lock)
+    }
 }
 
 impl Drop for ExclusiveFileLock {
@@ -106,16 +137,23 @@ fn retain_lock_for_child(
 }
 
 pub(crate) fn lock_file(path: &Path, label: &str) -> Result<ExclusiveFileLock, String> {
+    lock_open_file(open_lock_file(path, label)?, path, label)
+}
+
+fn open_lock_file(path: &Path, label: &str) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(path)
-        .map_err(|error| format!("failed to open {label} lock at {}: {error}", path.display()))?;
+        .map_err(|error| format!("failed to open {label} lock at {}: {error}", path.display()))
+}
+
+fn lock_open_file(file: File, path: &Path, label: &str) -> Result<ExclusiveFileLock, String> {
     file.lock_exclusive().map_err(|error| {
         format!(
             "failed to acquire {label} lock at {}: {error}",
@@ -913,6 +951,29 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn lock_set_reuses_open_file_identity_and_retains_exclusion() {
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lock");
+        let alias = root.path().join("alias");
+        let mut locks = super::ExclusiveFileLockSet::default();
+        let first = locks.acquire(&path, "test").unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+        let second = locks.acquire(&alias, "test").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let separate = locks
+            .acquire(&root.path().join("separate"), "test")
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &separate));
+        drop(locks);
+        drop(first);
+        assert!(super::try_lock_file(&alias, "test").unwrap().is_none());
+        drop(second);
+        assert!(super::try_lock_file(&path, "test").unwrap().is_some());
+    }
 
     fn temp_root(label: &str) -> PathBuf {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);

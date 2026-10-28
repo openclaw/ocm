@@ -1021,13 +1021,28 @@ On Linux and macOS, upgrade commands keep the environment mutation lock in their
 Version probes retain the lock during upgrade preflight, final verification, and rollback because configured Node preloads and launcher arguments can run before the version fast path.
 The same protection applies to final Gateway-status verification after an explicit rollback, because native diagnostic startup and exit can write environment state even for status queries.
 If the OCM parent is killed, competing environment mutations and upgrades wait until those children close the inherited lock or exit.
-Each fleet child retains only its own environment's lock.
+Each fleet child retains only its own environment's lock. If distinct registered
+names share that physical lock on a case-insensitive filesystem, it excludes
+mutations of both names until the child releases it.
 This is not crash recovery or proof that all descendants stopped: a program can close inherited descriptors before spawning further work, and Windows retains its existing locking behavior.
 
 If a later mutation keeps waiting, use `lsof "${OCM_HOME:-$HOME/.ocm}/locks/environments/mira.lock"` to inspect processes with that environment's lock file open.
 Distinguish waiting OCM commands from surviving upgrade children, and let active update work finish.
 Stop an unintended holder only after verifying that interrupting its work is safe, then retry the mutation.
 Do not delete or replace the lock file to bypass a holder: a new file can admit another writer while the original holder is still running.
+
+### Upgrade a selected batch
+
+For an explicit fleet transition, `ocm upgrade batch --runtime <runtime> --envs
+<first>,<second> --parallel 2 --accept-fleet-outage` captures every selected
+environment's checkpoint before starting upgrades. `--dry-run` previews the
+selection without the outage acknowledgement. Distinct names such as `Demo`
+and `demo` retain their exact identities and must have separate environment
+roots. When their existing lock files identify the same physical file, the
+batch acquires that lock once and processes those environments serially in
+both checkpoint and upgrade phases. Independent lock groups still run up to
+the requested parallelism. Existing lock paths and exclusion with other OCM
+processes are preserved.
 
 ### Upgrade every environment that can be updated safely
 
