@@ -260,9 +260,9 @@ fn write_env_archive_with_capture<T: Serialize>(
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".ocm-export-");
     let staged = if options.private_output {
-        let mut builder = tempfile::Builder::new();
-        builder.prefix(".ocm-export-");
         #[cfg(target_os = "macos")]
         let file = builder.make_in(
             parent,
@@ -275,42 +275,38 @@ fn write_env_archive_with_capture<T: Serialize>(
         );
         #[cfg(not(any(windows, target_os = "macos")))]
         let file = builder.tempfile_in(parent);
-        let file = file.map_err(|error| error.to_string())?;
-        Some(file)
+        file
     } else {
-        None
-    };
+        // Keep ordinary creation permissions and inherited ACLs. Only
+        // state-inclusive exports require the private-file creators above.
+        builder.make_in(parent, |path| {
+            File::options().write(true).create_new(true).open(path)
+        })
+    }
+    .map_err(|error| error.to_string())?;
+    // Stage both modes so retries and error cleanup touch only our own file.
+    // Publication must acquire the destination without replacing any entry.
+    let canonical_output = staged
+        .path()
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    options.own_output_path = canonical_output
+        .strip_prefix(source_root)
+        .ok()
+        .map(Path::to_path_buf);
     for attempt in 0..MAX_ENV_ARCHIVE_WRITE_ATTEMPTS {
-        let file = if let Some(staged) = &staged {
-            let mut file = staged
-                .as_file()
-                .try_clone()
-                .map_err(|error| error.to_string())?;
-            file.set_len(0).map_err(|error| error.to_string())?;
-            file.seek(SeekFrom::Start(0))
-                .map_err(|error| error.to_string())?;
-            file
-        } else {
-            File::create(output_path).map_err(|error| error.to_string())?
-        };
-        // Both ordinary output and private staging can be inside the source,
-        // including through an aliased parent. Exclude the actual file before
-        // traversal so the archive never reads bytes it is concurrently writing.
-        let archive_path = staged.as_ref().map_or(output_path, |file| file.path());
-        let canonical_output = archive_path
-            .canonicalize()
+        let mut file = staged
+            .as_file()
+            .try_clone()
             .map_err(|error| error.to_string())?;
-        options.own_output_path = canonical_output
-            .strip_prefix(source_root)
-            .ok()
-            .map(Path::to_path_buf);
+        file.set_len(0).map_err(|error| error.to_string())?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| error.to_string())?;
         match write_env_archive_attempt(metadata, source_root, file, options.clone(), capture) {
             Ok(()) => {
-                if let Some(staged) = staged {
-                    staged
-                        .persist_noclobber(output_path)
-                        .map_err(|error| error.to_string())?;
-                }
+                staged
+                    .persist_noclobber(output_path)
+                    .map_err(|error| error.to_string())?;
                 return Ok(());
             }
             Err(EnvArchiveWriteError::EntryDisappeared(_))
@@ -1598,6 +1594,34 @@ mod tests {
             .join(format!("{label}-{}-{id}", std::process::id()))
     }
 
+    #[test]
+    fn env_archive_refuses_existing_output_without_removing_it() {
+        for private_output in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("source");
+            let destination = fixture.path().join("destination");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&destination).unwrap();
+            fs::write(source.join("data.txt"), "source data").unwrap();
+            let archive = destination.join("archive.tar");
+            fs::write(&archive, "independently owned output").unwrap();
+
+            let result = write_env_archive_with_options(
+                &serde_json::json!({}),
+                &source,
+                &archive,
+                EnvArchiveOptions {
+                    private_output,
+                    ..EnvArchiveOptions::default()
+                },
+            );
+
+            assert!(result.is_err());
+            assert_eq!(fs::read(&archive).unwrap(), b"independently owned output");
+            assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn env_archives_preserve_symlinks_inside_the_root() {
@@ -2347,6 +2371,12 @@ mod tests {
             "contents after retry"
         );
         assert!(!extracted.root_dir.join("transient.db-shm").exists());
+        assert_eq!(
+            fs::read_dir(archive_path.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
 
         let _ = fs::remove_dir_all(source_root);
         let _ = fs::remove_dir_all(extract_dir);
@@ -2380,6 +2410,13 @@ mod tests {
 
         assert!(error.contains("failed to archive"), "{error}");
         assert!(PATHS_TO_REMOVE_BEFORE_ARCHIVE.lock().unwrap().is_empty());
+        assert!(!archive_path.exists());
+        assert_eq!(
+            fs::read_dir(archive_path.parent().unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
 
         let _ = fs::remove_dir_all(source_root);
         let _ = fs::remove_file(archive_path);
@@ -2495,6 +2532,13 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("SQLite"), "{error}");
+        assert!(!archive_path.exists());
+        assert_eq!(
+            fs::read_dir(archive_path.parent().unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
         let _ = fs::remove_dir_all(source_root);
         let _ = fs::remove_file(archive_path);
     }

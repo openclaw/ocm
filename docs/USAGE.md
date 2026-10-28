@@ -1502,7 +1502,10 @@ finishes. A later import removes staging left behind by an interrupted one.
 Export writes `<env>.ocm-env.tar` in the current directory unless `--output` is
 specified. The archive can be inside the environment, including through a
 directory alias: its own output is excluded from the archived contents. An
-existing output path is refused.
+existing output path is refused, including a dangling symlink or a file created
+by another writer while export is preparing the archive. Both export modes
+publish without replacing that entry and clean up only their own staging file
+if writing or publication fails.
 
 Export omits `.openclaw/state` by default. Default export keeps shared managed
 skills under `.openclaw/skills` and their global ClawHub tracking metadata under
