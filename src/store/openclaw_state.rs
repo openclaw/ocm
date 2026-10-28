@@ -907,6 +907,7 @@ pub(super) fn relocate_copied_databases(
     }
     let mut selection = OpenClawSqliteCopy {
         state_root: &paths.state_dir,
+        shared_databases: BTreeSet::new(),
         registered_agents: BTreeSet::new(),
         history: IntegrityProtectedLibraryPaths::new(&paths.state_dir)?,
     };
@@ -3175,6 +3176,7 @@ fn relocatable_plugin_path(
 // in a package, Workshop bundle, archive, or project fixture is not ownership.
 pub(super) struct OpenClawSqliteCopy<'a> {
     state_root: &'a Path,
+    shared_databases: BTreeSet<PathBuf>,
     registered_agents: BTreeSet<PathBuf>,
     history: IntegrityProtectedLibraryPaths,
 }
@@ -3199,19 +3201,37 @@ impl<'a> OpenClawSqliteCopy<'a> {
         Ok(())
     }
 
-    pub(super) fn new(state_root: &'a Path) -> Result<Self, String> {
+    pub(super) fn new(state_root: &'a Path, owned_root: &Path) -> Result<Self, String> {
         let mut selection = Self {
             state_root,
+            shared_databases: BTreeSet::new(),
             registered_agents: BTreeSet::new(),
             history: IntegrityProtectedLibraryPaths::new(state_root)?,
         };
-        let database = state_root.join("state/openclaw.sqlite");
-        // Preserve the existing handling of linked state; never discover owners
-        // by following a database or its parent outside the copied tree.
-        if !fs::symlink_metadata(state_root.join("state")).is_ok_and(|meta| meta.is_dir())
-            || !fs::symlink_metadata(&database).is_ok_and(|meta| meta.is_file())
-            || !is_sqlite_database(&database)?
-        {
+        let canonical_root = fs::canonicalize(owned_root).map_err(|error| error.to_string())?;
+        let shared_root = match fs::canonicalize(state_root.join("state")) {
+            Ok(path) if path.starts_with(&canonical_root) && path.is_dir() => path,
+            _ => return Ok(selection),
+        };
+        // The walker preserves directory links, but can reach their physical
+        // target elsewhere in the existing copy. Select these exact owners
+        // before traversal, without acquiring external data or leaf links.
+        for name in ["openclaw.sqlite", "openclaw-quarantine.sqlite"] {
+            let logical = state_root.join("state").join(name);
+            let database = shared_root.join(name);
+            if !fs::symlink_metadata(&database).is_ok_and(|meta| meta.is_file())
+                || is_integrity_protected_history_destination(state_root, &logical, &database)?
+            {
+                continue;
+            }
+            let relative = database
+                .strip_prefix(&canonical_root)
+                .map_err(|error| error.to_string())?;
+            selection.shared_databases.insert(owned_root.join(relative));
+            selection.shared_databases.insert(database);
+        }
+        let database = shared_root.join("openclaw.sqlite");
+        if !selection.shared_databases.contains(&database) || !is_sqlite_database(&database)? {
             return Ok(selection);
         }
         selection.read_agent_registry(&database, false)?;
@@ -3283,6 +3303,11 @@ impl<'a> OpenClawSqliteCopy<'a> {
             || self.history.roots.iter().any(|root| path.starts_with(root))
         {
             return false;
+        }
+        // An explicitly selected shared-state owner remains operational even
+        // when its admitted alias uses an otherwise opaque imports directory.
+        if self.shared_databases.contains(path) {
+            return true;
         }
         let relative = path.strip_prefix(self.state_root).ok();
         if relative.is_some_and(|path| path.starts_with("imports")) {
@@ -3912,7 +3937,7 @@ mod tests {
         // acquire SQLite copy ownership from that physical basename.
         fs::remove_file(state.join("skill-library")).unwrap();
         symlink("memory", state.join("skill-library")).unwrap();
-        let selection = OpenClawSqliteCopy::new(&state).unwrap();
+        let selection = OpenClawSqliteCopy::new(&state, &state).unwrap();
         assert!(!selection.contains(&state.join("memory/ordinary.sqlite")));
         assert!(
             contained_imported_database(
@@ -3943,7 +3968,7 @@ mod tests {
                 .contains(&state.join("missing"))
         );
         assert!(
-            OpenClawSqliteCopy::new(&state)
+            OpenClawSqliteCopy::new(&state, &state)
                 .unwrap()
                 .contains(&state.join("memory/ordinary.sqlite"))
         );

@@ -1878,28 +1878,40 @@ fn visit_files(root: &Path, on_file: &mut dyn FnMut(&Path)) {
 
 #[test]
 fn env_clone_rolls_back_an_unreadable_sqlite_snapshot() {
-    let root = TestDir::new("clone-invalid-sqlite");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-    assert!(
-        run_ocm(&cwd, &env, &["env", "create", "source"])
-            .status
-            .success()
-    );
-    let database = root.child("ocm-home/envs/source/.openclaw/state/openclaw.sqlite");
-    let invalid = b"SQLite format 3\0invalid database fixture";
-    fs::create_dir_all(database.parent().unwrap()).unwrap();
-    fs::write(&database, invalid).unwrap();
-    let output = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("SQLite"), "{}", stderr(&output));
-    assert!(!root.child("ocm-home/envs/target").exists());
-    let listing = run_ocm(&cwd, &env, &["env", "list", "--json"]);
-    let entries: Value = serde_json::from_str(&stdout(&listing)).unwrap();
-    assert_eq!(entries.as_array().unwrap().len(), 1);
-    assert_eq!(entries[0]["name"], "source");
-    assert_eq!(fs::read(&database).unwrap(), invalid);
+    for aliased in [false, true] {
+        #[cfg(not(unix))]
+        if aliased {
+            continue;
+        }
+        let root = TestDir::new("clone-invalid-sqlite");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        assert!(
+            run_ocm(&cwd, &env, &["env", "create", "source"])
+                .status
+                .success()
+        );
+        let state = root.child("ocm-home/envs/source/.openclaw");
+        #[cfg(unix)]
+        if aliased {
+            fs::create_dir_all(state.join("workspace/active")).unwrap();
+            std::os::unix::fs::symlink("workspace/active", state.join("state")).unwrap();
+        }
+        let database = state.join("state/openclaw.sqlite");
+        let invalid = b"SQLite format 3\0invalid database fixture";
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, invalid).unwrap();
+        let output = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("SQLite"), "{}", stderr(&output));
+        assert!(!root.child("ocm-home/envs/target").exists());
+        let listing = run_ocm(&cwd, &env, &["env", "list", "--json"]);
+        let entries: Value = serde_json::from_str(&stdout(&listing)).unwrap();
+        assert_eq!(entries.as_array().unwrap().len(), 1);
+        assert_eq!(entries[0]["name"], "source");
+        assert_eq!(fs::read(&database).unwrap(), invalid);
+    }
 }
 
 #[test]
