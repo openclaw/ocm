@@ -3266,7 +3266,7 @@ fn upgrade_simulate_tests_a_published_version_without_changing_the_source_env() 
 
 #[cfg(unix)]
 #[test]
-fn upgrade_simulate_rechecks_prepared_runtime_before_binding() {
+fn upgrade_simulate_rechecks_runtime_identity_and_cleanup_ownership() {
     use std::os::unix::process::CommandExt;
 
     struct Simulation(std::process::Child);
@@ -3277,7 +3277,18 @@ fn upgrade_simulate_rechecks_prepared_runtime_before_binding() {
         }
     }
 
-    for replace in [false, true] {
+    for (canonical, mutation, keep) in [
+        (true, "unchanged", true),
+        (true, "update", true),
+        (false, "unchanged", false),
+        (false, "update", false),
+        (false, "update-all", false),
+        (false, "reinstall", false),
+        (false, "reinstall", true),
+        (false, "removed", false),
+        (false, "unreadable", false),
+    ] {
+        let replace = mutation != "unchanged";
         let root = TestDir::new("simulation-runtime-identity");
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
@@ -3344,7 +3355,9 @@ printf '2026.3.24\n'
         };
         run(&["runtime", "add", "old", "--path", &path_string(&old)]);
         run(&["env", "create", "demo", "--runtime", "old"]);
-        run(&["runtime", "install", "--version", "2026.3.25"]);
+        if canonical {
+            run(&["runtime", "install", "--version", "2026.3.25"]);
+        }
         let source = root.child("ocm-home/envs/demo");
         let config = source.join(".openclaw/openclaw.json");
         let sentinel = source.join("source-sentinel");
@@ -3357,17 +3370,12 @@ printf '2026.3.24\n'
             .env_clear()
             .envs(&env)
             .process_group(0)
-            .args([
-                "upgrade",
-                "simulate",
-                "demo",
-                "--to",
-                "2026.3.25",
-                "--keep-simulations",
-                "--json",
-            ])
+            .args(["upgrade", "simulate", "demo", "--to", "2026.3.25", "--json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if keep {
+            command.arg("--keep-simulations");
+        }
         let mut simulation = Simulation(command.spawn().unwrap());
         let deadline = Instant::now() + Duration::from_secs(15);
         while !ready.exists() {
@@ -3377,18 +3385,90 @@ printf '2026.3.24\n'
             );
             sleep(Duration::from_millis(20));
         }
-        if replace {
-            let update = run(&[
-                "runtime",
-                "update",
-                "2026.3.25",
-                "--version",
-                "2026.3.26",
-                "--json",
-            ]);
-            let updated: Value = serde_json::from_str(&stdout(&update)).unwrap();
-            assert_eq!(updated["releaseVersion"], "2026.3.26");
+        let runtimes: Value =
+            serde_json::from_str(&stdout(&run(&["runtime", "list", "--json"]))).unwrap();
+        let runtime_name = if canonical {
+            "2026.3.25".to_string()
+        } else {
+            runtimes
+                .as_array()
+                .unwrap()
+                .iter()
+                .find_map(|meta| {
+                    meta["name"]
+                        .as_str()
+                        .filter(|name| name.starts_with("ocm-sim-runtime-"))
+                })
+                .unwrap()
+                .to_string()
+        };
+        let original: Value =
+            serde_json::from_str(&stdout(&run(&["runtime", "show", &runtime_name, "--json"])))
+                .unwrap();
+        let registration = ocm::store::runtime_meta_path(&runtime_name, &env, &cwd).unwrap();
+        match mutation {
+            "update" | "update-all" => {
+                let selection = if mutation == "update-all" {
+                    "--all"
+                } else {
+                    &runtime_name
+                };
+                run(&[
+                    "runtime",
+                    "update",
+                    selection,
+                    "--version",
+                    "2026.3.26",
+                    "--json",
+                ]);
+                let updated: Value = serde_json::from_str(&stdout(&run(&[
+                    "runtime",
+                    "show",
+                    &runtime_name,
+                    "--json",
+                ])))
+                .unwrap();
+                assert_eq!(updated["releaseVersion"], "2026.3.26");
+                assert_eq!(updated["createdAt"], original["createdAt"]);
+                assert_ne!(updated["updatedAt"], original["updatedAt"]);
+            }
+            "reinstall" | "removed" => {
+                run(&["runtime", "remove", &runtime_name]);
+                if mutation == "reinstall" {
+                    let independent = root.child("independent-openclaw");
+                    write_executable_script(&independent, "#!/bin/sh\nprintf 'independent\\n'\n");
+                    run(&[
+                        "runtime",
+                        "install",
+                        &runtime_name,
+                        "--path",
+                        &path_string(&independent),
+                        "--description",
+                        "Independent installation",
+                    ]);
+                }
+                if mutation != "removed" {
+                    let current: Value = serde_json::from_str(&stdout(&run(&[
+                        "runtime",
+                        "show",
+                        &runtime_name,
+                        "--json",
+                    ])))
+                    .unwrap();
+                    assert_ne!(current["createdAt"], original["createdAt"]);
+                }
+            }
+            "unreadable" => fs::write(&registration, "{invalid metadata").unwrap(),
+            "unchanged" => {}
+            _ => unreachable!(),
         }
+        let current_metadata = fs::read(&registration).ok();
+        let current_binary = current_metadata
+            .as_ref()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .map(|meta| PathBuf::from(meta["binaryPath"].as_str().unwrap()))
+            .unwrap_or_else(|| PathBuf::from(original["binaryPath"].as_str().unwrap()));
+        let current_bytes = fs::read(&current_binary).ok();
         fs::write(&release, "finish").unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         let status = loop {
@@ -3416,37 +3496,76 @@ printf '2026.3.24\n'
         let sim_name = summary["simulationEnv"].as_str().unwrap();
         let checks = summary["checks"].as_array().unwrap();
         if replace {
-            assert!(checks.iter().any(|check| {
-                check["name"] == "prepare target"
-                    && check["status"] == "failed"
-                    && check["note"]
-                        .as_str()
-                        .unwrap()
-                        .contains("changed after preparation")
-            }));
+            assert!(
+                checks.iter().any(|check| {
+                    check["name"] == "prepare target"
+                        && check["status"] == "failed"
+                        && (matches!(mutation, "removed" | "unreadable")
+                            || check["note"]
+                                .as_str()
+                                .unwrap()
+                                .contains("changed after preparation"))
+                }),
+                "{mutation}: {summary}"
+            );
             assert!(
                 !checks
                     .iter()
                     .any(|check| check["name"] == "openclaw --version")
             );
+        } else {
+            assert_eq!(summary["toBindingName"], runtime_name);
+            if keep {
+                let update = run_ocm(
+                    &cwd,
+                    &env,
+                    &["runtime", "update", &runtime_name, "--version", "2026.3.26"],
+                );
+                assert!(!update.status.success());
+                assert!(stderr(&update).contains("still used by environment(s)"));
+                assert!(stderr(&update).contains(sim_name));
+            }
+        }
+        if keep {
             assert_eq!(
                 stdout(&run(&["env", "run", sim_name, "--", "--version"])).trim(),
-                "2026.3.24"
+                if replace { "2026.3.24" } else { "2026.3.25" }
             );
         } else {
-            assert_eq!(summary["toBindingName"], "2026.3.25");
-            assert_eq!(
-                stdout(&run(&["env", "run", sim_name, "--", "--version"])).trim(),
-                "2026.3.25"
+            assert!(
+                !run_ocm(&cwd, &env, &["env", "show", sim_name, "--json"])
+                    .status
+                    .success()
             );
-            let update = run_ocm(
-                &cwd,
-                &env,
-                &["runtime", "update", "2026.3.25", "--version", "2026.3.26"],
+        }
+        let cleanup_refused = !keep && matches!(mutation, "reinstall" | "unreadable");
+        assert_eq!(
+            summary["cleanup"],
+            if keep {
+                "kept"
+            } else if cleanup_refused {
+                "failed"
+            } else {
+                "cleaned"
+            },
+            "{mutation}: {summary}"
+        );
+        if cleanup_refused {
+            assert!(
+                checks
+                    .iter()
+                    .any(|check| check["name"] == "cleanup simulation runtime"
+                        && check["status"] == "failed"),
+                "{summary}"
             );
-            assert!(!update.status.success());
-            assert!(stderr(&update).contains("still used by environment(s)"));
-            assert!(stderr(&update).contains(sim_name));
+        }
+        if canonical || keep || cleanup_refused {
+            assert_eq!(fs::read(&registration).ok(), current_metadata, "{mutation}");
+            assert_eq!(fs::read(&current_binary).ok(), current_bytes, "{mutation}");
+            assert!(current_binary.exists(), "{mutation}");
+        } else {
+            assert!(!registration.exists(), "{mutation}");
+            assert!(!current_binary.exists(), "{mutation}");
         }
         assert_eq!(
             stdout(&run(&["env", "show", "demo", "--json"])),
