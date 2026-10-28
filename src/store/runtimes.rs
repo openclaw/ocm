@@ -4204,9 +4204,11 @@ fn runtime_companion_integrity_issue(meta: &RuntimeMeta) -> Option<String> {
                 companion.id
             ));
         }
+        // Records contain display_path output, including native Windows separators.
+        // Normalize only the host separator; package declarations keep their stricter guard.
+        let entrypoint = companion.entrypoint.replace(std::path::MAIN_SEPARATOR, "/");
         let entrypoint_prefix = format!("dist/extensions/{}/", companion.id);
-        let Some(entrypoint_relative) = companion.entrypoint.strip_prefix(&entrypoint_prefix)
-        else {
+        let Some(entrypoint_relative) = entrypoint.strip_prefix(&entrypoint_prefix) else {
             return Some(format!(
                 "runtime companion {} has invalid entrypoint path: {}",
                 companion.id, companion.entrypoint
@@ -4219,7 +4221,8 @@ fn runtime_companion_integrity_issue(meta: &RuntimeMeta) -> Option<String> {
         let expected_entrypoint = PathBuf::from("dist/extensions")
             .join(&companion.id)
             .join(entrypoint_relative);
-        if display_path(&expected_entrypoint) != companion.entrypoint {
+        if display_path(&expected_entrypoint).replace(std::path::MAIN_SEPARATOR, "/") != entrypoint
+        {
             return Some(format!(
                 "runtime companion {} has invalid entrypoint path: {}",
                 companion.id, companion.entrypoint
