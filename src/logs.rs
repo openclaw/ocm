@@ -356,11 +356,13 @@ impl<'a> LogService<'a> {
                 writer
                     .write_all(&bytes)
                     .map_err(|error| error.to_string())?;
-                writer.flush().map_err(|error| error.to_string())?;
             }
         } else if let Some(snapshot) = snapshots.into_iter().flatten().next() {
             write_follow_snapshot(writer, snapshot)?;
         }
+        // Complete initial output even for an empty or pending source. The
+        // CLI may have a header to write; its failure must stop before polling.
+        writer.flush().map_err(|error| error.to_string())?;
 
         loop {
             self.refresh_follow_exclusions(&mut cursors)?;
@@ -1136,7 +1138,6 @@ fn write_follow_snapshot<W: Write>(writer: &mut W, snapshot: LogSnapshot) -> Res
         writer
             .write_all(&snapshot.bytes)
             .map_err(|error| error.to_string())?;
-        writer.flush().map_err(|error| error.to_string())?;
     }
     Ok(())
 }
