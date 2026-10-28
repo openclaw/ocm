@@ -1597,7 +1597,9 @@ mod archive_privacy_windows_tests {
                 if existing {
                     fs::create_dir(&directory).unwrap();
                 }
-                ensure_private_dir(&directory).unwrap();
+                ensure_private_dir(&directory).unwrap_or_else(|error| {
+                    panic!("units={units} existing={existing} path={directory:?}: {error}")
+                });
                 let file = directory_handle(&directory);
                 assert!(has_user_only_access(&file).unwrap(), "{directory:?}");
                 let identity = file_identity(&file, &file.metadata().unwrap()).unwrap();
@@ -1653,7 +1655,8 @@ mod archive_privacy_windows_tests {
             directory.file_name().unwrap().to_str().unwrap()
         ));
         let forward_slashes = PathBuf::from(directory.to_str().unwrap().replace('\\', "/"));
-        ensure_private_dir(&relative).unwrap();
+        ensure_private_dir(&relative)
+            .unwrap_or_else(|error| panic!("relative={relative:?}: {error}"));
         let file = directory_handle(&directory);
         let identity = file_identity(&file, &file.metadata().unwrap()).unwrap();
         for spelling in [&drive_relative, &normalized, &forward_slashes] {

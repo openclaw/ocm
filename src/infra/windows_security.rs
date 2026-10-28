@@ -5,12 +5,11 @@ use std::mem::{MaybeUninit, size_of};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_FILENAME_EXCED_RANGE, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE,
+    ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, AddAccessAllowedAce,
@@ -96,43 +95,22 @@ pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
         PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity,
     };
     use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, WRITE_DAC, WRITE_OWNER};
-    let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    if encoded.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid private directory path",
-        ));
-    }
-    encoded.push(0);
+    let encoded = private_directory_path(path)?;
     let user = UserSid::current()?;
     with_user_only_security_attributes(&user, |attributes| {
         if unsafe { CreateDirectoryW(encoded.as_ptr(), attributes) } != 0 {
             return Ok(());
         }
-        let mut error = io::Error::last_os_error();
-        let mut retry_path = None;
-        if error.raw_os_error() == Some(ERROR_FILENAME_EXCED_RANGE as i32) {
-            let extended = extended_directory_path(path)?;
-            if extended.as_os_str() == path.as_os_str() {
-                return Err(error);
-            }
-            encoded = extended.as_os_str().encode_wide().chain(Some(0)).collect();
-            retry_path = Some(extended);
-            // Retry with the same protected descriptor. Ordinary successful
-            // paths retain their original Win32 interpretation.
-            if unsafe { CreateDirectoryW(encoded.as_ptr(), attributes) } != 0 {
-                return Ok(());
-            }
-            error = io::Error::last_os_error();
-        }
+        let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::AlreadyExists {
             return Err(error);
         }
+        let checked_path = OsString::from_wide(&encoded[..encoded.len() - 1]);
         let directory = OpenOptions::new()
             .access_mode(READ_CONTROL | WRITE_DAC | WRITE_OWNER)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(retry_path.as_deref().unwrap_or(path))?;
+            .open(Path::new(&checked_path))?;
         let metadata = directory.metadata()?;
         if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(io::Error::new(
@@ -156,33 +134,51 @@ pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
     })
 }
 
-fn extended_directory_path(path: &Path) -> io::Result<PathBuf> {
-    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+fn private_directory_path(path: &Path) -> io::Result<Vec<u16>> {
+    let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if encoded.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid private directory path",
+        ));
+    }
+    // CreateDirectoryW has a stricter legacy bound than file APIs: 248 UTF-16
+    // units including NUL. Long ancestors can report PATH_NOT_FOUND, not just
+    // FILENAME_EXCED_RANGE, so prepare the spelling before calling it.
+    const LEGACY_MAX_PATH: usize = 248;
     const SEP: u16 = b'\\' as u16;
     const QUERY: u16 = b'?' as u16;
     const COLON: u16 = b':' as u16;
     const DOT: u16 = b'.' as u16;
-    if encoded.starts_with(&[SEP, SEP, QUERY, SEP])
+    let input_long = encoded.len() + 1 >= LEGACY_MAX_PATH;
+    if encoded.is_empty()
+        || encoded.starts_with(&[SEP, SEP, QUERY, SEP])
         || encoded.starts_with(&[SEP, QUERY, QUERY, SEP])
+        || (!input_long && path.is_absolute())
     {
-        return Ok(path.to_owned());
+        encoded.push(0);
+        return Ok(encoded);
     }
-    // GetFullPathNameW semantics normalize relative paths, separators and dot
-    // components without following the final entry (unlike canonicalize).
+    // Resolve relative paths and ordinary dot/separator syntax lexically,
+    // without following filesystem links. Keep short spellings unchanged.
     let absolute = std::path::absolute(path)?;
-    let encoded = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
-    let (prefix, rest) = match encoded.as_slice() {
-        [_, COLON, SEP, ..] => (r"\\?\", encoded.as_slice()),
+    let absolute = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    if !input_long && absolute.len() + 1 < LEGACY_MAX_PATH {
+        encoded.push(0);
+        return Ok(encoded);
+    }
+    let (prefix, rest) = match absolute.as_slice() {
+        [_, COLON, SEP, ..] => (r"\\?\", absolute.as_slice()),
         [SEP, SEP, DOT, SEP, rest @ ..] => (r"\\?\", rest),
-        [SEP, SEP, QUERY, SEP, ..] | [SEP, QUERY, QUERY, SEP, ..] => ("", encoded.as_slice()),
+        [SEP, SEP, QUERY, SEP, ..] | [SEP, QUERY, QUERY, SEP, ..] => ("", absolute.as_slice()),
         [SEP, SEP, rest @ ..] => (r"\\?\UNC\", rest),
-        _ => ("", encoded.as_slice()),
+        _ => ("", absolute.as_slice()),
     };
-    let extended = prefix
+    Ok(prefix
         .encode_utf16()
         .chain(rest.iter().copied())
-        .collect::<Vec<_>>();
-    Ok(PathBuf::from(OsString::from_wide(&extended)))
+        .chain(Some(0))
+        .collect())
 }
 
 pub(crate) fn owned_handle(raw: HANDLE) -> io::Result<OwnedHandle> {
@@ -439,11 +435,12 @@ mod tests {
             ),
             (r"\??\C:\literal. ", r"\??\C:\literal. "),
         ] {
+            let suffix = ["segment"; 40].join(r"\");
+            let input = format!("{input}\\{suffix}");
+            let expected = format!("{expected}\\{suffix}\0");
             assert_eq!(
-                extended_directory_path(Path::new(input))
-                    .unwrap()
-                    .as_os_str(),
-                expected
+                private_directory_path(Path::new(&input)).unwrap(),
+                expected.encode_utf16().collect::<Vec<_>>()
             );
         }
     }
