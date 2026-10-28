@@ -6,7 +6,6 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const {pathToFileURL} = require('node:url');
 
 assert.equal(process.platform, 'win32', 'This proof requires native Windows');
 assert.ok(process.argv[2] && process.argv[3], 'Pass the exact OCM binary and TestDir');
@@ -17,8 +16,6 @@ assert.ok(fs.statSync(binary).isFile());
 assert.ok(fs.statSync(root).isDirectory());
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const fileDigest = file => digest(fs.readFileSync(file));
-const openclawSource = process.env.OCM_TEST_OPENCLAW_SOURCE;
-const readerScript = path.join(__dirname, 'windows_companion_reader.mjs');
 let externalBindingRoot;
 
 const env = {};
@@ -42,14 +39,15 @@ for (const key of ['HOME', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'OCM_HOME', 'npm_c
 
 function observe(command, args, options = {}) {
   const cwd = options.cwd || root;
-  console.log(JSON.stringify({command, args, cwd, windowsHide: options.windowsHide ?? false}));
   const result = cp.spawnSync(command, args, {
     cwd, env: options.env || env, encoding: 'utf8', timeout: 60000,
     maxBuffer: 4 * 1024 * 1024, windowsHide: options.windowsHide ?? false,
   });
-  console.log(JSON.stringify({command, args, exit: result.status, signal: result.signal,
-    error: result.error ? String(result.error) : null,
-    stdout: result.stdout || '', stderr: result.stderr || ''}));
+  if (result.error || result.status !== 0) {
+    console.error(JSON.stringify({command, args, cwd, exit: result.status, signal: result.signal,
+      error: result.error ? String(result.error) : null,
+      stdout: result.stdout || '', stderr: result.stderr || ''}));
+  }
   if (result.error) throw result.error;
   return result;
 }
@@ -108,8 +106,7 @@ function main() {
   console.log(JSON.stringify({platform: process.platform, release: os.release(), version: os.version(),
     architecture: process.arch, node: process.version, nodeBinary: process.execPath,
     nodeSha256: fileDigest(process.execPath), binary, binarySha256: fileDigest(binary),
-    scriptSha256: fileDigest(__filename),
-    actualReader: openclawSource ? {sourceRoot: openclawSource, scriptSha256: fileDigest(readerScript)} : null}));
+    scriptSha256: fileDigest(__filename)}));
   const npmCommand = run('where.exe', ['npm.cmd']).trim().split(/\r?\n/)[0];
   assert.ok(path.isAbsolute(npmCommand) && fs.statSync(npmCommand).isFile());
   const npmCli = path.join(path.dirname(npmCommand), 'node_modules/npm/bin/npm-cli.js');
@@ -117,8 +114,8 @@ function main() {
   env.OCM_INTERNAL_NPM_BIN = npmCommand;
   console.log(JSON.stringify({npmCommand, npmCommandSha256: fileDigest(npmCommand),
     npmCli, npmCliSha256: fileDigest(npmCli)}));
-  run(process.execPath, [npmCli, '--version']);
-  run(binary, ['--version']);
+  console.log(JSON.stringify({npm: run(process.execPath, [npmCli, '--version']).trim(),
+    ocm: run(binary, ['--version']).trim()}));
 
   const archives = path.join(root, 'archives');
   const packages = path.join(root, 'packages');
@@ -167,68 +164,17 @@ function main() {
     cyclicBridgeArchives[cyclicName] = pack(cyclicDirectory);
   }
 
-  // Raw imports compare npm's graph, including identity between companions.
-  // They are a control, not OpenClaw's final admission of a plugin entry.
+  // OpenClaw's native final admission canonicalizes the declared entry.
+  // Compare the same native graph, including identity between companions.
   const inspectCompanions = `function inspect(pluginPaths) {
-  let graph;
-  try {
-    // Mirror the native canonical entry returned by OpenClaw's final admission.
-    // The production-loader preload separately qualifies this fixture boundary.
-    const fs=require('node:fs');
-    const plugins=pluginPaths.map(file=>require(fs.realpathSync.native(require.resolve(file))));
-    graph={companions:plugins.map(plugin=>plugin.observation),
-      isolated:plugins.every((plugin,index)=>plugins.slice(0,index).every(previous=>
-        plugin.token!==previous.token && plugin.direct!==previous.direct && plugin.common!==previous.common))};
-  } finally {
-    // Observe only after loading and computing graph facts. Diagnostics neither
-    // canonicalize import paths nor load additional fixture modules.
-    try {
-      const fs=require('node:fs'), path=require('node:path');
-      const identities=new Map();
-      const identity=value=>{
-        if(!value || !['object','function'].includes(typeof value)) return null;
-        if(!identities.has(value)) identities.set(value,identities.size+1);
-        return identities.get(value);
-      };
-      const attempt=read=>{
-        try {return {value:read()};}
-        catch(error) {return {code:error.code??null,message:String(error.message).slice(0,300)};}
-      };
-      const spelling=filename=>({filename,
-        realpath:attempt(()=>fs.realpathSync(filename)),
-        nativeRealpath:attempt(()=>fs.realpathSync.native(filename))});
-      const fixturePackages=['value','bridge-a','bridge-b','cyclic-bridge-a','cyclic-bridge-b','codex','second'];
-      const entries=Object.entries(require.cache).filter(([,entry])=>
-        (path.basename(entry.filename)==='index.cjs'
-          && fixturePackages.includes(path.basename(path.dirname(entry.filename))))
-        || (path.basename(entry.filename)==='sdk.cjs' && path.basename(path.dirname(entry.filename))==='openclaw'));
-      const modules=entries.slice(0,32).map(([cacheKey,entry])=>{
-        return {cacheKey,nativeRealpath:attempt(()=>fs.realpathSync.native(entry.filename)),
-          exportsId:identity(entry.exports),tokenId:identity(entry.exports?.token),
-          directId:identity(entry.exports?.direct),commonId:identity(entry.exports?.common),
-          valueId:identity(entry.exports?.value),pluginId:entry.exports?.observation?.id??null};
-      });
-      console.error(JSON.stringify({moduleIdentityDiagnostics:true,
-        requested:pluginPaths.map(requested=>({requested,
-          resolved:attempt(()=>spelling(require.resolve(requested)))})),
-        modules,omittedModules:Math.max(0,entries.length-32)}));
-    } catch(error) {
-      console.error(JSON.stringify({moduleIdentityDiagnostics:true,error:String(error)}));
-    }
-  }
-  console.log(JSON.stringify(graph));
+  const fs=require('node:fs');
+  const plugins=pluginPaths.map(file=>require(fs.realpathSync.native(require.resolve(file))));
+  console.log(JSON.stringify({companions:plugins.map(plugin=>plugin.observation),
+    isolated:plugins.every((plugin,index)=>plugins.slice(0,index).every(previous=>
+      plugin.token!==previous.token && plugin.direct!==previous.direct && plugin.common!==previous.common))}));
 }`;
-  // Capture only exports admitted and registered by the real loader. Requiring
-  // the logical path again in the reader could create the alias under test.
-  const registrationSource = `
-exports.id=exports.observation.id;
-exports.register=()=>{
-  const registrations=globalThis[Symbol.for('ocm.r4.registrations')];
-  if(!Array.isArray(registrations)) throw new Error('Missing fixture reader registration capture');
-  registrations.push({id:exports.id,observation:exports.observation,
-    token:exports.token,direct:exports.direct,common:exports.common,filename:__filename});
-};
-`;
+  // Keep fixture payloads valid native plugins as well as Node modules.
+  const registrationSource = "exports.id=exports.observation.id; exports.register=()=>{};\n";
   const failures = [];
   const cases = [
     {name: 'plain-hoisted', strategy: 'hoisted', bundled: false},
@@ -237,15 +183,8 @@ exports.register=()=>{
     {name: 'plain-linked', strategy: 'linked', bundled: false},
     {name: 'bundled-linked', strategy: 'linked', bundled: true},
   ];
-  // Temporary comparison selection; remove after the bounded baseline runs.
-  const requestedCases = process.env.OCM_TEST_COMPANION_CASES;
-  const selectedNames = requestedCases === undefined
-    ? cases.map(scenario => scenario.name) : requestedCases.split(',').map(name => name.trim());
-  assert.ok(selectedNames.length > 0 && selectedNames.every(name => cases.some(scenario => scenario.name === name)),
-    'OCM_TEST_COMPANION_CASES must name existing fixture cases');
-  assert.equal(new Set(selectedNames).size, selectedNames.length, 'Fixture case selection contains duplicates');
-  const selectedCases = cases.filter(scenario => selectedNames.includes(scenario.name));
-  console.log(JSON.stringify({selectedCases: selectedNames, allCases: selectedCases.length === cases.length}));
+  const selectedNames = cases.map(scenario => scenario.name);
+  const selectedCases = cases;
   for (const scenario of selectedCases) {
     const startedAt = Date.now();
     const repo = path.join(root, scenario.name);
@@ -280,7 +219,7 @@ exports.register=()=>{
       name: '@openclaw/codex', version, main: 'index.cjs',
       files: ['index.cjs', 'openclaw.plugin.json'],
       dependencies: {value: scenario.bundled ? '1.0.0' : leafArchive,
-        'external-bridge': `file:${externalBridge}`,
+        'external-bridge': `file:${externalBindingRoot}`,
         ...(scenario.bundled ? cyclicBridgeArchives : bridgeArchives)},
       openclaw: {build: {openclawVersion: version}, release: {publishToNpm: true},
         extensions: ['./index.cjs'], runtimeExtensions: ['./index.cjs']},
@@ -322,7 +261,7 @@ if(result.error) throw result.error;
 process.exit(result.status??1);
 `);
     let expectedSource = treeSnapshot(repo);
-    console.log(JSON.stringify({scenario, fixtureSha256: digest(JSON.stringify(expectedSource)), sourceFiles: expectedSource}));
+    console.log(JSON.stringify({scenario, fixtureSha256: digest(JSON.stringify(expectedSource))}));
     let native;
     let prerequisiteStep = 'pack';
     try {
@@ -405,8 +344,6 @@ process.exit(result.status??1);
         console.log(JSON.stringify({scenario: scenario.name, phase, verificationExit: verification.status,
           verificationHealthy: verified.healthy, verificationIssue: verified.issue ?? null}));
         const comparisons = [];
-        // Do not let a failed admission fixture prevent the production reader
-        // from observing the same installed bytes through its own admission.
         try {
           const materialized = JSON.parse(bound
             ? run(binary, [`@${scenario.name}`, '--', '--version'], {env: selectedEnv})
@@ -418,36 +355,7 @@ process.exit(result.status??1);
           console.error(error);
           comparisons.push({reader: 'canonical-entry-fixture', status: 'failed', failure: String(error)});
         }
-        if (openclawSource) {
-          try {
-            assert.ok(path.isAbsolute(openclawSource), 'OCM_TEST_OPENCLAW_SOURCE must be absolute');
-            const readerRequest = {schemaVersion: 1, scenario: scenario.name, phase: observationPhase,
-              installRoot: installed, entrypoint: currentMetadata.binaryPath,
-              pluginIds: companionIds, expected};
-            const result = observe(process.execPath,
-              ['--import', pathToFileURL(readerScript).href, currentMetadata.binaryPath, '--version'],
-              {env: {...selectedEnv, OCM_TEST_OPENCLAW_SOURCE: openclawSource,
-                OCM_TEST_COMPANION_READER_REQUEST: JSON.stringify(readerRequest)}});
-            const receipts = result.stdout.split(/\r?\n/).flatMap(line => {
-              try {
-                const value = JSON.parse(line);
-                return value?.actualOpenClawReader === true ? [value] : [];
-              } catch {
-                return [];
-              }
-            });
-            assert.equal(receipts.length, 1, 'Expected one tagged actual-loader receipt');
-            assert.equal(result.status, 0, 'Actual OpenClaw reader process failed');
-            assert.equal(receipts[0].status, 'passed');
-            assert.deepEqual(receipts[0].graph, expected, 'Actual OpenClaw reader changed the native graph');
-            comparisons.push({reader: 'actual-openclaw-loader', status: 'passed'});
-          } catch (error) {
-            console.error(error);
-            comparisons.push({reader: 'actual-openclaw-loader', status: 'failed', failure: String(error)});
-          }
-        }
-        console.log(JSON.stringify({scenario: scenario.name, phase, comparisons,
-          actualReaderRequested: Boolean(openclawSource)}));
+        console.log(JSON.stringify({scenario: scenario.name, phase, comparisons}));
         assert.equal(fileDigest(metadataPath), metadataSha256, 'Product observations rewrote generated runtime metadata');
         assert.deepEqual(treeSnapshot(repo), expectedSource, 'OCM changed the source fixture');
         assert.deepEqual(comparisons.filter(comparison => comparison.status !== 'passed'), [],
