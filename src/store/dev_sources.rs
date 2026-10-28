@@ -279,6 +279,7 @@ fn record_path_entries(
     path: &Path,
     entries: &mut BTreeSet<PathBuf>,
     links: &mut BTreeSet<PathBuf>,
+    include_directories: bool,
 ) -> Result<PathBuf, String> {
     let resolved = fs::canonicalize(path).map_err(|error| {
         format!(
@@ -288,10 +289,11 @@ fn record_path_entries(
     })?;
     entries.insert(resolved.clone());
     for ancestor in path.ancestors() {
-        if !fs::symlink_metadata(ancestor)
-            .map_err(|error| error.to_string())?
-            .is_symlink()
-        {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|error| error.to_string())?;
+        if include_directories && metadata.is_dir() {
+            entries.insert(fs::canonicalize(ancestor).map_err(|error| error.to_string())?);
+        }
+        if !metadata.is_symlink() {
             continue;
         }
         let parent = ancestor.parent().ok_or("source symlink has no parent")?;
@@ -306,7 +308,7 @@ fn record_path_entries(
             } else {
                 parent.join(target)
             };
-            record_path_entries(&target, entries, links)?;
+            record_path_entries(&target, entries, links, include_directories)?;
         }
     }
     Ok(resolved)
@@ -314,7 +316,15 @@ fn record_path_entries(
 
 pub(crate) fn existing_source_path_entries(path: &Path) -> Result<BTreeSet<PathBuf>, String> {
     let mut entries = BTreeSet::new();
-    record_path_entries(path, &mut entries, &mut BTreeSet::new())?;
+    record_path_entries(path, &mut entries, &mut BTreeSet::new(), false)?;
+    Ok(entries)
+}
+
+// Copy cleanup also needs ordinary directories traversed before a parent
+// component, even when they contain none of the final target's bytes.
+pub(crate) fn existing_source_path_route_entries(path: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    let mut entries = BTreeSet::new();
+    record_path_entries(path, &mut entries, &mut BTreeSet::new(), true)?;
     Ok(entries)
 }
 
@@ -335,7 +345,7 @@ fn record_git_path(
         reserve_path(path, footprint)?;
         return Ok(None);
     }
-    record_path_entries(path, &mut footprint.entries, links).map(Some)
+    record_path_entries(path, &mut footprint.entries, links, false).map(Some)
 }
 
 fn append_git_footprint(
@@ -512,7 +522,7 @@ fn append_git_object_footprint(
             }
             continue;
         }
-        let resolved = record_path_entries(&objects, &mut footprint.entries, links)?;
+        let resolved = record_path_entries(&objects, &mut footprint.entries, links, false)?;
         footprint.content_roots.insert(resolved.clone());
         if !visited.insert(resolved.clone()) {
             continue;

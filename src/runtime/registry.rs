@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 
 use crate::env::EnvMeta;
 use crate::store::{
-    InstallContext, RuntimeMutationGuard, add_runtime_with_context, get_runtime,
+    InstallContext, RuntimeMutationGuard, add_runtime_with_context, find_runtime, get_runtime,
     get_runtime_verified, list_runtimes, remove_runtime_with_guard, runtime_binding_dependencies,
     runtime_meta_path, runtime_owner_identity, validate_name, with_locked_environments,
 };
@@ -253,5 +253,27 @@ impl<'a> RuntimeService<'a> {
         })?;
         self.refresh_supervisor_if_present(name)?;
         Ok(meta)
+    }
+
+    pub(crate) fn remove_simulation(&self, expected: &RuntimeMeta) -> Result<(), String> {
+        let removed = self.with_unbound_runtime(&expected.name, |guard| {
+            let Some(current) = find_runtime(&expected.name, self.env, self.cwd)? else {
+                return Ok(false);
+            };
+            // Check lifetime and remove under the same mutation and binding
+            // guards. Ordinary updates retain this identity; name reuse does not.
+            if current.name != expected.name || current.created_at != expected.created_at {
+                return Err(format!(
+                    "simulation runtime \"{}\" was replaced; refusing to remove it",
+                    expected.name
+                ));
+            }
+            remove_runtime_with_guard(&expected.name, guard, self.env, self.cwd)?;
+            Ok(true)
+        })?;
+        if removed {
+            self.refresh_supervisor_if_present(&expected.name)?;
+        }
+        Ok(())
     }
 }

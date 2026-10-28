@@ -1878,28 +1878,132 @@ fn visit_files(root: &Path, on_file: &mut dyn FnMut(&Path)) {
 
 #[test]
 fn env_clone_rolls_back_an_unreadable_sqlite_snapshot() {
-    let root = TestDir::new("clone-invalid-sqlite");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-    assert!(
-        run_ocm(&cwd, &env, &["env", "create", "source"])
-            .status
-            .success()
-    );
-    let database = root.child("ocm-home/envs/source/.openclaw/state/openclaw.sqlite");
-    let invalid = b"SQLite format 3\0invalid database fixture";
-    fs::create_dir_all(database.parent().unwrap()).unwrap();
-    fs::write(&database, invalid).unwrap();
-    let output = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("SQLite"), "{}", stderr(&output));
-    assert!(!root.child("ocm-home/envs/target").exists());
-    let listing = run_ocm(&cwd, &env, &["env", "list", "--json"]);
-    let entries: Value = serde_json::from_str(&stdout(&listing)).unwrap();
-    assert_eq!(entries.as_array().unwrap().len(), 1);
-    assert_eq!(entries[0]["name"], "source");
-    assert_eq!(fs::read(&database).unwrap(), invalid);
+    for aliased in [false, true] {
+        #[cfg(not(unix))]
+        if aliased {
+            continue;
+        }
+        let root = TestDir::new("clone-invalid-sqlite");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        assert!(
+            run_ocm(&cwd, &env, &["env", "create", "source"])
+                .status
+                .success()
+        );
+        let state = root.child("ocm-home/envs/source/.openclaw");
+        #[cfg(unix)]
+        if aliased {
+            fs::create_dir_all(state.join("workspace/active")).unwrap();
+            std::os::unix::fs::symlink("workspace/active", state.join("state")).unwrap();
+        }
+        let database = state.join("state/openclaw.sqlite");
+        let invalid = b"SQLite format 3\0invalid database fixture";
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, invalid).unwrap();
+        let output = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("SQLite"), "{}", stderr(&output));
+        assert!(!root.child("ocm-home/envs/target").exists());
+        let listing = run_ocm(&cwd, &env, &["env", "list", "--json"]);
+        let entries: Value = serde_json::from_str(&stdout(&listing)).unwrap();
+        assert_eq!(entries.as_array().unwrap().len(), 1);
+        assert_eq!(entries[0]["name"], "source");
+        assert_eq!(fs::read(&database).unwrap(), invalid);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_retains_shared_database_alias_targets_and_routes() {
+    use std::os::unix::fs::symlink;
+
+    for route in ["direct", "link", "parent"] {
+        let root = TestDir::new("clone-shared-state-alias-lifetime");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let state = root.child("ocm-home/envs/source/.openclaw");
+        let storage = state.join("imports/ordinary");
+        fs::create_dir_all(&storage).unwrap();
+        let link_target = if route != "direct" {
+            fs::create_dir(state.join("aliases")).unwrap();
+            write_text(&state.join("aliases/unrelated.txt"), "runtime debris");
+            if route == "link" {
+                symlink("../imports/ordinary", state.join("aliases/storage")).unwrap();
+                "aliases/storage"
+            } else {
+                "aliases/../imports/ordinary"
+            }
+        } else {
+            "imports/ordinary"
+        };
+        symlink(link_target, state.join("state")).unwrap();
+        write_text(&storage.join("unrelated.txt"), "runtime debris");
+        let mut writers = Vec::new();
+        let mut originals = Vec::new();
+        for name in ["openclaw.sqlite", "openclaw-quarantine.sqlite"] {
+            let path = storage.join(name);
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                CREATE TABLE durable(value TEXT); INSERT INTO durable VALUES ('committed');",
+            )
+            .unwrap();
+            originals.push((
+                name,
+                fs::read(&path).unwrap(),
+                fs::read(format!("{}-wal", path.display())).unwrap(),
+            ));
+            writers.push(db);
+        }
+
+        let clone = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+        assert!(clone.status.success(), "{}", stderr(&clone));
+
+        let target = root.child("ocm-home/envs/target/.openclaw");
+        assert_eq!(
+            fs::read_link(target.join("state")).unwrap(),
+            Path::new(link_target)
+        );
+        if route == "link" {
+            assert_eq!(
+                fs::read_link(target.join("aliases/storage")).unwrap(),
+                Path::new("../imports/ordinary")
+            );
+            assert!(!target.join("aliases/unrelated.txt").exists());
+        }
+        if route == "parent" {
+            assert!(target.join("aliases").is_dir());
+            assert_eq!(fs::read_dir(target.join("aliases")).unwrap().count(), 0);
+        }
+        assert!(!target.join("imports/ordinary/unrelated.txt").exists());
+        for (name, main, wal) in originals {
+            let copied = target.join("state").join(name);
+            assert!(copied.is_file(), "{}", copied.display());
+            let db =
+                Connection::open_with_flags(&copied, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            assert_eq!(
+                db.query_row("SELECT value FROM durable", [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "committed"
+            );
+            assert_eq!(
+                db.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+            assert_eq!(fs::read(storage.join(name)).unwrap(), main);
+            assert_eq!(fs::read(storage.join(format!("{name}-wal"))).unwrap(), wal);
+        }
+        assert_eq!(
+            fs::read_to_string(storage.join("unrelated.txt")).unwrap(),
+            "runtime debris"
+        );
+    }
 }
 
 #[test]
@@ -3167,6 +3271,236 @@ fn copied_config_fixture(
 }
 
 #[test]
+fn env_clone_copied_git_config_native_worktrees_stage_independently_without_a_registry() {
+    for route in ["clone", "migrate", "adopt"] {
+        for storage_only in [false, true] {
+            let root = TestDir::new("copy-native-worktree");
+            let (mut env, source, mut repo) = copied_config_fixture(&root);
+            env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+            if storage_only {
+                let storage = source.join(".openclaw/git-storage");
+                fs::rename(&repo, &storage).unwrap();
+                repo = storage;
+            }
+            let checkout = source.join(".openclaw/workspace/task");
+            managed_git(
+                &repo,
+                &["worktree", "add", "-qb", "task", checkout.to_str().unwrap()],
+            );
+            write_text(&checkout.join("file"), "staged content\n");
+            copied_config_git(&checkout, &env, &["add", "file"]);
+            write_text(&checkout.join("file"), "unstaged content\n");
+            write_text(&checkout.join("untracked"), "untracked content\n");
+            let status = copied_config_git(&checkout, &env, &["status", "--porcelain"]);
+            let source_index = repo.join(".git/worktrees/task/index");
+            let index = fs::read(&source_index).unwrap();
+            let before = file_bytes(&source);
+            let home = source.join(".openclaw");
+            let output = match route {
+                "clone" => run_ocm(root.path(), &env, &["env", "clone", "source", "target"]),
+                "migrate" => run_ocm(
+                    root.path(),
+                    &env,
+                    &["migrate", "target", home.to_str().unwrap()],
+                ),
+                "adopt" => run_ocm(
+                    root.path(),
+                    &env,
+                    &[
+                        "adopt",
+                        "import",
+                        "--name",
+                        "target",
+                        home.to_str().unwrap(),
+                    ],
+                ),
+                _ => unreachable!(),
+            };
+            assert!(output.status.success(), "{route}: {}", stderr(&output));
+            assert_eq!(file_bytes(&source), before, "{route} changed its source");
+            let target = source.parent().unwrap().join("target");
+            let target_repo = target.join(repo.strip_prefix(&source).unwrap());
+            let target_checkout = target.join(checkout.strip_prefix(&source).unwrap());
+            let common =
+                copied_config_git(&target_checkout, &env, &["rev-parse", "--git-common-dir"]);
+            assert_eq!(
+                fs::canonicalize(target_checkout.join(common)).unwrap(),
+                fs::canonicalize(target_repo.join(".git")).unwrap()
+            );
+            let private =
+                copied_config_git(&target_checkout, &env, &["rev-parse", "--absolute-git-dir"]);
+            assert_eq!(
+                fs::canonicalize(private).unwrap(),
+                fs::canonicalize(target_repo.join(".git/worktrees/task")).unwrap()
+            );
+            assert_eq!(
+                fs::read(target_repo.join(".git/worktrees/task/index")).unwrap(),
+                index
+            );
+            assert_eq!(
+                copied_config_git(&target_checkout, &env, &["status", "--porcelain"]),
+                status
+            );
+            write_text(&target_checkout.join("target-only"), "target edit\n");
+            copied_config_git(&target_checkout, &env, &["add", "target-only"]);
+            assert!(
+                copied_config_git(&target_checkout, &env, &["diff", "--cached", "--name-only"])
+                    .lines()
+                    .any(|name| name == "target-only")
+            );
+            assert_eq!(fs::read(&source_index).unwrap(), index);
+            assert_eq!(
+                copied_config_git(&checkout, &env, &["status", "--porcelain"]),
+                status
+            );
+            assert_eq!(file_bytes(&source), before);
+            assert!(!checkout.join("target-only").exists());
+            fs::rename(&source, source.with_extension("offline")).unwrap();
+            assert!(
+                copied_config_git(&target_checkout, &env, &["status", "--porcelain"])
+                    .contains("A  target-only")
+            );
+        }
+    }
+}
+
+#[test]
+fn env_clone_copied_git_config_native_worktrees_keep_overlapping_migration_copies_independent() {
+    for adopt in [false, true] {
+        let root = TestDir::new("copy-native-overlapping-workspaces");
+        let (mut env, source, repo) = copied_config_fixture(&root);
+        env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+        let home = source.join(".openclaw");
+        let checkout = home.join("workspace/task");
+        managed_git(
+            &repo,
+            &["worktree", "add", "-qb", "task", checkout.to_str().unwrap()],
+        );
+        copied_config_git(
+            &repo,
+            &env,
+            &["config", "extensions.worktreeConfig", "true"],
+        );
+        for path in [&repo, &checkout] {
+            copied_config_git(
+                path,
+                &env,
+                &[
+                    "config",
+                    "--worktree",
+                    "core.worktree",
+                    &copied_config_path(path),
+                ],
+            );
+        }
+        write_text(
+            &home.join("openclaw.json"),
+            &serde_json::json!({"agents":{"defaults":{"workspace":source}}}).to_string(),
+        );
+        let before = file_bytes(&source);
+        let target = root.child("target");
+        let mut args = if adopt {
+            vec!["adopt", "import", "--name", "target"]
+        } else {
+            vec!["migrate", "target"]
+        };
+        args.extend([home.to_str().unwrap(), "--root", target.to_str().unwrap()]);
+        let output = run_ocm(root.path(), &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let homes = [
+            target.join(".openclaw"),
+            target.join(".openclaw/workspaces/default/.openclaw"),
+        ];
+        let indexes = homes
+            .iter()
+            .map(|home| home.join("workspace/nested repo/.git/worktrees/task/index"))
+            .collect::<Vec<_>>();
+        let index = fs::read(&indexes[0]).unwrap();
+        assert_eq!(fs::read(&indexes[1]).unwrap(), index);
+        for (i, copied_home) in homes.iter().enumerate() {
+            let copied_checkout = copied_home.join("workspace/task");
+            let common =
+                copied_config_git(&copied_checkout, &env, &["rev-parse", "--git-common-dir"]);
+            assert_eq!(
+                fs::canonicalize(copied_checkout.join(common)).unwrap(),
+                fs::canonicalize(copied_home.join("workspace/nested repo/.git")).unwrap()
+            );
+            write_text(&copied_checkout.join("target-only"), "only in this copy\n");
+            copied_config_git(&copied_checkout, &env, &["add", "target-only"]);
+            if i == 0 {
+                assert_eq!(fs::read(&indexes[1]).unwrap(), index);
+            }
+            assert_eq!(file_bytes(&source), before);
+        }
+    }
+}
+
+#[test]
+fn env_clone_copied_git_config_native_worktrees_refuse_unsafe_storage_and_roll_back() {
+    for route in ["clone", "migrate", "adopt"] {
+        for case in ["external", "missing", "locked"] {
+            let root = TestDir::new("copy-native-worktree-refusal");
+            let (env, source, mut repo) = copied_config_fixture(&root);
+            if case == "external" {
+                let external = root.child("external-repository");
+                fs::rename(&repo, &external).unwrap();
+                repo = external;
+            }
+            let checkout = source.join(".openclaw/workspace/task");
+            managed_git(
+                &repo,
+                &["worktree", "add", "-qb", "task", checkout.to_str().unwrap()],
+            );
+            if case == "missing" {
+                fs::remove_dir_all(repo.join(".git")).unwrap();
+            } else if case == "locked" {
+                write_text(&repo.join(".git/worktrees/task/index.lock"), "held");
+            }
+            let before = file_bytes(&source);
+            let repo_before = file_bytes(&repo);
+            let home = source.join(".openclaw");
+            let output = match route {
+                "clone" => run_ocm(root.path(), &env, &["env", "clone", "source", "target"]),
+                "migrate" => run_ocm(
+                    root.path(),
+                    &env,
+                    &["migrate", "target", home.to_str().unwrap()],
+                ),
+                "adopt" => run_ocm(
+                    root.path(),
+                    &env,
+                    &[
+                        "adopt",
+                        "import",
+                        "--name",
+                        "target",
+                        home.to_str().unwrap(),
+                    ],
+                ),
+                _ => unreachable!(),
+            };
+            assert!(
+                !output.status.success(),
+                "{route}/{case} unexpectedly succeeded"
+            );
+            assert!(
+                stderr(&output).contains("cannot copy managed worktree"),
+                "{route}/{case}: {}",
+                stderr(&output)
+            );
+            assert!(!source.parent().unwrap().join("target").exists());
+            assert!(
+                !run_ocm(root.path(), &env, &["env", "show", "target"])
+                    .status
+                    .success()
+            );
+            assert_eq!(file_bytes(&source), before);
+            assert_eq!(file_bytes(&repo), repo_before);
+        }
+    }
+}
+
+#[test]
 fn env_clone_copied_git_config_preserves_migration_projected_history() {
     for case in ["config", "structural", "ordinary"] {
         if cfg!(windows) && case == "structural" {
@@ -3877,6 +4211,8 @@ fn env_clone_copied_git_config_preserves_bare_repositories_and_nonrepository_dat
     copied_config_git(&repo, &env, &["config", "core.bare", "true"]);
     let workspace = source.join(".openclaw/workspace");
     write_text(&workspace.join("data/.git"), "ordinary data\n");
+    write_text(&workspace.join("lookalike/.git/HEAD"), "not a Git HEAD\n");
+    fs::create_dir_all(workspace.join("lookalike/.git/objects")).unwrap();
     write_text(
         &workspace.join("directory/.git/config"),
         "not Git configuration\n",
@@ -3907,6 +4243,10 @@ fn env_clone_copied_git_config_preserves_bare_repositories_and_nonrepository_dat
         "ordinary data\n"
     );
     assert_eq!(
+        fs::read_to_string(target.join("lookalike/.git/HEAD")).unwrap(),
+        "not a Git HEAD\n"
+    );
+    assert_eq!(
         fs::read_to_string(target.join("directory/.git/config")).unwrap(),
         "not Git configuration\n"
     );
@@ -3919,6 +4259,53 @@ fn env_clone_copied_git_config_preserves_bare_repositories_and_nonrepository_dat
         .unwrap(),
         fs::canonicalize(target.join("directory/nested")).unwrap()
     );
+}
+
+#[test]
+fn env_clone_copied_git_config_keeps_ordinary_repository_runtime_cleanup() {
+    for linked in [false, true] {
+        let root = TestDir::new("clone-git-runtime-cleanup");
+        let (env, source, original) = copied_config_fixture(&root);
+        let repo = source.join(".openclaw/extensions/generated");
+        fs::create_dir_all(repo.parent().unwrap()).unwrap();
+        fs::rename(original, &repo).unwrap();
+        write_text(&repo.join(".openclaw-runtime-deps.json"), "{}\n");
+        write_text(
+            &repo.join("node_modules/stale"),
+            "generated runtime payload\n",
+        );
+        write_text(
+            &source.join(".openclaw/openclaw.json"),
+            &serde_json::json!({"agents":{"defaults":{"workspace":repo}}}).to_string(),
+        );
+        if linked {
+            managed_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-qb",
+                    "task",
+                    source.join(".openclaw/workspace/task").to_str().unwrap(),
+                ],
+            );
+        }
+        let before = file_bytes(&source);
+        let output = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let target = source
+            .parent()
+            .unwrap()
+            .join("target/.openclaw/extensions/generated");
+        assert!(!target.join(".openclaw-runtime-deps.json").exists());
+        assert!(!target.join("node_modules/stale").exists());
+        assert!(target.join(".git/config").is_file());
+        assert_eq!(
+            fs::read(target.join("file")).unwrap(),
+            b"authored content\n"
+        );
+        assert_eq!(file_bytes(&source), before);
+    }
 }
 
 #[test]

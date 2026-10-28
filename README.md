@@ -431,7 +431,11 @@ to the host runtime. Verification checks integrity; use native plugin runtime
 inspection to check loading.
 
 `upgrade simulate` clones the source env, leaves the real env untouched, and
-cleans temporary simulation envs and runtimes when the run finishes. For
+cleans temporary simulation envs and runtimes when the run finishes. Runtime
+cleanup checks the original registration lifetime: removing a temporary runtime
+and independently reinstalling its name preserves the new installation and
+reports cleanup failure. Updating the existing temporary runtime does not
+transfer ownership; unused temporary runtimes are still cleaned. For
 published targets it first validates that the target exists, then runs OpenClaw's own
 `update --dry-run --json` plan against the clone, switches the clone, and runs
 update-mode doctor, plugin update dry-run, and gateway status checks. If the
@@ -706,6 +710,7 @@ Equivalent accepted and canonical environment-root spellings preserve the same c
 
 Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite snapshots for recognized operational databases: shared state and quarantine, canonical agent stores, legacy `memory/*.sqlite` stores, and the default Workboard, Team Reports, Logbook, and active Matrix account state stores.
 Agent database paths recorded in the source shared-state registry are also included when the existing copy traverses them.
+An accepted internal `state` directory alias receives the same coherent capture for its shared and quarantine databases, and its registry still selects agent databases. The alias must resolve inside the existing copy; links do not expand the copy footprint, and unrelated files beside those databases retain their ordinary copy behavior. Clone also retains those database files and the internal links and directory entries needed to reach them through runtime cleanup, without preserving unrelated unconfigured neighboring data.
 Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
 The source stays running and its database contents are not rewritten.
 Clone, default archive import, and upgrade simulation rebase retained SQLite session paths, including `sessionRoot` and `spawnedCwd`, from the source environment root to the copied root.
@@ -715,6 +720,12 @@ Clone relocates their registry identity and structural Git links together, prese
 It retains and relocates owned Git storage links needed by those checkouts.
 It fails and removes the incomplete target when required Git data is missing or external, copied locks/run ownership remain unresolved, or a required Git write would change integrity-protected history; resolve the reported condition before retrying.
 Clone does not copy external repositories, clear Git locks, or change source registrations.
+Native linked Git checkouts in retained workspaces receive the same structural
+relocation during clone, `migrate`, and `adopt import`, without requiring an
+OpenClaw worktree registry. Their repositories and required Git storage must all
+be inside the copied footprint. Staging in the destination then uses its own
+index; the source checkout and registrations remain unchanged. An incomplete or
+external Git graph fails the copy and removes the provisional target.
 Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 
 For clone, migration, and adoption, OCM does not classify a package or project

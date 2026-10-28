@@ -3529,6 +3529,20 @@ fn admit_supervisor_child_start(
             spec.env_name
         ));
     }
+    // A capability probe runs outside admission. Its saved runtime may have
+    // been cleared or replaced while the probe was in flight. The binding
+    // clear shares this lock, which stays held through spawn and publication.
+    if spec.binding_kind == "runtime"
+        && !matches!(
+            crate::env::resolve_execution_binding(&meta, None, None)?,
+            crate::env::ExecutionBinding::Runtime(name) if name == spec.binding_name
+        )
+    {
+        return Err(format!(
+            "refusing to start env \"{}\": its saved runtime plan no longer matches the registered binding; restart the service to refresh its plan",
+            spec.env_name
+        ));
+    }
     if spec.binding_kind == "dev" {
         if spec.binding_name != "dev"
             || !matches!(
@@ -4425,6 +4439,13 @@ mod tests {
             ),
         ]);
         let service = EnvironmentService::new(&env, root.path());
+        crate::runtime::RuntimeService::new(&env, root.path())
+            .add(crate::runtime::AddRuntimeOptions {
+                name: "stable".to_string(),
+                path: "/bin/sleep".to_string(),
+                description: None,
+            })
+            .unwrap();
         let meta = service
             .create(crate::env::CreateEnvironmentOptions {
                 name: "demo".to_string(),
@@ -4432,7 +4453,7 @@ mod tests {
                 gateway_port: None,
                 service_enabled: false,
                 service_running: false,
-                default_runtime: None,
+                default_runtime: Some("stable".to_string()),
                 default_launcher: None,
                 dev: None,
                 protected: false,

@@ -2612,13 +2612,15 @@ impl Cli {
             return Ok(());
         }
 
-        match self.runtime_service().remove(&prepared_runtime.name) {
+        match self
+            .runtime_service()
+            .remove_simulation(&prepared_runtime.meta)
+        {
             Ok(_) => Ok(()),
             Err(error) => {
-                for summary in summaries
-                    .iter_mut()
-                    .filter(|summary| summary.to_binding_name == prepared_runtime.name)
-                {
+                // The shared target belongs to every scenario, including one
+                // whose preparation failed before recording a target binding.
+                for summary in summaries {
                     record_simulation_cleanup_failure(
                         summary,
                         "cleanup simulation runtime",

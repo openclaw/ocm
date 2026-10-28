@@ -1704,6 +1704,88 @@ fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
     assert_eq!(integrity, "ok");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn env_snapshot_preserves_readonly_entries_with_user_attributes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("snapshot-readonly-xattrs");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let attribute = "user.ocm-snapshot";
+    let value = b"retained metadata";
+    let modified = filetime::FileTime::from_unix_time(1_700_000_000, 123_000_000);
+
+    for (name, directory, mode, with_attribute) in [
+        ("readonly-file", false, 0o444, true),
+        ("readonly-directory", true, 0o555, true),
+        ("writable-file", false, 0o644, true),
+        ("writable-directory", true, 0o755, true),
+        ("readonly-no-attribute", false, 0o444, false),
+    ] {
+        let create = run_ocm(&cwd, &env, &["env", "create", name]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child(format!("ocm-home/envs/{name}/durable"));
+        let payload = if directory {
+            fs::create_dir(&source).unwrap();
+            source.join("child")
+        } else {
+            source.clone()
+        };
+        fs::write(&payload, b"saved bytes").unwrap();
+        if with_attribute {
+            xattr::set(&source, attribute, value).unwrap();
+        }
+        filetime::set_file_mtime(&source, modified).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(mode)).unwrap();
+        let assert_metadata = |path: &Path| {
+            let metadata = fs::metadata(path).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o7777, mode, "{name}");
+            assert_eq!(
+                filetime::FileTime::from_last_modification_time(&metadata),
+                modified
+            );
+            assert_eq!(
+                xattr::get(path, attribute).unwrap(),
+                with_attribute.then(|| value.to_vec()),
+                "{name}"
+            );
+        };
+
+        let capture = run_ocm(&cwd, &env, &["env", "snapshot", "create", name, "--json"]);
+        assert!(capture.status.success(), "{name}: {}", stderr(&capture));
+        let snapshot: Value = serde_json::from_str(&stdout(&capture)).unwrap();
+        let id = snapshot["id"].as_str().unwrap();
+        let archive = Path::new(snapshot["archivePath"].as_str().unwrap());
+        assert_metadata(&source);
+        assert_metadata(&archive.join("durable"));
+        assert_eq!(fs::read(&payload).unwrap(), b"saved bytes");
+        let captured_payload = archive.join(if directory {
+            "durable/child"
+        } else {
+            "durable"
+        });
+        assert_eq!(fs::read(captured_payload).unwrap(), b"saved bytes");
+
+        // Change only the fixture after proving capture left its source intact.
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&payload, b"later bytes").unwrap();
+        let restore = run_ocm(&cwd, &env, &["env", "snapshot", "restore", name, id]);
+        assert!(restore.status.success(), "{name}: {}", stderr(&restore));
+        assert_metadata(&source);
+        assert_metadata(&archive.join("durable"));
+        assert_eq!(fs::read(&payload).unwrap(), b"saved bytes");
+
+        let remove = run_ocm(&cwd, &env, &["env", "snapshot", "remove", name, id]);
+        assert!(remove.status.success(), "{name}: {}", stderr(&remove));
+        assert!(!archive.exists());
+        assert_metadata(&source);
+        // TestDir can now dispose of the restored read-only directory's child.
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 #[test]
 fn env_snapshot_restore_does_not_collide_with_or_delete_a_foreign_restore_path() {
     let root = TestDir::new("env-snapshot-foreign-restore-path");

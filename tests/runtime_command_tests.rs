@@ -951,8 +951,58 @@ fn runtime_build_local_with_native_npm_preserves_tree_integrity() {
     .unwrap();
     write_executable_script(
         &repo.join("openclaw.mjs"),
-        "#!/usr/bin/env node\nimport { readFileSync } from 'node:fs';\nconsole.log(readFileSync(new URL('./payload', import.meta.url)).length);\n",
+        "#!/usr/bin/env node\nimport { readFileSync } from 'node:fs';\nimport { createRequire } from 'node:module';\nconst require = createRequire(import.meta.url);\nconsole.log(JSON.stringify({ bytes: readFileSync(new URL('./payload', import.meta.url)).length, companion: require('./dist/extensions/codex/dist/index.cjs') }));\n",
     );
+    let companion = repo.join("extensions/codex");
+    fs::create_dir_all(companion.join("dist")).unwrap();
+    fs::write(
+        companion.join("package.json"),
+        serde_json::json!({
+            "name": "@openclaw/codex", "version": "2026.4.25",
+            "files": ["dist", "openclaw.plugin.json"],
+            "openclaw": {
+                "build": {"openclawVersion": "2026.4.25"},
+                "release": {"publishToNpm": true},
+                "runtimeExtensions": ["./dist/index.cjs"]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        companion.join("openclaw.plugin.json"),
+        r#"{"id":"codex","configSchema":{}}"#,
+    )
+    .unwrap();
+    let companion_source = "module.exports = 'native companion';\n";
+    fs::write(companion.join("dist/index.cjs"), companion_source).unwrap();
+    fs::create_dir_all(repo.join("scripts/lib")).unwrap();
+    for relative in [
+        "scripts/lib/plugin-npm-runtime-build.mjs",
+        "scripts/generate-npm-package-lock.mjs",
+    ] {
+        fs::write(
+            repo.join(relative),
+            "// Fixture payload is already built.\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        repo.join("scripts/lib/plugin-npm-package-manifest.mjs"),
+        r#"import { spawnSync } from 'node:child_process';
+import path from 'node:path';
+const [,,run,directory,separator,command,...args] = process.argv;
+if (run !== '--run' || separator !== '--') throw Error('Unexpected packaging contract');
+const npm = process.env.OCM_INTERNAL_NPM_BIN || command;
+const windows = process.platform === 'win32';
+const result = spawnSync(windows ? process.execPath : npm,
+  windows ? [path.join(path.dirname(npm), 'node_modules/npm/bin/npm-cli.js'), ...args] : args,
+  {cwd: directory, stdio: 'inherit'});
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);
+"#,
+    )
+    .unwrap();
     let mut payload: Vec<u8> = (0..2 * 1024 * 1024 + 17)
         .map(|index| (index % 251) as u8)
         .collect();
@@ -967,6 +1017,8 @@ fn runtime_build_local_with_native_npm_preserves_tree_integrity() {
             "native",
             "--repo",
             &path_string(&repo),
+            "--companion",
+            "codex",
             "--json",
         ],
     );
@@ -976,6 +1028,16 @@ fn runtime_build_local_with_native_npm_preserves_tree_integrity() {
     let installed = runtime_install_root("native", &env, root.path()).unwrap();
     let installed_payload = installed.join("files/node_modules/openclaw/payload");
     assert_eq!(fs::read(&installed_payload).unwrap(), payload);
+    assert_eq!(
+        meta["companions"][0]["entrypoint"],
+        path_string(
+            &PathBuf::from("dist/extensions")
+                .join("codex")
+                .join("dist/index.cjs")
+        )
+    );
+    let metadata_path = runtime_meta_path("native", &env, root.path()).unwrap();
+    let original_metadata = fs::read(&metadata_path).unwrap();
 
     let verify = run_ocm(
         root.path(),
@@ -987,6 +1049,103 @@ fn runtime_build_local_with_native_npm_preserves_tree_integrity() {
         serde_json::from_str::<Value>(&stdout(&verify)).unwrap()["healthy"],
         true
     );
+    let create = run_ocm(
+        root.path(),
+        &env,
+        &["env", "create", "native", "--runtime", "native"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let execute = run_ocm(root.path(), &env, &["@native", "--", "--version"]);
+    assert!(execute.status.success(), "{}", stderr(&execute));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&execute)).unwrap(),
+        serde_json::json!({"bytes": payload.len(), "companion": "native companion"})
+    );
+    assert_eq!(fs::read(&metadata_path).unwrap(), original_metadata);
+
+    // Exercise the verifier with its generated record before testing altered records.
+    // Alternate native/portable separators describe the same contained file on Windows.
+    #[cfg(windows)]
+    for entrypoint in [
+        "dist/extensions/codex/dist/index.cjs",
+        r"dist\extensions\codex\dist\index.cjs",
+    ] {
+        let mut altered = meta.clone();
+        altered["companions"][0]["entrypoint"] = entrypoint.into();
+        fs::write(&metadata_path, serde_json::to_vec(&altered).unwrap()).unwrap();
+        let verify = run_ocm(
+            root.path(),
+            &env,
+            &["runtime", "verify", "native", "--json"],
+        );
+        assert!(
+            verify.status.success(),
+            "{}: {}",
+            entrypoint,
+            stdout(&verify)
+        );
+    }
+    for entrypoint in [
+        "dist/extensions/other/dist/index.cjs",
+        "dist/extensions/codex/../index.cjs",
+        "dist/extensions/codex/dist/../../index.cjs",
+        "dist/extensions/codex/",
+        "dist/extensions/codex/./dist/index.cjs",
+        "/dist/extensions/codex/dist/index.cjs",
+        r"C:\dist\extensions\codex\dist\index.cjs",
+        r"dist/extensions/codex/..\index.cjs",
+        r"dist/extensions/codex/C:\index.cjs",
+    ] {
+        let mut altered = meta.clone();
+        altered["companions"][0]["entrypoint"] = entrypoint.into();
+        fs::write(&metadata_path, serde_json::to_vec(&altered).unwrap()).unwrap();
+        let verify = run_ocm(
+            root.path(),
+            &env,
+            &["runtime", "verify", "native", "--json"],
+        );
+        assert_eq!(
+            verify.status.code(),
+            Some(1),
+            "{entrypoint}: {}",
+            stdout(&verify)
+        );
+        let result: Value = serde_json::from_str(&stdout(&verify)).unwrap();
+        assert_eq!(result["healthy"], false);
+        assert!(result["issue"].as_str().unwrap().contains("entrypoint"));
+    }
+    fs::write(&metadata_path, &original_metadata).unwrap();
+    let installed_entrypoint =
+        installed.join("files/node_modules/openclaw/dist/extensions/codex/dist/index.cjs");
+    fs::write(&installed_entrypoint, "tampered\n").unwrap();
+    let tampered = run_ocm(
+        root.path(),
+        &env,
+        &["runtime", "verify", "native", "--json"],
+    );
+    assert_eq!(tampered.status.code(), Some(1), "{}", stderr(&tampered));
+    let tampered: Value = serde_json::from_str(&stdout(&tampered)).unwrap();
+    assert!(
+        tampered["issue"]
+            .as_str()
+            .unwrap()
+            .contains("entrypoint sha256 mismatch")
+    );
+    fs::remove_file(&installed_entrypoint).unwrap();
+    let missing = run_ocm(
+        root.path(),
+        &env,
+        &["runtime", "verify", "native", "--json"],
+    );
+    assert_eq!(missing.status.code(), Some(1), "{}", stderr(&missing));
+    let missing: Value = serde_json::from_str(&stdout(&missing)).unwrap();
+    assert!(
+        missing["issue"]
+            .as_str()
+            .unwrap()
+            .contains("entrypoint does not exist")
+    );
+    fs::write(&installed_entrypoint, companion_source).unwrap();
     // Same-size drift beyond the first two reads must still invalidate the tree.
     *payload.last_mut().unwrap() ^= 1;
     fs::write(&installed_payload, payload).unwrap();
@@ -6876,6 +7035,8 @@ fn runtime_install_force_replaces_an_existing_runtime_definition() {
     );
     assert!(add.status.success(), "{}", stderr(&add));
 
+    let original = ocm::store::get_runtime("stable", &env, &cwd).unwrap();
+
     let duplicate_install = run_ocm(
         &cwd,
         &env,
@@ -6915,6 +7076,46 @@ fn runtime_install_force_replaces_an_existing_runtime_definition() {
         "\"binaryPath\": \"{}\"",
         path_string(&expected_binary)
     )));
+    let replaced = ocm::store::get_runtime("stable", &env, &cwd).unwrap();
+    assert_eq!(replaced.created_at, original.created_at);
+    assert!(replaced.updated_at > original.updated_at);
+
+    // Force-install still repairs an unreadable registration. Its unknown
+    // previous lifetime must not be inherited by automatic cleanup.
+    let registration = ocm::store::runtime_meta_path("stable", &env, &cwd).unwrap();
+    fs::write(&registration, "{invalid metadata").unwrap();
+    let repair = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "stable",
+            "--path",
+            "./downloads/openclaw",
+            "--force",
+        ],
+    );
+    assert!(repair.status.success(), "{}", stderr(&repair));
+    let repaired = ocm::store::get_runtime("stable", &env, &cwd).unwrap();
+    assert_ne!(repaired.created_at, replaced.created_at);
+
+    let remove = run_ocm(&cwd, &env, &["runtime", "remove", "stable"]);
+    assert!(remove.status.success(), "{}", stderr(&remove));
+    let reinstall = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "stable",
+            "--path",
+            "./downloads/openclaw",
+        ],
+    );
+    assert!(reinstall.status.success(), "{}", stderr(&reinstall));
+    let recreated = ocm::store::get_runtime("stable", &env, &cwd).unwrap();
+    assert_ne!(recreated.created_at, repaired.created_at);
 }
 
 #[test]

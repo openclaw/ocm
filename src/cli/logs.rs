@@ -3,6 +3,43 @@ use std::io::{self, Write};
 use super::render::RenderProfile;
 use super::{Cli, render};
 
+// Keep stdout's error kind across LogService's string-error boundary, while
+// still returning the error so a follower stops reading immediately.
+struct LogStdout<'a, W> {
+    inner: &'a mut W,
+    header: Option<String>,
+    broken_pipe: bool,
+}
+
+impl<W: Write> LogStdout<'_, W> {
+    fn write_header(&mut self) -> io::Result<()> {
+        if let Some(header) = self.header.take() {
+            self.inner
+                .write_all(header.as_bytes())
+                .inspect_err(|error| {
+                    self.broken_pipe |= error.kind() == io::ErrorKind::BrokenPipe;
+                })?;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for LogStdout<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_header()?;
+        self.inner.write(buf).inspect_err(|error| {
+            self.broken_pipe |= error.kind() == io::ErrorKind::BrokenPipe;
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.write_header()?;
+        self.inner.flush().inspect_err(|error| {
+            self.broken_pipe |= error.kind() == io::ErrorKind::BrokenPipe;
+        })
+    }
+}
+
 struct PrettyLogWriter<'a, W: Write> {
     inner: &'a mut W,
     profile: RenderProfile,
@@ -88,27 +125,46 @@ impl Cli {
             }
         };
         if follow {
-            if profile.pretty {
-                self.stdout_lines(render::logs::log_header(
-                    name,
-                    &self.log_service().follow_components(name, stream)?,
-                    tail_lines,
-                    true,
-                    profile,
-                ));
-            }
+            let header = if profile.pretty {
+                Some(
+                    render::logs::log_header(
+                        name,
+                        &self.log_service().follow_components(name, stream)?,
+                        tail_lines,
+                        true,
+                        profile,
+                    )
+                    .join("\n")
+                        + "\n",
+                )
+            } else {
+                None
+            };
             let stdout = io::stdout();
             let mut handle = stdout.lock();
-            if profile.pretty {
+            let mut output = LogStdout {
+                inner: &mut handle,
+                // The follower validates initial reads before writing/flushing
+                // this header, including when the source is empty or pending.
+                header,
+                broken_pipe: false,
+            };
+            let result = if profile.pretty {
                 // Merged streams need complete records for ordering and rendering.
                 // A single stream must forward partial bytes immediately.
-                let mut writer = PrettyLogWriter::new(&mut handle, profile, stream == "all");
+                let mut writer = PrettyLogWriter::new(&mut output, profile, stream == "all");
                 self.log_service()
-                    .follow(name, stream, tail_lines, &mut writer)?;
-                writer.finish()?;
+                    .follow(name, stream, tail_lines, &mut writer)
+                    .and_then(|_| writer.finish())
             } else {
                 self.log_service()
-                    .follow(name, stream, tail_lines, &mut handle)?;
+                    .follow(name, stream, tail_lines, &mut output)
+                    .map(|_| ())
+            };
+            if output.broken_pipe {
+                Self::record_stdout_error(io::Error::from(io::ErrorKind::BrokenPipe));
+            } else {
+                result?;
             }
             return Ok(0);
         }
@@ -128,25 +184,62 @@ impl Cli {
             ));
         }
 
-        let stdout = io::stdout();
-        let mut handle = stdout.lock();
         let content = if profile.pretty {
             render::logs::render_log_text(&summary.content, profile)
         } else {
             summary.content
         };
-        handle
-            .write_all(content.as_bytes())
-            .map_err(|error| error.to_string())?;
+        self.stdout_text(&content)?;
         Ok(0)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PrettyLogWriter;
+    use super::{LogStdout, PrettyLogWriter};
     use crate::cli::render::RenderProfile;
     use std::io::Write;
+
+    #[test]
+    fn log_stdout_preserves_write_and_flush_error_kinds() {
+        struct FailingWriter {
+            kind: std::io::ErrorKind,
+            fail_write: bool,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail_write {
+                    Err(self.kind.into())
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(self.kind.into())
+            }
+        }
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            for header in [None, Some("header\n".to_string())] {
+                for fail_write in [false, true] {
+                    let mut sink = FailingWriter { kind, fail_write };
+                    let mut output = LogStdout {
+                        inner: &mut sink,
+                        header: header.clone(),
+                        broken_pipe: false,
+                    };
+                    let error = output
+                        .write_all(b"record\n")
+                        .and_then(|_| output.flush())
+                        .unwrap_err();
+                    assert_eq!(error.kind(), kind);
+                    assert_eq!(output.broken_pipe, kind == std::io::ErrorKind::BrokenPipe);
+                }
+            }
+        }
+    }
 
     #[test]
     fn pretty_writer_preserves_utf8_split_across_writes() {

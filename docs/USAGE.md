@@ -250,6 +250,8 @@ Repeat `--companion <plugin-id>` when the checkout contains an official plugin t
 
 Companion materialization retains npm-installed dependency bindings across hoisted, nested, and linked layouts without changing the selected npm strategy. Private dependency versions remain private, and the explicit OpenClaw peer uses the host runtime. Dependencies survive removal of packing scratch, and shared packages retain their module identity. On Windows, OCM uses directory junctions when symbolic-link privilege is unavailable, preserving these bindings through publication and runtime recovery. A binding that the filesystem cannot preserve fails the owned build before publication instead of substituting a separate package instance. `runtime verify` checks recorded integrity; after enabling a companion, use `ocm @<env> -- plugins inspect <plugin-id> --runtime --json` and inspect its status and diagnostics to verify loading.
 
+On Windows, companion verification recognizes native separators in generated runtime records. It still requires a relative path within the selected companion and checks package metadata, file existence, and entrypoint integrity.
+
 The installed runtime uses the same package layout as published OpenClaw runtimes:
 
 ```text
@@ -374,6 +376,7 @@ Use `upgrade simulate` when you want to test what would happen against a publish
 - each simulation command checks the original clone's registration before launch; removing or recreating that registration makes remaining checks fail instead of sending commands to a replacement. Rerun `ocm upgrade simulate` against the source environment to create a fresh clone. An already running check may finish, and `--keep-simulations` does not bypass command admission
 - cleanup removes only the simulation environment generation created by that run; if the name was removed and recreated during checks, the replacement is preserved and cleanup reports failure without changing the functional outcome
 - if another environment binds to a temporary runtime, cleanup preserves that runtime and reports `cleanup: "failed"` with the dependent environment names; the functional `outcome` is unchanged, and the command exits nonzero. Clear those bindings before removing the retained runtime with `ocm runtime remove <name>`
+- runtime cleanup also checks the registration created by the simulation. If it was removed and its name independently reinstalled, cleanup preserves the replacement and reports failure, including when target preparation failed before binding. A runtime update keeps the same registration lifetime and does not prevent cleanup of an unused temporary runtime. `createdAt` stays fixed across updates and forced replacements of a readable registration; `updatedAt` records the new installation. Removing the registration and installing again starts a new creation identity
 - missing published targets fail before any simulation env is created
 - a selected runtime that changes before the clone switches fails the `prepare target` check instead of validating a different release; rerun the simulation to select the target again
 - `--scenario all` runs built-in current, clean minimum, and Telegram-configured env shapes as separate simulation clones
@@ -748,6 +751,11 @@ ocm logs mira --stream error
 ocm logs mira --follow
 ```
 
+Log output can be piped to a reader such as `head -n 1`. When that reader closes
+its input, snapshots and followers terminate quietly with success, including
+in shells using `set -o pipefail`. A follower detects closure when it next writes
+output. Log read failures and other output errors still fail the command.
+
 `logs` reads the newer of the env's own Gateway log and the background service
 child log. A single-stream follow such as `ocm logs mira --stream error --follow`
 started before either file exists waits for both and follows whichever appears
@@ -832,6 +840,10 @@ Retry after restoring manager access; `ocm service status` remains available for
 
 Saved dev service plans must still match the env's current binding and recorded
 worktree. If OCM refuses a stale plan, use `ocm service restart <env>` to refresh it.
+Pending runtime starts also recheck the selected runtime after capability probing.
+Clearing that binding with `ocm env set-runtime <env> none` prevents a pending
+probe from starting the removed runtime. This preserves service-running intent;
+normal reconciliation applies the updated plan and any remaining binding.
 
 Normal restart is gateway-aware while the Gateway is running and
 `ocm service status mira` reports restart handoff `protocol v1`: OpenClaw records
@@ -1172,6 +1184,7 @@ ocm start rowan
 
 Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite snapshots for recognized operational databases: shared state and quarantine, canonical agent stores, legacy `memory/*.sqlite` stores, and the default Workboard, Team Reports, Logbook, and active Matrix account state stores.
 Agent database paths recorded in the source shared-state registry are also included when the existing copy traverses them.
+An accepted internal `state` directory alias receives the same coherent capture for its shared and quarantine databases, and its registry still selects agent databases. The alias must resolve inside the existing copy; links do not expand the copy footprint, and unrelated files beside those databases retain their ordinary copy behavior. Clone also retains those database files and the internal links and directory entries needed to reach them through runtime cleanup, without preserving unrelated unconfigured neighboring data.
 Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
 The source stays running and its database contents are not rewritten.
 
@@ -1202,6 +1215,12 @@ Clone relocates their registry identity and structural Git links together, prese
 It retains and relocates owned Git storage links needed by those checkouts.
 It fails and removes the incomplete target when required Git data is missing or external, copied locks/run ownership remain unresolved, or a required Git write would change integrity-protected history; resolve the reported condition before retrying.
 Clone does not copy external repositories, clear Git locks, or change source registrations.
+Native linked Git checkouts in retained workspaces receive the same structural
+relocation during clone, `migrate`, and `adopt import`, without requiring an
+OpenClaw worktree registry. Their repositories and required Git storage must all
+be inside the copied footprint. Staging in the destination then uses its own
+index; the source checkout and registrations remain unchanged. An incomplete or
+external Git graph fails the copy and removes the provisional target.
 Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 The same active-state ownership check applies to migration and its existing import rollback.
 
@@ -1404,6 +1423,11 @@ sidecars, modes, symlinks, plugin data, and unknown future paths. Restore stages
 an exclusive candidate beside the live root and retains the displaced root
 until service acceptance; failed acceptance restores the displaced root.
 
+On Linux, readable files and traversable directories with read-only modes and
+ordinary `user.*` extended attributes can be captured and restored together.
+OCM preserves their final modes and attributes without making the live source
+writable or removing its attributes.
+
 A symlinked environment root is resolved for capture so the checkpoint contains
 independent bytes; links inside the root remain links. Restore replaces the
 registered root entry with the captured directory. If that entry is a symlink,
@@ -1504,7 +1528,10 @@ finishes. A later import removes staging left behind by an interrupted one.
 Export writes `<env>.ocm-env.tar` in the current directory unless `--output` is
 specified. The archive can be inside the environment, including through a
 directory alias: its own output is excluded from the archived contents. An
-existing output path is refused.
+existing output path is refused, including a dangling symlink or a file created
+by another writer while export is preparing the archive. Both export modes
+publish without replacing that entry and clean up only their own staging file
+if writing or publication fails.
 
 Export omits `.openclaw/state` by default. Default export keeps shared managed
 skills under `.openclaw/skills` and their global ClawHub tracking metadata under

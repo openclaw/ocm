@@ -828,20 +828,25 @@ fn clone_environment_with_policy(
         validate_nonportable_runtime_state_paths(&target_paths)?;
         let canonical_source_root =
             fs::canonicalize(&source_paths.root).map_err(|error| error.to_string())?;
-        let git_contexts = super::openclaw_state::git_config::copied_workspace_git_contexts(
-            &source_paths,
-            &target_paths,
-            &source_workspaces,
-        )?;
+        let git_repositories =
+            super::openclaw_state::git_config::copied_workspace_git_repositories(
+                &source_paths,
+                &target_paths,
+                &source_workspaces,
+            )?;
         let copied_worktrees = super::openclaw_state::relocate_copied_worktrees(
             &target_paths,
             &[
                 (&source_paths.root, &target_paths.root),
                 (&canonical_source_root, &target_paths.root),
             ],
-            git_contexts,
-            &[],
+            git_repositories.contexts,
+            &git_repositories.roots,
         )?;
+        let mut preserved_files = copied_worktrees.config_paths.clone();
+        preserved_files.extend(super::openclaw_state::cloned_shared_database_paths(
+            &target_paths,
+        )?);
         let created_at = now_utc();
         let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
         if matches!(policy, CloneEnvironmentPolicy::Standard) {
@@ -894,7 +899,7 @@ fn clone_environment_with_policy(
                     env,
                     target_runtime,
                     &copied_worktrees.preserved_roots,
-                    &copied_worktrees.config_paths,
+                    &preserved_files,
                 )?;
                 outcome
             }
@@ -931,7 +936,7 @@ fn clone_environment_with_policy(
                     env,
                     target_runtime,
                     &copied_worktrees.preserved_roots,
-                    &copied_worktrees.config_paths,
+                    &preserved_files,
                 )?;
                 Default::default()
             }
@@ -962,7 +967,7 @@ fn clone_environment_with_policy(
                     env,
                     target_runtime,
                     &copied_worktrees.preserved_roots,
-                    &copied_worktrees.config_paths,
+                    &preserved_files,
                 )?;
                 outcome
             }
@@ -1184,7 +1189,7 @@ pub fn export_environment(
     } else {
         clean_path(&cwd.join(format!("{}.ocm-env.tar", meta.name)))
     };
-    if path_exists(&output_path) {
+    if fs::symlink_metadata(&output_path).is_ok() {
         return Err(format!(
             "export archive already exists: {}",
             display_path(&output_path)
@@ -1220,16 +1225,12 @@ pub fn export_environment(
         },
     };
 
-    let result = write_env_archive_from_resolved_root(
+    write_env_archive_from_resolved_root(
         &metadata,
         &canonical_root,
         &output_path,
         archive_options,
-    );
-    if result.is_err() && !options.include_state {
-        let _ = fs::remove_file(&output_path);
-    }
-    result?;
+    )?;
 
     Ok(EnvExportSummary {
         include_state: options.include_state,
