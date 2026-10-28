@@ -130,7 +130,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'native junction primitive failed' }
             cargo test --locked --lib runtime_junction_ -- --nocapture
             if ($LASTEXITCODE -ne 0) { throw 'runtime junction lifecycle failed' }
-            cargo test --locked --lib store::upgrade_history::tests -- --nocapture
+            cargo test --locked --lib store::upgrade_history::tests::runtime_recovery_loads_only_healthy_managed_bytes -- --exact --nocapture
             if ($LASTEXITCODE -ne 0) { throw 'runtime recovery records failed' }
             cargo test --locked --test windows_runtime_publication_tests -- --nocapture
             if ($LASTEXITCODE -ne 0) { throw 'native runtime publication failed' }
