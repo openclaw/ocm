@@ -1189,7 +1189,7 @@ pub fn export_environment(
     } else {
         clean_path(&cwd.join(format!("{}.ocm-env.tar", meta.name)))
     };
-    if path_exists(&output_path) {
+    if fs::symlink_metadata(&output_path).is_ok() {
         return Err(format!(
             "export archive already exists: {}",
             display_path(&output_path)
@@ -1225,16 +1225,12 @@ pub fn export_environment(
         },
     };
 
-    let result = write_env_archive_from_resolved_root(
+    write_env_archive_from_resolved_root(
         &metadata,
         &canonical_root,
         &output_path,
         archive_options,
-    );
-    if result.is_err() && !options.include_state {
-        let _ = fs::remove_file(&output_path);
-    }
-    result?;
+    )?;
 
     Ok(EnvExportSummary {
         include_state: options.include_state,

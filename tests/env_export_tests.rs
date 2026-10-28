@@ -32,6 +32,16 @@ fn env_export_writes_the_default_archive_path() {
 
     let archive_path = cwd.join("source.ocm-env.tar");
     assert!(archive_path.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let reference = cwd.join("ordinary-file");
+        fs::write(&reference, "normal creation permissions").unwrap();
+        assert_eq!(
+            fs::metadata(&archive_path).unwrap().permissions().mode(),
+            fs::metadata(&reference).unwrap().permissions().mode()
+        );
+    }
 
     let extract_dir = root.child("extract-default");
     let extracted = extract_env_archive::<EnvArchiveMetadata>(&archive_path, &extract_dir).unwrap();
@@ -41,6 +51,89 @@ fn env_export_writes_the_default_archive_path() {
         fs::read_to_string(extracted.root_dir.join(".openclaw/workspace/notes.txt")).unwrap(),
         "hello export"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn env_export_preserves_existing_dangling_output_links() {
+    for include_state in [false, true] {
+        let root = TestDir::new("export-dangling-output");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let output = root.child("archive.tar");
+        std::os::unix::fs::symlink("independent.tar", &output).unwrap();
+        let mut args = vec!["env", "export", "source", "--output", "archive.tar"];
+        if include_state {
+            args.push("--include-state");
+        }
+        let export = run_ocm(root.path(), &env, &args);
+        assert!(!export.status.success());
+        assert!(stderr(&export).contains("export archive already exists"));
+        assert_eq!(
+            fs::read_link(&output).unwrap(),
+            std::path::Path::new("independent.tar")
+        );
+        assert!(!root.child("independent.tar").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_export_cleans_owned_staging_after_a_write_failure() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    for include_state in [false, true] {
+        let root = TestDir::new("export-write-failure");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source_file = root.child("ocm-home/envs/source/.openclaw/workspace/data.bin");
+        let contents = vec![b'x'; 32768];
+        fs::write(&source_file, &contents).unwrap();
+        let destination = root.child("archives");
+        fs::create_dir(&destination).unwrap();
+        let output = destination.join("archive.tar");
+        let mut command = Command::new(support::ocm_test_binary_path());
+        command
+            .current_dir(root.path())
+            .env_clear()
+            .envs(&env)
+            .args([
+                "env",
+                "export",
+                "source",
+                "--output",
+                output.to_str().unwrap(),
+            ]);
+        if include_state {
+            command.arg("--include-state");
+        }
+        // Return a genuine write error instead of terminating on SIGXFSZ.
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: 4096,
+                    rlim_max: 4096,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let export = command.output().unwrap();
+        assert_eq!(export.status.code(), Some(1), "{}", stderr(&export));
+        assert!(
+            stderr(&export).contains("File too large"),
+            "{}",
+            stderr(&export)
+        );
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        assert_eq!(fs::read(&source_file).unwrap(), contents);
+    }
 }
 
 #[test]
