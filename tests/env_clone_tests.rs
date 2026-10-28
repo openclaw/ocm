@@ -1919,7 +1919,7 @@ fn env_clone_rolls_back_an_unreadable_sqlite_snapshot() {
 fn env_clone_retains_shared_database_alias_targets_and_routes() {
     use std::os::unix::fs::symlink;
 
-    for indirect in [false, true] {
+    for route in ["direct", "link", "parent"] {
         let root = TestDir::new("clone-shared-state-alias-lifetime");
         let env = ocm_env(&root);
         let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
@@ -1927,11 +1927,15 @@ fn env_clone_retains_shared_database_alias_targets_and_routes() {
         let state = root.child("ocm-home/envs/source/.openclaw");
         let storage = state.join("imports/ordinary");
         fs::create_dir_all(&storage).unwrap();
-        let link_target = if indirect {
+        let link_target = if route != "direct" {
             fs::create_dir(state.join("aliases")).unwrap();
-            symlink("../imports/ordinary", state.join("aliases/storage")).unwrap();
             write_text(&state.join("aliases/unrelated.txt"), "runtime debris");
-            "aliases/storage"
+            if route == "link" {
+                symlink("../imports/ordinary", state.join("aliases/storage")).unwrap();
+                "aliases/storage"
+            } else {
+                "aliases/../imports/ordinary"
+            }
         } else {
             "imports/ordinary"
         };
@@ -1963,12 +1967,16 @@ fn env_clone_retains_shared_database_alias_targets_and_routes() {
             fs::read_link(target.join("state")).unwrap(),
             Path::new(link_target)
         );
-        if indirect {
+        if route == "link" {
             assert_eq!(
                 fs::read_link(target.join("aliases/storage")).unwrap(),
                 Path::new("../imports/ordinary")
             );
             assert!(!target.join("aliases/unrelated.txt").exists());
+        }
+        if route == "parent" {
+            assert!(target.join("aliases").is_dir());
+            assert_eq!(fs::read_dir(target.join("aliases")).unwrap().count(), 0);
         }
         assert!(!target.join("imports/ordinary/unrelated.txt").exists());
         for (name, main, wal) in originals {

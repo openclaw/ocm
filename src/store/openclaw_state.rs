@@ -132,6 +132,36 @@ impl OpenClawRuntimeStateCleanup {
         &self.removals
     }
 
+    fn preserve_directory_entries(
+        &mut self,
+        directories: &BTreeSet<PathBuf>,
+        files: &BTreeSet<PathBuf>,
+    ) -> Result<(), String> {
+        if directories.is_empty() {
+            return Ok(());
+        }
+        let needs_directory = |path: &Path| directories.iter().any(|dir| dir.starts_with(path));
+        let mut removals = BTreeSet::new();
+        for path in &self.removals {
+            if needs_directory(path) && fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+                // A route such as hop/../state needs the empty hop directory,
+                // but that must not exempt its unrelated contents from cleanup.
+                collect_parent_cleanup(
+                    path,
+                    &|path| files.contains(path),
+                    &|path| {
+                        needs_directory(path) || files.iter().any(|file| file.starts_with(path))
+                    },
+                    &mut removals,
+                )?;
+            } else {
+                removals.insert(path.clone());
+            }
+        }
+        self.removals = removals;
+        Ok(())
+    }
+
     pub(crate) fn apply(&self) -> Result<bool, String> {
         self.apply_recording(&mut Vec::new())?;
         Ok(!self.removals.is_empty())
@@ -1488,11 +1518,17 @@ fn clear_runtime_state_preserving_paths(
             .map_err(OpenClawCleanupPathError::into_message)?
     };
     // Configured paths were admitted by the selected inventory policy above.
-    // These additional roots and leaves were already admitted by Git preparation.
+    // Additional paths were admitted by copied Git or shared-database preparation.
+    let (directories, files): (BTreeSet<_>, BTreeSet<_>) = preserved_files
+        .iter()
+        .cloned()
+        .partition(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()));
     workspaces.preserve_copied_roots(preserved_roots);
-    workspaces.preserve_copied_config_paths(preserved_files);
+    workspaces.preserve_copied_config_paths(&files);
 
-    plan_runtime_state_cleanup(paths, &workspaces, preserved_roots, preserved_files)?.apply()
+    let mut cleanup = plan_runtime_state_cleanup(paths, &workspaces, preserved_roots, &files)?;
+    cleanup.preserve_directory_entries(&directories, &files)?;
+    cleanup.apply()
 }
 
 fn plan_runtime_state_cleanup(
@@ -3207,12 +3243,14 @@ pub(super) fn cloned_shared_database_paths(paths: &EnvPaths) -> Result<BTreeSet<
         if !is_sqlite_database(&database)? {
             continue;
         }
-        let links = super::dev_sources::existing_source_path_entries(&logical)?
+        let route = super::dev_sources::existing_source_path_route_entries(&logical)?
             .into_iter()
-            .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()));
+            .filter(|path| {
+                fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink() || meta.is_dir())
+            });
         // Keep only the database and the route used by its logical owner. Its
         // unconfigured parent must not retain unrelated runtime debris.
-        for path in std::iter::once(database).chain(links) {
+        for path in std::iter::once(database).chain(route) {
             if let Ok(relative) = path.strip_prefix(&root) {
                 preserved.insert(paths.root.join(relative));
                 preserved.insert(path);
