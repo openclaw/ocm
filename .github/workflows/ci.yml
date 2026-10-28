@@ -118,69 +118,15 @@ jobs:
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
-      - name: Capture native Windows companion dependency comparison
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 751
-        timeout-minutes: 20
-        shell: pwsh
-        env:
-          CARGO_BUILD_JOBS: 2
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $candidate = '${{ github.event.pull_request.head.sha }}'
-          $baseline = '9ba7b345add62471c828f73d9fc59e52aaf36e14'
-          $area = Join-Path $env:RUNNER_TEMP ('companion-proof-' + [guid]::NewGuid())
-          New-Item -ItemType Directory -Path $area | Out-Null
-          foreach ($item in @(@('candidate', $candidate), @('baseline', $baseline))) {
-            $name, $revision = $item
-            git fetch --no-tags --depth=1 origin $revision
-            if ($LASTEXITCODE -ne 0) { throw "fetch $name failed" }
-            git rev-parse $revision ($revision + '^{tree}')
-            $source = Join-Path $area $name
-            New-Item -ItemType Directory -Path $source | Out-Null
-            $archive = Join-Path $area ($name + '.tar')
-            git archive --format=tar --output=$archive $revision
-            if ($LASTEXITCODE -ne 0) { throw "archive $name failed" }
-            tar -xf $archive -C $source
-            if ($LASTEXITCODE -ne 0) { throw "extract $name failed" }
-            Get-FileHash (Join-Path $source 'Cargo.lock') -Algorithm SHA256
-            cargo build --locked --manifest-path (Join-Path $source 'Cargo.toml') --target-dir (Join-Path $area ($name + '-target'))
-            if ($LASTEXITCODE -ne 0) { throw "build $name failed" }
-            Get-FileHash (Join-Path $area ($name + '-target/debug/ocm.exe')) -Algorithm SHA256
-          }
-          $manifest = Join-Path $area 'candidate/Cargo.toml'
-          $target = Join-Path $area 'candidate-target'
-          $artifacts = cargo test --locked --manifest-path $manifest --target-dir $target --test windows_companion_bindings_tests --no-run --message-format=json
-          if ($LASTEXITCODE -ne 0) { throw 'build comparison harness failed' }
-          $harness = ($artifacts | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'windows_companion_bindings_tests' -and $_.executable } | Select-Object -Last 1).executable
-          if (!$harness) { throw 'comparison harness missing' }
-          Get-FileHash $harness -Algorithm SHA256
-          $policyFixture = Join-Path $area 'candidate/tests/support/windows_without_symlinks.ps1'
-          Get-FileHash $policyFixture -Algorithm SHA256
-          . $policyFixture
-          Invoke-WithoutDeveloperSymlinks {
-            foreach ($name in @('baseline', 'candidate')) {
-              $env:OCM_TEST_BINARY = Join-Path $area ($name + '-target/debug/ocm.exe')
-              if ($name -eq 'baseline') { $env:OCM_TEST_COMPANION_BASELINE_VALUES = '1' }
-              $output = & $harness --exact native_windows_companion_without_symlink_privilege --nocapture 2>&1
-              $comparisonExit = $LASTEXITCODE
-              $output | Write-Output
-              Remove-Item Env:OCM_TEST_COMPANION_BASELINE_VALUES -ErrorAction SilentlyContinue
-              Remove-Item Env:OCM_TEST_BINARY
-              Write-Output "$name comparisonExit=$comparisonExit"
-              Get-FileHash (Join-Path $area ($name + '-target/debug/ocm.exe')) -Algorithm SHA256
-              if (!($output -match '"nativeWindowsCompanionObservationsComplete":true')) {
-                throw "$name native companion observations did not complete"
-              }
-            }
-          }
       - name: Prove native Windows companion dependency bindings
-        if: github.event_name != 'pull_request' || github.event.pull_request.number != 751
         timeout-minutes: 5
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           . ./tests/support/windows_without_symlinks.ps1
           Invoke-WithoutDeveloperSymlinks {
+            cargo test --locked --lib junction -- --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'native runtime junction lifecycle failed' }
             cargo test --locked --test windows_companion_bindings_tests native_windows_companion_without_symlink_privilege -- --exact --nocapture
             if ($LASTEXITCODE -ne 0) { throw 'native companion regression failed' }
           }

@@ -612,6 +612,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn runtime_junction_recovery_readback_survives_absent_original() {
+        use crate::infra::{tree_digest::tree_sha256, windows_junction};
+        use crate::store::common::{copy_dir_preserving_modes, remove_owned_tree};
+
+        windows_junction::tests::without_symlink_privilege(|| {
+            let root = tempfile::tempdir().unwrap();
+            let env = BTreeMap::from([(
+                "OCM_HOME".into(),
+                root.path().join("ocm").display().to_string(),
+            )]);
+            let cwd = root.path();
+            let name = "stable";
+            let transaction = "transaction-1";
+            let installed = runtime_install_root(name, &env, cwd).unwrap();
+            let modules = installed.join("files/node_modules");
+            std::fs::create_dir_all(modules.join("package")).unwrap();
+            std::fs::create_dir_all(installed.join("files/bin")).unwrap();
+            std::fs::write(installed.join("files/bin/openclaw"), "runtime").unwrap();
+            std::fs::write(
+                modules.join("package/index.cjs"),
+                "module.exports='restored';",
+            )
+            .unwrap();
+            windows_junction::create(
+                &std::fs::canonicalize(modules.join("package")).unwrap(),
+                &modules.join("binding"),
+            )
+            .unwrap();
+            let digest = tree_sha256(&modules).unwrap();
+            let now = OffsetDateTime::now_utc();
+            // The runtime-tree recovery contract is independent of the separate
+            // companion-entrypoint spelling defect; no companion record is altered.
+            let meta = RuntimeMeta {
+                kind: "ocm-runtime".into(),
+                name: name.into(),
+                binary_path: installed.join("files/bin/openclaw").display().to_string(),
+                source_kind: RuntimeSourceKind::Installed,
+                source_path: None,
+                source_url: None,
+                source_manifest_url: None,
+                source_sha256: None,
+                source_integrity: None,
+                runtime_sha256: Some(digest.clone()),
+                release_version: None,
+                release_channel: None,
+                release_selector_kind: None,
+                release_selector_value: None,
+                install_root: Some(installed.display().to_string()),
+                companions: Vec::new(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+            };
+            let recovery_root =
+                upgrade_history_runtime_recovery_dir("demo", transaction, name, &env, cwd).unwrap();
+            let backup = recovery_root.join("install-root");
+            copy_dir_preserving_modes(&installed, &backup).unwrap();
+            write_json(&recovery_root.join("runtime.json"), &meta).unwrap();
+            std::fs::write(
+                recovery_root.parent().unwrap().join("snapshot-id"),
+                "snapshot-1",
+            )
+            .unwrap();
+            remove_owned_tree(&installed).unwrap();
+            let recovery =
+                get_upgrade_runtime_recovery("demo", transaction, "snapshot-1", name, &env, cwd)
+                    .unwrap();
+            assert_eq!(
+                recovery.meta.runtime_sha256.as_deref(),
+                Some(digest.as_str())
+            );
+            copy_dir_preserving_modes(&recovery.install_root, &installed).unwrap();
+            assert_eq!(tree_sha256(&modules).unwrap(), digest);
+            let result = std::process::Command::new("node")
+                .arg("-e")
+                .arg("console.log(require(process.argv[1]))")
+                .arg(modules.join("binding/index.cjs"))
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "restored");
+            remove_owned_tree(&backup).unwrap();
+            assert_eq!(tree_sha256(&modules).unwrap(), digest);
+        });
+    }
+
     #[test]
     fn runtime_recovery_loads_only_healthy_managed_bytes() {
         let (root, env) = test_env("runtime-recovery");

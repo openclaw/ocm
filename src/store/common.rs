@@ -616,6 +616,15 @@ fn copy_path_inner(
 
     if file_type.is_symlink() {
         #[cfg(windows)]
+        if preserve_directory_modes
+            && crate::infra::windows_junction::copy_if_junction(source, destination)
+                .map_err(|error| error.to_string())?
+        {
+            // Runtime recovery preserves the recorded link bytes, including
+            // final install targets that are absent while restoring a backup.
+            return Ok(());
+        }
+        #[cfg(windows)]
         let directory_hint = private_root.map(|_| {
             use std::os::windows::fs::FileTypeExt;
             file_type.is_symlink_dir()
@@ -1026,6 +1035,42 @@ mod tests {
             sleep(Duration::from_millis(10));
         }
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_copy_preserves_junctions_with_absent_final_root() {
+        use crate::infra::{tree_digest::tree_sha256, windows_junction};
+
+        windows_junction::tests::without_symlink_privilege(|| {
+            let root = tempfile::tempdir().unwrap();
+            let installed = root.path().join("installed");
+            let backup = root.path().join("backup");
+            fs::create_dir_all(installed.join("package")).unwrap();
+            fs::write(installed.join("package/value"), "original").unwrap();
+            let package = fs::canonicalize(installed.join("package")).unwrap();
+            windows_junction::create(&package, &installed.join("binding")).unwrap();
+            let digest = tree_sha256(&installed).unwrap();
+
+            super::copy_dir_preserving_modes(&installed, &backup).unwrap();
+            assert_eq!(tree_sha256(&backup).unwrap(), digest);
+            super::remove_owned_tree(&installed).unwrap();
+            assert!(!backup.join("binding/value").exists());
+            assert_eq!(tree_sha256(&backup).unwrap(), digest);
+            super::copy_dir_preserving_modes(&backup, &installed).unwrap();
+            assert_eq!(tree_sha256(&installed).unwrap(), digest);
+            assert_eq!(
+                fs::read_to_string(installed.join("binding/value")).unwrap(),
+                "original"
+            );
+
+            super::remove_owned_tree(&backup).unwrap();
+            assert_eq!(
+                fs::read_to_string(installed.join("package/value")).unwrap(),
+                "original"
+            );
+            assert_eq!(tree_sha256(&installed).unwrap(), digest);
+        });
     }
 
     #[cfg(unix)]

@@ -233,13 +233,6 @@ fn native_windows_companion_without_symlink_privilege() {
     }
     env.insert("OCM_TEST_BINARY".into(), path_string(&binary));
     env.insert(CHILD_ROOT.into(), path_string(fixture.path()));
-    // Temporary comparison mode applies only to the pinned predecessor run.
-    if std::env::var("OCM_TEST_COMPANION_BASELINE_VALUES").as_deref() == Ok("1") {
-        env.insert("OCM_TEST_COMPANION_BASELINE_VALUES".into(), "1".into());
-    }
-    if std::env::var("OCM_TEST_COMPANION_CAPTURE_ONLY").as_deref() == Ok("1") {
-        env.insert("OCM_TEST_COMPANION_CAPTURE_ONLY".into(), "1".into());
-    }
     let args = ["--exact", TEST_NAME, "--nocapture", "--test-threads=1"];
     println!(
         "{}",

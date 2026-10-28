@@ -2026,6 +2026,7 @@ fn install_local_openclaw_companion(
     context: InstallContext<'_>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
     owner: &RuntimeInstallTarget,
+    bindings: &mut CompanionDependencyBindings,
 ) -> Result<RuntimeCompanionMeta, String> {
     let install_root = scratch_dir.join("companion-installs").join(&packed.spec.id);
     ensure_dir(&install_root)?;
@@ -2124,9 +2125,13 @@ fn install_local_openclaw_companion(
         &source_package_root,
         &target_package_root,
         Some(retained),
-        copy_dir_recursive,
+        |source, target| bindings.link(source, target),
     )?;
-    ensure_local_extension_openclaw_peer(&openclaw_package_root, &target_package_root)?;
+    ensure_local_extension_openclaw_peer(
+        &openclaw_package_root,
+        &target_package_root,
+        |source, target| bindings.host_peer(source, target),
+    )?;
 
     let installed = load_json_value(
         &target_package_root.join("package.json"),
@@ -2564,6 +2569,7 @@ fn link_or_copy_openclaw_host(source: &Path, target: &Path) -> Result<(), String
 fn ensure_local_extension_openclaw_peer(
     host_package: &Path,
     extension_root: &Path,
+    link_or_copy: impl FnOnce(&Path, &Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let package_json_path = extension_root.join("package.json");
     let package: serde_json::Value = read_json(&package_json_path).map_err(|error| {
@@ -2582,7 +2588,7 @@ fn ensure_local_extension_openclaw_peer(
 
     let peer_path = extension_root.join("node_modules/openclaw");
     remove_path_if_present(&peer_path)?;
-    link_or_copy_openclaw_host(host_package, &peer_path)
+    link_or_copy(host_package, &peer_path)
 }
 
 fn installed_dependency_directory(
@@ -2607,29 +2613,110 @@ fn installed_dependency_directory(
     Ok(None)
 }
 
-fn link_retained_companion_dependency(source: &Path, target: &Path) -> Result<(), String> {
-    if let Some(parent) = target.parent() {
-        ensure_dir(parent)?;
-    }
-    let relative = relative_symlink_target(source, target)
-        .ok_or_else(|| "cannot make a relative companion dependency binding".to_string())?;
-    // Copying here would split singleton identity, and a cycle could copy an
-    // ancestor into itself. Fail the owned stage if the binding cannot be kept.
-    #[cfg(unix)]
-    let result = std::os::unix::fs::symlink(relative, target);
+#[derive(Default)]
+struct CompanionDependencyBindings {
     #[cfg(windows)]
-    let result = std::os::windows::fs::symlink_dir(relative, target);
-    #[cfg(not(any(unix, windows)))]
-    let result = Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "directory links unsupported",
-    ));
-    result.map_err(|error| {
-        format!(
-            "cannot preserve shared companion dependency at {}: {error}",
-            display_path(target)
-        )
-    })
+    junctions: BTreeMap<PathBuf, PathBuf>,
+}
+
+impl CompanionDependencyBindings {
+    fn host_peer(&mut self, source: &Path, target: &Path) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            // Copying the host would also copy the newly created junctions.
+            self.link(source, target)
+        }
+        #[cfg(not(windows))]
+        {
+            link_or_copy_openclaw_host(source, target)
+        }
+    }
+
+    fn link(&mut self, source: &Path, target: &Path) -> Result<(), String> {
+        if let Some(parent) = target.parent() {
+            ensure_dir(parent)?;
+        }
+        let relative = relative_symlink_target(source, target)
+            .ok_or_else(|| "cannot make a relative companion dependency binding".to_string())?;
+        // Copies would split singleton identity or recursively copy an ancestor.
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(relative, target);
+        #[cfg(windows)]
+        let result = match std::os::windows::fs::symlink_dir(relative, target) {
+            Err(error)
+                if error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD as i32) =>
+            {
+                let source = fs::canonicalize(source).map_err(|error| error.to_string())?;
+                let parent = target.parent().ok_or("companion binding has no parent")?;
+                // Freeze the physical link site, never its dereferenced target.
+                let site = fs::canonicalize(parent)
+                    .map_err(|error| error.to_string())?
+                    .join(target.file_name().ok_or("companion binding has no name")?);
+                crate::infra::windows_junction::create(&source, &site).map(|()| {
+                    self.junctions.insert(site, source);
+                })
+            }
+            result => result,
+        };
+        #[cfg(not(any(unix, windows)))]
+        let result = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory links unsupported",
+        ));
+        result.map_err(|error| {
+            format!(
+                "cannot preserve shared companion dependency at {}: {error}",
+                display_path(target)
+            )
+        })
+    }
+
+    fn finalize(&self, _target: &RuntimeInstallTarget) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            if self.junctions.is_empty() {
+                return Ok(());
+            }
+            _target.finish_children()?;
+            let stage =
+                fs::canonicalize(&_target.install_root).map_err(|error| error.to_string())?;
+            // The final root may hold the predecessor. Project from the owned
+            // stage's physical parent without inspecting that existing root.
+            let final_root = stage.with_file_name(
+                _target
+                    .final_install_root
+                    .file_name()
+                    .ok_or("runtime has no final name")?,
+            );
+            let replacements = self
+                .junctions
+                .iter()
+                .map(|(site, source)| {
+                    if !site.starts_with(&stage)
+                        || fs::read_link(site).map_err(|error| error.to_string())? != *source
+                        || fs::canonicalize(site).map_err(|error| error.to_string())? != *source
+                    {
+                        return Err(
+                            "owned companion junction changed before publication".to_string()
+                        );
+                    }
+                    let relative = source.strip_prefix(&stage).map_err(|_| {
+                        "companion junction target escaped its runtime stage".to_string()
+                    })?;
+                    Ok((site, source, final_root.join(relative)))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            // Every source and physical site is settled before the first update.
+            // Nothing below resolves through a retargeted junction.
+            for (site, source, final_target) in replacements {
+                crate::infra::windows_junction::retarget(site, source, &final_target).map_err(
+                    |error| format!("failed to finalize companion dependency binding: {error}"),
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn preserve_materialized_extension_dependencies(
@@ -2638,7 +2725,7 @@ fn preserve_materialized_extension_dependencies(
     installed_package: &Path,
     target: &Path,
     mut retained: Option<BTreeMap<PathBuf, PathBuf>>,
-    link_or_copy: fn(&Path, &Path) -> Result<(), String>,
+    mut link_or_copy: impl FnMut(&Path, &Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let install_files = fs::canonicalize(install_files).map_err(|error| error.to_string())?;
     let source_install_files =
@@ -2696,7 +2783,7 @@ fn preserve_materialized_extension_dependencies(
                         != Some(representative.clone())
                     {
                         remove_path_if_present(&binding)?;
-                        link_retained_companion_dependency(&representative, &binding)?;
+                        link_or_copy(&representative, &binding)?;
                     }
                     representative
                 } else {
@@ -2797,6 +2884,7 @@ fn materialize_local_source_extensions(
         ensure_local_extension_openclaw_peer(
             &installed_openclaw_package_root(install_files),
             &target,
+            link_or_copy_openclaw_host,
         )?;
     }
     Ok(())
@@ -3956,6 +4044,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
         local_adapter.as_ref(),
         &source_extensions,
     )?;
+    let mut bindings = CompanionDependencyBindings::default();
     meta.companions = packed_companions
         .iter()
         .map(|packed| {
@@ -3966,9 +4055,11 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
                 context,
                 local_adapter.as_ref(),
                 &target,
+                &mut bindings,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    bindings.finalize(&target)?;
     meta.runtime_sha256 = Some(tree_sha256(&target.install_files.join("node_modules"))?);
     // A published runtime contains installed files, never packing scratch.
     target.finish_children()?;
@@ -4774,6 +4865,64 @@ mod tests {
         )
         .unwrap();
         (root, env, binary)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn companion_junction_finalization_and_stage_cleanup_preserve_predecessor() {
+        use crate::infra::windows_junction;
+
+        windows_junction::tests::without_symlink_privilege(|| {
+            for partial in [false, true] {
+                let (root, env, _) = binding_fixture();
+                let target = super::prepare_runtime_install_target(
+                    "candidate".into(),
+                    true,
+                    super::InstallContext {
+                        env: &env,
+                        cwd: root.path(),
+                        runtime_guard: None,
+                    },
+                )
+                .unwrap();
+                for (directory, value) in [
+                    (&target.install_files, "new"),
+                    (&target.final_install_root.join("files"), "old"),
+                ] {
+                    std::fs::create_dir_all(directory.join("package")).unwrap();
+                    std::fs::write(directory.join("package/value"), value).unwrap();
+                }
+                let stage = std::fs::canonicalize(&target.install_root).unwrap();
+                let source = stage.join("files/package");
+                let first = stage.join("files/first");
+                let second = stage.join("files/second");
+                windows_junction::create(&source, &first).unwrap();
+                windows_junction::create(&source, &second).unwrap();
+                let mut bindings = super::CompanionDependencyBindings::default();
+                bindings.junctions.insert(first.clone(), source.clone());
+                bindings.junctions.insert(second.clone(), source.clone());
+                let final_package = std::fs::canonicalize(&target.final_install_root)
+                    .unwrap()
+                    .join("files/package");
+                if partial {
+                    // A failed finalization can leave some owned links pointing at
+                    // the final root. Dropping the stage must never follow them.
+                    windows_junction::retarget(&first, &source, &final_package).unwrap();
+                    assert!(bindings.finalize(&target).is_err());
+                    assert_eq!(std::fs::read_link(&second).unwrap(), source);
+                } else {
+                    // All validation and projection precedes updates, and uses the
+                    // staged identity even while an older final tree exists.
+                    bindings.finalize(&target).unwrap();
+                    assert_eq!(std::fs::read_link(&first).unwrap(), final_package);
+                    assert_eq!(std::fs::read_link(&second).unwrap(), final_package);
+                }
+                let old_value = target.final_install_root.join("files/package/value");
+                drop(target);
+                assert!(!stage.exists());
+                assert_eq!(std::fs::read_to_string(old_value).unwrap(), "old");
+            }
+        });
     }
 
     #[test]
