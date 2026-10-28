@@ -3281,7 +3281,7 @@ fn env_clone_copied_git_config_shared_repositories_read_history_without_the_sour
             copied_config_git(
                 &workspace,
                 &env,
-                &["clone", flag, donor.to_str().unwrap(), name],
+                &["clone", flag, &copied_config_path(&donor), name],
             );
         }
         let before = file_bytes(&source);
@@ -3331,7 +3331,12 @@ fn env_clone_copied_git_config_shared_repositories_refuse_uncopied_donors() {
         copied_config_git(
             &workspace,
             &env,
-            &["clone", "--shared", external.to_str().unwrap(), "shared"],
+            &[
+                "clone",
+                "--shared",
+                &copied_config_path(&external),
+                "shared",
+            ],
         );
         let source_before = file_bytes(&source);
         let donor_before = file_bytes(&external);
