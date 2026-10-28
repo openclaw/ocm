@@ -3768,17 +3768,25 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
     write_package(
         &shared,
         serde_json::json!({"name":"@private/value","version":"1.0.0","main":"index.cjs"}),
-        "module.exports=1;",
+        "module.exports={version:1};",
     );
     let shared_archive = pack(&shared);
     let bridge = cwd.join("bridge");
     write_package(
         &bridge,
         serde_json::json!({"name":"bridge","version":"1.0.0","main":"index.cjs",
-            "dependencies":{"@private/value":shared_archive}}),
-        "module.exports=require('@private/value');",
+            "dependencies":{"@private/value":shared_archive}, "peerDependencies":{"@openclaw/codex":"*"}}),
+        "module.exports={value:require('@private/value'),token:require('@openclaw/codex').token};",
     );
     let bridge_archive = pack(&bridge);
+    let bridge_b = cwd.join("bridge-b");
+    write_package(
+        &bridge_b,
+        serde_json::json!({"name":"bridge-b","version":"1.0.0","main":"index.cjs",
+            "dependencies":{"@private/value":shared_archive}, "peerDependencies":{"@openclaw/codex":"*"}}),
+        "module.exports={value:require('@private/value'),token:require('@openclaw/codex').token};",
+    );
+    let bridge_b_archive = pack(&bridge_b);
     let required = cwd.join("required");
     write_package(
         &required,
@@ -3801,7 +3809,7 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
     fs::write(repo.join("sdk.cjs"), "module.exports='host-sdk';").unwrap();
     write_executable_script(
         &repo.join("openclaw.mjs"),
-        "#!/usr/bin/env node\nimport {createRequire} from 'node:module'; const require=createRequire(import.meta.url); console.log(JSON.stringify({host:require('@private/value'),companion:require('./dist/extensions/codex/index.cjs')}));\n",
+        "#!/usr/bin/env node\nimport {createRequire} from 'node:module'; const require=createRequire(import.meta.url); console.log(JSON.stringify({host:require('@private/value').version,companion:require('./dist/extensions/codex/index.cjs')}));\n",
     );
     // npm resolves peer metadata even with --omit=peer. Keep that resolution offline.
     let host_archive = pack(&repo);
@@ -3809,7 +3817,7 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
     let manifest = serde_json::json!({
         "name":"@openclaw/codex","version":"2026.10.8","main":"index.cjs",
         "files":["index.cjs","openclaw.plugin.json"],
-        "dependencies":{"@private/value":"2.0.0","bridge":bridge_archive,"required-only":required_archive},
+        "dependencies":{"@private/value":"2.0.0","bridge":bridge_archive,"bridge-b":bridge_b_archive,"required-only":required_archive},
         "bundleDependencies":["@private/value"],
         "peerDependencies":{"openclaw":host_archive},
         "openclaw":{"build":{"openclawVersion":"2026.10.8"},
@@ -3818,14 +3826,14 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
     write_package(
         &companion,
         manifest.clone(),
-        "module.exports={direct:require('@private/value'),transitive:require('bridge'),required:require('required-only'),peer:require('openclaw/sdk')};",
+        "exports.token={}; const a=require('bridge'),b=require('bridge-b'); Object.assign(exports,{direct:require('@private/value').version,transitive:a.value.version,required:require('required-only'),peer:require('openclaw/sdk'),same:a.value===b.value,cycle:a.token===exports.token && b.token===exports.token});",
     );
     // npm bundles this private version while bridge inherits a different version.
     // The scope deliberately differs from the companion's own @openclaw scope.
     write_package(
         &companion.join("node_modules/@private/value"),
         serde_json::json!({"name":"@private/value","version":"2.0.0","main":"index.cjs"}),
-        "module.exports=2;",
+        "module.exports={version:2};",
     );
     fs::write(
         companion.join("openclaw.plugin.json"),
@@ -3842,10 +3850,41 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
     }
     fs::write(repo.join("scripts/lib/plugin-npm-package-manifest.mjs"),
         "import {spawnSync} from 'node:child_process'; const [,,run,dir,separator,command,...args]=process.argv; const child=spawnSync(command,args,{cwd:dir,stdio:'inherit',shell:process.platform==='win32'}); process.exit(child.status ?? 1);\n").unwrap();
+    let companion_archive = pack(&companion);
     let source_before = file_sha256(&companion.join("package.json")).unwrap();
     for strategy in ["hoisted", "nested", "linked"] {
         let mut selected_env = env.clone();
         selected_env.insert("npm_config_install_strategy".into(), strategy.into());
+        let native = root.child(&format!("native-{strategy}"));
+        let install = Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
+            .args(["install", "--prefix"])
+            .arg(&native)
+            .args([
+                "--omit=dev",
+                "--omit=peer",
+                "--no-save",
+                "--package-lock=false",
+                &companion_archive,
+                &host_archive,
+            ])
+            .env_clear()
+            .envs(&selected_env)
+            .output()
+            .unwrap();
+        assert!(install.status.success(), "{strategy}: {}", stderr(&install));
+        let control = Command::new("node")
+            .args([
+                "-e",
+                "console.log(JSON.stringify(require(process.argv[1])));",
+            ])
+            .arg(native.join("node_modules/@openclaw/codex"))
+            .env_clear()
+            .envs(&selected_env)
+            .output()
+            .unwrap();
+        assert!(control.status.success(), "{strategy}: {}", stderr(&control));
+        let control: Value = serde_json::from_str(&stdout(&control)).unwrap();
+        assert_eq!(control["cycle"], true, "{strategy}");
         let build = run_ocm(
             &cwd,
             &selected_env,
@@ -3878,8 +3917,7 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
         let result: Value = serde_json::from_str(&stdout(&launch)).unwrap();
         assert_eq!(
             result,
-            serde_json::json!({"host":1,"companion":{
-            "direct":2,"transitive":1,"required":"installed","peer":"host-sdk"}}),
+            serde_json::json!({"host":1,"companion":control}),
             "{strategy}"
         );
         let verify = run_ocm(&cwd, &env, &["runtime", "verify", strategy, "--json"]);
@@ -3890,7 +3928,7 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
         );
         assert_eq!(
             fs::read_to_string(companion.join("node_modules/@private/value/index.cjs")).unwrap(),
-            "module.exports=2;"
+            "module.exports={version:2};"
         );
     }
     // A failure after dependency materialization must still discard the stage.

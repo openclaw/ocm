@@ -1945,8 +1945,9 @@ fn copy_companion_runtime_dependencies(
     source_node_modules: &Path,
     destination_node_modules: &Path,
     own_package_path: &Path,
-) -> Result<(), String> {
+) -> Result<BTreeMap<PathBuf, PathBuf>, String> {
     ensure_dir(destination_node_modules)?;
+    let mut copied = Vec::new();
     for entry in fs::read_dir(source_node_modules).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let source = entry.path();
@@ -1967,6 +1968,9 @@ fn copy_companion_runtime_dependencies(
                     continue;
                 }
                 copy_path(&scoped_entry.path(), &destination)?;
+                if relative != Path::new(".bin") {
+                    copied.push((scoped_entry.path(), destination));
+                }
             }
             continue;
         }
@@ -1975,8 +1979,23 @@ fn copy_companion_runtime_dependencies(
             continue;
         }
         copy_path(&source, &destination)?;
+        if source.is_dir() {
+            copied.push((source, destination));
+        }
     }
-    Ok(())
+    // npm can enumerate package links before their .store targets. Resolve the
+    // copied identities only once the entire prefix has been copied.
+    let destination_root =
+        fs::canonicalize(destination_node_modules).map_err(|error| error.to_string())?;
+    let mut retained = BTreeMap::new();
+    for (source, destination) in copied {
+        let source = fs::canonicalize(source).map_err(|error| error.to_string())?;
+        let destination = fs::canonicalize(destination).map_err(|error| error.to_string())?;
+        if destination.starts_with(&destination_root) {
+            retained.insert(source, destination);
+        }
+    }
+    Ok(retained)
 }
 
 fn safe_companion_runtime_entrypoint(value: &str) -> Result<PathBuf, String> {
@@ -2091,19 +2110,20 @@ fn install_local_openclaw_companion(
         ));
     }
     copy_dir_recursive(&source_package_root, &target_package_root)?;
-    copy_companion_runtime_dependencies(
+    let retained = copy_companion_runtime_dependencies(
         &install_root.join("node_modules"),
         &target_package_root.join("node_modules"),
         &package_path,
     )?;
     // The isolated npm tree is packing scratch and is removed before publication.
-    // Copy bindings from its physical package ancestry; links into it cannot live
-    // in the published runtime, including links inherited by copied dependencies.
+    // Reuse retained physical packages so shared dependencies keep their module
+    // identity. No binding may depend on the temporary installation after this.
     preserve_materialized_extension_dependencies(
         install_files,
         &install_root,
         &source_package_root,
         &target_package_root,
+        Some(retained),
         copy_dir_recursive,
     )?;
     ensure_local_extension_openclaw_peer(&openclaw_package_root, &target_package_root)?;
@@ -2587,11 +2607,37 @@ fn installed_dependency_directory(
     Ok(None)
 }
 
+fn link_retained_companion_dependency(source: &Path, target: &Path) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        ensure_dir(parent)?;
+    }
+    let relative = relative_symlink_target(source, target)
+        .ok_or_else(|| "cannot make a relative companion dependency binding".to_string())?;
+    // Copying here would split singleton identity, and a cycle could copy an
+    // ancestor into itself. Fail the owned stage if the binding cannot be kept.
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(relative, target);
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_dir(relative, target);
+    #[cfg(not(any(unix, windows)))]
+    let result = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "directory links unsupported",
+    ));
+    result.map_err(|error| {
+        format!(
+            "cannot preserve shared companion dependency at {}: {error}",
+            display_path(target)
+        )
+    })
+}
+
 fn preserve_materialized_extension_dependencies(
     install_files: &Path,
     source_install_files: &Path,
     installed_package: &Path,
     target: &Path,
+    mut retained: Option<BTreeMap<PathBuf, PathBuf>>,
     link_or_copy: fn(&Path, &Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let install_files = fs::canonicalize(install_files).map_err(|error| error.to_string())?;
@@ -2602,6 +2648,11 @@ fn preserve_materialized_extension_dependencies(
     let source = fs::canonicalize(installed_package).map_err(|error| error.to_string())?;
     let target = fs::canonicalize(target).map_err(|error| error.to_string())?;
     let extension_root = target.clone();
+    if let Some(retained) = retained.as_mut() {
+        // Prefer the visible companion over its duplicate in npm's .store,
+        // including for dependency cycles back to the companion itself.
+        retained.insert(source.clone(), target.clone());
+    }
     let mut copies = BTreeMap::from([(target.clone(), source.clone())]);
     let mut pending = vec![(source, target)];
     let mut visited = BTreeSet::new();
@@ -2631,6 +2682,32 @@ fn preserve_materialized_extension_dependencies(
                 // npm may omit an optional dependency. Do not install anything here.
                 continue;
             };
+            if let Some(retained) = retained.as_mut() {
+                let representative = dependency.ancestors().find_map(|ancestor| {
+                    let root = retained.get(ancestor)?;
+                    let path = root.join(dependency.strip_prefix(ancestor).ok()?);
+                    let path = fs::canonicalize(path).ok()?;
+                    (path.starts_with(&install_files) && path.join("package.json").is_file())
+                        .then_some(path)
+                });
+                let binding = target.join("node_modules").join(&relative);
+                let representative = if let Some(representative) = representative {
+                    if installed_dependency_directory(&target, &relative, &install_files)?
+                        != Some(representative.clone())
+                    {
+                        remove_path_if_present(&binding)?;
+                        link_retained_companion_dependency(&representative, &binding)?;
+                    }
+                    representative
+                } else {
+                    remove_path_if_present(&binding)?;
+                    copy_dir_recursive(&dependency, &binding)?;
+                    fs::canonicalize(&binding).map_err(|error| error.to_string())?
+                };
+                retained.insert(dependency.clone(), representative.clone());
+                pending.push((dependency, representative));
+                continue;
+            }
             if let Some(resolved) =
                 installed_dependency_directory(&target, &relative, &install_files)?
             {
@@ -2714,6 +2791,7 @@ fn materialize_local_source_extensions(
             install_files,
             &installed_package,
             &target,
+            None,
             symlink_or_copy_dir,
         )?;
         ensure_local_extension_openclaw_peer(
@@ -4636,6 +4714,7 @@ mod tests {
             files,
             &source,
             &target,
+            None,
             super::copy_dir_recursive,
         )
         .unwrap();
