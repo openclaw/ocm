@@ -124,6 +124,7 @@ function main() {
     bridgeArchives[name] = pack(directory);
   }
 
+  const failures = [];
   const cases = [
     {name: 'plain-hoisted', strategy: 'hoisted', bundled: false},
     {name: 'plain-nested', strategy: 'nested', bundled: false},
@@ -218,8 +219,14 @@ process.exit(result.status??1);
         assert.equal(fileDigest(metadataPath), metadataSha256, 'Binding observation rewrote generated runtime metadata');
         continue;
       }
-      const verified = JSON.parse(run(binary, ['runtime', 'verify', scenario.name, '--json'], {env: selectedEnv}));
-      assert.equal(verified.healthy, true);
+      const verificationResult = observe(binary, ['runtime', 'verify', scenario.name, '--json'], {env: selectedEnv});
+      const verified = JSON.parse(verificationResult.stdout);
+      if (verificationResult.status !== 0 || verified.healthy !== true) {
+        failures.push({scenario: scenario.name, command: 'runtime verify',
+          exit: verificationResult.status, healthy: verified.healthy, issue: verified.issue});
+      }
+      // Binding has its own product admission check. Observe it independently
+      // while retaining failed verification as a failure of the complete test.
       run(binary, ['env', 'create', scenario.name, '--runtime', scenario.name], {env: selectedEnv});
       const materialized = JSON.parse(run(binary, [`@${scenario.name}`, '--', '--version'], {env: selectedEnv}));
       console.log(JSON.stringify({scenario, native, materialized, baselineValues}));
@@ -232,11 +239,17 @@ process.exit(result.status??1);
       } else {
         assert.deepEqual(materialized, native, 'Materialization changed the native dependency graph');
       }
+    } catch (error) {
+      if (captureOnly) throw error;
+      console.error(error);
+      failures.push({scenario: scenario.name, failure: String(error)});
     } finally {
       assert.deepEqual(sourceSnapshot(repo), before, 'OCM changed the source fixture');
       console.log(JSON.stringify({scenario: scenario.name, sourceBytesUnchanged: true}));
     }
   }
+  console.log(JSON.stringify({nativeWindowsCompanionObservationsComplete: true, failures}));
+  assert.deepEqual(failures, [], 'Native companion checks failed; verification failures were not waived');
   console.log(JSON.stringify(captureOnly ? {nativeWindowsCompanionCapture: 'captured', captureOnly: true} :
     {nativeWindowsCompanionWithoutSymlinkPrivilege: 'passed', baselineValues}));
 }

@@ -118,7 +118,7 @@ jobs:
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
-      - name: Capture native Windows companion entrypoint validation
+      - name: Capture native Windows companion dependency comparison
         if: github.event_name == 'pull_request' && github.event.pull_request.number == 751
         timeout-minutes: 20
         shell: pwsh
@@ -158,15 +158,20 @@ jobs:
           Get-FileHash $policyFixture -Algorithm SHA256
           . $policyFixture
           Invoke-WithoutDeveloperSymlinks {
-            $env:OCM_TEST_BINARY = Join-Path $area 'baseline-target/debug/ocm.exe'
-            $env:OCM_TEST_COMPANION_CAPTURE_ONLY = '1'
-            & $harness --exact native_windows_companion_without_symlink_privilege --nocapture
-            $captureExit = $LASTEXITCODE
-            Remove-Item Env:OCM_TEST_COMPANION_CAPTURE_ONLY
-            Remove-Item Env:OCM_TEST_BINARY
-            Write-Output "currentBaseCaptureExit=$captureExit"
-            Get-FileHash (Join-Path $area 'baseline-target/debug/ocm.exe') -Algorithm SHA256
-            if ($captureExit -ne 0) { throw 'native companion capture did not complete' }
+            foreach ($name in @('baseline', 'candidate')) {
+              $env:OCM_TEST_BINARY = Join-Path $area ($name + '-target/debug/ocm.exe')
+              if ($name -eq 'baseline') { $env:OCM_TEST_COMPANION_BASELINE_VALUES = '1' }
+              $output = & $harness --exact native_windows_companion_without_symlink_privilege --nocapture 2>&1
+              $comparisonExit = $LASTEXITCODE
+              $output | Write-Output
+              Remove-Item Env:OCM_TEST_COMPANION_BASELINE_VALUES -ErrorAction SilentlyContinue
+              Remove-Item Env:OCM_TEST_BINARY
+              Write-Output "$name comparisonExit=$comparisonExit"
+              Get-FileHash (Join-Path $area ($name + '-target/debug/ocm.exe')) -Algorithm SHA256
+              if (!($output -match '"nativeWindowsCompanionObservationsComplete":true')) {
+                throw "$name native companion observations did not complete"
+              }
+            }
           }
       - name: Prove native Windows companion dependency bindings
         if: github.event_name != 'pull_request' || github.event.pull_request.number != 751
