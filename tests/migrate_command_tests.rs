@@ -2915,10 +2915,19 @@ fn migrate_rejects_multiple_env_names() {
 
 #[test]
 fn migration_snapshots_registered_databases_and_preserves_workspace_assets() {
-    for adopt in [false, true] {
+    for (adopt, aliased) in [(false, false), (true, false), (false, true), (true, true)] {
+        #[cfg(not(unix))]
+        if aliased {
+            continue;
+        }
         let root = TestDir::new("migration-live-sqlite");
         let source = root.child("plain-home");
         let external = root.child("external");
+        #[cfg(unix)]
+        if aliased {
+            fs::create_dir_all(source.join("shared-store")).unwrap();
+            std::os::unix::fs::symlink("shared-store", source.join("state")).unwrap();
+        }
         fs::create_dir_all(source.join("state")).unwrap();
         fs::create_dir_all(source.join("workspaces/default")).unwrap();
         fs::create_dir_all(&external).unwrap();

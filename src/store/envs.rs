@@ -843,6 +843,10 @@ fn clone_environment_with_policy(
             git_repositories.contexts,
             &git_repositories.roots,
         )?;
+        let mut preserved_files = copied_worktrees.config_paths.clone();
+        preserved_files.extend(super::openclaw_state::cloned_shared_database_paths(
+            &target_paths,
+        )?);
         let created_at = now_utc();
         let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
         if matches!(policy, CloneEnvironmentPolicy::Standard) {
@@ -895,7 +899,7 @@ fn clone_environment_with_policy(
                     env,
                     target_runtime,
                     &copied_worktrees.preserved_roots,
-                    &copied_worktrees.config_paths,
+                    &preserved_files,
                 )?;
                 outcome
             }
@@ -932,7 +936,7 @@ fn clone_environment_with_policy(
                     env,
                     target_runtime,
                     &copied_worktrees.preserved_roots,
-                    &copied_worktrees.config_paths,
+                    &preserved_files,
                 )?;
                 Default::default()
             }
@@ -963,7 +967,7 @@ fn clone_environment_with_policy(
                     env,
                     target_runtime,
                     &copied_worktrees.preserved_roots,
-                    &copied_worktrees.config_paths,
+                    &preserved_files,
                 )?;
                 outcome
             }

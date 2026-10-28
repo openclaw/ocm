@@ -377,7 +377,7 @@ fn relative_link_target(link_parent: &Path, target: &Path) -> PathBuf {
 
 impl<'a> OpenClawDirectoryCopy<'a> {
     pub(crate) fn new(state_root: &'a Path, owned_root: &Path) -> Result<Self, String> {
-        let selection = OpenClawSqliteCopy::new(state_root)?;
+        let selection = OpenClawSqliteCopy::new(state_root, owned_root)?;
         // Reuse discovered source owners before copying. In particular, a
         // protected registry alias may point back to the ordinary global file.
         selection.admit_registered_databases(owned_root)?;
@@ -1267,6 +1267,120 @@ mod tests {
             fs::read(raw.join("broken.sqlite-wal")).unwrap(),
             b"raw sidecar"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_copy_snapshots_internal_shared_state_aliases() {
+        use std::os::unix::fs::symlink;
+
+        for (location, link_first, root_alias) in [
+            ("workspace/active", false, false),
+            ("workspace/active", true, true),
+            ("../shared-store", true, false),
+            ("imports/ordinary", false, false),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let physical = fixture.path().join("source");
+            fs::create_dir_all(physical.join(".openclaw")).unwrap();
+            let source = if root_alias {
+                let alias = fixture.path().join("alias");
+                symlink(&physical, &alias).unwrap();
+                alias
+            } else {
+                physical
+            };
+            let state = source.join(".openclaw");
+            let storage = state.join(location);
+            let link = state.join("state");
+            if link_first {
+                symlink(location, &link).unwrap();
+            }
+            fs::create_dir_all(&storage).unwrap();
+            if !link_first {
+                symlink(location, &link).unwrap();
+            }
+            let agent = state.join("custom-agent/records.db");
+            fs::create_dir_all(agent.parent().unwrap()).unwrap();
+            let paths = [
+                storage.join("openclaw.sqlite"),
+                storage.join("openclaw-quarantine.sqlite"),
+                agent.clone(),
+            ];
+            let mut writers = Vec::new();
+            for path in &paths {
+                let db = rusqlite::Connection::open(path).unwrap();
+                db.execute_batch(
+                    "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                    CREATE TABLE durable(value TEXT); INSERT INTO durable VALUES ('committed');",
+                )
+                .unwrap();
+                writers.push(db);
+            }
+            writers[0]
+                .execute_batch("CREATE TABLE agent_databases(path TEXT);")
+                .unwrap();
+            writers[0]
+                .execute(
+                    "INSERT INTO agent_databases VALUES (?1)",
+                    [agent.to_str().unwrap()],
+                )
+                .unwrap();
+            let originals: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    (
+                        fs::read(path).unwrap(),
+                        fs::read(super::sqlite_sidecars(path)[0].clone()).unwrap(),
+                    )
+                })
+                .collect();
+            let opaque = b"SQLite format 3\0opaque neighboring payload";
+            fs::write(storage.join("fixture.sqlite"), opaque).unwrap();
+            fs::write(storage.join("fixture.sqlite-wal"), b"opaque sidecar").unwrap();
+            let target = fixture.path().join("target");
+
+            copy_dir_with_sqlite_snapshots(&source, &target, &state).unwrap();
+
+            for (path, (main, wal)) in paths.iter().zip(originals) {
+                let copied = target.join(path.strip_prefix(&source).unwrap());
+                // Check before opening SQLite: replaying an ordinary copied WAL
+                // could otherwise disguise a missed coherent-copy selection.
+                for sidecar in super::sqlite_sidecars(&copied) {
+                    assert!(!sidecar.exists(), "{}", sidecar.display());
+                }
+                let db = rusqlite::Connection::open(&copied).unwrap();
+                assert_eq!(
+                    db.query_row("SELECT value FROM durable", [], |row| row
+                        .get::<_, String>(0))
+                        .unwrap(),
+                    "committed"
+                );
+                assert_eq!(
+                    db.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    "ok"
+                );
+                assert_eq!(fs::read(path).unwrap(), main);
+                assert_eq!(
+                    fs::read(super::sqlite_sidecars(path)[0].clone()).unwrap(),
+                    wal
+                );
+            }
+            let copied_storage = target.join(".openclaw").join(location);
+            assert_eq!(
+                fs::read(copied_storage.join("fixture.sqlite")).unwrap(),
+                opaque
+            );
+            assert_eq!(
+                fs::read(copied_storage.join("fixture.sqlite-wal")).unwrap(),
+                b"opaque sidecar"
+            );
+            assert_eq!(
+                fs::read_link(target.join(".openclaw/state")).unwrap(),
+                PathBuf::from(location)
+            );
+        }
     }
 
     #[cfg(unix)]

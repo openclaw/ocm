@@ -1170,6 +1170,7 @@ ocm start rowan
 
 Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite snapshots for recognized operational databases: shared state and quarantine, canonical agent stores, legacy `memory/*.sqlite` stores, and the default Workboard, Team Reports, Logbook, and active Matrix account state stores.
 Agent database paths recorded in the source shared-state registry are also included when the existing copy traverses them.
+An accepted internal `state` directory alias receives the same coherent capture for its shared and quarantine databases, and its registry still selects agent databases. The alias must resolve inside the existing copy; links do not expand the copy footprint, and unrelated files beside those databases retain their ordinary copy behavior. Clone also retains those database files and the internal links and directory entries needed to reach them through runtime cleanup, without preserving unrelated unconfigured neighboring data.
 Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
 The source stays running and its database contents are not rewritten.
 

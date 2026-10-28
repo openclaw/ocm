@@ -1878,28 +1878,132 @@ fn visit_files(root: &Path, on_file: &mut dyn FnMut(&Path)) {
 
 #[test]
 fn env_clone_rolls_back_an_unreadable_sqlite_snapshot() {
-    let root = TestDir::new("clone-invalid-sqlite");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-    assert!(
-        run_ocm(&cwd, &env, &["env", "create", "source"])
-            .status
-            .success()
-    );
-    let database = root.child("ocm-home/envs/source/.openclaw/state/openclaw.sqlite");
-    let invalid = b"SQLite format 3\0invalid database fixture";
-    fs::create_dir_all(database.parent().unwrap()).unwrap();
-    fs::write(&database, invalid).unwrap();
-    let output = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("SQLite"), "{}", stderr(&output));
-    assert!(!root.child("ocm-home/envs/target").exists());
-    let listing = run_ocm(&cwd, &env, &["env", "list", "--json"]);
-    let entries: Value = serde_json::from_str(&stdout(&listing)).unwrap();
-    assert_eq!(entries.as_array().unwrap().len(), 1);
-    assert_eq!(entries[0]["name"], "source");
-    assert_eq!(fs::read(&database).unwrap(), invalid);
+    for aliased in [false, true] {
+        #[cfg(not(unix))]
+        if aliased {
+            continue;
+        }
+        let root = TestDir::new("clone-invalid-sqlite");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        assert!(
+            run_ocm(&cwd, &env, &["env", "create", "source"])
+                .status
+                .success()
+        );
+        let state = root.child("ocm-home/envs/source/.openclaw");
+        #[cfg(unix)]
+        if aliased {
+            fs::create_dir_all(state.join("workspace/active")).unwrap();
+            std::os::unix::fs::symlink("workspace/active", state.join("state")).unwrap();
+        }
+        let database = state.join("state/openclaw.sqlite");
+        let invalid = b"SQLite format 3\0invalid database fixture";
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, invalid).unwrap();
+        let output = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("SQLite"), "{}", stderr(&output));
+        assert!(!root.child("ocm-home/envs/target").exists());
+        let listing = run_ocm(&cwd, &env, &["env", "list", "--json"]);
+        let entries: Value = serde_json::from_str(&stdout(&listing)).unwrap();
+        assert_eq!(entries.as_array().unwrap().len(), 1);
+        assert_eq!(entries[0]["name"], "source");
+        assert_eq!(fs::read(&database).unwrap(), invalid);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_retains_shared_database_alias_targets_and_routes() {
+    use std::os::unix::fs::symlink;
+
+    for route in ["direct", "link", "parent"] {
+        let root = TestDir::new("clone-shared-state-alias-lifetime");
+        let env = ocm_env(&root);
+        let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let state = root.child("ocm-home/envs/source/.openclaw");
+        let storage = state.join("imports/ordinary");
+        fs::create_dir_all(&storage).unwrap();
+        let link_target = if route != "direct" {
+            fs::create_dir(state.join("aliases")).unwrap();
+            write_text(&state.join("aliases/unrelated.txt"), "runtime debris");
+            if route == "link" {
+                symlink("../imports/ordinary", state.join("aliases/storage")).unwrap();
+                "aliases/storage"
+            } else {
+                "aliases/../imports/ordinary"
+            }
+        } else {
+            "imports/ordinary"
+        };
+        symlink(link_target, state.join("state")).unwrap();
+        write_text(&storage.join("unrelated.txt"), "runtime debris");
+        let mut writers = Vec::new();
+        let mut originals = Vec::new();
+        for name in ["openclaw.sqlite", "openclaw-quarantine.sqlite"] {
+            let path = storage.join(name);
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                CREATE TABLE durable(value TEXT); INSERT INTO durable VALUES ('committed');",
+            )
+            .unwrap();
+            originals.push((
+                name,
+                fs::read(&path).unwrap(),
+                fs::read(format!("{}-wal", path.display())).unwrap(),
+            ));
+            writers.push(db);
+        }
+
+        let clone = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+        assert!(clone.status.success(), "{}", stderr(&clone));
+
+        let target = root.child("ocm-home/envs/target/.openclaw");
+        assert_eq!(
+            fs::read_link(target.join("state")).unwrap(),
+            Path::new(link_target)
+        );
+        if route == "link" {
+            assert_eq!(
+                fs::read_link(target.join("aliases/storage")).unwrap(),
+                Path::new("../imports/ordinary")
+            );
+            assert!(!target.join("aliases/unrelated.txt").exists());
+        }
+        if route == "parent" {
+            assert!(target.join("aliases").is_dir());
+            assert_eq!(fs::read_dir(target.join("aliases")).unwrap().count(), 0);
+        }
+        assert!(!target.join("imports/ordinary/unrelated.txt").exists());
+        for (name, main, wal) in originals {
+            let copied = target.join("state").join(name);
+            assert!(copied.is_file(), "{}", copied.display());
+            let db =
+                Connection::open_with_flags(&copied, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            assert_eq!(
+                db.query_row("SELECT value FROM durable", [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "committed"
+            );
+            assert_eq!(
+                db.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+            assert_eq!(fs::read(storage.join(name)).unwrap(), main);
+            assert_eq!(fs::read(storage.join(format!("{name}-wal"))).unwrap(), wal);
+        }
+        assert_eq!(
+            fs::read_to_string(storage.join("unrelated.txt")).unwrap(),
+            "runtime debris"
+        );
+    }
 }
 
 #[test]
