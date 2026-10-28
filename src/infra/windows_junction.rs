@@ -194,7 +194,6 @@ fn create_with_data(link: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 /// Create a fresh junction. Its parent must exist; its target need not exist.
-#[cfg(test)]
 pub(crate) fn create(target: &Path, link: &Path) -> io::Result<()> {
     create_with_data(link, &junction_data(target)?)
 }

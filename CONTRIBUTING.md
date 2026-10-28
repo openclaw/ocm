@@ -143,7 +143,7 @@ coverage from one machine.
 | Surface | Additional proof and execution conditions |
 | --- | --- |
 | Rust compatibility | `cargo +1.88.0 check --workspace --all-targets --locked` on Linux with the declared minimum toolchain installed; stable Rust checks and the full test/install sequence on Linux and macOS. |
-| Windows paths, privacy, services, or dev lifecycle | Native Windows `cargo check --workspace --all-targets --locked`, then the exact focused Windows commands in the CI `windows` job. Cross-compilation does not execute these cases. |
+| Windows paths, privacy, services, or dev lifecycle | Native Windows `cargo check --workspace --all-targets --locked`, then the exact focused Windows commands in the CI `windows` job. The companion dependency graph check uses Node.js `24.22.1` and npm `11.19.1`, which supports external directory links in the linked layout; preceding native Windows checks retain Node.js `22.23.4`. Cross-compilation does not execute these cases. |
 | macOS private configuration | The ignored cross-user test described below, using its CI invocation on an authorized disposable runner. Ordinary `cargo test` does not execute it. |
 | npm packaging, launcher, installation, or recovery | Python 3.13 and npm 11.19.1: `python3 -B -m unittest discover -s scripts/tests -p 'test_npm_*.py'`. CI covers its declared Node.js and Linux/macOS architecture matrix. |
 | Signed npm binary installation | CI's `python3 -B scripts/tests/test_npm_install.py --published-binary-fixture` on its Node.js 24 jobs, with the required GitHub access and macOS signing identity. Do not supply signing credentials to an ordinary development checkout. |

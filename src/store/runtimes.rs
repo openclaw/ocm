@@ -32,8 +32,8 @@ use crate::runtime::{
 };
 
 use super::common::{
-    ExclusiveFileLock, copy_dir_recursive, copy_path, ensure_dir, load_json_files, path_exists,
-    read_json, read_json_if_present, write_json,
+    ExclusiveFileLock, copy_dir_recursive, copy_runtime_dir, copy_runtime_path, ensure_dir,
+    load_json_files, path_exists, read_json, read_json_if_present, write_json,
 };
 use super::envs::get_environment;
 use super::layout::{
@@ -1945,15 +1945,52 @@ fn npm_package_path(package_name: &str) -> Result<PathBuf, String> {
     ))
 }
 
+#[cfg(windows)]
+fn companion_entry(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to inspect companion entry {}: {error}",
+            display_path(path)
+        )),
+    }
+}
+
+fn companion_entry_exists(path: &Path) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        Ok(companion_entry(path)?.is_some())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(path_exists(path))
+    }
+}
+
 fn copy_companion_runtime_dependencies(
     source_node_modules: &Path,
     destination_node_modules: &Path,
     own_package_path: &Path,
-) -> Result<(), String> {
+) -> Result<BTreeMap<PathBuf, PathBuf>, String> {
+    // Windows runtime assembly preserves raw junctions. Never merge prefix
+    // data through one while it still names scratch; the projector owns it.
+    #[cfg(windows)]
+    if companion_entry(destination_node_modules)?
+        .is_some_and(|metadata| !metadata.file_type().is_dir())
+    {
+        return Ok(BTreeMap::new());
+    }
     ensure_dir(destination_node_modules)?;
-    let own_scope = (own_package_path.components().count() == 2)
-        .then(|| own_package_path.parent())
-        .flatten();
+    let mut copied = Vec::new();
+    let copied_directory = |path: &Path| -> Result<bool, String> {
+        // Copied aliases can still name scratch or carry relative ancestry that
+        // changes when moved. Only complete physical copies establish roots.
+        Ok(fs::symlink_metadata(path)
+            .map_err(|error| error.to_string())?
+            .file_type()
+            .is_dir())
+    };
     for entry in fs::read_dir(source_node_modules).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let source = entry.path();
@@ -1961,26 +1998,178 @@ fn copy_companion_runtime_dependencies(
         if relative == Path::new(".package-lock.json") {
             continue;
         }
-        if own_scope == Some(relative.as_path()) {
+        if entry.file_name().to_string_lossy().starts_with('@') || relative == Path::new(".bin") {
             let scope_destination = destination_node_modules.join(&relative);
+            #[cfg(windows)]
+            if companion_entry(&scope_destination)?
+                .is_some_and(|metadata| !metadata.file_type().is_dir())
+            {
+                continue;
+            }
             ensure_dir(&scope_destination)?;
             for scoped_entry in fs::read_dir(&source).map_err(|error| error.to_string())? {
                 let scoped_entry = scoped_entry.map_err(|error| error.to_string())?;
                 let scoped_relative = relative.join(scoped_entry.file_name());
-                if scoped_relative == own_package_path {
+                let destination = destination_node_modules.join(&scoped_relative);
+                if scoped_relative == own_package_path || companion_entry_exists(&destination)? {
                     continue;
                 }
-                copy_path(
-                    &scoped_entry.path(),
-                    &destination_node_modules.join(scoped_relative),
-                )?;
+                copy_runtime_path(&scoped_entry.path(), &destination)?;
+                if relative != Path::new(".bin") && copied_directory(&scoped_entry.path())? {
+                    copied.push((scoped_entry.path(), destination));
+                }
             }
             continue;
         }
-        if relative == own_package_path {
+        let destination = destination_node_modules.join(&relative);
+        if relative == own_package_path || companion_entry_exists(&destination)? {
             continue;
         }
-        copy_path(&source, &destination_node_modules.join(relative))?;
+        copy_runtime_path(&source, &destination)?;
+        if copied_directory(&source)? {
+            copied.push((source, destination));
+        }
+    }
+    let destination_root =
+        fs::canonicalize(destination_node_modules).map_err(|error| error.to_string())?;
+    let mut retained = BTreeMap::new();
+    for (source, destination) in copied {
+        let source = fs::canonicalize(source).map_err(|error| error.to_string())?;
+        let destination = fs::canonicalize(destination).map_err(|error| error.to_string())?;
+        if destination.starts_with(&destination_root) {
+            retained.entry(source).or_insert(destination);
+        }
+    }
+    Ok(retained)
+}
+
+#[cfg(windows)]
+fn companion_junctions(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut edges = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(directory)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_symlink()
+                && let Some(target) = crate::infra::windows_junction::target(&entry.path())
+                    .map_err(|error| error.to_string())?
+            {
+                edges.push((entry.path(), target));
+            }
+        }
+    }
+    Ok(edges)
+}
+
+#[cfg(windows)]
+fn retained_companion_directory(
+    source: &Path,
+    retained: &BTreeMap<PathBuf, PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    for ancestor in source.ancestors() {
+        let Some(root) = retained.get(ancestor) else {
+            continue;
+        };
+        let mut candidate = root.clone();
+        let mut physical =
+            companion_entry(&candidate)?.is_some_and(|metadata| metadata.file_type().is_dir());
+        for component in source.strip_prefix(ancestor).unwrap().components() {
+            if !physical {
+                break;
+            }
+            candidate.push(component.as_os_str());
+            physical =
+                companion_entry(&candidate)?.is_some_and(|metadata| metadata.file_type().is_dir());
+        }
+        if physical {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn companion_target_uses_scratch(target: &Path, scratch: &Path) -> bool {
+    // Match the generic publisher's owned-namespace test.
+    if clean_path(target).strip_prefix(scratch).is_ok() {
+        return true;
+    }
+    // A differently spelled ancestor can enter scratch and a later junction
+    // can leave it. Looking only at the final canonical target misses that
+    // dependency on the temporary namespace. Direct external targets stay raw.
+    target.ancestors().any(|ancestor| {
+        fs::canonicalize(ancestor).is_ok_and(|physical| physical.strip_prefix(scratch).is_ok())
+    })
+}
+
+#[cfg(windows)]
+fn project_companion_junctions(
+    source_install: &Path,
+    copied_root: &Path,
+    retained: &mut BTreeMap<PathBuf, PathBuf>,
+) -> Result<(), String> {
+    let source_install = fs::canonicalize(source_install).map_err(|error| error.to_string())?;
+    let copied_root = fs::canonicalize(copied_root).map_err(|error| error.to_string())?;
+    let mut pending = companion_junctions(&copied_root)?;
+    let mut replacements = Vec::new();
+    while let Some((site, old)) = pending.pop() {
+        if !companion_target_uses_scratch(&old, &source_install) {
+            continue;
+        }
+        let source = match fs::canonicalize(&old) {
+            Ok(source) => source,
+            // Preserve native omissions. Do not turn a dangling edge into a
+            // colliding retained package, or install anything to satisfy it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect native companion junction {}: {error}",
+                    display_path(&site)
+                ));
+            }
+        };
+        if !source.starts_with(&source_install) {
+            // The native target exists externally, but this edge reached it
+            // through scratch. Retain that existing identity directly; do not
+            // copy, adopt, or install external content.
+            replacements.push((site, old, source));
+            continue;
+        }
+        if let Some(representative) = retained_companion_directory(&source, retained)? {
+            replacements.push((site, old, representative));
+            continue;
+        }
+        // A private collision may have excluded this physical package from the
+        // prefix copy. Retain it once at this owned edge; later edges reuse it.
+        if crate::infra::windows_junction::target(&site).map_err(|error| error.to_string())?
+            != Some(old)
+        {
+            return Err("copied companion junction changed before materialization".into());
+        }
+        fs::remove_dir(&site).map_err(|error| error.to_string())?;
+        copy_runtime_dir(&source, &site)?;
+        let representative = fs::canonicalize(&site).map_err(|error| error.to_string())?;
+        retained.insert(source, representative.clone());
+        pending.extend(companion_junctions(&representative)?);
+    }
+    // All physical roots are now present. No retained lookup below traverses a
+    // raw scratch edge, and no source or namespace is resolved after rebinding.
+    for (site, old, representative) in replacements {
+        crate::infra::windows_junction::retarget(&site, &old, &representative).map_err(
+            |error| {
+                format!(
+                    "cannot project companion junction {}: {error}",
+                    display_path(&site)
+                )
+            },
+        )?;
     }
     Ok(())
 }
@@ -2096,13 +2285,56 @@ fn install_local_openclaw_companion(
             display_path(&target_package_root)
         ));
     }
-    copy_dir_recursive(&source_package_root, &target_package_root)?;
-    copy_companion_runtime_dependencies(
+    copy_runtime_dir(&source_package_root, &target_package_root)?;
+    let source_identity =
+        fs::canonicalize(&source_package_root).map_err(|error| error.to_string())?;
+    let visible_identity =
+        fs::canonicalize(&target_package_root).map_err(|error| error.to_string())?;
+    // This exact identity outranks any later .store subtree mapping.
+    let mut retained = BTreeMap::from([(source_identity, visible_identity.clone())]);
+    for (source, destination) in copy_companion_runtime_dependencies(
         &install_root.join("node_modules"),
         &target_package_root.join("node_modules"),
         &package_path,
+    )? {
+        retained.entry(source).or_insert(destination);
+    }
+    let package: serde_json::Value = read_json(&target_package_root.join("package.json"))?;
+    if package
+        .pointer("/peerDependencies/openclaw")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        let modules = visible_identity.join("node_modules");
+        #[cfg(windows)]
+        if companion_entry(&modules)?.is_some_and(|metadata| !metadata.file_type().is_dir()) {
+            return Err("companion host-peer namespace is not an owned physical directory".into());
+        }
+        // Reserve the explicit host slot before anyone can reuse it as a native
+        // representative. Transitive native copies remain available in scratch
+        // or .store and are retained elsewhere if they are actually needed.
+        let peer = modules.join("openclaw");
+        remove_path_if_present(&peer)?;
+        retained.retain(|_, destination| !destination.starts_with(&peer));
+    }
+    #[cfg(windows)]
+    project_companion_junctions(&install_root, &visible_identity, &mut retained)?;
+    // The isolated npm tree is packing scratch and is removed before publication.
+    // Reuse retained physical packages so shared dependencies keep their module
+    // identity. No binding may depend on the temporary installation after this.
+    preserve_materialized_extension_dependencies(
+        install_files,
+        &install_root,
+        &source_package_root,
+        &target_package_root,
+        Some(&mut retained),
+        link_companion_dependency,
     )?;
-    ensure_local_extension_openclaw_peer(&openclaw_package_root, &target_package_root)?;
+    ensure_local_extension_openclaw_peer(
+        &openclaw_package_root,
+        &target_package_root,
+        link_companion_host_peer,
+    )?;
 
     let installed = load_json_value(
         &target_package_root.join("package.json"),
@@ -2503,6 +2735,13 @@ fn remove_path_if_present(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if metadata.file_type().is_symlink_dir() {
+            return fs::remove_dir(path).map_err(|error| error.to_string());
+        }
+    }
     if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
         fs::remove_dir_all(path).map_err(|error| error.to_string())
     } else {
@@ -2540,6 +2779,7 @@ fn link_or_copy_openclaw_host(source: &Path, target: &Path) -> Result<(), String
 fn ensure_local_extension_openclaw_peer(
     host_package: &Path,
     extension_root: &Path,
+    link_or_copy: impl FnOnce(&Path, &Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let package_json_path = extension_root.join("package.json");
     let package: serde_json::Value = read_json(&package_json_path).map_err(|error| {
@@ -2558,7 +2798,7 @@ fn ensure_local_extension_openclaw_peer(
 
     let peer_path = extension_root.join("node_modules/openclaw");
     remove_path_if_present(&peer_path)?;
-    link_or_copy_openclaw_host(host_package, &peer_path)
+    link_or_copy(host_package, &peer_path)
 }
 
 fn installed_dependency_directory(
@@ -2583,18 +2823,75 @@ fn installed_dependency_directory(
     Ok(None)
 }
 
+fn link_companion_host_peer(source: &Path, target: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        link_companion_dependency(source, target)
+    }
+    #[cfg(not(windows))]
+    {
+        link_or_copy_openclaw_host(source, target)
+    }
+}
+
+fn link_companion_dependency(source: &Path, target: &Path) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        ensure_dir(parent)?;
+    }
+    let relative = relative_symlink_target(source, target)
+        .ok_or_else(|| "cannot make a relative companion dependency binding".to_string())?;
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(relative, target);
+    #[cfg(windows)]
+    let result = match std::os::windows::fs::symlink_dir(relative, target) {
+        Err(error)
+            if error.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD as i32) =>
+        {
+            let source = fs::canonicalize(source).map_err(|error| error.to_string())?;
+            let parent = target.parent().ok_or("companion binding has no parent")?;
+            let site = fs::canonicalize(parent)
+                .map_err(|error| error.to_string())?
+                .join(target.file_name().ok_or("companion binding has no name")?);
+            // The qualified generic publisher owns final target projection.
+            crate::infra::windows_junction::create(&source, &site)
+        }
+        result => result,
+    };
+    #[cfg(not(any(unix, windows)))]
+    let result = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "directory links unsupported",
+    ));
+    result.map_err(|error| {
+        format!(
+            "cannot preserve shared companion dependency at {}: {error}",
+            display_path(target)
+        )
+    })
+}
+
 fn preserve_materialized_extension_dependencies(
     install_files: &Path,
+    source_install_files: &Path,
     installed_package: &Path,
     target: &Path,
-    link_or_copy: fn(&Path, &Path) -> Result<(), String>,
+    mut retained: Option<&mut BTreeMap<PathBuf, PathBuf>>,
+    mut link_or_copy: impl FnMut(&Path, &Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let install_files = fs::canonicalize(install_files).map_err(|error| error.to_string())?;
+    let source_install_files =
+        fs::canonicalize(source_install_files).map_err(|error| error.to_string())?;
     let host = fs::canonicalize(installed_openclaw_package_root(&install_files))
         .map_err(|error| error.to_string())?;
     let source = fs::canonicalize(installed_package).map_err(|error| error.to_string())?;
     let target = fs::canonicalize(target).map_err(|error| error.to_string())?;
     let extension_root = target.clone();
+    if let Some(retained) = retained.as_mut() {
+        // Prefer the visible companion over its duplicate in npm's .store,
+        // including for dependency cycles back to the companion itself.
+        retained.insert(source.clone(), target.clone());
+    }
     let mut copies = BTreeMap::from([(target.clone(), source.clone())]);
     let mut pending = vec![(source, target)];
     let mut visited = BTreeSet::new();
@@ -2619,15 +2916,58 @@ fn preserve_materialized_extension_dependencies(
             let relative = npm_package_relative_path(name)
                 .ok_or_else(|| format!("invalid installed extension dependency name: {name}"))?;
             let Some(dependency) =
-                installed_dependency_directory(&source, &relative, &install_files)?
+                installed_dependency_directory(&source, &relative, &source_install_files)?
             else {
                 // npm may omit an optional dependency. Do not install anything here.
                 continue;
             };
+            if let Some(retained) = retained.as_mut() {
+                if !dependency.starts_with(&source_install_files) {
+                    // Native directory dependencies can retain external ancestry.
+                    // Preserve that binding rather than copying a partial graph.
+                    if installed_dependency_directory(&target, &relative, &install_files)?
+                        != Some(dependency.clone())
+                    {
+                        let binding = target.join("node_modules").join(&relative);
+                        remove_path_if_present(&binding)?;
+                        link_or_copy(&dependency, &binding)?;
+                    }
+                    continue;
+                }
+                let representative = dependency.ancestors().find_map(|ancestor| {
+                    let root = retained.get(ancestor)?;
+                    let path = root.join(dependency.strip_prefix(ancestor).ok()?);
+                    let path = fs::canonicalize(path).ok()?;
+                    (path.starts_with(&install_files) && path.join("package.json").is_file())
+                        .then_some(path)
+                });
+                let binding = target.join("node_modules").join(&relative);
+                let representative = if let Some(representative) = representative {
+                    if installed_dependency_directory(&target, &relative, &install_files)?
+                        != Some(representative.clone())
+                    {
+                        remove_path_if_present(&binding)?;
+                        link_or_copy(&representative, &binding)?;
+                    }
+                    representative
+                } else {
+                    remove_path_if_present(&binding)?;
+                    copy_runtime_dir(&dependency, &binding)?;
+                    let representative =
+                        fs::canonicalize(&binding).map_err(|error| error.to_string())?;
+                    retained.insert(dependency.clone(), representative.clone());
+                    #[cfg(windows)]
+                    project_companion_junctions(&source_install_files, &representative, retained)?;
+                    representative
+                };
+                retained.insert(dependency.clone(), representative.clone());
+                pending.push((dependency, representative));
+                continue;
+            }
             if let Some(resolved) =
                 installed_dependency_directory(&target, &relative, &install_files)?
             {
-                if resolved == dependency {
+                if resolved == dependency && dependency.starts_with(&install_files) {
                     // A link to the original package retains its complete npm ancestry.
                     continue;
                 }
@@ -2704,13 +3044,16 @@ fn materialize_local_source_extensions(
         copy_dir_recursive(&installed_package, &target)?;
         preserve_materialized_extension_dependencies(
             install_files,
+            install_files,
             &installed_package,
             &target,
+            None,
             symlink_or_copy_dir,
         )?;
         ensure_local_extension_openclaw_peer(
             &installed_openclaw_package_root(install_files),
             &target,
+            link_or_copy_openclaw_host,
         )?;
     }
     Ok(())
@@ -5191,6 +5534,55 @@ mod tests {
     }
 
     #[test]
+    fn companion_prefix_copy_preserves_private_packages_and_merges_namespaces() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().join("prefix");
+        let target = root.path().join("target");
+        for (base, relative, content) in [
+            (&prefix, "plain/package.json", "prefix"),
+            (&prefix, "@other/private/package.json", "prefix"),
+            (&prefix, "@other/extra/package.json", "extra"),
+            (&prefix, "@openclaw/codex/package.json", "own"),
+            (&prefix, ".bin/private", "prefix"),
+            (&prefix, ".bin/extra", "extra"),
+            (&target, "plain/package.json", "private"),
+            (&target, "@other/private/package.json", "private"),
+            (&target, ".bin/private", "private"),
+        ] {
+            let path = base.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        super::copy_companion_runtime_dependencies(
+            &prefix,
+            &target,
+            std::path::Path::new("@openclaw/codex"),
+        )
+        .unwrap();
+        for relative in [
+            "plain/package.json",
+            "@other/private/package.json",
+            ".bin/private",
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(target.join(relative)).unwrap(),
+                "private"
+            );
+            assert_eq!(
+                std::fs::read_to_string(prefix.join(relative)).unwrap(),
+                "prefix"
+            );
+        }
+        for relative in ["@other/extra/package.json", ".bin/extra"] {
+            assert_eq!(
+                std::fs::read_to_string(target.join(relative)).unwrap(),
+                "extra"
+            );
+        }
+        assert!(!target.join("@openclaw/codex").exists());
+    }
+
+    #[test]
     fn materialized_dependency_copy_fallback_preserves_nested_bindings_and_cycles() {
         let root = tempfile::tempdir().unwrap();
         let files = root.path();
@@ -5245,8 +5637,10 @@ mod tests {
         super::copy_dir_recursive(&source, &target).unwrap();
         super::preserve_materialized_extension_dependencies(
             files,
+            files,
             &source,
             &target,
+            None,
             super::copy_dir_recursive,
         )
         .unwrap();

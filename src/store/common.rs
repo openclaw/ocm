@@ -202,20 +202,44 @@ pub(crate) fn try_lock_file_shared(
     }
 }
 
+#[derive(Clone, Copy)]
+enum CopyPolicy {
+    Ordinary,
+    RuntimeAssembly,
+    RuntimeRecovery,
+}
+
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, None, false)
+    copy_dir_recursive_inner(source, destination, None, None, CopyPolicy::Ordinary)
+}
+
+/// Assemble an owned runtime tree, retaining native junction edges for its
+/// producer to project. Directory modes follow ordinary assembly copying.
+pub(crate) fn copy_runtime_dir(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_dir_recursive_inner(source, destination, None, None, CopyPolicy::RuntimeAssembly)
+}
+
+/// Copy one runtime assembly entry without following a native junction.
+pub(crate) fn copy_runtime_path(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_path_inner(source, destination, None, None, CopyPolicy::RuntimeAssembly)
 }
 
 /// Copy a runtime tree without changing the directory modes in its integrity digest.
 pub(crate) fn copy_dir_preserving_modes(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, None, true)
+    copy_dir_recursive_inner(source, destination, None, None, CopyPolicy::RuntimeRecovery)
 }
 
 pub(crate) fn copy_dir_preserving_permissions(
     source: &Path,
     destination: &Path,
 ) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, Some(destination), false)
+    copy_dir_recursive_inner(
+        source,
+        destination,
+        None,
+        Some(destination),
+        CopyPolicy::Ordinary,
+    )
 }
 
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), String> {
@@ -411,7 +435,7 @@ impl<'a> OpenClawDirectoryCopy<'a> {
             )),
             None => None,
         };
-        copy_dir_recursive_inner(source, destination, Some(self), None, false)
+        copy_dir_recursive_inner(source, destination, Some(self), None, CopyPolicy::Ordinary)
     }
 
     // Returns the replacement target and whether it names a directory.
@@ -479,7 +503,7 @@ fn copy_dir_recursive_inner(
     destination: &Path,
     mut copying: Option<&mut OpenClawDirectoryCopy<'_>>,
     private_root: Option<&Path>,
-    preserve_directory_modes: bool,
+    policy: CopyPolicy,
 ) -> Result<(), String> {
     if private_root.is_some() {
         ensure_private_dir(destination)?;
@@ -573,12 +597,14 @@ fn copy_dir_recursive_inner(
                 &destination_path,
                 copying.as_deref_mut(),
                 private_root,
-                preserve_directory_modes,
+                policy,
             )?;
         }
     }
 
-    if preserve_directory_modes || private_root.is_some_and(|root| root != destination) {
+    if matches!(policy, CopyPolicy::RuntimeRecovery)
+        || private_root.is_some_and(|root| root != destination)
+    {
         // Populate children before restoring modes, including read-only directories.
         let permissions = fs::metadata(source)
             .map_err(|error| error.to_string())?
@@ -601,7 +627,7 @@ pub(crate) fn copy_path_recursive(source: &Path, destination: &Path) -> Result<(
 }
 
 pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_path_inner(source, destination, None, None, false)
+    copy_path_inner(source, destination, None, None, CopyPolicy::Ordinary)
 }
 
 fn copy_path_inner(
@@ -609,20 +635,23 @@ fn copy_path_inner(
     destination: &Path,
     copying: Option<&mut OpenClawDirectoryCopy<'_>>,
     private_root: Option<&Path>,
-    preserve_directory_modes: bool,
+    policy: CopyPolicy,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     let file_type = metadata.file_type();
 
     if file_type.is_symlink() {
         #[cfg(windows)]
-        if preserve_directory_modes
-            && crate::infra::windows_junction::copy_if_junction(source, destination)
+        if !matches!(policy, CopyPolicy::Ordinary) {
+            if let Some(parent) = destination.parent() {
+                ensure_dir(parent)?;
+            }
+            if crate::infra::windows_junction::copy_if_junction(source, destination)
                 .map_err(|error| error.to_string())?
-        {
-            // Runtime backups preserve recorded targets even when the final
-            // install root is absent. Ordinary user-data copies stay unchanged.
-            return Ok(());
+            {
+                // Assembly owns projection; recovery keeps recorded target data.
+                return Ok(());
+            }
         }
         #[cfg(windows)]
         let directory_hint = private_root.map(|_| {
@@ -648,13 +677,7 @@ fn copy_path_inner(
         );
     }
     if file_type.is_dir() {
-        return copy_dir_recursive_inner(
-            source,
-            destination,
-            copying,
-            private_root,
-            preserve_directory_modes,
-        );
+        return copy_dir_recursive_inner(source, destination, copying, private_root, policy);
     }
     #[cfg(unix)]
     if file_type.is_socket() {
@@ -1067,6 +1090,68 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_junction_assembly_copy_keeps_directory_modes_separate() {
+        use crate::infra::windows_junction;
+
+        windows_junction::tests::without_symlink_privilege(|| {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("payload"), "owned bytes").unwrap();
+            let absent = fs::canonicalize(root.path()).unwrap().join("absent");
+            windows_junction::create(&absent, &source.join("edge")).unwrap();
+            let mut readonly = fs::metadata(&source).unwrap().permissions();
+            readonly.set_readonly(true);
+            fs::set_permissions(&source, readonly).unwrap();
+
+            let assembly = root.path().join("assembly");
+            super::copy_runtime_dir(&source, &assembly).unwrap();
+            assert!(!fs::metadata(&assembly).unwrap().permissions().readonly());
+            assert_eq!(
+                fs::read_to_string(assembly.join("payload")).unwrap(),
+                "owned bytes"
+            );
+            assert_eq!(
+                windows_junction::target(&assembly.join("edge")).unwrap(),
+                Some(absent.clone())
+            );
+            assert!(!assembly.join("edge").exists());
+
+            let single = root.path().join("new-parent/single");
+            super::copy_runtime_path(&source.join("edge"), &single).unwrap();
+            assert_eq!(windows_junction::target(&single).unwrap(), Some(absent));
+            let missing_parent = root.path().join("missing-source-parent");
+            assert!(
+                super::copy_runtime_path(
+                    &root.path().join("missing-source"),
+                    &missing_parent.join("entry"),
+                )
+                .is_err()
+            );
+            assert!(!missing_parent.exists());
+            let occupied = root.path().join("occupied");
+            fs::write(&occupied, "keep").unwrap();
+            assert!(super::copy_runtime_path(&source.join("edge"), &occupied).is_err());
+            assert_eq!(fs::read_to_string(&occupied).unwrap(), "keep");
+
+            let recovery = root.path().join("recovery");
+            super::copy_dir_preserving_modes(&source, &recovery).unwrap();
+            assert!(fs::metadata(&recovery).unwrap().permissions().readonly());
+            assert_eq!(
+                windows_junction::target(&recovery.join("edge")).unwrap(),
+                windows_junction::target(&source.join("edge")).unwrap(),
+            );
+            assert!(super::copy_path(&source.join("edge"), &root.path().join("ordinary")).is_err());
+            for path in [&source, &recovery, &assembly] {
+                super::remove_owned_tree(path).unwrap();
+            }
+            fs::remove_dir(&single).unwrap();
+            assert_eq!(fs::read_to_string(&occupied).unwrap(), "keep");
+        });
     }
 
     #[cfg(unix)]
