@@ -1554,24 +1554,217 @@ mod archive_privacy_windows_tests {
         );
     }
 
+    fn directory_handle(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap()
+    }
+
+    fn ordinary_path(path: &Path) -> PathBuf {
+        let canonical = path.canonicalize().unwrap();
+        PathBuf::from(canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap())
+    }
+
+    fn directory_at_length(root: &Path, units: usize) -> PathBuf {
+        use std::os::windows::ffi::OsStrExt;
+        let mut path = root.to_path_buf();
+        while units - path.as_os_str().encode_wide().count() > 100 {
+            path.push(format!("unicode-🦀-{}", "p".repeat(60)));
+        }
+        let remaining = units - path.as_os_str().encode_wide().count() - 1;
+        path.push("d".repeat(remaining));
+        assert_eq!(path.as_os_str().encode_wide().count(), units);
+        path
+    }
+
     #[test]
     fn private_config_archive_directory_has_user_only_access() {
-        let root = tempfile::tempdir().unwrap();
-        for existing in [false, true] {
-            let directory = root.path().join(if existing { "existing" } else { "new" });
-            if existing {
-                fs::create_dir(&directory).unwrap();
+        use crate::infra::file_identity::file_identity;
+        use crate::infra::windows_security::has_user_only_access;
+        for units in [0, 252, 300] {
+            let root = tempfile::tempdir().unwrap();
+            let ordinary = ordinary_path(root.path());
+            for existing in [false, true] {
+                let base = ordinary.join(if existing { "existing" } else { "new" });
+                let directory = if units == 0 {
+                    base
+                } else {
+                    directory_at_length(&base, units)
+                };
+                fs::create_dir_all(directory.parent().unwrap()).unwrap();
+                if existing {
+                    fs::create_dir(&directory).unwrap();
+                }
+                ensure_private_dir(&directory).unwrap_or_else(|error| {
+                    panic!("units={units} existing={existing} path={directory:?}: {error}")
+                });
+                let file = directory_handle(&directory);
+                assert!(has_user_only_access(&file).unwrap(), "{directory:?}");
+                let identity = file_identity(&file, &file.metadata().unwrap()).unwrap();
+                for spelling in [&directory, &directory.canonicalize().unwrap()] {
+                    ensure_private_dir(spelling).unwrap();
+                    let reopened = directory_handle(spelling);
+                    assert!(has_user_only_access(&reopened).unwrap());
+                    assert_eq!(
+                        identity,
+                        file_identity(&reopened, &reopened.metadata().unwrap()).unwrap()
+                    );
+                }
+                fs::write(directory.join("marker"), b"owned bytes").unwrap();
             }
-            ensure_private_dir(&directory).unwrap();
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                .open(directory)
-                .unwrap();
-            assert!(
-                crate::infra::windows_security::has_user_only_access(&file).unwrap(),
-                "existing directory: {existing}"
+            if units != 0 {
+                let source = ordinary.join("source");
+                fs::create_dir_all(source.join("nested")).unwrap();
+                fs::write(source.join("nested/marker"), b"copied bytes").unwrap();
+                let copy = directory_at_length(&ordinary.join("copy"), units);
+                copy_dir_preserving_permissions(&source, &copy).unwrap();
+                assert!(has_user_only_access(&directory_handle(&copy)).unwrap());
+                assert!(has_user_only_access(&directory_handle(&copy.join("nested"))).unwrap());
+                assert_eq!(
+                    fs::read(copy.join("nested/marker")).unwrap(),
+                    b"copied bytes"
+                );
+            }
+            remove_owned_tree(&ordinary).unwrap();
+            assert!(!ordinary.exists());
+        }
+    }
+
+    #[test]
+    fn private_config_long_directory_spellings_and_parent_alias_keep_identity() {
+        use crate::infra::file_identity::file_identity;
+        use crate::infra::windows_security::has_user_only_access;
+        let cwd = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&cwd).unwrap();
+        let ordinary = ordinary_path(root.path());
+        let directory = directory_at_length(&ordinary, 300);
+        let relative = directory
+            .strip_prefix(ordinary_path(&cwd))
+            .unwrap()
+            .to_path_buf();
+        let drive_relative = PathBuf::from(format!(
+            "{}:{}",
+            &directory.to_str().unwrap()[..1],
+            relative.display()
+        ));
+        let normalized = PathBuf::from(format!(
+            "{}/unused/../{}",
+            directory.parent().unwrap().display(),
+            directory.file_name().unwrap().to_str().unwrap()
+        ));
+        let forward_slashes = PathBuf::from(directory.to_str().unwrap().replace('\\', "/"));
+        ensure_private_dir(&relative)
+            .unwrap_or_else(|error| panic!("relative={relative:?}: {error}"));
+        let file = directory_handle(&directory);
+        let identity = file_identity(&file, &file.metadata().unwrap()).unwrap();
+        for spelling in [&drive_relative, &normalized, &forward_slashes] {
+            ensure_private_dir(spelling).unwrap();
+            let reopened = directory_handle(spelling);
+            assert!(has_user_only_access(&reopened).unwrap());
+            assert_eq!(
+                identity,
+                file_identity(&reopened, &reopened.metadata().unwrap()).unwrap()
             );
         }
+        let alias = ordinary.join("alias");
+        let target = ordinary.join("target");
+        fs::create_dir(&target).unwrap();
+        let result = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let aliased = directory_at_length(&alias, 300);
+        ensure_private_dir(&aliased).unwrap();
+        let actual = target.join(aliased.strip_prefix(&alias).unwrap());
+        let alias_handle = directory_handle(&aliased);
+        let actual_handle = directory_handle(&actual);
+        assert!(has_user_only_access(&actual_handle).unwrap());
+        assert_eq!(
+            file_identity(&alias_handle, &alias_handle.metadata().unwrap()).unwrap(),
+            file_identity(&actual_handle, &actual_handle.metadata().unwrap()).unwrap()
+        );
+        // Explicit verbatim names retain their literal trailing dot and space.
+        let literal = ordinary.canonicalize().unwrap().join("literal. ");
+        ensure_private_dir(&literal).unwrap();
+        ensure_private_dir(&literal).unwrap();
+        assert!(has_user_only_access(&directory_handle(&literal)).unwrap());
+        assert!(!ordinary.join("literal").exists());
+        fs::remove_dir(&literal).unwrap();
+        drop((file, alias_handle, actual_handle));
+        remove_owned_tree(&ordinary).unwrap();
+        assert!(!ordinary.exists());
+    }
+
+    #[test]
+    fn private_config_long_directory_refuses_files_and_final_reparse_entries() {
+        use crate::infra::windows_security::{ensure_private_directory, has_user_only_access};
+        let root = tempfile::tempdir().unwrap();
+        let ordinary = ordinary_path(root.path());
+        let target_root = tempfile::tempdir().unwrap();
+        let target = target_root.path();
+        fs::write(target.join("marker"), b"external bytes").unwrap();
+        let target_private = has_user_only_access(&directory_handle(target)).unwrap();
+        assert!(
+            !target_private,
+            "target must retain its inherited ACL for the refusal control"
+        );
+        for kind in ["file", "junction", "symlink"] {
+            let short = ordinary.join(kind);
+            match kind {
+                "file" => fs::write(&short, b"file bytes").unwrap(),
+                "junction" => {
+                    let result = std::process::Command::new("cmd")
+                        .args(["/c", "mklink", "/J"])
+                        .arg(&short)
+                        .arg(target)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        result.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
+                _ => std::os::windows::fs::symlink_dir(target, &short).unwrap(),
+            }
+            assert!(ensure_private_directory(&short).is_err());
+            let long = directory_at_length(&ordinary.join(format!("long-{kind}")), 300);
+            fs::create_dir_all(long.parent().unwrap()).unwrap();
+            fs::rename(&short, &long).unwrap();
+            assert!(ensure_private_directory(&long).is_err(), "{kind}");
+            if kind == "file" {
+                assert_eq!(fs::read(&long).unwrap(), b"file bytes");
+            } else {
+                assert!(
+                    fs::symlink_metadata(&long)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(fs::read(target.join("marker")).unwrap(), b"external bytes");
+                assert_eq!(
+                    has_user_only_access(&directory_handle(target)).unwrap(),
+                    target_private
+                );
+            }
+        }
+        for invalid in [
+            ordinary.join("nul\0suffix"),
+            ordinary.join("bad:name"),
+            ordinary.join("x".repeat(300)),
+        ] {
+            assert!(ensure_private_directory(&invalid).is_err());
+        }
+        remove_owned_tree(&ordinary).unwrap();
+        assert_eq!(fs::read(target.join("marker")).unwrap(), b"external bytes");
     }
 }
