@@ -198,17 +198,27 @@ pub(crate) fn create(target: &Path, link: &Path) -> io::Result<()> {
     create_with_data(link, &junction_data(target)?)
 }
 
+fn check_target(file: &File, expected_target: &Path) -> io::Result<()> {
+    let expected = junction_data(expected_target)?;
+    let current =
+        read_junction(file)?.ok_or_else(|| invalid_data("entry is not a directory junction"))?;
+    if substitute_name(&current)? != substitute_name(&expected)? {
+        return Err(invalid_data("junction target changed before publication"));
+    }
+    Ok(())
+}
+
+/// Check the stored target without the display-path conversion in fs::read_link.
+pub(crate) fn validate_target(link: &Path, expected_target: &Path) -> io::Result<()> {
+    check_target(&open_link(link, false)?, expected_target)
+}
+
 /// Update only a junction still naming the expected absolute target spelling.
 /// Both target paths may be dangling, including projections into the final runtime.
 pub(crate) fn retarget(link: &Path, expected_target: &Path, new_target: &Path) -> io::Result<()> {
-    let expected = junction_data(expected_target)?;
     let replacement = junction_data(new_target)?;
     let file = open_link(link, true)?;
-    let current = read_junction(&file)?
-        .ok_or_else(|| invalid_data("retarget entry is not a directory junction"))?;
-    if substitute_name(&current)? != substitute_name(&expected)? {
-        return Err(invalid_data("junction target changed before retargeting"));
-    }
+    check_target(&file, expected_target)?;
     set_junction(&file, &replacement)
 }
 

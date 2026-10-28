@@ -2693,8 +2693,9 @@ impl CompanionDependencyBindings {
                 .junctions
                 .iter()
                 .map(|(site, source)| {
+                    crate::infra::windows_junction::validate_target(site, source)
+                        .map_err(|error| error.to_string())?;
                     if !site.starts_with(&stage)
-                        || fs::read_link(site).map_err(|error| error.to_string())? != *source
                         || fs::canonicalize(site).map_err(|error| error.to_string())? != *source
                     {
                         return Err(
@@ -4909,13 +4910,13 @@ mod tests {
                     // the final root. Dropping the stage must never follow them.
                     windows_junction::retarget(&first, &source, &final_package).unwrap();
                     assert!(bindings.finalize(&target).is_err());
-                    assert_eq!(std::fs::read_link(&second).unwrap(), source);
+                    windows_junction::validate_target(&second, &source).unwrap();
                 } else {
                     // All validation and projection precedes updates, and uses the
                     // staged identity even while an older final tree exists.
                     bindings.finalize(&target).unwrap();
-                    assert_eq!(std::fs::read_link(&first).unwrap(), final_package);
-                    assert_eq!(std::fs::read_link(&second).unwrap(), final_package);
+                    windows_junction::validate_target(&first, &final_package).unwrap();
+                    windows_junction::validate_target(&second, &final_package).unwrap();
                 }
                 let old_value = target.final_install_root.join("files/package/value");
                 drop(target);
