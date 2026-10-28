@@ -22,7 +22,7 @@ use crate::env::{
 use crate::infra::process::{run_direct, run_shell};
 use crate::infra::process_identity::ProcessIdentity;
 #[cfg(unix)]
-use crate::infra::process_identity::process_start_id;
+use crate::infra::process_identity::{observe_process, process_start_id};
 use crate::infra::shell::{
     build_openclaw_dev_source_env, build_openclaw_env, render_use_script, resolve_activation_shell,
 };
@@ -2105,7 +2105,9 @@ fn current_process_identity(pid: u32) -> Result<Option<EnvDestroyProcessIdentity
     if !process_alive(pid) {
         return Ok(None);
     }
-    Ok(process_start_id(pid)?.map(|started_at| EnvDestroyProcessIdentity { pid, started_at }))
+    Ok(observe_process(pid)?
+        .filter(|process| process.running)
+        .map(|process| process.identity))
 }
 
 #[cfg(unix)]

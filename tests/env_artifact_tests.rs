@@ -350,6 +350,8 @@ fn artifact_export_detects_source_changes_and_failed_output() {
         (true, b"original".as_slice()),
     ] {
         let file = fixture.write("changing", b"original");
+        // Keep same-size mutations observable even within one filesystem clock tick.
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(0, 0)).unwrap();
         let mut output = ChangingOutput {
             file: &file,
             replace,
