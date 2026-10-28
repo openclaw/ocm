@@ -250,6 +250,11 @@ Repeat `--companion <plugin-id>` when the checkout contains an official plugin t
 
 On Windows, companion verification recognizes native separators in generated runtime records. It still requires a relative path within the selected companion and checks package metadata, file existence, and entrypoint integrity.
 
+On Windows, internal package junctions remain bound to the prepared installation
+until commit, then move with the published runtime. Integrity metadata covers the
+published link targets. Runtime recovery checks saved package bytes independently
+of the current installation and preserves the recorded bindings for restoration.
+
 The installed runtime uses the same package layout as published OpenClaw runtimes:
 
 ```text

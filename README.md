@@ -93,6 +93,9 @@ Inside this repo, use the development wrapper:
 Published OpenClaw release flows prefer host Node.js and npm when Node satisfies the selected package's `engines.node` requirement.
 OCM checks the verified package before installation and the installed manifest before ordinary execution.
 Windows invokes installed OpenClaw package entrypoints through the selected Node.js executable, preserving the forwarded arguments and environment.
+Native Windows package junctions remain usable while an installation is prepared
+and are relocated when its runtime is published. Runtime backups preserve those
+links and validate their saved package bytes independently of the current install.
 On supported platforms, OCM can manage a private Node.js 24.22.1 copy when the host tools are missing or incompatible.
 OCM reuses only the selected private Node.js version after checking the executable. Older private caches must be refreshed with `ocm start` or `ocm runtime install --channel stable` before offline launches.
 Packages without `engines.node` retain the legacy baseline of Node.js `22.22.3+`, `24.15.0+`, or `25.9.0+`.

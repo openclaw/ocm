@@ -17,6 +17,8 @@ pub(crate) mod sqlite_snapshot;
 pub mod terminal;
 pub(crate) mod tree_digest;
 #[cfg(windows)]
+pub(crate) mod windows_junction;
+#[cfg(windows)]
 pub(crate) mod windows_runtime_stage;
 #[cfg(windows)]
 pub(crate) mod windows_security;
