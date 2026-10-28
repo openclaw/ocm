@@ -135,12 +135,6 @@ jobs:
             cargo test --locked --test windows_runtime_publication_tests -- --nocapture
             if ($LASTEXITCODE -ne 0) { throw 'native runtime publication failed' }
           }
-      - name: Prove native Windows companion dependency bindings
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          pwsh -NoProfile -Command '$ErrorActionPreference = "Stop"; . ./tests/support/windows_without_symlinks.ps1; Invoke-WithoutDeveloperSymlinks { cargo test --locked --test windows_companion_bindings_tests native_windows_companion_without_symlink_privilege -- --exact --nocapture; if ($LASTEXITCODE -ne 0) { throw "native linked companion comparison failed" } }'
-          if ($LASTEXITCODE -ne 0) { throw 'native companion regression failed' }
       - name: Prove native Windows installed runtime launch
         timeout-minutes: 5
         shell: pwsh
@@ -159,6 +153,19 @@ jobs:
         run: |
           cargo test --locked --test windows_runtime_pack_tests native_windows_pack_preserves_live_child_archive -- --exact --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # npm 11 preserves outside-root file directory links in its linked layout.
+      # Keep the preceding native Windows checks on their existing Node 22 runtime.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.22.1'
+          package-manager-cache: false
+      - name: Prove native Windows companion dependency bindings
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -Command '$ErrorActionPreference = "Stop"; . ./tests/support/windows_without_symlinks.ps1; Invoke-WithoutDeveloperSymlinks { cargo test --locked --test windows_companion_bindings_tests native_windows_companion_without_symlink_privilege -- --exact --nocapture; if ($LASTEXITCODE -ne 0) { throw "native linked companion comparison failed" } }'
+          if ($LASTEXITCODE -ne 0) { throw 'native companion regression failed' }
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
