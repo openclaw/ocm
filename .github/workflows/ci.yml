@@ -118,6 +118,59 @@ jobs:
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
+      - name: Capture isolated R11 explicit rollback diagnostic
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 751
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $area = Join-Path $env:RUNNER_TEMP ('r11-diag-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          New-Item -ItemType Directory -Path $area | Out-Null
+          $source = Join-Path $area 'source'
+          git fetch --depth=1 origin 7228ef7d30eeba90678c8589af3f458b8b0fafc6
+          if ($LASTEXITCODE -ne 0) { throw 'R11 diagnostic source fetch failed' }
+          git worktree add --detach $source 7228ef7d30eeba90678c8589af3f458b8b0fafc6
+          if ($LASTEXITCODE -ne 0) { throw 'R11 diagnostic checkout failed' }
+          $patch = Join-Path $area 'native-diagnostic.patch'
+          [IO.File]::WriteAllBytes($patch, [Convert]::FromBase64String('LS0tIGEvdGVzdHMvd2luZG93c19ydW50aW1lX3B1YmxpY2F0aW9uX3Rlc3RzLnJzCisrKyBiL3Rlc3RzL3dpbmRvd3NfcnVudGltZV9wdWJsaWNhdGlvbl90ZXN0cy5ycwpAQCAtMTI3LDcgKzEyNywxNSBAQAogICAgIH0KIAogICAgIGZuIG9jbSgmc2VsZiwgYXJnczogJlsmc3RyXSkgLT4gT3V0cHV0IHsKLSAgICAgICAgcnVuX29jbShzZWxmLnJvb3QucGF0aCgpLCAmc2VsZi5lbnYsIGFyZ3MpCisgICAgICAgIGxldCBvdXRwdXQgPSBydW5fb2NtKHNlbGYucm9vdC5wYXRoKCksICZzZWxmLmVudiwgYXJncyk7CisgICAgICAgIHByaW50bG4hKAorICAgICAgICAgICAgIm5hdGl2ZSByZWNlaXB0IHt9IiwKKyAgICAgICAgICAgIGpzb24hKHsKKyAgICAgICAgICAgICAgICAiZXhlY3V0YWJsZSI6IHN1cHBvcnQ6Om9jbV90ZXN0X2JpbmFyeV9wYXRoKCksICJhcmd2IjogYXJncywKKyAgICAgICAgICAgICAgICAiZXhpdCI6IG91dHB1dC5zdGF0dXMuY29kZSgpLCAic3Rkb3V0Ijogc3Rkb3V0KCZvdXRwdXQpLCAic3RkZXJyIjogc3RkZXJyKCZvdXRwdXQpLAorICAgICAgICAgICAgfSkKKyAgICAgICAgKTsKKyAgICAgICAgb3V0cHV0CiAgICAgfQogCiAgICAgZm4gb2soJnNlbGYsIGFyZ3M6ICZbJnN0cl0pIC0+IFN0cmluZyB7CkBAIC01NDcsNyArNTU1LDE0IEBACiAgICAgZml4dHVyZS5hc3NlcnRfcnVudGltZSgic3RhYmxlIiwgT0xELCB0cnVlKTsKICAgICBmaXh0dXJlLmFzc2VydF9iaW5kaW5nKCJkZW1vIiwgInN0YWJsZSIsIE9MRCk7CiAgICAgYXNzZXJ0X2VxIShmczo6cmVhZF90b19zdHJpbmcoJm1hcmtlcikudW53cmFwKCksICJiZWZvcmUtdXBncmFkZSIpOwotICAgIGFzc2VydCEoIXJlY292ZXJ5LmV4aXN0cygpKTsKKyAgICBwcmludGxuISgKKyAgICAgICAgInJvbGxiYWNrIGNsZWFudXAgcmVjZWlwdCB7fSIsCisgICAgICAgIGpzb24hKHsKKyAgICAgICAgICAgICJyb2xsYmFjayI6IHJvbGxiYWNrLCAicmVjb3ZlcnkiOiByZWNvdmVyeSwKKyAgICAgICAgICAgICJyZW1haW5pbmciOiBmczo6cmVhZF9kaXIoJnJlY292ZXJ5KS5tYXAofGl0ZW1zfCBpdGVtcy5tYXAofGl0ZW18IGl0ZW0udW53cmFwKCkuZmlsZV9uYW1lKCkpLmNvbGxlY3Q6OjxWZWM8Xz4+KCkpLm9rKCksCisgICAgICAgIH0pCisgICAgKTsKKyAgICBhc3NlcnQhKCFyZWNvdmVyeS5leGlzdHMoKSwgInJvbGxiYWNrIGNsZWFudXAgcmVjZWlwdDoge3JvbGxiYWNrfSIpOwogICAgIGxldCByZXZlcnNlID0gZml4dHVyZS5qc29uKCZbInVwZ3JhZGUiLCAicm9sbGJhY2siLCAiZGVtbyIsICItLWpzb24iXSk7CiAgICAgYXNzZXJ0X2VxIShyZXZlcnNlWyJvdXRjb21lIl0sICJyb2xsZWQtYmFjayIsICJ7cmV2ZXJzZX0iKTsKICAgICBmaXh0dXJlLmFzc2VydF9ydW50aW1lKCJzdGFibGUiLCBORVcsIHRydWUpOwo='))
+          if ((Get-FileHash $patch -Algorithm SHA256).Hash -ne '6304e62ed1b89403ab7c30d69db2274be5a83d9cd38217706e9865771e375202') {
+            throw 'R11 diagnostic patch checksum mismatch'
+          }
+          $previousTarget = $env:CARGO_TARGET_DIR
+          Push-Location $source
+          try {
+            $env:CARGO_TARGET_DIR = Join-Path $area 'target'
+            git rev-parse HEAD 'HEAD^{tree}'
+            if ((git rev-parse 'HEAD^{tree}') -ne 'a65bf6bf93cb53067b31150ed2df9ae28a0d80d5') { throw 'R11 product tree mismatch' }
+            node --version
+            npm --version
+            if ((node --version) -ne 'v22.23.4' -or (npm --version) -ne '10.9.9') { throw 'R11 diagnostic tool version mismatch' }
+            git apply --check $patch
+            if ($LASTEXITCODE -ne 0) { throw 'R11 diagnostic patch does not apply' }
+            git apply $patch
+            if ($LASTEXITCODE -ne 0) { throw 'R11 diagnostic patch failed' }
+            git add -- tests/windows_runtime_publication_tests.rs
+            git diff --cached --stat
+            git write-tree
+            Get-FileHash tests/windows_runtime_publication_tests.rs -Algorithm SHA256
+            cargo build --locked
+            if ($LASTEXITCODE -ne 0) { throw 'R11 diagnostic product build failed' }
+            Get-FileHash (Join-Path $env:CARGO_TARGET_DIR 'debug/ocm.exe') -Algorithm SHA256
+            . ./tests/support/windows_without_symlinks.ps1
+            Invoke-WithoutDeveloperSymlinks {
+              cargo test --locked --test windows_runtime_publication_tests native_windows_in_place_upgrade_validates_retained_linked_bytes_and_rolls_back -- --exact --nocapture
+              $captureExit = $LASTEXITCODE
+              Get-FileHash (Join-Path $env:CARGO_TARGET_DIR 'debug/ocm.exe') -Algorithm SHA256
+              Write-Output "R11 isolated explicit rollback diagnostic exit=$captureExit"
+              if ($captureExit -ne 0) { throw 'R11 explicit rollback diagnostic retained its failure' }
+            }
+          } finally {
+            $env:CARGO_TARGET_DIR = $previousTarget
+            Pop-Location
+          }
       - name: Prove native Windows bundled-reader identity
         if: github.event_name == 'pull_request' && github.event.pull_request.number == 751
         timeout-minutes: 30

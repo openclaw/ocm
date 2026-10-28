@@ -67,7 +67,7 @@ function writePackage(directory, manifest, entry) {
 
 function treeSnapshot(directory, allowLinks = false) {
   const files = {};
-  const rootReal = fs.realpathSync(directory);
+  const rootReal = fs.realpathSync.native(directory);
   function visit(current) {
     for (const name of fs.readdirSync(current).sort()) {
       const file = path.join(current, name);
@@ -75,7 +75,7 @@ function treeSnapshot(directory, allowLinks = false) {
       const relative = path.relative(directory, file);
       if (stat.isSymbolicLink()) {
         assert.ok(allowLinks, `Unexpected source link: ${file}`);
-        const resolved = path.relative(rootReal, fs.realpathSync(file));
+        const resolved = path.relative(rootReal, fs.realpathSync.native(file));
         assert.ok(!path.isAbsolute(resolved) && resolved !== '..'
           && !resolved.startsWith(`..${path.sep}`), `Runtime link escaped its published tree: ${file}`);
         files[relative] = {link: fs.readlinkSync(file)};
