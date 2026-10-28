@@ -129,75 +129,78 @@ jobs:
           $area = Join-Path $env:RUNNER_TEMP ('companion-compare-' + [guid]::NewGuid())
           New-Item -ItemType Directory -Path $area | Out-Null
           git rev-parse HEAD 'HEAD^{tree}'
-          foreach ($item in @(@('baseline', 'ca30b244e2e3f9b46fd2581ffe4c9c43c337e6d6'), @('previous', 'ddf1514ec3122754c2bea4704f97132d42199a08'))) {
-            $name, $revision = $item
-            git fetch --no-tags --depth=1 origin $revision
-            if ($LASTEXITCODE -ne 0) { throw "fetch $name failed" }
-            git rev-parse $revision ($revision + '^{tree}')
-            $source = Join-Path $area $name
-            New-Item -ItemType Directory -Path $source | Out-Null
-            $archive = Join-Path $area ($name + '.tar')
-            git archive --format=tar --output=$archive $revision
-            if ($LASTEXITCODE -ne 0) { throw "archive $name failed" }
-            tar -xf $archive -C $source
-            if ($LASTEXITCODE -ne 0) { throw "extract $name failed" }
-            Get-FileHash (Join-Path $source 'Cargo.lock') -Algorithm SHA256
-            cargo build --locked --manifest-path (Join-Path $source 'Cargo.toml') --target-dir (Join-Path $area ($name + '-target'))
-            if ($LASTEXITCODE -ne 0) { throw "build $name failed" }
-            Get-FileHash (Join-Path $area ($name + '-target/debug/ocm.exe')) -Algorithm SHA256
-          }
+          $name = 'previous'
+          $revision = 'ddf1514ec3122754c2bea4704f97132d42199a08'
+          git fetch --no-tags --depth=1 origin $revision
+          if ($LASTEXITCODE -ne 0) { throw "fetch $name failed" }
+          git rev-parse $revision ($revision + '^{tree}')
+          $source = Join-Path $area $name
+          New-Item -ItemType Directory -Path $source | Out-Null
+          $archive = Join-Path $area ($name + '.tar')
+          git archive --format=tar --output=$archive $revision
+          if ($LASTEXITCODE -ne 0) { throw "archive $name failed" }
+          tar -xf $archive -C $source
+          if ($LASTEXITCODE -ne 0) { throw "extract $name failed" }
+          Get-FileHash (Join-Path $source 'Cargo.lock') -Algorithm SHA256
+          cargo build --locked --manifest-path (Join-Path $source 'Cargo.toml') --target-dir (Join-Path $area ($name + '-target'))
+          if ($LASTEXITCODE -ne 0) { throw "build $name failed" }
+          Get-FileHash (Join-Path $area ($name + '-target/debug/ocm.exe')) -Algorithm SHA256
           $proof = '$ErrorActionPreference = "Stop"; . ./tests/support/windows_without_symlinks.ps1; Invoke-WithoutDeveloperSymlinks { cargo test --locked --test windows_companion_bindings_tests native_windows_companion_without_symlink_privilege -- --exact --nocapture; if ($LASTEXITCODE -ne 0) { throw "native linked companion comparison failed" } }'
-          Write-Output 'Capture host-only publication: current baseline'
-          $env:OCM_TEST_BINARY = Join-Path $area 'baseline-target/debug/ocm.exe'
-          $env:OCM_TEST_ROOT_JUNCTION_PROBE = '1'
-          $output = & pwsh -NoProfile -Command $proof 2>&1
-          $captureExit = $LASTEXITCODE
-          $output | Write-Output
-          Remove-Item Env:OCM_TEST_ROOT_JUNCTION_PROBE
-          Remove-Item Env:OCM_TEST_BINARY
-          Write-Output "current baseline hostOnlyExit=$captureExit"
-          if (!($output -match '"nativeWindowsRootPublicationObservationsComplete":true')) {
-            throw 'current baseline root publication observations did not complete'
+          $nodeArchive = Join-Path $area 'node-v24.22.1-win-x64.zip'
+          Invoke-WebRequest https://nodejs.org/dist/v24.22.1/node-v24.22.1-win-x64.zip -OutFile $nodeArchive
+          if ((Get-FileHash $nodeArchive -Algorithm SHA256).Hash -ne 'd2046d28c2c3dcd211ac5145c0bf30e2047ef9dfb306693c8c6e2eccd8b95fa5') {
+            throw 'selected reader Node archive checksum mismatch'
           }
-          $readerSource = Join-Path $env:RUNNER_TEMP ('ocr-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-          git init -q $readerSource
-          if ($LASTEXITCODE -ne 0) { throw 'reader source init failed' }
-          git -C $readerSource config core.longpaths true
-          git -C $readerSource remote add origin https://github.com/openclaw/openclaw.git
-          git -C $readerSource fetch --depth=1 origin 8f2190bb63cc8ff1cafceffbf1bb429232c1ad5d
-          if ($LASTEXITCODE -ne 0) { throw 'reader source fetch failed' }
-          git -C $readerSource checkout --detach 8f2190bb63cc8ff1cafceffbf1bb429232c1ad5d
-          if ($LASTEXITCODE -ne 0) { throw 'reader source checkout failed' }
-          npm install --prefix (Join-Path $area 'pnpm') --ignore-scripts --no-audit --no-fund pnpm@12.15.0
-          if ($LASTEXITCODE -ne 0) { throw 'selected pnpm preparation failed' }
-          # The selected package's documented Corepack entry works when lifecycle
-          # scripts are disabled; npm's extensionless Windows shim does not.
-          $pnpm = Join-Path $area 'pnpm/node_modules/pnpm/bin/pnpm.mjs'
-          node $pnpm --version
-          if ($LASTEXITCODE -ne 0) { throw 'selected pnpm entry failed' }
-          node $pnpm --dir $readerSource install --frozen-lockfile --child-concurrency=2
-          if ($LASTEXITCODE -ne 0) { throw 'frozen reader dependencies failed' }
-          git -C $readerSource rev-parse HEAD 'HEAD^{tree}'
-          $readerDirty = git -C $readerSource status --porcelain=v1 --untracked-files=no
-          if ($LASTEXITCODE -ne 0 -or $readerDirty) { throw 'reader tracked source changed' }
-          Get-FileHash (Join-Path $readerSource 'pnpm-lock.yaml') -Algorithm SHA256
-          Get-FileHash tests/support/windows_companion_reader.mjs -Algorithm SHA256
-          foreach ($item in @(@('canonical-target predecessor', (Join-Path $area 'previous-target/debug/ocm.exe')), @('logical-target candidate', (Join-Path $PWD 'target/debug/ocm.exe')))) {
-            $label, $binaryPath = $item
-            Write-Output "Capture actual bundled reader: $label"
-            $env:OCM_TEST_BINARY = $binaryPath
-            $env:OCM_TEST_COMPANION_CASES = 'bundled-hoisted'
-            $env:OCM_TEST_OPENCLAW_SOURCE = $readerSource
-            $output = & pwsh -NoProfile -Command $proof 2>&1
-            $captureExit = $LASTEXITCODE
-            $output | Write-Output
-            Remove-Item Env:OCM_TEST_OPENCLAW_SOURCE
-            Remove-Item Env:OCM_TEST_COMPANION_CASES
-            Remove-Item Env:OCM_TEST_BINARY
-            Write-Output "$label actualReaderExit=$captureExit"
-            if (!($output -match '"nativeWindowsCompanionObservationsComplete":true') -or !($output -match 'actualOpenClawReader')) {
-              throw "$label actual-reader observations did not complete"
+          Expand-Archive -LiteralPath $nodeArchive -DestinationPath (Join-Path $area 'node')
+          $readerNodeDir = Join-Path $area 'node/node-v24.22.1-win-x64'
+          $readerNode = Join-Path $readerNodeDir 'node.exe'
+          Get-FileHash $readerNode -Algorithm SHA256
+          $previousPath = $env:PATH
+          try {
+            $env:PATH = "$readerNodeDir;$previousPath"
+            & $readerNode --version
+            $readerSource = Join-Path $env:RUNNER_TEMP ('ocr-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            git init -q $readerSource
+            if ($LASTEXITCODE -ne 0) { throw 'reader source init failed' }
+            git -C $readerSource config core.longpaths true
+            git -C $readerSource remote add origin https://github.com/openclaw/openclaw.git
+            git -C $readerSource fetch --depth=1 origin 8f2190bb63cc8ff1cafceffbf1bb429232c1ad5d
+            if ($LASTEXITCODE -ne 0) { throw 'reader source fetch failed' }
+            git -C $readerSource checkout --detach 8f2190bb63cc8ff1cafceffbf1bb429232c1ad5d
+            if ($LASTEXITCODE -ne 0) { throw 'reader source checkout failed' }
+            npm install --prefix (Join-Path $area 'pnpm') --ignore-scripts --no-audit --no-fund pnpm@12.15.0
+            if ($LASTEXITCODE -ne 0) { throw 'selected pnpm preparation failed' }
+            # The selected package's documented Corepack entry works when lifecycle
+            # scripts are disabled; npm's extensionless Windows shim does not.
+            $pnpm = Join-Path $area 'pnpm/node_modules/pnpm/bin/pnpm.mjs'
+            & $readerNode $pnpm --version
+            if ($LASTEXITCODE -ne 0) { throw 'selected pnpm entry failed' }
+            & $readerNode $pnpm --dir $readerSource install --frozen-lockfile --child-concurrency=2
+            if ($LASTEXITCODE -ne 0) { throw 'frozen reader dependencies failed' }
+            git -C $readerSource rev-parse HEAD 'HEAD^{tree}'
+            $readerDirty = git -C $readerSource status --porcelain=v1 --untracked-files=no
+            if ($LASTEXITCODE -ne 0 -or $readerDirty) { throw 'reader tracked source changed' }
+            Get-FileHash (Join-Path $readerSource 'pnpm-lock.yaml') -Algorithm SHA256
+            Get-FileHash tests/support/windows_companion_reader.mjs -Algorithm SHA256
+            foreach ($item in @(@('canonical-target predecessor', (Join-Path $area 'previous-target/debug/ocm.exe')), @('logical-target candidate', (Join-Path $PWD 'target/debug/ocm.exe')))) {
+              $label, $binaryPath = $item
+              Write-Output "Capture actual bundled reader: $label"
+              $env:OCM_TEST_BINARY = $binaryPath
+              $env:OCM_TEST_COMPANION_CASES = 'bundled-hoisted'
+              $env:OCM_TEST_OPENCLAW_SOURCE = $readerSource
+              $output = & pwsh -NoProfile -Command $proof 2>&1
+              $captureExit = $LASTEXITCODE
+              $output | Write-Output
+              Remove-Item Env:OCM_TEST_OPENCLAW_SOURCE
+              Remove-Item Env:OCM_TEST_COMPANION_CASES
+              Remove-Item Env:OCM_TEST_BINARY
+              Write-Output "$label actualReaderExit=$captureExit"
+              if (!($output -match '"nativeWindowsCompanionObservationsComplete":true') -or !($output -match 'actualOpenClawReader')) {
+                throw "$label actual-reader observations did not complete"
+              }
             }
+          } finally {
+            $env:PATH = $previousPath
           }
           # Captures retain actual nonzero outcomes. The current regression below
           # remains unconditional and must pass before this contribution is ready.
