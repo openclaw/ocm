@@ -2159,3 +2159,93 @@ fn env_destroy_refuses_to_issue_a_guard_when_process_inspection_fails() {
     assert!(stdout(&preview).is_empty());
     assert!(stderr(&preview).contains("failed to inspect running processes"));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn env_destroy_does_not_signal_a_process_observed_exited_after_the_live_check() {
+    use std::io::Write;
+
+    let root = TestDir::new("env-destroy-exited-observation");
+    let mut env = ocm_env(&root);
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "unsupported".into());
+    let created = run_ocm(root.path(), &env, &["env", "create", "demo"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let env_root = root.child("ocm-home/envs/demo");
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "read line; exit 0"])
+        .current_dir(&env_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let live = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .unwrap();
+    assert!(live.status.success());
+    let live_status = String::from_utf8(live.stdout).unwrap();
+    assert!(!live_status.trim().is_empty() && !live_status.contains('Z'));
+    child.stdin.take().unwrap().write_all(b"exit\n").unwrap();
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let waited =
+        unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+    assert_eq!(waited, 0);
+
+    // Replay the earlier live process-table/liveness observations while the
+    // canonical proc observation sees a real unreaped zombie. No shared PATH
+    // mutation: only this isolated CLI receives these external command fixtures.
+    let bin = root.child("stale-ps-bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_executable_script(
+        &bin.join("ps"),
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = -axo ]; then
+  echo '{pid} {} node {}/openclaw.mjs'
+elif [ "$1" = -p ] && [ "$2" = {pid} ]; then
+  printf '%s' '{}'
+else
+  exec /bin/ps "$@"
+fi
+"#,
+            std::process::id(),
+            path_string(&env_root),
+            live_status
+        ),
+    );
+    let signals = root.child("signals.log");
+    write_executable_script(
+        &bin.join("kill"),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+exec /bin/kill "$@"
+"#,
+            path_string(&signals)
+        ),
+    );
+    prepend_fake_bin(&mut env, &bin);
+    let destroy = run_ocm(
+        root.path(),
+        &env,
+        &["env", "destroy", "demo", "--yes", "--json"],
+    );
+    let reaped = child.wait().unwrap();
+    assert!(reaped.success());
+    let signal_log = fs::read_to_string(signals).unwrap_or_default();
+    assert!(
+        signal_log.contains("-0"),
+        "liveness boundary was not exercised: {}",
+        stderr(&destroy)
+    );
+    assert!(
+        !signal_log.contains("-TERM") && !signal_log.contains("-KILL"),
+        "signaled an observed exited process: {signal_log}"
+    );
+    assert!(
+        env_root.exists(),
+        "stale inventory must leave the installation recoverable"
+    );
+}

@@ -259,6 +259,11 @@ pub(crate) fn observe_process(pid: u32) -> Result<Option<ProcessObservation>, St
             ));
         }
     };
+    parse_linux_process_stat(pid, &stat).map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_stat(pid: u32, stat: &str) -> Result<ProcessObservation, String> {
     let Some((_, fields)) = stat.rsplit_once(')') else {
         return Err(format!(
             "failed to parse process start identity for pid {pid}"
@@ -268,19 +273,25 @@ pub(crate) fn observe_process(pid: u32) -> Result<Option<ProcessObservation>, St
     let started_at = fields
         .get(19)
         .ok_or_else(|| format!("failed to parse process start identity for pid {pid}"))?;
-    let process_group = fields
-        .get(2)
-        .and_then(|value| value.parse::<u32>().ok())
-        .ok_or_else(|| format!("failed to parse process group for pid {pid}"))?;
-    Ok(Some(ProcessObservation {
+    // Linux can emit -1 after task release clears sighand. Its state was
+    // sampled earlier, so that state cannot grant liveness or group authority.
+    let process_group = match fields.get(2).copied() {
+        Some("-1") => None,
+        field => Some(
+            field
+                .and_then(|value| value.parse::<u32>().ok())
+                .ok_or_else(|| format!("failed to parse process group for pid {pid}"))?,
+        ),
+    };
+    Ok(ProcessObservation {
         identity: ProcessIdentity {
             pid,
             started_at: (*started_at).to_string(),
         },
-        running: !matches!(fields.first().copied(), Some("Z" | "X")),
-        stopped: matches!(fields.first().copied(), Some("T" | "t")),
-        process_group: Some(process_group),
-    }))
+        running: process_group.is_some() && !matches!(fields.first().copied(), Some("Z" | "X")),
+        stopped: process_group.is_some() && matches!(fields.first().copied(), Some("T" | "t")),
+        process_group,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -413,5 +424,52 @@ mod tests {
         assert_eq!(observed.identity.pid, pid);
         assert!(!observed.running);
         assert!(!observed.stopped);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::{ProcessIdentity, parse_linux_process_stat};
+
+    // Captured from Ubuntu 6.8.0-147 while an owned child was reaped. State is
+    // sampled before sighand locking, so the released group can follow live state.
+    const RELEASED_STAT: &str = "39629 (ocm-exit-probe) X 0 -1 -1 0 -1 4227148 22 0 0 0 0 0 0 0 20 0 0 0 48761 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 17 2 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+
+    #[test]
+    fn linux_stat_distinguishes_released_tasks_from_live_groups() {
+        for state in ["X", "Z", "R", "S", "T", "t"] {
+            let stat = RELEASED_STAT.replace(") X ", &format!(") {state} "));
+            let observed = parse_linux_process_stat(39629, &stat).unwrap();
+            assert_eq!(
+                observed.identity,
+                ProcessIdentity {
+                    pid: 39629,
+                    started_at: "48761".into()
+                }
+            );
+            assert!(!observed.running, "{state}");
+            assert!(!observed.stopped, "{state}");
+            assert_eq!(observed.process_group, None, "{state}");
+        }
+        for (state, running, stopped) in
+            [("R", true, false), ("T", true, true), ("Z", false, false)]
+        {
+            let stat = RELEASED_STAT.replace(") X 0 -1 ", &format!(") {state} 0 42 "));
+            let observed = parse_linux_process_stat(39629, &stat).unwrap();
+            assert_eq!(observed.process_group, Some(42));
+            assert_eq!(observed.running, running);
+            assert_eq!(observed.stopped, stopped);
+        }
+    }
+
+    #[test]
+    fn linux_stat_keeps_invalid_group_values_as_errors() {
+        for group in ["-2", "-01", "4294967296", "invalid"] {
+            let stat = RELEASED_STAT.replace(") X 0 -1 ", &format!(") X 0 {group} "));
+            assert_eq!(
+                parse_linux_process_stat(39629, &stat).err().as_deref(),
+                Some("failed to parse process group for pid 39629")
+            );
+        }
     }
 }
