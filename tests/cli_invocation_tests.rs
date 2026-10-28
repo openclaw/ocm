@@ -263,6 +263,218 @@ fn closed_stdout_terminates_quietly() {
 }
 
 #[cfg(unix)]
+fn native_log_fixture(
+    root: &TestDir,
+    lines: usize,
+) -> (
+    std::path::PathBuf,
+    std::collections::BTreeMap<String, String>,
+) {
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(root);
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+    env.insert("OCM_SELF".into(), env!("CARGO_BIN_EXE_ocm").into());
+    crate::support::install_fake_launchctl(root, &mut env);
+    let count = root.child("count");
+    fs::write(&count, lines.to_string()).unwrap();
+    env.insert("OCM_TEST_LOG_COUNT".into(), count.to_str().unwrap().into());
+    let launcher = root.child("log-producer");
+    write_executable_script(
+        &launcher,
+        r#"#!/bin/sh
+count=$(cat "$OCM_TEST_LOG_COUNT")
+i=0
+while [ "$i" -lt "$count" ]; do
+  printf 'native stdout record %08d payload payload payload payload\n' "$i"
+  printf 'native stderr record %08d payload payload payload payload\n' "$i" >&2
+  i=$((i + 1))
+done
+"#,
+    );
+    for args in [
+        vec![
+            "launcher",
+            "add",
+            "fixture",
+            "--command",
+            launcher.to_str().unwrap(),
+        ],
+        vec!["env", "create", "demo", "--launcher", "fixture"],
+        vec!["service", "start", "demo"],
+        vec!["__daemon", "run", "--once"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+    (cwd, env)
+}
+
+#[cfg(unix)]
+struct LogReader(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for LogReader {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+impl LogReader {
+    fn assert_quiet_success(&mut self) {
+        use std::io::Read;
+        let status = wait_with_deadline(&mut self.0);
+        let mut errors = String::new();
+        self.0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut errors)
+            .unwrap();
+        assert!(status.success(), "{status}: {errors}");
+        assert!(errors.is_empty(), "{errors}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn logs_with_closed_stdout_terminate_quietly() {
+    let root = TestDir::new("logs-closed-stdout");
+    let (cwd, env) = native_log_fixture(&root, 20000);
+    for stream in [vec![], vec!["--stream", "info"], vec!["--stream", "error"]] {
+        for mode in [vec!["--raw"], vec!["--color", "always"], vec!["--json"]] {
+            for follow in [false, true] {
+                if follow && mode == ["--json"] {
+                    continue;
+                }
+                let mut args = vec!["logs", "demo", "--tail", "20000"];
+                args.extend_from_slice(&stream);
+                args.extend_from_slice(&mode);
+                if follow {
+                    args.push("--follow");
+                }
+                let (reader, writer) = UnixStream::pair().unwrap();
+                drop(reader);
+                let mut child = LogReader(
+                    Command::new(env!("CARGO_BIN_EXE_ocm"))
+                        .current_dir(&cwd)
+                        .env_clear()
+                        .envs(&env)
+                        .args(&args)
+                        .stdout(Stdio::from(OwnedFd::from(writer)))
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap(),
+                );
+                child.assert_quiet_success();
+            }
+        }
+        let mut args = vec!["logs", "demo", "--tail", "20000", "--raw"];
+        args.extend_from_slice(&stream);
+        let drained = run_ocm(&cwd, &env, &args);
+        assert!(drained.status.success(), "{}", stderr(&drained));
+        assert!(drained.stderr.is_empty());
+        assert_eq!(stdout(&drained).lines().count(), 20000);
+    }
+
+    // A closed output must not hide a genuine read failure before output starts.
+    let source = root.child("ocm-home/supervisor/logs/demo.stdout.log");
+    fs::remove_file(&source).unwrap();
+    fs::create_dir(&source).unwrap();
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_ocm"))
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(&env)
+        .args(["logs", "demo", "--stream", "info", "--raw"])
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn logs_follow_exits_when_consumer_closes_after_initial_output() {
+    use std::io::{BufRead, BufReader};
+    for stream in [vec![], vec!["--stream", "info"], vec!["--stream", "error"]] {
+        for mode in [vec!["--raw"], vec!["--color", "always"]] {
+            let root = TestDir::new("logs-late-closed-stdout");
+            let (cwd, env) = native_log_fixture(&root, 1);
+            let (reader, writer) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .unwrap();
+            let mut args = vec!["logs", "demo", "--follow"];
+            args.extend_from_slice(&stream);
+            args.extend_from_slice(&mode);
+            let mut child = LogReader(
+                Command::new(env!("CARGO_BIN_EXE_ocm"))
+                    .current_dir(&cwd)
+                    .env_clear()
+                    .envs(&env)
+                    .args(&args)
+                    .stdout(Stdio::from(OwnedFd::from(writer)))
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut reader = BufReader::new(reader);
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line.contains("native ") {
+                    break;
+                }
+            }
+            // EOF on stdout alone does not wake a follower. The next native
+            // child run supplies the write that observes the closed consumer.
+            drop(reader);
+            fs::write(root.child("count"), "20000").unwrap();
+            let next = run_ocm(&cwd, &env, &["__daemon", "run", "--once"]);
+            assert!(next.status.success(), "{}", stderr(&next));
+            child.assert_quiet_success();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn logs_preserve_non_broken_pipe_output_failures() {
+    let root = TestDir::new("logs-full-stdout");
+    let (cwd, env) = native_log_fixture(&root, 1);
+    for args in [
+        vec!["logs", "demo", "--raw"],
+        vec!["logs", "demo", "--raw", "--follow"],
+        vec!["logs", "demo", "--color", "always", "--follow"],
+        vec!["logs", "demo", "--json"],
+    ] {
+        let mut child = LogReader(
+            Command::new(env!("CARGO_BIN_EXE_ocm"))
+                .current_dir(&cwd)
+                .env_clear()
+                .envs(&env)
+                .args(&args)
+                .stdout(
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open("/dev/full")
+                        .unwrap(),
+                )
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        assert!(!wait_with_deadline(&mut child.0).success(), "{args:?}");
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn closed_stderr_preserves_command_failure() {
     let (reader, writer) = UnixStream::pair().unwrap();

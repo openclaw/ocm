@@ -746,6 +746,11 @@ ocm logs mira --stream error
 ocm logs mira --follow
 ```
 
+Log output can be piped to a reader such as `head -n 1`. When that reader closes
+its input, snapshots and followers terminate quietly with success, including
+in shells using `set -o pipefail`. A follower detects closure when it next writes
+output. Log read failures and other output errors still fail the command.
+
 `logs` reads the newer of the env's own Gateway log and the background service
 child log. A single-stream follow such as `ocm logs mira --stream error --follow`
 started before either file exists waits for both and follows whichever appears
