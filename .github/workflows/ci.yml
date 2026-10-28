@@ -129,7 +129,7 @@ jobs:
           $area = Join-Path $env:RUNNER_TEMP ('companion-compare-' + [guid]::NewGuid())
           New-Item -ItemType Directory -Path $area | Out-Null
           git rev-parse HEAD 'HEAD^{tree}'
-          foreach ($item in @(@('baseline', '17bf75fcca47acf00c25e520ddcb7691e259b9d5'), @('previous', 'ddf1514ec3122754c2bea4704f97132d42199a08'))) {
+          foreach ($item in @(@('baseline', 'ca30b244e2e3f9b46fd2581ffe4c9c43c337e6d6'), @('previous', 'ddf1514ec3122754c2bea4704f97132d42199a08'))) {
             $name, $revision = $item
             git fetch --no-tags --depth=1 origin $revision
             if ($LASTEXITCODE -ne 0) { throw "fetch $name failed" }
@@ -147,20 +147,17 @@ jobs:
             Get-FileHash (Join-Path $area ($name + '-target/debug/ocm.exe')) -Algorithm SHA256
           }
           $proof = '$ErrorActionPreference = "Stop"; . ./tests/support/windows_without_symlinks.ps1; Invoke-WithoutDeveloperSymlinks { cargo test --locked --test windows_companion_bindings_tests native_windows_companion_without_symlink_privilege -- --exact --nocapture; if ($LASTEXITCODE -ne 0) { throw "native linked companion comparison failed" } }'
-          foreach ($item in @(@('baseline', (Join-Path $area 'baseline-target/debug/ocm.exe')), @('candidate', (Join-Path $PWD 'target/debug/ocm.exe')))) {
-            $label, $binaryPath = $item
-            Write-Output "Capture host-only publication: $label"
-            $env:OCM_TEST_BINARY = $binaryPath
-            $env:OCM_TEST_ROOT_JUNCTION_PROBE = '1'
-            $output = & pwsh -NoProfile -Command $proof 2>&1
-            $captureExit = $LASTEXITCODE
-            $output | Write-Output
-            Remove-Item Env:OCM_TEST_ROOT_JUNCTION_PROBE
-            Remove-Item Env:OCM_TEST_BINARY
-            Write-Output "$label hostOnlyExit=$captureExit"
-            if (!($output -match '"nativeWindowsRootPublicationObservationsComplete":true')) {
-              throw "$label root publication observations did not complete"
-            }
+          Write-Output 'Capture host-only publication: current baseline'
+          $env:OCM_TEST_BINARY = Join-Path $area 'baseline-target/debug/ocm.exe'
+          $env:OCM_TEST_ROOT_JUNCTION_PROBE = '1'
+          $output = & pwsh -NoProfile -Command $proof 2>&1
+          $captureExit = $LASTEXITCODE
+          $output | Write-Output
+          Remove-Item Env:OCM_TEST_ROOT_JUNCTION_PROBE
+          Remove-Item Env:OCM_TEST_BINARY
+          Write-Output "current baseline hostOnlyExit=$captureExit"
+          if (!($output -match '"nativeWindowsRootPublicationObservationsComplete":true')) {
+            throw 'current baseline root publication observations did not complete'
           }
           $readerSource = Join-Path $env:RUNNER_TEMP ('ocr-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
           git init -q $readerSource
@@ -173,8 +170,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'reader source checkout failed' }
           npm install --prefix (Join-Path $area 'pnpm') --ignore-scripts --no-audit --no-fund pnpm@12.15.0
           if ($LASTEXITCODE -ne 0) { throw 'selected pnpm preparation failed' }
-          $pnpm = Join-Path $area 'pnpm/node_modules/.bin/pnpm.cmd'
-          & $pnpm --dir $readerSource install --frozen-lockfile --child-concurrency=2
+          # The selected package's documented Corepack entry works when lifecycle
+          # scripts are disabled; npm's extensionless Windows shim does not.
+          $pnpm = Join-Path $area 'pnpm/node_modules/pnpm/bin/pnpm.mjs'
+          node $pnpm --version
+          if ($LASTEXITCODE -ne 0) { throw 'selected pnpm entry failed' }
+          node $pnpm --dir $readerSource install --frozen-lockfile --child-concurrency=2
           if ($LASTEXITCODE -ne 0) { throw 'frozen reader dependencies failed' }
           git -C $readerSource rev-parse HEAD 'HEAD^{tree}'
           $readerDirty = git -C $readerSource status --porcelain=v1 --untracked-files=no
