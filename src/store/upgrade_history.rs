@@ -12,6 +12,7 @@ use super::layout::{
     display_path, runtime_install_root, upgrade_history_env_dir, upgrade_history_meta_path,
     upgrade_history_recovery_dir, validate_name,
 };
+#[cfg(not(windows))]
 use super::runtime_integrity_issue;
 use crate::runtime::{RuntimeMeta, RuntimeSourceKind};
 
@@ -274,7 +275,12 @@ pub(crate) fn get_upgrade_runtime_recovery(
     let mut relocated = meta.clone();
     relocated.binary_path = display_path(&recovery_binary);
     relocated.install_root = Some(display_path(&install_root));
-    if let Some(issue) = runtime_integrity_issue(&relocated, env) {
+    #[cfg(windows)]
+    let issue =
+        super::runtimes::runtime_recovery_integrity_issue(&relocated, &expected_install_root, env);
+    #[cfg(not(windows))]
+    let issue = runtime_integrity_issue(&relocated, env);
+    if let Some(issue) = issue {
         return Err(format!(
             "runtime recovery for \"{runtime_name}\" is not healthy: {issue}"
         ));

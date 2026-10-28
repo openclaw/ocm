@@ -116,8 +116,20 @@ jobs:
           cargo test --locked --lib windows_runtime_stage::tests -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Prove native Windows runtime tree hashing
-        timeout-minutes: 5
-        run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          . ./tests/support/windows_without_symlinks.ps1
+          Invoke-WithoutDeveloperSymlinks {
+            cargo test --locked --lib windows_junction::tests -- --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'native junction primitive failed' }
+            cargo test --locked --lib runtime_junction_ -- --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'runtime junction lifecycle failed' }
+            cargo test --locked --test windows_runtime_publication_tests -- --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'native runtime publication failed' }
+          }
       - name: Prove native Windows installed runtime launch
         timeout-minutes: 5
         shell: pwsh

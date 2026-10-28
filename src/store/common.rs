@@ -616,6 +616,15 @@ fn copy_path_inner(
 
     if file_type.is_symlink() {
         #[cfg(windows)]
+        if preserve_directory_modes
+            && crate::infra::windows_junction::copy_if_junction(source, destination)
+                .map_err(|error| error.to_string())?
+        {
+            // Runtime backups preserve recorded targets even when the final
+            // install root is absent. Ordinary user-data copies stay unchanged.
+            return Ok(());
+        }
+        #[cfg(windows)]
         let directory_hint = private_root.map(|_| {
             use std::os::windows::fs::FileTypeExt;
             file_type.is_symlink_dir()
