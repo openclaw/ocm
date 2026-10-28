@@ -3897,6 +3897,7 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
         path_string(&fs::canonicalize(env.get("OCM_HOME").unwrap()).unwrap()),
     );
     env.insert("npm_config_offline".into(), "true".into());
+    env.insert("npm_config_install_links".into(), "false".into());
     env.insert(
         "npm_config_cache".into(),
         path_string(&root.child("npm-cache")),
@@ -3930,6 +3931,37 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
         "module.exports={version:1};",
     );
     let shared_archive = pack(&shared);
+    // A native directory dependency retains ancestry outside the temporary
+    // companion install. Copying it would inherit the companion's private v2.
+    let external_parent = cwd.join("external-parent");
+    fs::create_dir_all(&external_parent).unwrap();
+    let external_bridge = external_parent.join("bridge");
+    write_package(
+        &external_bridge,
+        serde_json::json!({"name":"external-bridge","version":"1.0.0","main":"index.cjs",
+            "dependencies":{"@private/value":shared_archive}}),
+        "module.exports={value:require('@private/value').version,origin:require('node:fs').realpathSync.native(__filename)};",
+    );
+    let external_install = Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
+        .args(["install", "--prefix"])
+        .arg(&external_parent)
+        .args([
+            "--install-strategy=hoisted",
+            "--no-save",
+            "--package-lock=false",
+            &shared_archive,
+        ])
+        .env_clear()
+        .envs(&env)
+        .output()
+        .unwrap();
+    assert!(
+        external_install.status.success(),
+        "{}",
+        stderr(&external_install)
+    );
+    let external_before =
+        ["package.json", "index.cjs"].map(|file| file_sha256(&external_bridge.join(file)).unwrap());
     let bridge = cwd.join("bridge");
     write_package(
         &bridge,
@@ -3976,7 +4008,7 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
     let manifest = serde_json::json!({
         "name":"@openclaw/codex","version":"2026.10.8","main":"index.cjs",
         "files":["index.cjs","openclaw.plugin.json"],
-        "dependencies":{"@private/value":"2.0.0","bridge":bridge_archive,"bridge-b":bridge_b_archive,"required-only":required_archive},
+        "dependencies":{"@private/value":"2.0.0","bridge":bridge_archive,"bridge-b":bridge_b_archive,"required-only":required_archive,"external-bridge":format!("file:{}",path_string(&external_bridge))},
         "bundleDependencies":["@private/value"],
         "peerDependencies":{"openclaw":host_archive},
         "openclaw":{"build":{"openclawVersion":"2026.10.8"},
@@ -3985,7 +4017,7 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
     write_package(
         &companion,
         manifest.clone(),
-        "exports.token={}; const a=require('bridge'),b=require('bridge-b'); Object.assign(exports,{direct:require('@private/value').version,transitive:a.value.version,required:require('required-only'),peer:require('openclaw/sdk'),same:a.value===b.value,cycle:a.token===exports.token && b.token===exports.token});",
+        "exports.token={}; const a=require('bridge'),b=require('bridge-b'); Object.assign(exports,{direct:require('@private/value').version,transitive:a.value.version,required:require('required-only'),external:require('external-bridge'),peer:require('openclaw/sdk'),same:a.value===b.value,cycle:a.token===exports.token && b.token===exports.token});",
     );
     // npm bundles this private version while bridge inherits a different version.
     // The scope deliberately differs from the companion's own @openclaw scope.
@@ -4048,6 +4080,13 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
         assert!(control.status.success(), "{strategy}: {}", stderr(&control));
         let control: Value = serde_json::from_str(&stdout(&control)).unwrap();
         assert_eq!(control["cycle"], true, "{strategy}");
+        assert_eq!(control["external"]["value"], 1, "{strategy}");
+        #[cfg(unix)]
+        assert_eq!(
+            control["external"]["origin"],
+            path_string(&fs::canonicalize(external_bridge.join("index.cjs")).unwrap()),
+            "{strategy}"
+        );
         let build = run_ocm(
             &cwd,
             &selected_env,
@@ -4088,6 +4127,11 @@ fn runtime_build_local_preserves_native_companion_dependency_bindings() {
         assert_eq!(
             file_sha256(&companion.join("package.json")).unwrap(),
             source_before
+        );
+        assert_eq!(
+            ["package.json", "index.cjs"]
+                .map(|file| file_sha256(&external_bridge.join(file)).unwrap()),
+            external_before
         );
         assert_eq!(
             fs::read_to_string(companion.join("node_modules/@private/value/index.cjs")).unwrap(),

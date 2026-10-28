@@ -19,6 +19,7 @@ const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const fileDigest = file => digest(fs.readFileSync(file));
 const openclawSource = process.env.OCM_TEST_OPENCLAW_SOURCE;
 const readerScript = path.join(__dirname, 'windows_companion_reader.mjs');
+let externalBindingRoot;
 
 const env = {};
 for (const key of ['PATH', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT']) {
@@ -33,7 +34,7 @@ Object.assign(env, {
   OCM_HOME: path.join(root, 'ocm-home'), OCM_INTERNAL_SKIP_SERVICE_READINESS: '1',
   npm_config_cache: path.join(root, 'cache'), npm_config_offline: 'true',
   npm_config_audit: 'false', npm_config_fund: 'false',
-  npm_config_update_notifier: 'false',
+  npm_config_update_notifier: 'false', npm_config_install_links: 'false',
 });
 for (const key of ['HOME', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'OCM_HOME', 'npm_config_cache']) {
   fs.mkdirSync(env[key], {recursive: true});
@@ -75,9 +76,11 @@ function treeSnapshot(directory, allowLinks = false) {
       const relative = path.relative(directory, file);
       if (stat.isSymbolicLink()) {
         assert.ok(allowLinks, `Unexpected source link: ${file}`);
-        const resolved = path.relative(rootReal, fs.realpathSync.native(file));
-        assert.ok(!path.isAbsolute(resolved) && resolved !== '..'
-          && !resolved.startsWith(`..${path.sep}`), `Runtime link escaped its published tree: ${file}`);
+        const physical = fs.realpathSync.native(file);
+        const resolved = path.relative(rootReal, physical);
+        assert.ok((!path.isAbsolute(resolved) && resolved !== '..'
+          && !resolved.startsWith(`..${path.sep}`)) || physical === externalBindingRoot,
+          `Runtime link escaped its published tree or native external binding: ${file}`);
         files[relative] = {link: fs.readlinkSync(file)};
       } else if (stat.isDirectory()) {
         files[relative] = {directory: true};
@@ -138,6 +141,17 @@ function main() {
   const leafSource = 'module.exports={version:1};\n';
   writePackage(leaf, leafManifest, leafSource);
   const leafArchive = pack(leaf);
+  // Native directory dependencies keep their own npm ancestry and identity.
+  const externalParent = path.join(root, 'external-parent');
+  const externalBridge = path.join(externalParent, 'bridge');
+  writePackage(externalBridge, {name: 'external-bridge', version: '1.0.0', main: 'index.cjs',
+    dependencies: {value: leafArchive}},
+    "module.exports={value:require('value').version,origin:require('node:fs').realpathSync.native(__filename)};\n");
+  npm(['install', '--prefix', externalParent, '--install-strategy=hoisted',
+    '--no-save', '--package-lock=false', leafArchive]);
+  externalBindingRoot = fs.realpathSync.native(externalBridge);
+  const externalOrigin = fs.realpathSync.native(path.join(externalBridge, 'index.cjs'));
+  const externalBefore = ['package.json', 'index.cjs'].map(file => fileDigest(path.join(externalBridge, file)));
   const bridgeArchives = {};
   const cyclicBridgeArchives = {};
   for (const name of ['bridge-a', 'bridge-b']) {
@@ -266,6 +280,7 @@ exports.register=()=>{
       name: '@openclaw/codex', version, main: 'index.cjs',
       files: ['index.cjs', 'openclaw.plugin.json'],
       dependencies: {value: scenario.bundled ? '1.0.0' : leafArchive,
+        'external-bridge': `file:${externalBridge}`,
         ...(scenario.bundled ? cyclicBridgeArchives : bridgeArchives)},
       openclaw: {build: {openclawVersion: version}, release: {publishToNpm: true},
         extensions: ['./index.cjs'], runtimeExtensions: ['./index.cjs']},
@@ -276,7 +291,7 @@ exports.register=()=>{
     }
     const companionSource = (scenario.bundled
       ? "exports.token={}; const direct=require('value'),a=require('cyclic-bridge-a'),b=require('cyclic-bridge-b'); exports.direct=direct; exports.common=a.value; exports.observation={id:'codex',generation:1,values:[direct.version,a.value.version,b.value.version],shared:a.value===b.value,private:direct!==a.value,cycle:a.token===exports.token && b.token===exports.token,peer:require('openclaw/sdk')};\n"
-      : "exports.token={}; const direct=require('value'),a=require('bridge-a'),b=require('bridge-b'); exports.direct=direct; exports.common=direct; exports.observation={id:'codex',generation:1,values:[direct.version,a.version,b.version],shared:a===b,private:direct!==a};\n") + registrationSource;
+      : "exports.token={}; const direct=require('value'),a=require('bridge-a'),b=require('bridge-b'); exports.direct=direct; exports.common=direct; exports.observation={id:'codex',generation:1,values:[direct.version,a.version,b.version],shared:a===b,private:direct!==a};\n") + "exports.observation.external=require('external-bridge');\n" + registrationSource;
     writePackage(companion, manifest, companionSource);
     if (scenario.bundled) writePackage(path.join(companion, 'node_modules/value'), leafManifest, leafSource);
     fs.writeFileSync(path.join(companion, 'openclaw.plugin.json'), JSON.stringify({id: 'codex', configSchema: {}}));
@@ -366,6 +381,8 @@ process.exit(result.status??1);
         assert.equal(native.isolated, true, 'Independent native companion prefixes must retain separate identity');
         for (const plugin of native.companions) assert.equal(plugin.peer, 'host-sdk-1');
       }
+      assert.deepEqual(native.companions[0].external, {value: 1, origin: externalOrigin},
+        'Native npm must retain the external directory binding');
       phase = 'ocm-build';
       const buildArgs = ['runtime', 'build-local', scenario.name, '--repo', repo,
         ...companionIds.flatMap(id => ['--companion', id]), '--json'];
@@ -382,15 +399,9 @@ process.exit(result.status??1);
         assert.deepEqual(currentMetadata.companions.map(plugin => plugin.id), companionIds);
         const metadataSha256 = fileDigest(metadataPath);
         const verification = observe(binary, ['runtime', 'verify', scenario.name, '--json'], {env: selectedEnv});
-        assert.ok([0, 1].includes(verification.status), 'Unexpected verification process outcome');
+        assert.equal(verification.status, 0, 'Published companion must verify healthy');
         const verified = JSON.parse(verification.stdout);
-        assert.equal(verified.healthy, verification.status === 0);
-        // The existing Windows entrypoint spelling defect is independent of binding.
-        // Retain its exact failure; do not accept other integrity failures here.
-        if (!verified.healthy) {
-          assert.equal(verified.issue,
-            `runtime companion codex has invalid entrypoint path: ${currentMetadata.companions[0].entrypoint}`);
-        }
+        assert.equal(verified.healthy, true);
         console.log(JSON.stringify({scenario: scenario.name, phase, verificationExit: verification.status,
           verificationHealthy: verified.healthy, verificationIssue: verified.issue ?? null}));
         const comparisons = [];
@@ -498,6 +509,8 @@ process.exit(result.status??1);
     } finally {
       try {
         assert.deepEqual(treeSnapshot(repo), expectedSource, 'OCM changed the source fixture');
+        assert.deepEqual(['package.json', 'index.cjs'].map(file => fileDigest(path.join(externalBridge, file))),
+          externalBefore, 'OCM changed the native external package');
         console.log(JSON.stringify({scenario: scenario.name, sourceBytesUnchanged: true}));
       } catch (sourceError) {
         failures.push({scenario: scenario.name, phase: 'source-preservation', failure: String(sourceError)});

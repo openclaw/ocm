@@ -202,20 +202,44 @@ pub(crate) fn try_lock_file_shared(
     }
 }
 
+#[derive(Clone, Copy)]
+enum CopyPolicy {
+    Ordinary,
+    RuntimeAssembly,
+    RuntimeRecovery,
+}
+
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, None, false)
+    copy_dir_recursive_inner(source, destination, None, None, CopyPolicy::Ordinary)
+}
+
+/// Assemble an owned runtime tree, retaining native junction edges for its
+/// producer to project. Directory modes follow ordinary assembly copying.
+pub(crate) fn copy_runtime_dir(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_dir_recursive_inner(source, destination, None, None, CopyPolicy::RuntimeAssembly)
+}
+
+/// Copy one runtime assembly entry without following a native junction.
+pub(crate) fn copy_runtime_path(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_path_inner(source, destination, None, None, CopyPolicy::RuntimeAssembly)
 }
 
 /// Copy a runtime tree without changing the directory modes in its integrity digest.
 pub(crate) fn copy_dir_preserving_modes(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, None, true)
+    copy_dir_recursive_inner(source, destination, None, None, CopyPolicy::RuntimeRecovery)
 }
 
 pub(crate) fn copy_dir_preserving_permissions(
     source: &Path,
     destination: &Path,
 ) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, Some(destination), false)
+    copy_dir_recursive_inner(
+        source,
+        destination,
+        None,
+        Some(destination),
+        CopyPolicy::Ordinary,
+    )
 }
 
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), String> {
@@ -411,7 +435,7 @@ impl<'a> OpenClawDirectoryCopy<'a> {
             )),
             None => None,
         };
-        copy_dir_recursive_inner(source, destination, Some(self), None, false)
+        copy_dir_recursive_inner(source, destination, Some(self), None, CopyPolicy::Ordinary)
     }
 
     // Returns the replacement target and whether it names a directory.
@@ -479,7 +503,7 @@ fn copy_dir_recursive_inner(
     destination: &Path,
     mut copying: Option<&mut OpenClawDirectoryCopy<'_>>,
     private_root: Option<&Path>,
-    preserve_directory_modes: bool,
+    policy: CopyPolicy,
 ) -> Result<(), String> {
     if private_root.is_some() {
         ensure_private_dir(destination)?;
@@ -573,12 +597,14 @@ fn copy_dir_recursive_inner(
                 &destination_path,
                 copying.as_deref_mut(),
                 private_root,
-                preserve_directory_modes,
+                policy,
             )?;
         }
     }
 
-    if preserve_directory_modes || private_root.is_some_and(|root| root != destination) {
+    if matches!(policy, CopyPolicy::RuntimeRecovery)
+        || private_root.is_some_and(|root| root != destination)
+    {
         // Populate children before restoring modes, including read-only directories.
         let permissions = fs::metadata(source)
             .map_err(|error| error.to_string())?
@@ -601,7 +627,7 @@ pub(crate) fn copy_path_recursive(source: &Path, destination: &Path) -> Result<(
 }
 
 pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_path_inner(source, destination, None, None, false)
+    copy_path_inner(source, destination, None, None, CopyPolicy::Ordinary)
 }
 
 fn copy_path_inner(
@@ -609,20 +635,23 @@ fn copy_path_inner(
     destination: &Path,
     copying: Option<&mut OpenClawDirectoryCopy<'_>>,
     private_root: Option<&Path>,
-    preserve_directory_modes: bool,
+    policy: CopyPolicy,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     let file_type = metadata.file_type();
 
     if file_type.is_symlink() {
         #[cfg(windows)]
-        if preserve_directory_modes
-            && crate::infra::windows_junction::copy_if_junction(source, destination)
+        if !matches!(policy, CopyPolicy::Ordinary) {
+            if let Some(parent) = destination.parent() {
+                ensure_dir(parent)?;
+            }
+            if crate::infra::windows_junction::copy_if_junction(source, destination)
                 .map_err(|error| error.to_string())?
-        {
-            // Runtime recovery preserves the recorded link bytes, including
-            // final install targets that are absent while restoring a backup.
-            return Ok(());
+            {
+                // Assembly owns projection; recovery keeps recorded target data.
+                return Ok(());
+            }
         }
         #[cfg(windows)]
         let directory_hint = private_root.map(|_| {
@@ -648,13 +677,7 @@ fn copy_path_inner(
         );
     }
     if file_type.is_dir() {
-        return copy_dir_recursive_inner(
-            source,
-            destination,
-            copying,
-            private_root,
-            preserve_directory_modes,
-        );
+        return copy_dir_recursive_inner(source, destination, copying, private_root, policy);
     }
     #[cfg(unix)]
     if file_type.is_socket() {
@@ -1037,42 +1060,6 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn runtime_copy_preserves_junctions_with_absent_final_root() {
-        use crate::infra::{tree_digest::tree_sha256, windows_junction};
-
-        windows_junction::tests::without_symlink_privilege(|| {
-            let root = tempfile::tempdir().unwrap();
-            let installed = root.path().join("installed");
-            let backup = root.path().join("backup");
-            fs::create_dir_all(installed.join("package")).unwrap();
-            fs::write(installed.join("package/value"), "original").unwrap();
-            let package = fs::canonicalize(installed.join("package")).unwrap();
-            windows_junction::create(&package, &installed.join("binding")).unwrap();
-            let digest = tree_sha256(&installed).unwrap();
-
-            super::copy_dir_preserving_modes(&installed, &backup).unwrap();
-            assert_eq!(tree_sha256(&backup).unwrap(), digest);
-            super::remove_owned_tree(&installed).unwrap();
-            assert!(!backup.join("binding/value").exists());
-            assert_eq!(tree_sha256(&backup).unwrap(), digest);
-            super::copy_dir_preserving_modes(&backup, &installed).unwrap();
-            assert_eq!(tree_sha256(&installed).unwrap(), digest);
-            assert_eq!(
-                fs::read_to_string(installed.join("binding/value")).unwrap(),
-                "original"
-            );
-
-            super::remove_owned_tree(&backup).unwrap();
-            assert_eq!(
-                fs::read_to_string(installed.join("package/value")).unwrap(),
-                "original"
-            );
-            assert_eq!(tree_sha256(&installed).unwrap(), digest);
-        });
-    }
-
     #[cfg(unix)]
     #[test]
     fn copy_dir_recursive_preserves_broken_symlinks() {
@@ -1103,6 +1090,68 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_junction_assembly_copy_keeps_directory_modes_separate() {
+        use crate::infra::windows_junction;
+
+        windows_junction::tests::without_symlink_privilege(|| {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("payload"), "owned bytes").unwrap();
+            let absent = fs::canonicalize(root.path()).unwrap().join("absent");
+            windows_junction::create(&absent, &source.join("edge")).unwrap();
+            let mut readonly = fs::metadata(&source).unwrap().permissions();
+            readonly.set_readonly(true);
+            fs::set_permissions(&source, readonly).unwrap();
+
+            let assembly = root.path().join("assembly");
+            super::copy_runtime_dir(&source, &assembly).unwrap();
+            assert!(!fs::metadata(&assembly).unwrap().permissions().readonly());
+            assert_eq!(
+                fs::read_to_string(assembly.join("payload")).unwrap(),
+                "owned bytes"
+            );
+            assert_eq!(
+                windows_junction::target(&assembly.join("edge")).unwrap(),
+                Some(absent.clone())
+            );
+            assert!(!assembly.join("edge").exists());
+
+            let single = root.path().join("new-parent/single");
+            super::copy_runtime_path(&source.join("edge"), &single).unwrap();
+            assert_eq!(windows_junction::target(&single).unwrap(), Some(absent));
+            let missing_parent = root.path().join("missing-source-parent");
+            assert!(
+                super::copy_runtime_path(
+                    &root.path().join("missing-source"),
+                    &missing_parent.join("entry"),
+                )
+                .is_err()
+            );
+            assert!(!missing_parent.exists());
+            let occupied = root.path().join("occupied");
+            fs::write(&occupied, "keep").unwrap();
+            assert!(super::copy_runtime_path(&source.join("edge"), &occupied).is_err());
+            assert_eq!(fs::read_to_string(&occupied).unwrap(), "keep");
+
+            let recovery = root.path().join("recovery");
+            super::copy_dir_preserving_modes(&source, &recovery).unwrap();
+            assert!(fs::metadata(&recovery).unwrap().permissions().readonly());
+            assert_eq!(
+                windows_junction::target(&recovery.join("edge")).unwrap(),
+                windows_junction::target(&source.join("edge")).unwrap(),
+            );
+            assert!(super::copy_path(&source.join("edge"), &root.path().join("ordinary")).is_err());
+            for path in [&source, &recovery, &assembly] {
+                super::remove_owned_tree(path).unwrap();
+            }
+            fs::remove_dir(&single).unwrap();
+            assert_eq!(fs::read_to_string(&occupied).unwrap(), "keep");
+        });
     }
 
     #[cfg(unix)]
@@ -1599,24 +1648,217 @@ mod archive_privacy_windows_tests {
         );
     }
 
+    fn directory_handle(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap()
+    }
+
+    fn ordinary_path(path: &Path) -> PathBuf {
+        let canonical = path.canonicalize().unwrap();
+        PathBuf::from(canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap())
+    }
+
+    fn directory_at_length(root: &Path, units: usize) -> PathBuf {
+        use std::os::windows::ffi::OsStrExt;
+        let mut path = root.to_path_buf();
+        while units - path.as_os_str().encode_wide().count() > 100 {
+            path.push(format!("unicode-🦀-{}", "p".repeat(60)));
+        }
+        let remaining = units - path.as_os_str().encode_wide().count() - 1;
+        path.push("d".repeat(remaining));
+        assert_eq!(path.as_os_str().encode_wide().count(), units);
+        path
+    }
+
     #[test]
     fn private_config_archive_directory_has_user_only_access() {
-        let root = tempfile::tempdir().unwrap();
-        for existing in [false, true] {
-            let directory = root.path().join(if existing { "existing" } else { "new" });
-            if existing {
-                fs::create_dir(&directory).unwrap();
+        use crate::infra::file_identity::file_identity;
+        use crate::infra::windows_security::has_user_only_access;
+        for units in [0, 252, 300] {
+            let root = tempfile::tempdir().unwrap();
+            let ordinary = ordinary_path(root.path());
+            for existing in [false, true] {
+                let base = ordinary.join(if existing { "existing" } else { "new" });
+                let directory = if units == 0 {
+                    base
+                } else {
+                    directory_at_length(&base, units)
+                };
+                fs::create_dir_all(directory.parent().unwrap()).unwrap();
+                if existing {
+                    fs::create_dir(&directory).unwrap();
+                }
+                ensure_private_dir(&directory).unwrap_or_else(|error| {
+                    panic!("units={units} existing={existing} path={directory:?}: {error}")
+                });
+                let file = directory_handle(&directory);
+                assert!(has_user_only_access(&file).unwrap(), "{directory:?}");
+                let identity = file_identity(&file, &file.metadata().unwrap()).unwrap();
+                for spelling in [&directory, &directory.canonicalize().unwrap()] {
+                    ensure_private_dir(spelling).unwrap();
+                    let reopened = directory_handle(spelling);
+                    assert!(has_user_only_access(&reopened).unwrap());
+                    assert_eq!(
+                        identity,
+                        file_identity(&reopened, &reopened.metadata().unwrap()).unwrap()
+                    );
+                }
+                fs::write(directory.join("marker"), b"owned bytes").unwrap();
             }
-            ensure_private_dir(&directory).unwrap();
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                .open(directory)
-                .unwrap();
-            assert!(
-                crate::infra::windows_security::has_user_only_access(&file).unwrap(),
-                "existing directory: {existing}"
+            if units != 0 {
+                let source = ordinary.join("source");
+                fs::create_dir_all(source.join("nested")).unwrap();
+                fs::write(source.join("nested/marker"), b"copied bytes").unwrap();
+                let copy = directory_at_length(&ordinary.join("copy"), units);
+                copy_dir_preserving_permissions(&source, &copy).unwrap();
+                assert!(has_user_only_access(&directory_handle(&copy)).unwrap());
+                assert!(has_user_only_access(&directory_handle(&copy.join("nested"))).unwrap());
+                assert_eq!(
+                    fs::read(copy.join("nested/marker")).unwrap(),
+                    b"copied bytes"
+                );
+            }
+            remove_owned_tree(&ordinary).unwrap();
+            assert!(!ordinary.exists());
+        }
+    }
+
+    #[test]
+    fn private_config_long_directory_spellings_and_parent_alias_keep_identity() {
+        use crate::infra::file_identity::file_identity;
+        use crate::infra::windows_security::has_user_only_access;
+        let cwd = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&cwd).unwrap();
+        let ordinary = ordinary_path(root.path());
+        let directory = directory_at_length(&ordinary, 300);
+        let relative = directory
+            .strip_prefix(ordinary_path(&cwd))
+            .unwrap()
+            .to_path_buf();
+        let drive_relative = PathBuf::from(format!(
+            "{}:{}",
+            &directory.to_str().unwrap()[..1],
+            relative.display()
+        ));
+        let normalized = PathBuf::from(format!(
+            "{}/unused/../{}",
+            directory.parent().unwrap().display(),
+            directory.file_name().unwrap().to_str().unwrap()
+        ));
+        let forward_slashes = PathBuf::from(directory.to_str().unwrap().replace('\\', "/"));
+        ensure_private_dir(&relative)
+            .unwrap_or_else(|error| panic!("relative={relative:?}: {error}"));
+        let file = directory_handle(&directory);
+        let identity = file_identity(&file, &file.metadata().unwrap()).unwrap();
+        for spelling in [&drive_relative, &normalized, &forward_slashes] {
+            ensure_private_dir(spelling).unwrap();
+            let reopened = directory_handle(spelling);
+            assert!(has_user_only_access(&reopened).unwrap());
+            assert_eq!(
+                identity,
+                file_identity(&reopened, &reopened.metadata().unwrap()).unwrap()
             );
         }
+        let alias = ordinary.join("alias");
+        let target = ordinary.join("target");
+        fs::create_dir(&target).unwrap();
+        let result = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let aliased = directory_at_length(&alias, 300);
+        ensure_private_dir(&aliased).unwrap();
+        let actual = target.join(aliased.strip_prefix(&alias).unwrap());
+        let alias_handle = directory_handle(&aliased);
+        let actual_handle = directory_handle(&actual);
+        assert!(has_user_only_access(&actual_handle).unwrap());
+        assert_eq!(
+            file_identity(&alias_handle, &alias_handle.metadata().unwrap()).unwrap(),
+            file_identity(&actual_handle, &actual_handle.metadata().unwrap()).unwrap()
+        );
+        // Explicit verbatim names retain their literal trailing dot and space.
+        let literal = ordinary.canonicalize().unwrap().join("literal. ");
+        ensure_private_dir(&literal).unwrap();
+        ensure_private_dir(&literal).unwrap();
+        assert!(has_user_only_access(&directory_handle(&literal)).unwrap());
+        assert!(!ordinary.join("literal").exists());
+        fs::remove_dir(&literal).unwrap();
+        drop((file, alias_handle, actual_handle));
+        remove_owned_tree(&ordinary).unwrap();
+        assert!(!ordinary.exists());
+    }
+
+    #[test]
+    fn private_config_long_directory_refuses_files_and_final_reparse_entries() {
+        use crate::infra::windows_security::{ensure_private_directory, has_user_only_access};
+        let root = tempfile::tempdir().unwrap();
+        let ordinary = ordinary_path(root.path());
+        let target_root = tempfile::tempdir().unwrap();
+        let target = target_root.path();
+        fs::write(target.join("marker"), b"external bytes").unwrap();
+        let target_private = has_user_only_access(&directory_handle(target)).unwrap();
+        assert!(
+            !target_private,
+            "target must retain its inherited ACL for the refusal control"
+        );
+        for kind in ["file", "junction", "symlink"] {
+            let short = ordinary.join(kind);
+            match kind {
+                "file" => fs::write(&short, b"file bytes").unwrap(),
+                "junction" => {
+                    let result = std::process::Command::new("cmd")
+                        .args(["/c", "mklink", "/J"])
+                        .arg(&short)
+                        .arg(target)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        result.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
+                _ => std::os::windows::fs::symlink_dir(target, &short).unwrap(),
+            }
+            assert!(ensure_private_directory(&short).is_err());
+            let long = directory_at_length(&ordinary.join(format!("long-{kind}")), 300);
+            fs::create_dir_all(long.parent().unwrap()).unwrap();
+            fs::rename(&short, &long).unwrap();
+            assert!(ensure_private_directory(&long).is_err(), "{kind}");
+            if kind == "file" {
+                assert_eq!(fs::read(&long).unwrap(), b"file bytes");
+            } else {
+                assert!(
+                    fs::symlink_metadata(&long)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(fs::read(target.join("marker")).unwrap(), b"external bytes");
+                assert_eq!(
+                    has_user_only_access(&directory_handle(target)).unwrap(),
+                    target_private
+                );
+            }
+        }
+        for invalid in [
+            ordinary.join("nul\0suffix"),
+            ordinary.join("bad:name"),
+            ordinary.join("x".repeat(300)),
+        ] {
+            assert!(ensure_private_directory(&invalid).is_err());
+        }
+        remove_owned_tree(&ordinary).unwrap();
+        assert_eq!(fs::read(target.join("marker")).unwrap(), b"external bytes");
     }
 }

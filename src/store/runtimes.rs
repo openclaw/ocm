@@ -32,8 +32,8 @@ use crate::runtime::{
 };
 
 use super::common::{
-    ExclusiveFileLock, copy_dir_recursive, copy_path, ensure_dir, load_json_files, path_exists,
-    read_json, read_json_if_present, write_json,
+    ExclusiveFileLock, copy_dir_recursive, copy_runtime_dir, copy_runtime_path, ensure_dir,
+    load_json_files, path_exists, read_json, read_json_if_present, write_json,
 };
 use super::envs::get_environment;
 use super::layout::{
@@ -184,8 +184,11 @@ fn expose_openclaw_package_runtime_dependencies(install_files: &Path) -> Result<
     Ok(())
 }
 
-fn openclaw_package_runtime_dependency_layout_issue(package_root: &Path) -> Option<String> {
-    if !package_root.join("package.json").exists() {
+fn openclaw_package_runtime_dependency_layout_issue(
+    package_root: &Path,
+    paths: &RuntimeReadPaths,
+) -> Option<String> {
+    if !paths.exists(&package_root.join("package.json")) {
         return None;
     }
     let Some(prefix_node_modules) = package_root.parent() else {
@@ -195,7 +198,7 @@ fn openclaw_package_runtime_dependency_layout_issue(package_root: &Path) -> Opti
         ));
     };
     let package_node_modules = package_root.join("node_modules");
-    let entries = match fs::read_dir(prefix_node_modules) {
+    let entries = match paths.read_dir(prefix_node_modules) {
         Ok(entries) => entries,
         Err(error) => {
             return Some(format!(
@@ -219,10 +222,10 @@ fn openclaw_package_runtime_dependency_layout_issue(package_root: &Path) -> Opti
             continue;
         }
         if package_name.starts_with('@') {
-            if !source_dir.is_dir() {
+            if !paths.is_dir(&source_dir) {
                 continue;
             }
-            let scoped_entries = match fs::read_dir(&source_dir) {
+            let scoped_entries = match paths.read_dir(&source_dir) {
                 Ok(entries) => entries,
                 Err(error) => {
                     return Some(format!(
@@ -241,12 +244,12 @@ fn openclaw_package_runtime_dependency_layout_issue(package_root: &Path) -> Opti
                     }
                 };
                 let scoped_source_dir = scoped_entry.path();
-                if !scoped_source_dir.join("package.json").exists() {
+                if !paths.exists(&scoped_source_dir.join("package.json")) {
                     continue;
                 }
                 let scoped_name = scoped_entry.file_name().to_string_lossy().to_string();
                 let target_dir = package_node_modules.join(&package_name).join(scoped_name);
-                if !target_dir.join("package.json").exists() {
+                if !paths.exists(&target_dir.join("package.json")) {
                     return Some(format!(
                         "OpenClaw package runtime dependency layout is missing {}",
                         display_path(&target_dir.join("package.json"))
@@ -255,11 +258,11 @@ fn openclaw_package_runtime_dependency_layout_issue(package_root: &Path) -> Opti
             }
             continue;
         }
-        if !source_dir.join("package.json").exists() {
+        if !paths.exists(&source_dir.join("package.json")) {
             continue;
         }
         let target_dir = package_node_modules.join(package_name);
-        if !target_dir.join("package.json").exists() {
+        if !paths.exists(&target_dir.join("package.json")) {
             return Some(format!(
                 "OpenClaw package runtime dependency layout is missing {}",
                 display_path(&target_dir.join("package.json"))
@@ -1942,13 +1945,52 @@ fn npm_package_path(package_name: &str) -> Result<PathBuf, String> {
     ))
 }
 
+#[cfg(windows)]
+fn companion_entry(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to inspect companion entry {}: {error}",
+            display_path(path)
+        )),
+    }
+}
+
+fn companion_entry_exists(path: &Path) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        Ok(companion_entry(path)?.is_some())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(path_exists(path))
+    }
+}
+
 fn copy_companion_runtime_dependencies(
     source_node_modules: &Path,
     destination_node_modules: &Path,
     own_package_path: &Path,
 ) -> Result<BTreeMap<PathBuf, PathBuf>, String> {
+    // Windows runtime assembly preserves raw junctions. Never merge prefix
+    // data through one while it still names scratch; the projector owns it.
+    #[cfg(windows)]
+    if companion_entry(destination_node_modules)?
+        .is_some_and(|metadata| !metadata.file_type().is_dir())
+    {
+        return Ok(BTreeMap::new());
+    }
     ensure_dir(destination_node_modules)?;
     let mut copied = Vec::new();
+    let copied_directory = |path: &Path| -> Result<bool, String> {
+        // Copied aliases can still name scratch or carry relative ancestry that
+        // changes when moved. Only complete physical copies establish roots.
+        Ok(fs::symlink_metadata(path)
+            .map_err(|error| error.to_string())?
+            .file_type()
+            .is_dir())
+    };
     for entry in fs::read_dir(source_node_modules).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let source = entry.path();
@@ -1956,36 +1998,38 @@ fn copy_companion_runtime_dependencies(
         if relative == Path::new(".package-lock.json") {
             continue;
         }
-        // Preserve the package's private dependencies and binary links. A scope
-        // is a namespace, so merge its absent packages rather than the directory.
         if entry.file_name().to_string_lossy().starts_with('@') || relative == Path::new(".bin") {
             let scope_destination = destination_node_modules.join(&relative);
+            #[cfg(windows)]
+            if companion_entry(&scope_destination)?
+                .is_some_and(|metadata| !metadata.file_type().is_dir())
+            {
+                continue;
+            }
             ensure_dir(&scope_destination)?;
             for scoped_entry in fs::read_dir(&source).map_err(|error| error.to_string())? {
                 let scoped_entry = scoped_entry.map_err(|error| error.to_string())?;
                 let scoped_relative = relative.join(scoped_entry.file_name());
                 let destination = destination_node_modules.join(&scoped_relative);
-                if scoped_relative == own_package_path || path_exists(&destination) {
+                if scoped_relative == own_package_path || companion_entry_exists(&destination)? {
                     continue;
                 }
-                copy_path(&scoped_entry.path(), &destination)?;
-                if relative != Path::new(".bin") {
+                copy_runtime_path(&scoped_entry.path(), &destination)?;
+                if relative != Path::new(".bin") && copied_directory(&scoped_entry.path())? {
                     copied.push((scoped_entry.path(), destination));
                 }
             }
             continue;
         }
         let destination = destination_node_modules.join(&relative);
-        if relative == own_package_path || path_exists(&destination) {
+        if relative == own_package_path || companion_entry_exists(&destination)? {
             continue;
         }
-        copy_path(&source, &destination)?;
-        if source.is_dir() {
+        copy_runtime_path(&source, &destination)?;
+        if copied_directory(&source)? {
             copied.push((source, destination));
         }
     }
-    // npm can enumerate package links before their .store targets. Resolve the
-    // copied identities only once the entire prefix has been copied.
     let destination_root =
         fs::canonicalize(destination_node_modules).map_err(|error| error.to_string())?;
     let mut retained = BTreeMap::new();
@@ -1993,10 +2037,141 @@ fn copy_companion_runtime_dependencies(
         let source = fs::canonicalize(source).map_err(|error| error.to_string())?;
         let destination = fs::canonicalize(destination).map_err(|error| error.to_string())?;
         if destination.starts_with(&destination_root) {
-            retained.insert(source, destination);
+            retained.entry(source).or_insert(destination);
         }
     }
     Ok(retained)
+}
+
+#[cfg(windows)]
+fn companion_junctions(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut edges = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(directory)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_symlink()
+                && let Some(target) = crate::infra::windows_junction::target(&entry.path())
+                    .map_err(|error| error.to_string())?
+            {
+                edges.push((entry.path(), target));
+            }
+        }
+    }
+    Ok(edges)
+}
+
+#[cfg(windows)]
+fn retained_companion_directory(
+    source: &Path,
+    retained: &BTreeMap<PathBuf, PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    for ancestor in source.ancestors() {
+        let Some(root) = retained.get(ancestor) else {
+            continue;
+        };
+        let mut candidate = root.clone();
+        let mut physical =
+            companion_entry(&candidate)?.is_some_and(|metadata| metadata.file_type().is_dir());
+        for component in source.strip_prefix(ancestor).unwrap().components() {
+            if !physical {
+                break;
+            }
+            candidate.push(component.as_os_str());
+            physical =
+                companion_entry(&candidate)?.is_some_and(|metadata| metadata.file_type().is_dir());
+        }
+        if physical {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn companion_target_uses_scratch(target: &Path, scratch: &Path) -> bool {
+    // Match the generic publisher's owned-namespace test.
+    if clean_path(target).strip_prefix(scratch).is_ok() {
+        return true;
+    }
+    // A differently spelled ancestor can enter scratch and a later junction
+    // can leave it. Looking only at the final canonical target misses that
+    // dependency on the temporary namespace. Direct external targets stay raw.
+    target.ancestors().any(|ancestor| {
+        fs::canonicalize(ancestor).is_ok_and(|physical| physical.strip_prefix(scratch).is_ok())
+    })
+}
+
+#[cfg(windows)]
+fn project_companion_junctions(
+    source_install: &Path,
+    copied_root: &Path,
+    retained: &mut BTreeMap<PathBuf, PathBuf>,
+) -> Result<(), String> {
+    let source_install = fs::canonicalize(source_install).map_err(|error| error.to_string())?;
+    let copied_root = fs::canonicalize(copied_root).map_err(|error| error.to_string())?;
+    let mut pending = companion_junctions(&copied_root)?;
+    let mut replacements = Vec::new();
+    while let Some((site, old)) = pending.pop() {
+        if !companion_target_uses_scratch(&old, &source_install) {
+            continue;
+        }
+        let source = match fs::canonicalize(&old) {
+            Ok(source) => source,
+            // Preserve native omissions. Do not turn a dangling edge into a
+            // colliding retained package, or install anything to satisfy it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect native companion junction {}: {error}",
+                    display_path(&site)
+                ));
+            }
+        };
+        if !source.starts_with(&source_install) {
+            // The native target exists externally, but this edge reached it
+            // through scratch. Retain that existing identity directly; do not
+            // copy, adopt, or install external content.
+            replacements.push((site, old, source));
+            continue;
+        }
+        if let Some(representative) = retained_companion_directory(&source, retained)? {
+            replacements.push((site, old, representative));
+            continue;
+        }
+        // A private collision may have excluded this physical package from the
+        // prefix copy. Retain it once at this owned edge; later edges reuse it.
+        if crate::infra::windows_junction::target(&site).map_err(|error| error.to_string())?
+            != Some(old)
+        {
+            return Err("copied companion junction changed before materialization".into());
+        }
+        fs::remove_dir(&site).map_err(|error| error.to_string())?;
+        copy_runtime_dir(&source, &site)?;
+        let representative = fs::canonicalize(&site).map_err(|error| error.to_string())?;
+        retained.insert(source, representative.clone());
+        pending.extend(companion_junctions(&representative)?);
+    }
+    // All physical roots are now present. No retained lookup below traverses a
+    // raw scratch edge, and no source or namespace is resolved after rebinding.
+    for (site, old, representative) in replacements {
+        crate::infra::windows_junction::retarget(&site, &old, &representative).map_err(
+            |error| {
+                format!(
+                    "cannot project companion junction {}: {error}",
+                    display_path(&site)
+                )
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn safe_companion_runtime_entrypoint(value: &str) -> Result<PathBuf, String> {
@@ -2027,7 +2202,6 @@ fn install_local_openclaw_companion(
     context: InstallContext<'_>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
     owner: &RuntimeInstallTarget,
-    bindings: &mut CompanionDependencyBindings,
 ) -> Result<RuntimeCompanionMeta, String> {
     let install_root = scratch_dir.join("companion-installs").join(&packed.spec.id);
     ensure_dir(&install_root)?;
@@ -2111,12 +2285,40 @@ fn install_local_openclaw_companion(
             display_path(&target_package_root)
         ));
     }
-    copy_dir_recursive(&source_package_root, &target_package_root)?;
-    let retained = copy_companion_runtime_dependencies(
+    copy_runtime_dir(&source_package_root, &target_package_root)?;
+    let source_identity =
+        fs::canonicalize(&source_package_root).map_err(|error| error.to_string())?;
+    let visible_identity =
+        fs::canonicalize(&target_package_root).map_err(|error| error.to_string())?;
+    // This exact identity outranks any later .store subtree mapping.
+    let mut retained = BTreeMap::from([(source_identity, visible_identity.clone())]);
+    for (source, destination) in copy_companion_runtime_dependencies(
         &install_root.join("node_modules"),
         &target_package_root.join("node_modules"),
         &package_path,
-    )?;
+    )? {
+        retained.entry(source).or_insert(destination);
+    }
+    let package: serde_json::Value = read_json(&target_package_root.join("package.json"))?;
+    if package
+        .pointer("/peerDependencies/openclaw")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        let modules = visible_identity.join("node_modules");
+        #[cfg(windows)]
+        if companion_entry(&modules)?.is_some_and(|metadata| !metadata.file_type().is_dir()) {
+            return Err("companion host-peer namespace is not an owned physical directory".into());
+        }
+        // Reserve the explicit host slot before anyone can reuse it as a native
+        // representative. Transitive native copies remain available in scratch
+        // or .store and are retained elsewhere if they are actually needed.
+        let peer = modules.join("openclaw");
+        remove_path_if_present(&peer)?;
+        retained.retain(|_, destination| !destination.starts_with(&peer));
+    }
+    #[cfg(windows)]
+    project_companion_junctions(&install_root, &visible_identity, &mut retained)?;
     // The isolated npm tree is packing scratch and is removed before publication.
     // Reuse retained physical packages so shared dependencies keep their module
     // identity. No binding may depend on the temporary installation after this.
@@ -2125,13 +2327,13 @@ fn install_local_openclaw_companion(
         &install_root,
         &source_package_root,
         &target_package_root,
-        Some(retained),
-        |source, target| bindings.link(source, target),
+        Some(&mut retained),
+        link_companion_dependency,
     )?;
     ensure_local_extension_openclaw_peer(
         &openclaw_package_root,
         &target_package_root,
-        |source, target| bindings.host_peer(source, target),
+        link_companion_host_peer,
     )?;
 
     let installed = load_json_value(
@@ -2533,6 +2735,13 @@ fn remove_path_if_present(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if metadata.file_type().is_symlink_dir() {
+            return fs::remove_dir(path).map_err(|error| error.to_string());
+        }
+    }
     if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
         fs::remove_dir_all(path).map_err(|error| error.to_string())
     } else {
@@ -2614,112 +2823,52 @@ fn installed_dependency_directory(
     Ok(None)
 }
 
-#[derive(Default)]
-struct CompanionDependencyBindings {
+fn link_companion_host_peer(source: &Path, target: &Path) -> Result<(), String> {
     #[cfg(windows)]
-    junctions: BTreeMap<PathBuf, PathBuf>,
+    {
+        link_companion_dependency(source, target)
+    }
+    #[cfg(not(windows))]
+    {
+        link_or_copy_openclaw_host(source, target)
+    }
 }
 
-impl CompanionDependencyBindings {
-    fn host_peer(&mut self, source: &Path, target: &Path) -> Result<(), String> {
-        #[cfg(windows)]
-        {
-            // Copying the host would also copy the newly created junctions.
-            self.link(source, target)
-        }
-        #[cfg(not(windows))]
-        {
-            link_or_copy_openclaw_host(source, target)
-        }
+fn link_companion_dependency(source: &Path, target: &Path) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        ensure_dir(parent)?;
     }
-
-    fn link(&mut self, source: &Path, target: &Path) -> Result<(), String> {
-        if let Some(parent) = target.parent() {
-            ensure_dir(parent)?;
-        }
-        let relative = relative_symlink_target(source, target)
-            .ok_or_else(|| "cannot make a relative companion dependency binding".to_string())?;
-        // Copies would split singleton identity or recursively copy an ancestor.
-        #[cfg(unix)]
-        let result = std::os::unix::fs::symlink(relative, target);
-        #[cfg(windows)]
-        let result = match std::os::windows::fs::symlink_dir(relative, target) {
-            Err(error)
-                if error.raw_os_error()
-                    == Some(windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD as i32) =>
-            {
-                let source = fs::canonicalize(source).map_err(|error| error.to_string())?;
-                let parent = target.parent().ok_or("companion binding has no parent")?;
-                // Freeze the physical link site, never its dereferenced target.
-                let site = fs::canonicalize(parent)
-                    .map_err(|error| error.to_string())?
-                    .join(target.file_name().ok_or("companion binding has no name")?);
-                crate::infra::windows_junction::create(&source, &site).map(|()| {
-                    self.junctions.insert(site, source);
-                })
-            }
-            result => result,
-        };
-        #[cfg(not(any(unix, windows)))]
-        let result = Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "directory links unsupported",
-        ));
-        result.map_err(|error| {
-            format!(
-                "cannot preserve shared companion dependency at {}: {error}",
-                display_path(target)
-            )
-        })
-    }
-
-    fn finalize(&self, _target: &RuntimeInstallTarget) -> Result<(), String> {
-        #[cfg(windows)]
+    let relative = relative_symlink_target(source, target)
+        .ok_or_else(|| "cannot make a relative companion dependency binding".to_string())?;
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(relative, target);
+    #[cfg(windows)]
+    let result = match std::os::windows::fs::symlink_dir(relative, target) {
+        Err(error)
+            if error.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD as i32) =>
         {
-            if self.junctions.is_empty() {
-                return Ok(());
-            }
-            _target.finish_children()?;
-            let stage =
-                fs::canonicalize(&_target.install_root).map_err(|error| error.to_string())?;
-            // OpenClaw's final entry admission uses the native canonical path.
-            // Keep dependencies in that same namespace without resolving through
-            // a predecessor at the final root.
-            let final_root = stage.with_file_name(
-                _target
-                    .final_install_root
-                    .file_name()
-                    .ok_or("runtime has no final name")?,
-            );
-            let replacements = self
-                .junctions
-                .iter()
-                .map(|(site, source)| {
-                    crate::infra::windows_junction::validate_target(site, source)
-                        .map_err(|error| error.to_string())?;
-                    if !site.starts_with(&stage)
-                        || fs::canonicalize(site).map_err(|error| error.to_string())? != *source
-                    {
-                        return Err(
-                            "owned companion junction changed before publication".to_string()
-                        );
-                    }
-                    let relative = source.strip_prefix(&stage).map_err(|_| {
-                        "companion junction target escaped its runtime stage".to_string()
-                    })?;
-                    Ok((site, source, final_root.join(relative)))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            // Every source and physical site is settled before the first update.
-            // Nothing below resolves through a retargeted junction.
-            for (site, source, final_target) in replacements {
-                crate::infra::windows_junction::retarget(site, source, &final_target).map_err(
-                    |error| format!("failed to finalize companion dependency binding: {error}"),
-                )?;
-            }
+            let source = fs::canonicalize(source).map_err(|error| error.to_string())?;
+            let parent = target.parent().ok_or("companion binding has no parent")?;
+            let site = fs::canonicalize(parent)
+                .map_err(|error| error.to_string())?
+                .join(target.file_name().ok_or("companion binding has no name")?);
+            // The qualified generic publisher owns final target projection.
+            crate::infra::windows_junction::create(&source, &site)
         }
-        Ok(())
-    }
+        result => result,
+    };
+    #[cfg(not(any(unix, windows)))]
+    let result = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "directory links unsupported",
+    ));
+    result.map_err(|error| {
+        format!(
+            "cannot preserve shared companion dependency at {}: {error}",
+            display_path(target)
+        )
+    })
 }
 
 fn preserve_materialized_extension_dependencies(
@@ -2727,7 +2876,7 @@ fn preserve_materialized_extension_dependencies(
     source_install_files: &Path,
     installed_package: &Path,
     target: &Path,
-    mut retained: Option<BTreeMap<PathBuf, PathBuf>>,
+    mut retained: Option<&mut BTreeMap<PathBuf, PathBuf>>,
     mut link_or_copy: impl FnMut(&Path, &Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let install_files = fs::canonicalize(install_files).map_err(|error| error.to_string())?;
@@ -2773,6 +2922,18 @@ fn preserve_materialized_extension_dependencies(
                 continue;
             };
             if let Some(retained) = retained.as_mut() {
+                if !dependency.starts_with(&source_install_files) {
+                    // Native directory dependencies can retain external ancestry.
+                    // Preserve that binding rather than copying a partial graph.
+                    if installed_dependency_directory(&target, &relative, &install_files)?
+                        != Some(dependency.clone())
+                    {
+                        let binding = target.join("node_modules").join(&relative);
+                        remove_path_if_present(&binding)?;
+                        link_or_copy(&dependency, &binding)?;
+                    }
+                    continue;
+                }
                 let representative = dependency.ancestors().find_map(|ancestor| {
                     let root = retained.get(ancestor)?;
                     let path = root.join(dependency.strip_prefix(ancestor).ok()?);
@@ -2791,8 +2952,13 @@ fn preserve_materialized_extension_dependencies(
                     representative
                 } else {
                     remove_path_if_present(&binding)?;
-                    copy_dir_recursive(&dependency, &binding)?;
-                    fs::canonicalize(&binding).map_err(|error| error.to_string())?
+                    copy_runtime_dir(&dependency, &binding)?;
+                    let representative =
+                        fs::canonicalize(&binding).map_err(|error| error.to_string())?;
+                    retained.insert(dependency.clone(), representative.clone());
+                    #[cfg(windows)]
+                    project_companion_junctions(&source_install_files, &representative, retained)?;
+                    representative
                 };
                 retained.insert(dependency.clone(), representative.clone());
                 pending.push((dependency, representative));
@@ -3571,6 +3737,85 @@ fn lock_runtime_publication_paths(
         .collect()
 }
 
+#[cfg(windows)]
+fn physical_runtime_destination(root: &Path) -> Result<PathBuf, String> {
+    // Resolve existing ancestors, never an existing predecessor's contents.
+    // Recovery must not require (or recreate) the live runtime directory.
+    let parent = root.parent().ok_or("runtime root has no parent")?;
+    let name = root.file_name().ok_or("runtime root has no name")?;
+    Ok(super::openclaw_workspaces::canonicalize_path_allow_missing(parent)?.join(name))
+}
+
+#[cfg(windows)]
+fn publish_runtime_junctions(
+    target: &RuntimeInstallTarget,
+    meta: &mut RuntimeMeta,
+) -> Result<(), String> {
+    use crate::infra::windows_junction;
+
+    let stage = fs::canonicalize(&target.install_root).map_err(|error| error.to_string())?;
+    let destination = physical_runtime_destination(&target.final_install_root)?;
+    let mut directories = vec![target.install_files.clone()];
+    let mut bindings = Vec::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            if kind.is_dir() {
+                directories.push(entry.path());
+            } else if kind.is_symlink()
+                && let Some(old) =
+                    windows_junction::target(&entry.path()).map_err(|error| error.to_string())?
+            {
+                // The usual target already has the stage's physical spelling.
+                // Resolve alternate native spellings only while the stage exists.
+                // Never follow directory edges during traversal, including cycles.
+                let normalized = clean_path(&old);
+                let relative = normalized
+                    .strip_prefix(&stage)
+                    .ok()
+                    .map(Path::to_path_buf)
+                    .or_else(|| {
+                        old.ancestors().find_map(|ancestor| {
+                            let physical = fs::canonicalize(ancestor).ok()?;
+                            let relative = physical.strip_prefix(&stage).ok()?;
+                            Some(relative.join(old.strip_prefix(ancestor).ok()?))
+                        })
+                    });
+                if let Some(relative) = relative {
+                    bindings.push((entry.path(), old, destination.join(relative)));
+                }
+            }
+        }
+    }
+    if bindings.is_empty() {
+        return Ok(());
+    }
+    let modules = target.install_files.join("node_modules");
+    if let Some(expected) = meta.runtime_sha256.as_deref()
+        && tree_sha256(&modules)? != expected
+    {
+        return Err("prepared runtime changed before junction publication".into());
+    }
+    // Prepared callers have finished, the target is consumed, and both mutation
+    // and namespace locks are held. A partial failure only discards this stage;
+    // the predecessor has not been moved or modified.
+    for (link, old, new) in bindings {
+        windows_junction::retarget(&link, &old, &new).map_err(|error| {
+            format!(
+                "failed to publish runtime junction {}: {error}",
+                display_path(&link)
+            )
+        })?;
+    }
+    if meta.runtime_sha256.is_some() {
+        // v1 includes the stored link target. Preserve that format and hash the
+        // actual final representation, without following now-dangling targets.
+        meta.runtime_sha256 = Some(tree_sha256(&modules)?);
+    }
+    Ok(())
+}
+
 fn publish_runtime(target: RuntimeInstallTarget, meta: RuntimeMeta) -> Result<RuntimeMeta, String> {
     target.finish_children()?;
     let _namespace_locks =
@@ -3580,6 +3825,12 @@ fn publish_runtime(target: RuntimeInstallTarget, meta: RuntimeMeta) -> Result<Ru
         &target.final_meta_path,
         Some(&target.final_install_root),
     )?;
+    #[cfg(windows)]
+    let meta = {
+        let mut meta = meta;
+        publish_runtime_junctions(&target, &mut meta)?;
+        meta
+    };
     let nonce = now_utc().unix_timestamp_nanos();
     let backup_root = target
         .final_install_root
@@ -4055,7 +4306,6 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
         local_adapter.as_ref(),
         &source_extensions,
     )?;
-    let mut bindings = CompanionDependencyBindings::default();
     meta.companions = packed_companions
         .iter()
         .map(|packed| {
@@ -4066,11 +4316,9 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
                 context,
                 local_adapter.as_ref(),
                 &target,
-                &mut bindings,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    bindings.finalize(&target)?;
     meta.runtime_sha256 = Some(tree_sha256(&target.install_files.join("node_modules"))?);
     // A published runtime contains installed files, never packing scratch.
     target.finish_children()?;
@@ -4326,16 +4574,196 @@ pub(crate) fn prepare_runtime_from_selected_official_openclaw_release(
     }
 }
 
+/// Normal integrity reads use the filesystem directly. Windows recovery reads
+/// project recorded internal targets into saved bytes before following a link.
+/// Backup links and the v1 integrity digest remain byte-for-byte unchanged.
+#[derive(Default)]
+struct RuntimeReadPaths {
+    #[cfg(windows)]
+    recovery: Option<RuntimeRecoveryReadPaths>,
+}
+
+#[cfg(windows)]
+struct RuntimeRecoveryReadPaths {
+    original: PathBuf,
+    physical: PathBuf,
+    saved: PathBuf,
+    parent_name_ignores_case: bool,
+}
+
+#[cfg(windows)]
+impl RuntimeRecoveryReadPaths {
+    fn new(original: &Path, saved: &Path) -> Result<Self, String> {
+        let physical = physical_runtime_destination(original)?;
+        // The surviving store owns the spelling of its runtime directory. Its
+        // setting says nothing about names inside that possibly absent directory.
+        // If the flag is unavailable, retain exact matching.
+        let parent_name_ignores_case =
+            physical
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|store| {
+                    windows_directory_is_case_sensitive(store).is_ok_and(|flag| !flag)
+                });
+        Ok(Self {
+            original: original.to_path_buf(),
+            physical,
+            saved: fs::canonicalize(saved).map_err(|error| error.to_string())?,
+            parent_name_ignores_case,
+        })
+    }
+
+    fn relative<'a>(&self, target: &'a Path) -> Option<&'a Path> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+        if let Ok(relative) = target
+            .strip_prefix(&self.physical)
+            .or_else(|_| target.strip_prefix(&self.original))
+        {
+            return Some(relative);
+        }
+        if !self.parent_name_ignores_case {
+            return None;
+        }
+        let parent = self.physical.parent()?;
+        let mut components = target.strip_prefix(parent.parent()?).ok()?.components();
+        let parent_name = components.next()?.as_os_str();
+        let runtime_name = components.next()?.as_os_str();
+        // Only the runtime-parent spelling may have been lost. Never fold the
+        // surviving ancestor, runtime leaf, or external sibling namespaces.
+        if runtime_name != self.physical.file_name()? {
+            return None;
+        }
+        let left = parent_name.encode_wide().collect::<Vec<_>>();
+        let right = parent.file_name()?.encode_wide().collect::<Vec<_>>();
+        let equal = unsafe {
+            CompareStringOrdinal(
+                left.as_ptr(),
+                i32::try_from(left.len()).ok()?,
+                right.as_ptr(),
+                i32::try_from(right.len()).ok()?,
+                1,
+            ) == CSTR_EQUAL
+        };
+        equal.then(|| components.as_path())
+    }
+}
+
+#[cfg(windows)]
+fn windows_directory_is_case_sensitive(path: &Path) -> std::io::Result<bool> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        FileCaseSensitiveInfo, GetFileInformationByHandleEx,
+    };
+    use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
+
+    let directory = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut info = FILE_CASE_SENSITIVE_INFO { Flags: 0 };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            directory.as_raw_handle(),
+            FileCaseSensitiveInfo,
+            (&mut info as *mut FILE_CASE_SENSITIVE_INFO).cast(),
+            std::mem::size_of_val(&info) as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0)
+}
+
+impl RuntimeReadPaths {
+    fn resolve<'a>(&self, path: &'a Path) -> Result<std::borrow::Cow<'a, Path>, String> {
+        #[cfg(windows)]
+        if let Some(paths) = &self.recovery {
+            let mut pending = path.to_path_buf();
+            // Match the OS's bounded link resolution, without walking through
+            // the current runtime (which may be absent or contain newer bytes).
+            for _ in 0..40 {
+                let mut resolved = PathBuf::new();
+                let mut components = pending.components();
+                let mut redirected = None;
+                while let Some(component) = components.next() {
+                    resolved.push(component.as_os_str());
+                    if !matches!(component, Component::Normal(_)) {
+                        continue;
+                    }
+                    let metadata =
+                        fs::symlink_metadata(&resolved).map_err(|error| error.to_string())?;
+                    if metadata.file_type().is_symlink() {
+                        let target = crate::infra::windows_junction::target(&resolved)
+                            .map_err(|error| error.to_string())?
+                            .map(Ok)
+                            .unwrap_or_else(|| fs::read_link(&resolved))
+                            .map_err(|error| error.to_string())?;
+                        let target = if target.is_absolute() {
+                            target
+                        } else {
+                            clean_path(&resolved.parent().unwrap().join(target))
+                        };
+                        let projected = paths
+                            .relative(&target)
+                            .map(|relative| paths.saved.join(relative))
+                            .unwrap_or(target);
+                        redirected = Some(clean_path(&projected.join(components.as_path())));
+                        break;
+                    }
+                }
+                if let Some(next) = redirected {
+                    pending = next;
+                } else {
+                    return Ok(std::borrow::Cow::Owned(resolved));
+                }
+            }
+            return Err(format!(
+                "runtime recovery link cycle at {}",
+                display_path(path)
+            ));
+        }
+        Ok(std::borrow::Cow::Borrowed(path))
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        self.resolve(path).is_ok_and(|path| path.exists())
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        self.resolve(path).is_ok_and(|path| path.is_dir())
+    }
+
+    fn read_dir(&self, path: &Path) -> std::io::Result<fs::ReadDir> {
+        fs::read_dir(self.resolve(path).map_err(std::io::Error::other)?)
+    }
+}
+
 fn runtime_execution_issue(meta: &RuntimeMeta, env: &BTreeMap<String, String>) -> Option<String> {
+    runtime_execution_issue_with_paths(meta, env, &RuntimeReadPaths::default())
+}
+
+fn runtime_execution_issue_with_paths(
+    meta: &RuntimeMeta,
+    env: &BTreeMap<String, String>,
+    paths: &RuntimeReadPaths,
+) -> Option<String> {
     let binary_path = Path::new(&meta.binary_path);
-    if !path_exists(binary_path) {
+    let actual_binary_path = match paths.resolve(binary_path) {
+        Ok(path) => path,
+        Err(error) => return Some(error),
+    };
+    if !path_exists(&actual_binary_path) {
         return Some(format!(
             "binary path does not exist: {}",
             display_path(binary_path)
         ));
     }
 
-    let metadata = match fs::metadata(binary_path) {
+    let metadata = match fs::metadata(&actual_binary_path) {
         Ok(metadata) => metadata,
         Err(error) => return Some(error.to_string()),
     };
@@ -4351,7 +4779,7 @@ fn runtime_execution_issue(meta: &RuntimeMeta, env: &BTreeMap<String, String>) -
             Ok(value) => value,
             Err(error) => return Some(error),
         };
-        let actual_sha256 = match file_sha256(binary_path) {
+        let actual_sha256 = match file_sha256(&actual_binary_path) {
             Ok(value) => value,
             Err(error) => return Some(error),
         };
@@ -4364,7 +4792,7 @@ fn runtime_execution_issue(meta: &RuntimeMeta, env: &BTreeMap<String, String>) -
 
     if (is_official_openclaw_package_runtime(meta, env) || is_openclaw_package_runtime(meta))
         && let Some(package_root) = openclaw_package_root_from_binary(binary_path)
-        && let Some(issue) = openclaw_package_runtime_dependency_layout_issue(&package_root)
+        && let Some(issue) = openclaw_package_runtime_dependency_layout_issue(&package_root, paths)
     {
         return Some(issue);
     }
@@ -4372,7 +4800,10 @@ fn runtime_execution_issue(meta: &RuntimeMeta, env: &BTreeMap<String, String>) -
     None
 }
 
-fn runtime_companion_integrity_issue(meta: &RuntimeMeta) -> Option<String> {
+fn runtime_companion_integrity_issue(
+    meta: &RuntimeMeta,
+    paths: &RuntimeReadPaths,
+) -> Option<String> {
     let package_root = openclaw_package_root_from_binary(Path::new(&meta.binary_path))?;
     for companion in &meta.companions {
         if validate_local_companion_id(&companion.id).is_err() {
@@ -4413,6 +4844,10 @@ fn runtime_companion_integrity_issue(meta: &RuntimeMeta) -> Option<String> {
         }
         let companion_root = package_root.join("dist/extensions").join(&companion.id);
         let package_json_path = companion_root.join("package.json");
+        let package_json_path = match paths.resolve(&package_json_path) {
+            Ok(path) => path,
+            Err(error) => return Some(error),
+        };
         let package = match load_json_value(&package_json_path, "runtime companion package.json") {
             Ok(value) => value,
             Err(error) => return Some(error),
@@ -4428,6 +4863,10 @@ fn runtime_companion_integrity_issue(meta: &RuntimeMeta) -> Option<String> {
             ));
         }
         let entrypoint_path = package_root.join(&companion.entrypoint);
+        let entrypoint_path = match paths.resolve(&entrypoint_path) {
+            Ok(path) => path,
+            Err(error) => return Some(error),
+        };
         if !entrypoint_path.is_file() {
             return Some(format!(
                 "runtime companion {} entrypoint does not exist: {}",
@@ -4457,10 +4896,18 @@ pub(crate) fn runtime_operational_issue(
     meta: &RuntimeMeta,
     env: &BTreeMap<String, String>,
 ) -> Option<String> {
-    if let Some(issue) = runtime_execution_issue(meta, env) {
+    runtime_operational_issue_with_paths(meta, env, &RuntimeReadPaths::default())
+}
+
+fn runtime_operational_issue_with_paths(
+    meta: &RuntimeMeta,
+    env: &BTreeMap<String, String>,
+    paths: &RuntimeReadPaths,
+) -> Option<String> {
+    if let Some(issue) = runtime_execution_issue_with_paths(meta, env, paths) {
         return Some(issue);
     }
-    if let Some(issue) = runtime_companion_integrity_issue(meta) {
+    if let Some(issue) = runtime_companion_integrity_issue(meta, paths) {
         return Some(issue);
     }
 
@@ -4471,7 +4918,39 @@ pub fn runtime_integrity_issue(
     meta: &RuntimeMeta,
     env: &BTreeMap<String, String>,
 ) -> Option<String> {
-    if let Some(issue) = runtime_operational_issue(meta, env) {
+    runtime_integrity_issue_with_paths(meta, env, &RuntimeReadPaths::default())
+}
+
+#[cfg(windows)]
+pub(crate) fn runtime_recovery_integrity_issue(
+    meta: &RuntimeMeta,
+    original_root: &Path,
+    env: &BTreeMap<String, String>,
+) -> Option<String> {
+    let paths = (|| {
+        let saved = meta
+            .install_root
+            .as_deref()
+            .ok_or("missing recovery root")?;
+        Ok::<_, String>(RuntimeReadPaths {
+            recovery: Some(RuntimeRecoveryReadPaths::new(
+                original_root,
+                Path::new(saved),
+            )?),
+        })
+    })();
+    match paths {
+        Ok(paths) => runtime_integrity_issue_with_paths(meta, env, &paths),
+        Err(error) => Some(error),
+    }
+}
+
+fn runtime_integrity_issue_with_paths(
+    meta: &RuntimeMeta,
+    env: &BTreeMap<String, String>,
+    paths: &RuntimeReadPaths,
+) -> Option<String> {
+    if let Some(issue) = runtime_operational_issue_with_paths(meta, env, paths) {
         return Some(issue);
     }
 
@@ -4511,6 +4990,348 @@ pub fn verify_runtime_binary(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    fn prepared_junction_runtime(
+        root: &std::path::Path,
+        env: &std::collections::BTreeMap<String, String>,
+        value: &str,
+    ) -> super::PreparedRuntimeInstall {
+        use crate::infra::windows_junction;
+
+        let target = super::prepare_runtime_install_target(
+            "stable".into(),
+            true,
+            super::InstallContext {
+                env,
+                cwd: root,
+                runtime_guard: None,
+            },
+        )
+        .unwrap();
+        let modules = target.install_files.join("node_modules");
+        let package = modules.join(".store/host/node_modules/openclaw");
+        std::fs::create_dir_all(package.join("node_modules")).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"name":"openclaw"}"#).unwrap();
+        std::fs::write(
+            package.join("openclaw.mjs"),
+            format!("console.log('{value}');\n"),
+        )
+        .unwrap();
+        let package = std::fs::canonicalize(package).unwrap();
+        windows_junction::create(&package, &modules.join("openclaw")).unwrap();
+        windows_junction::create(&package, &package.join("node_modules/self")).unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), "untouched").unwrap();
+        windows_junction::create(
+            &std::fs::canonicalize(&outside).unwrap(),
+            &modules.join("external"),
+        )
+        .unwrap();
+        let binary = super::installed_openclaw_binary_path(&target.install_files);
+        let meta = super::build_installed_runtime_meta(
+            &target,
+            &binary,
+            &super::RuntimeSourceDetails {
+                sha256: Some(crate::infra::download::file_sha256(&binary).unwrap()),
+                ..Default::default()
+            },
+            Some(crate::infra::tree_digest::tree_sha256(&modules).unwrap()),
+            &super::RuntimeReleaseDetails::default(),
+            None,
+        );
+        super::PreparedRuntimeInstall {
+            target: Some(target),
+            meta,
+            reused: false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_junction_runtime_exec(binary: &std::path::Path, expected: &str) {
+        let output = std::process::Command::new("node")
+            .arg(binary)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_junction_publication_preserves_preparation_and_failed_replacement() {
+        use crate::infra::{tree_digest::tree_sha256, windows_junction};
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        windows_junction::tests::without_symlink_privilege(|| {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("physical-store")).unwrap();
+            windows_junction::create(
+                &std::fs::canonicalize(root.path().join("physical-store")).unwrap(),
+                &root.path().join("store"),
+            )
+            .unwrap();
+            let env = std::collections::BTreeMap::from([(
+                "OCM_HOME".into(),
+                root.path().join("store").display().to_string(),
+            )]);
+            let prepared = prepared_junction_runtime(root.path(), &env, "original");
+            let stage = prepared.target.as_ref().unwrap().install_root.clone();
+            assert_junction_runtime_exec(&prepared.prepared_binary_path(), "original");
+            let original = prepared.commit().unwrap();
+            assert!(!stage.exists());
+            assert_eq!(super::runtime_integrity_issue(&original, &env), None);
+            assert_junction_runtime_exec(std::path::Path::new(&original.binary_path), "original");
+            let installed = std::path::Path::new(original.install_root.as_ref().unwrap());
+            let modules = installed.join("files/node_modules");
+            assert_eq!(
+                std::fs::canonicalize(modules.join("openclaw")).unwrap(),
+                std::fs::canonicalize(modules.join("openclaw/node_modules/self")).unwrap(),
+            );
+            let original_digest = tree_sha256(&modules).unwrap();
+            let meta_path = super::runtime_meta_path("stable", &env, root.path()).unwrap();
+            let original_metadata = std::fs::read(&meta_path).unwrap();
+
+            let changed = prepared_junction_runtime(root.path(), &env, "candidate");
+            let stage = changed.target.as_ref().unwrap().install_root.clone();
+            std::fs::write(changed.prepared_binary_path(), "console.log('modified');").unwrap();
+            assert!(
+                changed
+                    .commit()
+                    .unwrap_err()
+                    .contains("prepared runtime changed")
+            );
+            assert!(!stage.exists());
+            assert_eq!(std::fs::read(&meta_path).unwrap(), original_metadata);
+            assert_eq!(tree_sha256(&modules).unwrap(), original_digest);
+
+            let refused = prepared_junction_runtime(root.path(), &env, "candidate");
+            let stage = refused.target.as_ref().unwrap().install_root.clone();
+            assert_junction_runtime_exec(&refused.prepared_binary_path(), "candidate");
+            // The old root moves first, then metadata rename fails. Rollback must
+            // restore the old root; stage cleanup must not follow its final links.
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&meta_path)
+                .unwrap();
+            assert!(
+                refused
+                    .commit()
+                    .unwrap_err()
+                    .contains("failed to preserve runtime")
+            );
+            drop(held);
+            assert!(!stage.exists());
+            assert_eq!(std::fs::read(&meta_path).unwrap(), original_metadata);
+            assert_eq!(tree_sha256(&modules).unwrap(), original_digest);
+            assert_junction_runtime_exec(std::path::Path::new(&original.binary_path), "original");
+
+            let replacement = prepared_junction_runtime(root.path(), &env, "replacement");
+            assert_junction_runtime_exec(&replacement.prepared_binary_path(), "replacement");
+            let replacement = replacement.commit().unwrap();
+            assert_eq!(super::runtime_integrity_issue(&replacement, &env), None);
+            assert_junction_runtime_exec(
+                std::path::Path::new(&replacement.binary_path),
+                "replacement",
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("outside/sentinel")).unwrap(),
+                "untouched"
+            );
+            assert_eq!(
+                windows_junction::target(&modules.join("external"))
+                    .unwrap()
+                    .unwrap(),
+                std::fs::canonicalize(root.path().join("outside")).unwrap(),
+            );
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_junction_recovery_reads_saved_bytes_with_absent_or_replaced_final_root() {
+        use crate::infra::{tree_digest::tree_sha256, windows_junction};
+        use crate::store::common::{copy_dir_preserving_modes, remove_owned_tree, write_json};
+        use crate::store::layout::upgrade_history_runtime_recovery_dir;
+        use crate::store::upgrade_history::get_upgrade_runtime_recovery;
+
+        windows_junction::tests::without_symlink_privilege(|| {
+            for runtime_parent in ["runtimes", "Runtimes"] {
+                let root = tempfile::tempdir().unwrap();
+                std::fs::create_dir_all(root.path().join("physical-store").join(runtime_parent))
+                    .unwrap();
+                windows_junction::create(
+                    &std::fs::canonicalize(root.path().join("physical-store")).unwrap(),
+                    &root.path().join("store"),
+                )
+                .unwrap();
+                let env = std::collections::BTreeMap::from([(
+                    "OCM_HOME".into(),
+                    root.path().join("store").display().to_string(),
+                )]);
+                let original = prepared_junction_runtime(root.path(), &env, "saved")
+                    .commit()
+                    .unwrap();
+                let installed = std::path::Path::new(original.install_root.as_ref().unwrap());
+                // Junction preservation is confined to the existing runtime copier.
+                assert!(
+                    super::copy_dir_recursive(installed, &root.path().join("ordinary-copy"))
+                        .is_err()
+                );
+                assert_eq!(super::runtime_integrity_issue(&original, &env), None);
+                let recovery = upgrade_history_runtime_recovery_dir(
+                    "demo",
+                    "transaction",
+                    "stable",
+                    &env,
+                    root.path(),
+                )
+                .unwrap();
+                let backup = recovery.join("install-root");
+                copy_dir_preserving_modes(installed, &backup).unwrap();
+                write_json(&recovery.join("runtime.json"), &original).unwrap();
+                std::fs::write(recovery.parent().unwrap().join("snapshot-id"), "snapshot").unwrap();
+                let modules = backup.join("files/node_modules");
+                let digest = tree_sha256(&modules).unwrap();
+                assert_eq!(original.runtime_sha256.as_deref(), Some(digest.as_str()));
+                let runtimes = installed.parent().unwrap();
+                remove_owned_tree(runtimes).unwrap();
+                assert!(
+                    !backup
+                        .join("files/node_modules/openclaw/openclaw.mjs")
+                        .exists()
+                );
+                let load = || {
+                    get_upgrade_runtime_recovery(
+                        "demo",
+                        "transaction",
+                        "snapshot",
+                        "stable",
+                        &env,
+                        root.path(),
+                    )
+                };
+                assert!(load().is_ok());
+                assert!(!runtimes.exists(), "recovery admission must be read-only");
+
+                let replacement = prepared_junction_runtime(root.path(), &env, "current")
+                    .commit()
+                    .unwrap();
+                assert_junction_runtime_exec(
+                    std::path::Path::new(&replacement.binary_path),
+                    "current",
+                );
+                assert!(
+                    load().is_ok(),
+                    "must validate saved bytes instead of current bytes"
+                );
+                assert_eq!(tree_sha256(&modules).unwrap(), digest);
+                let saved_binary = modules.join(".store/host/node_modules/openclaw/openclaw.mjs");
+                let saved_bytes = std::fs::read(&saved_binary).unwrap();
+                std::fs::write(&saved_binary, "corrupt saved payload").unwrap();
+                assert!(load().unwrap_err().contains("sha256 mismatch"));
+                assert_eq!(super::runtime_integrity_issue(&replacement, &env), None);
+                std::fs::write(&saved_binary, saved_bytes).unwrap();
+                let recovery = load().unwrap();
+                remove_owned_tree(installed).unwrap();
+                copy_dir_preserving_modes(&recovery.install_root, installed).unwrap();
+                assert_eq!(super::runtime_integrity_issue(&original, &env), None);
+                assert_junction_runtime_exec(std::path::Path::new(&original.binary_path), "saved");
+                remove_owned_tree(&backup).unwrap();
+                assert_eq!(super::runtime_integrity_issue(&original, &env), None);
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("outside/sentinel")).unwrap(),
+                    "untouched"
+                );
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_junction_recovery_keeps_case_sensitive_external_siblings() {
+        use crate::infra::{tree_digest::tree_sha256, windows_junction};
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+            FileCaseSensitiveInfo, SetFileInformationByHandle,
+        };
+        use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
+
+        windows_junction::tests::without_symlink_privilege(|| {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("store");
+            std::fs::create_dir(&home).unwrap();
+            let directory = std::fs::OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&home)
+                .unwrap();
+            let info = FILE_CASE_SENSITIVE_INFO {
+                Flags: FILE_CS_FLAG_CASE_SENSITIVE_DIR,
+            };
+            assert_ne!(
+                unsafe {
+                    SetFileInformationByHandle(
+                        directory.as_raw_handle(),
+                        FileCaseSensitiveInfo,
+                        (&info as *const FILE_CASE_SENSITIVE_INFO).cast(),
+                        std::mem::size_of_val(&info) as u32,
+                    )
+                },
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            drop(directory);
+            assert!(super::windows_directory_is_case_sensitive(&home).unwrap());
+
+            let original = home.join("runtimes/stable");
+            let external = home.join("Runtimes/stable");
+            let saved = root.path().join("saved");
+            for (path, bytes) in [
+                (&original, "current"),
+                (&external, "external"),
+                (&saved, "saved"),
+            ] {
+                std::fs::create_dir_all(path.join("files")).unwrap();
+                std::fs::write(path.join("files/value"), bytes).unwrap();
+            }
+            let external = std::fs::canonicalize(&external).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(original.join("files/value")).unwrap(),
+                "current"
+            );
+            let link = saved.join("external");
+            windows_junction::create(&external, &link).unwrap();
+            let digest = tree_sha256(&saved).unwrap();
+            std::fs::remove_dir_all(original.parent().unwrap()).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(external.join("files/value")).unwrap(),
+                "external"
+            );
+            let paths = super::RuntimeReadPaths {
+                recovery: Some(super::RuntimeRecoveryReadPaths::new(&original, &saved).unwrap()),
+            };
+            let input = link.join("files/value");
+            let resolved = paths.resolve(&input).unwrap();
+            assert_eq!(std::fs::read_to_string(&resolved).unwrap(), "external");
+            assert_eq!(
+                std::fs::canonicalize(&resolved).unwrap(),
+                external.join("files/value")
+            );
+            assert_eq!(windows_junction::target(&link).unwrap(), Some(external));
+            assert_eq!(tree_sha256(&saved).unwrap(), digest);
+            assert!(!original.parent().unwrap().exists());
+        });
+    }
+
     #[cfg(windows)]
     #[test]
     fn native_npm_prefix_accepts_windows_paths() {
@@ -4879,64 +5700,6 @@ mod tests {
         )
         .unwrap();
         (root, env, binary)
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn companion_junction_finalization_and_stage_cleanup_preserve_predecessor() {
-        use crate::infra::windows_junction;
-
-        windows_junction::tests::without_symlink_privilege(|| {
-            for partial in [false, true] {
-                let (root, env, _) = binding_fixture();
-                let target = super::prepare_runtime_install_target(
-                    "candidate".into(),
-                    true,
-                    super::InstallContext {
-                        env: &env,
-                        cwd: root.path(),
-                        runtime_guard: None,
-                    },
-                )
-                .unwrap();
-                for (directory, value) in [
-                    (&target.install_files, "new"),
-                    (&target.final_install_root.join("files"), "old"),
-                ] {
-                    std::fs::create_dir_all(directory.join("package")).unwrap();
-                    std::fs::write(directory.join("package/value"), value).unwrap();
-                }
-                let stage = std::fs::canonicalize(&target.install_root).unwrap();
-                let source = stage.join("files/package");
-                let first = stage.join("files/first");
-                let second = stage.join("files/second");
-                windows_junction::create(&source, &first).unwrap();
-                windows_junction::create(&source, &second).unwrap();
-                let mut bindings = super::CompanionDependencyBindings::default();
-                bindings.junctions.insert(first.clone(), source.clone());
-                bindings.junctions.insert(second.clone(), source.clone());
-                let final_package = std::fs::canonicalize(&target.final_install_root)
-                    .unwrap()
-                    .join("files/package");
-                if partial {
-                    // A failed finalization can leave some owned links pointing at
-                    // the final root. Dropping the stage must never follow them.
-                    windows_junction::retarget(&first, &source, &final_package).unwrap();
-                    assert!(bindings.finalize(&target).is_err());
-                    windows_junction::validate_target(&second, &source).unwrap();
-                } else {
-                    // All validation and projection precedes updates, and uses the
-                    // staged identity even while an older final tree exists.
-                    bindings.finalize(&target).unwrap();
-                    windows_junction::validate_target(&first, &final_package).unwrap();
-                    windows_junction::validate_target(&second, &final_package).unwrap();
-                }
-                let old_value = target.final_install_root.join("files/package/value");
-                drop(target);
-                assert!(!stage.exists());
-                assert_eq!(std::fs::read_to_string(old_value).unwrap(), "old");
-            }
-        });
     }
 
     #[test]

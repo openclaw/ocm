@@ -2,10 +2,10 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{ERROR_NOT_A_REPARSE_POINT, GENERIC_WRITE};
@@ -198,6 +198,23 @@ pub(crate) fn create(target: &Path, link: &Path) -> io::Result<()> {
     create_with_data(link, &junction_data(target)?)
 }
 
+/// Inspect the actual substitute target, never the optional display name.
+/// Opening the reparse entry does not follow the junction or require its target.
+pub(crate) fn target(link: &Path) -> io::Result<Option<PathBuf>> {
+    let Some(data) = read_junction(&open_link(link, false)?)? else {
+        return Ok(None);
+    };
+    let mut name = substitute_name(&data)?
+        .chunks_exact(2)
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+        .collect::<Vec<_>>();
+    // NT DOS-device paths and Win32 verbatim paths name the same target.
+    if name.starts_with(&[92, 63, 63, 92]) {
+        name[1] = 92;
+    }
+    Ok(Some(PathBuf::from(std::ffi::OsString::from_wide(&name))))
+}
+
 fn check_target(file: &File, expected_target: &Path) -> io::Result<()> {
     let expected = junction_data(expected_target)?;
     let current =
@@ -206,11 +223,6 @@ fn check_target(file: &File, expected_target: &Path) -> io::Result<()> {
         return Err(invalid_data("junction target changed before publication"));
     }
     Ok(())
-}
-
-/// Check the stored target without the display-path conversion in fs::read_link.
-pub(crate) fn validate_target(link: &Path, expected_target: &Path) -> io::Result<()> {
-    check_target(&open_link(link, false)?, expected_target)
 }
 
 /// Update only a junction still naming the expected absolute target spelling.
@@ -341,6 +353,10 @@ pub(crate) mod tests {
             fs::create_dir(&second).unwrap();
             let link = first.join("alias");
             create(&canonical_target, &link).unwrap();
+            assert_eq!(
+                super::target(&link).unwrap().as_deref(),
+                Some(canonical_target.as_path())
+            );
             assert_eq!(fs::canonicalize(&link).unwrap(), canonical_target);
             assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
             let original = read_junction(&open_link(&link, false).unwrap())
