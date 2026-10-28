@@ -3396,12 +3396,11 @@ fn lock_runtime_publication_paths(
 
 #[cfg(windows)]
 fn physical_runtime_destination(root: &Path) -> Result<PathBuf, String> {
-    // Resolve the parent, never an existing predecessor's contents.
+    // Resolve existing ancestors, never an existing predecessor's contents.
+    // Recovery must not require (or recreate) the live runtime directory.
     let parent = root.parent().ok_or("runtime root has no parent")?;
     let name = root.file_name().ok_or("runtime root has no name")?;
-    Ok(fs::canonicalize(parent)
-        .map_err(|error| error.to_string())?
-        .join(name))
+    Ok(super::openclaw_workspaces::canonicalize_path_allow_missing(parent)?.join(name))
 }
 
 #[cfg(windows)]
@@ -4756,7 +4755,8 @@ mod tests {
             let modules = backup.join("files/node_modules");
             let digest = tree_sha256(&modules).unwrap();
             assert_eq!(original.runtime_sha256.as_deref(), Some(digest.as_str()));
-            remove_owned_tree(installed).unwrap();
+            let runtimes = installed.parent().unwrap();
+            remove_owned_tree(runtimes).unwrap();
             assert!(
                 !backup
                     .join("files/node_modules/openclaw/openclaw.mjs")
@@ -4773,7 +4773,7 @@ mod tests {
                 )
             };
             assert!(load().is_ok());
-            assert!(!installed.exists(), "recovery admission must be read-only");
+            assert!(!runtimes.exists(), "recovery admission must be read-only");
 
             let replacement = prepared_junction_runtime(root.path(), &env, "current")
                 .commit()

@@ -664,6 +664,7 @@ mod tests {
         )
         .unwrap();
 
+        assert!(!expected_install_root.parent().unwrap().exists());
         let recovery = get_upgrade_runtime_recovery(
             "demo",
             transaction_id,
@@ -673,6 +674,7 @@ mod tests {
             cwd,
         )
         .unwrap();
+        assert!(!expected_install_root.parent().unwrap().exists());
         assert_eq!(recovery.meta.release_version.as_deref(), Some("2026.6.11"));
         assert_eq!(recovery.install_root, recovery_install_root);
 
