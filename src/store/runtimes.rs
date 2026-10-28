@@ -1947,9 +1947,6 @@ fn copy_companion_runtime_dependencies(
     own_package_path: &Path,
 ) -> Result<(), String> {
     ensure_dir(destination_node_modules)?;
-    let own_scope = (own_package_path.components().count() == 2)
-        .then(|| own_package_path.parent())
-        .flatten();
     for entry in fs::read_dir(source_node_modules).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let source = entry.path();
@@ -1957,26 +1954,27 @@ fn copy_companion_runtime_dependencies(
         if relative == Path::new(".package-lock.json") {
             continue;
         }
-        if own_scope == Some(relative.as_path()) {
+        // Preserve the package's private dependencies and binary links. A scope
+        // is a namespace, so merge its absent packages rather than the directory.
+        if entry.file_name().to_string_lossy().starts_with('@') || relative == Path::new(".bin") {
             let scope_destination = destination_node_modules.join(&relative);
             ensure_dir(&scope_destination)?;
             for scoped_entry in fs::read_dir(&source).map_err(|error| error.to_string())? {
                 let scoped_entry = scoped_entry.map_err(|error| error.to_string())?;
                 let scoped_relative = relative.join(scoped_entry.file_name());
-                if scoped_relative == own_package_path {
+                let destination = destination_node_modules.join(&scoped_relative);
+                if scoped_relative == own_package_path || path_exists(&destination) {
                     continue;
                 }
-                copy_path(
-                    &scoped_entry.path(),
-                    &destination_node_modules.join(scoped_relative),
-                )?;
+                copy_path(&scoped_entry.path(), &destination)?;
             }
             continue;
         }
-        if relative == own_package_path {
+        let destination = destination_node_modules.join(&relative);
+        if relative == own_package_path || path_exists(&destination) {
             continue;
         }
-        copy_path(&source, &destination_node_modules.join(relative))?;
+        copy_path(&source, &destination)?;
     }
     Ok(())
 }
@@ -2097,6 +2095,16 @@ fn install_local_openclaw_companion(
         &install_root.join("node_modules"),
         &target_package_root.join("node_modules"),
         &package_path,
+    )?;
+    // The isolated npm tree is packing scratch and is removed before publication.
+    // Copy bindings from its physical package ancestry; links into it cannot live
+    // in the published runtime, including links inherited by copied dependencies.
+    preserve_materialized_extension_dependencies(
+        install_files,
+        &install_root,
+        &source_package_root,
+        &target_package_root,
+        copy_dir_recursive,
     )?;
     ensure_local_extension_openclaw_peer(&openclaw_package_root, &target_package_root)?;
 
@@ -2581,11 +2589,14 @@ fn installed_dependency_directory(
 
 fn preserve_materialized_extension_dependencies(
     install_files: &Path,
+    source_install_files: &Path,
     installed_package: &Path,
     target: &Path,
     link_or_copy: fn(&Path, &Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let install_files = fs::canonicalize(install_files).map_err(|error| error.to_string())?;
+    let source_install_files =
+        fs::canonicalize(source_install_files).map_err(|error| error.to_string())?;
     let host = fs::canonicalize(installed_openclaw_package_root(&install_files))
         .map_err(|error| error.to_string())?;
     let source = fs::canonicalize(installed_package).map_err(|error| error.to_string())?;
@@ -2615,7 +2626,7 @@ fn preserve_materialized_extension_dependencies(
             let relative = npm_package_relative_path(name)
                 .ok_or_else(|| format!("invalid installed extension dependency name: {name}"))?;
             let Some(dependency) =
-                installed_dependency_directory(&source, &relative, &install_files)?
+                installed_dependency_directory(&source, &relative, &source_install_files)?
             else {
                 // npm may omit an optional dependency. Do not install anything here.
                 continue;
@@ -2623,7 +2634,7 @@ fn preserve_materialized_extension_dependencies(
             if let Some(resolved) =
                 installed_dependency_directory(&target, &relative, &install_files)?
             {
-                if resolved == dependency {
+                if resolved == dependency && dependency.starts_with(&install_files) {
                     // A link to the original package retains its complete npm ancestry.
                     continue;
                 }
@@ -2699,6 +2710,7 @@ fn materialize_local_source_extensions(
         }
         copy_dir_recursive(&installed_package, &target)?;
         preserve_materialized_extension_dependencies(
+            install_files,
             install_files,
             &installed_package,
             &target,
@@ -4518,6 +4530,55 @@ mod tests {
     }
 
     #[test]
+    fn companion_prefix_copy_preserves_private_packages_and_merges_namespaces() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().join("prefix");
+        let target = root.path().join("target");
+        for (base, relative, content) in [
+            (&prefix, "plain/package.json", "prefix"),
+            (&prefix, "@other/private/package.json", "prefix"),
+            (&prefix, "@other/extra/package.json", "extra"),
+            (&prefix, "@openclaw/codex/package.json", "own"),
+            (&prefix, ".bin/private", "prefix"),
+            (&prefix, ".bin/extra", "extra"),
+            (&target, "plain/package.json", "private"),
+            (&target, "@other/private/package.json", "private"),
+            (&target, ".bin/private", "private"),
+        ] {
+            let path = base.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        super::copy_companion_runtime_dependencies(
+            &prefix,
+            &target,
+            std::path::Path::new("@openclaw/codex"),
+        )
+        .unwrap();
+        for relative in [
+            "plain/package.json",
+            "@other/private/package.json",
+            ".bin/private",
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(target.join(relative)).unwrap(),
+                "private"
+            );
+            assert_eq!(
+                std::fs::read_to_string(prefix.join(relative)).unwrap(),
+                "prefix"
+            );
+        }
+        for relative in ["@other/extra/package.json", ".bin/extra"] {
+            assert_eq!(
+                std::fs::read_to_string(target.join(relative)).unwrap(),
+                "extra"
+            );
+        }
+        assert!(!target.join("@openclaw/codex").exists());
+    }
+
+    #[test]
     fn materialized_dependency_copy_fallback_preserves_nested_bindings_and_cycles() {
         let root = tempfile::tempdir().unwrap();
         let files = root.path();
@@ -4571,6 +4632,7 @@ mod tests {
         }
         super::copy_dir_recursive(&source, &target).unwrap();
         super::preserve_materialized_extension_dependencies(
+            files,
             files,
             &source,
             &target,

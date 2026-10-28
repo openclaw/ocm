@@ -248,6 +248,8 @@ the selected checkout unchanged.
 
 Repeat `--companion <plugin-id>` when the checkout contains an official plugin that is version-bound to the selected OpenClaw build but published separately. OCM uses OpenClaw's package-local plugin release contract, requires the plugin package version and `openclaw.build.openclawVersion` to match the root package exactly, installs its dependencies in an isolated runtime-owned tree, and stages it under `dist/extensions/<plugin-id>` so OpenClaw discovers it as bundled. The runtime record stores the package version plus artifact and entrypoint hashes, and `runtime verify` checks the installed entrypoint hash. OCM refuses missing, mismatched, non-publishable, duplicate, or already-bundled companion selections before publishing the runtime.
 
+Companion materialization retains npm-installed dependency bindings across hoisted, nested, and linked layouts without changing the selected npm strategy. Private dependency versions remain private, and the explicit OpenClaw peer uses the host runtime. Dependencies survive removal of packing scratch. `runtime verify` checks recorded integrity; after enabling a companion, use `ocm @<env> -- plugins inspect <plugin-id> --runtime --json` and inspect its status and diagnostics to verify loading.
+
 The installed runtime uses the same package layout as published OpenClaw runtimes:
 
 ```text

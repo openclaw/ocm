@@ -3726,6 +3726,208 @@ fn runtime_build_local_resolves_companion_manifest_id_and_staged_host_peer() {
 }
 
 #[test]
+fn runtime_build_local_preserves_native_companion_dependency_bindings() {
+    let root = TestDir::new("runtime-native-companion-bindings");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    fs::create_dir_all(&repo).unwrap();
+    let mut env = ocm_env(&root);
+    // Keep this dependency-layout test independent of prefix aliases on macOS.
+    env.insert(
+        "OCM_HOME".into(),
+        path_string(&fs::canonicalize(env.get("OCM_HOME").unwrap()).unwrap()),
+    );
+    env.insert("npm_config_offline".into(), "true".into());
+    env.insert(
+        "npm_config_cache".into(),
+        path_string(&root.child("npm-cache")),
+    );
+    env.insert("npm_config_audit".into(), "false".into());
+    env.insert("npm_config_fund".into(), "false".into());
+    let write_package = |dir: &Path, package: Value, entry: &str| {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("package.json"), package.to_string()).unwrap();
+        fs::write(dir.join("index.cjs"), entry).unwrap();
+    };
+    let pack = |dir: &Path| {
+        let output = Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
+            .args(["pack", "--json", "--ignore-scripts"])
+            .current_dir(dir)
+            .env_clear()
+            .envs(&env)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let result: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        format!(
+            "file:{}",
+            path_string(&dir.join(result[0]["filename"].as_str().unwrap()))
+        )
+    };
+    let shared = cwd.join("shared");
+    write_package(
+        &shared,
+        serde_json::json!({"name":"@private/value","version":"1.0.0","main":"index.cjs"}),
+        "module.exports=1;",
+    );
+    let shared_archive = pack(&shared);
+    let bridge = cwd.join("bridge");
+    write_package(
+        &bridge,
+        serde_json::json!({"name":"bridge","version":"1.0.0","main":"index.cjs",
+            "dependencies":{"@private/value":shared_archive}}),
+        "module.exports=require('@private/value');",
+    );
+    let bridge_archive = pack(&bridge);
+    let required = cwd.join("required");
+    write_package(
+        &required,
+        serde_json::json!({"name":"required-only","version":"1.0.0","main":"index.cjs",
+            "bin":{"required-tool":"index.cjs"}}),
+        "#!/usr/bin/env node\nmodule.exports='installed';",
+    );
+    let required_archive = pack(&required);
+    fs::write(
+        repo.join("package.json"),
+        serde_json::json!({
+            "name":"openclaw","version":"2026.10.8","type":"module",
+            "bin":{"openclaw":"openclaw.mjs"},"files":["openclaw.mjs","sdk.cjs"],
+            "exports":{"./sdk":"./sdk.cjs"},
+            "dependencies":{"@private/value":shared_archive}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(repo.join("sdk.cjs"), "module.exports='host-sdk';").unwrap();
+    write_executable_script(
+        &repo.join("openclaw.mjs"),
+        "#!/usr/bin/env node\nimport {createRequire} from 'node:module'; const require=createRequire(import.meta.url); console.log(JSON.stringify({host:require('@private/value'),companion:require('./dist/extensions/codex/index.cjs')}));\n",
+    );
+    // npm resolves peer metadata even with --omit=peer. Keep that resolution offline.
+    let host_archive = pack(&repo);
+    let companion = repo.join("extensions/codex");
+    let manifest = serde_json::json!({
+        "name":"@openclaw/codex","version":"2026.10.8","main":"index.cjs",
+        "files":["index.cjs","openclaw.plugin.json"],
+        "dependencies":{"@private/value":"2.0.0","bridge":bridge_archive,"required-only":required_archive},
+        "bundleDependencies":["@private/value"],
+        "peerDependencies":{"openclaw":host_archive},
+        "openclaw":{"build":{"openclawVersion":"2026.10.8"},
+            "release":{"publishToNpm":true},"runtimeExtensions":["./index.cjs"]}
+    });
+    write_package(
+        &companion,
+        manifest.clone(),
+        "module.exports={direct:require('@private/value'),transitive:require('bridge'),required:require('required-only'),peer:require('openclaw/sdk')};",
+    );
+    // npm bundles this private version while bridge inherits a different version.
+    // The scope deliberately differs from the companion's own @openclaw scope.
+    write_package(
+        &companion.join("node_modules/@private/value"),
+        serde_json::json!({"name":"@private/value","version":"2.0.0","main":"index.cjs"}),
+        "module.exports=2;",
+    );
+    fs::write(
+        companion.join("openclaw.plugin.json"),
+        r#"{"id":"codex","configSchema":{}}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(repo.join("scripts/lib")).unwrap();
+    // The fixture is already built. npm itself packs and installs every package.
+    for path in [
+        "scripts/lib/plugin-npm-runtime-build.mjs",
+        "scripts/generate-npm-package-lock.mjs",
+    ] {
+        fs::write(repo.join(path), "// fixture payload is already built\n").unwrap();
+    }
+    fs::write(repo.join("scripts/lib/plugin-npm-package-manifest.mjs"),
+        "import {spawnSync} from 'node:child_process'; const [,,run,dir,separator,command,...args]=process.argv; const child=spawnSync(command,args,{cwd:dir,stdio:'inherit',shell:process.platform==='win32'}); process.exit(child.status ?? 1);\n").unwrap();
+    let source_before = file_sha256(&companion.join("package.json")).unwrap();
+    for strategy in ["hoisted", "nested", "linked"] {
+        let mut selected_env = env.clone();
+        selected_env.insert("npm_config_install_strategy".into(), strategy.into());
+        let build = run_ocm(
+            &cwd,
+            &selected_env,
+            &[
+                "runtime",
+                "build-local",
+                strategy,
+                "--repo",
+                &path_string(&repo),
+                "--companion",
+                "codex",
+                "--json",
+            ],
+        );
+        assert!(build.status.success(), "{strategy}: {}", stderr(&build));
+        let installed = runtime_install_root(strategy, &env, &cwd).unwrap();
+        assert!(!installed.join("pack").exists());
+        let plugin = installed.join("files/node_modules/openclaw/dist/extensions/codex");
+        if strategy != "linked" {
+            assert!(plugin.join("node_modules/.bin/required-tool").is_file());
+        }
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", strategy, "--runtime", strategy],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        let launch = run_ocm(&cwd, &env, &[&format!("@{strategy}"), "--", "--version"]);
+        assert!(launch.status.success(), "{strategy}: {}", stderr(&launch));
+        let result: Value = serde_json::from_str(&stdout(&launch)).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"host":1,"companion":{
+            "direct":2,"transitive":1,"required":"installed","peer":"host-sdk"}}),
+            "{strategy}"
+        );
+        let verify = run_ocm(&cwd, &env, &["runtime", "verify", strategy, "--json"]);
+        assert!(verify.status.success(), "{strategy}: {}", stderr(&verify));
+        assert_eq!(
+            file_sha256(&companion.join("package.json")).unwrap(),
+            source_before
+        );
+        assert_eq!(
+            fs::read_to_string(companion.join("node_modules/@private/value/index.cjs")).unwrap(),
+            "module.exports=2;"
+        );
+    }
+    // A failure after dependency materialization must still discard the stage.
+    let mut invalid = manifest;
+    invalid["openclaw"]["runtimeExtensions"] = serde_json::json!(["./missing.cjs"]);
+    fs::write(companion.join("package.json"), invalid.to_string()).unwrap();
+    let failed = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "failed",
+            "--repo",
+            &path_string(&repo),
+            "--companion",
+            "codex",
+        ],
+    );
+    assert!(!failed.status.success());
+    assert!(
+        stderr(&failed).contains("missing runtime entrypoint"),
+        "{}",
+        stderr(&failed)
+    );
+    assert!(!runtime_install_root("failed", &env, &cwd).unwrap().exists());
+    let runtimes = Path::new(env.get("OCM_HOME").unwrap()).join("runtimes");
+    assert!(fs::read_dir(runtimes).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".stage-")
+    }));
+}
+
+#[test]
 fn runtime_build_local_rejects_mismatched_companion_before_packing() {
     let root = TestDir::new("runtime-build-local-companion-mismatch");
     let cwd = root.child("workspace");

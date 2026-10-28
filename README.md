@@ -425,7 +425,10 @@ plugins, repeat `runtime build-local --companion <plugin-id>`. OCM packages each
 selected plugin through OpenClaw's own package-local release contract, requires
 exact host-version parity, stages it as a runtime-owned bundled plugin with
 isolated dependencies, and records artifact and entrypoint hashes for runtime
-verification.
+verification. Materialization preserves the required dependency bindings npm
+installed, including linked and nested layouts, while the OpenClaw peer resolves
+to the host runtime. Verification checks integrity; use native plugin runtime
+inspection to check loading.
 
 `upgrade simulate` clones the source env, leaves the real env untouched, and
 cleans temporary simulation envs and runtimes when the run finishes. For
