@@ -266,6 +266,7 @@ fn closed_stdout_terminates_quietly() {
 fn native_log_fixture(
     root: &TestDir,
     lines: usize,
+    trailing_newline: bool,
 ) -> (
     std::path::PathBuf,
     std::collections::BTreeMap<String, String>,
@@ -279,6 +280,10 @@ fn native_log_fixture(
     let count = root.child("count");
     fs::write(&count, lines.to_string()).unwrap();
     env.insert("OCM_TEST_LOG_COUNT".into(), count.to_str().unwrap().into());
+    env.insert(
+        "OCM_TEST_LOG_ENDING".into(),
+        if trailing_newline { "\\n" } else { "" }.into(),
+    );
     let launcher = root.child("log-producer");
     write_executable_script(
         &launcher,
@@ -286,8 +291,8 @@ fn native_log_fixture(
 count=$(cat "$OCM_TEST_LOG_COUNT")
 i=0
 while [ "$i" -lt "$count" ]; do
-  printf 'native stdout record %08d payload payload payload payload\n' "$i"
-  printf 'native stderr record %08d payload payload payload payload\n' "$i" >&2
+  printf 'native stdout record %08d payload payload payload payload%b' "$i" "$OCM_TEST_LOG_ENDING"
+  printf 'native stderr record %08d payload payload payload payload%b' "$i" "$OCM_TEST_LOG_ENDING" >&2
   i=$((i + 1))
 done
 "#,
@@ -342,7 +347,7 @@ impl LogReader {
 #[test]
 fn logs_with_closed_stdout_terminate_quietly() {
     let root = TestDir::new("logs-closed-stdout");
-    let (cwd, env) = native_log_fixture(&root, 20000);
+    let (cwd, env) = native_log_fixture(&root, 20000, true);
     for stream in [vec![], vec!["--stream", "info"], vec!["--stream", "error"]] {
         for mode in [vec!["--raw"], vec!["--color", "always"], vec!["--json"]] {
             for follow in [false, true] {
@@ -412,7 +417,7 @@ fn logs_with_closed_stdout_terminate_quietly() {
 #[test]
 fn empty_and_pending_pretty_log_follow_stops_on_closed_stdout() {
     let root = TestDir::new("empty-logs-closed-stdout");
-    let (cwd, env) = native_log_fixture(&root, 0);
+    let (cwd, env) = native_log_fixture(&root, 0, true);
     for pending in [false, true] {
         if pending {
             for stream in ["stdout", "stderr"] {
@@ -453,7 +458,7 @@ fn logs_follow_exits_when_consumer_closes_after_initial_output() {
     for stream in [vec![], vec!["--stream", "info"], vec!["--stream", "error"]] {
         for mode in [vec!["--raw"], vec!["--color", "always"]] {
             let root = TestDir::new("logs-late-closed-stdout");
-            let (cwd, env) = native_log_fixture(&root, 1);
+            let (cwd, env) = native_log_fixture(&root, 1, true);
             let (reader, writer) = UnixStream::pair().unwrap();
             reader
                 .set_read_timeout(Some(std::time::Duration::from_secs(20)))
@@ -491,34 +496,79 @@ fn logs_follow_exits_when_consumer_closes_after_initial_output() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
-fn logs_preserve_non_broken_pipe_output_failures() {
-    let root = TestDir::new("logs-full-stdout");
-    let (cwd, env) = native_log_fixture(&root, 1);
-    for args in [
-        vec!["logs", "demo", "--raw"],
-        vec!["logs", "demo", "--raw", "--follow"],
-        vec!["logs", "demo", "--color", "always", "--follow"],
-        vec!["logs", "demo", "--json"],
-    ] {
+fn unterminated_native_log_snapshots_preserve_bytes_and_closed_consumer_success() {
+    let root = TestDir::new("logs-partial-stdout");
+    let (cwd, env) = native_log_fixture(&root, 1, false);
+    for (stream, source) in [("info", "stdout"), ("error", "stderr")] {
+        let args = ["logs", "demo", "--raw", "--stream", stream];
+        let expected = format!("native {source} record 00000000 payload payload payload payload");
+        assert_eq!(
+            fs::read(root.child(&format!("ocm-home/supervisor/logs/demo.{source}.log"))).unwrap(),
+            expected.as_bytes()
+        );
+        let captured = run_ocm(&cwd, &env, &args);
+        assert!(captured.status.success(), "{}", stderr(&captured));
+        assert_eq!(captured.stdout, expected.as_bytes());
+        assert!(captured.stderr.is_empty());
+
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
         let mut child = LogReader(
             Command::new(env!("CARGO_BIN_EXE_ocm"))
                 .current_dir(&cwd)
                 .env_clear()
                 .envs(&env)
-                .args(&args)
-                .stdout(
-                    fs::OpenOptions::new()
-                        .write(true)
-                        .open("/dev/full")
-                        .unwrap(),
-                )
-                .stderr(Stdio::null())
+                .args(args)
+                .stdout(Stdio::from(OwnedFd::from(writer)))
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
-        assert!(!wait_with_deadline(&mut child.0).success(), "{args:?}");
+        child.assert_quiet_success();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn logs_preserve_non_broken_pipe_output_failures() {
+    for trailing_newline in [false, true] {
+        let root = TestDir::new("logs-full-stdout");
+        let (cwd, env) = native_log_fixture(&root, 1, trailing_newline);
+        for stream in [vec![], vec!["--stream", "info"], vec!["--stream", "error"]] {
+            for mode in [
+                vec!["--raw"],
+                vec!["--raw", "--follow"],
+                vec!["--color", "always"],
+                vec!["--color", "always", "--follow"],
+                vec!["--json"],
+            ] {
+                let mut args = vec!["logs", "demo"];
+                args.extend_from_slice(&stream);
+                args.extend_from_slice(&mode);
+                let mut child = LogReader(
+                    Command::new(env!("CARGO_BIN_EXE_ocm"))
+                        .current_dir(&cwd)
+                        .env_clear()
+                        .envs(&env)
+                        .args(&args)
+                        .stdout(
+                            fs::OpenOptions::new()
+                                .write(true)
+                                .open("/dev/full")
+                                .unwrap(),
+                        )
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                );
+                assert!(
+                    !wait_with_deadline(&mut child.0).success(),
+                    "{args:?}, trailing_newline={trailing_newline}"
+                );
+            }
+        }
     }
 }
 

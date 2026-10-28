@@ -55,6 +55,27 @@ fn logs_reads_gateway_logs_from_the_env_root() {
 }
 
 #[test]
+fn raw_single_stream_snapshots_preserve_empty_and_unterminated_content() {
+    let root = TestDir::new("logs-raw-partial");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    setup_launcher_env(&cwd, &env);
+
+    let (stdout_path, stderr_path) = gateway_log_paths(&root);
+    fs::create_dir_all(stdout_path.parent().unwrap()).unwrap();
+    for content in ["", "partial", "complete line\nfinal € fragment"] {
+        for (stream, path) in [("info", &stdout_path), ("error", &stderr_path)] {
+            fs::write(path, content).unwrap();
+            let output = run_ocm(&cwd, &env, &["logs", "demo", "--raw", "--stream", stream]);
+            assert!(output.status.success(), "{}", stderr(&output));
+            assert_eq!(output.stdout, content.as_bytes());
+            assert!(output.stderr.is_empty());
+        }
+    }
+}
+
+#[test]
 fn logs_can_merge_stdout_and_stderr_in_one_snapshot() {
     let root = TestDir::new("logs-all-streams");
     let cwd = root.child("workspace");
