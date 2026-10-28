@@ -165,8 +165,12 @@ fn native_windows_companion_without_symlink_privilege() {
         assert_eq!(ready, [b'1']);
         let root = Path::new(&root);
         remove_child_symlink_privilege(root);
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/support/windows_companion_bindings.cjs");
+        let script_name = if std::env::var("OCM_TEST_ROOT_JUNCTION_PROBE").as_deref() == Ok("1") {
+            "tests/support/windows_runtime_root_probe.cjs"
+        } else {
+            "tests/support/windows_companion_bindings.cjs"
+        };
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join(script_name);
         let binary = ocm_test_binary_path();
         println!(
             "{}",
@@ -235,6 +239,11 @@ fn native_windows_companion_without_symlink_privilege() {
     env.insert(CHILD_ROOT.into(), path_string(fixture.path()));
     if let Ok(cases) = std::env::var("OCM_TEST_COMPANION_CASES") {
         env.insert("OCM_TEST_COMPANION_CASES".into(), cases);
+    }
+    for key in ["OCM_TEST_ROOT_JUNCTION_PROBE", "OCM_TEST_OPENCLAW_SOURCE"] {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.into(), value);
+        }
     }
     let args = ["--exact", TEST_NAME, "--nocapture", "--test-threads=1"];
     println!(

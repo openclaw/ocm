@@ -118,9 +118,9 @@ jobs:
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
-      - name: Capture native Windows companion comparison
+      - name: Capture native Windows publication and reader boundaries
         if: github.event_name == 'pull_request' && github.event.pull_request.number == 751
-        timeout-minutes: 20
+        timeout-minutes: 30
         shell: pwsh
         env:
           CARGO_BUILD_JOBS: 2
@@ -147,23 +147,59 @@ jobs:
             Get-FileHash (Join-Path $area ($name + '-target/debug/ocm.exe')) -Algorithm SHA256
           }
           $proof = '$ErrorActionPreference = "Stop"; . ./tests/support/windows_without_symlinks.ps1; Invoke-WithoutDeveloperSymlinks { cargo test --locked --test windows_companion_bindings_tests native_windows_companion_without_symlink_privilege -- --exact --nocapture; if ($LASTEXITCODE -ne 0) { throw "native linked companion comparison failed" } }'
-          foreach ($case in @(@('R10 target-only', 'baseline', 'plain-hoisted'), @('R4 linked baseline', 'baseline', 'plain-linked,bundled-linked'), @('R4 identity predecessor', 'previous', 'bundled-hoisted'))) {
-            $label, $binary, $cases = $case
-            Write-Output "Capture: $label"
-            $env:OCM_TEST_BINARY = Join-Path $area ($binary + '-target/debug/ocm.exe')
-            $env:OCM_TEST_COMPANION_CASES = $cases
+          foreach ($item in @(@('baseline', (Join-Path $area 'baseline-target/debug/ocm.exe')), @('candidate', (Join-Path $PWD 'target/debug/ocm.exe')))) {
+            $label, $binaryPath = $item
+            Write-Output "Capture host-only publication: $label"
+            $env:OCM_TEST_BINARY = $binaryPath
+            $env:OCM_TEST_ROOT_JUNCTION_PROBE = '1'
             $output = & pwsh -NoProfile -Command $proof 2>&1
             $captureExit = $LASTEXITCODE
             $output | Write-Output
-            Remove-Item Env:OCM_TEST_COMPANION_CASES
+            Remove-Item Env:OCM_TEST_ROOT_JUNCTION_PROBE
             Remove-Item Env:OCM_TEST_BINARY
-            Write-Output "$label captureExit=$captureExit"
-            if (!($output -match '"nativeWindowsCompanionObservationsComplete":true')) {
-              throw "$label observations did not complete"
+            Write-Output "$label hostOnlyExit=$captureExit"
+            if (!($output -match '"nativeWindowsRootPublicationObservationsComplete":true')) {
+              throw "$label root publication observations did not complete"
             }
           }
-          # This step records actual nonzero outcomes; the unconditional candidate
-          # regression below still requires the complete current graph to pass.
+          $readerSource = Join-Path $env:RUNNER_TEMP ('ocr-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          git init -q $readerSource
+          if ($LASTEXITCODE -ne 0) { throw 'reader source init failed' }
+          git -C $readerSource config core.longpaths true
+          git -C $readerSource remote add origin https://github.com/openclaw/openclaw.git
+          git -C $readerSource fetch --depth=1 origin 8f2190bb63cc8ff1cafceffbf1bb429232c1ad5d
+          if ($LASTEXITCODE -ne 0) { throw 'reader source fetch failed' }
+          git -C $readerSource checkout --detach 8f2190bb63cc8ff1cafceffbf1bb429232c1ad5d
+          if ($LASTEXITCODE -ne 0) { throw 'reader source checkout failed' }
+          npm install --prefix (Join-Path $area 'pnpm') --ignore-scripts --no-audit --no-fund pnpm@12.15.0
+          if ($LASTEXITCODE -ne 0) { throw 'selected pnpm preparation failed' }
+          $pnpm = Join-Path $area 'pnpm/node_modules/.bin/pnpm.cmd'
+          & $pnpm --dir $readerSource install --frozen-lockfile --child-concurrency=2
+          if ($LASTEXITCODE -ne 0) { throw 'frozen reader dependencies failed' }
+          git -C $readerSource rev-parse HEAD 'HEAD^{tree}'
+          $readerDirty = git -C $readerSource status --porcelain=v1 --untracked-files=no
+          if ($LASTEXITCODE -ne 0 -or $readerDirty) { throw 'reader tracked source changed' }
+          Get-FileHash (Join-Path $readerSource 'pnpm-lock.yaml') -Algorithm SHA256
+          Get-FileHash tests/support/windows_companion_reader.mjs -Algorithm SHA256
+          foreach ($item in @(@('canonical-target predecessor', (Join-Path $area 'previous-target/debug/ocm.exe')), @('logical-target candidate', (Join-Path $PWD 'target/debug/ocm.exe')))) {
+            $label, $binaryPath = $item
+            Write-Output "Capture actual bundled reader: $label"
+            $env:OCM_TEST_BINARY = $binaryPath
+            $env:OCM_TEST_COMPANION_CASES = 'bundled-hoisted'
+            $env:OCM_TEST_OPENCLAW_SOURCE = $readerSource
+            $output = & pwsh -NoProfile -Command $proof 2>&1
+            $captureExit = $LASTEXITCODE
+            $output | Write-Output
+            Remove-Item Env:OCM_TEST_OPENCLAW_SOURCE
+            Remove-Item Env:OCM_TEST_COMPANION_CASES
+            Remove-Item Env:OCM_TEST_BINARY
+            Write-Output "$label actualReaderExit=$captureExit"
+            if (!($output -match '"nativeWindowsCompanionObservationsComplete":true') -or !($output -match 'actualOpenClawReader')) {
+              throw "$label actual-reader observations did not complete"
+            }
+          }
+          # Captures retain actual nonzero outcomes. The current regression below
+          # remains unconditional and must pass before this contribution is ready.
           exit 0
       - name: Prove native Windows companion dependency bindings
         timeout-minutes: 5
