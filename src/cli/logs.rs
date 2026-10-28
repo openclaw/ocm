@@ -118,9 +118,6 @@ impl Cli {
                     profile,
                 ));
             }
-            if Self::output_failed() {
-                return Ok(0);
-            }
             let stdout = io::stdout();
             let mut handle = stdout.lock();
             let mut output = LogStdout {

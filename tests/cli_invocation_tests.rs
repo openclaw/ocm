@@ -383,19 +383,29 @@ fn logs_with_closed_stdout_terminate_quietly() {
     let source = root.child("ocm-home/supervisor/logs/demo.stdout.log");
     fs::remove_file(&source).unwrap();
     fs::create_dir(&source).unwrap();
-    let (reader, writer) = UnixStream::pair().unwrap();
-    drop(reader);
-    let output = Command::new(env!("CARGO_BIN_EXE_ocm"))
-        .current_dir(&cwd)
-        .env_clear()
-        .envs(&env)
-        .args(["logs", "demo", "--stream", "info", "--raw"])
-        .stdout(Stdio::from(OwnedFd::from(writer)))
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(!output.stderr.is_empty());
+    for mode in [vec!["--raw"], vec!["--color", "always"]] {
+        for follow in [false, true] {
+            let (reader, writer) = UnixStream::pair().unwrap();
+            drop(reader);
+            let mut args = vec!["logs", "demo", "--stream", "info"];
+            args.extend_from_slice(&mode);
+            if follow {
+                args.push("--follow");
+            }
+            let mut child = LogReader(
+                Command::new(env!("CARGO_BIN_EXE_ocm"))
+                    .current_dir(&cwd)
+                    .env_clear()
+                    .envs(&env)
+                    .args(&args)
+                    .stdout(Stdio::from(OwnedFd::from(writer)))
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            assert!(!wait_with_deadline(&mut child.0).success(), "{args:?}");
+        }
+    }
 }
 
 #[cfg(unix)]
