@@ -1763,6 +1763,9 @@ ocm env prune
 ocm env prune --older-than 30 --yes
 ```
 
+`--older-than` must be a positive number of days with a representable cutoff date.
+An age outside the supported date range returns an error before any environment is removed.
+
 Prune skips protected environments and environments whose background service is
 set to run, such as those started with `ocm start`, because their Gateway is in
 use without any of those commands. Run `ocm service stop <env>` first to make one

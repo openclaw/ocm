@@ -149,7 +149,10 @@ fn prune_selection_uses_last_used_at_and_skips_protected_and_service_backed_envs
         },
     ];
 
-    let candidates = select_prune_candidates(&envs, 14);
+    for days in [i64::MIN, i64::MAX, i64::from(u32::MAX)] {
+        assert!(select_prune_candidates(&envs, days).is_err());
+    }
+    let candidates = select_prune_candidates(&envs, 14).unwrap();
     let names = candidates
         .into_iter()
         .map(|meta| meta.name)

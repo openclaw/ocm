@@ -231,6 +231,50 @@ fn wait_for_listener_port(
 }
 
 #[test]
+fn env_prune_rejects_unrepresentable_ages_without_changing_environments() {
+    let root = TestDir::new("env-prune-age-validation");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    let created = run_ocm(cwd, &env, &["env", "create", "sample"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let meta = get_environment("sample", &env, cwd).unwrap();
+    let marker = Path::new(&meta.root).join("durable.txt");
+    fs::write(&marker, "preserved environment data").unwrap();
+    let registry = Path::new(env.get("OCM_HOME").unwrap()).join("envs.json");
+    let original_registry = fs::read(&registry).unwrap();
+    for apply in [false, true] {
+        for age in ["1", "30", "4294967295", "4294967296"] {
+            let mut args = vec!["env", "prune", "--older-than", age, "--json"];
+            if apply {
+                args.push("--yes");
+            }
+            let output = run_ocm(cwd, &env, &args);
+            if matches!(age, "1" | "30") {
+                assert!(output.status.success(), "{}", stderr(&output));
+                let result: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+                assert_eq!(result["apply"], apply);
+                assert_eq!(result["count"], 0);
+            } else {
+                assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+                let expected = if age == "4294967295" {
+                    "ocm: --older-than is outside the supported date range"
+                } else {
+                    "ocm: --older-than must be a positive integer"
+                };
+                assert!(stderr(&output).contains(expected), "{}", stderr(&output));
+                assert!(!stderr(&output).contains("panicked"));
+                assert!(stdout(&output).is_empty());
+            }
+            assert_eq!(fs::read(&registry).unwrap(), original_registry);
+            assert_eq!(
+                fs::read_to_string(&marker).unwrap(),
+                "preserved environment data"
+            );
+        }
+    }
+}
+
+#[test]
 fn env_prune_revalidates_candidates_after_waiting_for_operation_locks() {
     struct PendingPrune(Option<std::process::Child>);
     impl Drop for PendingPrune {
