@@ -39,10 +39,10 @@ for (const key of ['HOME', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'OCM_HOME', 'npm_c
 
 function run(command, args, options = {}) {
   const cwd = options.cwd || root;
-  console.log(JSON.stringify({command, args, cwd}));
+  console.log(JSON.stringify({command, args, cwd, windowsHide: options.windowsHide ?? false}));
   const result = cp.spawnSync(command, args, {
     cwd, env: options.env || env, encoding: 'utf8', timeout: 60000,
-    maxBuffer: 4 * 1024 * 1024, windowsHide: true,
+    maxBuffer: 4 * 1024 * 1024, windowsHide: options.windowsHide ?? false,
   });
   console.log(JSON.stringify({command, args, exit: result.status, signal: result.signal,
     error: result.error ? String(result.error) : null,
@@ -88,6 +88,21 @@ function main() {
     npmCli, npmCliSha256: fileDigest(npmCli)}));
   run(process.execPath, [npmCli, '--version']);
   run(binary, ['--version']);
+  // Match the ordinary Windows command route used by the existing packing
+  // fixture. Record a hidden-console control without treating it as product proof.
+  for (const windowsHide of [false, true]) {
+    const command = env.COMSPEC || path.join(env.SystemRoot, 'System32/cmd.exe');
+    const control = cp.spawnSync(command, ['/d', '/c', 'ver'], {
+      cwd: root, env, encoding: 'utf8', timeout: 10000, windowsHide,
+    });
+    console.log(JSON.stringify({command, args: ['/d', '/c', 'ver'], windowsHide,
+      exit: control.status, error: control.error ? String(control.error) : null,
+      stdout: control.stdout || '', stderr: control.stderr || ''}));
+    if (!windowsHide) {
+      assert.ifError(control.error);
+      assert.equal(control.status, 0, 'Ordinary native cmd.exe prerequisite failed');
+    }
+  }
 
   const archives = path.join(root, 'archives');
   const packages = path.join(root, 'packages');
