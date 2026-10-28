@@ -712,6 +712,12 @@ Clone relocates their registry identity and structural Git links together, prese
 It retains and relocates owned Git storage links needed by those checkouts.
 It fails and removes the incomplete target when required Git data is missing or external, copied locks/run ownership remain unresolved, or a required Git write would change integrity-protected history; resolve the reported condition before retrying.
 Clone does not copy external repositories, clear Git locks, or change source registrations.
+Native linked Git checkouts in retained workspaces receive the same structural
+relocation during clone, `migrate`, and `adopt import`, without requiring an
+OpenClaw worktree registry. Their repositories and required Git storage must all
+be inside the copied footprint. Staging in the destination then uses its own
+index; the source checkout and registrations remain unchanged. An incomplete or
+external Git graph fails the copy and removes the provisional target.
 Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 
 For clone, migration, and adoption, OCM does not classify a package or project

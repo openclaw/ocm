@@ -10,7 +10,7 @@ use crate::openclaw_repo::{
 };
 
 use super::{
-    copied_history_state_roots, is_integrity_protected_history_destination,
+    copied_history_state_roots, is_copied_git_entry, is_integrity_protected_history_destination,
     with_owner_write_permission,
 };
 use crate::store::layout::{EnvPaths, display_path};
@@ -182,11 +182,19 @@ pub(in crate::store) fn validate_copied_git_config(
     Ok(())
 }
 
-pub(in crate::store) fn copied_workspace_git_contexts(
+/// Structural roots must be relocated before Git can safely resolve their
+/// configuration contexts. Ordinary repositories keep their existing config-only
+/// path unless native worktree registrations require structural relocation.
+pub(in crate::store) struct CopiedGitRepositories {
+    pub roots: Vec<PathBuf>,
+    pub contexts: Vec<CopiedGitConfigContext>,
+}
+
+pub(in crate::store) fn copied_workspace_git_repositories(
     source: &EnvPaths,
     target: &EnvPaths,
     workspaces: &OpenClawWorkspaceInventory,
-) -> Result<Vec<CopiedGitConfigContext>, String> {
+) -> Result<CopiedGitRepositories, String> {
     let canonical_source = fs::canonicalize(&source.root).map_err(|e| e.to_string())?;
     let mappings = vec![
         (source.root.clone(), target.root.clone()),
@@ -195,16 +203,17 @@ pub(in crate::store) fn copied_workspace_git_contexts(
     let roots = workspaces
         .workspace_roots()
         .filter_map(|path| project(path, &mappings));
-    copied_destination_git_contexts(target, roots)
+    copied_destination_git_repositories(target, roots)
 }
 
-pub(in crate::store) fn copied_destination_git_contexts(
+pub(in crate::store) fn copied_destination_git_repositories(
     target: &EnvPaths,
     roots: impl IntoIterator<Item = PathBuf>,
-) -> Result<Vec<CopiedGitConfigContext>, String> {
+) -> Result<CopiedGitRepositories, String> {
     let mut pending = roots.into_iter().collect::<Vec<_>>();
     let mut seen = BTreeSet::new();
     let mut metadata_roots = BTreeSet::new();
+    let mut git_roots = BTreeSet::new();
     let canonical_target = fs::canonicalize(&target.root).map_err(|e| e.to_string())?;
     let mut contexts = Vec::new();
     while let Some(path) = pending.pop() {
@@ -216,7 +225,25 @@ pub(in crate::store) fn copied_destination_git_contexts(
         if !metadata.is_dir() || metadata_roots.contains(&path) || !seen.insert(path.clone()) {
             continue;
         }
-        if let Some(context) = copied_destination_git_context(&canonical_target, &path)? {
+        let entry = path.join(".git");
+        let structural_pointer = match fs::symlink_metadata(&entry) {
+            Ok(metadata) => {
+                (!metadata.is_dir() || entry.join("commondir").is_file())
+                    && is_copied_git_entry(&entry, metadata.file_type())?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.to_string()),
+        };
+        if structural_pointer {
+            // The copied gitfile may still select source storage, including a
+            // source that is now offline. Let the graph validate its projection.
+            git_roots.insert(path.clone());
+        } else if let Some(context) = copied_destination_git_context(&canonical_target, &path)? {
+            // Native validation distinguishes ordinary repositories from opaque
+            // project fixtures containing .git/HEAD and objects lookalikes.
+            if entry.join("worktrees").exists() {
+                git_roots.insert(path.clone());
+            }
             for directory in [&context.private_dir, &context.common_dir] {
                 let owned = owned(&canonical_target, directory)?;
                 metadata_roots.insert(
@@ -226,7 +253,7 @@ pub(in crate::store) fn copied_destination_git_contexts(
                 );
             }
             contexts.push(context);
-            if !path.join(".git").exists() {
+            if !entry.exists() {
                 continue; // A native bare repository is administrative storage.
             }
         }
@@ -238,7 +265,10 @@ pub(in crate::store) fn copied_destination_git_contexts(
             }
         }
     }
-    Ok(contexts)
+    Ok(CopiedGitRepositories {
+        roots: git_roots.into_iter().collect(),
+        contexts,
+    })
 }
 
 /// Discover one repository without traversing its administrative storage.
@@ -532,8 +562,48 @@ fn project_value(
     if !value.is_absolute() && selected.starts_with(root) {
         return None;
     }
-    let projected = project(&selected, mappings)?;
+    let projected = project_copied_git_path(
+        &selected,
+        copied_base,
+        mappings
+            .iter()
+            .map(|(source, target)| (source.as_path(), target.as_path())),
+    )?;
     (git_path(&projected) != git_path(&selected)).then_some(projected)
+}
+
+/// A migration can retain a home both directly and inside an enclosing
+/// workspace. Prefer the mapping into the copy containing this Git value,
+/// then the most specific source mapping. Other copy routes have one target.
+pub(super) fn project_copied_git_path<'a>(
+    path: &Path,
+    copied_base: &Path,
+    mappings: impl IntoIterator<Item = (&'a Path, &'a Path)>,
+) -> Option<PathBuf> {
+    let path = git_path(path);
+    let base =
+        git_path(&fs::canonicalize(copied_base).unwrap_or_else(|_| copied_base.to_path_buf()));
+    mappings
+        .into_iter()
+        .filter_map(|(source, destination)| {
+            let source = git_path(source);
+            let destination_path = git_path(
+                &fs::canonicalize(destination).unwrap_or_else(|_| destination.to_path_buf()),
+            );
+            let containing_depth = if base.starts_with(&destination_path) {
+                destination_path.components().count()
+            } else {
+                0
+            };
+            path.strip_prefix(&source).ok().map(|suffix| {
+                (
+                    (containing_depth, source.components().count()),
+                    destination.join(suffix),
+                )
+            })
+        })
+        .max_by_key(|(specificity, _)| *specificity)
+        .map(|(_, path)| path)
 }
 
 fn project(path: &Path, mappings: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {

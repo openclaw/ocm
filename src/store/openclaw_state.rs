@@ -669,30 +669,36 @@ pub(crate) fn prepare_migrated_runtime_state(
     }
     changed |= databases.values().any(|count| *count != 0);
     // A workspace containing the source home carries a complete second tree.
-    // Git paths follow that workspace projection; the active database above
-    // remains in the fixed state copy independently of this graph mapping.
+    // Keep both physical copies independent. Stored Git values select the
+    // containing copy; registry identity keeps the preferred workspace projection.
+    // The active database above remains in the fixed state copy.
     let graph_state_root = aliases
         .workspace_destination(canonical_source_state_root)
         .unwrap_or_else(|| paths.state_dir.clone());
     let mappings = aliases
         .roots
         .iter()
-        .map(|source| (source.as_path(), graph_state_root.as_path()))
+        .flat_map(|source| {
+            [
+                (source.as_path(), paths.state_dir.as_path()),
+                (source.as_path(), graph_state_root.as_path()),
+            ]
+        })
         .chain(
             workspace_copies
                 .iter()
                 .flat_map(|copy| [(copy.source, copy.target), (copy.source_alias, copy.target)]),
         )
         .collect::<Vec<_>>();
-    let git_contexts = git_config::copied_destination_git_contexts(
+    let git_repositories = git_config::copied_destination_git_repositories(
         paths,
         workspaces.workspace_roots().map(Path::to_path_buf),
     )?;
     let managed_worktrees = relocate_copied_worktrees_with_history_roots(
         paths,
         &mappings,
-        git_contexts,
-        &[],
+        git_repositories.contexts,
+        &git_repositories.roots,
         &[graph_state_root.clone()],
     )?;
     changed |=
