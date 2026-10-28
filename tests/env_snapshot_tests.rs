@@ -1786,6 +1786,156 @@ fn env_snapshot_preserves_readonly_entries_with_user_attributes() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn env_snapshot_captures_and_restores_closed_readonly_sqlite() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("snapshot-readonly-sqlite");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    for (name, journal, directory_mode) in [
+        ("wal-readonly", "WAL", 0o555),
+        ("wal-writable", "WAL", 0o755),
+        ("delete-readonly", "DELETE", 0o555),
+    ] {
+        let create = run_ocm(&cwd, &env, &["env", "create", name]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let durable = root.child(format!("ocm-home/envs/{name}/durable"));
+        fs::create_dir(&durable).unwrap();
+        // URI punctuation must remain part of the filename during verification.
+        let filename = "state ?#%.sqlite";
+        let database_path = durable.join(filename);
+        let database = Connection::open(&database_path).unwrap();
+        database
+            .execute_batch(&format!(
+                "PRAGMA journal_mode={journal};
+             CREATE TABLE state(value TEXT);
+             INSERT INTO state VALUES ('captured');"
+            ))
+            .unwrap();
+        drop(database);
+        assert_eq!(fs::read_dir(&durable).unwrap().count(), 1);
+        let bytes = fs::read(&database_path).unwrap();
+        fs::set_permissions(&database_path, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&durable, fs::Permissions::from_mode(directory_mode)).unwrap();
+        let assert_database = |directory: &Path| {
+            let path = directory.join(filename);
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{name}");
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                directory_mode
+            );
+            // These test-owned, closed databases have no outstanding WAL data.
+            let mut uri = url::Url::from_file_path(&path).unwrap();
+            uri.set_query(Some("immutable=1"));
+            let connection = Connection::open_with_flags(
+                uri.as_str(),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+            .unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT value FROM state", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "captured"
+            );
+            if directory_mode == 0o555 {
+                assert_eq!(fs::read_dir(directory).unwrap().count(), 1);
+            }
+        };
+        let capture = run_ocm(&cwd, &env, &["env", "snapshot", "create", name, "--json"]);
+        assert!(capture.status.success(), "{name}: {}", stderr(&capture));
+        let snapshot: Value = serde_json::from_str(&stdout(&capture)).unwrap();
+        let id = snapshot["id"].as_str().unwrap();
+        let archive = Path::new(snapshot["archivePath"].as_str().unwrap());
+        assert_database(&durable);
+        assert_database(&archive.join("durable"));
+
+        // Change only the fixture after proving capture preserved its source.
+        fs::set_permissions(&durable, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&database_path, fs::Permissions::from_mode(0o644)).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = durable.join(format!("{filename}{suffix}"));
+            if sidecar.exists() {
+                fs::set_permissions(sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        let database = Connection::open(&database_path).unwrap();
+        database
+            .execute_batch("UPDATE state SET value = 'later'")
+            .unwrap();
+        drop(database);
+        let restore = run_ocm(&cwd, &env, &["env", "snapshot", "restore", name, id]);
+        assert!(restore.status.success(), "{name}: {}", stderr(&restore));
+        assert_database(&durable);
+        assert_database(&archive.join("durable"));
+        let remove = run_ocm(&cwd, &env, &["env", "snapshot", "remove", name, id]);
+        assert!(remove.status.success(), "{name}: {}", stderr(&remove));
+        assert!(!archive.exists());
+        fs::set_permissions(&durable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_snapshot_rejects_corrupt_readonly_wal_database() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("snapshot-corrupt-readonly-wal");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let durable = root.child("ocm-home/envs/source/durable");
+    fs::create_dir(&durable).unwrap();
+    let path = durable.join("state.sqlite");
+    let database = Connection::open(&path).unwrap();
+    database.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE state(value TEXT); INSERT INTO state VALUES ('saved');").unwrap();
+    let page_size: u32 = database
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap();
+    drop(database);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[page_size as usize] = 0xff; // Invalid btree page; retain the valid WAL database header.
+    fs::write(&path, &bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(&durable, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let capture = run_ocm(&cwd, &env, &["env", "snapshot", "create", "source"]);
+    assert!(!capture.status.success());
+    assert!(stderr(&capture).contains("SQLite"), "{}", stderr(&capture));
+    let list = run_ocm(&cwd, &env, &["env", "snapshot", "list", "source", "--json"]);
+    assert!(list.status.success(), "{}", stderr(&list));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&list)).unwrap(),
+        serde_json::json!([])
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o444
+    );
+    assert_eq!(
+        fs::metadata(&durable).unwrap().permissions().mode() & 0o777,
+        0o555
+    );
+    assert_eq!(fs::read_dir(&durable).unwrap().count(), 1);
+    fs::set_permissions(&durable, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[test]
 fn env_snapshot_restore_does_not_collide_with_or_delete_a_foreign_restore_path() {
     let root = TestDir::new("env-snapshot-foreign-restore-path");
