@@ -828,19 +828,20 @@ fn clone_environment_with_policy(
         validate_nonportable_runtime_state_paths(&target_paths)?;
         let canonical_source_root =
             fs::canonicalize(&source_paths.root).map_err(|error| error.to_string())?;
-        let git_contexts = super::openclaw_state::git_config::copied_workspace_git_contexts(
-            &source_paths,
-            &target_paths,
-            &source_workspaces,
-        )?;
+        let git_repositories =
+            super::openclaw_state::git_config::copied_workspace_git_repositories(
+                &source_paths,
+                &target_paths,
+                &source_workspaces,
+            )?;
         let copied_worktrees = super::openclaw_state::relocate_copied_worktrees(
             &target_paths,
             &[
                 (&source_paths.root, &target_paths.root),
                 (&canonical_source_root, &target_paths.root),
             ],
-            git_contexts,
-            &[],
+            git_repositories.bare_contexts,
+            &git_repositories.roots,
         )?;
         let created_at = now_utc();
         let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));

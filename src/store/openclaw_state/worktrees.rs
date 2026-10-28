@@ -1,5 +1,5 @@
 use super::git_config::{
-    CopiedGitConfigContext, git_path, relocate_copied_git_config,
+    CopiedGitConfigContext, git_path, project_copied_git_path, relocate_copied_git_config,
     relocate_copied_git_config_with_history_roots, validate_copied_git_config,
 };
 use super::*;
@@ -236,8 +236,13 @@ impl CopiedWorktrees {
             let actual = git_identity_paths(path)?.ok_or("copied Git checkout disappeared")?;
             let checkout_matches = match git_value(path, &["rev-parse", "--show-toplevel"]) {
                 Ok(top) => {
-                    fs::canonicalize(top).map_err(|error| error.to_string())?
-                        == fs::canonicalize(path).map_err(|error| error.to_string())?
+                    let top = fs::canonicalize(top).map_err(|error| error.to_string())?;
+                    top == fs::canonicalize(path).map_err(|error| error.to_string())?
+                        // Ordinary repositories may use a contained core.worktree.
+                        // Managed and linked checkouts retain their exact identity.
+                        || (!managed_roots.contains(path)
+                            && expected.private == expected.common
+                            && top.starts_with(&root))
                 }
                 Err(error) => {
                     // A selected repository may be bare, but a managed binding
@@ -520,7 +525,8 @@ impl CopyGraph<'_> {
     // Keep this separate from already-relocated registry and selected paths.
     fn project_copied_value(&self, value: &Path, base: &Path) -> Option<PathBuf> {
         if value.is_absolute() {
-            self.project_source(value).or_else(|| self.project(value))
+            project_copied_git_path(value, base, self.mappings.iter().copied())
+                .or_else(|| self.project(value))
         } else {
             self.project(&base.join(value))
         }

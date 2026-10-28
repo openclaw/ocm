@@ -669,30 +669,36 @@ pub(crate) fn prepare_migrated_runtime_state(
     }
     changed |= databases.values().any(|count| *count != 0);
     // A workspace containing the source home carries a complete second tree.
-    // Git paths follow that workspace projection; the active database above
-    // remains in the fixed state copy independently of this graph mapping.
+    // Keep both physical copies independent. Stored Git values select the
+    // containing copy; registry identity keeps the preferred workspace projection.
+    // The active database above remains in the fixed state copy.
     let graph_state_root = aliases
         .workspace_destination(canonical_source_state_root)
         .unwrap_or_else(|| paths.state_dir.clone());
     let mappings = aliases
         .roots
         .iter()
-        .map(|source| (source.as_path(), graph_state_root.as_path()))
+        .flat_map(|source| {
+            [
+                (source.as_path(), paths.state_dir.as_path()),
+                (source.as_path(), graph_state_root.as_path()),
+            ]
+        })
         .chain(
             workspace_copies
                 .iter()
                 .flat_map(|copy| [(copy.source, copy.target), (copy.source_alias, copy.target)]),
         )
         .collect::<Vec<_>>();
-    let git_contexts = git_config::copied_destination_git_contexts(
+    let git_repositories = git_config::copied_destination_git_repositories(
         paths,
         workspaces.workspace_roots().map(Path::to_path_buf),
     )?;
     let managed_worktrees = relocate_copied_worktrees_with_history_roots(
         paths,
         &mappings,
-        git_contexts,
-        &[],
+        git_repositories.bare_contexts,
+        &git_repositories.roots,
         &[graph_state_root.clone()],
     )?;
     changed |=
@@ -739,50 +745,14 @@ pub(super) fn prepare_archived_worktrees(
     paths: &EnvPaths,
     source_roots: &[&Path],
 ) -> Result<CopiedWorktrees, String> {
-    let history = IntegrityProtectedLibraryPaths::new(&paths.state_dir)?;
-    let mut directories = vec![paths.root.clone()];
-    let mut git_roots = BTreeSet::new();
-    let mut bare_contexts = Vec::new();
-    let canonical_root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
-    while let Some(directory) = directories.pop() {
-        if fs::symlink_metadata(directory.join(".git")).is_err()
-            && let Some(context) =
-                git_config::copied_destination_git_context(&canonical_root, &directory)?
-        {
-            bare_contexts.push(context);
-            continue; // Do not scan a native bare repository's administrative storage.
-        }
-        for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
-            let path = entry.path();
-            if is_integrity_protected_history_path(&paths.state_dir, &path)
-                || history.roots.iter().any(|root| path.starts_with(root))
-            {
-                continue;
-            }
-            if entry.file_name() == ".git" {
-                if is_copied_git_entry(
-                    &path,
-                    entry.file_type().map_err(|error| error.to_string())?,
-                )? {
-                    git_roots.insert(directory.clone());
-                }
-            } else if entry
-                .file_type()
-                .map_err(|error| error.to_string())?
-                .is_dir()
-            {
-                // Only inspect the copied tree. Links do not select external
-                // content, and Git's administrative storage is not a checkout.
-                directories.push(path);
-            }
-        }
-    }
+    let repositories =
+        git_config::copied_destination_git_repositories(paths, [paths.root.clone()])?;
+    let git_roots = repositories.roots;
+    let bare_contexts = repositories.bare_contexts;
     let mappings: Vec<_> = source_roots
         .iter()
         .map(|source| (*source, paths.root.as_path()))
         .collect();
-    let git_roots = git_roots.into_iter().collect::<Vec<_>>();
     let bare_roots = bare_contexts
         .iter()
         .map(|context| context.checkout.clone())
