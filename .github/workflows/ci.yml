@@ -118,7 +118,7 @@ jobs:
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
-      - name: Capture isolated R11 cleanup call and spelling diagnostic
+      - name: Capture isolated R12 private directory premise
         if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 751
         continue-on-error: true
         timeout-minutes: 15
@@ -127,46 +127,44 @@ jobs:
           CARGO_BUILD_JOBS: 2
         run: |
           $ErrorActionPreference = 'Stop'
-          $area = Join-Path $env:RUNNER_TEMP ('r11-diag-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          $area = Join-Path $env:RUNNER_TEMP ('r12-premise-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
           New-Item -ItemType Directory -Path $area | Out-Null
           $source = Join-Path $area 'source'
-          git fetch --depth=1 origin 7228ef7d30eeba90678c8589af3f458b8b0fafc6
-          if ($LASTEXITCODE -ne 0) { throw 'R11 diagnostic source fetch failed' }
-          git worktree add --detach $source 7228ef7d30eeba90678c8589af3f458b8b0fafc6
-          if ($LASTEXITCODE -ne 0) { throw 'R11 diagnostic checkout failed' }
-          $patch = Join-Path $area 'cleanup-cause.patch'
-          [IO.File]::WriteAllBytes($patch, [Convert]::FromBase64String('LS0tIGEvdGVzdHMvd2luZG93c19ydW50aW1lX3B1YmxpY2F0aW9uX3Rlc3RzLnJzCisrKyBiL3Rlc3RzL3dpbmRvd3NfcnVudGltZV9wdWJsaWNhdGlvbl90ZXN0cy5ycwpAQCAtMTI3LDcgKzEyNywxNSBAQAogICAgIH0KIAogICAgIGZuIG9jbSgmc2VsZiwgYXJnczogJlsmc3RyXSkgLT4gT3V0cHV0IHsKLSAgICAgICAgcnVuX29jbShzZWxmLnJvb3QucGF0aCgpLCAmc2VsZi5lbnYsIGFyZ3MpCisgICAgICAgIGxldCBvdXRwdXQgPSBydW5fb2NtKHNlbGYucm9vdC5wYXRoKCksICZzZWxmLmVudiwgYXJncyk7CisgICAgICAgIHByaW50bG4hKAorICAgICAgICAgICAgIm5hdGl2ZSByZWNlaXB0IHt9IiwKKyAgICAgICAgICAgIGpzb24hKHsKKyAgICAgICAgICAgICAgICAiZXhlY3V0YWJsZSI6IHN1cHBvcnQ6Om9jbV90ZXN0X2JpbmFyeV9wYXRoKCksICJhcmd2IjogYXJncywKKyAgICAgICAgICAgICAgICAiZXhpdCI6IG91dHB1dC5zdGF0dXMuY29kZSgpLCAic3Rkb3V0Ijogc3Rkb3V0KCZvdXRwdXQpLCAic3RkZXJyIjogc3RkZXJyKCZvdXRwdXQpLAorICAgICAgICAgICAgfSkKKyAgICAgICAgKTsKKyAgICAgICAgb3V0cHV0CiAgICAgfQogCiAgICAgZm4gb2soJnNlbGYsIGFyZ3M6ICZbJnN0cl0pIC0+IFN0cmluZyB7CkBAIC01NDcsNyArNTU1LDUzIEBACiAgICAgZml4dHVyZS5hc3NlcnRfcnVudGltZSgic3RhYmxlIiwgT0xELCB0cnVlKTsKICAgICBmaXh0dXJlLmFzc2VydF9iaW5kaW5nKCJkZW1vIiwgInN0YWJsZSIsIE9MRCk7CiAgICAgYXNzZXJ0X2VxIShmczo6cmVhZF90b19zdHJpbmcoJm1hcmtlcikudW53cmFwKCksICJiZWZvcmUtdXBncmFkZSIpOwotICAgIGFzc2VydCEoIXJlY292ZXJ5LmV4aXN0cygpKTsKKyAgICBwcmludGxuISgKKyAgICAgICAgInJvbGxiYWNrIGNsZWFudXAgcmVjZWlwdCB7fSIsCisgICAgICAgIGpzb24hKHsKKyAgICAgICAgICAgICJyb2xsYmFjayI6IHJvbGxiYWNrLCAicmVjb3ZlcnkiOiByZWNvdmVyeSwKKyAgICAgICAgICAgICJyZW1haW5pbmciOiBmczo6cmVhZF9kaXIoJnJlY292ZXJ5KS5tYXAofGl0ZW1zfCBpdGVtcy5tYXAofGl0ZW18IGl0ZW0udW53cmFwKCkuZmlsZV9uYW1lKCkpLmNvbGxlY3Q6OjxWZWM8Xz4+KCkpLm9rKCksCisgICAgICAgIH0pCisgICAgKTsKKyAgICBpZiByZWNvdmVyeS5leGlzdHMoKSB7CisgICAgICAgIHVzZSBzdGQ6Om9zOjp3aW5kb3dzOjpmZmk6Ok9zU3RyRXh0OworICAgICAgICB1c2Ugd2luZG93c19zeXM6OldpbjMyOjpGb3VuZGF0aW9uOjpHZXRMYXN0RXJyb3I7CisgICAgICAgIHVzZSB3aW5kb3dzX3N5czo6V2luMzI6OlN0b3JhZ2U6OkZpbGVTeXN0ZW06OkNyZWF0ZURpcmVjdG9yeVc7CisgICAgICAgIGxldCBtdXQgZGlyZWN0b3JpZXMgPSB2ZWMhW3JldGFpbmVkLmNsb25lKCldOworICAgICAgICB3aGlsZSBsZXQgU29tZShkaXJlY3RvcnkpID0gZGlyZWN0b3JpZXMucG9wKCkgeworICAgICAgICAgICAgbGV0IGVudHJpZXMgPSBmczo6cmVhZF9kaXIoJmRpcmVjdG9yeSkKKyAgICAgICAgICAgICAgICAudW53cmFwKCkKKyAgICAgICAgICAgICAgICAuY29sbGVjdDo6PFJlc3VsdDxWZWM8Xz4sIF8+PigpCisgICAgICAgICAgICAgICAgLnVud3JhcCgpOworICAgICAgICAgICAgZm9yIGVudHJ5IGluICZlbnRyaWVzIHsKKyAgICAgICAgICAgICAgICBsZXQgbWV0YWRhdGEgPSBmczo6c3ltbGlua19tZXRhZGF0YShlbnRyeS5wYXRoKCkpLnVud3JhcCgpOworICAgICAgICAgICAgICAgIGlmIG1ldGFkYXRhLmlzX2RpcigpICYmIG1ldGFkYXRhLmZpbGVfYXR0cmlidXRlcygpICYgMHg0MDAgPT0gMCB7CisgICAgICAgICAgICAgICAgICAgIGRpcmVjdG9yaWVzLnB1c2goZW50cnkucGF0aCgpKTsKKyAgICAgICAgICAgICAgICB9CisgICAgICAgICAgICB9CisgICAgICAgICAgICBsZXQgY2Fub25pY2FsID0gZnM6OmNhbm9uaWNhbGl6ZSgmZGlyZWN0b3J5KS51bndyYXAoKTsKKyAgICAgICAgICAgIGZvciAoa2luZCwgcGF0aCkgaW4gWygicmVjb3JkZWQiLCAmZGlyZWN0b3J5KSwgKCJjYW5vbmljYWwiLCAmY2Fub25pY2FsKV0geworICAgICAgICAgICAgICAgIGxldCBtZXRhZGF0YSA9IGZzOjpzeW1saW5rX21ldGFkYXRhKHBhdGgpLnVud3JhcCgpOworICAgICAgICAgICAgICAgIGFzc2VydCEobWV0YWRhdGEuaXNfZGlyKCkgJiYgbWV0YWRhdGEuZmlsZV9hdHRyaWJ1dGVzKCkgJiAweDQwMCA9PSAwKTsKKyAgICAgICAgICAgICAgICBsZXQgbXV0IGVuY29kZWQgPSBwYXRoLmFzX29zX3N0cigpLmVuY29kZV93aWRlKCkuY29sbGVjdDo6PFZlYzxfPj4oKTsKKyAgICAgICAgICAgICAgICBsZXQgdW5pdHMgPSBlbmNvZGVkLmxlbigpOworICAgICAgICAgICAgICAgIGVuY29kZWQucHVzaCgwKTsKKyAgICAgICAgICAgICAgICAvLyBFeGlzdGluZywgc3RhYmxlIGZpeHR1cmUgZGlyZWN0b3JpZXMgb25seTogc3VjY2Vzc2Z1bCBjcmVhdGlvbgorICAgICAgICAgICAgICAgIC8vIHdvdWxkIGludmFsaWRhdGUgdGhlIHByb2JlLiBObyBzZWN1cml0eSBvciBwb2xpY3kgaXMgY2hhbmdlZC4KKyAgICAgICAgICAgICAgICBsZXQgcmVzdWx0ID0gdW5zYWZlIHsgQ3JlYXRlRGlyZWN0b3J5VyhlbmNvZGVkLmFzX3B0cigpLCBzdGQ6OnB0cjo6bnVsbCgpKSB9OworICAgICAgICAgICAgICAgIGxldCBlcnJvciA9IHVuc2FmZSB7IEdldExhc3RFcnJvcigpIH07CisgICAgICAgICAgICAgICAgYXNzZXJ0X2VxIShyZXN1bHQsIDAsICJwcm9iZSB1bmV4cGVjdGVkbHkgY3JlYXRlZCB7cGF0aDo/fSIpOworICAgICAgICAgICAgICAgIHByaW50bG4hKAorICAgICAgICAgICAgICAgICAgICAibmF0aXZlIGNsZWFudXAgY2FsbCB7fSIsCisgICAgICAgICAgICAgICAgICAgIGpzb24hKHsKKyAgICAgICAgICAgICAgICAgICAgICAgICJraW5kIjoga2luZCwgInBhdGgiOiBwYXRoLCAidXRmMTZVbml0cyI6IHVuaXRzLAorICAgICAgICAgICAgICAgICAgICAgICAgInN0ZE1ldGFkYXRhIjogIm9rIiwgInN0ZFJlYWREaXJFbnRyaWVzIjogZW50cmllcy5sZW4oKSwKKyAgICAgICAgICAgICAgICAgICAgICAgICJDcmVhdGVEaXJlY3RvcnlXIjogcmVzdWx0LCAid2luMzJFcnJvciI6IGVycm9yLAorICAgICAgICAgICAgICAgICAgICB9KQorICAgICAgICAgICAgICAgICk7CisgICAgICAgICAgICB9CisgICAgICAgIH0KKyAgICB9CisgICAgYXNzZXJ0ISghcmVjb3ZlcnkuZXhpc3RzKCksICJyb2xsYmFjayBjbGVhbnVwIHJlY2VpcHQ6IHtyb2xsYmFja30iKTsKICAgICBsZXQgcmV2ZXJzZSA9IGZpeHR1cmUuanNvbigmWyJ1cGdyYWRlIiwgInJvbGxiYWNrIiwgImRlbW8iLCAiLS1qc29uIl0pOwogICAgIGFzc2VydF9lcSEocmV2ZXJzZVsib3V0Y29tZSJdLCAicm9sbGVkLWJhY2siLCAie3JldmVyc2V9Iik7CiAgICAgZml4dHVyZS5hc3NlcnRfcnVudGltZSgic3RhYmxlIiwgTkVXLCB0cnVlKTsK'))
-          if ((Get-FileHash $patch -Algorithm SHA256).Hash -ne 'adb8b3c7d48add3e3efb2a546e14396eddf4b5aa88a5c8d4d8543a4f062b78b8') {
-            throw 'R11 diagnostic patch checksum mismatch'
+          git fetch --depth=1 origin ca30b244e2e3f9b46fd2581ffe4c9c43c337e6d6
+          if ($LASTEXITCODE -ne 0) { throw 'R12 premise source fetch failed' }
+          git worktree add --detach $source ca30b244e2e3f9b46fd2581ffe4c9c43c337e6d6
+          if ($LASTEXITCODE -ne 0) { throw 'R12 premise checkout failed' }
+          $patch = Join-Path $area 'premise.patch'
+          [IO.File]::WriteAllBytes($patch, [Convert]::FromBase64String('LS0tIGEvc3JjL3N0b3JlL2NvbW1vbi5ycworKysgYi9zcmMvc3RvcmUvY29tbW9uLnJzCkBAIC0xNTc1LDMgKzE1NzUsNDUgQEAKICAgICAgICAgfQogICAgIH0KIH0KKworI1tjZmcoYWxsKHRlc3QsIHdpbmRvd3MpKV0KK21vZCBwcml2YXRlX2RpcmVjdG9yeV9wYXRoX3ByZW1pc2UgeworICAgIHVzZSBzdXBlcjo6KjsKKyAgICB1c2Ugc3RkOjpvczo6d2luZG93czo6ZmZpOjpPc1N0ckV4dDsKKworICAgICNbdGVzdF0KKyAgICBmbiBuYXRpdmVfcHJpdmF0ZV9kaXJlY3RvcnlfcGF0aF9wcmVtaXNlKCkgeworICAgICAgICBsZXQgcm9vdCA9IHRlbXBmaWxlOjp0ZW1wZGlyKCkudW53cmFwKCk7CisgICAgICAgIGxldCBjYW5vbmljYWwgPSByb290LnBhdGgoKS5jYW5vbmljYWxpemUoKS51bndyYXAoKTsKKyAgICAgICAgbGV0IG9yZGluYXJ5ID0gUGF0aEJ1Zjo6ZnJvbShjYW5vbmljYWwudG9fc3RyKCkudW53cmFwKCkuc3RyaXBfcHJlZml4KHIiXFw/XCIpLnVud3JhcCgpKTsKKyAgICAgICAgbGV0IHBhcmVudCA9IG9yZGluYXJ5LmpvaW4oInAiLnJlcGVhdCg4MCkpOworICAgICAgICBmczo6Y3JlYXRlX2Rpcl9hbGwoJnBhcmVudCkudW53cmFwKCk7CisgICAgICAgIGxldCBuYW1lID0gImQiLnJlcGVhdCgyNTIgLSBwYXJlbnQuYXNfb3Nfc3RyKCkuZW5jb2RlX3dpZGUoKS5jb3VudCgpIC0gMSk7CisgICAgICAgIGxldCBkaXJlY3RvcnkgPSBwYXJlbnQuam9pbigmbmFtZSk7CisgICAgICAgIGFzc2VydF9lcSEoZGlyZWN0b3J5LmFzX29zX3N0cigpLmVuY29kZV93aWRlKCkuY291bnQoKSwgMjUyKTsKKyAgICAgICAgbGV0IG5hdGl2ZSA9IHBhcmVudC5jYW5vbmljYWxpemUoKS51bndyYXAoKS5qb2luKG5hbWUpOworICAgICAgICBhc3NlcnQhKG5hdGl2ZS5hc19vc19zdHIoKS5lbmNvZGVfd2lkZSgpLmNvdW50KCkgPiAyNTIpOworICAgICAgICBsZXQgY3JlYXRlID0gZW5zdXJlX3ByaXZhdGVfZGlyKCZkaXJlY3RvcnkpOworICAgICAgICBwcmludGxuISgiUjEyIG9yZGluYXJ5IGNyZWF0ZSB1bml0cz0yNTIgcmVzdWx0PXtjcmVhdGU6P30iKTsKKyAgICAgICAgYXNzZXJ0IShjcmVhdGUuaXNfZXJyKCkpOworICAgICAgICBlbnN1cmVfcHJpdmF0ZV9kaXIoJm5hdGl2ZSkudW53cmFwKCk7CisgICAgICAgIHByaW50bG4hKCJSMTIgbmF0aXZlIGNyZWF0ZSBzdWNjZWVkcyIpOworICAgICAgICBhc3NlcnQhKGZzOjpzeW1saW5rX21ldGFkYXRhKCZkaXJlY3RvcnkpLnVud3JhcCgpLmlzX2RpcigpKTsKKyAgICAgICAgbGV0IGRpcmVjdCA9IGNyYXRlOjppbmZyYTo6d2luZG93c19zZWN1cml0eTo6ZW5zdXJlX3ByaXZhdGVfZGlyZWN0b3J5KCZkaXJlY3RvcnkpOworICAgICAgICBwcmludGxuISgiUjEyIGhlbHBlciByZW9wZW4gcmF3IGVycm9yPXs6P30iLCBkaXJlY3QuYXNfcmVmKCkuZXJyKCkuYW5kX3RoZW4ofGV8IGUucmF3X29zX2Vycm9yKCkpKTsKKyAgICAgICAgYXNzZXJ0X2VxIShkaXJlY3QudW53cmFwX2VycigpLnJhd19vc19lcnJvcigpLCBTb21lKDIwNikpOworICAgICAgICBsZXQgcmVvcGVuID0gZW5zdXJlX3ByaXZhdGVfZGlyKCZkaXJlY3RvcnkpOworICAgICAgICBwcmludGxuISgiUjEyIG9yZGluYXJ5IHJlb3BlbiByZXN1bHQ9e3Jlb3Blbjo/fSIpOworICAgICAgICBhc3NlcnQhKHJlb3Blbi5pc19lcnIoKSk7CisgICAgICAgIGVuc3VyZV9wcml2YXRlX2RpcigmbmF0aXZlKS51bndyYXAoKTsKKyAgICAgICAgcHJpbnRsbiEoIlIxMiBuYXRpdmUgcmVvcGVuIHN1Y2NlZWRzIik7CisgICAgICAgIGZzOjp3cml0ZShkaXJlY3Rvcnkuam9pbigicmV0YWluZWQudHh0IiksIGIib3duZWQgY2xlYW51cCBmaXh0dXJlIikudW53cmFwKCk7CisgICAgICAgIGxldCBjbGVhbnVwID0gcmVtb3ZlX293bmVkX3RyZWUoJm9yZGluYXJ5KTsKKyAgICAgICAgcHJpbnRsbiEoIlIxMiBvcmRpbmFyeSBvd25lZCBjbGVhbnVwIHJlc3VsdD17Y2xlYW51cDo/fSIpOworICAgICAgICBhc3NlcnQhKGNsZWFudXAuaXNfZXJyKCkpOworICAgICAgICBhc3NlcnRfZXEhKGZzOjpyZWFkKGRpcmVjdG9yeS5qb2luKCJyZXRhaW5lZC50eHQiKSkudW53cmFwKCksIGIib3duZWQgY2xlYW51cCBmaXh0dXJlIik7CisgICAgICAgIHJlbW92ZV9vd25lZF90cmVlKCZjYW5vbmljYWwpLnVud3JhcCgpOworICAgICAgICBwcmludGxuISgiUjEyIG5hdGl2ZSBvd25lZCBjbGVhbnVwIHN1Y2NlZWRzIik7CisgICAgICAgIGFzc2VydCEoIW9yZGluYXJ5LmV4aXN0cygpKTsKKyAgICB9Cit9Cg=='))
+          if ((Get-FileHash $patch -Algorithm SHA256).Hash -ne 'ba0c394425e35e20272a2fd13885393002eed3efe0d404eea1a5fd68cee474c5') {
+            throw 'R12 premise patch checksum mismatch'
           }
           $previousTarget = $env:CARGO_TARGET_DIR
           Push-Location $source
           try {
             $env:CARGO_TARGET_DIR = Join-Path $area 'target'
             git rev-parse HEAD 'HEAD^{tree}'
-            if ((git rev-parse 'HEAD^{tree}') -ne 'a65bf6bf93cb53067b31150ed2df9ae28a0d80d5') { throw 'R11 product tree mismatch' }
-            node --version
-            npm --version
-            if ((node --version) -ne 'v22.23.4' -or (npm --version) -ne '10.9.9') { throw 'R11 diagnostic tool version mismatch' }
+            if ((git rev-parse 'HEAD^{tree}') -ne '2fff4bb974199b93c4604935a562afeedb486382') { throw 'R12 product tree mismatch' }
+            rustc -Vv
+            cargo --version
             git apply --check $patch
-            if ($LASTEXITCODE -ne 0) { throw 'R11 diagnostic patch does not apply' }
+            if ($LASTEXITCODE -ne 0) { throw 'R12 premise patch does not apply' }
             git apply $patch
-            if ($LASTEXITCODE -ne 0) { throw 'R11 diagnostic patch failed' }
-            git add -- tests/windows_runtime_publication_tests.rs
+            if ($LASTEXITCODE -ne 0) { throw 'R12 premise patch failed' }
+            git add -- src/store/common.rs
             git diff --cached --stat
             git write-tree
-            Get-FileHash tests/windows_runtime_publication_tests.rs -Algorithm SHA256
-            cargo build --locked
-            if ($LASTEXITCODE -ne 0) { throw 'R11 diagnostic product build failed' }
-            Get-FileHash (Join-Path $env:CARGO_TARGET_DIR 'debug/ocm.exe') -Algorithm SHA256
-            . ./tests/support/windows_without_symlinks.ps1
-            Invoke-WithoutDeveloperSymlinks {
-              cargo test --locked --test windows_runtime_publication_tests native_windows_in_place_upgrade_validates_retained_linked_bytes_and_rolls_back -- --exact --nocapture
-              $captureExit = $LASTEXITCODE
-              Get-FileHash (Join-Path $env:CARGO_TARGET_DIR 'debug/ocm.exe') -Algorithm SHA256
-              Write-Output "R11 isolated explicit rollback diagnostic exit=$captureExit"
-              if ($captureExit -ne 0) { throw 'R11 explicit rollback diagnostic retained its failure' }
-            }
+            Get-FileHash src/store/common.rs -Algorithm SHA256
+            cargo check --workspace --all-targets --locked
+            if ($LASTEXITCODE -ne 0) { throw 'R12 premise compile check failed' }
+            cargo test --locked --lib store::common::private_directory_path_premise::native_private_directory_path_premise -- --exact --nocapture
+            $captureExit = $LASTEXITCODE
+            $testBinaries = @(Get-ChildItem -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'debug/deps') -Filter 'ocm-*.exe' -File)
+            if ($testBinaries.Count -ne 1) { throw 'R12 premise test executable identity is ambiguous' }
+            Write-Output "R12 test executable=$($testBinaries[0].FullName)"
+            Get-FileHash $testBinaries[0].FullName -Algorithm SHA256
+            Write-Output "R12 isolated premise exit=$captureExit"
+            if ($captureExit -ne 0) { throw 'R12 premise test failed' }
           } finally {
             $env:CARGO_TARGET_DIR = $previousTarget
             Pop-Location
