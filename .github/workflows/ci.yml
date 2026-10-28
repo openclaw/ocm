@@ -118,7 +118,7 @@ jobs:
       - name: Prove native Windows runtime tree hashing
         timeout-minutes: 5
         run: cargo test --locked --test runtime_command_tests runtime_build_local_with_native_npm_preserves_tree_integrity -- --exact --nocapture
-      - name: Capture isolated current-target host publication
+      - name: Compare frozen native retained-runtime readers
         if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 751
         continue-on-error: true
         timeout-minutes: 15
@@ -127,65 +127,52 @@ jobs:
           CARGO_BUILD_JOBS: 2
         run: |
           $ErrorActionPreference = 'Stop'
-          $carrierRoot = (Get-Location).Path
-          $area = Join-Path $env:RUNNER_TEMP ('host-target-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          $area = Join-Path $env:RUNNER_TEMP ('retained-reader-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
           New-Item -ItemType Directory -Path $area | Out-Null
-          $source = Join-Path $area 'source'
-          git fetch --depth=1 origin 7f1afb279798960d04e18337471f093459e4c674
-          if ($LASTEXITCODE -ne 0) { throw 'target source fetch failed' }
-          git worktree add --detach $source 7f1afb279798960d04e18337471f093459e4c674
-          if ($LASTEXITCODE -ne 0) { throw 'target checkout failed' }
-          $previousTarget = $env:CARGO_TARGET_DIR
-          $previousBinary = $env:OCM_TEST_BINARY
-          $previousProbe = $env:OCM_TEST_ROOT_JUNCTION_PROBE
-          Push-Location $source
-          try {
-            $env:CARGO_TARGET_DIR = Join-Path $area 'target'
-            git rev-parse HEAD 'HEAD^{tree}'
-            if ((git rev-parse 'HEAD^{tree}') -ne '3256c9f1e1246b40abc8330e6f74145998fdd507') { throw 'target product tree mismatch' }
-            $dirty = git status --porcelain=v1 --untracked-files=no
-            if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'target product checkout is not clean' }
-            rustc -Vv
-            cargo --version
-            node --version
-            npm --version
-            if ((node --version) -ne 'v22.23.4' -or (npm --version) -ne '10.9.9') { throw 'target control tool version mismatch' }
-            Get-FileHash Cargo.lock -Algorithm SHA256
-            cargo build --locked
-            if ($LASTEXITCODE -ne 0) { throw 'pure target product build failed' }
-            $productDirectory = Join-Path $area 'product'
-            New-Item -ItemType Directory -Path $productDirectory | Out-Null
-            $productBinary = Join-Path $productDirectory 'ocm.exe'
-            Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'debug/ocm.exe') -Destination $productBinary
-            $productHash = (Get-FileHash $productBinary -Algorithm SHA256).Hash
-            @{productBinary=$productBinary; productSha256=$productHash} | ConvertTo-Json -Compress
-            foreach ($relative in @('tests/windows_companion_bindings_tests.rs', 'tests/support/windows_runtime_root_probe.cjs', 'tests/support/windows_without_symlinks.ps1')) {
-              Copy-Item -LiteralPath (Join-Path $carrierRoot $relative) -Destination (Join-Path $source $relative)
-              @{fixture=$relative; sha256=(Get-FileHash $relative -Algorithm SHA256).Hash} | ConvertTo-Json -Compress
+          rustc -Vv
+          cargo --version
+          $results = @()
+          foreach ($item in @(@('candidate', 'b20db7aa2751cb2e0fb09f063e6aaecc846a9dbc', 'd44d28a00ba2b692e3233212d7547eec07da062f'), @('target', '7f1afb279798960d04e18337471f093459e4c674', '3256c9f1e1246b40abc8330e6f74145998fdd507'))) {
+            $label, $revision, $expectedTree = $item
+            $source = Join-Path $area ($label + '-source')
+            $previousTarget = $env:CARGO_TARGET_DIR
+            $entered = $false
+            try {
+              git fetch --depth=1 origin $revision
+              if ($LASTEXITCODE -ne 0) { throw "$label source fetch failed" }
+              git worktree add --detach $source $revision
+              if ($LASTEXITCODE -ne 0) { throw "$label checkout failed" }
+              Push-Location $source
+              $entered = $true
+              $env:CARGO_TARGET_DIR = Join-Path $area ($label + '-target')
+              Write-Output "BEGIN retained-reader $label $revision"
+              git rev-parse HEAD 'HEAD^{tree}'
+              if ((git rev-parse 'HEAD^{tree}') -ne $expectedTree) { throw "$label product tree mismatch" }
+              $dirty = git status --porcelain=v1 --untracked-files=no
+              if ($LASTEXITCODE -ne 0 -or $dirty) { throw "$label checkout is not clean" }
+              Get-FileHash -LiteralPath @('Cargo.lock', 'src/store/upgrade_history.rs') -Algorithm SHA256
+              cargo test --locked --lib store::upgrade_history::tests::runtime_recovery_loads_only_healthy_managed_bytes -- --exact --nocapture
+              $captureExit = $LASTEXITCODE
+              $testBinaries = @(Get-ChildItem -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'debug/deps') -Filter 'ocm-*.exe' -File)
+              if ($testBinaries.Count -ne 1) { throw "$label test executable identity is ambiguous" }
+              $testHash = (Get-FileHash $testBinaries[0].FullName -Algorithm SHA256).Hash
+              $dirty = git status --porcelain=v1 --untracked-files=no
+              if ($LASTEXITCODE -ne 0 -or $dirty) { throw "$label test changed tracked source" }
+              $result = @{label=$label; revision=$revision; tree=$expectedTree; exit=$captureExit; testExecutable=$testBinaries[0].FullName; testSha256=$testHash; sourceUnchanged=$true}
+              $results += $result
+              $result | ConvertTo-Json -Compress
+              Write-Output "END retained-reader $label exit=$captureExit"
+            } catch {
+              $result = @{label=$label; revision=$revision; preparationError=$_.Exception.Message}
+              $results += $result
+              $result | ConvertTo-Json -Compress
+            } finally {
+              $env:CARGO_TARGET_DIR = $previousTarget
+              if ($entered) { Pop-Location }
             }
-            if ((Get-FileHash tests/support/windows_runtime_root_probe.cjs -Algorithm SHA256).Hash -ne 'c92730052761aca37d257720ef2b3b7cd307685f586b51ec10192289e05a9af5') { throw 'frozen root probe identity mismatch' }
-            git add -- tests/windows_companion_bindings_tests.rs tests/support/windows_runtime_root_probe.cjs tests/support/windows_without_symlinks.ps1
-            git diff --cached --stat
-            git write-tree
-            $env:OCM_TEST_BINARY = $productBinary
-            $env:OCM_TEST_ROOT_JUNCTION_PROBE = '1'
-            $proof = '$ErrorActionPreference = "Stop"; . ./tests/support/windows_without_symlinks.ps1; Invoke-WithoutDeveloperSymlinks { cargo test --locked --test windows_companion_bindings_tests native_windows_companion_without_symlink_privilege -- --exact --nocapture; if ($LASTEXITCODE -ne 0) { throw "native linked companion comparison failed" } }'
-            Write-Output 'Capture pure 7f1afb target host-only publication'
-            $output = & pwsh -NoProfile -Command $proof 2>&1
-            $captureExit = $LASTEXITCODE
-            $output | Write-Output
-            $afterHash = (Get-FileHash $productBinary -Algorithm SHA256).Hash
-            @{productBinary=$productBinary; productSha256After=$afterHash} | ConvertTo-Json -Compress
-            if ($afterHash -ne $productHash) { throw 'target product binary changed during fixture compilation' }
-            Write-Output "Pure 7f1afb target hostOnlyExit=$captureExit"
-            if (!($output -match '"nativeWindowsRootPublicationObservationsComplete":true')) { throw 'target root publication observations did not complete' }
-            if ($captureExit -ne 0) { throw 'target host publication control retained its failure' }
-          } finally {
-            $env:OCM_TEST_BINARY = $previousBinary
-            $env:OCM_TEST_ROOT_JUNCTION_PROBE = $previousProbe
-            $env:CARGO_TARGET_DIR = $previousTarget
-            Pop-Location
           }
+          @{retainedReaderComparisonComplete=$true; results=$results} | ConvertTo-Json -Depth 5 -Compress
+          if (@($results | Where-Object { $_.preparationError -or $_.exit -ne 0 }).Count -ne 0) { throw 'retained-runtime reader comparison retains a nonzero outcome' }
       - name: Prove native Windows companion dependency bindings
         timeout-minutes: 5
         shell: pwsh
