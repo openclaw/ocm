@@ -3172,6 +3172,56 @@ fn relocatable_plugin_path(
         .then(|| relative.to_path_buf())
 }
 
+// Resolve shared owners without acquiring external data, leaf links, or history.
+// The caller supplies the canonical root of the existing copy footprint.
+fn shared_state_database_locations(
+    state_root: &Path,
+    canonical_root: &Path,
+) -> Result<BTreeMap<PathBuf, PathBuf>, String> {
+    let mut locations = BTreeMap::new();
+    let shared_root = match fs::canonicalize(state_root.join("state")) {
+        Ok(path) if path.starts_with(canonical_root) && path.is_dir() => path,
+        _ => return Ok(locations),
+    };
+    for name in ["openclaw.sqlite", "openclaw-quarantine.sqlite"] {
+        let logical = state_root.join("state").join(name);
+        let database = shared_root.join(name);
+        if fs::symlink_metadata(&database).is_ok_and(|meta| meta.is_file())
+            && !is_integrity_protected_history_destination(state_root, &logical, &database)?
+        {
+            locations.insert(logical, database);
+        }
+    }
+    Ok(locations)
+}
+
+pub(super) fn cloned_shared_database_paths(paths: &EnvPaths) -> Result<BTreeSet<PathBuf>, String> {
+    let root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
+    let mut preserved = BTreeSet::new();
+    let state = match fs::canonicalize(&paths.state_dir) {
+        Ok(state) => state,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(preserved),
+        Err(error) => return Err(error.to_string()),
+    };
+    for (logical, database) in shared_state_database_locations(&state, &root)? {
+        if !is_sqlite_database(&database)? {
+            continue;
+        }
+        let links = super::dev_sources::existing_source_path_entries(&logical)?
+            .into_iter()
+            .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()));
+        // Keep only the database and the route used by its logical owner. Its
+        // unconfigured parent must not retain unrelated runtime debris.
+        for path in std::iter::once(database).chain(links) {
+            if let Ok(relative) = path.strip_prefix(&root) {
+                preserved.insert(paths.root.join(relative));
+                preserved.insert(path);
+            }
+        }
+    }
+    Ok(preserved)
+}
+
 // Only runtime-owned locations participate in coherent copies. A SQLite header
 // in a package, Workshop bundle, archive, or project fixture is not ownership.
 pub(super) struct OpenClawSqliteCopy<'a> {
@@ -3209,32 +3259,23 @@ impl<'a> OpenClawSqliteCopy<'a> {
             history: IntegrityProtectedLibraryPaths::new(state_root)?,
         };
         let canonical_root = fs::canonicalize(owned_root).map_err(|error| error.to_string())?;
-        let shared_root = match fs::canonicalize(state_root.join("state")) {
-            Ok(path) if path.starts_with(&canonical_root) && path.is_dir() => path,
-            _ => return Ok(selection),
-        };
+        let locations = shared_state_database_locations(state_root, &canonical_root)?;
         // The walker preserves directory links, but can reach their physical
         // target elsewhere in the existing copy. Select these exact owners
         // before traversal, without acquiring external data or leaf links.
-        for name in ["openclaw.sqlite", "openclaw-quarantine.sqlite"] {
-            let logical = state_root.join("state").join(name);
-            let database = shared_root.join(name);
-            if !fs::symlink_metadata(&database).is_ok_and(|meta| meta.is_file())
-                || is_integrity_protected_history_destination(state_root, &logical, &database)?
-            {
-                continue;
-            }
+        for database in locations.values() {
             let relative = database
                 .strip_prefix(&canonical_root)
                 .map_err(|error| error.to_string())?;
             selection.shared_databases.insert(owned_root.join(relative));
-            selection.shared_databases.insert(database);
+            selection.shared_databases.insert(database.clone());
         }
-        let database = shared_root.join("openclaw.sqlite");
-        if !selection.shared_databases.contains(&database) || !is_sqlite_database(&database)? {
+        let Some(database) = locations.get(&state_root.join("state/openclaw.sqlite")) else {
             return Ok(selection);
+        };
+        if is_sqlite_database(database)? {
+            selection.read_agent_registry(database, false)?;
         }
-        selection.read_agent_registry(&database, false)?;
         Ok(selection)
     }
 
