@@ -93,6 +93,16 @@ impl NativeFixture {
             node,
             npm_cli,
         };
+        let executable = support::ocm_test_binary_path();
+        println!(
+            "native identity {}",
+            json!({
+                "executable": executable,
+                "sha256": ocm::infra::download::file_sha256(&executable).unwrap(),
+                "node": fixture.node,
+                "npmCli": fixture.npm_cli,
+            })
+        );
         println!("native Node: {}", fixture.node(&["--version"]).trim());
         println!(
             "native npm: {}",
@@ -127,7 +137,15 @@ impl NativeFixture {
     }
 
     fn ocm(&self, args: &[&str]) -> Output {
-        run_ocm(self.root.path(), &self.env, args)
+        let output = run_ocm(self.root.path(), &self.env, args);
+        println!(
+            "native receipt {}",
+            json!({
+                "executable": support::ocm_test_binary_path(), "argv": args,
+                "exit": output.status.code(), "stdout": stdout(&output), "stderr": stderr(&output),
+            })
+        );
+        output
     }
 
     fn ok(&self, args: &[&str]) -> String {
@@ -547,7 +565,10 @@ fn native_windows_in_place_upgrade_validates_retained_linked_bytes_and_rolls_bac
     fixture.assert_runtime("stable", OLD, true);
     fixture.assert_binding("demo", "stable", OLD);
     assert_eq!(fs::read_to_string(&marker).unwrap(), "before-upgrade");
-    assert!(!recovery.exists());
+    assert!(
+        !recovery.exists(),
+        "retained recovery remains after rollback: {rollback}"
+    );
     let reverse = fixture.json(&["upgrade", "rollback", "demo", "--json"]);
     assert_eq!(reverse["outcome"], "rolled-back", "{reverse}");
     fixture.assert_runtime("stable", NEW, true);
