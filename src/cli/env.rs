@@ -1503,69 +1503,77 @@ impl Cli {
             }
         }
 
-        let resolved = self.environment_service().resolve_run(
+        self.environment_service().with_resolved_run(
             name,
             runtime_override,
             launcher_override,
             &after,
-        )?;
-        if should_clear_skip_bootstrap_for_openclaw_args(&after) {
-            clear_skip_bootstrap_for_openclaw_onboarding(&derive_env_paths(Path::new(&meta.root)))?;
-        }
-        match resolved {
-            crate::env::ResolvedExecution::Launcher {
-                env,
-                launcher_name,
-                command,
-                run_dir,
-            } => run_shell(
-                &command,
-                &format!("launcher \"{launcher_name}\""),
-                &build_openclaw_env(&env, &self.env),
-                &run_dir,
-            ),
-            crate::env::ResolvedExecution::Runtime {
-                env,
-                program,
-                program_args,
-                path_prepend,
-                run_dir,
-                ..
-            } => {
-                let mut process_env = build_openclaw_env(&env, &self.env);
-                crate::managed_node::apply_path_prepend_to_environment(
-                    &mut process_env,
-                    path_prepend.as_deref(),
-                )?;
-                run_direct(&program, &program_args, &process_env, &run_dir)
-            }
-            crate::env::ResolvedExecution::Dev {
-                env,
-                worktree_root,
-                program,
-                program_args,
-                run_dir,
-                ..
-            } => run_direct(
-                &program,
-                &program_args,
-                &build_openclaw_dev_source_env(&env, &self.env, Path::new(&worktree_root)),
-                &run_dir,
-            ),
-            crate::env::ResolvedExecution::SourceWatch {
-                env,
-                source,
-                program,
-                program_args,
-                run_dir,
-                ..
-            } => run_direct(
-                &program,
-                &program_args,
-                &build_openclaw_dev_source_env(&env, &self.env, Path::new(&source.repo_root)),
-                &run_dir,
-            ),
-        }
+            |resolved| {
+                if should_clear_skip_bootstrap_for_openclaw_args(&after) {
+                    clear_skip_bootstrap_for_openclaw_onboarding(&derive_env_paths(Path::new(
+                        &meta.root,
+                    )))?;
+                }
+                match resolved {
+                    crate::env::ResolvedExecution::Launcher {
+                        env,
+                        launcher_name,
+                        command,
+                        run_dir,
+                    } => run_shell(
+                        &command,
+                        &format!("launcher \"{launcher_name}\""),
+                        &build_openclaw_env(&env, &self.env),
+                        &run_dir,
+                    ),
+                    crate::env::ResolvedExecution::Runtime {
+                        env,
+                        program,
+                        program_args,
+                        path_prepend,
+                        run_dir,
+                        ..
+                    } => {
+                        let mut process_env = build_openclaw_env(&env, &self.env);
+                        crate::managed_node::apply_path_prepend_to_environment(
+                            &mut process_env,
+                            path_prepend.as_deref(),
+                        )?;
+                        run_direct(&program, &program_args, &process_env, &run_dir)
+                    }
+                    crate::env::ResolvedExecution::Dev {
+                        env,
+                        worktree_root,
+                        program,
+                        program_args,
+                        run_dir,
+                        ..
+                    } => run_direct(
+                        &program,
+                        &program_args,
+                        &build_openclaw_dev_source_env(&env, &self.env, Path::new(&worktree_root)),
+                        &run_dir,
+                    ),
+                    crate::env::ResolvedExecution::SourceWatch {
+                        env,
+                        source,
+                        program,
+                        program_args,
+                        run_dir,
+                        ..
+                    } => run_direct(
+                        &program,
+                        &program_args,
+                        &build_openclaw_dev_source_env(
+                            &env,
+                            &self.env,
+                            Path::new(&source.repo_root),
+                        ),
+                        &run_dir,
+                    ),
+                }
+            },
+        )
     }
 
     pub(super) fn handle_env_set_runtime(&self, args: Vec<String>) -> Result<i32, String> {

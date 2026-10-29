@@ -841,3 +841,191 @@ fn env_set_runtime_rejects_conflicting_version_and_channel_flags() {
     assert!(!bind.status.success());
     assert!(stderr(&bind).contains("env set-runtime accepts only one of --version or --channel"));
 }
+
+#[cfg(unix)]
+#[test]
+fn foreground_override_retains_shared_managed_custody_until_completion() {
+    use std::time::Instant;
+
+    let root = TestDir::new("foreground-runtime-custody");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let source = cwd.join("openclaw");
+    write_executable_script(
+        &source,
+        "#!/bin/sh\nprintf ready > \"$1\"\ni=0\nwhile [ ! -f \"$2\" ] && [ \"$i\" -lt 300 ]; do sleep 0.1; i=$((i+1)); done\n[ -f \"$2\" ]\n",
+    );
+    let env = ocm_env(&root);
+    for args in [
+        vec![
+            "runtime",
+            "install",
+            "backing",
+            "--path",
+            source.to_str().unwrap(),
+        ],
+        vec![
+            "runtime",
+            "add",
+            "unrelated",
+            "--path",
+            source.to_str().unwrap(),
+        ],
+        vec!["env", "create", "demo"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+    let backing = ocm::store::get_runtime("backing", &env, &cwd).unwrap();
+    let alias = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "alias", "--path", &backing.binary_path],
+    );
+    assert!(alias.status.success(), "{}", stderr(&alias));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.child("ocm-home/runtimes/.backing.lock"))
+        .unwrap();
+    let mut children = Vec::new();
+    for selected in ["backing", "alias"] {
+        let ready = cwd.join(format!("{selected}.ready"));
+        let finish = cwd.join(format!("{selected}.finish"));
+        let child = Command::new(env!("CARGO_BIN_EXE_ocm"))
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .args([
+                "env",
+                "run",
+                "demo",
+                "--runtime",
+                selected,
+                "--",
+                ready.to_str().unwrap(),
+                finish.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        children.push(child);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "{selected} did not start");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert_eq!(
+        FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    // Ordinary env admission is released, and unrelated runtime mutation can proceed.
+    let exec = run_ocm(&cwd, &env, &["env", "exec", "demo", "--", "true"]);
+    assert!(exec.status.success(), "{}", stderr(&exec));
+    let independent = run_ocm(&cwd, &env, &["runtime", "remove", "unrelated"]);
+    assert!(independent.status.success(), "{}", stderr(&independent));
+    let mut removal = Command::new(env!("CARGO_BIN_EXE_ocm"))
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(&env)
+        .args(["runtime", "remove", "backing"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    assert!(removal.try_wait().unwrap().is_none());
+    assert!(std::path::Path::new(&backing.binary_path).is_file());
+    for (index, selected) in ["backing", "alias"].into_iter().enumerate() {
+        fs::write(cwd.join(format!("{selected}.finish")), b"finish").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = children[index].try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(Instant::now() < deadline, "{selected} did not finish");
+            thread::sleep(Duration::from_millis(20));
+        }
+        if index == 0 {
+            assert!(removal.try_wait().unwrap().is_none());
+            assert_eq!(
+                FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while removal.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "removal did not finish after the last user"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let removal = removal.wait_with_output().unwrap();
+    assert!(removal.status.success(), "{}", stderr(&removal));
+    assert!(!std::path::Path::new(&backing.binary_path).exists());
+    FileExt::try_lock_exclusive(&lock).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_runtime_admission_and_spawn_failure_release_custody() {
+    let root = TestDir::new("foreground-runtime-spawn-error");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let source = cwd.join("openclaw");
+    // Verification can read the executable, but the OS cannot start its interpreter.
+    write_executable_script(&source, "#!/no-such-ocm-test-interpreter\n");
+    let env = ocm_env(&root);
+    for args in [
+        vec![
+            "runtime",
+            "install",
+            "selected",
+            "--path",
+            source.to_str().unwrap(),
+        ],
+        vec!["env", "create", "demo"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.child("ocm-home/runtimes/.selected.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let busy = run_ocm(
+        &cwd,
+        &env,
+        &["env", "run", "demo", "--runtime", "selected", "--"],
+    );
+    assert!(!busy.status.success());
+    assert!(
+        stderr(&busy).contains("busy with another operation"),
+        "{}",
+        stderr(&busy)
+    );
+    FileExt::unlock(&lock).unwrap();
+    let failed = run_ocm(
+        &cwd,
+        &env,
+        &["env", "run", "demo", "--runtime", "selected", "--"],
+    );
+    assert!(!failed.status.success());
+    assert!(
+        stderr(&failed).contains("failed to run"),
+        "{}",
+        stderr(&failed)
+    );
+    FileExt::try_lock_exclusive(&lock).unwrap();
+    FileExt::unlock(&lock).unwrap();
+    let removed = run_ocm(&cwd, &env, &["runtime", "remove", "selected"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+}

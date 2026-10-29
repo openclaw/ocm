@@ -14,6 +14,11 @@ ocm @mira -- status
 ocm @mira -- onboard
 ```
 
+Foreground commands keep their selected runtime's managed files available until
+they finish, including when `env run --runtime` selects a one-off override.
+Direct runtime removal waits for that use to finish and still refuses a runtime
+with a persistent environment binding.
+
 ## What ocm manages
 
 `ocm` keeps the moving parts separate:

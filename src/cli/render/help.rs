@@ -1564,6 +1564,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 "When a foreground dev session is active for this env, OCM runs node <checkout>/openclaw.mjs directly instead of rebuilding through the package script.",
                 "If an environment is active, you can also use the root-level `--` shortcut.",
                 "For one-shot explicit env runs, use the root-level `@<env>` shortcut.",
+                "The selected runtime and its managed backing files stay protected until the foreground command finishes, including with --runtime. Direct removal waits for that use to finish.",
             ],
         ),
         "set-independent-paths" => render_leaf(
@@ -2330,6 +2331,7 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
             vec![format!("{cmd} runtime remove stable")],
             &[
                 "Clear every environment binding that uses the runtime or a registered alias to its managed files before removal.",
+                "Removal waits while an OCM-owned foreground command uses the runtime, including through a one-off --runtime override.",
             ],
         ),
         _ => return None,
