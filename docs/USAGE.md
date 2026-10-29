@@ -1555,6 +1555,9 @@ With `--all`, retention is applied separately to each exact environment name,
 including names whose snapshot directories refer to the same physical directory.
 Show, restore, and remove require the snapshot's exact owner name.
 
+With `--older-than <days>`, an age outside the supported date range is rejected
+before any snapshots are removed. Omit `--yes` to preview the selected snapshots.
+
 ### Export and import
 
 Export:
