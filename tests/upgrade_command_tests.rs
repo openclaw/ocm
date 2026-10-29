@@ -7182,6 +7182,155 @@ fn upgrade_reuses_the_bound_named_runtime_without_retaining_recovery_bytes() {
 }
 
 #[test]
+fn upgrade_history_selects_exact_owners_with_case_distinct_names() {
+    let root = TestDir::new("upgrade-history-case-distinct");
+    let mut env = ocm_env(&root);
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "unsupported".into());
+    let command = |args: &[&str]| -> Value {
+        let output = run_ocm(root.path(), &env, args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        serde_json::from_str(&stdout(&output)).unwrap()
+    };
+    for (name, version) in [("old", "2026.8.1"), ("new", "2026.8.2")] {
+        let runtime = root.child(format!("{name}-openclaw"));
+        write_executable_script(&runtime, &recording_openclaw_script(version));
+        let add = run_ocm(
+            root.path(),
+            &env,
+            &["runtime", "add", name, "--path", &path_string(&runtime)],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    for (name, directory) in [("Demo", "upper"), ("demo", "lower"), ("other", "other")] {
+        command(&[
+            "env",
+            "create",
+            name,
+            "--runtime",
+            "old",
+            "--root",
+            &path_string(&root.child(directory)),
+            "--json",
+        ]);
+    }
+    let mut transactions = BTreeMap::new();
+    for name in ["Demo", "demo", "other"] {
+        // A peer's transaction must not make an environment with no history fail.
+        assert_eq!(
+            command(&["upgrade", "history", name, "--json"]),
+            serde_json::json!([])
+        );
+        let upgraded = command(&["upgrade", name, "--runtime", "new", "--json"]);
+        assert_eq!(upgraded["outcome"], "switched");
+        let history = command(&["upgrade", "history", name, "--json"]);
+        assert_eq!(history.as_array().unwrap().len(), 1);
+        assert_eq!(history[0]["envName"], name);
+        transactions.insert(name, history[0]["id"].as_str().unwrap().to_string());
+    }
+    let history_root = root.child("ocm-home/upgrade-history");
+    let aliased = fs::canonicalize(history_root.join("Demo")).unwrap()
+        == fs::canonicalize(history_root.join("demo")).unwrap();
+    eprintln!("native history directories aliased: {aliased}");
+    for (name, peer, directory) in [
+        ("Demo", "demo", "upper"),
+        ("demo", "Demo", "lower"),
+        ("other", "Demo", "other"),
+    ] {
+        let before = command(&["env", "show", name, "--json"]);
+        let history = command(&["upgrade", "history", name, "--json"]);
+        assert_eq!(history.as_array().unwrap().len(), 1);
+        assert_eq!(history[0]["envName"], name);
+        assert_eq!(history[0]["id"], transactions[name]);
+        let marker = root.child(directory).join(".openclaw/workspace/keep");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, name).unwrap();
+        let plan = command(&[
+            "upgrade",
+            "rollback",
+            name,
+            "--transaction",
+            &transactions[name],
+            "--dry-run",
+            "--json",
+        ]);
+        assert_eq!(plan["outcome"], "would-rollback");
+        assert_eq!(plan["transactionId"], transactions[name]);
+        assert_eq!(plan["bindingName"], "old");
+        let foreign = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "upgrade",
+                "rollback",
+                name,
+                "--transaction",
+                &transactions[peer],
+                "--dry-run",
+                "--json",
+            ],
+        );
+        assert!(!foreign.status.success(), "{}", stdout(&foreign));
+        let error = stderr(&foreign);
+        assert!(
+            error.contains("belongs to environment") || error.contains("does not exist"),
+            "{error}"
+        );
+        if aliased && name != "other" {
+            assert!(error.contains("belongs to environment"), "{error}");
+        }
+        assert_eq!(command(&["env", "show", name, "--json"]), before);
+        assert_eq!(command(&["upgrade", "history", name, "--json"]), history);
+        assert_eq!(fs::read_to_string(marker).unwrap(), name);
+    }
+
+    let removed = run_ocm(root.path(), &env, &["env", "destroy", "demo", "--yes"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    let recreated = command(&[
+        "env",
+        "create",
+        "demo",
+        "--runtime",
+        "new",
+        "--root",
+        &path_string(&root.child("replacement")),
+        "--json",
+    ]);
+    let old_plan = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "upgrade",
+            "rollback",
+            "demo",
+            "--transaction",
+            &transactions["demo"],
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert!(!old_plan.status.success(), "{}", stdout(&old_plan));
+    assert!(
+        stderr(&old_plan).contains("snapshot"),
+        "{}",
+        stderr(&old_plan)
+    );
+    assert_eq!(command(&["env", "show", "demo", "--json"]), recreated);
+    // Destroying the peer must not invalidate the surviving exact owner's plan.
+    assert_eq!(
+        command(&[
+            "upgrade",
+            "rollback",
+            "Demo",
+            "--transaction",
+            &transactions["Demo"],
+            "--dry-run",
+            "--json",
+        ])["outcome"],
+        "would-rollback"
+    );
+}
+
+#[test]
 fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
     let root = TestDir::new("upgrade-explicit-rollback-switch");
     let cwd = root.child("workspace");
