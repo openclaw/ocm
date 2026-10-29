@@ -17,13 +17,6 @@ fn windows_error(action: &str) -> String {
 
 pub struct FixtureJob(OwnedHandle);
 
-#[derive(Debug)]
-pub struct StopAccounting {
-    pub active: u32,
-    pub total: u32,
-    pub terminated: u32,
-}
-
 impl FixtureJob {
     pub fn new() -> Result<Self, String> {
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -58,7 +51,7 @@ impl FixtureJob {
         Ok(())
     }
 
-    pub fn stop(&self) -> Result<StopAccounting, String> {
+    pub fn stop(&self) -> Result<(), String> {
         if unsafe { TerminateJobObject(self.handle(), 1) } == 0 {
             return Err(windows_error("stop fixture job"));
         }
@@ -78,11 +71,7 @@ impl FixtureJob {
                 return Err(windows_error("inspect fixture job cleanup"));
             }
             if info.ActiveProcesses == 0 {
-                return Ok(StopAccounting {
-                    active: info.ActiveProcesses,
-                    total: info.TotalProcesses,
-                    terminated: info.TotalTerminatedProcesses,
-                });
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(format!(
