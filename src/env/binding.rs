@@ -24,11 +24,12 @@ impl<'a> EnvironmentService<'a> {
     }
 
     /// Rebinds like `dev rebind`, but only while the environment still uses
-    /// `expected`, so an implicit switch never overwrites a concurrent rebind.
+    /// `expected` generation and source, so an implicit switch never overwrites
+    /// a replacement environment or a concurrent rebind.
     pub(crate) fn rebind_dev_from(
         &self,
         name: &str,
-        expected: Option<&str>,
+        expected: Option<&EnvMeta>,
         source: &Path,
     ) -> Result<DevRebindSummary, String> {
         let _operation = crate::store::try_lock_environment_operation(name, self.env, self.cwd)?
@@ -39,7 +40,22 @@ impl<'a> EnvironmentService<'a> {
         let previous = meta.dev.as_ref().and_then(EnvDevMeta::borrowed_source_root)
             .filter(|_| meta.default_runtime.is_none() && meta.default_launcher.is_none())
             .ok_or("dev rebind requires an existing borrowed dev environment without a runtime or launcher binding")?;
-        if expected.is_some_and(|expected| expected != previous) {
+        if expected.is_some_and(|expected| {
+            meta.name != expected.name
+                || meta.root != expected.root
+                || meta.created_at != expected.created_at
+        }) {
+            return Err(format!(
+                "environment {name} was replaced; its binding was kept"
+            ));
+        }
+        if expected.is_some_and(|expected| {
+            expected
+                .dev
+                .as_ref()
+                .and_then(EnvDevMeta::borrowed_source_root)
+                != Some(previous)
+        }) {
             return Err(format!(
                 "environment {name} is now bound to {previous}; its binding was kept"
             ));
